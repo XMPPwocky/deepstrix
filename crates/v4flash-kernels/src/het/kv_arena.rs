@@ -5,8 +5,8 @@
 //! by per-row base arrays (the `*_rows` wrappers; `tests/multistream_row_bases.rs`
 //! shows them bit-identical to the single-sequence forms). This module owns:
 //!
-//!   * per layer, one RAW SWA window buffer of `n_slots * KV_CACHE_ROWS` rows —
-//!     stream `s` owns rows `[s*KV_CACHE_ROWS, (s+1)*KV_CACHE_ROWS)`, and its
+//!   * per layer, one RAW SWA window buffer of `n_slots * ARENA_RAW_ROWS` rows —
+//!     stream `s` owns rows `[s*ARENA_RAW_ROWS, (s+1)*ARENA_RAW_ROWS)`, and its
 //!     live window is `[raw_off, raw_off + n_raw)` inside that region exactly as
 //!     `HetLayerState` keeps it (monotonic append, compaction at the region end);
 //!   * per KV-SOURCE layer (`config::KV_SOURCE_LAYERS`), one compressed store:
@@ -41,8 +41,19 @@ use v4flash_hip::{Device, DeviceBuffer, Stream};
 use crate::config::{
     kv_source_of, CED_DECODER_START, COMPRESS_RATIOS, KV_SOURCE_LAYERS, NEG_INF, N_HEAD_DIM, N_LAYER, SWA_WINDOW,
 };
-use crate::het::state::{CompKvStore, HetCompressorState, HetLayerState, HetModelState, KV_CACHE_ROWS};
+use crate::het::state::{CompKvStore, HetCompressorState, HetLayerState, HetModelState};
 use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
+
+/// Raw rows per slot beyond the SWA window. The arena only appends DECODE rows
+/// (one per step; a DSpark verify block is `MTP_BLOCK` = 5), never a prefill
+/// chunk, so it does not need the single-sequence state's `B_MAX` rows of chunk
+/// room (`state::KV_CACHE_ROWS` = 128 + 1024): 1152 -> 256 rows saves ~37 MB of
+/// dGPU per slot (40 layers x 896 rows x 1 KiB). A full region costs one
+/// `compact_raw` (40 layers x two <=128 KiB D2D copies) every
+/// `ARENA_RAW_SLACK` tokens of that stream.
+pub const ARENA_RAW_SLACK: usize = 128;
+/// Raw rows per slot per layer (`raw_region_base`, `needs_compaction`).
+pub const ARENA_RAW_ROWS: usize = SWA_WINDOW as usize + ARENA_RAW_SLACK;
 
 /// Index into `KvArena::stores` / `RowTables::stores` of the store `layer`
 /// reads (its KV source's), `None` for the dense layers.
@@ -107,6 +118,18 @@ impl RowFreeList {
         }
         Some(base)
     }
+    /// Carve exactly `[base, base + rows)` when a free run STARTS at `base` and
+    /// holds `rows` (a region growing in place into the run right after it).
+    pub fn carve_at(&mut self, base: u32, rows: u32) -> bool {
+        let Some(i) = self.free.iter().position(|&(b, len)| b == base && len >= rows) else { return false };
+        let len = self.free[i].1;
+        if len == rows {
+            self.free.remove(i);
+        } else {
+            self.free[i] = (base + rows, len - rows);
+        }
+        true
+    }
     pub fn give_back(&mut self, base: u32, rows: u32) {
         self.free.push((base, rows));
         self.free.sort_unstable();
@@ -133,6 +156,64 @@ impl RowFreeList {
     }
 }
 
+/// The bounce copies `(src_row, dst_row, rows)` that move `n` rows from `from`
+/// to `to` inside ONE buffer, `chunk` rows at a time, in an order that never
+/// overwrites a source row before it has been read: front to back when the
+/// rows move down, back to front when they move up (the ranges may overlap).
+fn move_chunks(from: u32, to: u32, n: u32, chunk: u32) -> Vec<(u32, u32, u32)> {
+    let chunk = chunk.max(1);
+    let mut out = Vec::with_capacity(n.div_ceil(chunk) as usize);
+    let mut r = 0;
+    while r < n {
+        let len = (n - r).min(chunk);
+        out.push((from + r, to + r, len));
+        r += len;
+    }
+    if to > from {
+        out.reverse();
+    }
+    out
+}
+
+/// Where `KvArena::grow` puts one store's regions when it has to compact
+/// around region `x`: the regions at or below `x` pack DOWN from row 0
+/// (ascending, every move downward), the regions above it pack UP against
+/// `rows_cap` (descending, every move upward), which leaves every free row in
+/// one run right after `x`. `regs` = `(base, cap)` per live region. Returns the
+/// moves in a safe execution order as `(index into regs, new base)` (regions
+/// already in place included) and the free run `(base, rows)`.
+fn plan_compact_around(regs: &[(u32, u32)], x: usize, rows_cap: u32) -> (Vec<(usize, u32)>, (u32, u32)) {
+    let xb = regs[x].0;
+    let mut low: Vec<usize> = (0..regs.len()).filter(|&i| regs[i].0 <= xb).collect();
+    let mut high: Vec<usize> = (0..regs.len()).filter(|&i| regs[i].0 > xb).collect();
+    low.sort_by_key(|&i| regs[i].0);
+    high.sort_by_key(|&i| std::cmp::Reverse(regs[i].0));
+    let mut moves = Vec::with_capacity(regs.len());
+    let mut next = 0u32;
+    for i in low {
+        moves.push((i, next));
+        next += regs[i].1;
+    }
+    let free_base = next;
+    let mut top = rows_cap;
+    for i in high {
+        top -= regs[i].1;
+        moves.push((i, top));
+    }
+    (moves, (free_base, top - free_base))
+}
+
+/// How `KvArena::grow` found the rows (the most expensive store's way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GrowHow {
+    /// The free run right after the region was big enough.
+    InPlace,
+    /// The region moved to a free run that holds the grown size.
+    Relocated,
+    /// The store was compacted around the region first.
+    Compacted,
+}
+
 /// One compressed store (one KV-source layer) for all streams: allocator +
 /// geometry. Its buffers are `KvArena::state.layers[layer].compressor`.
 pub struct CompStore {
@@ -152,7 +233,7 @@ pub struct CompStore {
 pub struct RowTables {
     pub pos_per: Vec<i32>,
     /// Raw window per row BEFORE the append: rows valid and the window start in
-    /// the LAYER buffer (`slot * KV_CACHE_ROWS + raw_off`), the same for every
+    /// the LAYER buffer (`slot * ARENA_RAW_ROWS + raw_off`), the same for every
     /// layer.
     pub n_raw_per: Vec<i32>,
     pub n_raw_offset_per: Vec<i32>,
@@ -257,7 +338,7 @@ pub struct KvArena {
     pub dgpu: Device,
     pub n_slots: u32,
     /// The buffers, as the layer driver takes them (module doc). Layer `l`:
-    /// `kv_cache` = `n_slots * KV_CACHE_ROWS * N_HEAD_DIM` f16; KV-source
+    /// `kv_cache` = `n_slots * ARENA_RAW_ROWS * N_HEAD_DIM` f16; KV-source
     /// layers: `compressor = Some(..)` with `state_kv`/`state_score` =
     /// `[n_slots, ratio * width]` f32, `comp_kv = F16([rows_cap, width])`,
     /// `index_k = Some([rows_cap, E2M1_KEY_ROW_BYTES])`. Counters stay 0.
@@ -285,7 +366,7 @@ impl KvArena {
             return Err(eyre!("kv arena: n_slots must be >= 1"));
         }
         dgpu.set_current()?;
-        let raw_rows = (n_slots as usize) * KV_CACHE_ROWS;
+        let raw_rows = (n_slots as usize) * ARENA_RAW_ROWS;
         let mut stores = Vec::with_capacity(KV_SOURCE_LAYERS.len());
         let mut layers = Vec::with_capacity(N_LAYER as usize);
         for l in 0..N_LAYER as usize {
@@ -387,6 +468,227 @@ impl KvArena {
         pos: u32,
         stream: &Stream,
     ) -> eyre::Result<u32> {
+        let (n_raw, n_raw_dec) = self.source_windows(src, pos)?;
+        let slot = self.admit(ctx_cap.max(pos + 1), pos)?;
+        // Any failure below must give the slot back: it used to stay allocated
+        // with no Stream owning it, and a parked request retried every tick.
+        match self.fill_admitted(src, slot, n_raw, n_raw_dec, stream) {
+            Ok(()) => Ok(slot),
+            Err(e) => {
+                let _ = self.release(slot);
+                Err(e)
+            }
+        }
+    }
+
+    /// Reserve a slot and `ceil(ctx_cap / ratio)` rows per store for a stream
+    /// whose prompt is still being prefilled: `admit` at position 0, filled
+    /// later by `fill_reserved`. The scheduler steps only its own streams, so a
+    /// reservation is never a step row; compaction and `grow` move it like any
+    /// region (zero rows written).
+    pub fn reserve(&mut self, ctx_cap: u32) -> eyre::Result<u32> {
+        self.admit(ctx_cap.max(1), 0)
+    }
+
+    /// Fill reservation `slot` from the prefilled `src` (as `admit_from_state`)
+    /// with `pos` = the prompt length. The reservation must hold `pos + 1`
+    /// positions (`grow` it first otherwise). On error the slot stays
+    /// reserved: it is the caller's to release.
+    pub fn fill_reserved(&mut self, slot: u32, src: &HetModelState, pos: u32, stream: &Stream) -> eyre::Result<()> {
+        let (n_raw, n_raw_dec) = self.source_windows(src, pos)?;
+        let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not reserved"))?;
+        if s.pos != 0 || s.n_raw != 0 || s.n_raw_dec != 0 || s.comp.iter().any(|r| r.n_comp != 0 || r.n_index_comp != 0) {
+            return Err(eyre!("kv arena: slot {slot} is not a fresh reservation"));
+        }
+        let room = self.reserved_positions(slot);
+        if room < pos + 1 {
+            return Err(eyre!("kv arena: slot {slot} reserves {room} positions, the prompt needs {}", pos + 1));
+        }
+        self.fill_admitted(src, slot, n_raw, n_raw_dec, stream)?;
+        self.stream_mut(slot).expect("checked").pos = pos;
+        Ok(())
+    }
+
+    /// Positions `slot`'s regions can hold: the stream can run every position
+    /// below this (`min` over stores of `cap * ratio`).
+    pub fn reserved_positions(&self, slot: u32) -> u32 {
+        self.stream(slot)
+            .map(|s| s.comp.iter().zip(&self.stores).map(|(r, st)| r.cap * st.ratio).min().unwrap_or(u32::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Can `slot` run its next position without a region overflowing? The
+    /// exact condition `tables` enforces: every store whose compressor boundary
+    /// fires at `pos` has a free row left.
+    pub fn can_step(&self, slot: u32) -> bool {
+        self.stream(slot).is_some_and(|s| {
+            s.comp.iter().zip(&self.stores).all(|(r, st)| (s.pos + 1) % st.ratio != 0 || r.n_comp < r.cap)
+        })
+    }
+
+    /// Would `reserve(ctx_cap)` fit, after a compaction if need be, with
+    /// `spare` positions of rows still free in every store afterwards (the
+    /// room live streams grow into)?
+    pub fn fits_with_spare(&self, ctx_cap: u32, spare: u32) -> bool {
+        self.stores.iter().all(|st| {
+            st.free.free_rows() >= ctx_cap.div_ceil(st.ratio).max(1) + spare.div_ceil(st.ratio)
+        })
+    }
+
+    /// Would `reserve(ctx_cap)` fit right now, without compaction?
+    pub fn fits_now(&self, ctx_cap: u32) -> bool {
+        self.stores.iter().all(|st| st.free.fits(ctx_cap.div_ceil(st.ratio).max(1)))
+    }
+
+    /// Grow `slot`'s regions to hold `ctx_cap` positions. Per store: extend in
+    /// place into the free run right after the region, else move the region to
+    /// a free run that holds the grown size, else compact the store around it
+    /// (`plan_compact_around`) and extend. `Ok(None)` = some store has fewer
+    /// free rows than the growth needs; nothing was changed. Copies run through
+    /// the bounce buffers on `stream`, which is synchronized before return.
+    /// Call between steps, like `compact_stores`.
+    pub fn grow(
+        &mut self,
+        slot: u32,
+        ctx_cap: u32,
+        stream: &Stream,
+        bounce_f16: &mut DeviceBuffer<u16>,
+        bounce_u8: &mut DeviceBuffer<u8>,
+    ) -> eyre::Result<Option<GrowHow>> {
+        let comp = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?.comp.clone();
+        let need: Vec<u32> = self.stores.iter().map(|st| ctx_cap.div_ceil(st.ratio).max(1)).collect();
+        if self.stores.iter().zip(&comp).zip(&need).any(|((st, r), &n)| n.saturating_sub(r.cap) > st.free.free_rows()) {
+            return Ok(None);
+        }
+        self.dgpu.set_current()?;
+        let mut how = GrowHow::InPlace;
+        let mut copied = false;
+        for si in 0..self.stores.len() {
+            let r = self.streams[slot as usize].as_ref().expect("live").comp[si];
+            if need[si] <= r.cap {
+                continue;
+            }
+            let extra = need[si] - r.cap;
+            if self.stores[si].free.carve_at(r.base + r.cap, extra) {
+                self.streams[slot as usize].as_mut().expect("live").comp[si].cap = need[si];
+                continue;
+            }
+            if let Some(nb) = self.stores[si].free.carve(need[si]) {
+                self.move_region_rows(si, r.base, nb, r.n_comp, r.n_index_comp, stream, bounce_f16, bounce_u8)?;
+                self.stores[si].free.give_back(r.base, r.cap);
+                let reg = &mut self.streams[slot as usize].as_mut().expect("live").comp[si];
+                reg.base = nb;
+                reg.cap = need[si];
+                how = how.max(GrowHow::Relocated);
+                copied = true;
+                continue;
+            }
+            self.compact_store_around(si, slot, stream, bounce_f16, bounce_u8)?;
+            let r = self.streams[slot as usize].as_ref().expect("live").comp[si];
+            if !self.stores[si].free.carve_at(r.base + r.cap, extra) {
+                return Err(eyre!("kv arena: L{} grow after compaction found no run after the region", self.stores[si].layer));
+            }
+            self.streams[slot as usize].as_mut().expect("live").comp[si].cap = need[si];
+            how = GrowHow::Compacted;
+            copied = true;
+        }
+        if copied {
+            stream.synchronize()?;
+        }
+        Ok(Some(how))
+    }
+
+    /// Compact store `si` so all its free rows sit in one run right after
+    /// `slot`'s region (`plan_compact_around`). Accumulator blocks are per
+    /// slot and do not move. The caller synchronizes `stream`.
+    fn compact_store_around(
+        &mut self,
+        si: usize,
+        slot: u32,
+        stream: &Stream,
+        bounce_f16: &mut DeviceBuffer<u16>,
+        bounce_u8: &mut DeviceBuffer<u8>,
+    ) -> eyre::Result<()> {
+        let live: Vec<usize> = (0..self.streams.len()).filter(|&sl| self.streams[sl].is_some()).collect();
+        let regs: Vec<(u32, u32)> = live.iter().map(|&sl| {
+            let r = self.streams[sl].as_ref().expect("live").comp[si];
+            (r.base, r.cap)
+        }).collect();
+        let x = live.iter().position(|&sl| sl == slot as usize).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
+        let (moves, free) = plan_compact_around(&regs, x, self.stores[si].rows_cap);
+        for (i, nb) in moves {
+            let sl = live[i];
+            let r = self.streams[sl].as_ref().expect("live").comp[si];
+            if r.base != nb {
+                self.move_region_rows(si, r.base, nb, r.n_comp, r.n_index_comp, stream, bounce_f16, bounce_u8)?;
+                self.streams[sl].as_mut().expect("live").comp[si].base = nb;
+            }
+        }
+        self.stores[si].free = RowFreeList { free: if free.1 > 0 { vec![free] } else { Vec::new() } };
+        Ok(())
+    }
+
+    /// Move a region's written comp rows and index keys from row `from` to row
+    /// `to` of store `si`, through the bounce buffers (`move_chunks` order, so
+    /// overlapping moves in either direction are safe). Async on `stream`.
+    #[allow(clippy::too_many_arguments)]
+    fn move_region_rows(
+        &mut self,
+        si: usize,
+        from: u32,
+        to: u32,
+        n_comp: u32,
+        n_keys: u32,
+        stream: &Stream,
+        bounce_f16: &mut DeviceBuffer<u16>,
+        bounce_u8: &mut DeviceBuffer<u8>,
+    ) -> eyre::Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let width = self.stores[si].width as usize;
+        let chunk_rows = (bounce_f16.len() / width).min(bounce_u8.len() / E2M1_KEY_ROW_BYTES).max(1) as u32;
+        let l = self.stores[si].layer;
+        let cs = self.state.layers[l].compressor.as_mut().expect("arena store");
+        if n_comp > 0 {
+            let buf = cs.comp_kv.f16_mut().expect("f16 store");
+            for (src_row, dst_row, n) in move_chunks(from, to, n_comp, chunk_rows) {
+                let (src_row, dst_row, n) = (src_row as usize, dst_row as usize, n as usize);
+                {
+                    let src = buf.slice_view(src_row * width, n * width);
+                    let mut b = bounce_f16.slice_view_mut(0, n * width);
+                    b.copy_from_buffer_async(&src, stream)?;
+                }
+                {
+                    let b = bounce_f16.slice_view(0, n * width);
+                    let mut dst = buf.slice_view_mut(dst_row * width, n * width);
+                    dst.copy_from_buffer_async(&b, stream)?;
+                }
+            }
+        }
+        if n_keys > 0 {
+            let kb = cs.index_k.as_mut().expect("keys");
+            for (src_row, dst_row, n) in move_chunks(from, to, n_keys, chunk_rows) {
+                let (src_row, dst_row, n) = (src_row as usize, dst_row as usize, n as usize);
+                {
+                    let src = kb.slice_view(src_row * E2M1_KEY_ROW_BYTES, n * E2M1_KEY_ROW_BYTES);
+                    let mut b = bounce_u8.slice_view_mut(0, n * E2M1_KEY_ROW_BYTES);
+                    b.copy_from_buffer_async(&src, stream)?;
+                }
+                {
+                    let b = bounce_u8.slice_view(0, n * E2M1_KEY_ROW_BYTES);
+                    let mut dst = kb.slice_view_mut(dst_row * E2M1_KEY_ROW_BYTES, n * E2M1_KEY_ROW_BYTES);
+                    dst.copy_from_buffer_async(&b, stream)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The live raw windows of a prefilled single-sequence `src` at next
+    /// position `pos`: `(n_raw, n_raw_dec)` after checking they are in lockstep
+    /// within the encoder / decoder groups and fit the window.
+    fn source_windows(&self, src: &HetModelState, pos: u32) -> eyre::Result<(u32, u32)> {
         if src.layers.len() != self.state.layers.len() {
             return Err(eyre!("kv arena: source state has {} layers, arena {}", src.layers.len(), self.state.layers.len()));
         }
@@ -399,16 +701,7 @@ impl KvArena {
         if n_raw > SWA_WINDOW || pos < n_raw || n_raw_dec > SWA_WINDOW || pos < n_raw_dec {
             return Err(eyre!("kv arena: source windows {n_raw}/{n_raw_dec} rows at pos {pos}"));
         }
-        let slot = self.admit(ctx_cap.max(pos + 1), pos)?;
-        // Any failure below must give the slot back: it used to stay allocated
-        // with no Stream owning it, and a parked request retried every tick.
-        match self.fill_admitted(src, slot, n_raw, n_raw_dec, stream) {
-            Ok(()) => Ok(slot),
-            Err(e) => {
-                let _ = self.release(slot);
-                Err(e)
-            }
-        }
+        Ok((n_raw, n_raw_dec))
     }
 
     /// Copy `src`'s live KV into freshly admitted `slot` (`admit_from_state`).
@@ -567,9 +860,7 @@ impl KvArena {
         self.dgpu.set_current()?;
         let n_stores = self.stores.len();
         for si in 0..n_stores {
-            let width = self.stores[si].width as usize;
-            let chunk_rows = (bounce_f16.len() / width).min(bounce_u8.len() / E2M1_KEY_ROW_BYTES).max(1);
-            // (slot, base, n_comp) of every live region, ascending by base.
+            // (slot, base, cap) of every live region, ascending by base.
             let mut regs: Vec<(usize, u32, u32)> = self.streams.iter().enumerate()
                 .filter_map(|(sl, s)| s.as_ref().map(|s| (sl, s.comp[si].base, s.comp[si].cap)))
                 .collect();
@@ -578,48 +869,8 @@ impl KvArena {
             for (sl, base, cap) in regs {
                 if base != next_base {
                     debug_assert!(base > next_base);
-                    let s = self.streams[sl].as_ref().expect("live");
-                    let (n_comp, n_keys) = (s.comp[si].n_comp as usize, s.comp[si].n_index_comp as usize);
-                    let l = self.stores[si].layer;
-                    let cs = self.state.layers[l].compressor.as_mut().expect("arena store");
-                    // comp rows
-                    if n_comp > 0 {
-                        let buf = cs.comp_kv.f16_mut().expect("f16 store");
-                        let mut r = 0usize;
-                        while r < n_comp {
-                            let n = (n_comp - r).min(chunk_rows);
-                            {
-                                let src = buf.slice_view((base as usize + r) * width, n * width);
-                                let mut b = bounce_f16.slice_view_mut(0, n * width);
-                                b.copy_from_buffer_async(&src, stream)?;
-                            }
-                            {
-                                let b = bounce_f16.slice_view(0, n * width);
-                                let mut dst = buf.slice_view_mut((next_base as usize + r) * width, n * width);
-                                dst.copy_from_buffer_async(&b, stream)?;
-                            }
-                            r += n;
-                        }
-                    }
-                    // index keys
-                    if n_keys > 0 {
-                        let kb = cs.index_k.as_mut().expect("keys");
-                        let mut r = 0usize;
-                        while r < n_keys {
-                            let n = (n_keys - r).min(chunk_rows);
-                            {
-                                let src = kb.slice_view((base as usize + r) * E2M1_KEY_ROW_BYTES, n * E2M1_KEY_ROW_BYTES);
-                                let mut b = bounce_u8.slice_view_mut(0, n * E2M1_KEY_ROW_BYTES);
-                                b.copy_from_buffer_async(&src, stream)?;
-                            }
-                            {
-                                let b = bounce_u8.slice_view(0, n * E2M1_KEY_ROW_BYTES);
-                                let mut dst = kb.slice_view_mut((next_base as usize + r) * E2M1_KEY_ROW_BYTES, n * E2M1_KEY_ROW_BYTES);
-                                dst.copy_from_buffer_async(&b, stream)?;
-                            }
-                            r += n;
-                        }
-                    }
+                    let r = self.streams[sl].as_ref().expect("live").comp[si];
+                    self.move_region_rows(si, base, next_base, r.n_comp, r.n_index_comp, stream, bounce_f16, bounce_u8)?;
                     self.streams[sl].as_mut().expect("live").comp[si].base = next_base;
                 }
                 next_base += cap;
@@ -642,7 +893,7 @@ impl KvArena {
 
     /// Row start of `slot`'s raw region in every layer buffer, in rows.
     pub fn raw_region_base(slot: u32) -> u32 {
-        slot * KV_CACHE_ROWS as u32
+        slot * ARENA_RAW_ROWS as u32
     }
 
     /// The step's tables for `slots` (one row per slot, in order). Every row is
@@ -693,7 +944,7 @@ impl KvArena {
     /// caller must `compact_raw` first (a D2D copy per layer, on `stream`).
     pub fn needs_compaction(&self, slot: u32) -> bool {
         self.stream(slot).is_some_and(|s| {
-            (s.raw_off + s.n_raw) as usize >= KV_CACHE_ROWS || (s.raw_off_dec + s.n_raw_dec) as usize >= KV_CACHE_ROWS
+            (s.raw_off + s.n_raw) as usize >= ARENA_RAW_ROWS || (s.raw_off_dec + s.n_raw_dec) as usize >= ARENA_RAW_ROWS
         })
     }
 
@@ -788,5 +1039,107 @@ mod tests {
         assert_eq!(fl.free, vec![(0, 60)]);
         assert_eq!(fl.free_rows(), 60);
         assert!(fl.fits(60) && !fl.fits(61));
+    }
+
+    #[test]
+    fn carve_at_only_from_the_start_of_a_run() {
+        let mut fl = RowFreeList::new(100);
+        assert_eq!(fl.carve(30), Some(0));
+        assert!(!fl.carve_at(20, 5), "inside a live region");
+        assert!(!fl.carve_at(31, 5), "not the start of the run");
+        assert!(!fl.carve_at(30, 71), "longer than the run");
+        assert!(fl.carve_at(30, 10));
+        assert_eq!(fl.free, vec![(40, 60)]);
+        assert!(fl.carve_at(40, 60));
+        assert!(fl.free.is_empty());
+    }
+
+    /// Apply `move_chunks` through a bounce buffer on a host "store", exactly
+    /// as `move_region_rows` does on the device (src -> bounce -> dst per chunk).
+    fn apply_move(buf: &mut [i64], from: u32, to: u32, n: u32, chunk: u32) {
+        for (s, d, len) in move_chunks(from, to, n, chunk) {
+            let bounce: Vec<i64> = buf[s as usize..(s + len) as usize].to_vec();
+            buf[d as usize..(d + len) as usize].copy_from_slice(&bounce);
+        }
+    }
+
+    #[test]
+    fn move_chunks_overlapping_both_directions() {
+        for &(from, to, n, chunk) in &[(10u32, 3u32, 20u32, 4u32), (3, 10, 20, 4), (0, 1, 50, 7), (1, 0, 50, 7), (5, 45, 30, 8), (5, 5, 9, 2), (0, 7, 7, 3)] {
+            let mut buf: Vec<i64> = (0..100).map(|i| -(i as i64) - 1).collect();
+            for r in 0..n {
+                buf[(from + r) as usize] = 1000 + r as i64;
+            }
+            apply_move(&mut buf, from, to, n, chunk);
+            for r in 0..n {
+                assert_eq!(buf[(to + r) as usize], 1000 + r as i64, "from {from} to {to} n {n} chunk {chunk} row {r}");
+            }
+        }
+    }
+
+    /// Tiny LCG so the property test needs no dev-dependency.
+    fn lcg(s: &mut u64) -> u32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*s >> 33) as u32
+    }
+
+    #[test]
+    fn compact_around_keeps_every_row_and_frees_after_x() {
+        let mut seed = 7u64;
+        for case in 0..2000 {
+            let rows_cap = 40 + lcg(&mut seed) % 200;
+            // Random live regions carved first-fit with holes punched between.
+            let mut fl = RowFreeList::new(rows_cap);
+            let mut regs: Vec<(u32, u32, u32)> = Vec::new(); // (base, cap, n)
+            for _ in 0..(1 + lcg(&mut seed) % 8) {
+                let cap = 1 + lcg(&mut seed) % 30;
+                if let Some(b) = fl.carve(cap) {
+                    regs.push((b, cap, lcg(&mut seed) % (cap + 1)));
+                }
+            }
+            if regs.is_empty() {
+                continue;
+            }
+            let mut i = 0;
+            while i < regs.len() && regs.len() > 1 {
+                if lcg(&mut seed) % 3 == 0 {
+                    let (b, c, _) = regs.remove(i);
+                    fl.give_back(b, c);
+                } else {
+                    i += 1;
+                }
+            }
+            let mut buf = vec![-1i64; rows_cap as usize];
+            for (k, &(b, _, n)) in regs.iter().enumerate() {
+                for r in 0..n {
+                    buf[(b + r) as usize] = (k as i64) * 10_000 + r as i64;
+                }
+            }
+            let x = (lcg(&mut seed) as usize) % regs.len();
+            let plan_in: Vec<(u32, u32)> = regs.iter().map(|&(b, c, _)| (b, c)).collect();
+            let (moves, free) = plan_compact_around(&plan_in, x, rows_cap);
+            let chunk = 1 + lcg(&mut seed) % 6;
+            let mut now: Vec<u32> = regs.iter().map(|r| r.0).collect();
+            for (i, nb) in &moves {
+                apply_move(&mut buf, now[*i], *nb, regs[*i].2, chunk);
+                now[*i] = *nb;
+            }
+            assert_eq!(moves.len(), regs.len(), "case {case}: every region placed once");
+            for (k, &(_, c, n)) in regs.iter().enumerate() {
+                assert!(now[k] + c <= rows_cap, "case {case}");
+                for r in 0..n {
+                    assert_eq!(buf[(now[k] + r) as usize], (k as i64) * 10_000 + r as i64, "case {case} region {k} row {r}");
+                }
+            }
+            // No two regions overlap, and the free run is every free row, right after x.
+            let mut spans: Vec<(u32, u32)> = regs.iter().enumerate().map(|(k, &(_, c, _))| (now[k], now[k] + c)).collect();
+            spans.sort();
+            for w in spans.windows(2) {
+                assert!(w[0].1 <= w[1].0, "case {case}: overlap {w:?}");
+            }
+            assert_eq!(free.0, now[x] + regs[x].1, "case {case}: free run starts after x");
+            assert_eq!(free.1, fl.free_rows(), "case {case}: free run holds every free row");
+            assert!(spans.iter().all(|&(a, b)| b <= free.0 || a >= free.0 + free.1), "case {case}: free run overlaps a region");
+        }
     }
 }
