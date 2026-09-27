@@ -27,8 +27,8 @@
 //!      PARITY_MH_BF16 = 1 (default; the oracle rounds mh to bf16) | 0,
 //!      PARITY_MH = alternative main-hidden file (e.g. the engine's own),
 //!      PARITY_SHOW = N steps printed in detail (default 6),
-//!      PARITY_ASSERT = 1 to fail below the bars (E no more than 0.2 below the
-//!      reference, i.e. ~4.2 for `base`; d1 draft agreement >= 0.90),
+//!      PARITY_ASSERT = 1 applies THE pass rule: E(ours) >= E(ref) - 0.2 (~4.2
+//!      for `base`) AND the paired 90% bootstrap lower bound >= -0.45,
 //!      PARITY_OUT = csv path for our per-step drafts.
 //!
 //! `PARITY_ASSERT` is meaningful for `base` / `incseed` only. `noseed` is NOT like
@@ -320,19 +320,26 @@ fn drafter_matches_reference() {
     // The reference's E recomputed from its records must equal what its JSON
     // recorded; otherwise the targets or the record parsing are off.
     let json = format!("{dir}/../dspark_accept_{refname}.json");
-    if let Ok(bytes) = std::fs::read(&json) {
-        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("reference json");
-        if let Some(want) = v["expected_tokens"].get(MTP_BLOCK - 1).and_then(|x| x.as_f64()) {
+    let asserting = std::env::var("PARITY_ASSERT").as_deref() == Ok("1");
+    match std::fs::read(&json) {
+        Ok(bytes) => {
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("reference json");
+            let want = v["expected_tokens"].get(MTP_BLOCK - 1).and_then(|x| x.as_f64());
+            let want = want.unwrap_or_else(|| panic!("{json}: no expected_tokens[{}]", MTP_BLOCK - 1));
             assert!((want - er).abs() < 1e-6, "reference E from records {er:.6} != its JSON {want:.6}");
         }
+        Err(e) if asserting => panic!("{json}: {e} (the alignment check needs the reference JSON)"),
+        Err(e) => println!("WARNING: {json}: {e}; reference E NOT cross-checked against its JSON"),
     }
     if let Ok(p) = std::env::var("PARITY_OUT") {
         std::fs::write(&p, csv).expect("write PARITY_OUT");
         println!("per-step drafts written to {p}");
     }
-    if std::env::var("PARITY_ASSERT").as_deref() == Ok("1") {
-        // Owner's bar: a numerics-level shortfall (~4.2 vs 4.38) is fine.
+    if asserting {
+        // THE pass rule (plan M-A): owner's bar -- a numerics-level shortfall
+        // (~4.2 vs 4.38) is fine -- as a point gap, AND the paired interval's
+        // lower bound within ~one reference SE (0.45; effective n ~19).
         assert!(eo >= er - 0.2, "E {eo:.3} is more than 0.2 below the reference's {er:.3}");
-        assert!(agree[0] as f64 / n >= 0.90, "d1 draft agreement {:.3}", agree[0] as f64 / n);
+        assert!(lo >= -0.45, "paired 90% interval lower bound {lo:+.3} < -0.45");
     }
 }

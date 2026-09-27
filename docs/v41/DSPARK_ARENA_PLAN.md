@@ -6,7 +6,10 @@ rev 1; one pushed back: the production row mix, 1.3). Round 2: APPROVE WITH
 CHANGES (N1-N7, addressed in rev 2). Round 3: APPROVE WITH CHANGES (R3-1..R3-5,
 addressed in rev 3: paired gate + more reference positions, what 4.382 means,
 A4 CED seeding, test hardening, the drafter KV quantizer FIXED in a6baf76, CPU
-bisect first). Supersedes the verify-path economics in
+bisect first). **Round 4: APPROVE** (the new drafter KV chain verified step for
+step against the main model's V4.1 chain and the reference quantizer; minor
+R4-1..R4-4 folded in: one numeric pass rule, JSON check no longer silent, iGPU
+kernel exercise, fuse the KV chain after parity). Supersedes the verify-path economics in
 `DSPARK_VERIFY_ECONOMICS.md` / `DSPARK_WHAT_IS_LEFT.md` (they priced a
 prefill-shaped verify that no longer needs to exist).
 
@@ -18,7 +21,13 @@ shortfall is fine). That is milestone M-A (section 9).
 **What 4.382 is and is not** (review R3-2): it describes the DRAFTER ON gen2, a
 transcript that is the reference model's own greedy continuation (greedy equals
 the text at 100% of scored positions; T=1 rejection-sampling E 4.13 on it). On
-`prose` the same seeded reference drafter scores E 1.99. So M-A is a PARITY bar
+`prose` (also the model's own greedy continuation, greedy == text at 100%) the
+same reference drafter scores E 1.99 (RS at T=1: 1.82), BUT that run could seed
+only 74 rows (the whole prompt) against gen2's 128, and seeding alone is worth
+3.28 -> 4.38 on gen2; each figure is one 89-step transcript (effective n ~19).
+So the prose gap mixes content with a thin window and must not be quoted as a
+content effect until a prose run with a >= 128-token prompt exists (a CPU
+reference run, RAM-bound; queued with R3-1's extra positions). M-A is a PARITY bar
 (our drafter vs the reference drafter on the same input); production acceptance
 is lower for the reference drafter too, and M0 prices production with the
 realized E of the drafter that passed parity, measured on production-like,
@@ -616,13 +625,20 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     overlapping blocks have lag-1 autocorrelation ~0.65 (effective n ~19; the
     reference's own E carries a ~0.45 SE), so the gate is draft agreement given
     identical earlier drafts per depth, plus the moving-block bootstrap interval
-    of E(ours) - E(ref) (both printed by the test), with "E >= ~4.2" as the
-    headline. More positions, CPU only: rerun the fixed `base` reference drafter
+    of E(ours) - E(ref) (both printed by the test). **The pass rule**
+    (`PARITY_ASSERT=1`): point gap E(ours) >= E(ref) - 0.2 (~4.2 for `base`) AND
+    the paired 90% interval's lower bound >= -0.45 (about one reference SE).
+    Before the window, if possible, exercise `fp8_act_quant_inplace` and
+    `kv_cache_append_slotdev` on gfx1151 (they have only ever run on the dGPU;
+    review R4-1); otherwise a broken iGPU kernel shows up as `base` far below
+    `base:v4`. Record `draft_ms`: the V4.1 chain is 4 launches per KV row instead
+    of 1 (+54 per draft), so once parity holds, fuse a V4.1 `kv_post_fused`
+    (per-32 ue8m0 over all 512 dims, tail included; review R4-2). More positions, CPU only: rerun the fixed `base` reference drafter
     on `main` (1,006 tokens, ~740 steps; its current `dspark_accept.json` predates
     the ffn_norm fix), `gen` and `gen_dspark` (needs ~13+ GB of RAM for the
     oracle's expert cache, so also a hub-down item unless the cache is trimmed).
     **Fixed before the first run** (a6baf76): the drafter's ring and block KV
-    used the V4-era `kv_post_fused` (E4M3, f32 scale per 64 over the first 448
+    used the V4-era `kv_post_fused` (E4M3, power-of-two scale per 64 over the first 448
     dims, RoPE tail unquantized), a DIFFERENT quantizer from the reference's
     `act_quant` (E4M3, ue8m0 scale per 32 over all 512 dims); now it is the main
     model's V4.1 window quantizer, `V41_MTP_KV_QUANT=v4` for the A/B. Remaining
