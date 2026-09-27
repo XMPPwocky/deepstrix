@@ -1,0 +1,268 @@
+== 1790474976.000441.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP kv_rms_rope_fp8 b=1 plain: bit-exact (0)
+CMP rope_tail_batched_copy b=1 plain: bit-exact (0)
+CMP rope_inv_quant heads b=1 plain: bit-exact (0)
+CMP rope_inv_quant xq b=1 plain: bit-exact (0)
+CMP rope_inv_quant xscale b=1 plain: bit-exact (0)
+CMP kv_rms_rope_fp8 b=1 yarn: bit-exact (0)
+CMP rope_tail_batched_copy b=1 yarn: bit-exact (0)
+CMP rope_inv_quant heads b=1 yarn: bit-exact (0)
+CMP rope_inv_quant xq b=1 yarn: bit-exact (0)
+CMP rope_inv_quant xscale b=1 yarn: bit-exact (0)
+CMP rms_quant qr_normed b=1: bit-exact (0)
+CMP rms_quant xq b=1: bit-exact (0)
+CMP rms_quant xscale b=1: bit-exact (0)
+
+== decode chains b=1 warm graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv: rms + rope + fp8 (3 nodes)                10.66       9.68      19.14    1.000       0.0       0.0
+kv: fused (1 node)                             6.28       5.89      18.27    0.589       0.0       0.0
+qa: rms + cast_qr + quant (3 nodes)           10.65       8.63      29.67    0.999       0.0       0.0
+qa: rms + quant (2 nodes)                      8.61       6.53      26.06    0.808       0.0       0.0
+qa: fused (1 node)                             5.58       5.04      21.62    0.523       0.0       0.0
+q: memcpy + rope (2 nodes)                     7.39       5.99      21.70    0.693       0.0       0.0
+q: rope_copy (1 node)                          4.55       4.03      16.25    0.427       0.0       0.0
+oproj: rope_inv + cast_heads + quant (3)       9.72       8.60      32.33    0.912       0.0       0.0
+oproj: rope_inv + quant (2 nodes)              8.34       6.18      21.65    0.782       0.0       0.0
+oproj: fused (1 node)                          5.43       5.08      13.27    0.509       0.0       0.0
+dead: cast_input + quant + dup quant (3)      10.09       8.20      18.15    0.947       0.0       0.0
+dead-free: quant (1 node)                      3.86       3.56      12.60    0.362       0.0       0.0
+dead: cast_low + quant (2 nodes)               6.24       5.79      17.47    0.585       0.0       0.0
+dead-free: quant low (1 node)                  3.86       3.55       7.48    0.362       0.0       0.0
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"kv: rms + rope + fp8 (3 nodes)","med_us":10.660,"p10_us":9.680,"p90_us":19.136,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"kv: fused (1 node)","med_us":6.276,"p10_us":5.892,"p90_us":18.268,"ratio":0.5888,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"qa: rms + cast_qr + quant (3 nodes)","med_us":10.648,"p10_us":8.628,"p90_us":29.668,"ratio":0.9989,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"qa: rms + quant (2 nodes)","med_us":8.612,"p10_us":6.528,"p90_us":26.056,"ratio":0.8079,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"qa: fused (1 node)","med_us":5.580,"p10_us":5.040,"p90_us":21.620,"ratio":0.5235,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"q: memcpy + rope (2 nodes)","med_us":7.388,"p10_us":5.988,"p90_us":21.704,"ratio":0.6931,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"q: rope_copy (1 node)","med_us":4.548,"p10_us":4.032,"p90_us":16.248,"ratio":0.4267,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"oproj: rope_inv + cast_heads + quant (3)","med_us":9.720,"p10_us":8.604,"p90_us":32.328,"ratio":0.9118,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"oproj: rope_inv + quant (2 nodes)","med_us":8.336,"p10_us":6.180,"p90_us":21.652,"ratio":0.7820,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"oproj: fused (1 node)","med_us":5.428,"p10_us":5.080,"p90_us":13.272,"ratio":0.5092,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"dead: cast_input + quant + dup quant (3)","med_us":10.092,"p10_us":8.204,"p90_us":18.148,"ratio":0.9467,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"dead-free: quant (1 node)","med_us":3.860,"p10_us":3.564,"p90_us":12.600,"ratio":0.3621,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"dead: cast_low + quant (2 nodes)","med_us":6.240,"p10_us":5.792,"p90_us":17.472,"ratio":0.5854,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=1 warm graph inner=10","variant":"dead-free: quant low (1 node)","med_us":3.856,"p10_us":3.552,"p90_us":7.484,"ratio":0.3617,"gbps":0.00,"graph":1,"flush":0}
+CMP kv_rms_rope_fp8 b=2 plain: bit-exact (0)
+CMP rope_tail_batched_copy b=2 plain: bit-exact (0)
+CMP rope_inv_quant heads b=2 plain: bit-exact (0)
+CMP rope_inv_quant xq b=2 plain: bit-exact (0)
+CMP rope_inv_quant xscale b=2 plain: bit-exact (0)
+CMP kv_rms_rope_fp8 b=2 yarn: bit-exact (0)
+CMP rope_tail_batched_copy b=2 yarn: bit-exact (0)
+CMP rope_inv_quant heads b=2 yarn: bit-exact (0)
+CMP rope_inv_quant xq b=2 yarn: bit-exact (0)
+CMP rope_inv_quant xscale b=2 yarn: bit-exact (0)
+CMP rms_quant qr_normed b=2: bit-exact (0)
+CMP rms_quant xq b=2: bit-exact (0)
+CMP rms_quant xscale b=2: bit-exact (0)
+
+== decode chains b=2 warm graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv: rms + rope + fp8 (3 nodes)                10.31       9.62      22.66    1.000       0.0       0.0
+kv: fused (1 node)                             6.06       5.90      12.22    0.588       0.0       0.0
+qa: rms + cast_qr + quant (3 nodes)            8.92       8.58      16.65    0.866       0.0       0.0
+qa: rms + quant (2 nodes)                      6.62       6.35      12.66    0.643       0.0       0.0
+qa: fused (1 node)                             5.30       5.01      16.52    0.515       0.0       0.0
+q: memcpy + rope (2 nodes)                     6.26       6.02      11.57    0.607       0.0       0.0
+q: rope_copy (1 node)                          4.28       4.16      13.36    0.415       0.0       0.0
+oproj: rope_inv + cast_heads + quant (3)       9.08       8.76      16.28    0.881       0.0       0.0
+oproj: rope_inv + quant (2 nodes)              6.68       6.42      21.99    0.648       0.0       0.0
+oproj: fused (1 node)                          5.50       5.33      20.11    0.534       0.0       0.0
+dead: cast_input + quant + dup quant (3)       8.65       8.21      32.26    0.839       0.0       0.0
+dead-free: quant (1 node)                      3.77       3.56      13.33    0.366       0.0       0.0
+dead: cast_low + quant (2 nodes)               6.30       5.82      21.30    0.611       0.0       0.0
+dead-free: quant low (1 node)                  3.80       3.57      13.30    0.369       0.0       0.0
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"kv: rms + rope + fp8 (3 nodes)","med_us":10.308,"p10_us":9.624,"p90_us":22.664,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"kv: fused (1 node)","med_us":6.064,"p10_us":5.904,"p90_us":12.224,"ratio":0.5883,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"qa: rms + cast_qr + quant (3 nodes)","med_us":8.924,"p10_us":8.580,"p90_us":16.652,"ratio":0.8657,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"qa: rms + quant (2 nodes)","med_us":6.624,"p10_us":6.348,"p90_us":12.664,"ratio":0.6426,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"qa: fused (1 node)","med_us":5.304,"p10_us":5.012,"p90_us":16.524,"ratio":0.5146,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"q: memcpy + rope (2 nodes)","med_us":6.256,"p10_us":6.024,"p90_us":11.568,"ratio":0.6069,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"q: rope_copy (1 node)","med_us":4.276,"p10_us":4.164,"p90_us":13.360,"ratio":0.4148,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"oproj: rope_inv + cast_heads + quant (3)","med_us":9.080,"p10_us":8.764,"p90_us":16.284,"ratio":0.8809,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"oproj: rope_inv + quant (2 nodes)","med_us":6.676,"p10_us":6.424,"p90_us":21.992,"ratio":0.6477,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"oproj: fused (1 node)","med_us":5.504,"p10_us":5.328,"p90_us":20.112,"ratio":0.5340,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"dead: cast_input + quant + dup quant (3)","med_us":8.648,"p10_us":8.208,"p90_us":32.256,"ratio":0.8390,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"dead-free: quant (1 node)","med_us":3.772,"p10_us":3.560,"p90_us":13.332,"ratio":0.3659,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"dead: cast_low + quant (2 nodes)","med_us":6.296,"p10_us":5.824,"p90_us":21.296,"ratio":0.6108,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=2 warm graph inner=10","variant":"dead-free: quant low (1 node)","med_us":3.800,"p10_us":3.572,"p90_us":13.304,"ratio":0.3687,"gbps":0.00,"graph":1,"flush":0}
+CMP kv_rms_rope_fp8 b=3 plain: bit-exact (0)
+CMP rope_tail_batched_copy b=3 plain: bit-exact (0)
+CMP rope_inv_quant heads b=3 plain: bit-exact (0)
+CMP rope_inv_quant xq b=3 plain: bit-exact (0)
+CMP rope_inv_quant xscale b=3 plain: bit-exact (0)
+CMP kv_rms_rope_fp8 b=3 yarn: bit-exact (0)
+CMP rope_tail_batched_copy b=3 yarn: bit-exact (0)
+CMP rope_inv_quant heads b=3 yarn: bit-exact (0)
+CMP rope_inv_quant xq b=3 yarn: bit-exact (0)
+CMP rope_inv_quant xscale b=3 yarn: bit-exact (0)
+CMP rms_quant qr_normed b=3: bit-exact (0)
+CMP rms_quant xq b=3: bit-exact (0)
+CMP rms_quant xscale b=3: bit-exact (0)
+
+== decode chains b=3 warm graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv: rms + rope + fp8 (3 nodes)                10.81       9.57      23.12    1.000       0.0       0.0
+kv: fused (1 node)                             6.10       5.92      12.55    0.564       0.0       0.0
+qa: rms + cast_qr + quant (3 nodes)            9.12       8.60      11.62    0.843       0.0       0.0
+qa: rms + quant (2 nodes)                      6.70       6.34      10.60    0.620       0.0       0.0
+qa: fused (1 node)                             5.20       5.02      10.96    0.481       0.0       0.0
+q: memcpy + rope (2 nodes)                     6.55       6.22      17.09    0.606       0.0       0.0
+q: rope_copy (1 node)                          4.58       4.44      16.02    0.424       0.0       0.0
+oproj: rope_inv + cast_heads + quant (3)       9.96       9.27      35.03    0.921       0.0       0.0
+oproj: rope_inv + quant (2 nodes)              7.35       6.84      19.54    0.680       0.0       0.0
+oproj: fused (1 node)                          6.01       5.77       9.71    0.556       0.0       0.0
+dead: cast_input + quant + dup quant (3)       8.88       8.24      16.08    0.821       0.0       0.0
+dead-free: quant (1 node)                      3.87       3.57       5.32    0.358       0.0       0.0
+dead: cast_low + quant (2 nodes)               6.32       5.87      14.90    0.585       0.0       0.0
+dead-free: quant low (1 node)                  3.92       3.61       8.53    0.363       0.0       0.0
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"kv: rms + rope + fp8 (3 nodes)","med_us":10.812,"p10_us":9.568,"p90_us":23.120,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"kv: fused (1 node)","med_us":6.100,"p10_us":5.916,"p90_us":12.552,"ratio":0.5642,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"qa: rms + cast_qr + quant (3 nodes)","med_us":9.120,"p10_us":8.604,"p90_us":11.620,"ratio":0.8435,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"qa: rms + quant (2 nodes)","med_us":6.700,"p10_us":6.336,"p90_us":10.600,"ratio":0.6197,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"qa: fused (1 node)","med_us":5.196,"p10_us":5.020,"p90_us":10.956,"ratio":0.4806,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"q: memcpy + rope (2 nodes)","med_us":6.552,"p10_us":6.224,"p90_us":17.092,"ratio":0.6060,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"q: rope_copy (1 node)","med_us":4.584,"p10_us":4.440,"p90_us":16.016,"ratio":0.4240,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"oproj: rope_inv + cast_heads + quant (3)","med_us":9.960,"p10_us":9.272,"p90_us":35.032,"ratio":0.9212,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"oproj: rope_inv + quant (2 nodes)","med_us":7.348,"p10_us":6.840,"p90_us":19.536,"ratio":0.6796,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"oproj: fused (1 node)","med_us":6.012,"p10_us":5.772,"p90_us":9.712,"ratio":0.5560,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"dead: cast_input + quant + dup quant (3)","med_us":8.880,"p10_us":8.240,"p90_us":16.076,"ratio":0.8213,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"dead-free: quant (1 node)","med_us":3.868,"p10_us":3.568,"p90_us":5.316,"ratio":0.3577,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"dead: cast_low + quant (2 nodes)","med_us":6.320,"p10_us":5.868,"p90_us":14.904,"ratio":0.5845,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=3 warm graph inner=10","variant":"dead-free: quant low (1 node)","med_us":3.924,"p10_us":3.612,"p90_us":8.532,"ratio":0.3629,"gbps":0.00,"graph":1,"flush":0}
+CMP kv_rms_rope_fp8 b=4 plain: bit-exact (0)
+CMP rope_tail_batched_copy b=4 plain: bit-exact (0)
+CMP rope_inv_quant heads b=4 plain: bit-exact (0)
+CMP rope_inv_quant xq b=4 plain: bit-exact (0)
+CMP rope_inv_quant xscale b=4 plain: bit-exact (0)
+CMP kv_rms_rope_fp8 b=4 yarn: bit-exact (0)
+CMP rope_tail_batched_copy b=4 yarn: bit-exact (0)
+CMP rope_inv_quant heads b=4 yarn: bit-exact (0)
+CMP rope_inv_quant xq b=4 yarn: bit-exact (0)
+CMP rope_inv_quant xscale b=4 yarn: bit-exact (0)
+CMP rms_quant qr_normed b=4: bit-exact (0)
+CMP rms_quant xq b=4: bit-exact (0)
+CMP rms_quant xscale b=4: bit-exact (0)
+
+== decode chains b=4 warm graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv: rms + rope + fp8 (3 nodes)                11.28       9.47      24.06    1.000       0.0       0.0
+kv: fused (1 node)                             6.43       5.86      18.10    0.570       0.0       0.0
+qa: rms + cast_qr + quant (3 nodes)            9.16       8.59      15.61    0.812       0.0       0.0
+qa: rms + quant (2 nodes)                      6.94       6.32      23.44    0.615       0.0       0.0
+qa: fused (1 node)                             5.70       4.98      18.59    0.505       0.0       0.0
+q: memcpy + rope (2 nodes)                     7.01       6.26      16.42    0.621       0.0       0.0
+q: rope_copy (1 node)                          5.38       4.64      11.50    0.477       0.0       0.0
+oproj: rope_inv + cast_heads + quant (3)      10.76       9.66      38.87    0.953       0.0       0.0
+oproj: rope_inv + quant (2 nodes)              8.77       7.15      27.83    0.777       0.0       0.0
+oproj: fused (1 node)                          6.85       6.37      21.92    0.607       0.0       0.0
+dead: cast_input + quant + dup quant (3)       9.48       8.28      27.51    0.840       0.0       0.0
+dead-free: quant (1 node)                      3.95       3.59       7.80    0.350       0.0       0.0
+dead: cast_low + quant (2 nodes)               6.55       5.91      12.46    0.580       0.0       0.0
+dead-free: quant low (1 node)                  4.02       3.65       9.65    0.357       0.0       0.0
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"kv: rms + rope + fp8 (3 nodes)","med_us":11.284,"p10_us":9.472,"p90_us":24.056,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"kv: fused (1 node)","med_us":6.428,"p10_us":5.856,"p90_us":18.100,"ratio":0.5697,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"qa: rms + cast_qr + quant (3 nodes)","med_us":9.160,"p10_us":8.588,"p90_us":15.612,"ratio":0.8118,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"qa: rms + quant (2 nodes)","med_us":6.940,"p10_us":6.316,"p90_us":23.436,"ratio":0.6150,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"qa: fused (1 node)","med_us":5.696,"p10_us":4.980,"p90_us":18.588,"ratio":0.5048,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"q: memcpy + rope (2 nodes)","med_us":7.012,"p10_us":6.256,"p90_us":16.424,"ratio":0.6214,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"q: rope_copy (1 node)","med_us":5.384,"p10_us":4.644,"p90_us":11.500,"ratio":0.4771,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"oproj: rope_inv + cast_heads + quant (3)","med_us":10.756,"p10_us":9.660,"p90_us":38.868,"ratio":0.9532,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"oproj: rope_inv + quant (2 nodes)","med_us":8.772,"p10_us":7.152,"p90_us":27.832,"ratio":0.7774,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"oproj: fused (1 node)","med_us":6.852,"p10_us":6.372,"p90_us":21.920,"ratio":0.6072,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"dead: cast_input + quant + dup quant (3)","med_us":9.480,"p10_us":8.284,"p90_us":27.508,"ratio":0.8401,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"dead-free: quant (1 node)","med_us":3.952,"p10_us":3.588,"p90_us":7.796,"ratio":0.3502,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"dead: cast_low + quant (2 nodes)","med_us":6.548,"p10_us":5.908,"p90_us":12.460,"ratio":0.5803,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=4 warm graph inner=10","variant":"dead-free: quant low (1 node)","med_us":4.024,"p10_us":3.648,"p90_us":9.648,"ratio":0.3566,"gbps":0.00,"graph":1,"flush":0}
+CMP kv_rms_rope_fp8 b=5 plain: bit-exact (0)
+CMP rope_tail_batched_copy b=5 plain: bit-exact (0)
+CMP rope_inv_quant heads b=5 plain: bit-exact (0)
+CMP rope_inv_quant xq b=5 plain: bit-exact (0)
+CMP rope_inv_quant xscale b=5 plain: bit-exact (0)
+CMP kv_rms_rope_fp8 b=5 yarn: bit-exact (0)
+CMP rope_tail_batched_copy b=5 yarn: bit-exact (0)
+CMP rope_inv_quant heads b=5 yarn: bit-exact (0)
+CMP rope_inv_quant xq b=5 yarn: bit-exact (0)
+CMP rope_inv_quant xscale b=5 yarn: bit-exact (0)
+CMP rms_quant qr_normed b=5: bit-exact (0)
+CMP rms_quant xq b=5: bit-exact (0)
+CMP rms_quant xscale b=5: bit-exact (0)
+
+== decode chains b=5 warm graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv: rms + rope + fp8 (3 nodes)                37.47       9.54     105.66    1.000       0.0       0.0
+kv: fused (1 node)                            19.72       5.87      44.28    0.526       0.0       0.0
+qa: rms + cast_qr + quant (3 nodes)           33.95       8.61     108.50    0.906       0.0       0.0
+qa: rms + quant (2 nodes)                     26.34       6.34      72.86    0.703       0.0       0.0
+qa: fused (1 node)                            18.36       4.99      41.32    0.490       0.0       0.0
+q: memcpy + rope (2 nodes)                    27.06       6.49      77.82    0.722       0.0       0.0
+q: rope_copy (1 node)                         18.75       4.84      41.16    0.500       0.0       0.0
+oproj: rope_inv + cast_heads + quant (3)      41.00      10.10     111.91    1.094       0.0       0.0
+oproj: rope_inv + quant (2 nodes)             28.52       7.54      79.58    0.761       0.0       0.0
+oproj: fused (1 node)                         20.42       6.95      41.50    0.545       0.0       0.0
+dead: cast_input + quant + dup quant (3)      31.32       8.40     103.58    0.836       0.0       0.0
+dead-free: quant (1 node)                     13.27       3.65      42.49    0.354       0.0       0.0
+dead: cast_low + quant (2 nodes)              24.29       6.01      77.74    0.648       0.0       0.0
+dead-free: quant low (1 node)                 13.54       3.73      42.31    0.361       0.0       0.0
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"kv: rms + rope + fp8 (3 nodes)","med_us":37.468,"p10_us":9.544,"p90_us":105.665,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"kv: fused (1 node)","med_us":19.716,"p10_us":5.872,"p90_us":44.276,"ratio":0.5262,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"qa: rms + cast_qr + quant (3 nodes)","med_us":33.948,"p10_us":8.608,"p90_us":108.505,"ratio":0.9061,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"qa: rms + quant (2 nodes)","med_us":26.336,"p10_us":6.344,"p90_us":72.860,"ratio":0.7029,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"qa: fused (1 node)","med_us":18.364,"p10_us":4.988,"p90_us":41.320,"ratio":0.4901,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"q: memcpy + rope (2 nodes)","med_us":27.060,"p10_us":6.492,"p90_us":77.820,"ratio":0.7222,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"q: rope_copy (1 node)","med_us":18.748,"p10_us":4.840,"p90_us":41.160,"ratio":0.5004,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"oproj: rope_inv + cast_heads + quant (3)","med_us":41.000,"p10_us":10.100,"p90_us":111.909,"ratio":1.0943,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"oproj: rope_inv + quant (2 nodes)","med_us":28.520,"p10_us":7.544,"p90_us":79.576,"ratio":0.7612,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"oproj: fused (1 node)","med_us":20.424,"p10_us":6.948,"p90_us":41.504,"ratio":0.5451,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"dead: cast_input + quant + dup quant (3)","med_us":31.316,"p10_us":8.396,"p90_us":103.581,"ratio":0.8358,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"dead-free: quant (1 node)","med_us":13.268,"p10_us":3.648,"p90_us":42.492,"ratio":0.3541,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"dead: cast_low + quant (2 nodes)","med_us":24.292,"p10_us":6.012,"p90_us":77.740,"ratio":0.6483,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=5 warm graph inner=10","variant":"dead-free: quant low (1 node)","med_us":13.544,"p10_us":3.728,"p90_us":42.308,"ratio":0.3615,"gbps":0.00,"graph":1,"flush":0}
+CMP kv_rms_rope_fp8 b=8 plain: bit-exact (0)
+CMP rope_tail_batched_copy b=8 plain: bit-exact (0)
+CMP rope_inv_quant heads b=8 plain: bit-exact (0)
+CMP rope_inv_quant xq b=8 plain: bit-exact (0)
+CMP rope_inv_quant xscale b=8 plain: bit-exact (0)
+CMP kv_rms_rope_fp8 b=8 yarn: bit-exact (0)
+CMP rope_tail_batched_copy b=8 yarn: bit-exact (0)
+CMP rope_inv_quant heads b=8 yarn: bit-exact (0)
+CMP rope_inv_quant xq b=8 yarn: bit-exact (0)
+CMP rope_inv_quant xscale b=8 yarn: bit-exact (0)
+CMP rms_quant qr_normed b=8: bit-exact (0)
+CMP rms_quant xq b=8: bit-exact (0)
+CMP rms_quant xscale b=8: bit-exact (0)
+
+== decode chains b=8 warm graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv: rms + rope + fp8 (3 nodes)                39.56       9.46     105.54    1.000       0.0       0.0
+kv: fused (1 node)                            21.74       5.81      45.05    0.550       0.0       0.0
+qa: rms + cast_qr + quant (3 nodes)           38.87       8.59     108.83    0.983       0.0       0.0
+qa: rms + quant (2 nodes)                     26.93       6.32      78.70    0.681       0.0       0.0
+qa: fused (1 node)                            20.14       4.92      46.98    0.509       0.0       0.0
+q: memcpy + rope (2 nodes)                    29.05       6.81      75.60    0.734       0.0       0.0
+q: rope_copy (1 node)                         20.65       5.40      45.74    0.522       0.0       0.0
+oproj: rope_inv + cast_heads + quant (3)      43.32      11.36     113.18    1.095       0.0       0.0
+oproj: rope_inv + quant (2 nodes)             35.44       8.62      81.70    0.896       0.0       0.0
+oproj: fused (1 node)                         24.76       8.61      48.09    0.626       0.0       0.0
+dead: cast_input + quant + dup quant (3)      37.75       8.52     108.33    0.954       0.0       0.0
+dead-free: quant (1 node)                     13.24       3.70      41.28    0.335       0.0       0.0
+dead: cast_low + quant (2 nodes)              24.17       6.21      74.43    0.611       0.0       0.0
+dead-free: quant low (1 node)                 13.40       3.95      45.56    0.339       0.0       0.0
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"kv: rms + rope + fp8 (3 nodes)","med_us":39.556,"p10_us":9.456,"p90_us":105.537,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"kv: fused (1 node)","med_us":21.744,"p10_us":5.808,"p90_us":45.048,"ratio":0.5497,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"qa: rms + cast_qr + quant (3 nodes)","med_us":38.872,"p10_us":8.592,"p90_us":108.829,"ratio":0.9827,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"qa: rms + quant (2 nodes)","med_us":26.932,"p10_us":6.316,"p90_us":78.697,"ratio":0.6809,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"qa: fused (1 node)","med_us":20.136,"p10_us":4.920,"p90_us":46.976,"ratio":0.5091,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"q: memcpy + rope (2 nodes)","med_us":29.052,"p10_us":6.812,"p90_us":75.596,"ratio":0.7345,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"q: rope_copy (1 node)","med_us":20.652,"p10_us":5.400,"p90_us":45.744,"ratio":0.5221,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"oproj: rope_inv + cast_heads + quant (3)","med_us":43.316,"p10_us":11.360,"p90_us":113.185,"ratio":1.0951,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"oproj: rope_inv + quant (2 nodes)","med_us":35.436,"p10_us":8.620,"p90_us":81.704,"ratio":0.8958,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"oproj: fused (1 node)","med_us":24.760,"p10_us":8.612,"p90_us":48.088,"ratio":0.6259,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"dead: cast_input + quant + dup quant (3)","med_us":37.752,"p10_us":8.516,"p90_us":108.333,"ratio":0.9544,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"dead-free: quant (1 node)","med_us":13.244,"p10_us":3.696,"p90_us":41.276,"ratio":0.3348,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"dead: cast_low + quant (2 nodes)","med_us":24.168,"p10_us":6.208,"p90_us":74.428,"ratio":0.6110,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode chains b=8 warm graph inner=10","variant":"dead-free: quant low (1 node)","med_us":13.400,"p10_us":3.952,"p90_us":45.560,"ratio":0.3388,"gbps":0.00,"graph":1,"flush":0}
+RESULT: all fused outputs bit-exact

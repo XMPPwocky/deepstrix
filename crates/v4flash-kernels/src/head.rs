@@ -372,6 +372,43 @@ impl HcPost {
         ])
     }
 
+    /// `hc_post_from_split_batched_add` (2026-09-27 round 2, `V41_DEC_FUSE`):
+    /// `VecAddInplace::launch(block_out += addend)` + [`Self::launch_from_split_batched`]
+    /// in one launch; `out_hc` BIT-IDENTICAL (tests/decode_fusion_bitexact.rs).
+    /// `block_out` is left WITHOUT the addend (nothing reads it after hc_post).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_from_split_batched_add(
+        &self,
+        stream: &Stream,
+        out_hc: &mut DeviceBuffer<f32>,
+        block_out: &DeviceBuffer<f32>,
+        addend: &DeviceBuffer<f32>,
+        residual_hc: &DeviceBuffer<f32>,
+        split: &DeviceBuffer<f32>,
+        n_w: u32,
+        n_embd: u32,
+        n_hc: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if addend.len() < (batch as usize) * (n_embd as usize) || block_out.len() < (batch as usize) * (n_embd as usize) {
+            return Err(eyre!("hc_post_from_split_batched_add: block_out / addend too small"));
+        }
+        let function = self.module.get_function("hc_post_from_split_batched_add")?;
+        let block_x = 256u32;
+        let grid_x = n_embd.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, n_hc, batch),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out_hc.raw(), block_out.raw(), addend.raw(), residual_hc.raw(), split.raw(), n_w, n_embd, n_hc
+        ])
+    }
+
     /// Launch reading `post` and `comb` directly from a packed `split`
     /// buffer with layout `[w(n_w), post(n_hc), comb(n_hc*n_hc)]`. This
     /// is exactly the layout produced by `HcSinkhorn`, so callers can

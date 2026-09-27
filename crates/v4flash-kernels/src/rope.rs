@@ -244,17 +244,7 @@ impl RopeTail {
         if b == 0 {
             return Ok(());
         }
-        let theta_scale = params.freq_base.powf(-2.0 / n_rot as f32);
-        let mscale_eff = if params.ext_factor != 0.0 && params.freq_scale > 0.0 {
-            params.attn_factor * (1.0 + 0.1 * (1.0 / params.freq_scale).ln())
-        } else {
-            params.attn_factor
-        };
-        let (corr_low, corr_high) = if params.ext_factor != 0.0 {
-            corr_dims(n_rot, params.n_ctx_orig, params.freq_base, params.beta_fast, params.beta_slow)
-        } else {
-            (0.0, 0.0)
-        };
+        let (theta_scale, mscale_eff, corr_low, corr_high) = Self::device_args(params, n_rot);
         let function = self.module.get_function("rope_tail_batched")?;
         let inverse_i: i32 = if inverse { 1 } else { 0 };
         // `V41_GRID_PAD`: one idle head column (the kernel's `head >= n_head`
@@ -270,6 +260,148 @@ impl RopeTail {
             x.raw(), pos_per_b.raw(), n_head, head_dim, n_rot,
             theta_scale, params.freq_scale, params.ext_factor,
             mscale_eff, corr_low, corr_high, inverse_i
+        ])
+    }
+
+    /// The device-side rope arguments `launch_batched` derives from `params`
+    /// (theta_scale, mscale_eff, corr_low, corr_high), by the same expressions,
+    /// for the fused round-2 kernels below.
+    fn device_args(params: &RopeParams, n_rot: u32) -> (f32, f32, f32, f32) {
+        let theta_scale = params.freq_base.powf(-2.0 / n_rot as f32);
+        let mscale_eff = if params.ext_factor != 0.0 && params.freq_scale > 0.0 {
+            params.attn_factor * (1.0 + 0.1 * (1.0 / params.freq_scale).ln())
+        } else {
+            params.attn_factor
+        };
+        let (corr_low, corr_high) = if params.ext_factor != 0.0 {
+            corr_dims(n_rot, params.n_ctx_orig, params.freq_base, params.beta_fast, params.beta_slow)
+        } else {
+            (0.0, 0.0)
+        };
+        (theta_scale, mscale_eff, corr_low, corr_high)
+    }
+
+    /// `kv_rms_rope_fp8` (2026-09-27 round 2, `V41_DEC_FUSE`): the decode window-KV chain
+    /// `RmsNorm::launch_weighted_batched(n = 512)` -> `launch_forward_batched(1 head,
+    /// 512, n_rot)` -> `Fp4KvQuant::launch_fp8_window(512)` in one launch, BIT-IDENTICAL
+    /// (tests/decode_fusion_bitexact.rs). `out` receives the chain's final `kv_normed`.
+    /// Requires head_dim 512 and n_rot 64 (the V4.1 window KV). Chain 10.9 -> 6.7 us
+    /// at b = 4 (graph, warm, 5 runs; 0.57-0.61 of the chain at b = 1..8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_rms_rope_fp8(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        eps: f32,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_rot: u32,
+        b: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        if n_rot != 64 {
+            return Err(eyre!("kv_rms_rope_fp8: n_rot={n_rot}, the kernel is written for 64"));
+        }
+        if b == 0 {
+            return Ok(());
+        }
+        if x.len() < (b as usize) * 512 || out.len() < (b as usize) * 512 || weight.len() < 512 {
+            return Err(eyre!("kv_rms_rope_fp8: buffers too small for b={b}"));
+        }
+        let (theta_scale, mscale_eff, corr_low, corr_high) = Self::device_args(params, n_rot);
+        let function = self.module.get_function("kv_rms_rope_fp8")?;
+        let cfg = LaunchConfig { grid: (b, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), x.raw(), weight.raw(), eps, pos_per_b.raw(),
+            theta_scale, params.freq_scale, params.ext_factor, mscale_eff, corr_low, corr_high
+        ])
+    }
+
+    /// `rope_tail_batched_copy` (2026-09-27 round 2, `V41_DEC_FUSE`): `dst := src` then
+    /// `launch_forward_batched(dst)` in one launch (the V4.1 decode `q_normed := q`
+    /// D2D copy + q rope), BIT-IDENTICAL. Needs (head_dim - n_rot) % 4 == 0 and 16-B
+    /// aligned buffers (checked; the caller falls back to copy + rope otherwise).
+    /// Chain 7.8 -> 5.3 us at b = 4 (0.67-0.76 at b = 1..8), with the `V41_GRID_PAD`
+    /// column: the exact (64, 1, 8) x 128 grid is 2048 waves (2.2x slower unpadded).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_forward_batched_copy(
+        &self,
+        stream: &Stream,
+        dst: &mut DeviceBuffer<f32>,
+        src: &DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        if n_rot % 2 != 0 || n_rot > 64 || n_rot > head_dim || (head_dim - n_rot) % 4 != 0 {
+            return Err(eyre!("rope_tail_batched_copy: head_dim={head_dim} n_rot={n_rot} unsupported"));
+        }
+        if b == 0 {
+            return Ok(());
+        }
+        let n = (b as usize) * (n_head as usize) * (head_dim as usize);
+        if src.len() < n || dst.len() < n {
+            return Err(eyre!("rope_tail_batched_copy: buffers too small"));
+        }
+        let (theta_scale, mscale_eff, corr_low, corr_high) = Self::device_args(params, n_rot);
+        let function = self.module.get_function("rope_tail_batched_copy")?;
+        // `V41_GRID_PAD`: DO NOT REMOVE (see the doc above and `crate::grid_pad`).
+        let cfg = LaunchConfig { grid: (n_head + crate::grid_pad(), 1, b), block: (128, 1, 1), shared_mem_bytes: 0 };
+        let inverse_i: i32 = 0;
+        launch_kernel!(function, cfg, stream, [
+            dst.raw(), src.raw(), pos_per_b.raw(), n_head, head_dim, n_rot,
+            theta_scale, params.freq_scale, params.ext_factor, mscale_eff, corr_low, corr_high, inverse_i
+        ])
+    }
+
+    /// Whether [`Self::launch_forward_batched_copy`] can serve these buffers.
+    pub fn copy_ok(src: &DeviceBuffer<f32>, dst: &DeviceBuffer<f32>, head_dim: u32, n_rot: u32) -> bool {
+        n_rot % 2 == 0 && n_rot <= 64 && n_rot <= head_dim && (head_dim - n_rot) % 4 == 0
+            && head_dim % 4 == 0
+            && (src.raw() as usize) % 16 == 0 && (dst.raw() as usize) % 16 == 0
+    }
+
+    /// `rope_inv_quant_q8` (2026-09-27 round 2, `V41_DEC_FUSE`): the output projection's
+    /// `launch_inverse_batched(heads, 64 heads, 512, n_rot 64)` + the Q8_0 quantize of the
+    /// whole [b, 32768] heads row (`Q8_0Matvec::quantize_input_batched`, wave kernel) in one
+    /// launch, BIT-IDENTICAL (heads, xq, xscale). Chain (incl. the dead f16 cast it also
+    /// drops) 11.4 -> 7.1 us at b = 4 (0.59-0.70 at b = 1..8), `V41_GRID_PAD` column
+    /// (the exact (64, 8) x 128 grid is 2048 waves).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_inverse_quant_q8(
+        &self,
+        stream: &Stream,
+        heads: &mut DeviceBuffer<f32>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        if n_head != 64 || head_dim != 512 || n_rot != 64 {
+            return Err(eyre!("rope_inv_quant_q8: written for 64 x 512 heads, n_rot 64"));
+        }
+        if b == 0 {
+            return Ok(());
+        }
+        let n = (b as usize) * 32768;
+        if heads.len() < n || xq.len() < n || xscale.len() < n / 32 {
+            return Err(eyre!("rope_inv_quant_q8: buffers too small for b={b}"));
+        }
+        let (theta_scale, mscale_eff, corr_low, corr_high) = Self::device_args(params, n_rot);
+        let function = self.module.get_function("rope_inv_quant_q8")?;
+        // `V41_GRID_PAD`: DO NOT REMOVE (see the doc above and `crate::grid_pad`).
+        let cfg = LaunchConfig { grid: (64 + crate::grid_pad(), b, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [
+            heads.raw(), xq.raw(), xscale.raw(), pos_per_b.raw(),
+            theta_scale, params.freq_scale, params.ext_factor, mscale_eff, corr_low, corr_high
         ])
     }
 

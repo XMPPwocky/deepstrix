@@ -227,3 +227,55 @@ extern "C" __global__ void rms_norm_weighted_quantize_q8(
         }
     }
 }
+
+// rms_quant_q8_1280_batched — 2026-09-27 round 2 (d_fusion): the decode q_a norm
+// rms_norm_weighted_batched_fast(n = 1280) followed by q8_0_quantize_f32_wave of its
+// output (the qb GEMV's dp4a input) in ONE launch, grid (b) x 256. rms_w_fast<5>
+// verbatim (same loads, double partials, LDS tree, output expression); element
+// e = tid + 256 j sits in wave tid >> 5, register j, so the 32-block k = 8 j + wave is
+// exactly one wave's register j and the quantize is the wave kernel's code
+// (shfl_xor amax, d = amax / 127, lrintf + clamp). Writes qr_normed (still read by the
+// indexer), xq and xscale BIT-IDENTICAL to the two-kernel chain
+// (tests/decode_fusion_bitexact.rs). Selected by RmsNorm::launch_weighted_quant_q8_1280.
+extern "C" __global__ __launch_bounds__(256) void rms_quant_q8_1280_batched(
+        float* __restrict__ out, signed char* __restrict__ xq, float* __restrict__ xscale,
+        const float* __restrict__ x, const float* __restrict__ weight, float eps) {
+    __shared__ float sdata[256];
+    const unsigned int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31u, w = tid >> 5;
+    const float* xb = x + (size_t)b * 1280u;
+    float xv[5], wv[5];
+    #pragma unroll
+    for (unsigned j = 0; j < 5; ++j) xv[j] = xb[tid + 256u * j];
+    #pragma unroll
+    for (unsigned j = 0; j < 5; ++j) wv[j] = weight[tid + 256u * j];
+    double partial = 0.0;
+    #pragma unroll
+    for (unsigned j = 0; j < 5; ++j) {
+        const float v = xv[j];
+        partial += (double)v * (double)v;
+    }
+    sdata[tid] = (float)partial;
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+    const float mean_sq = sdata[0] / (float)1280u;
+    const float scale = rsqrtf(mean_sq + eps);
+    float* ob = out + (size_t)b * 1280u;
+    #pragma unroll
+    for (unsigned j = 0; j < 5; ++j) {
+        const float v = xv[j] * scale * wv[j];
+        ob[tid + 256u * j] = v;
+        const unsigned k = 8u * j + w;
+        float amax = fabsf(v);
+        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, amax, off));
+        float d = amax / 127.0f;
+        float id = d != 0.0f ? 1.0f / d : 0.0f;
+        if (lane == 0) xscale[(size_t)b * 40u + k] = d;
+        int q = (int)lrintf(v * id);
+        if (q > 127) q = 127;
+        if (q < -128) q = -128;
+        xq[(size_t)b * 1280u + 32u * k + lane] = (signed char)q;
+    }
+}

@@ -992,6 +992,46 @@ pub fn kv_f16_roundtrip() -> bool {
     *D
 }
 
+/// `V41_DEC_SKIP_DEAD` (default ON; `0` = the previous launches): skip the per-layer
+/// launches whose outputs nothing reads on the arm actually taken -- the f16 casts
+/// `k.q_chain.cast_input_f16` (x16_n_embd: read only by the q_a / kv f16x arms),
+/// `k.q_chain.cast_qr_f16` (qr16: only the qb f16x arm), `k.output_proj.cast_heads_f16`
+/// (heads16: only the wo_a f16x arm) and `k.output_proj.cast_low_f16` (low16: only
+/// the wo_b f16x arm) are skipped exactly when their consumer takes the dp4a arm
+/// (the SAME predicates the consumers use), and the kv chain's quantize of
+/// attn_input_norm is skipped when the q chain already wrote that identical
+/// (xq_n_embd, xscale_n_embd) this layer. Removing unread work: outputs unchanged by
+/// construction. 2026-09-27 round 2 (d_fusion, graph, warm, 5 runs): cast_input +
+/// duplicate quantize 10.3 -> 4.2 us, cast_low 7.1 -> 4.2 us at b = 4 (the cast_qr /
+/// cast_heads savings are counted with `V41_DEC_FUSE`).
+pub fn dec_skip_dead() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_DEC_SKIP_DEAD").as_deref() != Ok("0"));
+    *D
+}
+
+/// `V41_DEC_FUSE` (default ON; `0` = the separate launches): decode launch-count
+/// fusions, each BIT-IDENTICAL to the chain it replaces (tests/decode_fusion_bitexact.rs):
+/// kv chain rms(512) + rope + fp8 window quant -> `RopeTail::launch_kv_rms_rope_fp8`
+/// (10.9 -> 6.7 us at b = 4); q_a rms(1280) + its Q8_0 quantize ->
+/// `RmsNorm::launch_weighted_quant_q8_1280` (10.1 -> 5.6 with the dead cast); the V4.1
+/// `q_normed := q` copy + q rope -> `RopeTail::launch_forward_batched_copy` (7.8 -> 5.3);
+/// output-projection inverse rope + heads quantize -> `RopeTail::launch_inverse_quant_q8`
+/// (11.4 -> 7.1 with the dead cast); the FFN combine's remote `vec_add` + `hc_post` ->
+/// `HcPost::launch_from_split_batched_add`. 2026-09-27 round 2 (d_fusion, graph chains,
+/// warm, 5 runs, b = 1..8: every fused chain 0.55-0.76 of the old one). Each site falls
+/// back to the old launches when its shape / arm preconditions do not hold, and above
+/// `DEC_FUSE_MAX_B` rows (decode / verify lanes only: replay and prefill passes were not
+/// measured, and a 512-row kv launch would sit in the 2048-wave dispatch window).
+pub fn dec_fuse(b: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_DEC_FUSE").as_deref() != Ok("0"));
+    *D && b <= DEC_FUSE_MAX_B
+}
+
+/// See [`dec_fuse`].
+pub const DEC_FUSE_MAX_B: u32 = 16;
+
 /// `V41_MHC_FFN_LATE` (default ON; arena decode, V4.1, fused mixes): queue the
 /// pre-ffn MIXES after the router instead of before it, on the same stream.
 /// V4.1 collapses with the carry, so the router path (collapse -> rms_w ->
@@ -3953,10 +3993,16 @@ impl HeterogeneousEngine {
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         let cap = self.stage_cap(de, "g.q_chain", layer as usize, b, lane_ptr, cap_ok)?;
         if !cap.skip {
+        // `V41_DEC_SKIP_DEAD`: x16_n_embd is read only by the q_a f16x arm (Q8_0 and not
+        // small-b dp4a, dense_gemm_prefill) and the kv f16x arm (!prefill_f32_matvec).
+        let q_a_is_q8 = dlw.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0;
+        let x16_input_read = (q_a_is_q8 && !super::dispatch::small_b_dense_dp4a(b)) || !prefill_f32_matvec(b);
         {
             let _t = de.events.stage("k.q_chain.cast_input_f16", &de.compute)?;
+            if x16_input_read || !dec_skip_dead() {
             de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &sd.attn_input_norm,
                 b, N_EMBD, super::batch_scratch::f16_pitch(N_EMBD))?;
+            }
             // `qa_matvec` below takes the dp4a arm at small b, which consumes
             // (xq_n_embd, xscale_n_embd). The only other writer of that pair is
             // the KV chain FURTHER DOWN, so without this the q_a projection
@@ -4002,7 +4048,26 @@ impl HeterogeneousEngine {
                 N_EMBD,
             )?;
         }
+        // Decided before the q_a norm (was below): `V41_DEC_FUSE` folds the dp4a arm's
+        // quantize of qr_normed into the norm, `V41_DEC_SKIP_DEAD` drops the qr16 cast
+        // unless the f16x arm reads it.
+        let qb_variant = std::env::var("QB_WMMA")
+            .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
+        let qa_rms_quant_fused = dec_fuse(b) && qb_variant != "f16x" && N_LORA_Q == 1280;
         {
+            if qa_rms_quant_fused {
+                let _t = de.events.stage("k.q_chain.rms_quant", &de.compute)?;
+                de.rms_w.launch_weighted_quant_q8_1280(
+                    &de.compute,
+                    &mut sd.qr_normed,
+                    &mut sd.qr_xq,
+                    &mut sd.qr_xscale,
+                    &sd.qr,
+                    &dlw.q_a_norm,
+                    RMS_EPS,
+                    b,
+                )?;
+            } else {
             let _t = de.events.stage("k.q_chain.rms_w", &de.compute)?;
             de.rms_w.launch_weighted_batched(
                 &de.compute,
@@ -4013,8 +4078,9 @@ impl HeterogeneousEngine {
                 RMS_EPS,
                 b,
             )?;
+            }
         }
-        {
+        if qb_variant == "f16x" || !dec_skip_dead() {
             let _t = de.events.stage("k.q_chain.cast_qr_f16", &de.compute)?;
             de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.qr16, &sd.qr_normed,
                 b, N_LORA_Q, super::batch_scratch::f16_pitch(N_LORA_Q))?;
@@ -4035,9 +4101,8 @@ impl HeterogeneousEngine {
         // through #0b. `QB_WMMA` / `Q8_GROUPED_VARIANT` / `Q8_OUT_VARIANT` set
         // explicitly still win.
         // `V41_REPLAY_F16X` (prefill_f32_matvec_qb_wo): f16x above 16 rows, not 64.
-        let qb_variant = std::env::var("QB_WMMA")
-            .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
-        if qb_variant != "f16x" {
+        // (`qb_variant` is decided above the q_a norm.)
+        if qb_variant != "f16x" && !qa_rms_quant_fused {
             // legacy variants consume the Q8_0 quantization of qr
             de.q8.quantize_input_batched(&de.compute, &mut sd.qr_xq, &mut sd.qr_xscale, &sd.qr_normed, N_LORA_Q, b)?;
         }
@@ -4071,6 +4136,24 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
+        // `V41_DEC_FUSE`: V4.1's `q_normed := q` copy and the q rope in one launch.
+        let q_rope_copy = cfg!(feature = "v41") && dec_fuse(b)
+            && crate::rope::RopeTail::copy_ok(&sd.q, &sd.q_normed, N_HEAD_DIM, N_ROT);
+        if q_rope_copy {
+            let _t = de.events.stage("k.q_chain.rope_copy", &de.compute)?;
+            let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+            de.rope.launch_forward_batched_copy(
+                &de.compute,
+                &mut sd.q_normed,
+                &sd.q,
+                &pos_v,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                b,
+                &dlw.rope_params,
+            )?;
+        } else {
         {
             let _t = de.events.stage("k.q_chain.rms_nw_heads", &de.compute)?;
             if cfg!(feature = "v41") {
@@ -4098,6 +4181,7 @@ impl HeterogeneousEngine {
                 b,
                 &dlw.rope_params,
             )?;
+        }
         }
         // KNOWN_BUGS #0b: q_normed is the LAST attention input not yet diffed
         // against decode. Slots, windows and the SWA kernel are all proven
@@ -4138,10 +4222,17 @@ impl HeterogeneousEngine {
             // (`if variant != "f16x" { quantize_input_batched(..) }`); this one
             // had no such guard because it was not a variant flip.
             if prefill_f32_matvec(b) {
+                // `V41_DEC_SKIP_DEAD`: the q chain above already wrote this exact
+                // (xq_n_embd, xscale_n_embd) from attn_input_norm at this b (same
+                // predicate as its quantize); nothing writes the pair in between.
+                let q_chain_quantized_input = dlw.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0
+                    && super::dispatch::small_b_dense_dp4a(b);
+                if !(dec_skip_dead() && q_chain_quantized_input) {
                 de.q8.quantize_input_batched(
                     &de.compute, &mut sd.xq_n_embd, &mut sd.xscale_n_embd,
                     &sd.attn_input_norm, N_EMBD, b,
                 )?;
+                }
                 let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
                 de.q8.matvec_batched(
                     &de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer,
@@ -4156,6 +4247,23 @@ impl HeterogeneousEngine {
                     N_EMBD, N_HEAD_DIM, 1, b, super::batch_scratch::f16_pitch(N_EMBD))?;
             }
         }
+        // `V41_DEC_FUSE`: V4.1 window KV rms(512) + rope + fp8 in one launch.
+        let kv_fused = cfg!(feature = "v41") && dec_fuse(b) && N_HEAD_DIM == 512 && N_ROT == 64;
+        if kv_fused {
+            let _t = de.events.stage("k.kv_chain.rms_rope_fp8", &de.compute)?;
+            let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+            de.rope.launch_kv_rms_rope_fp8(
+                &de.compute,
+                &mut sd.kv_normed,
+                &sd.kv_raw,
+                &dlw.kv_a_norm,
+                RMS_EPS,
+                &pos_v,
+                N_ROT,
+                b,
+                &dlw.rope_params,
+            )?;
+        } else {
         {
             let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
             de.rms_w.launch_weighted_batched(
@@ -4182,7 +4290,8 @@ impl HeterogeneousEngine {
                 &dlw.rope_params,
             )?;
         }
-        {
+        }
+        if !kv_fused {
             let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
             if cfg!(feature = "v41") {
                 // V4.1 window KV: E4M3 × 2^e per 32 over the whole row (decode twin: forward_layer.rs).
@@ -6339,7 +6448,29 @@ impl HeterogeneousEngine {
         if let Some(ticks) = super::mtp::slack_probe_ticks("verify_dgpu") {
             de.q8.slack_probe_spin(&de.compute, ticks)?;
         }
-        {
+        // Decided before the inverse rope (was below): `V41_DEC_FUSE` folds the dp4a
+        // arm's heads quantize into the inverse rope; `V41_DEC_SKIP_DEAD` drops the
+        // heads16 cast unless the f16x arm reads it.
+        let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
+            .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
+        let heads_rope_quant_fused = cfg!(feature = "v41") && dec_fuse(b) && grp_variant != "f16x"
+            && N_HEAD == 64 && N_HEAD_DIM == 512 && N_ROT == 64;
+        if heads_rope_quant_fused {
+            let _t = de.events.stage("k.output_proj.rope_inv_quant", &de.compute)?;
+            let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+            de.rope.launch_inverse_quant_q8(
+                &de.compute,
+                &mut sd.heads,
+                &mut sd.heads_xq,
+                &mut sd.heads_xscale,
+                &pos_v,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                b,
+                &dlw.rope_params,
+            )?;
+        } else {
             let _t = de.events.stage("k.output_proj.rope_inverse", &de.compute)?;
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
             de.rope.launch_inverse_batched(
@@ -6353,7 +6484,7 @@ impl HeterogeneousEngine {
                 &dlw.rope_params,
             )?;
         }
-        {
+        if grp_variant == "f16x" || !dec_skip_dead() {
             let _t = de.events.stage("k.output_proj.cast_heads_f16", &de.compute)?;
             de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.heads16, &sd.heads,
                 b, Q_FLAT, super::batch_scratch::f16_pitch(Q_FLAT))?;
@@ -6386,9 +6517,8 @@ impl HeterogeneousEngine {
             // `matvec_grouped`. Guarded quantize at the branch above writes
             // heads_xq/heads_xscale, so this arm has its input.
             // `V41_REPLAY_F16X` (prefill_f32_matvec_qb_wo): f16x above 16 rows, not 64.
-            let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
-                .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
-            if grp_variant != "f16x" {
+            // (`grp_variant` is decided above the inverse rope.)
+            if grp_variant != "f16x" && !heads_rope_quant_fused {
                 de.q8.quantize_input_batched(&de.compute, &mut sd.heads_xq, &mut sd.heads_xscale, &sd.heads, Q_FLAT, b)?;
             }
             if grp_variant == "f16x" {
@@ -6410,7 +6540,10 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
-        {
+        // `V41_DEC_SKIP_DEAD`: low16 is read only by the wo_b f16x arm below.
+        let out_variant = std::env::var("Q8_OUT_VARIANT")
+            .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
+        if out_variant == "f16x" || !dec_skip_dead() {
             let _t = de.events.stage("k.output_proj.cast_low_f16", &de.compute)?;
             de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.low16, &sd.low,
                 b, OUT_LOW, super::batch_scratch::f16_pitch(OUT_LOW))?;
@@ -6424,8 +6557,7 @@ impl HeterogeneousEngine {
             // Same: the "dp4a" arm is `q8.matvec_batched`, decode's kernel with a
             // row dimension. The guarded quantize below writes low_xq/low_xscale.
             // `V41_REPLAY_F16X` (prefill_f32_matvec_qb_wo): f16x above 16 rows, not 64.
-            let out_variant = std::env::var("Q8_OUT_VARIANT")
-                .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
+            // (`out_variant` is decided above the low16 cast.)
             if out_variant != "f16x" {
                 de.q8.quantize_input_batched(&de.compute, &mut sd.low_xq, &mut sd.low_xscale, &sd.low, OUT_LOW, b)?;
             }
@@ -9768,7 +9900,12 @@ impl HeterogeneousEngine {
         // Second half of the combine, AFTER the blocking wait above. Separate
         // bracket from `dgpu.ffn_combine.local` on purpose -- see the note there.
         let _t_combine_remote = de.events.stage("dgpu.ffn_combine.remote", &de.compute)?;
-        if bd.remote_ffn_moe_valid {
+        // `V41_DEC_FUSE`: box 2's partial is added inside the hc_post below instead of
+        // by its own vec_add (same f32 add, bit-identical out_hc) -- when it is the
+        // last add before hc_post (no resident-expert partial).
+        let fuse_remote_add = bd.remote_ffn_moe_valid && !hot_active && dec_fuse(b)
+            && bd.remote_ffn_moe.is_some();
+        if bd.remote_ffn_moe_valid && !fuse_remote_add {
             // Two-box split: the iGPU skipped every expert box 2 owns (its
             // remap entry was non-negative), so this partial is the rest of the
             // sum, not a duplicate. Cleared immediately: the buffer outlives the
@@ -9817,7 +9954,27 @@ impl HeterogeneousEngine {
             // `V41_MS_MHC_SPLIT`: this layer's FFN mixes (split + carry) ran on `de.hc`.
             self.dgpu.compute.wait_event(&sev.hc_mixes_ffn)?;
         }
-        {
+        if fuse_remote_add {
+            let _t = de.events.stage("k.ffn_combine.hc_post_add", &de.compute)?;
+            let remote = bd
+                .remote_ffn_moe
+                .as_ref()
+                .expect("fuse_remote_add checked remote_ffn_moe");
+            de.hc_post.launch_from_split_batched_add(
+                &de.compute,
+                &mut bd.residual_next,
+                &bd.ffn_moe_recv,
+                remote,
+                &bd.after_attn_hc,
+                &bd.split,
+                N_HC,
+                N_EMBD,
+                N_HC,
+                b,
+            )?;
+            // Consumed, exactly as the unfused branch clears it after its vec_add.
+            bd.remote_ffn_moe_valid = false;
+        } else {
             let _t = de.events.stage("k.ffn_combine.hc_post", &de.compute)?;
             de.hc_post.launch_from_split_batched(
                 &de.compute,

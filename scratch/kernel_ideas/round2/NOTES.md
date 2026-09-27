@@ -129,3 +129,48 @@ Test: `tests/f16_mv_z16_bitexact.rs` (every NB symbol x pad 0/1 + the z16 and ro
 `f16_matvec_batched` at 7 shapes incl. a row tail, a plain-loop k and b up to 64; site-gate asserts)
 passes with defaults and `V41_F16_MV_Z16=0 V41_GRID_PAD=0`; `mhc_glue_bitexact` (router wrapper at
 b = 1..64) passes with defaults and `V41_F16_MV_Z16=0 V41_ROUTER_MV_H20=0`.
+
+## (d) Decode launch-count fusions — WIRED (`V41_DEC_FUSE`, `V41_DEC_SKIP_DEAD`)
+
+Adjacency verified in `forward_prefill.rs` (the arena decode path; the q / kv / output-projection
+stages are graph-captured, the FFN combine is not). Per lane-layer at decode the chain was
+q chain: cast_input_f16 (DEAD) -> quantize(attn_input_norm) -> q_a GEMV -> rms_w(1280) ->
+cast_qr_f16 (DEAD) -> quantize(qr_normed) -> q_b GEMV -> D2D copy q -> q_normed -> rope(q);
+kv chain: quantize(attn_input_norm) (DUPLICATE of the q chain's) -> kv GEMV -> rms_w(512) ->
+rope(1 head) -> fp8 window quant; output proj: rope_inverse -> cast_heads_f16 (DEAD) ->
+quantize(heads) -> wo_a -> cast_low_f16 (DEAD) -> quantize(low) -> wo_b; combine: vec_add(local,
+before the box-2 wait, off the critical path) -> [wait] -> vec_add(remote) -> hc_post.
+Dead = its only reader is the f16x arm and the dp4a arm is taken at decode (b <= 8).
+
+Candidates `d_fusion/cand_fuse.hip`, chain harness `d_fusion/chain_harness.cpp` (production
+kernels from the in-tree code objects with their wrappers' grids incl. pads, graph inner=10, warm,
+every output compared; plain AND YaRN rope params). In-tree kernels re-measured with CH_INTREE=1,
+5 runs (combine: 2), new/old chain ratio, med [p10]:
+
+| chain | b=1 | 2 | 3 | 4 | 5 | 8 | b=4 us | wired as |
+|---|---|---|---|---|---|---|---|---|
+| kv: rms + rope + fp8 -> 1 | .61 | .60 | .62 | .62 | .60 | .61 | 10.0 -> 6.0 | RopeTail::launch_kv_rms_rope_fp8 |
+| q_a: rms + cast_qr + quant -> rms + quant | .74 | .74 | .74 | .75 | .75 | .74 | 8.9 -> 6.7 | dead cast skip |
+| q_a: -> 1 (rms_quant) | .57 | .59 | .58 | .58 | .58 | .57 | 8.9 -> 5.2 | RmsNorm::launch_weighted_quant_q8_1280 |
+| q: D2D copy + rope -> 1 | .67 | .69 | .71 | .74 | .74 | .78 | 6.7 -> 4.8 | RopeTail::launch_forward_batched_copy |
+| oproj: rope_inv + cast_heads + quant -> 2 | .73 | .73 | .74 | .74 | .75 | .76 | 10.3 -> 7.4 | dead cast skip |
+| oproj: -> 1 | .58 | .61 | .62 | .66 | .68 | .76 | 10.3 -> 6.6 | RopeTail::launch_inverse_quant_q8 |
+| cast_input + quant + dup quant -> quant | .43 | .43 | .43 | .43 | .43 | .43 | 8.7 -> 3.7 | dead skip x2 |
+| cast_low + quant -> quant | .62 | .61 | .61 | .62 | .62 | .62 | 6.2 -> 3.8 | dead cast skip |
+| combine: vec_add + hc_post -> 1 | .64 | .64 | .65 | .68 | .69 | .72 | 7.2 -> 4.9 | HcPost::launch_from_split_batched_add |
+
+~23 us of dGPU graph time per lane-layer at 4 rows -> ~0.9 ms per lane-step (40 layers), ~1.8 ms
+per 8-row step (2 lanes). The candidate first ran the rope_copy / oproj kernels with the exact
+(64, b) grids: at b = 8 they are 2048 waves and were 2.2x / 1.16x SLOWER than the chain -- the
+item-(a) window again; the wired launches carry the `V41_GRID_PAD` column.
+Gates: fusions only at b <= 16 (`DEC_FUSE_MAX_B`: decode / verify lanes; replay / prefill not
+measured, a 512-row fused kv launch would sit in the 2048-wave window); the q_a / heads fusions only
+on the dp4a arm (the f16x arm keeps its cast, no quantize); the combine fusion only when box 2's
+partial is the last add (no resident-expert partial). Dead-launch skips use the consumers' own
+predicates (any b). Not done: (4) router matvec + topk + readback_pack (the router matvec is a
+48-WG GEMV: a single-WG fusion is the 24x-regression pattern; a last-WG-does-topk scheme needs an
+atomic ticket -- next list) and (5) head prep (hc_weighted_sum + rms per row in forward_head.rs --
+next list).
+Test: `tests/decode_fusion_bitexact.rs` (each fused wrapper vs its chain of production wrappers,
+b = 1..16, plain + YaRN rope, sentinel-filled outputs) passes with defaults and `V41_GRID_PAD=0`;
+`grid_pad_bitexact` passes after the RopeTail arg refactor; server + expertd build.

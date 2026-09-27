@@ -1,0 +1,22 @@
+== 1790474943.000438.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+### fusion defaults (decode_fusion_bitexact)
+test decode_fusions_match_their_chains ... b=1: kv / q copy / heads (plain + yarn), q_a rms_quant, hc_post_add bit-exact
+PASS: 32 rope-param cases + 16 rms_quant / hc_post_add batches bit-exact
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+### rc=0
+### fusion pad off (decode_fusion_bitexact, V41_GRID_PAD=0)
+test decode_fusions_match_their_chains ... b=1: kv / q copy / heads (plain + yarn), q_a rms_quant, hc_post_add bit-exact
+PASS: 32 rope-param cases + 16 rms_quant / hc_post_add batches bit-exact
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+### rc=0
+### grid pad (rope refactor) (grid_pad_bitexact)
+test cast_f16_2d_pad_bit_exact ... cast_f16_2d rows=16 cols=32768 pitch=32768: diff=0 pitch/tail touched=0 both-unwritten=32
+PASS: f32_to_f16_cast_2d grid pad bit-exact
+test fp8_window_and_indexer_fp4_pad_bit_exact ... arch gfx1201, V41_GRID_PAD on
+PASS: fp8 window / indexer_fp4 grid pad bit-exact
+test rope_batched_pad_bit_exact ... rope_tail_batched n_head=64 head_dim=512 b=1 inverse=false: bit_diff=0
+PASS: rope_tail_batched grid pad bit-exact
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+### rc=0
+### overall rc=0

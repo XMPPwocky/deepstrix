@@ -582,3 +582,15 @@
 2026-09-27T01:47:17Z	round2/c_z16_c5	dgpu	110MB	rc=0	13.2s	busy_before=63	busy_after=90	bash run_confirm.sh c5 intree  
 2026-09-27T01:47:30Z	round2/c_z16_c6	dgpu	110MB	rc=0	13.3s	busy_before=41	busy_after=90	bash run_confirm.sh c6 intree  
 2026-09-27T01:52:53Z	round2/c_intree	dgpu	120MB	rc=0	4.9s	busy_before=63	busy_after=21	bash round2/run_tests.sh z16\ defaults\|\|f16_mv_z16_bitexact z16\ knobs=0\|V41_F16_MV_Z16=0\ V41_GRID_PAD=0\|f16_mv_z16_bitexact mhc\ glue\ \(router\ wrapper\)\ defaults\|\|mhc_glue_bitexact mhc\ glu
+2026-09-27T01:56:56Z	round2/d_chain_r1	dgpu	40MB	rc=0	1.2s	busy_before=62	busy_after=93	./chain_harness 1 2 3 4 5 8  
+2026-09-27T01:57:19Z	round2/d_chain_r2	dgpu	40MB	rc=2	1.4s	busy_before=73	busy_after=92	./chain_harness 1 2 3 4 5 8 16  
+2026-09-27T01:57:21Z	round2/d_chain_r3	dgpu	40MB	rc=2	2.6s	busy_before=94	busy_after=88	./chain_harness 1 2 3 4 5 8 16  
+2026-09-27T01:57:23Z	round2/d_chain_r4	dgpu	40MB	rc=2	1.9s	busy_before=71	busy_after=85	./chain_harness 1 2 3 4 5 8 16  
+2026-09-27T01:57:26Z	round2/d_chain_r5	dgpu	40MB	rc=2	2.2s	busy_before=64	busy_after=81	./chain_harness 1 2 3 4 5 8 16  
+2026-09-27T01:57:28Z	round2/d_chain_r6	dgpu	40MB	rc=2	2.0s	busy_before=67	busy_after=83	./chain_harness 1 2 3 4 5 8 16  
+2026-09-27T02:09:07Z	round2/d_intree	dgpu	120MB	rc=0	3.2s	busy_before=56	busy_after=21	bash round2/run_tests.sh fusion\ defaults\|\|decode_fusion_bitexact fusion\ pad\ off\|V41_GRID_PAD=0\|decode_fusion_bitexact grid\ pad\ \(rope\ refactor\)\|\|grid_pad_bitexact  
+2026-09-27T02:09:38Z	round2/d_chain_i1	dgpu	40MB	rc=0	1.2s	busy_before=44	busy_after=91	env CH_INTREE=1 ./chain_harness 1 2 3 4 5 8  
+2026-09-27T02:09:40Z	round2/d_chain_i2	dgpu	40MB	rc=0	2.0s	busy_before=75	busy_after=86	env CH_INTREE=1 ./chain_harness 1 2 3 4 5 8  
+2026-09-27T02:09:42Z	round2/d_chain_i3	dgpu	40MB	rc=0	2.4s	busy_before=81	busy_after=88	env CH_INTREE=1 ./chain_harness 1 2 3 4 5 8  
+2026-09-27T02:10:07Z	round2/d_chain_i4	dgpu	40MB	rc=0	1.1s	busy_before=35	busy_after=74	env CH_INTREE=1 ./chain_harness 1 2 3 4 5 8  
+2026-09-27T02:10:09Z	round2/d_chain_i5	dgpu	40MB	rc=0	2.0s	busy_before=4	busy_after=49	env CH_INTREE=1 ./chain_harness 1 2 3 4 5 8  

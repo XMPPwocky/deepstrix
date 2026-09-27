@@ -26,7 +26,10 @@ for fn in args:
         i = line.find("KBJSON {\"tag\"")
         if i < 0:
             continue
-        j = json.loads(line[i + 7:])
+        try:
+            j = json.loads(line[i + 7:])
+        except json.JSONDecodeError:
+            continue  # a line interleaved with stderr
         d.setdefault(j["tag"], collections.OrderedDict())[j["variant"]] = j
     runs.append(d)
 

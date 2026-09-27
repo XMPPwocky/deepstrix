@@ -196,6 +196,39 @@ impl RmsNorm {
         };
         launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), weight.raw(), n, eps])
     }
+
+    /// `rms_quant_q8_1280_batched` (2026-09-27 round 2, `V41_DEC_FUSE`): the decode q_a
+    /// norm `launch_weighted_batched(n = 1280)` + the Q8_0 quantize of its output
+    /// (`Q8_0Matvec::quantize_input_batched`, wave kernel) in one launch; `out`, `xq`,
+    /// `xscale` BIT-IDENTICAL to the two launches (tests/decode_fusion_bitexact.rs).
+    /// Chain (incl. the dead f16 cast it also drops) 10.1 -> 5.6 us at b = 4 (graph,
+    /// warm, 5 runs; 0.55-0.75 at b = 1..8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_weighted_quant_q8_1280(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let needed = (batch as usize) * 1280;
+        if out.len() < needed || x.len() < needed || xq.len() < needed || xscale.len() < needed / 32 {
+            return Err(eyre!("rms_quant_q8_1280_batched: buffer too small (need {needed})"));
+        }
+        if weight.len() != 1280 {
+            return Err(eyre!("rms_quant_q8_1280_batched: weight len != 1280"));
+        }
+        let function = self.module.get_function("rms_quant_q8_1280_batched")?;
+        let cfg = LaunchConfig { grid: (batch, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [out.raw(), xq.raw(), xscale.raw(), x.raw(), weight.raw(), eps])
+    }
 }
 
 /// No-weight RMSNorm — mirrors ds4.c `rms_norm_no_weight`. Operates on
