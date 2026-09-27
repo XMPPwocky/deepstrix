@@ -2815,9 +2815,15 @@ impl ShardPool {
     fn touch_hit(&mut self, layer: u32, e: u32, scan_class: bool) -> bool {
         let Some(&slot) = self.slot_of.get(&(layer, e)) else { return false };
         self.tick += 1;
-        self.sc.hits += u64::from(slot >= self.stage);
+        let staged = slot >= self.stage;
+        self.sc.hits += u64::from(staged);
         let lu = &mut self.last_use[slot as usize];
-        if scan_class {
+        // A STAGED slot stays prefill-class whoever hits it: staging is an LRU
+        // among prefill-class entries, so a decode-class stamp there would
+        // make the slot un-evictable while any prefill-class candidate exists
+        // -- an expert seeded or spilled into the band would never recycle
+        // into main, never pin, and read as "not held" on every reply.
+        if scan_class || staged {
             if *lu < PREFILL_AGE {
                 *lu = self.tick;
             }
@@ -2878,7 +2884,9 @@ impl ShardPool {
         self.slot_of.insert((layer, e), victim);
         self.held[layer as usize] += 1;
         self.tick += 1;
-        self.last_use[victim as usize] = if scan_class { self.tick } else { self.tick + PREFILL_AGE };
+        // A victim in staging (a prefill claim, or a spill-in) is stamped
+        // prefill-class whatever the pass: see `touch_hit`.
+        self.last_use[victim as usize] = if scan_class || victim >= self.stage { self.tick } else { self.tick + PREFILL_AGE };
         Some((victim, evicted))
     }
 
@@ -8202,6 +8210,10 @@ mod tests {
         // Hits on staged experts are counted; pins never land in staging.
         assert!(pool.touch_hit(1, 40, false) && pool.touch_hit(1, 41, false));
         assert_eq!(pool.sc.hits, 1);
+        // A decode hit keeps a STAGED slot prefill-class (staging's LRU must be
+        // able to recycle it into main), and a main slot decode-class.
+        assert!(pool.last_use[11] < PREFILL_AGE, "staged slot stays prefill-class after a decode hit");
+        assert!(pool.last_use[v as usize] >= PREFILL_AGE);
         pool.pins.enable(8);
         pool.pins.grant(1, 40); // staged
         pool.pins.grant(1, 41); // main
