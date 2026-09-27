@@ -70,6 +70,46 @@ fn mhc_gemm_narrow_for(n_rows: u32, k: u32, weight: &DeviceBuffer<u8>, x: &Devic
         && (x.raw() as usize) % 16 == 0
 }
 
+/// `V41_F16_MV_Z16` (default ON; `0` = `f16_matvec_batched`, grid.z = batch):
+/// [`F16Matvec::matvec_batched_z16`] runs `f16_matvec_batched_z16_n<NB>` --
+/// the batch split into NB-row slices on grid.z (NB = 1, 2, 4, 8 or 16, the
+/// smallest >= min(batch, 16)), each weight element read once per slice instead
+/// of once per batch row, 8 hoisted weight loads per lane -- with the
+/// `V41_GRID_PAD` idle work-group on the wide grids. BIT-IDENTICAL
+/// (tests/f16_mv_z16_bitexact.rs: every NB symbol, pad 0/1, 7 shapes, b up to 64).
+/// Callers: the indexer q projection (4096 x 1280, every b <= 64), the indexer
+/// head-weight projection (32 x 5120, b <= [`Z16_PROJ_MAX_B`]), the ratio-1
+/// compressor (512 x 5120, [`z16_comp_ratio1_for`]) and the replay router
+/// (b > [`Z16_ROUTER_MIN_B`]). 2026-09-27 round 2 (c_z16, dGPU, cold weights,
+/// graph, 6 runs, ratio vs the production kernel, med / p10): idx q b = 1 0.73 /
+/// 0.74, 2 0.61 / 0.58, 3 0.60 / 0.50, 4 0.49 / 0.41 (72.8 -> 38.9 us), 5 0.39,
+/// 6 0.47, 8 0.31, 16 0.31, 32 0.29, 64 0.26 (639 -> 164 us, x8 index layers x2
+/// lanes per replay); compressor b = 1 0.51, 2 0.86 / 0.68, 5 0.77, 8 0.84, 16
+/// 0.90, 32 0.50, 64 0.30; proj b = 1 0.28, 2 0.33, 3 0.64, 4 0.80.
+fn f16_mv_z16_on() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_F16_MV_Z16").as_deref() != Ok("0"));
+    *D
+}
+
+/// Batch above which the router logits matvec ([`F16Matvec::matvec_batched_router`],
+/// 384 x 5120) takes the z16 kernel instead of `_h20`: z16 / h20 = 1.43 at b = 32,
+/// 0.98 at 48, 0.80 at 64 (cold W, 3 runs) -- i.e. only the replay-sized passes.
+pub const Z16_ROUTER_MIN_B: u32 = 48;
+
+/// Largest batch at which the idx head-weight projection (32 x 5120: a 4-WG
+/// grid) takes [`F16Matvec::matvec_batched_z16`]: 0.28 / 0.29 / 0.65 / 0.82 at
+/// b = 1..4, neutral at 5-6, LOSES x1.36 at 8 and x2.4 at 16 (one slice of 4 WGs).
+pub const Z16_PROJ_MAX_B: u32 = 4;
+
+/// Whether the ratio-1 compressor matvec (512 x 5120, a 64-WG grid) takes
+/// [`F16Matvec::matvec_batched_z16`] at `batch`: it wins at every measured b
+/// except 3 and 4 (x1.05-1.08 / ~1.0: there the 3-4 z-slices of the production
+/// grid still out-parallelise one z16 slice), so those two keep grid.z = b.
+pub fn z16_comp_ratio1_for(batch: u32) -> bool {
+    !(3..=4).contains(&batch)
+}
+
 pub struct F16Matvec {
     wide: Module,
     narrow: Module,
@@ -544,8 +584,69 @@ impl F16Matvec {
         k: u32,
         batch: u32,
     ) -> eyre::Result<()> {
+        // `V41_F16_MV_Z16` above Z16_ROUTER_MIN_B rows (the replay router, ~64
+        // rows per lane): 0.80 of _h20 at b = 64, equal at 48, loses below.
+        if f16_mv_z16_on() && batch > Z16_ROUTER_MIN_B {
+            return self.matvec_batched_z16(stream, out, weight, x, n_rows, k, batch);
+        }
         let sym = if router_mv_h20_for(k) { "f16_matvec_batched_h20" } else { "f16_matvec_batched" };
         self.matvec_batched_sym(stream, out, weight, x, n_rows, k, batch, sym)
+    }
+
+    /// [`Self::matvec_batched`] with the grid.z = ceil(batch / NB) kernels under
+    /// `V41_F16_MV_Z16` (see [`f16_mv_z16_on`]); identical outputs, else the
+    /// production grid.z = batch launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_batched_z16(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if !f16_mv_z16_on() || batch == 0 {
+            return self.matvec_batched(stream, out, weight, x, n_rows, k, batch);
+        }
+        let expected_weight_bytes = (n_rows as usize) * (k as usize) * 2;
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "f16 matvec_batched_z16 weight bytes: have {}, expected {} (n_rows={n_rows}, k={k})",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        if x.len() < (batch as usize) * (k as usize) {
+            return Err(eyre!("f16 matvec_batched_z16 x too small: {}", x.len()));
+        }
+        if out.len() < (batch as usize) * (n_rows as usize) {
+            return Err(eyre!("f16 matvec_batched_z16 out too small: {}", out.len()));
+        }
+        let nb: u32 = match batch {
+            1 => 1,
+            2 => 2,
+            3..=4 => 4,
+            5..=8 => 8,
+            _ => 16,
+        };
+        let function = self.wide.get_function(&format!("f16_matvec_batched_z16_n{nb}"))?;
+        // `V41_GRID_PAD`: one idle WG column (the kernel's `row >= n_rows` guard)
+        // on the wide grids only. DO NOT REMOVE: the exact 512-WG idx-q grid
+        // (4096 waves per z slice) sits in gfx1201's slow-dispatch window --
+        // unpadded z16 is 1.00 / 0.68 / 0.63 / 0.37 of the production kernel at
+        // b = 1 / 2 / 4 / 8, padded 0.73 / 0.61 / 0.49 / 0.31. The 64-WG
+        // compressor grid measured neutral, the 4- / 48-WG proj / router grids
+        // were measured unpadded.
+        let gx = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let pad = if gx >= 256 { crate::grid_pad() } else { 0 };
+        let cfg = LaunchConfig {
+            grid: (gx + pad, 1, batch.div_ceil(nb)),
+            block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), x.raw(), k, n_rows, batch])
     }
 
     /// The loaded wide matvec module (tests: explicit-symbol launches).

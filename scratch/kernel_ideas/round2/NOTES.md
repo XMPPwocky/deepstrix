@@ -101,3 +101,31 @@ Tests: `tests/round2_gates.rs` (selector asserts, knob-aware; padded gather at b
 threshold at b = 12/24/32 vs the production kernels) passes with defaults and all five knobs = 0;
 `indexer_sweep_bitexact` and `q8_0_sweep_c2_bitexact` pass with defaults and knobs = 0
 (`b_crossover/results/intree_tests.txt`).
+
+## (c) z16 chunking of f16_matvec_batched — WIRED (`V41_F16_MV_Z16`)
+
+Candidates `c_z16/cand_z16.hip`: grid.z = ceil(b/NB), one warp per weight row for NB batch rows,
+NB accumulators, per-(row, b) order identical to the production kernel (so bit-exact by
+construction and checked at every (shape, b)); "plain" (1 element / lane / step) vs "h8" / "h4" /
+"h16" (8 / 4 / 16 weight elements hoisted into registers per step). h8 at the smallest NB >= b won
+everywhere it wins; plain was worse than h8 at every b; h4 ~ h8; h16_n4 worse. In-tree:
+`f16_matvec_batched_z16_n{1,2,4,8,16}` (f16_matvec.hip) + `F16Matvec::matvec_batched_z16`.
+Cold weights (rotating copies > MALL, graph of `copies` calls), 6 runs (3 candidate file + 3 the
+in-tree object, identical): ratio vs production `f16_matvec_batched` (med / p10):
+
+| shape (site) | b=1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64 | wired |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| idx q 4096x1280, z16 + pad | .73/.74 | .61/.58 | .60/.50 | .49/.41 | .39/.37 | .47/.35 | .31/.32 | .31/.31 | .29/.28 | .26/.26 | all b |
+| idx q, z16 unpadded | 1.00 | .68 | .61 | .63 | .48 | .55 | .37 | .32 | .29 | .27 | (pad kept) |
+| idx q, production kernel +1 WG only | .82 | .78 | .84 | .89 | .89 | .91 | .88 | 1.02 | .99 | 1.00 | (not wired) |
+| ratio-1 compressor 512x5120 | .51 | .85/.68 | **1.08** | .98 | .81/.77 | .88/.85 | .84 | .94/.80 | .49 | .30 | b not in 3..4 |
+| idx proj 32x5120 | .28 | .33 | .64 | .80 | 1.00 | **1.10** | **1.44** | **2.46** | | | b <= 4 |
+| router 384x5120 vs **_h20** (production) | | | | | | | (8) 1.9 | 2.2 | 1.43 | (48) .98, (64) .80 | b > 48 |
+
+Absolute: idx q at decode b=4 72.8 -> 38.9 us (8 index layers per lane-step: ~0.27 ms/lane-step), at
+replay b=64 639 -> 164 us (x8 layers x2 lanes: ~7.6 ms per replay); compressor b=64 325 -> 97 us;
+replay router b=64 106 -> 85 us (x20 layers x2 lanes: ~0.85 ms per replay).
+Test: `tests/f16_mv_z16_bitexact.rs` (every NB symbol x pad 0/1 + the z16 and router wrappers vs
+`f16_matvec_batched` at 7 shapes incl. a row tail, a plain-loop k and b up to 64; site-gate asserts)
+passes with defaults and `V41_F16_MV_Z16=0 V41_GRID_PAD=0`; `mhc_glue_bitexact` (router wrapper at
+b = 1..64) passes with defaults and `V41_F16_MV_Z16=0 V41_ROUTER_MV_H20=0`.

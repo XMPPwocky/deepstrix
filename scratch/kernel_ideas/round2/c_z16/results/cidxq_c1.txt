@@ -1,0 +1,263 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[z16] idxq 4096x1280, 9 weight copies (94.4 MB)
+CMP idxq h20 b=1 bit_diff=0 of 4096
+CMP idxq plain_n1 b=1 bit_diff=0 of 4096
+CMP idxq h8_n1 b=1 bit_diff=0 of 4096
+CMP idxq plain_n2 b=1 bit_diff=0 of 4096
+CMP idxq h8_n2 b=1 bit_diff=0 of 4096
+CMP idxq plain_n4 b=1 bit_diff=0 of 4096
+CMP idxq h8_n4 b=1 bit_diff=0 of 4096
+CMP idxq plain_n8 b=1 bit_diff=0 of 4096
+CMP idxq h8_n8 b=1 bit_diff=0 of 4096
+CMP idxq plain_n16 b=1 bit_diff=0 of 4096
+CMP idxq h8_n16 b=1 bit_diff=0 of 4096
+CMP idxq h4_n1 b=1 bit_diff=0 of 4096
+CMP idxq h4_n4 b=1 bit_diff=0 of 4096
+CMP idxq h4_n16 b=1 bit_diff=0 of 4096
+CMP idxq h16_n4 b=1 bit_diff=0 of 4096
+
+== idxq 4096x1280 b=1 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                       27.81      27.61      35.61    1.000     377.0       0.0
+base +1 WG                                    23.28      21.96      37.82    0.837     450.5       0.0
+cand h8_n1                                    27.82      27.60      38.91    1.000     376.9       0.0
+cand h8_n1 +1                                 20.49      20.37      28.81    0.737     511.7       0.0
+KBJSON {"tag":"idxq 4096x1280 b=1 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":27.813,"p10_us":27.609,"p90_us":35.609,"ratio":1.0000,"gbps":377.00,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=1 COLD W (9 copies) graph","variant":"base +1 WG","med_us":23.276,"p10_us":21.956,"p90_us":37.818,"ratio":0.8369,"gbps":450.50,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=1 COLD W (9 copies) graph","variant":"cand h8_n1","med_us":27.822,"p10_us":27.600,"p90_us":38.907,"ratio":1.0003,"gbps":376.88,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=1 COLD W (9 copies) graph","variant":"cand h8_n1 +1","med_us":20.493,"p10_us":20.369,"p90_us":28.809,"ratio":0.7368,"gbps":511.66,"graph":1,"flush":0}
+CMP idxq h20 b=2 bit_diff=0 of 8192
+CMP idxq plain_n1 b=2 bit_diff=0 of 8192
+CMP idxq h8_n1 b=2 bit_diff=0 of 8192
+CMP idxq plain_n2 b=2 bit_diff=0 of 8192
+CMP idxq h8_n2 b=2 bit_diff=0 of 8192
+CMP idxq plain_n4 b=2 bit_diff=0 of 8192
+CMP idxq h8_n4 b=2 bit_diff=0 of 8192
+CMP idxq plain_n8 b=2 bit_diff=0 of 8192
+CMP idxq h8_n8 b=2 bit_diff=0 of 8192
+CMP idxq plain_n16 b=2 bit_diff=0 of 8192
+CMP idxq h8_n16 b=2 bit_diff=0 of 8192
+CMP idxq h4_n1 b=2 bit_diff=0 of 8192
+CMP idxq h4_n4 b=2 bit_diff=0 of 8192
+CMP idxq h4_n16 b=2 bit_diff=0 of 8192
+CMP idxq h16_n4 b=2 bit_diff=0 of 8192
+
+== idxq 4096x1280 b=2 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                       40.52      39.69      64.23    1.000     258.8       0.0
+base +1 WG                                    31.72      30.32      42.89    0.783     330.6       0.0
+cand h8_n2                                    26.70      26.36      31.72    0.659     392.8       0.0
+cand h8_n2 +1                                 19.71      19.36      25.31    0.487     532.0       0.0
+KBJSON {"tag":"idxq 4096x1280 b=2 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":40.516,"p10_us":39.694,"p90_us":64.227,"ratio":1.0000,"gbps":258.81,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=2 COLD W (9 copies) graph","variant":"base +1 WG","med_us":31.720,"p10_us":30.325,"p90_us":42.894,"ratio":0.7829,"gbps":330.57,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=2 COLD W (9 copies) graph","variant":"cand h8_n2","med_us":26.698,"p10_us":26.365,"p90_us":31.716,"ratio":0.6590,"gbps":392.75,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=2 COLD W (9 copies) graph","variant":"cand h8_n2 +1","med_us":19.711,"p10_us":19.365,"p90_us":25.311,"ratio":0.4865,"gbps":531.97,"graph":1,"flush":0}
+CMP idxq h20 b=3 bit_diff=0 of 12288
+CMP idxq plain_n1 b=3 bit_diff=0 of 12288
+CMP idxq h8_n1 b=3 bit_diff=0 of 12288
+CMP idxq plain_n2 b=3 bit_diff=0 of 12288
+CMP idxq h8_n2 b=3 bit_diff=0 of 12288
+CMP idxq plain_n4 b=3 bit_diff=0 of 12288
+CMP idxq h8_n4 b=3 bit_diff=0 of 12288
+CMP idxq plain_n8 b=3 bit_diff=0 of 12288
+CMP idxq h8_n8 b=3 bit_diff=0 of 12288
+CMP idxq plain_n16 b=3 bit_diff=0 of 12288
+CMP idxq h8_n16 b=3 bit_diff=0 of 12288
+CMP idxq h4_n1 b=3 bit_diff=0 of 12288
+CMP idxq h4_n4 b=3 bit_diff=0 of 12288
+CMP idxq h4_n16 b=3 bit_diff=0 of 12288
+CMP idxq h16_n4 b=3 bit_diff=0 of 12288
+
+== idxq 4096x1280 b=3 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                       48.88      48.55      58.37    1.000     214.5       0.0
+base +1 WG                                    41.12      39.51      60.35    0.841     255.0       0.0
+cand h8_n4                                    28.07      27.39      29.75    0.574     373.6       0.0
+cand h8_n4 +1                                 26.54      24.15      30.52    0.543     395.1       0.0
+KBJSON {"tag":"idxq 4096x1280 b=3 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":48.885,"p10_us":48.547,"p90_us":58.369,"ratio":1.0000,"gbps":214.50,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=3 COLD W (9 copies) graph","variant":"base +1 WG","med_us":41.125,"p10_us":39.511,"p90_us":60.347,"ratio":0.8413,"gbps":254.97,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=3 COLD W (9 copies) graph","variant":"cand h8_n4","med_us":28.067,"p10_us":27.387,"p90_us":29.747,"ratio":0.5741,"gbps":373.60,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=3 COLD W (9 copies) graph","variant":"cand h8_n4 +1","med_us":26.538,"p10_us":24.147,"p90_us":30.516,"ratio":0.5429,"gbps":395.12,"graph":1,"flush":0}
+CMP idxq h20 b=4 bit_diff=0 of 16384
+CMP idxq plain_n1 b=4 bit_diff=0 of 16384
+CMP idxq h8_n1 b=4 bit_diff=0 of 16384
+CMP idxq plain_n2 b=4 bit_diff=0 of 16384
+CMP idxq h8_n2 b=4 bit_diff=0 of 16384
+CMP idxq plain_n4 b=4 bit_diff=0 of 16384
+CMP idxq h8_n4 b=4 bit_diff=0 of 16384
+CMP idxq plain_n8 b=4 bit_diff=0 of 16384
+CMP idxq h8_n8 b=4 bit_diff=0 of 16384
+CMP idxq plain_n16 b=4 bit_diff=0 of 16384
+CMP idxq h8_n16 b=4 bit_diff=0 of 16384
+CMP idxq h4_n1 b=4 bit_diff=0 of 16384
+CMP idxq h4_n4 b=4 bit_diff=0 of 16384
+CMP idxq h4_n16 b=4 bit_diff=0 of 16384
+CMP idxq h16_n4 b=4 bit_diff=0 of 16384
+
+== idxq 4096x1280 b=4 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                       61.58      57.38      75.31    1.000     170.3       0.0
+base +1 WG                                    50.06      48.35      72.72    0.813     209.5       0.0
+cand h8_n4                                    29.45      28.42      41.31    0.478     356.1       0.0
+cand h8_n4 +1                                 23.71      22.33      35.25    0.385     442.2       0.0
+KBJSON {"tag":"idxq 4096x1280 b=4 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":61.583,"p10_us":57.383,"p90_us":75.307,"ratio":1.0000,"gbps":170.27,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=4 COLD W (9 copies) graph","variant":"base +1 WG","med_us":50.058,"p10_us":48.347,"p90_us":72.720,"ratio":0.8129,"gbps":209.47,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=4 COLD W (9 copies) graph","variant":"cand h8_n4","med_us":29.449,"p10_us":28.422,"p90_us":41.307,"ratio":0.4782,"gbps":356.07,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=4 COLD W (9 copies) graph","variant":"cand h8_n4 +1","med_us":23.711,"p10_us":22.329,"p90_us":35.249,"ratio":0.3850,"gbps":442.23,"graph":1,"flush":0}
+CMP idxq h20 b=5 bit_diff=0 of 20480
+CMP idxq plain_n1 b=5 bit_diff=0 of 20480
+CMP idxq h8_n1 b=5 bit_diff=0 of 20480
+CMP idxq plain_n2 b=5 bit_diff=0 of 20480
+CMP idxq h8_n2 b=5 bit_diff=0 of 20480
+CMP idxq plain_n4 b=5 bit_diff=0 of 20480
+CMP idxq h8_n4 b=5 bit_diff=0 of 20480
+CMP idxq plain_n8 b=5 bit_diff=0 of 20480
+CMP idxq h8_n8 b=5 bit_diff=0 of 20480
+CMP idxq plain_n16 b=5 bit_diff=0 of 20480
+CMP idxq h8_n16 b=5 bit_diff=0 of 20480
+CMP idxq h4_n1 b=5 bit_diff=0 of 20480
+CMP idxq h4_n4 b=5 bit_diff=0 of 20480
+CMP idxq h4_n16 b=5 bit_diff=0 of 20480
+CMP idxq h16_n4 b=5 bit_diff=0 of 20480
+
+== idxq 4096x1280 b=5 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                       69.31      66.16      91.71    1.000     151.3       0.0
+base +1 WG                                    63.18      56.85      92.85    0.912     166.0       0.0
+cand h8_n8                                    32.99      31.29      40.92    0.476     317.8       0.0
+cand h8_n8 +1                                 24.97      23.77      42.49    0.360     420.0       0.0
+KBJSON {"tag":"idxq 4096x1280 b=5 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":69.307,"p10_us":66.156,"p90_us":91.712,"ratio":1.0000,"gbps":151.29,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=5 COLD W (9 copies) graph","variant":"base +1 WG","med_us":63.178,"p10_us":56.854,"p90_us":92.845,"ratio":0.9116,"gbps":165.97,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=5 COLD W (9 copies) graph","variant":"cand h8_n8","med_us":32.991,"p10_us":31.289,"p90_us":40.925,"ratio":0.4760,"gbps":317.83,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=5 COLD W (9 copies) graph","variant":"cand h8_n8 +1","med_us":24.969,"p10_us":23.769,"p90_us":42.489,"ratio":0.3603,"gbps":419.95,"graph":1,"flush":0}
+CMP idxq h20 b=6 bit_diff=0 of 24576
+CMP idxq plain_n1 b=6 bit_diff=0 of 24576
+CMP idxq h8_n1 b=6 bit_diff=0 of 24576
+CMP idxq plain_n2 b=6 bit_diff=0 of 24576
+CMP idxq h8_n2 b=6 bit_diff=0 of 24576
+CMP idxq plain_n4 b=6 bit_diff=0 of 24576
+CMP idxq h8_n4 b=6 bit_diff=0 of 24576
+CMP idxq plain_n8 b=6 bit_diff=0 of 24576
+CMP idxq h8_n8 b=6 bit_diff=0 of 24576
+CMP idxq plain_n16 b=6 bit_diff=0 of 24576
+CMP idxq h8_n16 b=6 bit_diff=0 of 24576
+CMP idxq h4_n1 b=6 bit_diff=0 of 24576
+CMP idxq h4_n4 b=6 bit_diff=0 of 24576
+CMP idxq h4_n16 b=6 bit_diff=0 of 24576
+CMP idxq h16_n4 b=6 bit_diff=0 of 24576
+
+== idxq 4096x1280 b=6 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                       76.18      74.68      93.08    1.000     137.6       0.0
+base +1 WG                                    71.49      65.98      99.46    0.939     146.7       0.0
+cand h8_n8                                    33.52      32.47      49.62    0.440     312.8       0.0
+cand h8_n8 +1                                 26.61      25.36      47.47    0.349     394.1       0.0
+KBJSON {"tag":"idxq 4096x1280 b=6 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":76.178,"p10_us":74.680,"p90_us":93.076,"ratio":1.0000,"gbps":137.65,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=6 COLD W (9 copies) graph","variant":"base +1 WG","med_us":71.494,"p10_us":65.978,"p90_us":99.463,"ratio":0.9385,"gbps":146.67,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=6 COLD W (9 copies) graph","variant":"cand h8_n8","med_us":33.525,"p10_us":32.467,"p90_us":49.618,"ratio":0.4401,"gbps":312.78,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=6 COLD W (9 copies) graph","variant":"cand h8_n8 +1","med_us":26.609,"p10_us":25.365,"p90_us":47.471,"ratio":0.3493,"gbps":394.07,"graph":1,"flush":0}
+CMP idxq h20 b=8 bit_diff=0 of 32768
+CMP idxq plain_n1 b=8 bit_diff=0 of 32768
+CMP idxq h8_n1 b=8 bit_diff=0 of 32768
+CMP idxq plain_n2 b=8 bit_diff=0 of 32768
+CMP idxq h8_n2 b=8 bit_diff=0 of 32768
+CMP idxq plain_n4 b=8 bit_diff=0 of 32768
+CMP idxq h8_n4 b=8 bit_diff=0 of 32768
+CMP idxq plain_n8 b=8 bit_diff=0 of 32768
+CMP idxq h8_n8 b=8 bit_diff=0 of 32768
+CMP idxq plain_n16 b=8 bit_diff=0 of 32768
+CMP idxq h8_n16 b=8 bit_diff=0 of 32768
+CMP idxq h4_n1 b=8 bit_diff=0 of 32768
+CMP idxq h4_n4 b=8 bit_diff=0 of 32768
+CMP idxq h4_n16 b=8 bit_diff=0 of 32768
+CMP idxq h16_n4 b=8 bit_diff=0 of 32768
+
+== idxq 4096x1280 b=8 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                       98.60      90.27     119.87    1.000     106.3       0.0
+base +1 WG                                    88.13      83.10     114.08    0.894     119.0       0.0
+cand h8_n8                                    35.88      33.86      52.25    0.364     292.2       0.0
+cand h8_n8 +1                                 30.12      28.72      49.08    0.305     348.2       0.0
+KBJSON {"tag":"idxq 4096x1280 b=8 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":98.601,"p10_us":90.267,"p90_us":119.867,"ratio":1.0000,"gbps":106.35,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=8 COLD W (9 copies) graph","variant":"base +1 WG","med_us":88.129,"p10_us":83.098,"p90_us":114.081,"ratio":0.8938,"gbps":118.98,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=8 COLD W (9 copies) graph","variant":"cand h8_n8","med_us":35.880,"p10_us":33.862,"p90_us":52.249,"ratio":0.3639,"gbps":292.24,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=8 COLD W (9 copies) graph","variant":"cand h8_n8 +1","med_us":30.116,"p10_us":28.720,"p90_us":49.085,"ratio":0.3054,"gbps":348.18,"graph":1,"flush":0}
+CMP idxq h20 b=16 bit_diff=0 of 65536
+CMP idxq plain_n1 b=16 bit_diff=0 of 65536
+CMP idxq h8_n1 b=16 bit_diff=0 of 65536
+CMP idxq plain_n2 b=16 bit_diff=0 of 65536
+CMP idxq h8_n2 b=16 bit_diff=0 of 65536
+CMP idxq plain_n4 b=16 bit_diff=0 of 65536
+CMP idxq h8_n4 b=16 bit_diff=0 of 65536
+CMP idxq plain_n8 b=16 bit_diff=0 of 65536
+CMP idxq h8_n8 b=16 bit_diff=0 of 65536
+CMP idxq plain_n16 b=16 bit_diff=0 of 65536
+CMP idxq h8_n16 b=16 bit_diff=0 of 65536
+CMP idxq h4_n1 b=16 bit_diff=0 of 65536
+CMP idxq h4_n4 b=16 bit_diff=0 of 65536
+CMP idxq h4_n16 b=16 bit_diff=0 of 65536
+CMP idxq h16_n4 b=16 bit_diff=0 of 65536
+
+== idxq 4096x1280 b=16 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                      157.32     152.75     170.45    1.000      66.7       0.0
+base +1 WG                                   169.07     152.00     188.47    1.075      62.0       0.0
+cand h8_n16                                   55.69      47.12      77.73    0.354     188.3       0.0
+cand h8_n16 +1                                49.80      47.56      75.57    0.317     210.5       0.0
+KBJSON {"tag":"idxq 4096x1280 b=16 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":157.321,"p10_us":152.748,"p90_us":170.445,"ratio":1.0000,"gbps":66.65,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=16 COLD W (9 copies) graph","variant":"base +1 WG","med_us":169.068,"p10_us":151.996,"p90_us":188.472,"ratio":1.0747,"gbps":62.02,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=16 COLD W (9 copies) graph","variant":"cand h8_n16","med_us":55.689,"p10_us":47.120,"p90_us":77.734,"ratio":0.3540,"gbps":188.29,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=16 COLD W (9 copies) graph","variant":"cand h8_n16 +1","med_us":49.805,"p10_us":47.560,"p90_us":75.565,"ratio":0.3166,"gbps":210.54,"graph":1,"flush":0}
+CMP idxq h20 b=32 bit_diff=0 of 131072
+CMP idxq plain_n1 b=32 bit_diff=0 of 131072
+CMP idxq h8_n1 b=32 bit_diff=0 of 131072
+CMP idxq plain_n2 b=32 bit_diff=0 of 131072
+CMP idxq h8_n2 b=32 bit_diff=0 of 131072
+CMP idxq plain_n4 b=32 bit_diff=0 of 131072
+CMP idxq h8_n4 b=32 bit_diff=0 of 131072
+CMP idxq plain_n8 b=32 bit_diff=0 of 131072
+CMP idxq h8_n8 b=32 bit_diff=0 of 131072
+CMP idxq plain_n16 b=32 bit_diff=0 of 131072
+CMP idxq h8_n16 b=32 bit_diff=0 of 131072
+CMP idxq h4_n1 b=32 bit_diff=0 of 131072
+CMP idxq h4_n4 b=32 bit_diff=0 of 131072
+CMP idxq h4_n16 b=32 bit_diff=0 of 131072
+CMP idxq h16_n4 b=32 bit_diff=0 of 131072
+
+== idxq 4096x1280 b=32 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                      330.19     302.55     343.99    1.000      31.8       0.0
+base +1 WG                                   321.19     304.85     345.39    0.973      32.6       0.0
+cand h8_n16                                   92.17      83.53     113.21    0.279     113.8       0.0
+cand h8_n16 +1                                89.77      83.94     109.99    0.272     116.8       0.0
+KBJSON {"tag":"idxq 4096x1280 b=32 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":330.193,"p10_us":302.549,"p90_us":343.989,"ratio":1.0000,"gbps":31.76,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=32 COLD W (9 copies) graph","variant":"base +1 WG","med_us":321.189,"p10_us":304.846,"p90_us":345.393,"ratio":0.9727,"gbps":32.65,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=32 COLD W (9 copies) graph","variant":"cand h8_n16","med_us":92.174,"p10_us":83.534,"p90_us":113.210,"ratio":0.2792,"gbps":113.76,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=32 COLD W (9 copies) graph","variant":"cand h8_n16 +1","med_us":89.769,"p10_us":83.943,"p90_us":109.992,"ratio":0.2719,"gbps":116.81,"graph":1,"flush":0}
+CMP idxq h20 b=64 bit_diff=0 of 262144
+CMP idxq plain_n1 b=64 bit_diff=0 of 262144
+CMP idxq h8_n1 b=64 bit_diff=0 of 262144
+CMP idxq plain_n2 b=64 bit_diff=0 of 262144
+CMP idxq h8_n2 b=64 bit_diff=0 of 262144
+CMP idxq plain_n4 b=64 bit_diff=0 of 262144
+CMP idxq h8_n4 b=64 bit_diff=0 of 262144
+CMP idxq plain_n8 b=64 bit_diff=0 of 262144
+CMP idxq h8_n8 b=64 bit_diff=0 of 262144
+CMP idxq plain_n16 b=64 bit_diff=0 of 262144
+CMP idxq h8_n16 b=64 bit_diff=0 of 262144
+CMP idxq h4_n1 b=64 bit_diff=0 of 262144
+CMP idxq h4_n4 b=64 bit_diff=0 of 262144
+CMP idxq h4_n16 b=64 bit_diff=0 of 262144
+CMP idxq h16_n4 b=64 bit_diff=0 of 262144
+
+== idxq 4096x1280 b=64 COLD W (9 copies) graph  (rounds=30 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched                      638.10     608.59     653.00    1.000      16.4       0.0
+base +1 WG                                   636.31     603.24     647.57    0.997      16.5       0.0
+cand h8_n16                                  169.90     155.67     183.42    0.266      61.7       0.0
+cand h8_n16 +1                               161.98     156.05     186.93    0.254      64.7       0.0
+KBJSON {"tag":"idxq 4096x1280 b=64 COLD W (9 copies) graph","variant":"base f16_matvec_batched","med_us":638.102,"p10_us":608.590,"p90_us":653.004,"ratio":1.0000,"gbps":16.43,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=64 COLD W (9 copies) graph","variant":"base +1 WG","med_us":636.306,"p10_us":603.244,"p90_us":647.568,"ratio":0.9972,"gbps":16.48,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=64 COLD W (9 copies) graph","variant":"cand h8_n16","med_us":169.899,"p10_us":155.668,"p90_us":183.423,"ratio":0.2663,"gbps":61.72,"graph":1,"flush":0}
+KBJSON {"tag":"idxq 4096x1280 b=64 COLD W (9 copies) graph","variant":"cand h8_n16 +1","med_us":161.979,"p10_us":156.054,"p90_us":186.934,"ratio":0.2538,"gbps":64.74,"graph":1,"flush":0}
+RESULT: all candidates bit-exact

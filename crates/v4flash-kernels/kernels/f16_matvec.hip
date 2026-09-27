@@ -249,6 +249,84 @@ extern "C" __global__ __launch_bounds__(256) void f16_matvec_batched_h20(
     mv_body<20>(out, weight, x, k, n_rows);       // 8 chunks of 20 at k = 5120
 }
 
+// f16_matvec_batched_z16_n<NB> — f16_matvec_batched with the batch split into
+// NB-row slices on grid.z (grid (ceil(n_rows/8), 1, ceil(batch/NB)) x 256):
+// one warp owns a weight row for NB batch rows, so each weight element is read
+// ONCE per slice instead of once per batch row (the production grid.z = B
+// kernel re-reads the row B times). BIT-IDENTICAL per (row, b) to
+// f16_matvec_batched (and to _h20): one f32 accumulator per batch row, elements
+// i = lane + 32 j in ascending j, the same `acc += h2f(w) * x` expression, the
+// same shfl_down tree. When k % 256 == 0, 8 weight elements per lane are loaded
+// into registers per step and each batch row's 8 matching x values are loaded
+// and FMA'd in ascending order (hoisted loads, as _h20); other k run the plain
+// loop. `batch` is the TRUE row count (the last slice may be partial). Selected
+// by F16Matvec::matvec_batched_z16 under V41_F16_MV_Z16 for the idx-q (4096 x
+// 1280), idx proj (32 x 5120, small b only), ratio-1 compressor (512 x 5120) and
+// replay router (384 x 5120, b > 48) sites. 2026-09-27 round 2 (c_z16): idx q
+// b = 4 72.8 -> 38.9 us, b = 64 639 -> 164 us; see the wrapper for the rest.
+template <unsigned NB>
+__device__ __forceinline__ void mv_z16_body(float* __restrict__ out, const __half* __restrict__ weight,
+                                            const float* __restrict__ x, unsigned int k, unsigned int n_rows,
+                                            unsigned int batch) {
+    constexpr unsigned CH = 8;
+    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= n_rows) return;
+    const uint32_t b0 = blockIdx.z * NB;
+    if (b0 >= batch) return;
+    const uint32_t nb = min(NB, batch - b0);
+    const __half* wr = weight + (size_t)row * (size_t)k;
+    const float* xb = x + (size_t)b0 * (size_t)k;
+    float acc[NB];
+    #pragma unroll
+    for (unsigned j = 0; j < NB; ++j) acc[j] = 0.0f;
+    if (k % (F16_WARP_LANES * CH) == 0u) {
+        const uint32_t nchunks = k / (F16_WARP_LANES * CH);
+        __half wv[CH];
+        for (uint32_t c = 0; c < nchunks; ++c) {
+            const uint32_t base = c * (F16_WARP_LANES * CH) + lane;
+            #pragma unroll
+            for (unsigned t = 0; t < CH; ++t) wv[t] = wr[base + F16_WARP_LANES * t];
+            #pragma unroll
+            for (unsigned j = 0; j < NB; ++j) {
+                if (j < nb) {
+                    float xv[CH];
+                    #pragma unroll
+                    for (unsigned t = 0; t < CH; ++t) xv[t] = xb[(size_t)j * k + base + F16_WARP_LANES * t];
+                    #pragma unroll
+                    for (unsigned t = 0; t < CH; ++t) acc[j] += __half2float(wv[t]) * xv[t];
+                }
+            }
+        }
+    } else {
+        for (uint32_t i = lane; i < k; i += F16_WARP_LANES) {
+            const float w = __half2float(wr[i]);
+            #pragma unroll
+            for (unsigned j = 0; j < NB; ++j)
+                if (j < nb) acc[j] += w * xb[(size_t)j * k + i];
+        }
+    }
+    #pragma unroll
+    for (unsigned j = 0; j < NB; ++j) {
+        if (j < nb) {
+            const float s = f16_warp_sum_f32(acc[j]);
+            if (lane == 0) out[(size_t)(b0 + j) * (size_t)n_rows + row] = s;
+        }
+    }
+}
+
+#define F16_MV_Z16(NB)                                                                              \
+extern "C" __global__ __launch_bounds__(256) void f16_matvec_batched_z16_n##NB(                     \
+        float* __restrict__ out, const __half* __restrict__ weight, const float* __restrict__ x,    \
+        unsigned int k, unsigned int n_rows, unsigned int batch) {                                  \
+    mv_z16_body<NB>(out, weight, x, k, n_rows, batch);                                              \
+}
+F16_MV_Z16(1)
+F16_MV_Z16(2)
+F16_MV_Z16(4)
+F16_MV_Z16(8)
+F16_MV_Z16(16)
+
 // M40-P4.5: 2-wide pair variant. One weight matrix, two input vectors,
 // two output vectors. Per-lane: load W[i] once, multiply by x_a[i] and
 // x_b[i], accumulate into two scalars. Halves W bandwidth.

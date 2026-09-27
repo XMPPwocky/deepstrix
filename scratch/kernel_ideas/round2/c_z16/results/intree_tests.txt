@@ -1,0 +1,35 @@
+== 1790473968.000431.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+### z16 defaults (f16_mv_z16_bitexact)
+test z16_matches_grid_z_batched_matvec ... mv 4096x1280 b=1: z16 n1..n16 x pad 0/1 bit-exact, wrapper bit_diff=0, router wrapper bit_diff=0
+PASS: 72 (shape, b) cases, every NB symbol + wrapper bit-exact
+test z16_site_gates ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+### rc=0
+### z16 knobs=0 (f16_mv_z16_bitexact, V41_F16_MV_Z16=0 V41_GRID_PAD=0)
+test z16_matches_grid_z_batched_matvec ... mv 4096x1280 b=1: z16 n1..n16 x pad 0/1 bit-exact, wrapper bit_diff=0, router wrapper bit_diff=0
+PASS: 72 (shape, b) cases, every NB symbol + wrapper bit-exact
+test z16_site_gates ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+### rc=0
+### mhc glue (router wrapper) defaults (mhc_glue_bitexact)
+test mhc_gemm_narrow_matches_lds_tiled ... gemm 24x20480 B=1: narrow bit_diff=0, wrapper bit_diff=0
+PASS: 16 gemm cases bit-exact
+test rms_fast_matches_rms_norm_weighted ... rms n=512 b=1: fast bit_diff=0, wrapper bit_diff=0
+PASS: 27 rms cases bit-exact
+test router_mv_h20_matches_f16_matvec_batched ... mv 384x5120 b=1: h20 bit_diff=0, router wrapper bit_diff=0
+PASS: 34 matvec cases bit-exact
+test topk_wfred_matches_router_topk_par ... PASS: 147 topk configs bit-exact (selected, weights, alts, alt_w, orig_sel, range)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
+### rc=0
+### mhc glue knobs=0 (mhc_glue_bitexact, V41_F16_MV_Z16=0 V41_ROUTER_MV_H20=0)
+test mhc_gemm_narrow_matches_lds_tiled ... gemm 24x20480 B=1: narrow bit_diff=0, wrapper bit_diff=0
+PASS: 16 gemm cases bit-exact
+test rms_fast_matches_rms_norm_weighted ... rms n=512 b=1: fast bit_diff=0, wrapper bit_diff=0
+PASS: 27 rms cases bit-exact
+test router_mv_h20_matches_f16_matvec_batched ... mv 384x5120 b=1: h20 bit_diff=0, router wrapper bit_diff=0
+PASS: 34 matvec cases bit-exact
+test topk_wfred_matches_router_topk_par ... PASS: 147 topk configs bit-exact (selected, weights, alts, alt_w, orig_sel, range)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.46s
+### rc=0
+### overall rc=0

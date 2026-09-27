@@ -578,3 +578,7 @@
 2026-09-27T01:36:06Z	round2/b_C1_r5	dgpu	128MB	rc=0	21.4s	busy_before=56	busy_after=97	bash run_job.sh C1 r5  
 2026-09-27T01:37:48Z	round2/b_C2_r5	dgpu	128MB	rc=0	102.0s	busy_before=46	busy_after=56	bash run_job.sh C2 r5  
 2026-09-27T01:45:15Z	round2/b_intree	dgpu	120MB	rc=0	9.5s	busy_before=67	busy_after=73	bash round2/run_tests.sh gates\ defaults\|\|round2_gates gates\ knobs=0\|V41_F16X_256=0\ V41_GEMV_BPACK_Z16=0\ V41_CAND_THRESH_ILP=0\ V41_IDX_GATHER_B128=0\ V41_GRID_PAD=0\|round2_gates indexer\ sweep
+2026-09-27T01:47:03Z	round2/c_z16_c4	dgpu	110MB	rc=0	11.5s	busy_before=57	busy_after=75	bash run_confirm.sh c4 intree  
+2026-09-27T01:47:17Z	round2/c_z16_c5	dgpu	110MB	rc=0	13.2s	busy_before=63	busy_after=90	bash run_confirm.sh c5 intree  
+2026-09-27T01:47:30Z	round2/c_z16_c6	dgpu	110MB	rc=0	13.3s	busy_before=41	busy_after=90	bash run_confirm.sh c6 intree  
+2026-09-27T01:52:53Z	round2/c_intree	dgpu	120MB	rc=0	4.9s	busy_before=63	busy_after=21	bash round2/run_tests.sh z16\ defaults\|\|f16_mv_z16_bitexact z16\ knobs=0\|V41_F16_MV_Z16=0\ V41_GRID_PAD=0\|f16_mv_z16_bitexact mhc\ glue\ \(router\ wrapper\)\ defaults\|\|mhc_glue_bitexact mhc\ glu

@@ -4463,6 +4463,19 @@ impl HeterogeneousEngine {
                 // V4.1 ratio 1 (layer 20): latent = norm(wkv(x)) — one batched matvec,
                 // no gate. `sc_cur` is zeroed so the (identity) 1-row pool sees finite
                 // scores; the state/snapshot machinery below is ratio-generic.
+                // `V41_F16_MV_Z16`: grid.z = ceil(b/NB) slices (bit-identical)
+                // except at b = 3..4 (see crate::f16::z16_comp_ratio1_for).
+                if crate::f16::z16_comp_ratio1_for(b) {
+                    de.f16.matvec_batched_z16(
+                        &de.compute,
+                        &mut sd.kv_cur,
+                        &cw.wkv.buffer,
+                        &sd.attn_input_norm,
+                        comp_width,
+                        N_EMBD,
+                        b,
+                    )?;
+                } else {
                 de.f16.matvec_batched(
                     &de.compute,
                     &mut sd.kv_cur,
@@ -4472,6 +4485,7 @@ impl HeterogeneousEngine {
                     N_EMBD,
                     b,
                 )?;
+                }
                 sd.sc_cur.slice_view_mut(0, (b * comp_width) as usize).fill_zero_async(&de.compute)?;
             } else if std::env::var("DEEPSTRIX_COMP_TILED").map(|v| v != "0").unwrap_or(true) {
                 de.f16.matvec_pair_batched_tiled(
@@ -5586,7 +5600,9 @@ impl HeterogeneousEngine {
                 {
                     let _t = de.events.stage("k.indexer.matvec_q", &de.compute)?;
                     if prefill_f32_matvec(b) {
-                    de.f16.matvec_batched(
+                    // `V41_F16_MV_Z16`: each weight element once per <=16-row slice
+                    // instead of once per row (bit-identical; 2.3x at 4 rows, 3.9x at 64).
+                    de.f16.matvec_batched_z16(
                             &de.compute,
                             &mut sd.indexer_q,
                             &iw.attn_q_b.buffer,
@@ -5636,6 +5652,18 @@ impl HeterogeneousEngine {
                 }
                 {
                     let _t = de.events.stage("k.indexer.matvec_proj", &de.compute)?;
+                    // `V41_F16_MV_Z16` only up to Z16_PROJ_MAX_B rows (a 4-WG grid).
+                    if b <= crate::f16::Z16_PROJ_MAX_B {
+                    de.f16.matvec_batched_z16(
+                        &de.compute,
+                        &mut sd.indexer_head_weights,
+                        &iw.proj.buffer,
+                        &sd.attn_input_norm,
+                        N_INDEXER_HEAD,
+                        N_EMBD,
+                        b,
+                    )?;
+                    } else {
                     de.f16.matvec_batched(
                         &de.compute,
                         &mut sd.indexer_head_weights,
@@ -5645,6 +5673,7 @@ impl HeterogeneousEngine {
                         N_EMBD,
                         b,
                     )?;
+                    }
                 }
                 {
                     let _t = de.events.stage("k.indexer.scale", &de.compute)?;
