@@ -1,17 +1,28 @@
 # DSpark on the multistream arena — build plan
 
-rev 2, 2026-09-27. Base: production branch `worktree-b2-pin-deploy` @ 04c00f3.
+rev 3, 2026-09-27. Base: production branch `worktree-b2-pin-deploy` @ 04c00f3.
 Status: PLAN. Review round 1: APPROVE WITH CHANGES (15 findings, addressed in
 rev 1; one pushed back: the production row mix, 1.3). Round 2: APPROVE WITH
-CHANGES (N1-N7, addressed in rev 2). Supersedes the verify-path economics in
+CHANGES (N1-N7, addressed in rev 2). Round 3: APPROVE WITH CHANGES (R3-1..R3-5,
+addressed in rev 3: paired gate + more reference positions, what 4.382 means,
+A4 CED seeding, test hardening, the drafter KV quantizer FIXED in a6baf76, CPU
+bisect first). Supersedes the verify-path economics in
 `DSPARK_VERIFY_ECONOMICS.md` / `DSPARK_WHAT_IS_LEFT.md` (they priced a
 prefill-shaped verify that no longer needs to exist).
 
 **Owner directive (2026-09-27): the engine's drafter must reach the SEEDED
 REFERENCE acceptance, E 4.382 at K=5 on the gen2 agentic transcript (temperature
-0, positions 256-344), before anything else counts.** That is milestone M-A
-(section 9) and every gate below is evaluated at that acceptance, not at
-today's in-engine numbers.
+0, positions 256-344), before anything else counts** (bar ~4.2: a numerics-level
+shortfall is fine). That is milestone M-A (section 9).
+
+**What 4.382 is and is not** (review R3-2): it describes the DRAFTER ON gen2, a
+transcript that is the reference model's own greedy continuation (greedy equals
+the text at 100% of scored positions; T=1 rejection-sampling E 4.13 on it). On
+`prose` the same seeded reference drafter scores E 1.99. So M-A is a PARITY bar
+(our drafter vs the reference drafter on the same input); production acceptance
+is lower for the reference drafter too, and M0 prices production with the
+realized E of the drafter that passed parity, measured on production-like,
+reasoning-heavy traffic, never at 4.38.
 
 rev 2 changes: M-A drafter parity first, with its test written
 (`tests/dspark_parity.rs`); depth decisions as a stopping rule for sampled drafts
@@ -599,12 +610,29 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     the same seeding (positions 128-255 into the window) and the same steps;
     compares draft by draft with the reference's recorded drafts, and scores
     against the reference's greedy targets. Needs the iGPU and ~8.7 GB, so the hub
-    must be down (box 1 has ~5 GB free beside production). `PARITY_REF=noseed |
-    nomarkov` reproduce the ablations. Suspects to bisect if drafts differ: the
-    ring's FP8 path (V4-style `fp8.launch_kv_post_fused` vs the reference's
-    `act_quant` on `main_kv`, 4.8), the markov head (Q8_0 weights and Q8
-    activations vs the reference's f32 linear; engine +0.82 E vs reference +2.00),
-    the exit/head, bf16 vs f32 activations.
+    must be down (box 1 has ~5 GB free beside production). Run:
+    `scripts/v41_oracle/run_dspark_parity.sh` (base, base with the legacy ring
+    quantizer, nomarkov). **Gate on PAIRED statistics** (review R3-1): 89
+    overlapping blocks have lag-1 autocorrelation ~0.65 (effective n ~19; the
+    reference's own E carries a ~0.45 SE), so the gate is draft agreement given
+    identical earlier drafts per depth, plus the moving-block bootstrap interval
+    of E(ours) - E(ref) (both printed by the test), with "E >= ~4.2" as the
+    headline. More positions, CPU only: rerun the fixed `base` reference drafter
+    on `main` (1,006 tokens, ~740 steps; its current `dspark_accept.json` predates
+    the ffn_norm fix), `gen` and `gen_dspark` (needs ~13+ GB of RAM for the
+    oracle's expert cache, so also a hub-down item unless the cache is trimmed).
+    **Fixed before the first run** (a6baf76): the drafter's ring and block KV
+    used the V4-era `kv_post_fused` (E4M3, f32 scale per 64 over the first 448
+    dims, RoPE tail unquantized), a DIFFERENT quantizer from the reference's
+    `act_quant` (E4M3, ue8m0 scale per 32 over all 512 dims); now it is the main
+    model's V4.1 window quantizer, `V41_MTP_KV_QUANT=v4` for the A/B. Remaining
+    suspects if drafts still differ: the markov head (Q8_0 weights and Q8
+    activations on a 256-dim embedding, `hf_v41.rs` ~444, vs the reference's f32
+    `F.linear`; engine +0.82 E vs reference +2.00), q8 activations in the dense
+    layers, the exit/head. **Bisect on the CPU first** (review R3-5): add
+    engine-numerics toggles to the oracle's drafter script ((a) V4-style KV
+    quant, (b) Q8 markov head, (c) q8 dense activations); whichever drops the
+    reference from 4.38 toward ~2.8 names the culprit with no server downtime.
   * **A2, engine seeding**: `seed_mtp_ring` seeds from ONE prefill lane and only
     the last chunk (`engine_worker.rs` ~2888), so a short prompt or suffix seeds
     about half its rows (the 09-18 log: `seeded=19 n=20` on a 40-token prompt).
@@ -616,8 +644,22 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     existing `agentic` golden is a different 1,006-token transcript that shares
     only its first 258 tokens with gen2), add a tap that dumps the per-position
     mean-over-hc residuals after layers 36/37/38 during `tests/v41_golden_gate.rs`,
-    then run `dspark_parity` with `PARITY_MH=<that dump>`. Compare our residuals
-    with the oracle's per position (cosine) at the same time. Bar: E >= ~4.2.
+    then run `dspark_parity` with `PARITY_MH=<that dump>` and
+    `PARITY_MH_BF16=0` (production feeds the drafter f32 captures). Compare our
+    residuals with the oracle's per position (cosine) at the same time, and score
+    against the ENGINE's own greedy as well as the oracle's (main-model top-1
+    disagreement compounds over five depths and must not be charged to the
+    drafter). The exit then runs on the dGPU as in production. Bar: E >= ~4.2.
+  * **A4, the seeding condition production actually runs under** (review R3-3):
+    every oracle transcript has a 57-token first prompt, so A3's seeding rows all
+    come from decode steps. Production prompts are long and their ring is seeded
+    from the CED replay's last 128 rows, whose decoder windows start empty
+    (KNOWN_BUGS #28), residuals the reference drafter never saw. Run an A3 variant
+    on `main` with `GOLDEN_DECODE_FROM` ~400 (seeding rows from a truncated
+    replay) and compare E seeded from replay residuals against E seeded from
+    decode residuals. If replay seeding costs E, mitigate (e.g. a 256-row decoder
+    replay when DSpark is on, so the last 128 rows have full windows); otherwise a
+    low M0(a) would be blamed on the drafter.
   Parity is judged at temperature 0 because that is how the reference was scored;
   production-temperature acceptance follows from the same drafter (M0).
 * **M0: go/no-go, before M2 or M3** (parallel with M1), evaluated at the
