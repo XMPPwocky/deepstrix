@@ -13,6 +13,10 @@
 //! 1-2 picks per row from 48 experts (distinct ~4.3, the production mix).
 //! Prints per-phase wall p50 for the run and the readback.
 //!
+//! Runs whichever chain `V41_B2_FAST_CHAIN` selects (default the short one;
+//! `=0` the old one), so the same binary traces both. 2026-09-27, phase `one`:
+//! old 14 commands per request (incl. the f16 readback's cast + D2H), fast 6.
+//!
 //! Run (box 1, one GPU test process at a time; ~0.4 GB of GTT, well under a
 //! second of iGPU time):
 //!   rocprofv3 --kernel-trace --memory-copy-trace -d DIR -o kt --output-format csv -- \
