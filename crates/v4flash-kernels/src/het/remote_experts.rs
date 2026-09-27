@@ -1914,6 +1914,8 @@ pub mod knobs {
     static PREFILL_ROUTE_SPLIT: AtomicBool = AtomicBool::new(true);
     /// Every shard's mirror opened (`set_mirror_ok`, at `enable_paging`).
     static MIRROR_OK: AtomicBool = AtomicBool::new(false);
+    /// `V41_B2_FAST_CHAIN` (default on; `0` = the old chain): see `fast_chain`.
+    static FAST_CHAIN: AtomicBool = AtomicBool::new(true);
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     fn init() {
         INIT.get_or_init(|| {
@@ -1933,8 +1935,24 @@ pub mod knobs {
             PARK.store(std::env::var("V41_B2_PARK").as_deref() == Ok("1"), Relaxed);
             ROUTE_URGENCY.store(std::env::var("V41_B2_ROUTE").as_deref() == Ok("urgency"), Relaxed);
             PREFILL_ROUTE_SPLIT.store(std::env::var("V41_B2_PREFILL_ROUTE").as_deref() != Ok("mirror"), Relaxed);
+            FAST_CHAIN.store(std::env::var("V41_B2_FAST_CHAIN").as_deref() != Ok("0"), Relaxed);
         });
     }
+    /// `V41_B2_FAST_CHAIN` (default ON; `0` = the exact old chain); file key
+    /// `fast_chain`. A batched pass of `b <= FAST_CHAIN_MAX_B` rows (every
+    /// box-2 decode request of 2+ rows, verify batches, merged decode pairs)
+    /// runs the short chain: ONE upload (xq + sel + ew), ONE fused group +
+    /// work-item builder (`b2_moe_group_wi_builder`), no per-request partials
+    /// memset (the reduce re-zeroes what it consumed), and for f16 replies the
+    /// reduce writes the f16 result straight into pinned host memory (no cast
+    /// kernel, no sync, no blocking copy). Bit-identical to the old chain
+    /// (tests/remote_experts_fast_chain.rs). Kernel trace of a 3-row request
+    /// (tests/remote_experts_chain_trace.rs, 2026-09-27, 1 distinct expert):
+    /// 14 GPU commands -> 6, small commands 26.9 -> 12.7 us, gaps inside the
+    /// chain 29.3 -> 17.5 us, host readback 25-39 us -> ~1 us.
+    pub fn fast_chain() -> bool { init(); FAST_CHAIN.load(Relaxed) }
+    /// In-process toggle (tests, A/B harnesses); the daemon uses the env/file.
+    pub fn set_fast_chain(on: bool) { init(); FAST_CHAIN.store(on, Relaxed) }
     /// `V41_B2_PREFILL_ROUTE=split` (default) | `mirror`; file key
     /// `prefill_route`. Under `route=urgency` a PREFILL-shaped pass's demand
     /// reads (and its early-page / park reads, `PfJob::stage`) are STRIPED
@@ -2014,12 +2032,14 @@ pub mod knobs {
                 ("prefill_route", "mirror") => PREFILL_ROUTE_SPLIT.store(false, Relaxed),
                 ("prefill_route", v) => eprintln!("expertd: knobs: unknown prefill_route={v:?} (want split|mirror); unchanged"),
                 ("mirror_frac", v) => { if let Ok(f) = v.parse::<f32>() { v4flash_core::hf_v41::set_expert_mirror_frac(f) } }
+                ("fast_chain", v) => FAST_CHAIN.store(v != "0", Relaxed),
                 _ => {}
             }
         }
-        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={}", park(),
+        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={}", park(),
             merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac(),
-            if route_urgency() { "urgency" } else { "split" }, if prefill_route_split() { "split" } else { "mirror" })
+            if route_urgency() { "urgency" } else { "split" }, if prefill_route_split() { "split" } else { "mirror" },
+            u8::from(fast_chain()))
     }
 }
 
@@ -2038,10 +2058,10 @@ pub fn install_knobs_toggle() -> String {
     // it while passing `V41_B2_MISS_PAR=4` on the command line runs at 4 and looks
     // like it is running at 1 (found by the 2026-09-22 audit, B4).
     let _ = knobs::reload();
-    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} (SIGUSR2 reloads {})",
+    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} (SIGUSR2 reloads {})",
         knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::coalesce(),
         v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" },
-        if knobs::prefill_route_split() { "split" } else { "mirror" }, knobs::path());
+        if knobs::prefill_route_split() { "split" } else { "mirror" }, u8::from(knobs::fast_chain()), knobs::path());
     unsafe { signal(SIGUSR2, knobs_signal); }
     init
 }
@@ -5454,10 +5474,33 @@ pub struct ExecTiming {
     /// two-pass path ran (misses > 0 on the batched path).
     pub n_missing: u32,
     pub two_pass: bool,
+    /// The short batched chain ran (`knobs::fast_chain`, `b <= FAST_CHAIN_MAX_B`).
+    pub fast_chain: bool,
     /// Pin mode's PAGED bits (`proto::RESP_FLAG_PIN`): experts of the layer
     /// this pass picked that were not landed when it started, i.e. that it had
     /// to page or wait for. Taken before anything can land or evict.
     pub paged: [u32; proto::RESID_WORDS],
+}
+
+/// Largest batched pass (rows) the short chain takes (`knobs::fast_chain`):
+/// `b * N_EXPERT_USED` = 96 picks fit the fused builder's one work-group.
+pub const FAST_CHAIN_MAX_B: usize = 16;
+
+/// The fast chain's ONE per-request upload, for `b` rows:
+/// `[sel i32 | ew f32 | pad to 256 | xq]`. Returns (ew offset, xq offset, total
+/// bytes). The sel/ew head alone is what a hits-first pass B / reduce re-uploads.
+fn fast_in_layout(b: usize) -> (usize, usize, usize) {
+    let n = b * N_EXPERT_USED;
+    let xq_off = (n * 8).next_multiple_of(256);
+    (n * 4, xq_off, xq_off + b * XQ_BYTES_PER_TOKEN)
+}
+
+/// Non-owning views of one request's device inputs: the old chain's own
+/// `xq` / `d_selected` / `d_ew` buffers, or the fast chain's single upload.
+struct PassIo {
+    xq: DeviceBuffer<u8>,
+    sel: DeviceBuffer<i32>,
+    ew: DeviceBuffer<f32>,
 }
 
 /// Per-request kernel geometry shared by the by-expert passes.
@@ -5529,6 +5572,39 @@ pub struct MoeExecutor {
     /// paging caught only 40% of non-resident experts because the next frame
     /// had usually not arrived at the single poll point).
     ev_done: v4flash_hip::Event,
+    // --- The short batched chain (`knobs::fast_chain`) ---------------------
+    fast_k: crate::b2_fast_chain::B2FastChain,
+    /// Rows the fast chain can take on this executor (`FAST_CHAIN_MAX_B` or
+    /// fewer on a small executor).
+    fast_rows: usize,
+    /// ONE device region per request (`fast_in_layout`) instead of three
+    /// buffers and three copies; the passes read views into it.
+    fin_dev: DeviceBuffer<u8>,
+    /// Its pinned staging, three regions of `fast_in_layout(fast_rows).2`
+    /// bytes for the same reason as `sel_pin` (pass A / pass B / the reduce).
+    fin_pin: PinnedBuffer<u8>,
+    /// Host-mapped f16 result: the fast reduce writes it directly when
+    /// `reply_f16`, and `run_path`'s final event wait makes it host-visible.
+    out16_pin: PinnedBuffer<u16>,
+    /// Rows of `out16_pin` that hold the LAST `run_path`'s result (set only
+    /// after its final event wait; 0 = `read_f16*` take the device path).
+    out16_host_rows: usize,
+    /// The next request's reply is f16 (the daemon sets it per request from
+    /// `REQ_FLAG_RESP_F32`; default true).
+    reply_f16: bool,
+    /// `partials` rows `[lo, hi)` that may hold non-zero data (`lo >= hi` =
+    /// all zero). The fast chain needs rows `[0, b*nu)` zero on entry and
+    /// leaves them zero (its reduce re-zeroes what it consumed); the old chain
+    /// memsets on entry and leaves its rows dirty, and a request that errors
+    /// mid-chain leaves its rows dirty. Starts all-dirty (hipMalloc).
+    p_dirty: (usize, usize),
+    /// Partials memsets the fast chain had to issue (tests: 0 in steady state).
+    fast_memsets: u64,
+    /// Set while a request's GPU work is queued. Still set when the next
+    /// `run_path` starts = the last one ERRORED with work possibly in flight
+    /// (DMA from the pinned staging, kernels writing `partials`): synchronize
+    /// before reusing anything.
+    in_flight: bool,
 }
 
 impl MoeExecutor {
@@ -5543,6 +5619,8 @@ impl MoeExecutor {
         let id = igpu.id;
         let nu = N_EXPERT_USED;
         let wi_len = N_EXPERT as usize + rows * nu;
+        let fast_rows = rows.min(FAST_CHAIN_MAX_B);
+        let fin_bytes = fast_in_layout(fast_rows).2;
         Ok(Self {
             missed_scratch: Vec::with_capacity(N_EXPERT_USED),
             resident_scratch: Vec::with_capacity(rows * nu),
@@ -5577,7 +5655,50 @@ impl MoeExecutor {
             warm_out: DeviceBuffer::new(id, BLOCK_Q8_K_BYTES)?,
             ev: None,
             ev_done: v4flash_hip::Event::new_no_timing()?,
+            fast_k: crate::b2_fast_chain::B2FastChain::for_arch(&arch)?,
+            fast_rows,
+            fin_dev: DeviceBuffer::new(id, fin_bytes)?,
+            fin_pin: PinnedBuffer::new(3 * fin_bytes)?,
+            out16_pin: PinnedBuffer::new(fast_rows * N_EMBD as usize)?,
+            out16_host_rows: 0,
+            reply_f16: true,
+            p_dirty: (0, rows * nu),
+            fast_memsets: 0,
+            in_flight: false,
         })
+    }
+
+    /// Reply format of the NEXT `run_path` (true = f16): under the fast chain
+    /// an f16 reply is written by the reduce straight into pinned host memory.
+    pub fn set_reply_f16(&mut self, on: bool) {
+        self.reply_f16 = on;
+    }
+
+    /// Partials memsets the fast chain issued so far (after an old-chain pass,
+    /// an error, or a larger batch than any before). 0 in steady state.
+    pub fn fast_chain_memsets(&self) -> u64 {
+        self.fast_memsets
+    }
+
+    /// Rows `[0, n)` of `partials` may now be dirty (hull with what already was).
+    fn partials_mark_dirty(&mut self, n: usize) {
+        let (lo, hi) = self.p_dirty;
+        self.p_dirty = if lo >= hi { (0, n) } else { (0, hi.max(n)) };
+    }
+
+    /// Make rows `[0, n)` of `partials` zero: a stream-ordered memset of the
+    /// part that may be dirty (usually none).
+    fn partials_make_clean(&mut self, n: usize) -> eyre::Result<()> {
+        let (lo, hi) = self.p_dirty;
+        let end = n.min(hi);
+        if lo < end {
+            let row = N_EMBD as usize;
+            self.partials.slice_view_mut(lo * row, (end - lo) * row).fill_zero_async(&self.engine.compute)?;
+            self.fast_memsets += 1;
+        }
+        // Rows [0, end) are zero now: [0, lo) already were.
+        self.p_dirty = if end >= hi || lo >= hi { (0, 0) } else { (lo.max(end), hi) };
+        Ok(())
     }
 
     /// One trivial launch + sync (a single Q8_K block) so the iGPU never sits
@@ -5680,11 +5801,22 @@ impl MoeExecutor {
         overlap: &mut dyn FnMut(&mut ExpertShard, bool) -> eyre::Result<()>,
     ) -> eyre::Result<ExecTiming> {
         let nu = N_EXPERT_USED;
+        // No f16 reply in host memory until this request's final event wait.
+        self.out16_host_rows = 0;
         if b == 0 || b > self.rows {
             return Err(eyre!("executor: b={b} outside 1..={}", self.rows));
         }
         if xq.len() != b * XQ_BYTES_PER_TOKEN || sel.len() != b * nu || ew.len() != b * nu {
             return Err(eyre!("executor: payload sizes do not match b={b}"));
+        }
+        // The previous request errored with GPU work possibly still queued
+        // (uploads from the pinned staging this one is about to overwrite,
+        // kernels writing `partials`): let it drain first. Its partial rows
+        // are already marked dirty.
+        if self.in_flight {
+            self.device.set_current()?;
+            self.engine.compute.synchronize()?;
+            self.in_flight = false;
         }
         // Pin mode's surprise evidence: what this pass must page or wait for,
         // judged BEFORE the first `ensure` / admission can change residency.
@@ -5699,6 +5831,9 @@ impl MoeExecutor {
         // is up to 1024x6 and nothing consumes the mask.
         let mut miss_mask = 0u32;
         let path_decode = b <= self.decode_max_b && !force_batched;
+        // The short batched chain (`knobs::fast_chain`): decode-sized batched
+        // passes only; the decode-down diagnostic keeps the old chain.
+        let fast = !path_decode && b <= self.fast_rows && knobs::fast_chain() && !b2_decode_down();
         // HITS-FIRST (docs/v41/MULTISTREAM_DECODE_PLAN.md 4.1). On the batched path,
         // split the picks into resident / missing WITHOUT reading anything, launch
         // the resident experts' pass, read the misses while those kernels run, then
@@ -5751,6 +5886,7 @@ impl MoeExecutor {
             }
         }
         self.device.set_current()?;
+        self.in_flight = true;
         let t0 = Instant::now();
         // Uploads: stage through pinned host memory and queue them on the
         // compute stream. The caller's slices are unpinned, and a blocking
@@ -5758,9 +5894,15 @@ impl MoeExecutor {
         // request = 33 us of a ~380 us decode request). The memcpy into the
         // pinned staging is ~6 KB; the DMA then overlaps whatever the stream is
         // still finishing and orders ahead of this request's kernels.
-        self.xq_pin.as_mut_slice()[..xq.len()].copy_from_slice(xq);
-        self.xq.slice_view_mut(0, xq.len()).copy_from_host_async(&self.xq_pin.as_slice()[..xq.len()], &self.engine.compute)?;
-        self.upload_sel(0, b)?;
+        // The fast chain stages xq + sel + ew back to back and copies them ONCE
+        // (the old chain's three copies were three commands, ~2.5 us apart).
+        if fast {
+            self.upload_fast(0, b, Some(xq))?;
+        } else {
+            self.xq_pin.as_mut_slice()[..xq.len()].copy_from_slice(xq);
+            self.xq.slice_view_mut(0, xq.len()).copy_from_host_async(&self.xq_pin.as_slice()[..xq.len()], &self.engine.compute)?;
+            self.upload_sel(0, b)?;
+        }
         let t1 = Instant::now();
         if let Some((a, _)) = self.ev.as_ref() {
             a.record(&self.engine.compute)?;
@@ -5785,6 +5927,7 @@ impl MoeExecutor {
             miss_mask,
             n_missing: self.missing_scratch.len() as u32,
             two_pass,
+            fast_chain: fast,
             paged,
             ..Default::default()
         };
@@ -5816,10 +5959,24 @@ impl MoeExecutor {
             // Production prefill chain (forward_prefill.rs stage 11, MXFP4 arm):
             // hetsplit group builder -> work items (host readback) -> kwide
             // gate/up -> q8k(mid) -> by-expert kwide2 down -> hetsplit reduce.
+            let io = self.pass_io(b, fast);
+            let n_prow = b * nu;
+            // Partials: the fast chain needs rows [0, n_prow) zero on entry
+            // (a memset only after an old-chain pass or an error) and leaves
+            // them zero once its reduce is queued; until then they count as
+            // dirty, so an error anywhere below leaves the next request a
+            // memset. The old chain memsets on entry and leaves them dirty.
+            let clean_after = if fast {
+                self.partials_make_clean(n_prow)?;
+                Some(self.p_dirty)
+            } else {
+                None
+            };
+            self.partials_mark_dirty(n_prow);
             let diag_done;
             {
                 let (gate, up, down, remap) = shard.layer_views(layer)?;
-                let (n_wi, done) = self.batched_pass(&gate, &up, &down, remap, &geo, true)?;
+                let (n_wi, done) = self.batched_pass(&gate, &up, &down, remap, &geo, true, fast, &io)?;
                 timing.n_work_items = n_wi;
                 diag_done = done;
             }
@@ -5858,9 +6015,13 @@ impl MoeExecutor {
                     self.sel_host[i] = if live { e } else { SENTINEL_EXPERT };
                     self.ew_host[i] = if live { ew[i] } else { 0.0 };
                 }
-                self.upload_sel(1, b)?;
+                if fast {
+                    self.upload_fast(1, b, None)?;
+                } else {
+                    self.upload_sel(1, b)?;
+                }
                 let (gate, up, down, remap) = shard.layer_views(layer)?;
-                let (n_wi, _) = self.batched_pass(&gate, &up, &down, remap, &geo, false)?;
+                let (n_wi, _) = self.batched_pass(&gate, &up, &down, remap, &geo, false, fast, &io)?;
                 timing.n_work_items += n_wi;
                 // Reduce over the FULL pick list: every real slot, whichever pass
                 // wrote its partial.
@@ -5868,11 +6029,20 @@ impl MoeExecutor {
                     self.sel_host[i] = if e == NO_PICK { SENTINEL_EXPERT } else { e };
                     self.ew_host[i] = if e == NO_PICK { 0.0 } else { ew[i] };
                 }
-                self.upload_sel(2, b)?;
-                self.reduce_partials(remap, b)?;
+                if fast {
+                    self.upload_fast(2, b, None)?;
+                } else {
+                    self.upload_sel(2, b)?;
+                }
+                self.reduce_io(remap, b, fast, &io)?;
             } else {
                 let (_, _, _, remap) = shard.layer_views(layer)?;
-                self.reduce_partials(remap, b)?;
+                self.reduce_io(remap, b, fast, &io)?;
+            }
+            if let Some(st) = clean_after {
+                // The fast reduce is queued: rows [0, n_prow) end this request
+                // zero, as they started it.
+                self.p_dirty = st;
             }
         }
         if let Some((_, ev_b)) = self.ev.as_ref() {
@@ -5890,9 +6060,81 @@ impl MoeExecutor {
             overlap(shard, false)?;
             std::thread::sleep(std::time::Duration::from_micros(20));
         }
+        self.in_flight = false;
+        if fast && self.reply_f16 {
+            // The fast reduce wrote the f16 rows into `out16_pin`; the event
+            // above (system-scope release) made them host-visible.
+            self.out16_host_rows = b;
+        }
         timing.h2d = t1 - t0;
         timing.gpu = t1.elapsed();
         Ok(timing)
+    }
+
+    /// The fast chain's upload for `region` (0: pass A / single pass with
+    /// `xq`; 1: pass B; 2: the reduce, both sel/ew only): stage
+    /// `sel_host`/`ew_host` (+ `xq`) into `fin_pin` in the `fast_in_layout(b)`
+    /// layout and queue ONE async copy into `fin_dev`.
+    fn upload_fast(&mut self, region: usize, b: usize, xq: Option<&[u8]>) -> eyre::Result<()> {
+        let n = b * N_EXPERT_USED;
+        let (ew_off, xq_off, total) = fast_in_layout(b);
+        let stride = fast_in_layout(self.fast_rows).2;
+        let base = region * stride;
+        let bytes = if xq.is_some() { total } else { 2 * n * 4 };
+        let pin = &mut self.fin_pin.as_mut_slice()[base..base + bytes];
+        for (d, v) in pin[..ew_off].chunks_exact_mut(4).zip(&self.sel_host[..n]) {
+            d.copy_from_slice(&v.to_le_bytes());
+        }
+        for (d, v) in pin[ew_off..2 * n * 4].chunks_exact_mut(4).zip(&self.ew_host[..n]) {
+            d.copy_from_slice(&v.to_le_bytes());
+        }
+        if let Some(xq) = xq {
+            pin[xq_off..total].copy_from_slice(xq);
+        }
+        self.fin_dev
+            .slice_view_mut(0, bytes)
+            .copy_from_host_async(&self.fin_pin.as_slice()[base..base + bytes], &self.engine.compute)
+    }
+
+    /// This request's input views: the fast chain's single upload, or the old
+    /// chain's three buffers (exactly the views `batched_pass` always used).
+    fn pass_io(&self, b: usize, fast: bool) -> PassIo {
+        let n = b * N_EXPERT_USED;
+        if fast {
+            let (ew_off, xq_off, _) = fast_in_layout(b);
+            // SAFETY: `fin_dev` holds `fast_in_layout(fast_rows)` bytes and
+            // b <= fast_rows; both offsets are 4-byte aligned (xq's is 256).
+            unsafe {
+                PassIo {
+                    sel: self.fin_dev.view_as::<i32>(0, n),
+                    ew: self.fin_dev.view_as::<f32>(ew_off, n),
+                    xq: self.fin_dev.view_as::<u8>(xq_off, b * XQ_BYTES_PER_TOKEN),
+                }
+            }
+        } else {
+            PassIo {
+                xq: self.xq.slice_view(0, b * XQ_BYTES_PER_TOKEN),
+                sel: self.d_selected.slice_view(0, n),
+                ew: self.d_ew.slice_view(0, n),
+            }
+        }
+    }
+
+    /// The reduce of a batched request: the old hetsplit reduce, or (fast) the
+    /// zeroing reduce that also writes the f16 reply into `out16_pin`.
+    fn reduce_io(&mut self, remap: &DeviceBuffer<i32>, b: usize, fast: bool, io: &PassIo) -> eyre::Result<()> {
+        if !fast {
+            return self.reduce_partials(remap, b);
+        }
+        let nu = N_EXPERT_USED;
+        let s = &self.engine.compute;
+        let mut out_v = self.ffn_moe.slice_view_mut(0, b * N_EMBD as usize);
+        let mut part_v = self.partials.slice_view_mut(0, b * nu * N_EMBD as usize);
+        let out16 = if self.reply_f16 { Some(&mut self.out16_pin) } else { None };
+        self.fast_k.launch_reduce_zero(
+            s, &mut out_v, out16, &mut part_v, &io.sel, remap, 0, N_EXPERT_USED as u32, nu as u32, N_EMBD,
+            b as u32, N_EXPERT,
+        )
     }
 
     /// Stage `sel_host`/`ew_host` (first `b * nu` entries) through pinned region
@@ -5934,6 +6176,8 @@ impl MoeExecutor {
         remap: &DeviceBuffer<i32>,
         g: &PassGeo,
         first: bool,
+        fast: bool,
+        io: &PassIo,
     ) -> eyre::Result<(u32, bool)> {
         let nu = N_EXPERT_USED;
         let b = g.b;
@@ -5941,19 +6185,26 @@ impl MoeExecutor {
         let e = &self.engine;
         let s = &e.compute;
         let max_per_expert = self.rows as u32;
-        let sel_v = self.d_selected.slice_view(0, b * nu);
-        let ew_v = self.d_ew.slice_view(0, b * nu);
-        let xq_v = self.xq.slice_view(0, b * XQ_BYTES_PER_TOKEN);
-        self.group_count.fill_zero_async(s)?;
-        e.moe_group_builder.launch_hetsplit(
-            s, &mut self.group_count, &mut self.expert_members, &sel_v, remap, 0, g.cap, bu,
-            nu as u32, g.gbound, max_per_expert,
-        )?;
-        self.n_work_items.fill_zero_async(s)?;
+        let (sel_v, ew_v, xq_v) = (&io.sel, &io.ew, &io.xq);
         let max_items = self.work_items.len() as u32;
-        e.moe_group_builder.launch_work_items(
-            s, &mut self.work_items, &mut self.n_work_items, &self.group_count, g.gbound, CHUNK_SIZE, max_items,
-        )?;
+        if fast {
+            // ONE work-group builds the groups THIS pass touches, the work items
+            // and their count (b2_fast_chain.hip): no zeroing, no second kernel.
+            self.fast_k.launch_builder(
+                s, &mut self.group_count, &mut self.expert_members, &mut self.work_items, &mut self.n_work_items,
+                sel_v, remap, 0, g.cap, bu, nu as u32, g.gbound, max_per_expert, CHUNK_SIZE, max_items,
+            )?;
+        } else {
+            self.group_count.fill_zero_async(s)?;
+            e.moe_group_builder.launch_hetsplit(
+                s, &mut self.group_count, &mut self.expert_members, sel_v, remap, 0, g.cap, bu,
+                nu as u32, g.gbound, max_per_expert,
+            )?;
+            self.n_work_items.fill_zero_async(s)?;
+            e.moe_group_builder.launch_work_items(
+                s, &mut self.work_items, &mut self.n_work_items, &self.group_count, g.gbound, CHUNK_SIZE, max_items,
+            )?;
+        }
         let devcount = super::forward_prefill::moe_wi_devcount()
             && !b2_decode_down()
             && super::dispatch::moe_wi_devcount_supported(g.gdt, g.ddt);
@@ -5978,7 +6229,7 @@ impl MoeExecutor {
         // `_rows`: MXFP4 at >= 256 rows takes the int8-WMMA arm (`V41_MOE_WMMA_GATEUP`,
         // 2026-09-26 sweep; not bit-exact).
         let handled = super::dispatch::moe_gate_up_chunked_rows(
-            e, g.gdt, s, &mut mid_v, gate, up, &xq_v, &ew_v, &self.group_count, &self.expert_members,
+            e, g.gdt, s, &mut mid_v, gate, up, xq_v, ew_v, &self.group_count, &self.expert_members,
             &self.work_items, n_wi, g.gbpe, g.ubpe, nu as u32, max_per_expert, CHUNK_SIZE, SWIGLU_CLAMP_EXP,
             N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_wi_dev, bu,
         )?;
@@ -6019,7 +6270,11 @@ impl MoeExecutor {
         // REQ_FLAG_BATCHED exactly when b > 1, which is why the corruption
         // appeared only at b >= 2: a b=1 request takes the decode branch,
         // which writes `ffn_moe` directly per token.
-        if first {
+        //
+        // The FAST chain skips it: `run_path` guarantees rows [0, b*nu) are
+        // zero on entry (`partials_make_clean`) and its reduce re-zeroes every
+        // slot it consumed and every slot holding a real pick.
+        if first && !fast {
             part_v.fill_zero_async(s)?;
         }
         match g.ddt {
@@ -6088,6 +6343,9 @@ impl MoeExecutor {
     }
 
     pub fn read_f16_at(&mut self, off_rows: usize, b: usize, dst: &mut [u16]) -> eyre::Result<()> {
+        if self.read_f16_pinned(off_rows, b, dst)? {
+            return Ok(());
+        }
         self.device.set_current()?;
         let n = b * N_EMBD as usize;
         let src = self.ffn_moe.slice_view(off_rows * N_EMBD as usize, n);
@@ -6100,6 +6358,9 @@ impl MoeExecutor {
     /// Cast the last result to f16 on the device (`f32_to_f16_cast`, RNE) and
     /// copy to host.
     pub fn read_f16(&mut self, b: usize, dst: &mut [u16]) -> eyre::Result<()> {
+        if self.read_f16_pinned(0, b, dst)? {
+            return Ok(());
+        }
         self.device.set_current()?;
         let n = b * N_EMBD as usize;
         let src = self.ffn_moe.slice_view(0, n);
@@ -6107,6 +6368,22 @@ impl MoeExecutor {
         self.engine.q8k.launch_cast_f16(&self.engine.compute, &mut o, &src, n as u32)?;
         self.engine.compute.synchronize()?;
         o.copy_to_host(dst)
+    }
+
+    /// The fast chain's f16 reply: rows `[off_rows, off_rows + b)` of the last
+    /// request, already in host memory (`out16_pin`, written by the reduce and
+    /// published by `run_path`'s final event wait). `Ok(false)` = not there
+    /// (old chain, decode path, f32 reply requested): take the device path.
+    fn read_f16_pinned(&self, off_rows: usize, b: usize, dst: &mut [u16]) -> eyre::Result<bool> {
+        if off_rows + b > self.out16_host_rows {
+            return Ok(false);
+        }
+        let row = N_EMBD as usize;
+        if dst.len() != b * row {
+            return Err(eyre!("read_f16: dst has {} elements, want {}", dst.len(), b * row));
+        }
+        dst.copy_from_slice(&self.out16_pin.as_slice()[off_rows * row..(off_rows + b) * row]);
+        Ok(true)
     }
 
     /// Host-side staging for a request's activations (the daemon reuses it).
@@ -6850,6 +7127,8 @@ pub fn serve_connection(
                     None => (req.xq, req.sel, req.ew),
                 };
                 let ev_t_run0 = if ev_on { super::evtrace::now() } else { nan };
+                // A merged partner has the same reply format (`mergeable`).
+                exec.set_reply_f16(req.flags & proto::REQ_FLAG_RESP_F32 == 0);
                 let timing = exec.run_path(shard, req.layer, b + bb, xq_run, sel_run, ew_run, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?;
                 let ev_t_run1 = if ev_on { super::evtrace::now() } else { nan };
                 drop(overlap);
@@ -7290,6 +7569,7 @@ fn serve_interleaved(
     let ev_pw0 = shard.prefetch_wait_ns;
     let ev_t_run0 = if ev_on { super::evtrace::now() } else { f64::NAN };
     let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
+    exec.set_reply_f16(req.flags & proto::REQ_FLAG_RESP_F32 == 0);
     let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut |_, _| Ok(()))?;
     let ev_t_run1 = if ev_on { super::evtrace::now() } else { f64::NAN };
     let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
