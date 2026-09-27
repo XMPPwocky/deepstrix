@@ -423,6 +423,157 @@ pub fn moe_wi_upper_bound(members: usize, groups: u32, chunk: u32, cap: usize) -
     m.min(g + m.div_ceil(chunk.max(1) as usize)).min(cap) as u32
 }
 
+/// Largest pass (rows) whose MXFP4 down runs the small-b twin (`V41_MOE_DOWN_DN2`).
+pub const MOE_DOWN_DN2_MAX_ROWS: u32 = 8;
+/// Smallest pass (rows) whose MXFP4 gate+up runs the int8-WMMA arm (`V41_MOE_WMMA_GATEUP`).
+pub const MOE_WMMA_GATEUP_MIN_ROWS: u32 = 256;
+/// Smallest pass (rows) whose MXFP4 down runs the int8-WMMA arm (`V41_MOE_WMMA_DOWN`).
+pub const MOE_WMMA_DOWN_MIN_ROWS: u32 = 128;
+
+/// `V41_MOE_DOWN_DN2` (default ON; `0` = `mxfp4_matvec_par_by_expert_kwide2` at
+/// every size): a batched MXFP4 down pass of `rows <= 8` (hub decode lanes,
+/// box-2 decode requests with b >= 2) runs `mxfp4_matvec_par_by_expert_smallb`
+/// (member-outer, weights stripe in registers, 105 vs 173 VGPR), same grid and
+/// contract, BIT-IDENTICAL partials (tests/mxfp4_moe_sweep.rs; the sweep review
+/// at b = 1..8 incl. 1-member groups). 2026-09-26 sweep (A_moe_smallb/
+/// dn2_member_outer, gfx1151, cold weights): kernel 178 -> 142 us at b = 4, chain
+/// x1.085 (b=4) / x1.05 (b=2) / x1.08 (b=8). Measured only up to 8 rows, so
+/// larger passes keep kwide2 (or the WMMA arm below).
+pub fn moe_down_dn2_for(rows: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MOE_DOWN_DN2").as_deref() != Ok("0"));
+    *D && (1..=MOE_DOWN_DN2_MAX_ROWS).contains(&rows)
+}
+
+/// `V41_MOE_WMMA_GATEUP` (default ON; `0` = the kwide gate+up at every size):
+/// an MXFP4 gate+up pass (kwide selected) of `rows >= 256` runs the int8-WMMA
+/// arm `mxfp4_pair_matvec_fused_swiglu_wmma` (gfx1151 only). The rule is the
+/// review's per-size result on the full 384-expert layer: 1.56x at 1024 rows,
+/// 1.18x at 512, ~1.0x at <= 128 (at 1.9 members per expert the WMMA tiles are
+/// mostly empty); 256 is between the measured points. NOT BIT-EXACT: identical
+/// int32 dots, f32 re-association (rel_rmse ~5e-7); covered by the golden gate.
+pub fn moe_wmma_gateup_for(rows: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MOE_WMMA_GATEUP").as_deref() != Ok("0"));
+    *D && rows >= MOE_WMMA_GATEUP_MIN_ROWS
+}
+
+/// `V41_MOE_WMMA_DOWN` (default ON; `0` = kwide2 at every size): an MXFP4 down
+/// pass of `rows >= 128` runs the int8-WMMA arm `mxfp4_matvec_par_by_expert_wmma`
+/// (gfx1151 only): 2.7x at 1024 rows, 1.8x at 512, 1.3x at 128 (review, full
+/// 384-expert layer). NOT BIT-EXACT (rel_rmse ~1.7e-7); covered by the golden gate.
+pub fn moe_wmma_down_for(rows: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MOE_WMMA_DOWN").as_deref() != Ok("0"));
+    *D && rows >= MOE_WMMA_DOWN_MIN_ROWS
+}
+
+/// Does an MXFP4 gate+up pass of `rows` take the int8-WMMA arm on this engine?
+/// (Also the trace label's source of truth, see [`pair_prefill_stage_rows`].)
+pub fn mxfp4_gateup_wmma_selected(e: &DeviceEngine, dt: GgufType, rows: u32) -> bool {
+    dt == GgufType::MXFP4
+        && pair_kwide_selected(dt, pair_variant_rollback())
+        && e.mxfp4pair.has_wmma()
+        && moe_wmma_gateup_for(rows)
+}
+
+/// [`pair_prefill_stage`] for a pass of `rows` on `e`: `igpu.pair_wmma_i8` when
+/// the MXFP4 gate+up takes the int8-WMMA arm.
+pub fn pair_prefill_stage_rows(e: &DeviceEngine, dt: GgufType, rows: u32) -> &'static str {
+    if mxfp4_gateup_wmma_selected(e, dt, rows) { "igpu.pair_wmma_i8" } else { pair_prefill_stage(dt) }
+}
+
+/// [`moe_gate_up_chunked_ex`] for a pass of `rows` (the caller's batch rows,
+/// NOT the work-item count): MXFP4 with the kwide kernel selected takes the
+/// int8-WMMA arm at `rows >= 256` (`V41_MOE_WMMA_GATEUP`, gfx1151); everything
+/// else is exactly `moe_gate_up_chunked_ex`. Serves box 1's prefill / decode
+/// lanes (forward_prefill) and box 2's batched pass (remote_experts).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up_chunked_rows(
+    e: &DeviceEngine,
+    dt: GgufType,
+    s: &Stream,
+    mid: &mut DeviceBuffer<f32>,
+    gate: &DeviceBuffer<u8>,
+    up: &DeviceBuffer<u8>,
+    xq: &DeviceBuffer<u8>,
+    ew: &DeviceBuffer<f32>,
+    group_count: &DeviceBuffer<i32>,
+    expert_members: &DeviceBuffer<i32>,
+    work_items: &DeviceBuffer<i32>,
+    n_work_items: u32,
+    gbpe: u32,
+    ubpe: u32,
+    n_used: u32,
+    max_per_expert: u32,
+    chunk: u32,
+    clamp: f32,
+    n_rows: u32,
+    n_blocks: u32,
+    n_wi_dev: Option<&DeviceBuffer<i32>>,
+    rows: u32,
+) -> eyre::Result<bool> {
+    if mxfp4_gateup_wmma_selected(e, dt, rows) {
+        e.mxfp4pair.launch_fused_swiglu_wmma_ex(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks, n_wi_dev,
+        )?;
+        return Ok(true);
+    }
+    moe_gate_up_chunked_ex(
+        e, dt, s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+        gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks, n_wi_dev,
+    )
+}
+
+/// The MXFP4 by-expert down launch for a pass of `rows` (the caller's batch
+/// rows): the int8-WMMA arm at `rows >= 128` (`V41_MOE_WMMA_DOWN`, gfx1151),
+/// the small-b twin at `rows <= 8` (`V41_MOE_DOWN_DN2`; only for the compiled
+/// n_blocks_in = 9 and n_rows % 16 == 0), else kwide2 -- all with kwide2's
+/// arguments, device-count contract and partials set. Serves box 1
+/// (forward_prefill) and box 2's batched pass (remote_experts).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_down_mxfp4(
+    e: &DeviceEngine,
+    s: &Stream,
+    partials: &mut DeviceBuffer<f32>,
+    w_base: &DeviceBuffer<u8>,
+    xq_base: &DeviceBuffer<u8>,
+    group_count: &DeviceBuffer<i32>,
+    expert_members: &DeviceBuffer<i32>,
+    work_items: &DeviceBuffer<i32>,
+    n_work_items: u32,
+    dbpe: u32,
+    xq_slot_stride: u32,
+    n_used: u32,
+    max_per_expert: u32,
+    chunk: u32,
+    n_rows: u32,
+    n_blocks_in: u32,
+    n_wi_dev: Option<&DeviceBuffer<i32>>,
+    rows: u32,
+) -> eyre::Result<()> {
+    if e.mxfp4.has_wmma() && moe_wmma_down_for(rows) {
+        return e.mxfp4.launch_by_expert_wmma_ex(
+            s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
+            dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
+        );
+    }
+    if moe_down_dn2_for(rows)
+        && n_blocks_in == crate::mxfp4::SMALLB_DOWN_N_BLOCKS_IN
+        && n_rows % 16 == 0
+    {
+        return e.mxfp4.launch_by_expert_smallb_ex(
+            s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
+            dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
+        );
+    }
+    e.mxfp4.launch_by_expert_kwide2_ex(
+        s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
+        dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
+    )
+}
+
 /// Can the MoE work-item count stay on the device (`V41_MOE_WI_DEVCOUNT`)?
 /// Only the MXFP4 kwide gate/up + MXFP4 kwide2 down pair checks a device count.
 pub fn moe_wi_devcount_supported(gate: GgufType, down: GgufType) -> bool {

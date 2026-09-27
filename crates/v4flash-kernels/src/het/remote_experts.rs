@@ -4435,10 +4435,12 @@ impl MoeExecutor {
         if b2_decode_down() {
             mid_v.fill_zero_async(s)?;
         }
-        let handled = super::dispatch::moe_gate_up_chunked_ex(
+        // `_rows`: MXFP4 at >= 256 rows takes the int8-WMMA arm (`V41_MOE_WMMA_GATEUP`,
+        // 2026-09-26 sweep; not bit-exact).
+        let handled = super::dispatch::moe_gate_up_chunked_rows(
             e, g.gdt, s, &mut mid_v, gate, up, &xq_v, &ew_v, &self.group_count, &self.expert_members,
             &self.work_items, n_wi, g.gbpe, g.ubpe, nu as u32, max_per_expert, CHUNK_SIZE, SWIGLU_CLAMP_EXP,
-            N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_wi_dev,
+            N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_wi_dev, bu,
         )?;
         if !handled {
             return Err(eyre!("executor: no prefill gate/up kernel for {:?}", g.gdt));
@@ -4481,10 +4483,12 @@ impl MoeExecutor {
             part_v.fill_zero_async(s)?;
         }
         match g.ddt {
-            GgufType::MXFP4 => e.mxfp4.launch_by_expert_kwide2_ex(
-                s, &mut part_v, down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,
+            // By rows: int8-WMMA arm at >= 128 (`V41_MOE_WMMA_DOWN`, not bit-exact),
+            // small-b twin at <= 8 (`V41_MOE_DOWN_DN2`, bit-exact), else kwide2.
+            GgufType::MXFP4 => super::dispatch::moe_down_mxfp4(
+                e, s, &mut part_v, down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,
                 n_wi, g.dbpe, MIDQ_BYTES_PER_SLOT as u32, nu as u32, max_per_expert, CHUNK_SIZE, N_EMBD,
-                BLOCKS_Q8K_DOWN_IN, n_wi_dev,
+                BLOCKS_Q8K_DOWN_IN, n_wi_dev, bu,
             )?,
             GgufType::IQ3_XXS => e.iq3.launch_by_expert_kwide2(
                 s, &mut part_v, down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,

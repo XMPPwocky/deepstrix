@@ -8,6 +8,17 @@ use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const MXFP4_PAIR_GFX1201: &[u8] = include_bytes!(env!("KERNEL_MXFP4_PAIR_MATVEC_GFX1201"));
 const MXFP4_PAIR_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MXFP4_PAIR_MATVEC_GFX1151"));
+/// `kernels/mxfp4_moe_wmma.hip` (the int8-WMMA gate+up / down arm, 2026-09-26
+/// sweep B_moe_prefill). gfx1151 only: the RDNA3 WMMA intrinsic; the gfx12 build
+/// of that file traps, so it is never loaded there.
+pub(crate) const MXFP4_MOE_WMMA_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MXFP4_MOE_WMMA_GFX1151"));
+
+/// Members per work item the WMMA kernels stage (`WM_MAX_CHUNK`; the kernel
+/// silently clamps a larger chunk, which would DROP members, so the launchers
+/// refuse it).
+pub const MXFP4_WMMA_MAX_CHUNK: u32 = 32;
+/// Weight rows per work-group of the WMMA kernels (`WM_ROWS_PER_WG`).
+pub const MXFP4_WMMA_ROWS_PER_WG: u32 = 128;
 
 /// Q8_K superblocks the kernels stage in LDS (`MXFP4_PAIR_MAX_BLOCKS`).
 pub const MXFP4_PAIR_MAX_BLOCKS: u32 = 32;
@@ -17,6 +28,8 @@ pub const MXFP4_KW_MAX_CHUNK: u32 = 32;
 
 pub struct Mxfp4PairMatvec {
     module: Module,
+    /// The int8-WMMA module (gfx1151 only), see [`Self::launch_fused_swiglu_wmma_ex`].
+    wmma: Option<Module>,
 }
 
 /// Warps per workgroup (= rows per workgroup, one row each) for the decode
@@ -43,8 +56,20 @@ impl Mxfp4PairMatvec {
             return Err(eyre!("unsupported arch for mxfp4_pair_matvec: {arch}"));
         };
         let module = Module::load_data(image)?;
-        Ok(Self { module })
+        let wmma = if arch.starts_with("gfx1151") {
+            Some(Module::load_data(MXFP4_MOE_WMMA_GFX1151)?)
+        } else {
+            None
+        };
+        Ok(Self { module, wmma })
     }
+
+    /// Whether the int8-WMMA gate+up kernel exists on this device (gfx1151).
+    pub fn has_wmma(&self) -> bool { self.wmma.is_some() }
+
+    /// The loaded modules (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
+    pub fn wmma_module(&self) -> Option<&Module> { self.wmma.as_ref() }
 
     fn check(mid: &DeviceBuffer<f32>, n_used: u32, n_rows: u32, n_blocks: u32) -> eyre::Result<()> {
         if n_rows % 8 != 0 {
@@ -287,6 +312,69 @@ impl Mxfp4PairMatvec {
         }
         let function = self.module.get_function("mxfp4_pair_matvec_fused_swiglu_kwide")?;
         let cfg = LaunchConfig { grid: (n_rows / 8, n_work_items, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(
+            function,
+            cfg,
+            stream,
+            [
+                mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(), expert_w.raw(),
+                group_count.raw(), expert_members.raw(), work_items.raw(),
+                gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks,
+                n_wi_dev
+            ]
+        )
+    }
+
+    /// int8-WMMA twin of [`Self::launch_fused_swiglu_kwide_ex`]
+    /// (`mxfp4_pair_matvec_fused_swiglu_wmma`, kernels/mxfp4_moe_wmma.hip): the
+    /// SAME argument list and work-item / device-count contract, grid
+    /// (ceil(n_rows/128), n_work_items) x 256. NOT bit-exact vs kwide (f32
+    /// re-association of identical int32 dots, rel_rmse ~5e-7); needs Q8_K `xq`
+    /// with bsums (production q8_k_quantize writes them). gfx1151 only.
+    /// Selected by `dispatch::moe_gate_up_chunked_rows` (`V41_MOE_WMMA_GATEUP`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_wmma_ex(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items_dev: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let module = self.wmma.as_ref().ok_or_else(|| eyre!("mxfp4 pair wmma: no WMMA module on this arch (gfx1151 only)"))?;
+        if n_work_items_dev.is_some() && n_work_items as usize > work_items.len() {
+            return Err(eyre!("mxfp4 pair wmma: grid bound {n_work_items} > work_items {}", work_items.len()));
+        }
+        let n_wi_dev = n_work_items_dev.map_or(std::ptr::null_mut(), |c| c.raw());
+        if n_blocks == 0 || n_blocks > MXFP4_PAIR_MAX_BLOCKS {
+            return Err(eyre!("mxfp4 pair wmma: n_blocks={n_blocks} outside [1, {MXFP4_PAIR_MAX_BLOCKS}]"));
+        }
+        if chunk_size == 0 || chunk_size > MXFP4_WMMA_MAX_CHUNK {
+            return Err(eyre!("mxfp4 pair wmma: chunk_size={chunk_size} not in 1..={MXFP4_WMMA_MAX_CHUNK} (the kernel would drop members)"));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = module.get_function("mxfp4_pair_matvec_fused_swiglu_wmma")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows.div_ceil(MXFP4_WMMA_ROWS_PER_WG), n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         launch_kernel!(
             function,
             cfg,

@@ -9078,10 +9078,12 @@ impl HeterogeneousEngine {
                     // essentially the whole iGPU MoE prefill in the
                     // Vision-Exp mix.
                     let _t_ch = ie.events.stage(
-                        super::dispatch::pair_prefill_stage(routed_src.gate.dtype),
+                        super::dispatch::pair_prefill_stage_rows(ie, routed_src.gate.dtype, b),
                         &ie.compute,
                     )?;
-                    super::dispatch::moe_gate_up_chunked_ex(
+                    // `_rows`: MXFP4 at >= 256 rows takes the int8-WMMA arm
+                    // (`V41_MOE_WMMA_GATEUP`, 2026-09-26 sweep; not bit-exact).
+                    super::dispatch::moe_gate_up_chunked_rows(
                         ie, routed_src.gate.dtype, &ie.compute, d_mid_cat,
                         &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
@@ -9092,6 +9094,7 @@ impl HeterogeneousEngine {
                         crate::config::N_FF_EXP,
                         crate::config::BLOCKS_Q8K_GATE_IN,
                         n_wi_dev,
+                        b,
                     )?
                 };
                 if handled {
@@ -9247,14 +9250,18 @@ impl HeterogeneousEngine {
                         N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
                     )?;
                 } else if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::MXFP4 {
-                    ie.mxfp4.launch_by_expert_kwide2_ex(
-                        &ie.compute, &mut si.q2k_partials,
+                    // By rows: int8-WMMA arm at >= 128 (`V41_MOE_WMMA_DOWN`, not
+                    // bit-exact), small-b twin at <= 8 (`V41_MOE_DOWN_DN2`,
+                    // bit-exact), else kwide2 (2026-09-26 sweep).
+                    super::dispatch::moe_down_mxfp4(
+                        ie, &ie.compute, &mut si.q2k_partials,
                         &routed_src.down.buffer, &si.d_midq_cat,
                         &bi.group_count, &si.expert_members, &si.work_items,
                         n_work_items, dbpe, mid_blocks_bytes as u32,
                         cs_n_used as u32, max_per_expert, CHUNK_SIZE,
                         N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
                         if wi_devcount { Some(&bi.n_work_items) } else { None },
+                        b,
                     )?;
                 } else if use_kwide2 {
                     ie.q2k.launch_by_expert_kwide2(
