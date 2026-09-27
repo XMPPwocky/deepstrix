@@ -500,8 +500,12 @@ pub struct PinLedger {
     queue: std::collections::VecDeque<u32>,
     /// Per layer, `WORDS` u64s: HELD.
     held: Vec<u64>,
-    /// Per `layer * NE + e`: decode picks sent, halved every
-    /// `decay_steps` steps.
+    /// Per `layer * NE + e`: decode picks sent, WEIGHTED BY RANK (a rank-1
+    /// pick adds `N_EXPERT_USED`, a rank-6 pick adds 1), halved every
+    /// `decay_steps` steps. The reads box 2 still pays are the PROTECTED-rank
+    /// picks the cache prior may not swap, so the pool should keep the experts
+    /// that win at rank 1-2 and release the ones only ever picked at swappable
+    /// ranks (2026-09-27: blocked picks were 4-6 of ~5 reads per 3-row step).
     counts: Vec<u32>,
     steps: u32,
     /// `(epoch, pinned, budget)` of the reply with the newest epoch.
@@ -578,12 +582,17 @@ impl PinLedger {
         l < LAYERS && e < NE && (self.held[l * WORDS + e / 64] >> (e % 64)) & 1 == 1
     }
 
-    /// A decode pick sent to box 2 (ranks it for release).
+    /// A decode pick sent to box 2 (ranks it for release), weight 1.
     pub fn note_pick(&mut self, layer: u32, e: u32) {
+        self.note_pick_w(layer, e, 1);
+    }
+
+    /// A decode pick with a rank weight (`N_EXPERT_USED - rank`, rank 0-based).
+    pub fn note_pick_w(&mut self, layer: u32, e: u32, w: u32) {
         let (l, e) = (layer as usize, e as usize);
         if l < LAYERS && e < NE {
             let c = &mut self.counts[l * NE + e];
-            *c = c.saturating_add(1);
+            *c = c.saturating_add(w);
         }
     }
 
@@ -731,9 +740,11 @@ pub fn pin_note_submit(layer: u32, sel: &[i32], decode_shaped: bool) -> ([u32; R
     }
     if decode_shaped {
         if let Ok(mut g) = LEDGER.lock() {
-            for &e in sel {
+            // `sel` is `[b, nu]` in the router's rank order: weight by rank.
+            let nu = crate::config::N_EXPERT_USED;
+            for (i, &e) in sel.iter().enumerate() {
                 if (0..N_EXPERT as i32).contains(&e) {
-                    g.note_pick(layer, e as u32);
+                    g.note_pick_w(layer, e as u32, (nu - i % nu) as u32);
                 }
             }
         }
@@ -1584,6 +1595,37 @@ mod tests {
         set_pin_wanted(false);
         on_connect();
         assert_eq!(pin_request_flag(), 0);
+    }
+
+    /// Rank-weighted ranking: an expert picked once at rank 1 outranks one
+    /// picked three times at rank 6, so a release takes the latter first.
+    #[test]
+    fn pin_release_prefers_rank1_winners() {
+        let nu = crate::config::N_EXPERT_USED as u32;
+        let mut g = PinLedger::new();
+        g.apply_map(4, &map(&[1, 2, 3]), 0);
+        g.note_reply(0, 3, 3);
+        g.note_pick_w(4, 1, nu); // one rank-1 pick
+        for _ in 0..3 {
+            g.note_pick_w(4, 2, 1); // three rank-6 picks
+        }
+        // est 3 > 3 - 1: release down to 3 - 2 = 1 -> the two coldest: 3 (0) and 2 (3).
+        let mut w = g.step(1, 0, 512);
+        w.sort();
+        assert_eq!(w, vec![(4 << 16) | 2, (4 << 16) | 3]);
+        assert!(g.held(4, 1) && !g.held(4, 2) && !g.held(4, 3));
+        // `pin_note_submit` applies the weights from the row position.
+        let _guard = STATICS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut l = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+        *l = PinLedger::new();
+        drop(l);
+        let nu_us = crate::config::N_EXPERT_USED;
+        let mut sel = vec![-1i32; nu_us];
+        sel[0] = 7;
+        sel[nu_us - 1] = 8;
+        let _ = pin_note_submit(5, &sel, true);
+        let l = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!((l.counts[5 * NE + 7], l.counts[5 * NE + 8]), (nu, 1));
     }
 
     /// Release indices wrap without ever becoming 0 (= never released), and

@@ -479,6 +479,29 @@ pub mod hot_set {
                 if own[e] { acc += c as u64; }
             }
             let _ = mass_cap; // ranks decide; the mass is reported, not enforced
+            // CHANGE CAP (`V41_B1_HOT_MAX_CHANGE`, default 0 = unlimited): at
+            // most this many NEWCOMERS per layer per refresh; the excess keeps
+            // the strongest departing incumbents instead, so the set stays
+            // `per_layer` wide. MEASURED 2026-09-27: with hyst 40 a refresh
+            // still flipped 255 ids (p90 462) every ~68 s = 208 GB/h of box-1
+            // reads while the set's pick mass only moved 0.75-0.83, and the
+            // flips are the +18-21 ms of `b1_read` in the slowest decode steps.
+            let cap = env_u("V41_B1_HOT_MAX_CHANGE", 0);
+            if warm && cap > 0 {
+                let prev_own = |e: usize| OWN[l * NE + e].load(Relaxed);
+                let mut newcomers: Vec<(u32, usize)> = (0..NE).filter(|&e| own[e] && !prev_own(e)).map(|e| (COUNTS[l * NE + e].load(Relaxed), e)).collect();
+                if newcomers.len() > cap {
+                    // Weakest newcomers out, strongest departing incumbents back.
+                    newcomers.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    let mut departed: Vec<(u32, usize)> = (0..NE).filter(|&e| !own[e] && prev_own(e)).map(|e| (COUNTS[l * NE + e].load(Relaxed), e)).collect();
+                    departed.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    let excess = newcomers.len() - cap;
+                    for &(_, e) in &newcomers[cap..] { own[e] = false; }
+                    for &(_, e) in departed.iter().take(excess) { own[e] = true; }
+                    // The mass is the accepted set's: recompute it.
+                    acc = (0..NE).filter(|&e| own[e]).map(|e| COUNTS[l * NE + e].load(Relaxed) as u64).sum();
+                }
+            }
             mass_sum += if total > 0 { acc as f32 / total as f32 } else { 0.0 };
             for e in 0..NE {
                 let prev = OWN[l * NE + e].swap(own[e], Relaxed);
@@ -492,6 +515,43 @@ pub mod hot_set {
         TOTAL.store(TOTAL.load(Relaxed) / 2, Relaxed);
         WARM.store(true, Relaxed);
         Some((owned, mass_sum / NL as f32, changed))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The change cap bounds newcomers per layer per refresh and keeps the
+        /// set `per_layer` wide by retaining the strongest departing incumbents.
+        /// (One test: the module's counts are process-wide statics.)
+        #[test]
+        fn refresh_change_cap() {
+            std::env::set_var("V41_B1_HOT_MIN_PICKS", "0");
+            std::env::set_var("V41_B1_HOT_PER_LAYER", "4");
+            std::env::set_var("V41_B1_HOT_HYST", "0");
+            std::env::set_var("V41_B1_HOT_MAX_CHANGE", "1");
+            // Warm-up refresh: layer 0 owns 0..4 (counts 40, 30, 20, 10).
+            for (e, n) in [(0u32, 40), (1, 30), (2, 20), (3, 10)] {
+                for _ in 0..n { note_pick(0, e); }
+            }
+            let (owned, _, _) = refresh().unwrap();
+            assert_eq!(owned, 4);
+            assert!((0..4).all(|e| box1_owns(0, e) == Some(true)));
+            // Now 10..14 are far hotter than everyone: uncapped, all four would
+            // flip; capped at 1 newcomer, only the hottest (10) comes in and the
+            // strongest three incumbents stay.
+            for e in 10u32..14 {
+                for _ in 0..100 { note_pick(0, e); }
+            }
+            let (owned, _, changed) = refresh().unwrap();
+            assert_eq!(owned, 4);
+            assert_eq!(changed, 2, "one in, one out");
+            assert_eq!(box1_owns(0, 10), Some(true));
+            assert!((11..14).all(|e| box1_owns(0, e) == Some(false)));
+            assert!((0..3).all(|e| box1_owns(0, e) == Some(true)), "strongest incumbents kept");
+            assert_eq!(box1_owns(0, 3), Some(false), "the weakest incumbent left");
+            std::env::set_var("V41_B1_HOT_MAX_CHANGE", "0");
+        }
     }
 }
 
