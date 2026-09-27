@@ -659,6 +659,27 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     engine-numerics toggles to the oracle's drafter script ((a) V4-style KV
     quant, (b) Q8 markov head, (c) q8 dense activations); whichever drops the
     reference from 4.38 toward ~2.8 names the culprit with no server downtime.
+    **A1 RESULT (2026-09-27 17:58-18:02 window, logs ~/logs/dspark_parity_20260927):**
+
+    | run | E ours | E ref | 90% paired interval | d1 draft == ref |
+    |---|---|---|---|---|
+    | base, V4.1 ring quantizer | 3.764 | 4.382 | [-0.92, -0.27] | 0.854 |
+    | base, legacy quantizer | 3.719 | 4.382 | [-0.99, -0.32] | 0.854 |
+    | nomarkov | 1.831 | 2.382 | [-0.97, -0.20] | 0.573 |
+
+    FAILS the bar. The quantizer fix is neutral (+0.045, noise). The drafter's own
+    transformer output diverges from the reference inside its three layers: the
+    transformer-only first draft matches the reference's only 57% of the time, and
+    our confidence is systematically LOW (ours - ref mean -3.33 at d1, -1.95 d2,
+    -0.71 d3, -0.49 d4, -0.23 d5; ours d1 mean +5.4 vs +8.75). Agreement given
+    identical earlier drafts is 0.80-0.85 per depth. The markov head (fed the real
+    token at d1) carries d1 up to 0.854. So the next step is a LAYER BISECT of the
+    drafter against reference intermediates for a few steps (per layer: attention
+    output, ring rows, hc mixes, MoE output, pre-head x): dump them from the CPU
+    oracle (drafter only, ~6 GB RAM without the expert cache) and from our drafter
+    (`dspark_parity` dump mode, a one-minute GPU run). Suspects: window attention
+    (sink, scale, inverse RoPE, the per-query loop on gfx1151), hc pre/post mixing,
+    FP8 -> Q8_0 weight requantization and q8 activations.
   * **A2, engine seeding**: `seed_mtp_ring` seeds from ONE prefill lane and only
     the last chunk (`engine_worker.rs` ~2888), so a short prompt or suffix seeds
     about half its rows (the 09-18 log: `seeded=19 n=20` on a 40-token prompt).
