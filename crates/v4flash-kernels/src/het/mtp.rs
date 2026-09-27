@@ -1397,6 +1397,16 @@ impl MtpState {
             None
         };
         // Shared expert, same swiglu clamp as the routed path.
+        //
+        // Its gate/up weights are Q8_0, and `dense_matvec` then reads ONLY the
+        // quantized pair (`xq`, `xscale`), ignoring the f32 row. That pair must
+        // therefore be the FFN input (`normed` after `ffn_norm`), quantized
+        // HERE: the last writer of `self.xq` was `attn()`, which quantized the
+        // ATTENTION input. Before this line the shared expert of every drafter
+        // layer ran on the attention input -- found by the parity test
+        // (tests/dspark_parity.rs: transformer-only first draft matched the
+        // reference 57% of the time, confidence systematically low).
+        e.q8.quantize_input_batched(s, &mut self.xq, &mut self.xscale, &self.normed, N_EMBD, B)?;
         for j in 0..MTP_BLOCK {
             let xr = self.normed.slice_view(j * ne, ne);
             let xqr = self.xq.slice_view(j * ne, ne);
