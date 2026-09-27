@@ -492,9 +492,10 @@ pub mod hot_set {
                 let mut newcomers: Vec<(u32, usize)> = (0..NE).filter(|&e| own[e] && !prev_own(e)).map(|e| (COUNTS[l * NE + e].load(Relaxed), e)).collect();
                 if newcomers.len() > cap {
                     // Weakest newcomers out, strongest departing incumbents back.
-                    newcomers.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    // Count descending, expert id ascending: deterministic among ties.
+                    newcomers.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
                     let mut departed: Vec<(u32, usize)> = (0..NE).filter(|&e| !own[e] && prev_own(e)).map(|e| (COUNTS[l * NE + e].load(Relaxed), e)).collect();
-                    departed.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    departed.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
                     let excess = newcomers.len() - cap;
                     for &(_, e) in &newcomers[cap..] { own[e] = false; }
                     for &(_, e) in departed.iter().take(excess) { own[e] = true; }
@@ -540,8 +541,8 @@ pub mod hot_set {
             // Now 10..14 are far hotter than everyone: uncapped, all four would
             // flip; capped at 1 newcomer, only the hottest (10) comes in and the
             // strongest three incumbents stay.
-            for e in 10u32..14 {
-                for _ in 0..100 { note_pick(0, e); }
+            for (e, n) in [(10u32, 100), (11, 90), (12, 80), (13, 70)] {
+                for _ in 0..n { note_pick(0, e); }
             }
             let (owned, _, changed) = refresh().unwrap();
             assert_eq!(owned, 4);
