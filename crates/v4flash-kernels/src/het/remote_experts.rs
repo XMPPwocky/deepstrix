@@ -2103,6 +2103,12 @@ pub struct ExpertShard {
     /// ... and whether that request is PREFILL-shaped (its reads then land in
     /// the staging band: `prefetch_words_cls`).
     pub park_prefill: bool,
+    /// Mode-aware eviction: the request being served is a PREFILL request by
+    /// the hub's flag (no `REQ_FLAG_DECODE`). With the mode on, a claim is a
+    /// prefill claim only inside a prefill phase AND for such a request, so a
+    /// decode request never ranks in tiers or stamps prefill-class (e.g. the
+    /// first requests after a burst, before the hysteresis ends the phase).
+    pub req_prefill: bool,
     /// Pin mode: each queued request's picks NOT landed when its frame
     /// ARRIVED (see [`EarlyPaged`]). Empty unless pins are on.
     pub early_paged: EarlyPaged,
@@ -3829,6 +3835,7 @@ impl ExpertShard {
             parked_pins: Vec::new(),
             park_words: Vec::new(),
             park_prefill: false,
+            req_prefill: false,
             early_paged: EarlyPaged::default(),
             prefetch_wait_ns: 0,
             ev_admit: [0; 5],
@@ -3860,9 +3867,21 @@ impl ExpertShard {
     /// Mode-aware eviction: note the hub's phase of a request (`flags`) before
     /// serving it.
     pub fn note_request_phase(&mut self, flags: u32) {
+        self.set_request_mode(flags);
         if let Some(pool) = self.pool.as_mut() {
             pool.me_note_request(flags & proto::REQ_FLAG_DECODE == 0);
         }
+    }
+
+    /// The request mode only, not the phase state: a frame served INSIDE a
+    /// parked request's pass (its caller restores the parked one's mode).
+    pub fn set_request_mode(&mut self, flags: u32) {
+        self.req_prefill = flags & proto::REQ_FLAG_DECODE == 0;
+    }
+
+    /// Mode-aware eviction is on for this shard's pool.
+    pub fn mode_evict_on(&self) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.me.on)
     }
 
     /// Hub prefetch words carried by a PREFILL-shaped request (layer-major group
@@ -4693,7 +4712,7 @@ impl ExpertShard {
         // `V41_B2_SCAN_CLASS=0` restores the single LRU.
         // Mode-aware eviction: inside the hub's prefill phase every claim is a
         // prefill claim (a small prompt tail too); otherwise the request shape.
-        let prefill_mode = if pool.me.on { pool.me.prefill_phase } else { prefill_shaped };
+        let prefill_mode = if pool.me.on { pool.me.prefill_phase && self.req_prefill } else { prefill_shaped };
         let scan_class = prefill_mode && b2_scan_class();
         let global = b2_global_pool();
         let r = &mut self.routed;
@@ -5628,7 +5647,7 @@ impl MoeExecutor {
                     for &e in &self.missing_scratch {
                         shard.park_words.push((layer << 16) | e as u32);
                     }
-                    shard.park_prefill = b > 16;
+                    shard.park_prefill = if shard.mode_evict_on() { shard.req_prefill } else { b > 16 };
                     shard.parked_pins.clear();
                     for &e in sel.iter().filter(|&&e| e != NO_PICK && (0..N_EXPERT as i32).contains(&e)) {
                         shard.parked_pins.push((layer, e as u32));
@@ -6500,7 +6519,9 @@ pub fn serve_connection(
                         if !words.is_empty() {
                             shard.pinned = cur_pins.clone();
                             // A prefill chunk's reads land in the staging band.
-                            shard.prefetch_words_cls(&words, true, nreq.b > proto::PIN_DECODE_MAX_ROWS);
+                            // Mode-aware eviction: the frame's hub flag, not its shape.
+                            let pf_class = if shard.mode_evict_on() { nreq.flags & proto::REQ_FLAG_DECODE == 0 } else { nreq.b > proto::PIN_DECODE_MAX_ROWS };
+                            shard.prefetch_words_cls(&words, true, pf_class);
                             shard.pinned.clear();
                         }
                     };
@@ -6566,7 +6587,11 @@ pub fn serve_connection(
                                 let reply = proto::RESP_DATA_OFF + r.b as usize * N_EMBD as usize * elem_out;
                                 b2_adapt_busy_poll(&stream, r.flags & proto::REQ_FLAG_DECODE != 0, buf.len(), reply, opts.socket.busy_poll_us);
                             }
+                            // The served-inside frame sets its own request mode;
+                            // the parked request's is restored for its pass.
+                            let parked_mode = shard.req_prefill;
                             let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
+                            shard.req_prefill = parked_mode;
                             let _ = tx_req_recycle_ref.send(buf);
                             *serve_acc += t_serve.elapsed().as_nanos() as u64;
                             match out {
@@ -7048,7 +7073,10 @@ fn serve_interleaved(
     if req.flags & proto::REQ_FLAG_PIN != 0 {
         shard.pin_enable();
     }
-    shard.note_request_phase(req.flags);
+    // A frame served inside a parked pass: its own claim mode, but it does not
+    // move the phase (a burst of decode frames inside one park must not end a
+    // prefill phase under the parked chunk).
+    shard.set_request_mode(req.flags);
     let ev_pin0 = shard.pin_counters();
     let ev_sc0 = shard.stage_counters();
     shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { req.prefetch });
@@ -7430,8 +7458,13 @@ impl RemoteExpertClient {
             return Ok(());
         }
         let fresh = Self::connect(&self.addr, &self.opts.clone())?;
+        // The hub's phase survives the redial: a fresh client starts "not
+        // decoding", which would flag decode requests as prefill until the next
+        // decode driver sets it (box 2's mode-aware eviction reads the flag).
+        let decode_phase = self.decode_phase;
         // Dropping the old value closes its channel and joins its threads.
         *self = fresh;
+        self.decode_phase = decode_phase;
         eprintln!("remote_experts: reconnected to {}", self.addr);
         Ok(())
     }
@@ -8642,7 +8675,9 @@ mod tests {
                     last_phase = pool.me.phase;
                     phase_decode_victims = 0;
                 }
-                let prefill_mode = if pool.me.prefill_phase { true } else { prefill_req };
+                // As `ensure_layer_inner` with the mode on: a prefill claim only
+                // inside a prefill phase AND for a prefill-flagged request.
+                let prefill_mode = pool.me.prefill_phase && prefill_req;
                 let layer = rng.below(LAYERS as u64) as u32;
                 let want: Vec<u32> = (0..1 + rng.below(6)).map(|_| rng.below(IDS as u64) as u32).collect();
                 let landing = rng.below(8) == 0;
