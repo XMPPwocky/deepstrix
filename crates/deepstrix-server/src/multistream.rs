@@ -1001,7 +1001,10 @@ impl Sched {
             // they are saved EMPTY (a resume replays onto empty rings, like a
             // fresh prompt) rather than stale by `done` positions.
             let done = pf.job.done_rows();
-            if done >= checkpoint_min_rows() && !pf.job.chunks_done() {
+            // Not mid layer-major window: its early groups hold more rows than
+            // its late ones, so no prefix length describes the state (the work
+            // since the last closed window is lost, <= V41_LM_ROWS rows).
+            if done >= checkpoint_min_rows() && !pf.job.chunks_done() && pf.job.checkpoint_ok() {
                 let t = Instant::now();
                 pf.kv.restore_compressor_lending();
                 pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
@@ -1068,7 +1071,7 @@ impl Sched {
                 // empty (see the cancel checkpoint above).
                 let every = env_usize("V41_MS_CHECKPOINT_EVERY", 32768);
                 let done = pf.job.done_rows();
-                if every > 0 && done >= every && (done - rows) / every != done / every {
+                if every > 0 && done >= every && (done - rows) / every != done / every && pf.job.checkpoint_ok() {
                     let t = Instant::now();
                     pf.kv.restore_compressor_lending();
                     pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);

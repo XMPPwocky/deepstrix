@@ -311,6 +311,15 @@ pub enum CedMode {
     Replay,
 }
 
+/// Where `pipelined_range_impl` takes the rows entering its first layer.
+#[derive(Clone, Copy)]
+enum RangeSeed<'a> {
+    /// Host HCs per row, plus (for a range after layer 0) the mHC carry.
+    Host { hcs: &'a [Vec<f32>], carry: Option<&'a [Vec<f32>]> },
+    /// Rows `[row0, row0 + b)` of a device residual / carry store.
+    Device { residual: &'a DeviceBuffer<f32>, carry: &'a DeviceBuffer<f32>, row0: usize },
+}
+
 /// `V41_CED` (default on under the `v41` feature): encoder-only prefill +
 /// Decoder SWA Bounded Replay in `forward_prefill_pipelined` (last-token
 /// path). `V41_CED=0` restores the exact all-40-layer prefill.
@@ -531,6 +540,109 @@ struct ReplayRow {
     carry: Vec<f32>,
 }
 
+// ---------------------------------------------------------------------------
+// LAYER-MAJOR PREFILL (`V41_LM_PREFILL=1`, default OFF; 2026-09-29)
+//
+// A CED prefill chunk runs encoder layers 0..=CED_DECODER_START for <= B_MAX
+// rows, and every chunk pages each layer's expert union through box 2's pool,
+// which evicts prefill-class slots first -- so the next chunk re-reads the same
+// experts from disk (the prefill wall: ~170 box-2 demand reads/s). Layer-major
+// runs a WINDOW of up to `V41_LM_ROWS` rows (default 4096) one layer GROUP at
+// a time over the window's sub-chunks, so each group's experts are paged about
+// once per window instead of once per chunk.
+//
+// Units of work are (group, sub-chunk): one `forward_prompt_batch_v2_pipelined_
+// range` call each, so the scheduler interleaves them with decode bursts like
+// chunks. Sub-chunks are EXACTLY the chunks `plan_chunk` would have cut (same
+// ends, same lane cuts), and each layer sees the same rows in the same order
+// with the same inputs, so the result is meant to be BIT-IDENTICAL to chunked
+// prefill (gated by a GPU test). The rows entering each group live in a device
+// store (`HC_DIM` + `HC_MIX_DIM` f32 per row, ~336 MB at 4096 rows).
+//
+// GROUPS start where a single call's internal state would otherwise leak across
+// a call boundary: every KV-source layer (its reuse layers borrow the source's
+// compressor store inside ONE call) and every index-source layer (the reuse
+// layers read `indexer_sel_saved` -- the source's top-k for the SAME rows,
+// per-lane scratch the next sub-chunk would overwrite). For V4.1 that is
+// [0,2) [2,8) [8,14) [14,20) [20] (layer 20 = CedMode::KvSourceOnly).
+// Checkpoints are only valid BETWEEN windows (mid-window, early groups hold
+// more rows than late ones): `done_rows` advances only when a window completes
+// and `checkpoint_ok` is false while one is open.
+// ---------------------------------------------------------------------------
+
+/// `V41_LM_PREFILL=1`: layer-major CED prefill (see the block comment above).
+pub fn lm_prefill_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_LM_PREFILL").as_deref() == Ok("1"))
+}
+
+/// `V41_LM_ROWS` (default 4096): rows per layer-major window (the device store's
+/// capacity). Clamped below to two chunks (a one-chunk window IS chunked prefill).
+pub fn lm_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_LM_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
+}
+
+/// The layer groups of a layer-major window over encoder layers
+/// `0..=split` (`split` = `CED_DECODER_START`): a new group at layer 0, at every
+/// KV-source / index-source layer below `split`, and `split` alone (it runs
+/// `KvSourceOnly`, and a `KvSourceOnly` range must END there).
+pub fn lm_groups(split: usize) -> Vec<std::ops::Range<usize>> {
+    let mut starts: Vec<usize> = vec![0];
+    for l in 1..split {
+        let src = crate::config::KV_SOURCE_LAYERS.contains(&(l as i32))
+            || crate::config::INDEX_SOURCE_LAYERS.contains(&(l as i32));
+        if src {
+            starts.push(l);
+        }
+    }
+    starts.push(split);
+    let mut groups: Vec<std::ops::Range<usize>> = starts.windows(2).map(|w| w[0]..w[1]).collect();
+    groups.push(split..split + 1);
+    groups
+}
+
+/// One open layer-major window of a [`PrefillJob`].
+struct LmWindow {
+    /// Token indices (into the job's `tokens`) `[start, end)`.
+    start: usize,
+    end: usize,
+    /// Sub-chunks `(start, end, lane cut)`, token indices, as `plan_chunk` cuts them.
+    subs: Vec<(usize, usize, usize)>,
+    /// Next unit: `groups[group]` over `subs[sub]`.
+    group: usize,
+    sub: usize,
+    /// Lazy mode: the window's Engram rows, one `[rows * ENGRAM_IN]` buffer per
+    /// Engram layer, filled by the group-0 units (the inputs arrive with layer 0)
+    /// and read by any later group that contains an Engram layer.
+    engram: Option<Vec<Vec<f32>>>,
+}
+
+/// Plan a layer-major window from `start`: the chunks `plan_chunk` would cut
+/// (capacity `chunk_size`, `lane_caps`), as long as they fit `cap` rows. `None`
+/// when fewer than two chunks fit (then it is just chunked prefill).
+fn lm_plan_window(
+    pos0: u32,
+    start: usize,
+    t: usize,
+    chunk_size: usize,
+    lane_caps: (usize, usize),
+    spans: &[ImageSpan],
+    cap: usize,
+) -> eyre::Result<Option<Vec<(usize, usize, usize)>>> {
+    let mut subs = Vec::new();
+    let mut s = start;
+    while s < t {
+        let (e, b_a) = image_spans::plan_chunk(pos0, s, t, chunk_size, Some(lane_caps), spans)?;
+        if e - start > cap {
+            break;
+        }
+        subs.push((s, e, b_a));
+        s = e;
+    }
+    Ok(if subs.len() >= 2 { Some(subs) } else { None })
+}
+
 /// `V41_PREFILL_LOGITS_DUMP=<path>`: append the last-token prefill logits
 /// (raw f32 LE, `N_VOCAB` per call) — the CED-vs-exact bit-equality gate.
 fn dump_prefill_logits(logits: &[f32]) -> eyre::Result<()> {
@@ -579,6 +691,14 @@ pub struct PrefillJob {
     /// Set by `prefill_job_chunk` after the last chunk when CED is off (the head
     /// is taken there); `prefill_job_finish` returns it.
     last_logits: Option<Vec<f32>>,
+    /// Layer-major window rows (`V41_LM_ROWS` when `V41_LM_PREFILL=1` and CED is
+    /// on; 0 = chunked prefill). Cleared to 0 if the device store cannot be had.
+    lm_rows: usize,
+    /// The open layer-major window, if any.
+    lm: Option<LmWindow>,
+    /// The layer-major device store: rows entering the next group, `(residual
+    /// [cap * HC_DIM], carry [cap * HC_MIX_DIM], cap)`. Kept across windows.
+    lm_store: Option<(DeviceBuffer<f32>, DeviceBuffer<f32>, usize)>,
     /// LAZY inputs: when `input_hcs` is empty the caller supplies the next
     /// chunk's rows through `set_chunk_inputs` right before `prefill_job_chunk`
     /// (embeddings + Engram rows for `next_chunk_range()` only). A 135K-token
@@ -624,6 +744,9 @@ impl PrefillJob {
             ced: ced_enabled(),
             started: std::time::Instant::now(),
             last_logits: None,
+            lm_rows: if lm_prefill_enabled() && ced_enabled() { lm_rows() } else { 0 },
+            lm: None,
+            lm_store: None,
             chunk_inputs: None,
         })
     }
@@ -646,6 +769,24 @@ impl PrefillJob {
         }
     }
     pub fn done_rows(&self) -> usize { self.chunk_start }
+    /// Override the layer-major window (`V41_LM_ROWS` / `V41_LM_PREFILL` pick the
+    /// default): 0 = chunked prefill. Only before the first chunk, and only under
+    /// CED (layer-major is a CED encoder driver). For A/B tests in one process.
+    pub fn set_layer_major_rows(&mut self, rows: usize) -> eyre::Result<()> {
+        if self.chunk_start != 0 || self.lm.is_some() {
+            return Err(eyre!("PrefillJob: layer-major rows can only be set before the first chunk"));
+        }
+        if rows > 0 && !self.ced {
+            return Err(eyre!("PrefillJob: layer-major prefill needs CED"));
+        }
+        self.lm_rows = rows;
+        self.lm_store = None;
+        Ok(())
+    }
+    /// May `state` be CHECKPOINTED now? Not while a layer-major window is open:
+    /// its early groups then hold more rows than its late ones, so no prefix
+    /// length describes the state. (`done_rows` is the last CLOSED window.)
+    pub fn checkpoint_ok(&self) -> bool { self.lm.is_none() }
     pub fn chunks_done(&self) -> bool { self.chunk_start >= self.tokens.len() }
     pub fn pos0(&self) -> u32 { self.pos0 }
     pub fn tokens(&self) -> &[i32] { &self.tokens }
@@ -654,6 +795,11 @@ impl PrefillJob {
     /// `[start, end)` token indices (into `tokens()`) of the chunk the next
     /// `prefill_job_chunk` will run, given the lane capacities it will see.
     pub fn next_chunk_range(&self, lane_caps: (usize, usize)) -> eyre::Result<(usize, usize)> {
+        // Layer-major: inputs (embeddings, Engram rows) are consumed by the
+        // group-0 unit of each sub-chunk only; every other unit takes none.
+        if let Some(w) = self.lm.as_ref() {
+            return Ok(if w.group == 0 { (w.subs[w.sub].0, w.subs[w.sub].1) } else { (self.chunk_start, self.chunk_start) });
+        }
         let t = self.tokens.len();
         let chunk_size = self.chunk_rows.min(lane_caps.0 + lane_caps.1);
         let (end, _) = image_spans::plan_chunk(self.pos0, self.chunk_start, t, chunk_size, Some(lane_caps), &self.image_spans)?;
@@ -685,9 +831,218 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// Layer-major: is a window open (opening one if at least two chunks fit)?
+    /// Allocates the device store on first use, halving `V41_LM_ROWS` down to two
+    /// chunks if VRAM is short; with no store at all the job falls back to
+    /// chunked prefill for good (`lm_rows = 0`). Never opens a window when the
+    /// single-lane shortcut is configured: `Exact` group ranges would take it
+    /// and cut the lanes differently from `plan_chunk` (and from chunked CED).
+    fn lm_open_window(&self, job: &mut PrefillJob, lane_caps: (usize, usize), chunk_size: usize) -> eyre::Result<bool> {
+        if job.lm.is_some() {
+            return Ok(true);
+        }
+        if single_lane_max() > 0 {
+            job.lm_rows = 0;
+            return Ok(false);
+        }
+        let t = job.tokens.len();
+        let min_cap = 2 * chunk_size;
+        let mut cap = job.lm_rows.max(min_cap);
+        if job.lm_store.as_ref().is_none_or(|st| st.2 < cap) {
+            job.lm_store = None;
+            self.set_current_cached(self.dgpu.device)?;
+            let id = self.dgpu.device.id;
+            loop {
+                let got = DeviceBuffer::<f32>::new(id, cap * HC_DIM as usize).and_then(|r| {
+                    DeviceBuffer::<f32>::new(id, cap * HC_MIX_DIM as usize).map(|c| (r, c))
+                });
+                match got {
+                    Ok((r, c)) => {
+                        job.lm_store = Some((r, c, cap));
+                        break;
+                    }
+                    Err(e) if cap / 2 >= min_cap => {
+                        tracing::warn!(cap, error = %e, "layer-major prefill: store allocation failed; halving the window");
+                        cap /= 2;
+                    }
+                    Err(e) => {
+                        tracing::warn!(cap, error = %e, "layer-major prefill: no device store; chunked prefill for this job");
+                        job.lm_rows = 0;
+                        return Ok(false);
+                    }
+                }
+            }
+            job.lm_rows = cap;
+        }
+        let cap = job.lm_store.as_ref().map(|st| st.2).unwrap_or(0);
+        let Some(subs) = lm_plan_window(job.pos0, job.chunk_start, t, chunk_size, lane_caps, &job.image_spans, cap)? else {
+            return Ok(false);
+        };
+        let (start, end) = (job.chunk_start, subs.last().expect("two or more").1);
+        tracing::info!(pos0 = job.pos0 + start as u32, rows = end - start, sub_chunks = subs.len(), cap,
+            tokens_done = start, tokens_total = t, "prefill_lm_window open");
+        job.lm = Some(LmWindow { start, end, subs, group: 0, sub: 0, engram: None });
+        Ok(true)
+    }
+
+    /// Layer-major: run ONE unit -- the open window's next (group, sub-chunk) --
+    /// and advance. Returns the rows COMPLETED: the window's size when this unit
+    /// closed it, else 0 (so `done_rows` and the checkpoint cadence only ever
+    /// see whole windows).
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_job_lm_unit(
+        &self,
+        job: &mut PrefillJob,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<usize> {
+        let split = crate::config::CED_DECODER_START;
+        let groups = lm_groups(split);
+        let (h, m, ein) = (HC_DIM as usize, HC_MIX_DIM as usize, ENGRAM_IN as usize);
+        let (g, k, win_start, win_rows, (s, e, b_a_plan)) = {
+            let w = job.lm.as_ref().ok_or_else(|| eyre!("layer-major: no open window"))?;
+            (w.group, w.sub, w.start, w.end - w.start, w.subs[w.sub])
+        };
+        let b = e - s;
+        let row0 = s - win_start;
+        let range = groups[g].clone();
+        let last_group = g + 1 == groups.len();
+        let ced_mode = if range.end == split + 1 { CedMode::KvSourceOnly } else { CedMode::Exact };
+        let has_engram_layer = crate::config::ENGRAM_LAYERS.iter().any(|&l| range.contains(&(l as usize)));
+        let lazy = job.lazy_inputs();
+        let taken = job.chunk_inputs.take();
+        // Inputs: embeddings (and Engram rows) arrive with the group-0 unit of
+        // each sub-chunk; a later group that holds an Engram layer re-reads the
+        // window's copy of them.
+        let (hcs_lazy, engram_now): (Option<Vec<Vec<f32>>>, Option<Vec<Vec<f32>>>) = if g == 0 {
+            if lazy {
+                let (hcs, eng) = taken.ok_or_else(|| eyre!("layer-major: lazy job has no inputs for rows [{s}, {e})"))?;
+                if hcs.len() != b || eng.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() != b * ein)) {
+                    return Err(eyre!("layer-major: inputs for {} rows, sub-chunk [{s}, {e}) is {b}", hcs.len()));
+                }
+                if let Some(rs) = eng.as_ref() {
+                    let w = job.lm.as_mut().expect("open window");
+                    let buf = w.engram.get_or_insert_with(|| vec![vec![0f32; win_rows * ein]; rs.len()]);
+                    if buf.len() != rs.len() {
+                        return Err(eyre!("layer-major: {} Engram buffers, window holds {}", rs.len(), buf.len()));
+                    }
+                    for (dst, src) in buf.iter_mut().zip(rs) {
+                        dst[row0 * ein..(row0 + b) * ein].copy_from_slice(src);
+                    }
+                }
+                (Some(hcs), eng)
+            } else {
+                (None, job.engram_rows.as_ref().map(|rs| rs.iter().map(|r| r[s * ein..e * ein].to_vec()).collect()))
+            }
+        } else {
+            if taken.as_ref().is_some_and(|(hcs, _)| !hcs.is_empty()) {
+                return Err(eyre!("layer-major: inputs handed to group {g} (only group 0 takes them)"));
+            }
+            let eng = if !has_engram_layer {
+                None
+            } else if lazy {
+                let w = job.lm.as_ref().expect("open window");
+                w.engram.as_ref().map(|rs| rs.iter().map(|r| r[row0 * ein..(row0 + b) * ein].to_vec()).collect())
+            } else {
+                job.engram_rows.as_ref().map(|rs| rs.iter().map(|r| r[s * ein..e * ein].to_vec()).collect())
+            };
+            (None, eng)
+        };
+        if g == 0 && k == 0 {
+            let elapsed_s = job.started.elapsed().as_secs_f32();
+            tracing::info!(chunk = job.chunk_idx, chunk_pos0 = job.pos0 + s as u32, tokens_done = job.chunk_start,
+                tokens_total = job.tokens.len(), elapsed_s = format!("{elapsed_s:.1}"), "prefill_job_progress");
+        }
+        self.dgpu.events.reset();
+        self.igpu.events.reset();
+        let tokens = &job.tokens[s..e];
+        let pos0 = job.pos0 + s as u32;
+        let cut = if g == 0 {
+            let hcs: &[Vec<f32>] = match hcs_lazy.as_ref() {
+                Some(x) => x.as_slice(),
+                None => &job.input_hcs[s..e],
+            };
+            self.forward_prompt_batch_v2_pipelined_range(
+                bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, hcs, tokens, pos0,
+                None, Some(&job.image_spans), pager.as_deref_mut(), engram_now.as_deref(),
+                range.clone(), ced_mode, None,
+            )?
+        } else {
+            let (res, carry, _) = job.lm_store.as_ref().ok_or_else(|| eyre!("layer-major: no device store"))?;
+            self.forward_prompt_batch_v2_pipelined_range_dev(
+                bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, res, carry, row0, tokens, pos0,
+                Some(&job.image_spans), pager.as_deref_mut(), engram_now.as_deref(),
+                range.clone(), ced_mode,
+            )?
+        };
+        if cut != b_a_plan {
+            return Err(eyre!("layer-major: lane cut {cut} != planned {b_a_plan} (group {g}, rows [{s}, {e}))"));
+        }
+        if !last_group {
+            // The rows entering the next group: this range's output residual and
+            // carry (a KvSourceOnly range, which leaves them as they entered, is
+            // only ever the last group).
+            let (res, carry, _) = job.lm_store.as_mut().ok_or_else(|| eyre!("layer-major: no device store"))?;
+            self.set_current_cached(self.dgpu.device)?;
+            let de = &self.dgpu;
+            for (bd, r0, n) in [(&*bd_a, row0, cut), (&*bd_b, row0 + cut, b - cut)] {
+                if n == 0 {
+                    continue;
+                }
+                res.slice_view_mut(r0 * h, n * h).copy_from_buffer_async(&bd.residual.slice_view(0, n * h), &de.compute)?;
+                carry.slice_view_mut(r0 * m, n * m).copy_from_buffer_async(&bd.hc_pre_carry.slice_view(0, n * m), &de.compute)?;
+            }
+            // The lanes are shared with the decode steps the scheduler may run
+            // before this job's next unit: the store must hold its copy first.
+            de.compute.synchronize()?;
+        } else {
+            // Rows ENTERING the decoder layer (KvSourceOnly left them as they
+            // entered): the CED replay window, taken exactly as chunked prefill
+            // takes it after `0..=split`.
+            let take = b.min(SWA_WINDOW as usize);
+            for i in b - take..b {
+                let (src, idx) = if i < cut { (&*bd_a, i) } else { (&*bd_b, i - cut) };
+                let mut row = ReplayRow { tok: job.tokens[s + i], hc: vec![0f32; h], carry: vec![0f32; m] };
+                src.residual.slice_view(idx * h, h).copy_to_host(&mut row.hc)?;
+                src.hc_pre_carry.slice_view(idx * m, m).copy_to_host(&mut row.carry)?;
+                job.replay.push_back(row);
+                if job.replay.len() > SWA_WINDOW as usize {
+                    job.replay.pop_front();
+                }
+            }
+        }
+        self.emit_prefill_perfetto()?;
+        let w = job.lm.as_mut().expect("open window");
+        w.sub += 1;
+        if w.sub < w.subs.len() {
+            return Ok(0);
+        }
+        w.sub = 0;
+        w.group += 1;
+        if w.group < groups.len() {
+            return Ok(0);
+        }
+        let (start, end, n_sub) = (w.start, w.end, w.subs.len());
+        job.lm = None;
+        job.chunk_start = end;
+        job.chunk_idx += n_sub;
+        tracing::info!(rows = end - start, sub_chunks = n_sub, tokens_done = end, tokens_total = job.tokens.len(),
+            elapsed_s = format!("{:.1}", job.started.elapsed().as_secs_f32()), "prefill_lm_window done");
+        Ok(end - start)
+    }
+
     /// Run the job's next chunk (at most `chunk_rows` rows, split across the two
     /// lanes as the pipelined prefill does). Returns the rows processed, 0 when
-    /// the chunks are already done.
+    /// the chunks are already done. Under layer-major (`V41_LM_PREFILL`) it runs
+    /// one (group, sub-chunk) unit instead and returns the rows COMPLETED
+    /// (non-zero only when a window closes).
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_job_chunk(
         &self,
@@ -711,6 +1066,9 @@ impl HeterogeneousEngine {
         super::b2_mirror::expire_incoming();
         let lane_caps = (bd_a.rows, bd_b.rows);
         let chunk_size = job.chunk_rows.min(lane_caps.0 + lane_caps.1);
+        if job.ced && job.lm_rows > 0 && self.lm_open_window(job, lane_caps, chunk_size)? {
+            return self.prefill_job_lm_unit(job, bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, pager);
+        }
         let split = crate::config::CED_DECODER_START;
         let (chunk_end, b_a) = image_spans::plan_chunk(job.pos0, job.chunk_start, t, chunk_size, Some(lane_caps), &job.image_spans)?;
         let chunk_b = chunk_end - job.chunk_start;
@@ -1494,6 +1852,69 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         pos0: u32,
         stats: Option<&mut PrefillStats>,
+        image_spans: Option<&[ImageSpan]>,
+        pager: Option<&mut super::expert_pager::ExpertPager>,
+        engram_rows: Option<&[Vec<f32>]>,
+        layers: std::ops::Range<usize>,
+        ced: CedMode,
+        seed_carry: Option<&[Vec<f32>]>,
+    ) -> eyre::Result<usize> {
+        self.pipelined_range_impl(
+            bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, RangeSeed::Host { hcs: input_hcs, carry: seed_carry },
+            tokens, pos0, stats, image_spans, pager, engram_rows, layers, ced,
+        )
+    }
+
+    /// [`Self::forward_prompt_batch_v2_pipelined_range`] seeded from DEVICE rows
+    /// (layer-major prefill, `V41_LM_PREFILL`): the rows entering `layers.start`
+    /// are rows `[row0, row0 + tokens.len())` of `residual` (`HC_DIM` each) and
+    /// `carry` (`HC_MIX_DIM` each), copied into the lanes on `de.compute` --
+    /// the exact bits a single call over the whole range would have carried
+    /// across that layer boundary. `layers.start` must be > 0 (layer 0 resets
+    /// the carry and takes embeddings from the host).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prompt_batch_v2_pipelined_range_dev(
+        &self,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        residual: &DeviceBuffer<f32>,
+        carry: &DeviceBuffer<f32>,
+        row0: usize,
+        tokens: &[i32],
+        pos0: u32,
+        image_spans: Option<&[ImageSpan]>,
+        pager: Option<&mut super::expert_pager::ExpertPager>,
+        engram_rows: Option<&[Vec<f32>]>,
+        layers: std::ops::Range<usize>,
+        ced: CedMode,
+    ) -> eyre::Result<usize> {
+        self.pipelined_range_impl(
+            bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, RangeSeed::Device { residual, carry, row0 },
+            tokens, pos0, None, image_spans, pager, engram_rows, layers, ced,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipelined_range_impl(
+        &self,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        seed: RangeSeed<'_>,
+        tokens: &[i32],
+        pos0: u32,
+        stats: Option<&mut PrefillStats>,
         // See `forward_prompt_batch_v2`. Each LANE is a KV-visible unit
         // (lane A's post-attention eviction runs before lane B appends),
         // so the lane cut is moved off any image span — `lane_split`.
@@ -1506,10 +1927,13 @@ impl HeterogeneousEngine {
         engram_rows: Option<&[Vec<f32>]>,
         layers: std::ops::Range<usize>,
         ced: CedMode,
-        seed_carry: Option<&[Vec<f32>]>,
     ) -> eyre::Result<usize> {
         self.remote_set_phase_busy_poll(false);
         super::b2_mirror::expire_incoming();
+        let (host_hcs, seed_carry) = match seed {
+            RangeSeed::Host { hcs, carry } => (Some(hcs), carry),
+            RangeSeed::Device { .. } => (None, None),
+        };
         // Same repair as `forward_token_impl`: the steady-state loop below lends
         // each KV-source layer's compressor to its reuse layer and hands it back
         // at the bottom of the iteration, and any `?` in between leaks it.
@@ -1518,11 +1942,25 @@ impl HeterogeneousEngine {
         if b == 0 {
             return Ok(0);
         }
-        if input_hcs.len() != b {
-            return Err(eyre!(
-                "forward_prompt_batch_v2_pipelined: input_hcs len {} != tokens len {b}",
-                input_hcs.len()
-            ));
+        match seed {
+            RangeSeed::Host { hcs, .. } if hcs.len() != b => {
+                return Err(eyre!(
+                    "forward_prompt_batch_v2_pipelined: input_hcs len {} != tokens len {b}",
+                    hcs.len()
+                ));
+            }
+            RangeSeed::Device { residual, carry, row0 } => {
+                if layers.start == 0 {
+                    return Err(eyre!("forward_prompt_batch_v2_pipelined: a device seed needs a range after layer 0"));
+                }
+                if residual.len() < (row0 + b) * HC_DIM as usize || carry.len() < (row0 + b) * HC_MIX_DIM as usize {
+                    return Err(eyre!(
+                        "forward_prompt_batch_v2_pipelined: device seed rows [{row0}, {}) exceed the store ({} / {} floats)",
+                        row0 + b, residual.len(), carry.len()
+                    ));
+                }
+            }
+            _ => {}
         }
         let (lo, hi) = (layers.start, layers.end);
         let split = crate::config::CED_DECODER_START;
@@ -1565,7 +2003,9 @@ impl HeterogeneousEngine {
             && lo == 0
             && hi == N_LAYER as usize
             && engram_rows.is_none()
+            && host_hcs.is_some()
         {
+            let input_hcs = host_hcs.expect("checked above");
             // This path runs the whole batch through lane A, so the cut is `b`.
             // Setting it matters: the ONLY other writer is after this return, so
             // without it a B=1 verify leaves the PREVIOUS call's cut in place and
@@ -1636,8 +2076,6 @@ impl HeterogeneousEngine {
         check_scratch_rows("forward_prompt_batch_v2_pipelined lane B", b_b, bd_b, bi_b, sd, si)?;
         let tokens_a = &tokens[..b_a];
         let tokens_b = &tokens[b_a..];
-        let input_a = &input_hcs[..b_a];
-        let input_b = &input_hcs[b_a..];
         let pos0_a = pos0;
         let pos0_b = pos0 + b_a as u32;
         let vis_a = chunk_visibility(pos0_a, b_a, spans)?;
@@ -1647,17 +2085,39 @@ impl HeterogeneousEngine {
             .store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
 
-        for i in 0..b_a {
-            let mut slot = bd_a
-                .residual
-                .slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
-            slot.copy_from_host(&input_a[i])?;
-        }
-        for i in 0..b_b {
-            let mut slot = bd_b
-                .residual
-                .slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
-            slot.copy_from_host(&input_b[i])?;
+        match seed {
+            RangeSeed::Host { hcs: input_hcs, .. } => {
+                let input_a = &input_hcs[..b_a];
+                let input_b = &input_hcs[b_a..];
+                for i in 0..b_a {
+                    let mut slot = bd_a
+                        .residual
+                        .slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
+                    slot.copy_from_host(&input_a[i])?;
+                }
+                for i in 0..b_b {
+                    let mut slot = bd_b
+                        .residual
+                        .slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
+                    slot.copy_from_host(&input_b[i])?;
+                }
+            }
+            RangeSeed::Device { residual, carry, row0 } => {
+                // Stream-ordered on de.compute, ahead of the first layer's kernels.
+                let (h, m) = (HC_DIM as usize, HC_MIX_DIM as usize);
+                let de = &self.dgpu;
+                for (bd, r0, n) in [(&mut *bd_a, row0, b_a), (&mut *bd_b, row0 + b_a, b_b)] {
+                    if n == 0 {
+                        continue;
+                    }
+                    bd.residual
+                        .slice_view_mut(0, n * h)
+                        .copy_from_buffer_async(&residual.slice_view(r0 * h, n * h), &de.compute)?;
+                    bd.hc_pre_carry
+                        .slice_view_mut(0, n * m)
+                        .copy_from_buffer_async(&carry.slice_view(r0 * m, n * m), &de.compute)?;
+                }
+            }
         }
         if let Some(c) = seed_carry {
             let m = HC_MIX_DIM as usize;
@@ -10744,5 +11204,62 @@ mod remote_sel_tests {
         assert_eq!(remote_sel_override(false, false, &extra, &eff, &sel), vec![3, 250]);
         // Dry (debug split modes): the old path, partition or not.
         assert!(remote_sel_override(true, true, &extra, &eff, &sel).is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "v41"))]
+mod lm_tests {
+    use super::*;
+
+    #[test]
+    fn lm_groups_follow_the_source_layers() {
+        let split = crate::config::CED_DECODER_START;
+        let groups = lm_groups(split);
+        assert_eq!(groups, vec![0..2, 2..8, 8..14, 14..20, 20..21]);
+        for g in &groups {
+            // A group never starts on a layer that borrows state from an
+            // earlier layer (that state would have to cross a call boundary).
+            assert!(crate::config::kv_source_of(g.start).is_none(), "group {g:?} starts on a KV reuse layer");
+            let ix = crate::config::index_source_of(g.start);
+            assert!(ix.is_none() || ix == Some(g.start), "group {g:?} starts on an index reuse layer");
+            // Every layer's KV source and index source are inside its group.
+            for l in g.clone() {
+                if let Some(s) = crate::config::kv_source_of(l) {
+                    assert!(g.contains(&s), "L{l}: KV source {s} outside group {g:?}");
+                }
+                if let Some(s) = crate::config::index_source_of(l) {
+                    assert!(g.contains(&s), "L{l}: index source {s} outside group {g:?}");
+                }
+            }
+        }
+        // Contiguous cover of the encoder layers 0..=split.
+        assert_eq!(groups.first().unwrap().start, 0);
+        assert_eq!(groups.last().unwrap().end, split + 1);
+        for w in groups.windows(2) {
+            assert_eq!(w[0].end, w[1].start);
+        }
+    }
+
+    #[test]
+    fn lm_plan_window_cuts_the_chunked_plan() {
+        // 5000 rows, 1024-row chunks in 512/512 lanes: a 4096 window holds four
+        // chunks; the 904-row tail is one chunk (no window).
+        let subs = lm_plan_window(0, 0, 5000, 1024, (512, 512), &[], 4096).unwrap().unwrap();
+        assert_eq!(subs, vec![(0, 1024, 512), (1024, 2048, 512), (2048, 3072, 512), (3072, 4096, 512)]);
+        assert!(lm_plan_window(0, 4096, 5000, 1024, (512, 512), &[], 4096).unwrap().is_none());
+        // A cap that is not a multiple of the chunk takes the chunks that fit.
+        let subs = lm_plan_window(7, 100, 5000, 1024, (512, 512), &[], 3000).unwrap().unwrap();
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[1].1, 2148);
+        // Same cuts as plan_chunk, chunk by chunk (with an image span in the way).
+        let spans = [(1500u32, 300u32)];
+        let subs = lm_plan_window(0, 0, 5000, 1024, (512, 512), &spans, 4096).unwrap().unwrap();
+        let mut s = 0;
+        for &(a, e, b_a) in &subs {
+            assert_eq!(a, s);
+            assert_eq!(image_spans::plan_chunk(0, a, 5000, 1024, Some((512, 512)), &spans).unwrap(), (e, b_a));
+            s = e;
+        }
+        assert!(subs.last().unwrap().1 <= 4096);
     }
 }
