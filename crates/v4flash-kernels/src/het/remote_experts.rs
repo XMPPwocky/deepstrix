@@ -2180,6 +2180,108 @@ struct ShardPool {
     /// See "PREFILL STAGING" in the pinning block below.
     stage: u32,
     sc: StageCounters,
+    /// Mode-aware eviction (`V41_B2_MODE_EVICT`); off unless enabled at load.
+    me: ModeEvict,
+}
+
+// ---------------------------------------------------------------------------
+// MODE-AWARE EVICTION (2026-09-29, `V41_B2_MODE_EVICT=1`, default OFF; needs
+// staging off and the two-class LRU on).
+//
+// The two-class LRU stamps prefill-class slots older than every decode-class
+// one, and the victim search takes the global minimum: right for DECODE (a
+// prefill burst must not wipe decode's cold tier), wrong for PREFILL, whose
+// claims then evict prefill's OWN pages first -- the prefill class never
+// outgrows about one layer's miss union, so every chunk (and every sub-chunk
+// of a layer-major group) re-reads what the previous one paged. With staging
+// off, prefill's early-page / park landings are also stamped decode-class and
+// search the same global minimum, i.e. they evict prefill's demand pages too.
+//
+// With it on, a PREFILL-mode search (a prefill-shaped claim or a prefill
+// landing) ranks candidates in TIERS, least-recently-used within a tier:
+//   0 free
+//   1 prefill-class, stale (last used before this prefill phase began)
+//   2 decode-class, while this phase's BUDGET of decode victims lasts
+//   3 prefill-class, this phase (prefill evicts its own oldest)
+//   4 decode-class, budget spent
+//   5 decode-class slots this prefill phase HIT (it is still using them)
+// A decode-mode search is unchanged (prefill-class first, then decode LRU).
+// Every decode victim a prefill-mode search takes is recorded with its stamp
+// (`decode_delta`) for the delta restore that follows (not yet built).
+// Prefill's early-page / park reads land prefill-class. The mode is the
+// request's shape (`prefill_shaped`), noted at every `ensure`; a change of
+// mode is a PHASE switch (the hub runs prefill and decode in bursts).
+// ---------------------------------------------------------------------------
+
+/// Per-phase counters of mode-aware eviction (logged at each phase switch).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModeEvictCounters {
+    pub took_free: u64,
+    pub took_stale: u64,
+    pub took_decode: u64,
+    pub took_own: u64,
+    pub took_decode_over: u64,
+    pub took_decode_touched: u64,
+}
+
+/// Mode-aware eviction state (see the block above).
+#[derive(Debug, Default)]
+struct ModeEvict {
+    on: bool,
+    /// Decode victims one prefill phase may take before preferring its own.
+    budget: u64,
+    budget_left: u64,
+    /// The current phase is prefill (else decode).
+    prefill_phase: bool,
+    /// Prefill phases begun (1-based once the first begins).
+    phase: u32,
+    /// `tick` when the current prefill phase began.
+    phase_start: u64,
+    /// Per slot: the prefill phase that last HIT this decode-class slot.
+    phase_touch: Vec<u32>,
+    /// Decode experts evicted by prefill-mode searches `(layer, e, stamp)`,
+    /// oldest first, capped (`MODE_EVICT_DELTA_CAP`).
+    decode_delta: std::collections::VecDeque<(u32, u32, u64)>,
+    c: ModeEvictCounters,
+}
+
+const MODE_EVICT_DELTA_CAP: usize = 16384;
+
+/// `V41_B2_MODE_EVICT=1`: mode-aware eviction (default OFF).
+pub fn b2_mode_evict() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_B2_MODE_EVICT").as_deref() == Ok("1"));
+    *B
+}
+
+/// `V41_B2_PREFILL_BUDGET` (default 2048): decode victims one prefill phase may
+/// take before it evicts its own oldest pages. ~ today's measured displacement
+/// per prefill phase (2,136 decode experts median, 2026-09-27).
+pub fn b2_prefill_budget() -> u64 {
+    static B: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_PREFILL_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
+    });
+    *B
+}
+
+impl ModeEvict {
+    fn enabled(n_slots: usize, budget: u64) -> Self {
+        Self { on: true, budget, phase_touch: vec![0; n_slots], ..Default::default() }
+    }
+
+    /// Tier of an eligible candidate for a PREFILL-mode search (block above).
+    fn tier(&self, slot: u32, last_use: u64, free: bool) -> u8 {
+        if free {
+            0
+        } else if last_use < PREFILL_AGE {
+            if last_use < self.phase_start { 1 } else { 3 }
+        } else if self.phase_touch[slot as usize] == self.phase {
+            5
+        } else if self.budget_left > 0 {
+            2
+        } else {
+            4
+        }
+    }
 }
 
 /// Prefill-staging counters (cumulative since `enable_paging`; `b2_req`
@@ -2693,6 +2795,68 @@ impl ShardPool {
             pins: PinBook::off(),
             stage: n_slots as u32,
             sc: StageCounters::default(),
+            me: ModeEvict::default(),
+        }
+    }
+
+    /// Turn mode-aware eviction on (load time; also tests).
+    fn enable_mode_evict(&mut self, budget: u64) {
+        self.me = ModeEvict::enabled(self.owner_of.len(), budget);
+    }
+
+    /// Note the mode of the request about to claim / land (`ensure`): a change
+    /// is a phase switch. Starting a prefill phase resets its budget and stamps
+    /// its start; the ending phase's counters are logged.
+    fn me_note_mode(&mut self, prefill: bool) {
+        if !self.me.on || prefill == self.me.prefill_phase {
+            return;
+        }
+        let c = self.me.c;
+        if self.me.prefill_phase {
+            eprintln!(
+                "expertd: mode-evict prefill phase {} ended: victims free {} stale-prefill {} decode {} (budget {}, {} left) own-prefill {} decode-over-budget {} decode-in-use {}; decode delta {}",
+                self.me.phase, c.took_free, c.took_stale, c.took_decode, self.me.budget, self.me.budget_left,
+                c.took_own, c.took_decode_over, c.took_decode_touched, self.me.decode_delta.len()
+            );
+        }
+        self.me.prefill_phase = prefill;
+        self.me.c = ModeEvictCounters::default();
+        if prefill {
+            self.me.phase += 1;
+            self.me.phase_start = self.tick;
+            self.me.budget_left = self.me.budget;
+        }
+    }
+
+    /// Account the victim a search in `prefill_mode` is about to evict (call
+    /// BEFORE `evict`, which clears the owner): budget, counters, the delta.
+    fn me_account(&mut self, slot: u32, prefill_mode: bool) {
+        if !(self.me.on && prefill_mode) {
+            return;
+        }
+        let lu = self.last_use[slot as usize];
+        let Some((l, e)) = self.owner_of[slot as usize] else {
+            self.me.c.took_free += 1;
+            return;
+        };
+        if lu >= PREFILL_AGE {
+            if self.me.phase_touch[slot as usize] == self.me.phase {
+                self.me.c.took_decode_touched += 1;
+            }
+            if self.me.budget_left > 0 {
+                self.me.budget_left -= 1;
+                self.me.c.took_decode += 1;
+            } else {
+                self.me.c.took_decode_over += 1;
+            }
+            if self.me.decode_delta.len() >= MODE_EVICT_DELTA_CAP {
+                self.me.decode_delta.pop_front();
+            }
+            self.me.decode_delta.push_back((l, e, lu));
+        } else if lu < self.me.phase_start {
+            self.me.c.took_stale += 1;
+        } else {
+            self.me.c.took_own += 1;
         }
     }
 
@@ -2740,10 +2904,13 @@ impl ShardPool {
         extra: ExtraPins<'_>,
         for_layer: u32,
         ignore_hub_pins: bool,
+        prefill_mode: bool,
     ) -> Option<u32> {
         let n = self.owner_of.len() as u32;
         let range = range.start.min(n)..range.end.min(n);
-        let mut best: Option<(u64, u32)> = None;
+        // Mode-aware eviction: a prefill-mode search ranks by (tier, recency).
+        let tiered = prefill_mode && self.me.on;
+        let mut best: Option<((u8, u64), u32)> = None;
         for sl in range {
             let ok = match self.owner_of[sl as usize] {
                 Some((ol, oe)) => {
@@ -2763,8 +2930,9 @@ impl ShardPool {
                 continue;
             }
             let t = self.last_use[sl as usize];
-            if best.is_none_or(|(bt, _)| t < bt) {
-                best = Some((t, sl));
+            let key = if tiered { (self.me.tier(sl, t, self.owner_of[sl as usize].is_none()), t) } else { (0, t) };
+            if best.is_none_or(|(bk, _)| key < bk) {
+                best = Some((key, sl));
             }
         }
         best.map(|(_, sl)| sl)
@@ -2785,15 +2953,16 @@ impl ShardPool {
         extra: ExtraPins<'_>,
         for_layer: u32,
         ignore_hub_pins: bool,
+        prefill_mode: bool,
     ) -> Option<u32> {
         let n = self.owner_of.len() as u32;
         match band {
             Band::Main => {
                 let first = if global { 0..self.stage } else { region.0.min(self.stage)..region.1.min(self.stage) };
-                self.pick_victim(first, want_layer, want, extra, for_layer, ignore_hub_pins)
-                    .or_else(|| self.pick_victim(0..self.stage, want_layer, want, extra, for_layer, ignore_hub_pins))
+                self.pick_victim(first, want_layer, want, extra, for_layer, ignore_hub_pins, prefill_mode)
+                    .or_else(|| self.pick_victim(0..self.stage, want_layer, want, extra, for_layer, ignore_hub_pins, prefill_mode))
             }
-            Band::Stage => self.pick_victim(self.stage..n, want_layer, want, extra, for_layer, ignore_hub_pins),
+            Band::Stage => self.pick_victim(self.stage..n, want_layer, want, extra, for_layer, ignore_hub_pins, prefill_mode),
         }
     }
 
@@ -2831,6 +3000,10 @@ impl ShardPool {
         if scan_class || staged {
             if *lu < PREFILL_AGE {
                 *lu = self.tick;
+            } else if self.me.on && scan_class {
+                // Mode-aware eviction: this prefill phase is using decode's slot;
+                // its own later claims take it last (tier 5).
+                self.me.phase_touch[slot as usize] = self.me.phase;
             }
         } else {
             *lu = self.tick + PREFILL_AGE;
@@ -2866,24 +3039,25 @@ impl ShardPool {
     ) -> Option<(u32, Option<(u32, u32)>)> {
         let staged = prefill_shaped && self.stage_slots() > 0;
         let (own, other) = if staged { (Band::Stage, Band::Main) } else { (Band::Main, Band::Stage) };
-        let victim = match self.pick_victim_any(region, global, own, layer, want, extra, layer, false) {
+        let victim = match self.pick_victim_any(region, global, own, layer, want, extra, layer, false, prefill_shaped) {
             Some(v) => {
                 self.sc.claims += u64::from(staged);
                 v
             }
-            None => match (self.stage_slots() > 0).then(|| self.pick_victim_any(region, global, other, layer, want, extra, layer, false)).flatten() {
+            None => match (self.stage_slots() > 0).then(|| self.pick_victim_any(region, global, other, layer, want, extra, layer, false, prefill_shaped)).flatten() {
                 Some(v) => {
                     if staged { self.sc.spill_out += 1 } else { self.sc.spill_in += 1 }
                     v
                 }
                 None if self.pins.on => {
-                    let v = self.pick_victim_any(region, global, Band::Main, layer, want, extra, layer, true)?;
+                    let v = self.pick_victim_any(region, global, Band::Main, layer, want, extra, layer, true, prefill_shaped)?;
                     self.pins.c.revokes += 1;
                     v
                 }
                 None => return None,
             },
         };
+        self.me_account(victim, prefill_shaped);
         let evicted = self.evict(victim, layer);
         self.owner_of[victim as usize] = Some((layer, e));
         self.slot_of.insert((layer, e), victim);
@@ -3658,6 +3832,11 @@ impl ExpertShard {
         if words.is_empty() || self.pool.is_none() {
             return;
         }
+        // Mode-aware eviction: a prefill request's own early-page / park reads
+        // land PREFILL-class even with staging off (they used to land
+        // decode-class and search the global minimum = prefill's own pages).
+        let me_on = self.pool.as_ref().is_some_and(|p| p.me.on);
+        let prefill = prefill || (me_on && stage && self.stage_slots() == 0);
         let stage = stage && self.stage_slots() > 0;
         if self.prefetch.is_none() {
             if self.pf_stages_spare.is_empty() {
@@ -3947,16 +4126,20 @@ impl ExpertShard {
             // prefill chunk's read (`stage`) lands in the staging band only
             // and is dropped when that has no victim.
             let band = if d.stage { Band::Stage } else { Band::Main };
-            let Some(victim) = pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, false) else {
+            // Mode-aware eviction: a prefill landing (staged, or prefill-class)
+            // searches in prefill mode.
+            let prefill_landing = d.stage || d.prefill;
+            let Some(victim) = pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, false, prefill_landing) else {
                 if d.stage {
                     pool.sc.drops += 1;
-                } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, true).is_some() {
+                } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, true, prefill_landing).is_some() {
                     pool.pins.c.no_victim_drops += 1;
                 }
                 pf.free.push(d.set);
                 continue;
             };
             let ev_scan_ns = ev_t_scan.elapsed().as_nanos() as f64;
+            pool.me_account(victim, prefill_landing);
             let ev_victim = pool.evict(victim, cur_layer);
             let ev_t_repack = std::time::Instant::now();
             let landed: eyre::Result<()> = match (repack, repack_stream) {
@@ -4106,6 +4289,14 @@ impl ExpertShard {
         // Prefill staging band (the block above `PIN_RESERVE_MIN`): the pin
         // budget a connection will get is stated here once, at startup.
         let stage = pool.set_stage(b2_prefill_stage());
+        if b2_mode_evict() {
+            if stage == 0 && b2_scan_class() {
+                pool.enable_mode_evict(b2_prefill_budget());
+                eprintln!("expertd: mode-aware eviction ON (prefill budget {} decode victims per phase)", b2_prefill_budget());
+            } else {
+                eprintln!("expertd: V41_B2_MODE_EVICT=1 IGNORED: needs V41_B2_PREFILL_STAGE=0 and the two-class LRU (V41_B2_SCAN_CLASS != 0)");
+            }
+        }
         let floors: usize = pool.floor.iter().map(|&f| f as usize).sum();
         let reserve = b2_pin_reserve(stage);
         eprintln!(
@@ -4437,6 +4628,8 @@ impl ExpertShard {
             pool.dirty[layer as usize] = false;
         }
         let ev_t_dirty = if ev_on { super::evtrace::now() } else { nan };
+        // Mode-aware eviction: this request's shape is the phase.
+        pool.me_note_mode(prefill_shaped);
         // `evtrace`: staging claims / hits / spills across this call.
         let ev_sc0 = pool.sc;
         // ONE POOL for all layers. The per-layer carve was never load-bearing: it
@@ -8247,8 +8440,8 @@ mod tests {
         // without a revoke; a background landing would be dropped.
         let want = [10u32, 11, 0, 3];
         let extra = [(2u32, 1u32)];
-        assert!(pool.pick_victim_any((4, 8), true, Band::Main, 2, &want, &extra, 2, false).is_none());
-        assert!(pool.pick_victim_any((4, 8), true, Band::Main, 2, &want, &extra, 2, true).is_some(), "only pins stand in the way");
+        assert!(pool.pick_victim_any((4, 8), true, Band::Main, 2, &want, &extra, 2, false, false).is_none());
+        assert!(pool.pick_victim_any((4, 8), true, Band::Main, 2, &want, &extra, 2, true, false).is_some(), "only pins stand in the way");
         for (l, e) in [(1u32, 0u32), (1, 1), (1, 2)] {
             assert!(pool.slot_of.contains_key(&(l, e)) && pool.remap_hosts[l as usize][e as usize] != 0);
         }
@@ -8272,6 +8465,83 @@ mod tests {
         assert!(ev.is_some());
         assert_eq!((pool.pins.c.revokes, pool.pins.c.pinned_evictions, pool.pins.pinned), (1, 1, 1));
         assert!(PIN_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed) > v0);
+    }
+
+    /// MODE-AWARE EVICTION (the block above `ModeEvictCounters`): a prefill
+    /// phase takes stale prefill slots first, then decode's LRU within its
+    /// budget (recording each in the delta), then its own oldest pages; a
+    /// decode claim is unchanged; with the mode off a prefill search is the
+    /// plain global LRU.
+    #[test]
+    fn pool_mode_evict_tiers_budget_and_delta() {
+        let ids: Vec<u32> = (0..4).collect();
+        // Off: a prefill-mode search is the plain LRU (slot 0 is the oldest).
+        let pool = ShardPool::seeded(12, &[(1, 0, &ids), (2, 4, &ids), (3, 8, &ids)], 0.0);
+        assert_eq!(pool.pick_victim_any((0, 12), true, Band::Main, 9, &[], &[], 9, false, true), Some(0));
+
+        let mut pool = ShardPool::seeded(12, &[(1, 0, &ids), (2, 4, &ids), (3, 8, &ids)], 0.0);
+        pool.enable_mode_evict(2);
+        // Decode touches layers 2 and 3 (decode-class), in the order
+        // (2,0) (3,0) (2,1) (3,1) ...; layer 1 stays prefill-class (seeded).
+        for e in 0..4 {
+            assert!(pool.touch_hit(2, e, false));
+            assert!(pool.touch_hit(3, e, false));
+        }
+        pool.me_note_mode(true);
+        assert_eq!((pool.me.phase, pool.me.budget_left), (1, 2));
+        let region = (0, 12);
+        let want5: Vec<u32> = (20..27).collect();
+        // Tier 1: layer 1's stale prefill slots first.
+        for e in 20..24 {
+            let (slot, ev) = pool.claim_miss(5, e, &want5, &[], region, true, true, true).unwrap();
+            assert_eq!(ev.map(|x| x.0), Some(1), "claim of {e} takes a stale prefill slot");
+            pool.commit(5, e, slot);
+        }
+        // Tier 2: decode's LRU while the budget lasts (layer 5's own pages are
+        // wanted by this pass, so they are not candidates here anyway).
+        let (s1, ev1) = pool.claim_miss(5, 24, &want5, &[], region, true, true, true).unwrap();
+        assert_eq!(ev1, Some((2, 0)));
+        pool.commit(5, 24, s1);
+        let (s2, ev2) = pool.claim_miss(5, 25, &want5, &[], region, true, true, true).unwrap();
+        assert_eq!(ev2, Some((3, 0)));
+        pool.commit(5, 25, s2);
+        assert_eq!(pool.me.budget_left, 0);
+        // Tier 3: budget spent, another layer's claim takes prefill's OWN
+        // oldest page, not decode's.
+        let (s3, ev3) = pool.claim_miss(6, 30, &[30], &[], region, true, true, true).unwrap();
+        assert_eq!(ev3, Some((5, 20)));
+        pool.commit(6, 30, s3);
+        let c = pool.me.c;
+        assert_eq!((c.took_stale, c.took_decode, c.took_own, c.took_decode_over), (4, 2, 1, 0));
+        let delta: Vec<(u32, u32)> = pool.me.decode_delta.iter().map(|&(l, e, _)| (l, e)).collect();
+        assert_eq!(delta, vec![(2, 0), (3, 0)]);
+        assert!(pool.me.decode_delta.iter().all(|&(_, _, t)| t >= PREFILL_AGE), "the delta keeps decode stamps");
+        // Decode mode is unchanged: prefill-class (layer 5/6 pages) first.
+        pool.me_note_mode(false);
+        let (s4, ev4) = pool.claim_miss(8, 40, &[40], &[], region, true, false, false).unwrap();
+        assert_eq!(ev4.map(|x| x.0), Some(5), "a decode claim takes prefill-class first");
+        pool.commit(8, 40, s4);
+        // The next prefill phase gets a fresh budget.
+        pool.me_note_mode(true);
+        assert_eq!((pool.me.phase, pool.me.budget_left, pool.me.c), (2, 2, ModeEvictCounters::default()));
+    }
+
+    /// Past its budget a prefill phase takes decode slots it is NOT using
+    /// (tier 4) before the ones it hit this phase (tier 5).
+    #[test]
+    fn pool_mode_evict_spares_decode_slots_prefill_is_using() {
+        let ids: Vec<u32> = (0..3).collect();
+        let mut pool = ShardPool::seeded(3, &[(2, 0, &ids)], 0.0);
+        pool.enable_mode_evict(0);
+        for e in 0..3 {
+            assert!(pool.touch_hit(2, e, false)); // all decode-class, (2,0) oldest
+        }
+        pool.me_note_mode(true);
+        assert!(pool.touch_hit(2, 0, true), "a prefill hit on decode's slot");
+        assert!(pool.last_use[0] >= PREFILL_AGE, "it stays decode-class");
+        let (_, ev) = pool.claim_miss(7, 50, &[50], &[], (0, 3), true, true, true).unwrap();
+        assert_eq!(ev, Some((2, 1)), "the oldest decode slot prefill is NOT using");
+        assert_eq!(pool.me.c.took_decode_over, 1);
     }
 
     /// PREFILL STAGING on a seeded pool (the block above `PIN_RESERVE_MIN`):
@@ -8304,12 +8574,12 @@ mod tests {
         pool.commit(2, 30, slot);
         assert_eq!(pool.sc.claims, 3);
         // Landings: a staged one inside, a decode one outside.
-        let v = pool.pick_victim_any(region, true, Band::Stage, 2, &[], &[], 1, false).unwrap();
+        let v = pool.pick_victim_any(region, true, Band::Stage, 2, &[], &[], 1, false, false).unwrap();
         assert_eq!(v, 11);
         pool.evict(v, 2);
         pool.land(v, (1, 40), true);
         assert!(pool.last_use[11] < PREFILL_AGE, "a staged landing is prefill-class");
-        let v = pool.pick_victim_any(region, true, Band::Main, 2, &[], &[], 1, false).unwrap();
+        let v = pool.pick_victim_any(region, true, Band::Main, 2, &[], &[], 1, false, false).unwrap();
         assert!(v < 8, "a decode landing stays in main (got {v})");
         pool.evict(v, 2);
         pool.land(v, (1, 41), false);
@@ -8525,7 +8795,7 @@ mod tests {
                 }
                 let region = self.region(key.0);
                 let band = if stage { Band::Stage } else { Band::Main };
-                match self.pool.pick_victim_any(region, self.global, band, layer, want, extra, key.0, false) {
+                match self.pool.pick_victim_any(region, self.global, band, layer, want, extra, key.0, false, false) {
                     Some(v) => {
                         // STAGING INVARIANT: a landing takes a slot of its own band.
                         assert_eq!(v >= self.pool.stage, stage, "landing of {key:?} (stage {stage}) at slot {v}");
@@ -8536,7 +8806,7 @@ mod tests {
                     None => {
                         if stage {
                             self.pool.sc.drops += 1;
-                        } else if self.pool.pick_victim_any(region, self.global, band, layer, want, extra, key.0, true).is_some() {
+                        } else if self.pool.pick_victim_any(region, self.global, band, layer, want, extra, key.0, true, false).is_some() {
                             self.pool.pins.c.no_victim_drops += 1;
                         }
                         self.st.bg_dropped += 1;
