@@ -1427,6 +1427,8 @@ struct PfDone {
     set: usize,
     /// `PfJob::stage`: lands in the prefill staging band.
     stage: bool,
+    /// `PfJob::prefill`: lands prefill-class.
+    prefill: bool,
     offs: [Option<(usize, usize, u32, u32)>; 3],
     coalesced: bool,
     /// Hint sent -> a reader picked it up (queueing behind other reads).
@@ -1451,6 +1453,9 @@ struct PfJob {
     /// A PREFILL-shaped request's own pick (its early page / park): lands in
     /// the staging band, and reads by `knobs::prefill_route_split`.
     stage: bool,
+    /// Lands PREFILL-class (evicted first) even outside the staging band: a hub
+    /// word carried by a prefill-shaped request (layer-major group prefetch).
+    prefill: bool,
     t_hint: std::time::Instant,
 }
 
@@ -3629,6 +3634,18 @@ impl ExpertShard {
     /// page or park): the reads land in the staging band, prefill-class, and
     /// route by `knobs::prefill_route_split`. Ignored with staging off.
     pub fn prefetch_words_cls(&mut self, words: &[u32], certain: bool, stage: bool) {
+        self.prefetch_words_full(words, certain, stage, false)
+    }
+
+    /// Hub prefetch words carried by a PREFILL-shaped request (layer-major group
+    /// prefetch, `V41_LM_PREFETCH`): speculative, but they land PREFILL-class
+    /// (evicted before decode's residents, like the prefill's own demand pages)
+    /// instead of decode-class. In the main band when staging is off.
+    pub fn prefetch_words_prefill(&mut self, words: &[u32]) {
+        self.prefetch_words_full(words, false, false, true)
+    }
+
+    fn prefetch_words_full(&mut self, words: &[u32], certain: bool, stage: bool, prefill: bool) {
         if words.is_empty() || self.pool.is_none() {
             return;
         }
@@ -3663,7 +3680,7 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let urgency = knobs::route_urgency();
-                    let Some(PfJob { layer, e, set, certain, stage, t_hint }) = queue_r.pop_mode(urgency) else { break };
+                    let Some(PfJob { layer, e, set, certain, stage, prefill, t_hint }) = queue_r.pop_mode(urgency) else { break };
                     let ev_on = super::evtrace::enabled();
                     let ev_t_pop = if ev_on { super::evtrace::now() } else { f64::NAN };
                     let mut ev_yield_ns = 0u64;
@@ -3730,7 +3747,7 @@ impl ExpertShard {
                     }
                     drop(done);
                     let msg = match r {
-                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, offs, coalesced, queue_ns, read_ns, ev }),
+                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, prefill, offs, coalesced, queue_ns, read_ns, ev }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
                     };
                     if tx_done.send(msg).is_err() {
@@ -3772,7 +3789,7 @@ impl ExpertShard {
             let Some(set) = pf.free.pop() else { pf.dropped += 1; continue };
             pf.pending.insert(key);
             pf.hinted += 1;
-            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, t_hint: std::time::Instant::now() });
+            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, prefill, t_hint: std::time::Instant::now() });
         }
     }
 
@@ -3946,7 +3963,7 @@ impl ExpertShard {
                 pf.free.push(d.set);
                 return Err(err);
             }
-            pool.land(victim, key, d.stage);
+            pool.land(victim, key, d.stage || d.prefill);
             pf.admitted += 1;
             pf.free.push(d.set);
             if ev_on {
@@ -6129,16 +6146,22 @@ pub fn serve_connection(
                 }
                 let ev_pin0 = shard.pin_counters();
                 let ev_sc0 = shard.stage_counters();
-                shard.pin_apply_words(req.release, req.prefetch);
+                // A prefill-shaped request's prefetch words are layer-major group
+                // prefetch, never pin grants (they would pin prefill experts).
+                shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { req.prefetch });
                 if let Some(rb) = reqb.as_ref() {
-                    shard.pin_apply_words(rb.release, rb.prefetch);
+                    shard.pin_apply_words(rb.release, if rb.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { rb.prefetch });
                 }
                 if let Some(rb) = reqb.as_ref() {
                     if !rb.hint_admit.is_empty() {
                         shard.hint_evict_first(rb.hint_admit);
                     }
                     if !rb.prefetch.is_empty() {
-                        shard.prefetch_words(rb.prefetch);
+                        if rb.b > proto::PIN_DECODE_MAX_ROWS {
+                            shard.prefetch_words_prefill(rb.prefetch);
+                        } else {
+                            shard.prefetch_words(rb.prefetch);
+                        }
                     }
                 }
                 // Paging THIS request did on our own NVMe. `run_path` calls
@@ -6151,7 +6174,11 @@ pub fn serve_connection(
                     shard.hint_evict_first(req.hint_admit);
                 }
                 if !req.prefetch.is_empty() {
-                    shard.prefetch_words(req.prefetch);
+                    if req.b > proto::PIN_DECODE_MAX_ROWS {
+                        shard.prefetch_words_prefill(req.prefetch);
+                    } else {
+                        shard.prefetch_words(req.prefetch);
+                    }
                 }
                 let ev_t_hints = if ev_on { super::evtrace::now() } else { nan };
                 let ev_pd0 = shard.layer_page_detail(req.layer);
@@ -6769,12 +6796,16 @@ fn serve_interleaved(
     }
     let ev_pin0 = shard.pin_counters();
     let ev_sc0 = shard.stage_counters();
-    shard.pin_apply_words(req.release, req.prefetch);
+    shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { req.prefetch });
     if !req.hint_admit.is_empty() {
         shard.hint_evict_first(req.hint_admit);
     }
     if !req.prefetch.is_empty() {
-        shard.prefetch_words(req.prefetch);
+        if req.b > proto::PIN_DECODE_MAX_ROWS {
+            shard.prefetch_words_prefill(req.prefetch);
+        } else {
+            shard.prefetch_words(req.prefetch);
+        }
     }
     let ev_pd0 = shard.layer_page_detail(req.layer);
     let ev_pw0 = shard.prefetch_wait_ns;
@@ -7832,7 +7863,7 @@ mod tests {
     fn prefetch_queue_priority_and_reservation() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, prefill: false, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, false));
         q.push(job(2, false));
@@ -7906,7 +7937,7 @@ mod tests {
     fn prefetch_finish_releases_spec_key() {
         use std::time::Instant;
         let q = PfQueue::with_readers(2, 3);
-        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, t_hint: Instant::now() });
+        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, prefill: false, t_hint: Instant::now() });
         let j = q.pop_mode(true).unwrap();
         assert!(q.spec_keys_snapshot().contains(&(6, 1)));
         assert!(!q.promote(6, 1), "a running speculative key must not be promoted/urgent");
@@ -7920,7 +7951,7 @@ mod tests {
         // Urgency cap: max_spec 2 but 3 readers -> 2 may run; with 2 readers -> 1.
         let q2 = PfQueue::with_readers(2, 2);
         for e in 0..3 {
-            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, t_hint: Instant::now() });
+            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, prefill: false, t_hint: Instant::now() });
         }
         let _a = q2.pop_mode(true).unwrap();
         let g = q2.inner.lock().unwrap();
@@ -7936,7 +7967,7 @@ mod tests {
     fn prefetch_queue_urgency_routing() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, prefill: false, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, true));
         q.push(job(2, false));

@@ -599,21 +599,30 @@ pub fn lm_prefetch_enabled() -> bool {
     *V.get_or_init(|| std::env::var("V41_LM_PREFETCH").as_deref() == Ok("1"))
 }
 
-/// `V41_LM_PREFETCH_PER_REQ` (default 16 = box 2's default staging sets): the
-/// prefetch words one request carries while layer-major units run. Box 2 drops
-/// speculative words beyond its free staging sets, so more per request only
-/// burns the queue.
+/// `V41_LM_PREFETCH_PER_REQ` (default 4): the prefetch words one request carries
+/// while layer-major units run. Box 2 starts a speculative word only into a free
+/// staging set (sets free as its few background readers finish) and DROPS the
+/// rest, so a request should carry about what box 2 can start between two
+/// requests; the words it dropped are re-queued at the next unit from the
+/// residency mirror (still `Some(false)` until they land).
 pub fn lm_prefetch_per_req() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("V41_LM_PREFETCH_PER_REQ").ok().and_then(|v| v.parse().ok()).unwrap_or(16).max(1))
+    *V.get_or_init(|| std::env::var("V41_LM_PREFETCH_PER_REQ").ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1))
 }
 
-/// Restores the per-request prefetch word cap when a layer-major unit ends
-/// (also on error), so decode steps between units carry their words uncapped.
-struct PrefetchCapGuard(usize);
+/// End of a layer-major unit (also on error): restore the per-request word cap
+/// and DROP this unit's unsent group-prefetch words, so decode steps between
+/// units neither carry them (ahead of decode's own words, and as pin grants in
+/// pin mode) nor run capped. The next unit re-queues what is still missing.
+struct PrefetchCapGuard {
+    prev_cap: usize,
+    layers: std::ops::Range<usize>,
+}
 impl Drop for PrefetchCapGuard {
     fn drop(&mut self) {
-        super::remote_experts::set_prefetch_take_cap(self.0);
+        let layers = self.layers.clone();
+        super::remote_experts::retain_prefetch_words(|w| !layers.contains(&((w >> 16) as usize)));
+        super::remote_experts::set_prefetch_take_cap(self.prev_cap);
     }
 }
 
@@ -1039,24 +1048,25 @@ impl HeterogeneousEngine {
         }
         self.dgpu.events.reset();
         self.igpu.events.reset();
-        // Group prefetch (`V41_LM_PREFETCH`): at a group's first unit, queue the
-        // NEXT group's non-resident box-2 experts (dropping any stale words of
-        // earlier groups), and cap the words per request for every unit so the
-        // queue drains at box 2's staging rate instead of being dropped.
+        // Group prefetch (`V41_LM_PREFETCH`): every unit queues the NEXT group's
+        // box-2 experts the mirror says box 2 does not hold, capped per request
+        // so the queue drains at box 2's staging rate; the guard drops whatever
+        // is still unsent when the unit ends (see `PrefetchCapGuard`).
         let _pf_cap = if lm_prefetch_enabled() && self.remote.is_some() && g + 1 < groups.len() {
-            let next = groups[g + 1].clone();
-            if k == 0 {
-                let keep = next.clone();
-                super::remote_experts::retain_prefetch_words(|w| keep.contains(&((w >> 16) as usize)));
-                let words = lm_prefetch_words(next, split);
-                let n = words.len();
-                if !super::remote_experts::push_prefetch_words(&words) {
-                    tracing::debug!(n, "layer-major prefetch: word queue full; skipped");
-                } else {
-                    tracing::debug!(group = g + 1, n, "layer-major prefetch: queued");
-                }
+            if !super::b2_mirror::wanted() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("V41_LM_PREFETCH: no box-2 residency mirror (V41_SUB / V41_B2_PIN off): nothing to prefetch from"));
             }
-            Some(PrefetchCapGuard(super::remote_experts::set_prefetch_take_cap(lm_prefetch_per_req())))
+            let next = groups[g + 1].clone();
+            let words = lm_prefetch_words(next.clone(), split);
+            let n = words.len();
+            let prev_cap = super::remote_experts::set_prefetch_take_cap(lm_prefetch_per_req());
+            if !super::remote_experts::push_prefetch_words(&words) {
+                tracing::debug!(n, "layer-major prefetch: word queue full; skipped");
+            } else if k == 0 {
+                tracing::debug!(group = g + 1, n, "layer-major prefetch: queued");
+            }
+            Some(PrefetchCapGuard { prev_cap, layers: next })
         } else {
             None
         };
