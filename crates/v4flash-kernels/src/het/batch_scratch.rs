@@ -879,11 +879,19 @@ fn hot_scratch_wanted() -> bool {
 ///   ordered against the other lane's in-flight `ie.compute` kernels;
 ///   they stay per-lane so that memset can never race a reader. Tiny.
 ///
-/// ~16 MiB at rows=512 (recv/moe 8 each, the rest < 30 KiB).
+/// * `xq_recv` — recv mailbox for the dGPU's Q8_K of `ffn_input_norm`
+///   (`V41_PUSH_XQ`), pushed INSTEAD of the f32 rows. Per lane for the same
+///   reason as `ffn_input_norm_recv`: `de.xfer` writes it unordered against
+///   the other lane's `ie.compute`, so the chain copies it into the shared
+///   `d_xq_q8k` on `ie.compute` (where the quantize used to run).
+///
+/// ~19 MiB at rows=512 (recv/moe 8 each, xq_recv 2.9, the rest < 30 KiB).
 pub struct BatchIgpuScratch {
     /// Row capacity every B-scaled buffer was sized for.
     pub rows: usize,
     pub ffn_input_norm_recv: DeviceBuffer<f32>,
+    /// `[B, BLOCKS_Q8K_GATE_IN*292]` — see the struct doc.
+    pub xq_recv: DeviceBuffer<u8>,
     pub ffn_moe: DeviceBuffer<f32>,
     pub d_selected: DeviceBuffer<i32>,
     pub d_ew: DeviceBuffer<f32>,
@@ -967,6 +975,7 @@ impl BatchIgpuScratch {
         Ok(Self {
             rows,
             ffn_input_norm_recv: DeviceBuffer::new(id, b * N_EMBD as usize)?,
+            xq_recv: DeviceBuffer::new(id, b * (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES)?,
             ffn_moe: DeviceBuffer::new(id, b * N_EMBD as usize)?,
             d_selected: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,
             d_ew: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,

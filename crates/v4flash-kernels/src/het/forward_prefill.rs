@@ -44,7 +44,7 @@ use crate::config::{ENGRAM_CHUNK, ENGRAM_IN, ENGRAM_OUT};
 use super::state::{CompKvStore, HetLayerState, HetModelState, KV_CACHE_ROWS};
 use super::kv_arena::{store_index_of, KvArena, RowTables, RowTablesDev};
 use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
-use super::sync::{peer_push_f32, peer_push_i32};
+use super::sync::{peer_push_f32, peer_push_i32, peer_push_u8};
 use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
 
 const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
@@ -2668,6 +2668,9 @@ pub struct PreMoeCarry {
     n_work_items: u32,
     variant: String,
     wmma_path: bool,
+    /// `pre_moe_prep` pushed the dGPU's Q8_K (`bi.xq_recv`) instead of the f32
+    /// rows (`V41_PUSH_XQ`); `pre_moe_launch` copies it in place of quantizing.
+    xq_pushed: bool,
     hot_active: bool,
     max_per_expert: u32,
     chunk_size: u32,
@@ -8652,6 +8655,25 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         // `selected_ready` was recorded on the chain right after the router.
         de.xfer.wait_event(&sev.selected_ready)?;
+        // `V41_PUSH_XQ`: the chain already quantised these rows to Q8_K for box 2
+        // (`remote_xq_lane`, written iff `remote_split_on`, before `selected_ready`),
+        // so push those bytes and let `pre_moe_launch` copy them where its own
+        // quantize would have written. Only where nothing on the iGPU reads the
+        // f32 rows: the WMMA MoE casts them to f16, the decode-MoE verify
+        // requantises them. The predicate mirrors `pre_moe_launch`'s `wmma_path`.
+        let wmma_path_here = super::dispatch::igpu_moe_wmma_selected(
+            routed_src.gate.dtype,
+            routed_src.down.dtype,
+            self.igpu.is_gfx11,
+            &std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into()),
+            super::dispatch::igpu_moe_wmma_env_enabled(),
+        );
+        let xq_pushed = push_xq()
+            && remote_split_on
+            && bd.remote_xq_lane.is_some()
+            && !wmma_path_here
+            && !verify_decode_moe();
+        let xq_bytes = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
         // Single batched peer-push of all B activations + routing.
         let ain_v = bd
             .ffn_input_norm
@@ -8667,7 +8689,12 @@ impl HeterogeneousEngine {
         let mut bi_ew = bi.d_ew.slice_view_mut(0, (b as usize) * cs_n_used);
         {
             let _t_peer_ain = de.events.stage("dgpu.peer_push_ffn_input_norm", &de.xfer)?;
-            {
+            if xq_pushed {
+                let _t = de.events.stage("k.peer_push.xq", &de.xfer)?;
+                let xq_v = bd.remote_xq_lane.as_ref().expect("xq_pushed").slice_view(0, xq_bytes);
+                let mut bi_xq = bi.xq_recv.slice_view_mut(0, xq_bytes);
+                peer_push_u8(&xq_v, &mut bi_xq, &de.xfer)?;
+            } else {
                 let _t = de.events.stage("k.peer_push.ain", &de.xfer)?;
                 peer_push_f32(&ain_v, &mut bi_ain, &de.xfer)?;
             }
@@ -8820,6 +8847,7 @@ impl HeterogeneousEngine {
         // dispatch (group_builder + work_items pre-pass), q2_k stays
         // by-token (could also be by-expert but smaller perf lever).
         c.hot_active = hot_active;
+        c.xq_pushed = xq_pushed;
         Ok(())
     }
 
@@ -8844,7 +8872,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Prepped, PreMoePhase::Launched)? { return Ok(()); }
         let PreMoeCarry {
-            layer, b, cs_n_used, cs_n_embd, moe_group_bound, split_cap, sparse_resid_layer, hot_active, ref sel_host_audit, ..
+            layer, b, cs_n_used, cs_n_embd, moe_group_bound, split_cap, sparse_resid_layer, hot_active, xq_pushed, ref sel_host_audit, ..
         } = *c;
         let _ = (sd, dlw, ilw, hot_active, cs_n_embd);
         let pager_window;
@@ -8919,6 +8947,17 @@ impl HeterogeneousEngine {
         if wmma_path {
             let _t_cast = ie.events.stage("igpu.cast_f16_pre_moe", &ie.compute)?;
             ie.q8k.launch_cast_f16(&ie.compute, &mut si.d_x16, &bi.ffn_input_norm_recv, N_EMBD * b)?;
+        } else if xq_pushed {
+            // `V41_PUSH_XQ`: the dGPU's Q8_K of these rows landed in this lane's
+            // `xq_recv` (covered by `selected_pushed`, waited above). Copy it
+            // into the shared chain head on `ie.compute`, stream-ordered after
+            // the other lane's last read, exactly where the quantize would write.
+            debug_assert!(!wmma_path, "pre_moe_prep pushed Q8_K for a WMMA layer");
+            let _t_xq = ie.events.stage("igpu.xq_recv_copy", &ie.compute)?;
+            let n = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
+            si.d_xq_q8k
+                .slice_view_mut(0, n)
+                .copy_from_buffer_async(&bi.xq_recv.slice_view(0, n), &ie.compute)?;
         } else {
             // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks].
             let _t_q8k_pre = ie.events.stage("igpu.q8k_quantize_pre_iq2", &ie.compute)?;
@@ -10386,6 +10425,19 @@ pub fn emit_layer_miss_hist(tag: &str) {
         decoder_pct = format!("{:.1}", 100.0 * dec as f64 / tot as f64),
         "prefill.layer_miss_hist"
     );
+}
+
+/// `V41_PUSH_XQ=1` (default OFF): when the dGPU has already quantised this
+/// lane-layer's `ffn_input_norm` to Q8_K for box 2 (`bd.remote_xq_lane`),
+/// peer-push THOSE bytes to the iGPU instead of the f32 rows and skip the
+/// iGPU's own quantize. 5,840 B/row instead of 20,480 (3.5x less over the
+/// OCuLink link, which carries every lane-layer's push). Same `q8_k_quantize`
+/// source on both GPUs, -O3 without fast-math: IEEE divides, a fixed-order max
+/// reduction, no fusable multiply-add, integer atomics -- expected
+/// BIT-IDENTICAL, confirmed only by `tests/q8k_cross_device.rs` (GPU, #[ignore]).
+pub fn push_xq() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_PUSH_XQ").as_deref() == Ok("1"))
 }
 
 /// `V41_VERIFY_DECODE_MOE=1`: recompute the batched path's local MoE with the
