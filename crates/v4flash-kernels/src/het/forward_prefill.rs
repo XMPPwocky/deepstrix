@@ -699,6 +699,8 @@ pub struct PrefillJob {
     /// The layer-major device store: rows entering the next group, `(residual
     /// [cap * HC_DIM], carry [cap * HC_MIX_DIM], cap)`. Kept across windows.
     lm_store: Option<(DeviceBuffer<f32>, DeviceBuffer<f32>, usize)>,
+    /// Layer-major windows this job has completed (tests assert it ran).
+    lm_windows: usize,
     /// LAZY inputs: when `input_hcs` is empty the caller supplies the next
     /// chunk's rows through `set_chunk_inputs` right before `prefill_job_chunk`
     /// (embeddings + Engram rows for `next_chunk_range()` only). A 135K-token
@@ -747,6 +749,7 @@ impl PrefillJob {
             lm_rows: if lm_prefill_enabled() && ced_enabled() { lm_rows() } else { 0 },
             lm: None,
             lm_store: None,
+            lm_windows: 0,
             chunk_inputs: None,
         })
     }
@@ -787,6 +790,8 @@ impl PrefillJob {
     /// its early groups then hold more rows than its late ones, so no prefix
     /// length describes the state. (`done_rows` is the last CLOSED window.)
     pub fn checkpoint_ok(&self) -> bool { self.lm.is_none() }
+    /// Layer-major windows completed so far (0 = the job ran chunked).
+    pub fn lm_windows_run(&self) -> usize { self.lm_windows }
     pub fn chunks_done(&self) -> bool { self.chunk_start >= self.tokens.len() }
     pub fn pos0(&self) -> u32 { self.pos0 }
     pub fn tokens(&self) -> &[i32] { &self.tokens }
@@ -843,46 +848,50 @@ impl HeterogeneousEngine {
         }
         if single_lane_max() > 0 {
             job.lm_rows = 0;
+            job.lm_store = None;
             return Ok(false);
         }
         let t = job.tokens.len();
         let min_cap = 2 * chunk_size;
         let mut cap = job.lm_rows.max(min_cap);
-        if job.lm_store.as_ref().is_none_or(|st| st.2 < cap) {
-            job.lm_store = None;
-            self.set_current_cached(self.dgpu.device)?;
-            let id = self.dgpu.device.id;
-            loop {
-                let got = DeviceBuffer::<f32>::new(id, cap * HC_DIM as usize).and_then(|r| {
-                    DeviceBuffer::<f32>::new(id, cap * HC_MIX_DIM as usize).map(|c| (r, c))
-                });
+        loop {
+            // Plan FIRST: the store is only worth VRAM for a window that opens.
+            let Some(subs) = lm_plan_window(job.pos0, job.chunk_start, t, chunk_size, lane_caps, &job.image_spans, cap)? else {
+                // Fewer than two chunks are left (a cap >= two chunks always fits
+                // two), and what is left only shrinks: no later window either.
+                job.lm_store = None;
+                return Ok(false);
+            };
+            let (start, end) = (job.chunk_start, subs.last().expect("two or more").1);
+            let rows = end - start;
+            // Sized to this window, which is the largest the job will open (a
+            // later one is either cap-bound like this one, or the tail).
+            if job.lm_store.as_ref().is_none_or(|st| st.2 < rows) {
+                job.lm_store = None;
+                self.set_current_cached(self.dgpu.device)?;
+                let id = self.dgpu.device.id;
+                let got = DeviceBuffer::<f32>::new(id, rows * HC_DIM as usize)
+                    .and_then(|r| DeviceBuffer::<f32>::new(id, rows * HC_MIX_DIM as usize).map(|c| (r, c)));
                 match got {
-                    Ok((r, c)) => {
-                        job.lm_store = Some((r, c, cap));
-                        break;
-                    }
+                    Ok((r, c)) => job.lm_store = Some((r, c, rows)),
                     Err(e) if cap / 2 >= min_cap => {
-                        tracing::warn!(cap, error = %e, "layer-major prefill: store allocation failed; halving the window");
+                        tracing::warn!(cap, rows, error = %e, "layer-major prefill: store allocation failed; halving the window");
                         cap /= 2;
+                        job.lm_rows = cap;
+                        continue;
                     }
                     Err(e) => {
-                        tracing::warn!(cap, error = %e, "layer-major prefill: no device store; chunked prefill for this job");
+                        tracing::warn!(cap, rows, error = %e, "layer-major prefill: no device store; chunked prefill for this job");
                         job.lm_rows = 0;
                         return Ok(false);
                     }
                 }
             }
-            job.lm_rows = cap;
+            tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap,
+                tokens_done = start, tokens_total = t, "prefill_lm_window open");
+            job.lm = Some(LmWindow { start, end, subs, group: 0, sub: 0, engram: None });
+            return Ok(true);
         }
-        let cap = job.lm_store.as_ref().map(|st| st.2).unwrap_or(0);
-        let Some(subs) = lm_plan_window(job.pos0, job.chunk_start, t, chunk_size, lane_caps, &job.image_spans, cap)? else {
-            return Ok(false);
-        };
-        let (start, end) = (job.chunk_start, subs.last().expect("two or more").1);
-        tracing::info!(pos0 = job.pos0 + start as u32, rows = end - start, sub_chunks = subs.len(), cap,
-            tokens_done = start, tokens_total = t, "prefill_lm_window open");
-        job.lm = Some(LmWindow { start, end, subs, group: 0, sub: 0, engram: None });
-        Ok(true)
     }
 
     /// Layer-major: run ONE unit -- the open window's next (group, sub-chunk) --
@@ -928,13 +937,21 @@ impl HeterogeneousEngine {
                     return Err(eyre!("layer-major: inputs for {} rows, sub-chunk [{s}, {e}) is {b}", hcs.len()));
                 }
                 if let Some(rs) = eng.as_ref() {
+                    // Only the Engram layers a LATER group reads (layer 14: ~100 MB
+                    // at 4096 rows); layer 1's rows are consumed right here.
+                    let later = groups.get(1).map(|r| r.start).unwrap_or(usize::MAX);
+                    let keep = |li: usize| crate::config::ENGRAM_LAYERS.get(li).is_some_and(|&l| l as usize >= later);
                     let w = job.lm.as_mut().expect("open window");
-                    let buf = w.engram.get_or_insert_with(|| vec![vec![0f32; win_rows * ein]; rs.len()]);
+                    let buf = w.engram.get_or_insert_with(|| {
+                        (0..rs.len()).map(|li| if keep(li) { vec![0f32; win_rows * ein] } else { Vec::new() }).collect()
+                    });
                     if buf.len() != rs.len() {
                         return Err(eyre!("layer-major: {} Engram buffers, window holds {}", rs.len(), buf.len()));
                     }
-                    for (dst, src) in buf.iter_mut().zip(rs) {
-                        dst[row0 * ein..(row0 + b) * ein].copy_from_slice(src);
+                    for (li, (dst, src)) in buf.iter_mut().zip(rs).enumerate() {
+                        if keep(li) {
+                            dst[row0 * ein..(row0 + b) * ein].copy_from_slice(src);
+                        }
                     }
                 }
                 (Some(hcs), eng)
@@ -945,13 +962,20 @@ impl HeterogeneousEngine {
             if taken.as_ref().is_some_and(|(hcs, _)| !hcs.is_empty()) {
                 return Err(eyre!("layer-major: inputs handed to group {g} (only group 0 takes them)"));
             }
+            // One buffer per Engram layer (the staging indexes by position), but
+            // only the layers inside this group carry rows.
+            let in_range = |li: usize| crate::config::ENGRAM_LAYERS.get(li).is_some_and(|&l| range.contains(&(l as usize)));
             let eng = if !has_engram_layer {
                 None
             } else if lazy {
                 let w = job.lm.as_ref().expect("open window");
-                w.engram.as_ref().map(|rs| rs.iter().map(|r| r[row0 * ein..(row0 + b) * ein].to_vec()).collect())
+                w.engram.as_ref().map(|rs| {
+                    rs.iter().enumerate().map(|(li, r)| if in_range(li) { r[row0 * ein..(row0 + b) * ein].to_vec() } else { Vec::new() }).collect()
+                })
             } else {
-                job.engram_rows.as_ref().map(|rs| rs.iter().map(|r| r[s * ein..e * ein].to_vec()).collect())
+                job.engram_rows.as_ref().map(|rs| {
+                    rs.iter().enumerate().map(|(li, r)| if in_range(li) { r[s * ein..e * ein].to_vec() } else { Vec::new() }).collect()
+                })
             };
             (None, eng)
         };
@@ -1031,6 +1055,7 @@ impl HeterogeneousEngine {
         }
         let (start, end, n_sub) = (w.start, w.end, w.subs.len());
         job.lm = None;
+        job.lm_windows += 1;
         job.chunk_start = end;
         job.chunk_idx += n_sub;
         tracing::info!(rows = end - start, sub_chunks = n_sub, tokens_done = end, tokens_total = job.tokens.len(),
@@ -1164,6 +1189,9 @@ impl HeterogeneousEngine {
         if !job.chunks_done() {
             return Err(eyre!("PrefillJob: finish called with {} of {} rows done", job.chunk_start, job.tokens.len()));
         }
+        // A job whose last window ended the prompt never came back to
+        // `lm_open_window` to drop its store; the replay does not need it.
+        job.lm_store = None;
         if !job.ced {
             return job.last_logits.take().ok_or_else(|| eyre!("PrefillJob: no logits from the last chunk"));
         }

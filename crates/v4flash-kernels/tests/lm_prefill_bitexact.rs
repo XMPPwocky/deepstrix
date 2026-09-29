@@ -13,13 +13,21 @@
 //! same inputs, so anything but byte equality is a bug (a group boundary that
 //! leaks per-call state, a wrong device seed, a row-offset slip...).
 //!
+//! Every case also runs chunked prefill TWICE (the determinism null) and fails
+//! with "no verdict" if those two disagree; and fails if the layer-major run
+//! ran no window at all (a silent fallback would compare chunked with chunked).
+//!
 //! Cases (`LM_CASES` to pick, default all):
 //!   fresh     -- a 5,000-token prompt from position 0 at `LM_ROWS` (default 4096):
 //!                one window, then a 904-row tail that is too short for a window
 //!                (chunked), exercising the switch between the two;
 //!   multi     -- the same prompt at 2048-row windows: several windows back to back;
 //!   restored  -- a 1,500-token prefix prefilled chunked, then a 3,000-token suffix
-//!                (pos0 = 1500) layer-major vs chunked on copies of that state.
+//!                (pos0 = 1500) layer-major vs chunked on copies of that state;
+//!   lazy      -- 5,000 tokens at 2048-row windows with the SERVER's input path
+//!                (lazy per-unit inputs via next_chunk_range / set_chunk_inputs,
+//!                incl. the window's kept Engram rows for layer 14) and a foreign
+//!                one-token forward on the same lanes between every two units.
 //!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
@@ -106,7 +114,6 @@ fn zero_state(st: &mut HetModelState) -> eyre::Result<()> {
         ls.kv_cache.fill_zero()?;
         for cs in [ls.compressor.as_mut(), ls.indexer_compressor.as_mut()].into_iter().flatten() {
             cs.state_kv.fill_zero()?;
-            cs.state_score.fill_zero()?;
             match &mut cs.comp_kv {
                 CompKvStore::F16(b) => b.fill_zero()?,
                 CompKvStore::Fp8 { rows, head } => {
@@ -191,7 +198,7 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
     let lm_rows = env_usize("LM_ROWS", 4096);
     let decode_steps = env_usize("LM_DECODE_STEPS", 3);
     let cases: Vec<String> = std::env::var("LM_CASES")
-        .unwrap_or_else(|_| "fresh,multi,restored".into())
+        .unwrap_or_else(|_| "fresh,multi,restored,lazy".into())
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
@@ -244,52 +251,112 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
         Ok(out)
     };
 
+    // A second sequence advanced one token between layer-major units (`foreign`):
+    // stands in for the decode steps the scheduler runs on the same lanes, pager
+    // and streams between two units of a prefill job.
+    let mut x_state = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+    // Starts empty: its first forward is position 0 on an empty state.
+    let mut x_seq: Vec<i32> = Vec::new();
+
     // One prefill job over `toks[pos0..]` on `st` (which holds `toks[..pos0]`);
-    // `rows` = the Engram rows of `toks[pos0..]`.
+    // `rows` = the Engram rows of `toks[pos0..]`. `lazy`: inputs handed over per
+    // unit through `next_chunk_range` / `set_chunk_inputs`, as the server does
+    // (`multistream::chunk_inputs`). Returns the logits and the layer-major
+    // windows the job ran.
     let mut run = |toks: &[i32], pos0: usize, rows: Vec<Vec<f32>>, st: &mut HetModelState, lm: usize,
-                   pg: &mut ExpertPager| -> eyre::Result<Vec<f32>> {
+                   lazy: bool, foreign: bool, pg: &mut ExpertPager| -> eyre::Result<(Vec<f32>, usize)> {
         let sfx = &toks[pos0..];
         let hcs: Vec<Vec<f32>> = sfx.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
-        let mut job = PrefillJob::new(sfx.to_vec(), hcs, Some(rows), None, pos0 as u32, 1024)?;
+        let mut job = if lazy {
+            PrefillJob::new(sfx.to_vec(), Vec::new(), None, None, pos0 as u32, 1024)?
+        } else {
+            PrefillJob::new(sfx.to_vec(), hcs.clone(), Some(rows.clone()), None, pos0 as u32, 1024)?
+        };
         job.set_layer_major_rows(lm)?;
         let mut units = 0usize;
         while !job.chunks_done() {
+            if lazy {
+                let (a, z) = job.next_chunk_range((bd_a.rows, bd_b.rows))?;
+                let eng: Vec<Vec<f32>> = rows.iter().map(|r| r[a * ein..z * ein].to_vec()).collect();
+                job.set_chunk_inputs(hcs[a..z].to_vec(), Some(eng));
+            }
             engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, st, &weights, Some(&mut *pg))?;
             units += 1;
+            if foreign && !job.checkpoint_ok() {
+                // Mid-window: another sequence's one-token forward on the same lanes.
+                let t = synth_prompt(1000 + x_seq.len() as u64, 1)[0];
+                x_seq.push(t);
+                let pos = x_seq.len() - 1;
+                let xr = rows_for(pg.raw(), &x_seq, pos)?;
+                let mut xj = PrefillJob::new(vec![t], vec![embed(t)?], Some(xr), None, pos as u32, 1024)?;
+                xj.set_layer_major_rows(0)?;
+                while !xj.chunks_done() {
+                    engine.prefill_job_chunk(&mut xj, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut x_state, &weights, Some(&mut *pg))?;
+                }
+                engine.prefill_job_finish(&mut xj, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut x_state, &weights, Some(&mut *pg))?;
+                x_state.restore_compressor_lending();
+            }
         }
-        eprintln!("    job pos0={pos0} rows={} lm_rows={lm}: {units} units", sfx.len());
+        let windows = job.lm_windows_run();
+        eprintln!("    job pos0={pos0} rows={} lm_rows={lm} lazy={lazy} foreign={foreign}: {units} units, {windows} layer-major windows", sfx.len());
         let l = engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, st, &weights, Some(&mut *pg))?;
         st.restore_compressor_lending();
-        Ok(l)
+        Ok((l, windows))
     };
     let fresh_state = || -> eyre::Result<HetModelState> {
         let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
         zero_state(&mut st)?;
+        // Production's initial compressor state (score accumulators at -inf).
+        st.reset_in_place(dgpu, igpu)?;
         Ok(st)
     };
 
     let mut failures = Vec::new();
     for case in &cases {
-        let (prompt, pos0, rows) = match case.as_str() {
-            "fresh" => (synth_prompt(11, 5000), 0usize, lm_rows),
-            "multi" => (synth_prompt(12, 5000), 0, 2048),
-            "restored" => (synth_prompt(13, 4500), 1500, lm_rows),
+        // (prompt, pos0, window, lazy + foreign units on the layer-major run)
+        let (prompt, pos0, rows, lazy) = match case.as_str() {
+            "fresh" => (synth_prompt(11, 5000), 0usize, lm_rows, false),
+            "multi" => (synth_prompt(12, 5000), 0, 2048, false),
+            "restored" => (synth_prompt(13, 4500), 1500, lm_rows, false),
+            "lazy" => (synth_prompt(14, 5000), 0, 2048, true),
             other => return Err(eyre!("unknown LM_CASES entry {other}")),
         };
-        eprintln!("case {case}: {} tokens, pos0 {pos0}, window {rows}", prompt.len());
+        eprintln!("case {case}: {} tokens, pos0 {pos0}, window {rows}, lazy+foreign {lazy}", prompt.len());
         let rows_all = rows_for(pg.raw(), &prompt, 0)?;
         let slice = |a: usize, z: usize| -> Vec<Vec<f32>> { rows_all.iter().map(|r| r[a * ein..z * ein].to_vec()).collect() };
+        // c = chunked, n = chunked again (the determinism NULL), l = layer-major.
         let mut st_c = fresh_state()?;
+        let mut st_n = fresh_state()?;
         let mut st_l = fresh_state()?;
         if pos0 > 0 {
-            // The shared prefix, chunked, on both states.
+            // The shared prefix, chunked, on all three states.
             let pre = &prompt[..pos0];
-            run(pre, 0, slice(0, pos0), &mut st_c, 0, &mut pg)?;
-            run(pre, 0, slice(0, pos0), &mut st_l, 0, &mut pg)?;
+            for st in [&mut st_c, &mut st_n, &mut st_l] {
+                run(pre, 0, slice(0, pos0), st, 0, false, false, &mut pg)?;
+            }
         }
-        let l_c = run(&prompt, pos0, slice(pos0, prompt.len()), &mut st_c, 0, &mut pg)?;
-        let l_l = run(&prompt, pos0, slice(pos0, prompt.len()), &mut st_l, rows, &mut pg)?;
-        let mut diffs = diff_states(&st_c, &st_l)?;
+        let (l_c, _) = run(&prompt, pos0, slice(pos0, prompt.len()), &mut st_c, 0, false, false, &mut pg)?;
+        let (l_n, _) = run(&prompt, pos0, slice(pos0, prompt.len()), &mut st_n, 0, false, false, &mut pg)?;
+        let (l_l, windows) = run(&prompt, pos0, slice(pos0, prompt.len()), &mut st_l, rows, lazy, lazy, &mut pg)?;
+        // The NULL first: chunked twice must agree, or no verdict on layer-major
+        // is possible (a non-deterministic reduction would be blamed on it).
+        let mut null = diff_states(&st_c, &st_n)?;
+        let bad_null = l_c.iter().zip(&l_n).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        if bad_null > 0 {
+            null.push(format!("prefill logits: {bad_null} differ"));
+        }
+        if !null.is_empty() {
+            for d in null.iter().take(10) {
+                eprintln!("  {case}: NULL (chunked vs chunked): {d}");
+            }
+            failures.push(format!("{case}: chunked prefill is not deterministic ({} differences) -- no verdict", null.len()));
+            continue;
+        }
+        let mut diffs = Vec::new();
+        if windows == 0 {
+            diffs.push("layer-major never ran (0 windows): single-lane shortcut or no device store".to_string());
+        }
+        diffs.extend(diff_states(&st_c, &st_l)?);
         let bad_logits = l_c.iter().zip(&l_l).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
         if bad_logits > 0 {
             diffs.push(format!("prefill logits: {bad_logits} of {} differ", l_c.len()));
@@ -302,8 +369,8 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
             seq.push(tok);
             let pos = seq.len() - 1;
             let r_new = rows_for(pg.raw(), &seq, pos)?;
-            let d_c = run(&seq, pos, r_new.clone(), &mut st_c, 0, &mut pg)?;
-            let d_l = run(&seq, pos, r_new, &mut st_l, 0, &mut pg)?;
+            let (d_c, _) = run(&seq, pos, r_new.clone(), &mut st_c, 0, false, false, &mut pg)?;
+            let (d_l, _) = run(&seq, pos, r_new, &mut st_l, 0, false, false, &mut pg)?;
             let n = d_c.iter().zip(&d_l).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
             if n > 0 {
                 diffs.push(format!("decode step {step}: {n} logits differ"));
@@ -311,7 +378,7 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
             tok = argmax(&d_c) as i32;
         }
         if diffs.is_empty() {
-            eprintln!("  {case}: BIT-IDENTICAL (state + logits + {decode_steps} decode steps)");
+            eprintln!("  {case}: BIT-IDENTICAL over {windows} windows (state + logits + {decode_steps} decode steps; null clean)");
         } else {
             for d in diffs.iter().take(20) {
                 eprintln!("  {case}: {d}");

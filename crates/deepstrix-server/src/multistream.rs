@@ -987,8 +987,18 @@ impl Sched {
         // Prefill requests carry no decode step (also after a failed step,
         // whose own clear never ran).
         v4flash_kernels::het::evtrace_kinds::clear_step();
-        let i = self.rr % self.prefills.len();
-        self.rr = self.rr.wrapping_add(1);
+        // A job with an open layer-major window keeps the prefill until the
+        // window closes: alternating units between two jobs would make box 2's
+        // pool hold both jobs' group unions at once, which is the paging the
+        // window exists to avoid. Otherwise round-robin as before.
+        let i = match self.prefills.iter().position(|p| !p.job.checkpoint_ok()) {
+            Some(j) => j,
+            None => {
+                let i = self.rr % self.prefills.len();
+                self.rr = self.rr.wrapping_add(1);
+                i
+            }
+        };
         let mut pf = self.prefills.remove(i);
         if pf.p.cancel.load(Ordering::Relaxed) || pf.p.tx.is_closed() {
             // CHECKPOINT the partial prefill: a client that times out (the
@@ -1021,7 +1031,7 @@ impl Sched {
                     Err(e) => tracing::warn!(error = %e, "multistream: prefill cancelled; partial snapshot FAILED"),
                 }
             } else {
-                tracing::info!(done, total = pf.job.total(), "multistream: prefill cancelled");
+                tracing::info!(done, total = pf.job.total(), lm_open = !pf.job.checkpoint_ok(), "multistream: prefill cancelled");
             }
             let _ = self.arena.release(pf.slot);
             self.spare_states.push(pf.kv);
