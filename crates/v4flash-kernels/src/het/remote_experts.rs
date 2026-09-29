@@ -1429,6 +1429,8 @@ struct PfDone {
     stage: bool,
     /// `PfJob::prefill`: lands prefill-class.
     prefill: bool,
+    /// `PfJob::restore`.
+    restore: u64,
     offs: [Option<(usize, usize, u32, u32)>; 3],
     coalesced: bool,
     /// Hint sent -> a reader picked it up (queueing behind other reads).
@@ -1456,6 +1458,9 @@ struct PfJob {
     /// Lands PREFILL-class (evicted first) even outside the staging band: a hub
     /// word carried by a prefill-shaped request (layer-major group prefetch).
     prefill: bool,
+    /// Delta restore (`V41_B2_RESTORE`): the decode stamp the expert had when a
+    /// prefill phase evicted it (0 = not a restore read).
+    restore: u64,
     t_hint: std::time::Instant,
 }
 
@@ -2261,6 +2266,36 @@ struct ModeEvict {
     /// prefill phase)`, oldest first, capped (`MODE_EVICT_DELTA_CAP`).
     decode_delta: std::collections::VecDeque<(u32, u32, u64, u32)>,
     c: ModeEvictCounters,
+    /// Delta restore (`V41_B2_RESTORE`, needs the mode on).
+    restore_on: bool,
+    /// Entries to restore `(layer, e, decode stamp)`, NEWEST stamp first.
+    restore: std::collections::VecDeque<(u32, u32, u64)>,
+    rc: RestoreCounters,
+}
+
+/// Delta-restore counters (cumulative; logged at each phase switch).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RestoreCounters {
+    pub queued: u64,
+    pub pumped: u64,
+    pub landed: u64,
+    /// Entries found already resident (decode paged them back itself).
+    pub skipped: u64,
+    /// Restores stopped: no victim decode would evict before the entry.
+    pub stopped: u64,
+    /// Landings that arrived inside a prefill phase and went back to the queue.
+    pub requeued: u64,
+}
+
+/// Restore reads started per decode request (`pump_restore`).
+const RESTORE_PUMP: usize = 4;
+
+/// `V41_B2_RESTORE=1` (needs `V41_B2_MODE_EVICT=1`): after each prefill phase,
+/// read back the decode experts it evicted, newest first, each landing only over
+/// a victim decode itself would evict before it and keeping its own stamp.
+pub fn b2_restore() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_B2_RESTORE").as_deref() == Ok("1"));
+    *B
 }
 
 const MODE_EVICT_DELTA_CAP: usize = 16384;
@@ -2854,6 +2889,13 @@ impl ShardPool {
                 self.me.budget_left, c.took_own, c.took_decode_over, self.me.decode_delta.len()
             );
         }
+        if self.me.restore_on && !self.me.prefill_phase && self.me.phase > 0 {
+            let r = self.me.rc;
+            eprintln!(
+                "expertd: mode-evict restore after phase {}: queued {} pumped {} landed {} skipped {} stopped {} requeued {}; {} left",
+                self.me.phase, r.queued, r.pumped, r.landed, r.skipped, r.stopped, r.requeued, self.me.restore.len()
+            );
+        }
         self.me.prefill_phase = prefill;
         self.me.decode_streak = 0;
         self.me.c = ModeEvictCounters::default();
@@ -2861,7 +2903,56 @@ impl ShardPool {
             self.me.phase += 1;
             self.me.phase_start = self.tick;
             self.me.budget_left = self.me.budget;
+        } else if self.me.restore_on {
+            self.me_build_restore();
         }
+    }
+
+    /// Prefill -> decode: merge the delta into the restore queue (whatever an
+    /// earlier restore left too): one entry per expert at its newest stamp,
+    /// minus the resident ones, newest first.
+    fn me_build_restore(&mut self) {
+        let mut best: std::collections::HashMap<(u32, u32), u64> = std::collections::HashMap::new();
+        for &(l, e, t) in self.me.restore.iter() {
+            let v = best.entry((l, e)).or_insert(t);
+            *v = (*v).max(t);
+        }
+        for &(l, e, t, _) in self.me.decode_delta.iter() {
+            let v = best.entry((l, e)).or_insert(t);
+            *v = (*v).max(t);
+        }
+        self.me.decode_delta.clear();
+        let mut ents: Vec<(u32, u32, u64)> = best.into_iter().filter(|(k, _)| !self.slot_of.contains_key(k)).map(|((l, e), t)| (l, e, t)).collect();
+        ents.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+        self.me.rc = RestoreCounters { queued: ents.len() as u64, ..Default::default() };
+        self.me.restore = ents.into_iter().collect();
+    }
+
+    /// Delta restore: the slot a restore of an expert last stamped `stamp` may
+    /// land in -- the plain LRU's victim, provided decode would evict it before
+    /// that expert (free, prefill-class, or an older decode stamp). `None` =
+    /// nothing is older: this entry and every later (older) one would only be
+    /// evicted first, so the restore stops.
+    #[allow(clippy::too_many_arguments)]
+    fn restore_victim(
+        &self,
+        region: (u32, u32),
+        global: bool,
+        want_layer: u32,
+        want: &[u32],
+        extra: ExtraPins<'_>,
+        for_layer: u32,
+        stamp: u64,
+    ) -> Option<u32> {
+        let v = self.pick_victim_any(region, global, Band::Main, want_layer, want, extra, for_layer, false, false)?;
+        let lu = self.last_use[v as usize];
+        (self.owner_of[v as usize].is_none() || lu < PREFILL_AGE || lu < stamp).then_some(v)
+    }
+
+    /// `land`, keeping the expert's own (decode) stamp: a delta restore.
+    fn land_stamped(&mut self, slot: u32, key: (u32, u32), stamp: u64) {
+        self.land(slot, key, false);
+        self.last_use[slot as usize] = stamp;
     }
 
     /// Mode-aware eviction applies to this search: on, in a prefill phase, and
@@ -3893,8 +3984,16 @@ impl ExpertShard {
     }
 
     fn prefetch_words_full(&mut self, words: &[u32], certain: bool, stage: bool, prefill: bool) {
+        let _ = self.prefetch_words_core(words, &[], certain, stage, prefill);
+    }
+
+    /// `prefetch_words_full`, with an optional restore stamp per word
+    /// (`stamps` empty, or one per word: `PfJob::restore`). Returns the words
+    /// DROPPED for want of a free staging set (the delta restore re-queues them).
+    fn prefetch_words_core(&mut self, words: &[u32], stamps: &[u64], certain: bool, stage: bool, prefill: bool) -> Vec<u32> {
+        let mut dropped_words = Vec::new();
         if words.is_empty() || self.pool.is_none() {
-            return;
+            return dropped_words;
         }
         // Mode-aware eviction: a prefill request's own early-page / park reads
         // land PREFILL-class even with staging off (they used to land
@@ -3904,7 +4003,7 @@ impl ExpertShard {
         let stage = stage && self.stage_slots() > 0;
         if self.prefetch.is_none() {
             if self.pf_stages_spare.is_empty() {
-                return;
+                return words.to_vec();
             }
             let n_par_q = b2_prefetch_par().min(self.pf_stages_spare.len().max(1));
             let queue = std::sync::Arc::new(PfQueue::with_readers(n_par_q.saturating_sub(b2_prefetch_reserve()), n_par_q));
@@ -3932,7 +4031,7 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let urgency = knobs::route_urgency();
-                    let Some(PfJob { layer, e, set, certain, stage, prefill, t_hint }) = queue_r.pop_mode(urgency) else { break };
+                    let Some(PfJob { layer, e, set, certain, stage, prefill, restore, t_hint }) = queue_r.pop_mode(urgency) else { break };
                     let ev_on = super::evtrace::enabled();
                     let ev_t_pop = if ev_on { super::evtrace::now() } else { f64::NAN };
                     let mut ev_yield_ns = 0u64;
@@ -3999,7 +4098,7 @@ impl ExpertShard {
                     }
                     drop(done);
                     let msg = match r {
-                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, prefill, offs, coalesced, queue_ns, read_ns, ev }),
+                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, prefill, restore, offs, coalesced, queue_ns, read_ns, ev }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
                     };
                     if tx_done.send(msg).is_err() {
@@ -4014,7 +4113,8 @@ impl ExpertShard {
         }
         let pool = self.pool.as_ref().unwrap();
         let pf = self.prefetch.as_mut().unwrap();
-        for &w in words {
+        for (i, &w) in words.iter().enumerate() {
+            let restore = stamps.get(i).copied().unwrap_or(0);
             let key = ((w >> 16) as u32, (w & 0xFFFF) as u32);
             if key.0 as usize >= self.layers.len() || key.1 >= N_EXPERT || self.layers[key.0 as usize].is_none() {
                 continue;
@@ -4036,12 +4136,49 @@ impl ExpertShard {
             // whoever wants it next); a certain word may use any set.
             if !certain && pf.free.len() <= 2 * b2_prefetch_reserve() {
                 pf.dropped += 1;
+                dropped_words.push(w);
                 continue;
             }
-            let Some(set) = pf.free.pop() else { pf.dropped += 1; continue };
+            let Some(set) = pf.free.pop() else {
+                pf.dropped += 1;
+                dropped_words.push(w);
+                continue;
+            };
             pf.pending.insert(key);
             pf.hinted += 1;
-            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, prefill, t_hint: std::time::Instant::now() });
+            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, prefill, restore, t_hint: std::time::Instant::now() });
+        }
+        dropped_words
+    }
+
+    /// Delta restore (`V41_B2_RESTORE`): in a DECODE phase, start background
+    /// reads of the next few restore-queue entries (newest stamp first). Words
+    /// dropped for want of a staging set go back to the front, in order; an
+    /// entry decode already paged back is skipped. Called per request.
+    pub fn pump_restore(&mut self) {
+        let Some(pool) = self.pool.as_mut() else { return };
+        if !(pool.me.on && pool.me.restore_on && !pool.me.prefill_phase) {
+            return;
+        }
+        let mut batch: Vec<(u32, u32, u64)> = Vec::with_capacity(RESTORE_PUMP);
+        while batch.len() < RESTORE_PUMP {
+            let Some(ent) = pool.me.restore.pop_front() else { break };
+            if pool.slot_of.contains_key(&(ent.0, ent.1)) {
+                pool.me.rc.skipped += 1;
+                continue;
+            }
+            batch.push(ent);
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let words: Vec<u32> = batch.iter().map(|&(l, e, _)| (l << 16) | e).collect();
+        let stamps: Vec<u64> = batch.iter().map(|&(_, _, t)| t).collect();
+        let dropped = self.prefetch_words_core(&words, &stamps, false, false, false);
+        let pool = self.pool.as_mut().expect("checked above");
+        pool.me.rc.pumped += (batch.len() - dropped.len()) as u64;
+        for ent in batch.iter().rev().filter(|ent| dropped.contains(&((ent.0 << 16) | ent.1))) {
+            pool.me.restore.push_front(*ent);
         }
     }
 
@@ -4193,7 +4330,31 @@ impl ExpertShard {
             // Mode-aware eviction: a prefill landing (staged, or prefill-class)
             // searches in prefill mode.
             let prefill_landing = d.stage || d.prefill;
-            let Some(victim) = pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, false, prefill_landing) else {
+            // Delta restore (`V41_B2_RESTORE`): lands only over what decode would
+            // evict before it, with its own stamp; STOPS the restore when nothing
+            // is older; back to the queue if a prefill phase began meanwhile. A
+            // restore the current request wants is just a decode landing.
+            let restore_stamp = if d.restore != 0 && !ev_wanted_this { d.restore } else { 0 };
+            if restore_stamp != 0 && (!pool.me.on || pool.me.prefill_phase) {
+                pool.me.restore.push_front((d.layer, d.e, restore_stamp));
+                pool.me.rc.requeued += 1;
+                pf.free.push(d.set);
+                continue;
+            }
+            let victim = if restore_stamp != 0 {
+                match pool.restore_victim(region, global, cur_layer, want, &pinned, d.layer, restore_stamp) {
+                    Some(v) => Some(v),
+                    None => {
+                        pool.me.rc.stopped += 1;
+                        pool.me.restore.clear();
+                        pf.free.push(d.set);
+                        continue;
+                    }
+                }
+            } else {
+                pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, false, prefill_landing)
+            };
+            let Some(victim) = victim else {
                 if d.stage {
                     pool.sc.drops += 1;
                 } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, true, prefill_landing).is_some() {
@@ -4203,7 +4364,9 @@ impl ExpertShard {
                 continue;
             };
             let ev_scan_ns = ev_t_scan.elapsed().as_nanos() as f64;
-            pool.me_account(victim, prefill_landing);
+            if restore_stamp == 0 {
+                pool.me_account(victim, prefill_landing);
+            }
             let ev_victim = pool.evict(victim, cur_layer);
             let ev_t_repack = std::time::Instant::now();
             let landed: eyre::Result<()> = match (repack, repack_stream) {
@@ -4219,7 +4382,12 @@ impl ExpertShard {
                 pf.free.push(d.set);
                 return Err(err);
             }
-            pool.land(victim, key, d.stage || d.prefill);
+            if restore_stamp != 0 {
+                pool.land_stamped(victim, key, restore_stamp);
+                pool.me.rc.landed += 1;
+            } else {
+                pool.land(victim, key, d.stage || d.prefill);
+            }
             pf.admitted += 1;
             pf.free.push(d.set);
             if ev_on {
@@ -4356,7 +4524,9 @@ impl ExpertShard {
         if b2_mode_evict() {
             if stage == 0 && b2_scan_class() && b2_global_pool() {
                 pool.enable_mode_evict(b2_prefill_budget());
-                eprintln!("expertd: mode-aware eviction ON (prefill budget {} decode victims per phase)", b2_prefill_budget());
+                pool.me.restore_on = b2_restore();
+                eprintln!("expertd: mode-aware eviction ON (prefill budget {} decode victims per phase; delta restore {})",
+                    b2_prefill_budget(), if pool.me.restore_on { "ON" } else { "off" });
             } else {
                 eprintln!("expertd: V41_B2_MODE_EVICT=1 IGNORED: needs V41_B2_PREFILL_STAGE=0, the two-class LRU (V41_B2_SCAN_CLASS != 0) and the global pool (V41_B2_GLOBAL_POOL != 0)");
             }
@@ -6417,6 +6587,7 @@ pub fn serve_connection(
                 if let Some(rb) = reqb.as_ref() {
                     shard.note_request_phase(rb.flags);
                 }
+                shard.pump_restore();
                 let ev_pin0 = shard.pin_counters();
                 let ev_sc0 = shard.stage_counters();
                 // A prefill-shaped request's prefetch words are layer-major group
@@ -8151,7 +8322,7 @@ mod tests {
     fn prefetch_queue_priority_and_reservation() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, prefill: false, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, prefill: false, restore: 0, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, false));
         q.push(job(2, false));
@@ -8225,7 +8396,7 @@ mod tests {
     fn prefetch_finish_releases_spec_key() {
         use std::time::Instant;
         let q = PfQueue::with_readers(2, 3);
-        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, prefill: false, t_hint: Instant::now() });
+        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, prefill: false, restore: 0, t_hint: Instant::now() });
         let j = q.pop_mode(true).unwrap();
         assert!(q.spec_keys_snapshot().contains(&(6, 1)));
         assert!(!q.promote(6, 1), "a running speculative key must not be promoted/urgent");
@@ -8239,7 +8410,7 @@ mod tests {
         // Urgency cap: max_spec 2 but 3 readers -> 2 may run; with 2 readers -> 1.
         let q2 = PfQueue::with_readers(2, 2);
         for e in 0..3 {
-            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, prefill: false, t_hint: Instant::now() });
+            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, prefill: false, restore: 0, t_hint: Instant::now() });
         }
         let _a = q2.pop_mode(true).unwrap();
         let g = q2.inner.lock().unwrap();
@@ -8255,7 +8426,7 @@ mod tests {
     fn prefetch_queue_urgency_routing() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, prefill: false, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, prefill: false, restore: 0, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, true));
         q.push(job(2, false));
@@ -8742,6 +8913,66 @@ mod tests {
             assert!(pool.me.decode_delta.iter().all(|&(_, _, t, ph)| t >= PREFILL_AGE && ph >= 1), "seed {seed}: delta stamps");
             assert!(checked > 2000 && prefill_victims > 300 && pool.me.phase >= 5, "seed {seed}: not exercised ({checked}, {prefill_victims}, {})", pool.me.phase);
         }
+    }
+
+    /// DELTA RESTORE: after a prefill phase the decode experts it evicted come
+    /// back newest-first, each landing only over what decode would evict before
+    /// it (prefill-class first, then decode slots OLDER than its own stamp) and
+    /// keeping that stamp; what decode demand-paged meanwhile (fresh stamps) is
+    /// never a victim, and the restore stops when nothing is older.
+    #[test]
+    fn pool_restore_lands_only_over_older_and_keeps_its_stamp() {
+        let ids: Vec<u32> = (0..4).collect();
+        let mut pool = ShardPool::seeded(8, &[(1, 0, &ids), (2, 4, &ids)], 0.0);
+        pool.enable_mode_evict(8);
+        pool.me.restore_on = true;
+        for l in [1u32, 2] {
+            for e in 0..4 {
+                assert!(pool.touch_hit(l, e, false)); // all decode-class
+            }
+        }
+        let stamp_of = |p: &ShardPool, k: (u32, u32)| p.last_use[p.slot_of[&k] as usize];
+        // Prefill phase: evicts (1,0) and (1,1) (the two oldest decode slots).
+        pool.me_note_request(true);
+        for e in 20..22 {
+            let (slot, _) = pool.claim_miss(3, e, &[20, 21], &[], (0, 8), true, true, true).unwrap();
+            pool.commit(3, e, slot);
+        }
+        let delta: Vec<(u32, u32, u64)> = pool.me.decode_delta.iter().map(|&(l, e, t, _)| (l, e, t)).collect();
+        assert_eq!(delta.iter().map(|&(l, e, _)| (l, e)).collect::<Vec<_>>(), vec![(1, 0), (1, 1)]);
+        let (t10, t11) = (delta[0].2, delta[1].2);
+        // Back to decode: the queue is the delta, newest stamp first.
+        for _ in 0..ME_DECODE_STREAK {
+            pool.me_note_request(false);
+        }
+        assert_eq!(pool.me.restore.iter().map(|&(l, e, _)| (l, e)).collect::<Vec<_>>(), vec![(1, 1), (1, 0)]);
+        assert_eq!(pool.me.rc.queued, 2);
+        // Decode demand-pages (4,0) before the restore lands: fresh stamp.
+        let (s40, _) = pool.claim_miss(4, 0, &[0], &[], (0, 8), true, false, false).unwrap();
+        pool.commit(4, 0, s40);
+        let t40 = pool.last_use[s40 as usize];
+        assert!(t40 > t11, "a demand page during the restore is younger than every entry");
+        // (1,1): the victim is the remaining PREFILL-class page (layer 3).
+        let v = pool.restore_victim((0, 8), true, 9, &[], &[], 1, t11).expect("prefill-class page first");
+        assert_eq!(pool.owner_of[v as usize].map(|k| k.0), Some(3));
+        pool.evict(v, 9);
+        pool.land_stamped(v, (1, 1), t11);
+        assert_eq!(stamp_of(&pool, (1, 1)), t11, "keeps its own stamp");
+        // (1,0), stamp t10: the plain LRU victim is now (1,1) at t11 > t10 --
+        // nothing is older than the entry, so it would only be evicted first:
+        // STOP. (4,0) was never a candidate either.
+        assert!(pool.restore_victim((0, 8), true, 9, &[], &[], 1, t10).is_none());
+        assert_eq!(stamp_of(&pool, (4, 0)), t40);
+        // Merge: an old queue entry and a new delta entry for the same expert
+        // keep the newer stamp; resident experts are dropped.
+        pool.me.restore.clear();
+        pool.me.restore.push_back((2, 9, 5 + PREFILL_AGE));
+        pool.me.decode_delta.push_back((2, 9, 7 + PREFILL_AGE, 3));
+        pool.me.decode_delta.push_back((1, 1, 9 + PREFILL_AGE, 3)); // resident again
+        pool.me.decode_delta.push_back((2, 8, 6 + PREFILL_AGE, 3));
+        pool.me_build_restore();
+        assert_eq!(pool.me.restore.iter().copied().collect::<Vec<_>>(), vec![(2, 9, 7 + PREFILL_AGE), (2, 8, 6 + PREFILL_AGE)]);
+        assert!(pool.me.decode_delta.is_empty());
     }
 
     /// Past its budget a prefill phase takes decode slots it is NOT using
