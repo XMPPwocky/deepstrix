@@ -2270,6 +2270,8 @@ struct ModeEvict {
     restore_on: bool,
     /// Entries to restore `(layer, e, decode stamp)`, NEWEST stamp first.
     restore: std::collections::VecDeque<(u32, u32, u64)>,
+    /// Restore reads started and not yet handled (`RESTORE_INFLIGHT` cap).
+    restore_inflight: std::collections::HashSet<(u32, u32)>,
     rc: RestoreCounters,
 }
 
@@ -2287,8 +2289,13 @@ pub struct RestoreCounters {
     pub requeued: u64,
 }
 
-/// Restore reads started per decode request (`pump_restore`).
+/// Restore reads started per decode request (`pump_restore`), at most.
 const RESTORE_PUMP: usize = 4;
+/// Restore reads in flight at once: the restore is a BACKGROUND share of box
+/// 2's readers and staging sets, never all of them (decode's own park /
+/// early-page reads and speculative admissions keep the rest). It also only
+/// starts while more than half of the staging sets are free.
+const RESTORE_INFLIGHT: usize = 2;
 
 /// `V41_B2_RESTORE=1` (needs `V41_B2_MODE_EVICT=1`): after each prefill phase,
 /// read back the decode experts it evicted, newest first, each landing only over
@@ -2926,6 +2933,9 @@ impl ShardPool {
         ents.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
         self.me.rc = RestoreCounters { queued: ents.len() as u64, ..Default::default() };
         self.me.restore = ents.into_iter().collect();
+        // A completion that never came back must not hold the throttle forever;
+        // a late one is harmless (removing an absent key).
+        self.me.restore_inflight.clear();
     }
 
     /// Delta restore: the slot a restore of an expert last stamped `stamp` may
@@ -4156,14 +4166,22 @@ impl ExpertShard {
     /// dropped for want of a staging set go back to the front, in order; an
     /// entry decode already paged back is skipped. Called per request.
     pub fn pump_restore(&mut self) {
+        // Throttle: only while more than half the staging sets are free.
+        if self.prefetch.as_ref().is_some_and(|pf| pf.free.len() * 2 <= pf.stages.len()) {
+            return;
+        }
+        let pending_of = |pf: &Option<B2Prefetch>, k: &(u32, u32)| pf.as_ref().is_some_and(|pf| pf.pending.contains(k));
         let Some(pool) = self.pool.as_mut() else { return };
         if !(pool.me.on && pool.me.restore_on && !pool.me.prefill_phase) {
             return;
         }
-        let mut batch: Vec<(u32, u32, u64)> = Vec::with_capacity(RESTORE_PUMP);
-        while batch.len() < RESTORE_PUMP {
+        let room = RESTORE_PUMP.min(RESTORE_INFLIGHT.saturating_sub(pool.me.restore_inflight.len()));
+        let mut batch: Vec<(u32, u32, u64)> = Vec::with_capacity(room);
+        while batch.len() < room {
             let Some(ent) = pool.me.restore.pop_front() else { break };
-            if pool.slot_of.contains_key(&(ent.0, ent.1)) {
+            // Already back (decode paged it), or already being read by another
+            // job (it lands as that job's read): nothing to restore.
+            if pool.slot_of.contains_key(&(ent.0, ent.1)) || pending_of(&self.prefetch, &(ent.0, ent.1)) {
                 pool.me.rc.skipped += 1;
                 continue;
             }
@@ -4176,7 +4194,12 @@ impl ExpertShard {
         let stamps: Vec<u64> = batch.iter().map(|&(_, _, t)| t).collect();
         let dropped = self.prefetch_words_core(&words, &stamps, false, false, false);
         let pool = self.pool.as_mut().expect("checked above");
-        pool.me.rc.pumped += (batch.len() - dropped.len()) as u64;
+        for ent in &batch {
+            if !dropped.contains(&((ent.0 << 16) | ent.1)) {
+                pool.me.rc.pumped += 1;
+                pool.me.restore_inflight.insert((ent.0, ent.1));
+            }
+        }
         for ent in batch.iter().rev().filter(|ent| dropped.contains(&((ent.0 << 16) | ent.1))) {
             pool.me.restore.push_front(*ent);
         }
@@ -4299,6 +4322,7 @@ impl ExpertShard {
                 Ok(Err((set, layer, e, msg))) => {
                     if let Some(t) = t_w { wait_ns += t.elapsed().as_nanos() as u64; }
                     eprintln!("expertd: prefetch read failed (L{layer} e{e}): {msg}");
+                    pool.me.restore_inflight.remove(&(layer, e));
                     pf.pending.remove(&(layer, e));
                     pf.queue.clear_urgent(layer, e);
                     pf.free.push(set);
@@ -4309,6 +4333,7 @@ impl ExpertShard {
             let key = (d.layer, d.e);
             let ev_t_recv = if ev_on { super::evtrace::now() } else { f64::NAN };
             let ev_wanted_this = d.layer == cur_layer && want.contains(&d.e);
+            pool.me.restore_inflight.remove(&key);
             pf.pending.remove(&key);
             pf.queue.clear_urgent(d.layer, d.e);
             if pool.slot_of.contains_key(&key) {
@@ -8973,6 +8998,107 @@ mod tests {
         pool.me_build_restore();
         assert_eq!(pool.me.restore.iter().copied().collect::<Vec<_>>(), vec![(2, 9, 7 + PREFILL_AGE), (2, 8, 6 + PREFILL_AGE)]);
         assert!(pool.me.decode_delta.is_empty());
+    }
+
+    /// Randomized DELTA RESTORE: prefill phases build the delta, decode phases
+    /// interleave demand claims / hits with OUT-OF-ORDER landings of in-flight
+    /// restores (up to 4 popped from the queue, landed in random order). A
+    /// restore never evicts a decode slot at or above its own stamp (so never a
+    /// page decode made during the restore), keeps its stamp, and stops only
+    /// when no eligible slot is older; the queue is duplicate-free, newest
+    /// first, bounded, and never holds a resident expert when built.
+    #[test]
+    fn pool_restore_randomized_never_evicts_younger() {
+        const LAYERS: u32 = 4;
+        const PER: u32 = 12;
+        let n = (LAYERS * PER) as usize;
+        let ids: Vec<u32> = (0..PER).collect();
+        let regions: Vec<(u32, u32, &[u32])> = (0..LAYERS).map(|l| (l, l * PER, &ids[..])).collect();
+        let (mut landed, mut stops, mut younger_seen) = (0u64, 0u64, 0u64);
+        for seed in 1..=8u64 {
+            let mut rng = SimRng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+            let mut pool = ShardPool::seeded(n, &regions, 0.0);
+            pool.enable_mode_evict(10);
+            pool.me.restore_on = true;
+            for l in 0..LAYERS {
+                for e in 0..PER {
+                    assert!(pool.touch_hit(l, e, false));
+                }
+            }
+            for cycle in 0..40u32 {
+                // Prefill phase: claims for prefill-only experts (ids 30..60).
+                pool.me_note_request(true);
+                for _ in 0..(5 + rng.below(25)) {
+                    let (l, e) = (rng.below(LAYERS as u64) as u32, 30 + rng.below(30) as u32);
+                    if !pool.touch_hit(l, e, true) {
+                        let (v, _) = pool.claim_miss(l, e, &[e], &[], (l * PER, (l + 1) * PER), true, true, true).unwrap();
+                        pool.commit(l, e, v);
+                    }
+                }
+                // Decode phase: the switch builds the queue.
+                for _ in 0..ME_DECODE_STREAK {
+                    pool.me_note_request(false);
+                }
+                assert!(!pool.me.prefill_phase);
+                let q: Vec<(u32, u32, u64)> = pool.me.restore.iter().copied().collect();
+                let keys: std::collections::HashSet<(u32, u32)> = q.iter().map(|&(l, e, _)| (l, e)).collect();
+                assert_eq!(keys.len(), q.len(), "seed {seed} cycle {cycle}: duplicate keys");
+                assert!(q.len() <= N_LAYER as usize * N_EXPERT as usize);
+                assert!(q.windows(2).all(|w| w[0].2 >= w[1].2), "newest first");
+                assert!(q.iter().all(|&(l, e, _)| !pool.slot_of.contains_key(&(l, e))), "none resident");
+                let restore_start = pool.tick;
+                let mut inflight: Vec<(u32, u32, u64)> = Vec::new();
+                for _ in 0..(20 + rng.below(60)) {
+                    if rng.below(2) == 0 {
+                        // Decode demand: a hit or a claim (fresh stamp).
+                        let (l, e) = (rng.below(LAYERS as u64) as u32, rng.below(20) as u32);
+                        if !pool.touch_hit(l, e, false) {
+                            let (v, _) = pool.claim_miss(l, e, &[e], &[], (l * PER, (l + 1) * PER), true, false, false).unwrap();
+                            pool.commit(l, e, v);
+                        }
+                        continue;
+                    }
+                    while inflight.len() < 4 {
+                        let Some(ent) = pool.me.restore.pop_front() else { break };
+                        inflight.push(ent);
+                    }
+                    if inflight.is_empty() {
+                        continue;
+                    }
+                    let (l, e, stamp) = inflight.swap_remove(rng.below(inflight.len() as u64) as usize);
+                    if pool.slot_of.contains_key(&(l, e)) {
+                        continue;
+                    }
+                    match pool.restore_victim((0, n as u32), true, l, &[], &[], l, stamp) {
+                        None => {
+                            // Stop only when nothing eligible is older.
+                            assert!(pool.owner_of.iter().enumerate().all(|(sl, o)| o.is_some() && pool.last_use[sl] >= PREFILL_AGE && pool.last_use[sl] >= stamp),
+                                "seed {seed}: a stop with an older / prefill / free slot available");
+                            pool.me.restore.clear();
+                            inflight.clear();
+                            stops += 1;
+                        }
+                        Some(v) => {
+                            let lu = pool.last_use[v as usize];
+                            let occupied = pool.owner_of[v as usize].is_some();
+                            assert!(!occupied || lu < PREFILL_AGE || lu < stamp, "seed {seed}: restore evicts a younger decode slot");
+                            assert!(!(occupied && lu >= PREFILL_AGE && lu - PREFILL_AGE > restore_start), "seed {seed}: evicts a page decode made during the restore");
+                            younger_seen += u64::from(pool.last_use.iter().any(|&t| t >= PREFILL_AGE && t - PREFILL_AGE > restore_start));
+                            pool.evict(v, l);
+                            pool.land_stamped(v, (l, e), stamp);
+                            assert_eq!(pool.last_use[v as usize], stamp);
+                            landed += 1;
+                        }
+                    }
+                }
+                for (sl, o) in pool.owner_of.iter().enumerate() {
+                    if let Some(k) = o {
+                        assert_eq!(pool.slot_of.get(k), Some(&(sl as u32)), "seed {seed}: maps disagree");
+                    }
+                }
+            }
+        }
+        assert!(landed > 300 && stops > 5 && younger_seen > 50, "not exercised: landed {landed} stops {stops} younger {younger_seen}");
     }
 
     /// Past its budget a prefill phase takes decode slots it is NOT using
