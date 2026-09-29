@@ -586,6 +586,54 @@ pub fn lm_rows() -> usize {
     *V.get_or_init(|| std::env::var("V41_LM_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
 }
 
+/// `V41_LM_PREFETCH=1` (default OFF): while a layer-major group runs, queue box 2
+/// background reads of the NEXT group's experts it owns and (per the residency
+/// mirror, `b2_mirror`) does not hold. They go out as ordinary prefetch words:
+/// speculative class, so under box 2's `route=urgency` they read from the drive
+/// demand reads do not use (the E100, idle during prefill), land in staging sets
+/// and are admitted at the next `ensure`. A window of >= 4096 rows touches ~91%
+/// of a layer's box-2 experts, so the whole non-resident set is (nearly) what
+/// the group will page anyway -- no predictor.
+pub fn lm_prefetch_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_LM_PREFETCH").as_deref() == Ok("1"))
+}
+
+/// `V41_LM_PREFETCH_PER_REQ` (default 16 = box 2's default staging sets): the
+/// prefetch words one request carries while layer-major units run. Box 2 drops
+/// speculative words beyond its free staging sets, so more per request only
+/// burns the queue.
+pub fn lm_prefetch_per_req() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_LM_PREFETCH_PER_REQ").ok().and_then(|v| v.parse().ok()).unwrap_or(16).max(1))
+}
+
+/// Restores the per-request prefetch word cap when a layer-major unit ends
+/// (also on error), so decode steps between units carry their words uncapped.
+struct PrefetchCapGuard(usize);
+impl Drop for PrefetchCapGuard {
+    fn drop(&mut self) {
+        super::remote_experts::set_prefetch_take_cap(self.0);
+    }
+}
+
+/// Prefetch words `(layer << 16) | e` for the MoE layers of `layers` (a
+/// `KvSourceOnly` layer has no MoE): experts box 2 owns (`partition_box2`) that
+/// its last report for the layer says it does not hold. Layer order, so the
+/// group's first layer -- needed first -- leads. Layers box 2 has never
+/// reported are skipped (no residency to go on).
+fn lm_prefetch_words(layers: std::ops::Range<usize>, split: usize) -> Vec<u32> {
+    let mut words = Vec::new();
+    for l in layers.filter(|&l| l != split) {
+        for e in 0..crate::config::N_EXPERT {
+            if super::expert_pager::partition_box2(l as i32, e) && super::b2_mirror::resident(l as i32, e) == Some(false) {
+                words.push(((l as u32) << 16) | e);
+            }
+        }
+    }
+    words
+}
+
 /// The layer groups of a layer-major window over encoder layers
 /// `0..=split` (`split` = `CED_DECODER_START`): a new group at layer 0, at every
 /// KV-source / index-source layer below `split`, and `split` alone (it runs
@@ -991,6 +1039,27 @@ impl HeterogeneousEngine {
         }
         self.dgpu.events.reset();
         self.igpu.events.reset();
+        // Group prefetch (`V41_LM_PREFETCH`): at a group's first unit, queue the
+        // NEXT group's non-resident box-2 experts (dropping any stale words of
+        // earlier groups), and cap the words per request for every unit so the
+        // queue drains at box 2's staging rate instead of being dropped.
+        let _pf_cap = if lm_prefetch_enabled() && self.remote.is_some() && g + 1 < groups.len() {
+            let next = groups[g + 1].clone();
+            if k == 0 {
+                let keep = next.clone();
+                super::remote_experts::retain_prefetch_words(|w| keep.contains(&((w >> 16) as usize)));
+                let words = lm_prefetch_words(next, split);
+                let n = words.len();
+                if !super::remote_experts::push_prefetch_words(&words) {
+                    tracing::debug!(n, "layer-major prefetch: word queue full; skipped");
+                } else {
+                    tracing::debug!(group = g + 1, n, "layer-major prefetch: queued");
+                }
+            }
+            Some(PrefetchCapGuard(super::remote_experts::set_prefetch_take_cap(lm_prefetch_per_req())))
+        } else {
+            None
+        };
         let tokens = &job.tokens[s..e];
         let pos0 = job.pos0 + s as u32;
         let cut = if g == 0 {

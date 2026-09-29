@@ -3223,9 +3223,27 @@ pub struct PinNote<'a> {
 }
 
 pub fn take_prefetch_words(max: usize) -> Vec<u32> {
+    let cap = PREFETCH_TAKE_CAP.load(std::sync::atomic::Ordering::Relaxed);
     let mut g = PREFETCH_WORDS.lock().unwrap();
-    let n = g.len().min(max);
+    let n = g.len().min(max).min(cap);
     g.drain(..n).collect()
+}
+
+/// Per-request cap on the words `take_prefetch_words` hands a frame (default
+/// unlimited). Box 2 starts a speculative word only into a free staging set and
+/// drops the rest, so a producer with more words than sets (layer-major group
+/// prefetch) paces them out over requests instead of losing them on the first.
+static PREFETCH_TAKE_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Set the per-request word cap; returns the previous one (to restore it).
+pub fn set_prefetch_take_cap(cap: usize) -> usize {
+    PREFETCH_TAKE_CAP.swap(cap.max(1), std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Keep only the queued words `keep` accepts (a producer dropping its own stale
+/// words before queueing new ones).
+pub fn retain_prefetch_words(keep: impl Fn(u32) -> bool) {
+    PREFETCH_WORDS.lock().unwrap().retain(|&w| keep(w));
 }
 
 pub fn b2_hits_first() -> bool {
