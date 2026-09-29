@@ -676,6 +676,11 @@ struct LmWindow {
     /// Engram layer, filled by the group-0 units (the inputs arrive with layer 0)
     /// and read by any later group that contains an Engram layer.
     engram: Option<Vec<Vec<f32>>>,
+    /// `V41_LM_PREFETCH`: the next group's words already SENT during the current
+    /// group (the mirror for those layers only refreshes when they run, so it
+    /// keeps saying `Some(false)` for words box 2 already has or is reading).
+    /// Cleared when the group changes.
+    pf_sent: std::collections::HashSet<u32>,
 }
 
 /// Plan a layer-major window from `start`: the chunks `plan_chunk` would cut
@@ -951,7 +956,7 @@ impl HeterogeneousEngine {
             }
             tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap,
                 tokens_done = start, tokens_total = t, "prefill_lm_window open");
-            job.lm = Some(LmWindow { start, end, subs, group: 0, sub: 0, engram: None });
+            job.lm = Some(LmWindow { start, end, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default() });
             return Ok(true);
         }
     }
@@ -1058,15 +1063,17 @@ impl HeterogeneousEngine {
                 ONCE.call_once(|| tracing::warn!("V41_LM_PREFETCH: no box-2 residency mirror (V41_SUB / V41_B2_PIN off): nothing to prefetch from"));
             }
             let next = groups[g + 1].clone();
-            let words = lm_prefetch_words(next.clone(), split);
+            let sent = &job.lm.as_ref().expect("open window").pf_sent;
+            let words: Vec<u32> = lm_prefetch_words(next.clone(), split).into_iter().filter(|w| !sent.contains(w)).collect();
             let n = words.len();
             let prev_cap = super::remote_experts::set_prefetch_take_cap(lm_prefetch_per_req());
-            if !super::remote_experts::push_prefetch_words(&words) {
+            let queued = super::remote_experts::push_prefetch_words(&words);
+            if !queued {
                 tracing::debug!(n, "layer-major prefetch: word queue full; skipped");
             } else if k == 0 {
                 tracing::debug!(group = g + 1, n, "layer-major prefetch: queued");
             }
-            Some(PrefetchCapGuard { prev_cap, layers: next })
+            Some((PrefetchCapGuard { prev_cap, layers: next }, if queued { words } else { Vec::new() }))
         } else {
             None
         };
@@ -1090,6 +1097,20 @@ impl HeterogeneousEngine {
                 range.clone(), ced_mode,
             )?
         };
+        // Group prefetch bookkeeping: what this unit's requests carried out is
+        // sent (not re-queued by later units of this group); the rest goes back
+        // to the pool of candidates. The guard then only restores the cap.
+        if let Some((guard, queued)) = _pf_cap.as_ref() {
+            let layers = guard.layers.clone();
+            let unsent = super::remote_experts::extract_prefetch_words(|w| layers.contains(&((w >> 16) as usize)));
+            let unsent: std::collections::HashSet<u32> = unsent.into_iter().collect();
+            let w = job.lm.as_mut().expect("open window");
+            for &word in queued {
+                if !unsent.contains(&word) {
+                    w.pf_sent.insert(word);
+                }
+            }
+        }
         if cut != b_a_plan {
             return Err(eyre!("layer-major: lane cut {cut} != planned {b_a_plan} (group {g}, rows [{s}, {e}))"));
         }
@@ -1134,6 +1155,7 @@ impl HeterogeneousEngine {
         }
         w.sub = 0;
         w.group += 1;
+        w.pf_sent.clear();
         if w.group < groups.len() {
             return Ok(0);
         }

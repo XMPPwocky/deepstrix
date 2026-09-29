@@ -3251,6 +3251,15 @@ pub fn retain_prefetch_words(keep: impl Fn(u32) -> bool) {
     PREFETCH_WORDS.lock().unwrap().retain(|&w| keep(w));
 }
 
+/// Remove and return the queued words `take` selects (a producer learning which
+/// of its words were NOT sent).
+pub fn extract_prefetch_words(take: impl Fn(u32) -> bool) -> Vec<u32> {
+    let mut g = PREFETCH_WORDS.lock().unwrap();
+    let (out, keep): (Vec<u32>, Vec<u32>) = g.iter().partition(|&&w| take(w));
+    *g = keep;
+    out
+}
+
 pub fn b2_hits_first() -> bool {
     HITS_FIRST_INIT.get_or_init(|| {
         let on = matches!(std::env::var("V41_B2_HITS_FIRST").as_deref(), Ok("1") | Ok("on"));
