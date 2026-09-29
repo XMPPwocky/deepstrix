@@ -578,6 +578,9 @@ pub fn lm_prefill_enabled() -> bool {
 
 /// `V41_LM_ROWS` (default 4096): rows per layer-major window (the device store's
 /// capacity). Clamped below to two chunks (a one-chunk window IS chunked prefill).
+/// TTFT tradeoff: the scheduler keeps the prefill on a job whose window is open
+/// (multistream `prefill_tick`), so a short prompt arriving meanwhile waits up to
+/// one window of encoder work (~4096 rows) instead of one chunk.
 pub fn lm_rows() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("V41_LM_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
@@ -864,8 +867,10 @@ impl HeterogeneousEngine {
             };
             let (start, end) = (job.chunk_start, subs.last().expect("two or more").1);
             let rows = end - start;
-            // Sized to this window, which is the largest the job will open (a
-            // later one is either cap-bound like this one, or the tail).
+            // Sized to this window; a later one can be larger (image spans make
+            // `plan_chunk` cut shorter chunks, so fewer rows fit under `cap`
+            // here), in which case the store is reallocated -- it holds nothing
+            // live between windows.
             if job.lm_store.as_ref().is_none_or(|st| st.2 < rows) {
                 job.lm_store = None;
                 self.set_current_cached(self.dgpu.device)?;

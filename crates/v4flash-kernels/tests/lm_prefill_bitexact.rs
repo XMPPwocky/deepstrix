@@ -353,6 +353,19 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
             continue;
         }
         let mut diffs = Vec::new();
+        if lazy {
+            // Separate "lazy/foreign" from "layer-major": the same window, eager
+            // inputs, no foreign forwards.
+            let mut st_e = fresh_state()?;
+            let (l_e, _) = run(&prompt, pos0, slice(pos0, prompt.len()), &mut st_e, rows, false, false, &mut pg)?;
+            for d in diff_states(&st_c, &st_e)? {
+                diffs.push(format!("eager layer-major: {d}"));
+            }
+            let n = l_c.iter().zip(&l_e).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            if n > 0 {
+                diffs.push(format!("eager layer-major: prefill logits: {n} differ"));
+            }
+        }
         if windows == 0 {
             diffs.push("layer-major never ran (0 windows): single-lane shortcut or no device store".to_string());
         }
