@@ -181,6 +181,10 @@ fn push_xq_transport_matches_igpu_quantize() -> eyre::Result<()> {
     let d_xfer = Stream::new(dgpu.id)?;
     let mut x_d: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, MAX_ROWS * N_EMBD)?;
     let mut xq_d: DeviceBuffer<u8> = DeviceBuffer::new(dgpu.id, max_bytes)?;
+    // Both events are recorded on dGPU streams, so they belong to the dGPU
+    // (as `LayerSyncEvents` do); the iGPU stream waits on them cross-device.
+    let ready = Event::new_no_timing()?;
+    let pushed = Event::new_no_timing()?;
     igpu.set_current()?;
     let qi = Q8KQuantize::for_arch(&igpu.properties()?.gcn_arch_name)?;
     let i_compute = Stream::new(igpu.id)?;
@@ -188,8 +192,6 @@ fn push_xq_transport_matches_igpu_quantize() -> eyre::Result<()> {
     let mut recv_i: DeviceBuffer<u8> = DeviceBuffer::new(igpu.id, max_bytes)?;
     let mut head_i: DeviceBuffer<u8> = DeviceBuffer::new(igpu.id, max_bytes)?;
     let mut ref_i: DeviceBuffer<u8> = DeviceBuffer::new(igpu.id, max_bytes)?;
-    let ready = Event::new_no_timing()?;
-    let pushed = Event::new_no_timing()?;
 
     let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
     let row_set = [1usize, 2, 3, 4, 5, 8, 4, 4, 3, 512, 1, 4, 256, 7, 4, 4];
