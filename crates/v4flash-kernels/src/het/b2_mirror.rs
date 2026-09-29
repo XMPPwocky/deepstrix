@@ -89,7 +89,8 @@
 //!   (a reply's map is then its pinned set for the layer, never merely
 //!   resident) and never evicts a pinned expert (`remote_experts`, the block
 //!   above `PinBook`, has box 2's side and the no-deadlock budget);
-//! * the hub RELEASES its coldest held experts (decayed decode pick counts)
+//! * the hub RELEASES its coldest held experts (decayed, rank-weighted counts
+//!   of the ROUTER's decode picks, `V41_B2_PIN_WANTS`)
 //!   once box 2's pinned count nears its budget: `begin_step` clears them here
 //!   at once and queues `layer << 16 | e` RELEASE words that ride on the next
 //!   requests (`REQ_FLAG_RELEASE`). No request is routed-but-unsent at
@@ -109,7 +110,8 @@
 //! routes exactly as without it: pinning only changes which slot box 2 evicts.
 //! Knobs: `V41_B2_PIN_HEADROOM` (default 256 slots below box 2's budget before
 //! releasing, down to twice that), `V41_B2_PIN_DECAY_STEPS` (default 256: pick
-//! counts halve), `V41_B2_ASSERT_NO_SURPRISE`.
+//! counts halve), `V41_B2_PIN_WANTS` (default on: rank by the router's picks,
+//! not the prior's), `V41_B2_ASSERT_NO_SURPRISE`.
 //!
 //! Which picks may be swapped (modes 1-2):
 //! * `V41_SUB_MIN_RANK` (1..=6, default 6): only picks at this rank or lower
@@ -452,6 +454,23 @@ pub fn pin_decay_steps() -> u32 {
     *D
 }
 
+/// `V41_B2_PIN_WANTS` (default ON; `0` = the ledger as deployed 2026-09-27):
+/// rank held experts for release by the ROUTER's own decode picks (in its rank
+/// order), not by the picks sent after the cache prior, and break count ties by
+/// the last want (the longest-unwanted goes first) instead of by (layer, id).
+/// Counting the sent picks let the held set earn its own credit: a held expert
+/// the prior boosted into a row was counted, the pick it displaced was not. So
+/// a displaced expert admitted in the background (`V41_SUB_ADMIT`) arrived with
+/// a count of ~0, tied for coldest, and went at the next release: box 2 paid
+/// the read, released it unused, and the prior swapped it away on its next
+/// want. Box 1's hot set ranks by the router's picks for the same reason
+/// (`forward_prefill`, "rank the hot set by the ROUTER's picks").
+pub fn pin_wants() -> bool {
+    static W: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_B2_PIN_WANTS").as_deref() != Ok("0"));
+    *W
+}
+
 /// `V41_B2_ASSERT_NO_SURPRISE=1`: a surprise panics (verification runs).
 /// Default: counted and logged. A surprise costs a few ms of box-2 paging; a
 /// panic costs an outage for every agent on the server.
@@ -474,6 +493,7 @@ static LEDGER: std::sync::LazyLock<std::sync::Mutex<PinLedger>> =
 static N_SURPRISES: AtomicU64 = AtomicU64::new(0);
 static N_HELD_PICKS: AtomicU64 = AtomicU64::new(0);
 static N_RELEASED: AtomicU64 = AtomicU64::new(0);
+static N_RELEASED_UNUSED: AtomicU64 = AtomicU64::new(0);
 /// Cumulative (never drained): for tests and the surprise log.
 static TOT_SURPRISES: AtomicU64 = AtomicU64::new(0);
 static TOT_HELD_PICKS: AtomicU64 = AtomicU64::new(0);
@@ -500,9 +520,10 @@ pub struct PinLedger {
     queue: std::collections::VecDeque<u32>,
     /// Per layer, `WORDS` u64s: HELD.
     held: Vec<u64>,
-    /// Per `layer * NE + e`: decode picks sent, WEIGHTED BY RANK (a rank-1
-    /// pick adds `N_EXPERT_USED`, a rank-6 pick adds 1), halved every
-    /// `decay_steps` steps. The reads box 2 still pays are the PROTECTED-rank
+    /// Per `layer * NE + e`: decode picks, WEIGHTED BY RANK (a rank-1 pick
+    /// adds `N_EXPERT_USED`, a rank-6 pick adds 1), halved every `decay_steps`
+    /// steps. The ROUTER's picks and ranks with `by_wants`, else the picks sent
+    /// (see `pin_wants`). The reads box 2 still pays are the PROTECTED-rank
     /// picks the cache prior may not swap, so the pool should keep the experts
     /// that win at rank 1-2 and release the ones only ever picked at swappable
     /// ranks (2026-09-27: blocked picks were 4-6 of ~5 reads per 3-row step).
@@ -510,6 +531,20 @@ pub struct PinLedger {
     steps: u32,
     /// `(epoch, pinned, budget)` of the reply with the newest epoch.
     last: Option<(u32, u32, u32)>,
+    /// `pin_wants()` at creation: count the router's picks and break count
+    /// ties by `last_want`. Off = the 2026-09-27 ledger exactly.
+    by_wants: bool,
+    /// Per `layer * NE + e`: `steps + 1` at the last want (0 = never).
+    last_want: Vec<u32>,
+    /// Per `layer * NE + e`: `steps + 1` when a background admission was
+    /// queued (`note_admits`), 0 = none or used since: sent to box 2 (the
+    /// read, in flight or landed, served it), or wanted in a LATER step. A
+    /// want in the same step does not count: the want the prior displaced
+    /// (the admission's cause) is noted at submit, after the admission.
+    admitted: Vec<u32>,
+    /// Releases of `admitted` experts since the last `take_released_unused`:
+    /// reads box 2 paid for experts the hub let go before using them.
+    released_unused: u32,
 }
 
 impl Default for PinLedger {
@@ -528,6 +563,10 @@ impl PinLedger {
             counts: vec![0; LAYERS * NE],
             steps: 0,
             last: None,
+            by_wants: pin_wants(),
+            last_want: vec![0; LAYERS * NE],
+            admitted: vec![0; LAYERS * NE],
+            released_unused: 0,
         }
     }
 
@@ -596,10 +635,77 @@ impl PinLedger {
         }
     }
 
+    /// The router wanted `(layer, e)`: stamp its recency and, unless the
+    /// admission was queued in this same step (by this want), clear its
+    /// admitted-unused mark.
+    pub fn note_wanted(&mut self, layer: u32, e: u32) {
+        let (l, e) = (layer as usize, e as usize);
+        if l < LAYERS && e < NE {
+            // +1 so that 0 keeps meaning "never".
+            let now = self.steps.wrapping_add(1);
+            let k = l * NE + e;
+            self.last_want[k] = now;
+            if self.admitted[k] != now {
+                self.admitted[k] = 0;
+            }
+        }
+    }
+
+    /// One decode-shaped request's picks, for the release ranking. `sent`: the
+    /// picks sent to box 2 (`[b, nu]`, `NO_PICK` where box 1 computes).
+    /// `wants`: the ROUTER's own picks for the same rows (`[b, nu]`, its rank
+    /// order), when the caller has them; under a live cache prior they differ
+    /// from `sent`. With `by_wants` the counts come from `wants` (else `sent`);
+    /// without, from `sent` (the 2026-09-27 ledger). Recency and the
+    /// admitted-unused marks follow `wants` (else `sent`) in both modes, so
+    /// `released_unused` compares across the knob; a `sent` pick always
+    /// clears its mark. A `wants` of another shape is ignored.
+    pub fn note_decode_picks(&mut self, layer: u32, sent: &[i32], wants: Option<&[i32]>) {
+        let nu = crate::config::N_EXPERT_USED;
+        let wants = wants.filter(|w| w.len() == sent.len());
+        let router = wants.unwrap_or(sent);
+        let ranked = if self.by_wants { router } else { sent };
+        for (i, &e) in ranked.iter().enumerate() {
+            if (0..N_EXPERT as i32).contains(&e) {
+                self.note_pick_w(layer, e as u32, (nu - i % nu) as u32);
+            }
+        }
+        for &e in router {
+            if (0..N_EXPERT as i32).contains(&e) {
+                self.note_wanted(layer, e as u32);
+            }
+        }
+        // Box 2 computes what it is sent: an admission of it, in flight or
+        // landed, served a pick even within its own step (the other lane's).
+        if (layer as usize) < LAYERS {
+            for &e in sent {
+                if (0..N_EXPERT as i32).contains(&e) {
+                    self.admitted[layer as usize * NE + e as usize] = 0;
+                }
+            }
+        }
+    }
+
+    /// A background admission of `(layer, e)` was queued: if it is released
+    /// before the router wants it again, the read was paid for nothing.
+    pub fn note_admitted(&mut self, layer: u32, e: u32) {
+        let (l, e) = (layer as usize, e as usize);
+        if l < LAYERS && e < NE {
+            self.admitted[l * NE + e] = self.steps.wrapping_add(1);
+        }
+    }
+
+    /// Releases of admitted-but-unwanted experts since the last call.
+    pub fn take_released_unused(&mut self) -> u32 {
+        std::mem::take(&mut self.released_unused)
+    }
+
     /// One decode step: decay the pick counts, and if box 2 is within
     /// `headroom` of its budget, RELEASE the coldest held experts (at most
     /// `max`) down to `budget - 2 * headroom`: each is not held from now on,
     /// gets the next release index, and its word is queued. Returns the words.
+    /// Count ties go to the longest-unwanted with `by_wants`, else to the
+    /// lowest `(layer, e)`.
     pub fn step(&mut self, headroom: u32, decay_steps: u32, max: usize) -> Vec<u32> {
         self.steps = self.steps.wrapping_add(1);
         if decay_steps > 0 && self.steps % decay_steps == 0 {
@@ -612,14 +718,17 @@ impl PinLedger {
             return Vec::new();
         }
         let want = (est - budget.saturating_sub(2 * headroom)) as usize;
-        let mut cand: Vec<(u32, u32)> = Vec::new();
+        // `(count, recency, key)`; recency is constant without `by_wants`, so
+        // the order is exactly the old `(count, key)` one.
+        let mut cand: Vec<(u32, u32, u32)> = Vec::new();
         for (wi, &w) in self.held.iter().enumerate() {
             let mut bits = w;
             while bits != 0 {
                 let b = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let (l, e) = (wi / WORDS, (wi % WORDS) * 64 + b);
-                cand.push((self.counts[l * NE + e], (l * NE + e) as u32));
+                let k = l * NE + e;
+                cand.push((self.counts[k], if self.by_wants { self.last_want[k] } else { 0 }, k as u32));
             }
         }
         let n = want.min(max).min(cand.len());
@@ -630,8 +739,11 @@ impl PinLedger {
             cand.select_nth_unstable(n - 1);
         }
         let mut out = Vec::with_capacity(n);
-        for &(_, k) in &cand[..n] {
+        for &(_, _, k) in &cand[..n] {
             let (l, e) = (k as usize / NE, k as usize % NE);
+            if std::mem::take(&mut self.admitted[k as usize]) != 0 {
+                self.released_unused += 1;
+            }
             self.held[l * WORDS + e / 64] &= !(1u64 << (e % 64));
             // Skips 0 (= never released): after 2^32 words the indices run one
             // ahead of box 2's epoch, which only masks a release one word
@@ -726,8 +838,10 @@ pub fn update_pinned(layer: u32, words: &[u32], epoch: u32, pinned: u32, budget:
 
 /// At submit (pin mode): which of the sent picks `sel` the mirror HOLDS, as
 /// `RESID_WORDS` bits, and how many distinct ones. `b <= 16` requests also
-/// count their picks for release ranking.
-pub fn pin_note_submit(layer: u32, sel: &[i32], decode_shaped: bool) -> ([u32; RESID_WORDS], u32) {
+/// count picks for release ranking: the router's own `wants` (same `[b, nu]`
+/// shape, its rank order) when the caller has them, else `sel`
+/// (`PinLedger::note_decode_picks`).
+pub fn pin_note_submit(layer: u32, sel: &[i32], wants: Option<&[i32]>, decode_shaped: bool) -> ([u32; RESID_WORDS], u32) {
     let mut held = [0u32; RESID_WORDS];
     let l = layer as usize;
     if l >= LAYERS {
@@ -740,13 +854,7 @@ pub fn pin_note_submit(layer: u32, sel: &[i32], decode_shaped: bool) -> ([u32; R
     }
     if decode_shaped {
         if let Ok(mut g) = LEDGER.lock() {
-            // `sel` is `[b, nu]` in the router's rank order: weight by rank.
-            let nu = crate::config::N_EXPERT_USED;
-            for (i, &e) in sel.iter().enumerate() {
-                if (0..N_EXPERT as i32).contains(&e) {
-                    g.note_pick_w(layer, e as u32, (nu - i % nu) as u32);
-                }
-            }
+            g.note_decode_picks(layer, sel, wants);
         }
     }
     let n: u32 = held.iter().map(|w| w.count_ones()).sum();
@@ -778,9 +886,11 @@ fn pin_begin_step() {
         let (l, e) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
         BITS[l][e / 64].fetch_and(!(1u64 << (e % 64)), Ordering::Relaxed);
     }
+    let unused = g.take_released_unused();
     drop(g);
     N_RELEASED.fetch_add(words.len() as u64, Ordering::Relaxed);
     TOT_RELEASED.fetch_add(words.len() as u64, Ordering::Relaxed);
+    N_RELEASED_UNUSED.fetch_add(u64::from(unused), Ordering::Relaxed);
 }
 
 /// The end-to-end check on a pin-mode reply: sent picks the mirror held at
@@ -814,9 +924,11 @@ pub fn check_surprises(layer: u32, seq: u32, held: &[u32; RESID_WORDS], paged: &
 }
 
 /// `(surprises, held picks sent, release words queued, box 2's pinned count
-/// net of releases in flight, its budget)` since the last call; `None` unless
-/// pinning is on.
-pub fn take_pin_stats() -> Option<[f64; 5]> {
+/// net of releases in flight, its budget, releases of background-admitted
+/// experts the router had not wanted since)` since the last call; `None`
+/// unless pinning is on. The last is box-2 reads paid for nothing: compare it
+/// with `sub_admits_queued` (`take_sub_stats`).
+pub fn take_pin_stats() -> Option<[f64; 6]> {
     if !pin_wanted() {
         return None;
     }
@@ -831,6 +943,7 @@ pub fn take_pin_stats() -> Option<[f64; 5]> {
         N_RELEASED.swap(0, Ordering::Relaxed) as f64,
         est,
         budget,
+        N_RELEASED_UNUSED.swap(0, Ordering::Relaxed) as f64,
     ])
 }
 
@@ -859,9 +972,16 @@ static N_FAILED: AtomicU64 = AtomicU64::new(0);
 static N_ADMITS: AtomicU64 = AtomicU64::new(0);
 static N_INCOMING: AtomicU64 = AtomicU64::new(0);
 
-/// Background admissions queued (`V41_SUB_ADMIT`), for the profile.
-pub fn note_admits(n: usize) {
-    N_ADMITS.fetch_add(n as u64, Ordering::Relaxed);
+/// Background admissions queued (`V41_SUB_ADMIT`, words `layer << 16 | e`),
+/// for the profile and, in pin mode, the ledger's admitted-unused marks.
+pub fn note_admits(words: &[u32]) {
+    N_ADMITS.fetch_add(words.len() as u64, Ordering::Relaxed);
+    if pin_active() && !words.is_empty() {
+        let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+        for &w in words {
+            g.note_admitted(w >> 16, w & 0xFFFF);
+        }
+    }
 }
 
 /// Count one lane-layer's distinct box-2 picks (`is_box2`) that box 2's last
@@ -1542,15 +1662,18 @@ mod tests {
         update_pinned(l, &map(&all), 0, 745, 1000);
         pin_reply_seen(true);
         assert!(pin_active() && pin_request_flag() == REQ_FLAG_PIN);
-        let (h, n) = pin_note_submit(l, &[3, 5, 301, -1], true);
+        let (h, n) = pin_note_submit(l, &[3, 5, 301, -1], None, true);
         assert_eq!(n, 2);
         assert!(h[0] & (1 << 3) != 0 && h[0] & (1 << 5) != 0 && h[9] & (1 << (301 % 32)) == 0);
         assert!(held(l, 7) && !held(l, 301));
         // 3, 5, 7 are hot; everything else in the layer is cold.
         for _ in 0..4 {
-            let _ = pin_note_submit(l, &[3, 5, 7], true);
+            let _ = pin_note_submit(l, &[3, 5, 7], None, true);
         }
         let _ = take_pin_stats();
+        // Background admissions of 0 (cold: released below, never wanted
+        // again = a read paid for nothing) and 3 (hot: kept).
+        note_admits(&[l << 16, (l << 16) | 3]);
         // A step: release the 257 coldest (745 - (1000 - 512)) at once.
         begin_step();
         let mut words = Vec::new();
@@ -1565,10 +1688,12 @@ mod tests {
         assert!(!released.iter().any(|e| [3, 5, 7].contains(e)), "the hot ones stay");
         for e in 0..300u32 {
             assert_eq!(held(l, e), !released.contains(&e), "BITS cleared at release for e{e}");
-            assert_eq!(pin_note_submit(l, &[e as i32], false).1, u32::from(!released.contains(&e)));
+            assert_eq!(pin_note_submit(l, &[e as i32], None, false).1, u32::from(!released.contains(&e)));
         }
         let st = take_pin_stats().unwrap();
         assert_eq!((st[2], st[3], st[4]), (257.0, 488.0, 1000.0), "released, est pinned net of in-flight, budget");
+        assert!(released.contains(&0) && !released.contains(&3));
+        assert_eq!(st[5], 1.0, "one admitted expert released before any later want");
         // Nothing more to release now that the estimate is at target.
         begin_step();
         assert!(take_release_words(128).is_empty());
@@ -1579,7 +1704,7 @@ mod tests {
         update_pinned(l, &map(&all), 257, 745, 1000);
         assert!(held(l, released[0]) && held(l, released[256]) && held(l, 3));
         // Surprise: held-at-submit 3 paged anyway (with 301, which was not held).
-        let (h, _) = pin_note_submit(l, &[3, 301], true);
+        let (h, _) = pin_note_submit(l, &[3, 301], None, true);
         let mut paged = [0u32; RESID_WORDS];
         paged[0] = 1 << 3;
         paged[301 / 32] = 1 << (301 % 32);
@@ -1623,9 +1748,114 @@ mod tests {
         let mut sel = vec![-1i32; nu_us];
         sel[0] = 7;
         sel[nu_us - 1] = 8;
-        let _ = pin_note_submit(5, &sel, true);
+        let _ = pin_note_submit(5, &sel, None, true);
         let l = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!((l.counts[5 * NE + 7], l.counts[5 * NE + 8]), (nu, 1));
+    }
+
+    /// `V41_B2_PIN_WANTS`: the ranking counts the ROUTER's picks at the
+    /// router's ranks. A pick only the prior put in a row earns nothing and the
+    /// pick it displaced is credited; off, the sent picks count exactly as
+    /// before. Without router picks (or with a mis-shaped slice) the sent
+    /// picks count either way.
+    #[test]
+    fn pin_ledger_counts_router_wants() {
+        let nu = crate::config::N_EXPERT_USED;
+        // One row: the router wanted 10.. in rank order; the prior replaced
+        // its rank-3 pick (12) with a held 40, in the same slot.
+        let wants: Vec<i32> = (10..10 + nu as i32).collect();
+        let mut sent = wants.clone();
+        sent[2] = 40;
+        let mut on = PinLedger::new();
+        on.by_wants = true;
+        on.note_decode_picks(3, &sent, Some(&wants));
+        assert_eq!(on.counts[3 * NE + 12], (nu - 2) as u32, "the displaced want is credited at its rank");
+        assert_eq!(on.counts[3 * NE + 40], 0, "a pick only the prior made earns nothing");
+        assert_eq!(on.counts[3 * NE + 10], nu as u32);
+        let mut off = PinLedger::new();
+        off.by_wants = false;
+        off.note_decode_picks(3, &sent, Some(&wants));
+        assert_eq!((off.counts[3 * NE + 40], off.counts[3 * NE + 12]), ((nu - 2) as u32, 0), "off: the sent picks");
+        let mut none = PinLedger::new();
+        none.by_wants = true;
+        none.note_decode_picks(3, &sent, None);
+        none.note_decode_picks(3, &sent, Some(&wants[..nu - 1]));
+        assert_eq!((none.counts[3 * NE + 40], none.counts[3 * NE + 12]), (2 * (nu - 2) as u32, 0));
+        // Recency follows the router's picks in both modes.
+        assert!(on.last_want[3 * NE + 12] != 0 && off.last_want[3 * NE + 12] != 0);
+        assert_eq!((on.last_want[3 * NE + 40], off.last_want[3 * NE + 40]), (0, 0));
+    }
+
+    /// Count ties go to the longest-unwanted with `by_wants` (never-wanted
+    /// first), to the lowest `(layer, e)` without.
+    #[test]
+    fn pin_release_ties_go_to_the_longest_unwanted() {
+        for by_wants in [true, false] {
+            let mut g = PinLedger::new();
+            g.by_wants = by_wants;
+            g.apply_map(1, &map(&[4, 5, 6]), 0);
+            g.note_reply(0, 3, 3);
+            g.steps = 10;
+            g.note_wanted(1, 6);
+            g.steps = 20;
+            g.note_wanted(1, 4);
+            // All counts 0; est 3 > 3 - 1: release down to 3 - 2 = 1.
+            let mut w = g.step(1, 0, 512);
+            w.sort();
+            let kept = if by_wants { 4 } else { 6 };
+            let gone: Vec<u32> = [4, 5, 6].into_iter().filter(|&e| e != kept).map(|e| (1 << 16) | e).collect();
+            assert_eq!(w, gone, "by_wants {by_wants}");
+            assert!(g.held(1, kept));
+        }
+    }
+
+    /// The bug `V41_B2_PIN_WANTS` fixes, on a bare ledger in production order
+    /// (admission queued at route time, then the submit notes the picks): the
+    /// prior displaces a want for 3 and box 2 admits it; a stale held 9 was
+    /// never wanted. Off, 3 has no count, loses the (layer, e) tie and is
+    /// released unused. On, its displaced want keeps it, and 9 goes. A want in
+    /// a LATER step clears the admitted mark; the causing want does not.
+    #[test]
+    fn pin_admitted_displaced_want_survives() {
+        let nu = crate::config::N_EXPERT_USED;
+        let mut wants = vec![20i32; nu];
+        for (i, w) in wants.iter_mut().enumerate() {
+            *w = 20 + i as i32;
+        }
+        wants[nu - 1] = 3; // the router's rank-6 pick
+        let mut sent = wants.clone();
+        sent[nu - 1] = 21 + nu as i32; // the prior's held substitute
+        for by_wants in [true, false] {
+            let mut g = PinLedger::new();
+            g.by_wants = by_wants;
+            g.note_admitted(2, 3);
+            g.note_decode_picks(2, &sent, Some(&wants));
+            assert!(g.admitted[2 * NE + 3] != 0, "the causing want leaves the mark");
+            // Box 2 lands and pins 3; 9 is stale. Over budget by one.
+            g.apply_map(2, &map(&[3, 9]), 0);
+            g.note_reply(0, 2, 2);
+            let w = g.step(1, 0, 1);
+            if by_wants {
+                assert_eq!(w, vec![(2 << 16) | 9]);
+                assert_eq!(g.take_released_unused(), 0);
+                assert!(g.admitted[2 * NE + 3] != 0, "still unused, still held");
+                // Wanted in a later step: the admission paid off.
+                g.note_decode_picks(2, &wants, None);
+                assert_eq!(g.admitted[2 * NE + 3], 0);
+            } else {
+                assert_eq!(w, vec![(2 << 16) | 3], "the old ledger releases the fresh admission first");
+                assert_eq!(g.take_released_unused(), 1);
+                assert_eq!(g.take_released_unused(), 0, "drained");
+            }
+        }
+        // Sent to box 2 in the admission's own step (another lane's protected
+        // pick): the read in flight served it.
+        let mut g = PinLedger::new();
+        g.note_admitted(2, 11);
+        let mut row = vec![-1i32; nu];
+        row[0] = 11;
+        g.note_decode_picks(2, &row, None);
+        assert_eq!(g.admitted[2 * NE + 11], 0);
     }
 
     /// Release indices wrap without ever becoming 0 (= never released), and

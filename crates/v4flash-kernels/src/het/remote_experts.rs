@@ -7270,12 +7270,12 @@ impl RemoteExpertClient {
     /// it validates the hub's INTENT (the remap encoding), not the outcome.
     pub fn submit_unmasked(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
         let flags = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 };
-        self.submit_inner(layer, b, xq, sel, ew, flags, false)
+        self.submit_inner(layer, b, xq, sel, ew, flags, false, None)
     }
 
     /// As [`Self::submit_unmasked`] with explicit `proto::REQ_FLAG_*` bits.
     pub fn submit_unmasked_flags(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
-        self.submit_inner(layer, b, xq, sel, ew, flags, false)
+        self.submit_inner(layer, b, xq, sel, ew, flags, false, None)
     }
 
     /// `submit` or `submit_unmasked`, chosen by whether box 1 is computing any
@@ -7292,8 +7292,12 @@ impl RemoteExpertClient {
     /// Getting this backwards is equally silent in the other direction: an
     /// unmasked submit while box 1 still computes its share DOUBLE-COUNTS every
     /// expert both devices claim.
+    ///
+    /// `wants`: the ROUTER's own picks for these rows when a cache prior
+    /// changed them (`[b, nu]`, its rank order); only the pin ledger reads
+    /// them (`b2_mirror::pin_wants`). `None` ranks by `sel`.
     #[allow(clippy::too_many_arguments)]
-    pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool, partner: bool) -> eyre::Result<Option<Ticket>> {
+    pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool, partner: bool, wants: Option<&[i32]>) -> eyre::Result<Option<Ticket>> {
         let extra = if partner { proto::REQ_FLAG_PARTNER } else { 0 };
         let resid = if super::b2_mirror::wanted() {
             // These picks will be resident on box 2 by the time the other lane's
@@ -7304,11 +7308,7 @@ impl RemoteExpertClient {
             0
         };
         let f = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 } | extra | resid;
-        if unmasked {
-            self.submit_unmasked_flags(layer, b, xq, sel, ew, f)
-        } else {
-            self.submit_flags(layer, b, xq, sel, ew, f)
-        }
+        self.submit_inner(layer, b, xq, sel, ew, f, !unmasked, wants)
     }
 
     pub fn submit(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
@@ -7317,7 +7317,7 @@ impl RemoteExpertClient {
 
     /// As [`Self::submit`] with explicit `proto::REQ_FLAG_*` bits.
     pub fn submit_flags(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
-        self.submit_inner(layer, b, xq, sel, ew, flags, true)
+        self.submit_inner(layer, b, xq, sel, ew, flags, true, None)
     }
 
     /// [`Self::submit_flags`] without the advertised-ownership mask — i.e. what
@@ -7326,10 +7326,14 @@ impl RemoteExpertClient {
     /// exercise the miss path at all: masked submits can only ever request
     /// resident experts, so they never fault.
     pub fn submit_flags_unmasked(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
-        self.submit_inner(layer, b, xq, sel, ew, flags, false)
+        self.submit_inner(layer, b, xq, sel, ew, flags, false, None)
     }
 
-    fn submit_inner(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32, mask: bool) -> eyre::Result<Option<Ticket>> {
+    /// `wants`: the router's own picks for these rows (`[b, nu]`, its rank
+    /// order), for the pin ledger's release ranking only (see
+    /// `b2_mirror::pin_note_submit`); `None` ranks by `sel`.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_inner(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32, mask: bool, wants: Option<&[i32]>) -> eyre::Result<Option<Ticket>> {
         let nu = N_EXPERT_USED;
         if b == 0 || b > self.info.max_batch as usize {
             return Err(eyre!("remote submit: b={b} outside 1..={}", self.info.max_batch));
@@ -7398,7 +7402,7 @@ impl RemoteExpertClient {
         // surprise check on the reply), and the queued RELEASE words, which
         // only go out once box 2 has shown it understands them.
         let (held, n_held) = if flags & proto::REQ_FLAG_PIN != 0 {
-            super::b2_mirror::pin_note_submit(layer, &self.sel_scratch[..b * nu], b as u32 <= proto::PIN_DECODE_MAX_ROWS)
+            super::b2_mirror::pin_note_submit(layer, &self.sel_scratch[..b * nu], wants, b as u32 <= proto::PIN_DECODE_MAX_ROWS)
         } else {
             ([0u32; proto::RESID_WORDS], 0)
         };

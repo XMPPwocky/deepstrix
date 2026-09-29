@@ -87,8 +87,10 @@ pub static HUB_STEP: Kind = Kind {
         // pinning (b2_mirror::take_pin_stats; NaN when `V41_B2_PIN` is off):
         // SURPRISES = sent picks the mirror held that box 2 paged anyway (must
         // be 0), held picks sent, release words queued, box 2's pinned count
-        // (estimated net of releases in flight) and its budget
-        "b2_surprises", "b2_held_picks", "b2_pin_released", "b2_pinned", "b2_pin_budget",
+        // (estimated net of releases in flight), its budget, and releases of
+        // background-admitted experts the router had not wanted since (reads
+        // paid for nothing; compare with sub_admits_queued)
+        "b2_surprises", "b2_held_picks", "b2_pin_released", "b2_pinned", "b2_pin_budget", "b2_pin_released_unused",
         // box-1 pager (deltas; a prefill between steps lands in the next step)
         "b1_misses", "b1_read_ms", "b1_pf_queued", "b1_pf_admitted", "b1_pf_dropped_full", "b1_pf_admit_ms",
         // layer-host timers (lh.*, ms)

@@ -1164,8 +1164,8 @@ impl Sched {
         // carries them with or without the profile: `b2_surprises` must stay
         // 0 -- a held pick box 2 paged anyway (ERROR-logged where it happens).
         let pin_stats = v4flash_kernels::het::b2_mirror::take_pin_stats();
-        if let (true, Some([sur, held, rel, pinned, budget])) = (ev_on, pin_stats) {
-            for (k, v) in [("b2_surprises", sur), ("b2_held_picks", held), ("b2_pin_released", rel), ("b2_pinned", pinned), ("b2_pin_budget", budget)] {
+        if let (true, Some([sur, held, rel, pinned, budget, unused])) = (ev_on, pin_stats) {
+            for (k, v) in [("b2_surprises", sur), ("b2_held_picks", held), ("b2_pin_released", rel), ("b2_pinned", pinned), ("b2_pin_budget", budget), ("b2_pin_released_unused", unused)] {
                 ev.insert(k.into(), v);
             }
         }
@@ -1287,8 +1287,8 @@ impl Sched {
                 }
             }
             // Box-2 pinning, per step (drained above).
-            if let Some([sur, held, rel, pinned, _budget]) = pin_stats {
-                for (name, v) in [("pin.surprises", sur), ("pin.held_picks", held), ("pin.released", rel), ("pin.pinned", pinned)] {
+            if let Some([sur, held, rel, pinned, _budget, unused]) = pin_stats {
+                for (name, v) in [("pin.surprises", sur), ("pin.held_picks", held), ("pin.released", rel), ("pin.pinned", pinned), ("pin.released_unused", unused)] {
                     if v.is_finite() {
                         let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                         e.0 += v; e.1 += 1;

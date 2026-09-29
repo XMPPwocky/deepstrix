@@ -7414,6 +7414,9 @@ impl HeterogeneousEngine {
         let mut sel_host_remote: Vec<i32> = Vec::new();
         let mut sel_host_audit: Vec<i32> = Vec::new();
         let mut sel_for_remote: Vec<i32> = Vec::new();
+        // The router's own picks when a live cache prior changed them: the pin
+        // ledger ranks by these, not by what box 2 is sent (`b2_mirror::pin_wants`).
+        let mut sel_wants: Vec<i32> = Vec::new();
         let mut owns_eff: Vec<bool> = Vec::new();
         let mut ew_for_remote: Vec<f32> = Vec::new();
         let mut extra_remote = vec![false; N_EXPERT as usize];
@@ -7767,7 +7770,7 @@ impl HeterogeneousEngine {
                     });
                     if !admit.is_empty() && super::remote_experts::push_prefetch_words(&admit) {
                         super::b2_mirror::note_incoming(&admit);
-                        super::b2_mirror::note_admits(admit.len());
+                        super::b2_mirror::note_admits(&admit);
                     }
                 }
                 let mut sel_orig: Vec<i32> = Vec::new();
@@ -7859,7 +7862,7 @@ impl HeterogeneousEngine {
                         bd.d_ew.slice_view_mut(0, n_sel).copy_from_host(&ew_sub)?;
                         if !admit.is_empty() && super::remote_experts::push_prefetch_words(&admit) {
                             super::b2_mirror::note_incoming(&admit);
-                            super::b2_mirror::note_admits(admit.len());
+                            super::b2_mirror::note_admits(&admit);
                         }
                         sel_orig = std::mem::replace(&mut sel_host, sel_sub);
                         ew_pre = Some(ew_sub);
@@ -8083,6 +8086,12 @@ impl HeterogeneousEngine {
                 // before any paging, so nothing here reads residency that `ensure`
                 // is about to change. Only the exclusion/audit below genuinely
                 // need post-`ensure` state, and they stay there.
+                // `sel_host` (sent below) is the prior's choice under a live
+                // prior; the router's own picks go to the pin ledger with it.
+                // Dry run: `sel_host` already holds the plain picks.
+                if sub3 && prior_on && !super::b2_mirror::dry() && orig_host.len() == sel_host.len() && super::b2_mirror::pin_wanted() {
+                    sel_wants = orig_host;
+                }
                 sel_host_remote = sel_host;
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} C before remote submit: remote_split_on={remote_split_on} remote={} replay_offload={} ids={}", self.remote.is_some(), replay_offload, ids.len()); }
                 if group_audit() {
@@ -8285,6 +8294,7 @@ impl HeterogeneousEngine {
                                 // and run both as one MoE pass. False on the
                                 // sequential path, where nothing follows.
                                 partner_follows,
+                                (!sel_wants.is_empty()).then_some(sel_wants.as_slice()),
                             )?;
                         let ev_t_submit_end = super::evtrace::now();
                         let t_sub_end = super::perfetto::now_ns();
