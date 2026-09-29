@@ -8661,18 +8661,18 @@ impl HeterogeneousEngine {
         // quantize would have written. Only where nothing on the iGPU reads the
         // f32 rows: the WMMA MoE casts them to f16, the decode-MoE verify
         // requantises them. The predicate mirrors `pre_moe_launch`'s `wmma_path`.
-        let wmma_path_here = super::dispatch::igpu_moe_wmma_selected(
-            routed_src.gate.dtype,
-            routed_src.down.dtype,
-            self.igpu.is_gfx11,
-            &std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into()),
-            super::dispatch::igpu_moe_wmma_env_enabled(),
-        );
         let xq_pushed = push_xq()
             && remote_split_on
             && bd.remote_xq_lane.is_some()
-            && !wmma_path_here
-            && !verify_decode_moe();
+            && bi.xq_recv.is_some()
+            && !verify_decode_moe()
+            && !super::dispatch::igpu_moe_wmma_selected(
+                routed_src.gate.dtype,
+                routed_src.down.dtype,
+                self.igpu.is_gfx11,
+                &std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into()),
+                super::dispatch::igpu_moe_wmma_env_enabled(),
+            );
         let xq_bytes = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
         // Single batched peer-push of all B activations + routing.
         let ain_v = bd
@@ -8692,7 +8692,7 @@ impl HeterogeneousEngine {
             if xq_pushed {
                 let _t = de.events.stage("k.peer_push.xq", &de.xfer)?;
                 let xq_v = bd.remote_xq_lane.as_ref().expect("xq_pushed").slice_view(0, xq_bytes);
-                let mut bi_xq = bi.xq_recv.slice_view_mut(0, xq_bytes);
+                let mut bi_xq = bi.xq_recv.as_mut().expect("xq_pushed").slice_view_mut(0, xq_bytes);
                 peer_push_u8(&xq_v, &mut bi_xq, &de.xfer)?;
             } else {
                 let _t = de.events.stage("k.peer_push.ain", &de.xfer)?;
@@ -8944,6 +8944,11 @@ impl HeterogeneousEngine {
             &variant_peek,
             super::dispatch::igpu_moe_wmma_env_enabled(),
         );
+        // Prep decided `xq_pushed` from its own copy of this predicate; if they
+        // ever disagree, the WMMA cast below would read f32 rows nobody pushed.
+        if xq_pushed && wmma_path {
+            return Err(eyre!("L{layer}: V41_PUSH_XQ pushed Q8_K but pre_moe_launch selected the WMMA MoE (f32 rows not pushed)"));
+        }
         if wmma_path {
             let _t_cast = ie.events.stage("igpu.cast_f16_pre_moe", &ie.compute)?;
             ie.q8k.launch_cast_f16(&ie.compute, &mut si.d_x16, &bi.ffn_input_norm_recv, N_EMBD * b)?;
@@ -8952,12 +8957,11 @@ impl HeterogeneousEngine {
             // `xq_recv` (covered by `selected_pushed`, waited above). Copy it
             // into the shared chain head on `ie.compute`, stream-ordered after
             // the other lane's last read, exactly where the quantize would write.
-            debug_assert!(!wmma_path, "pre_moe_prep pushed Q8_K for a WMMA layer");
             let _t_xq = ie.events.stage("igpu.xq_recv_copy", &ie.compute)?;
             let n = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
             si.d_xq_q8k
                 .slice_view_mut(0, n)
-                .copy_from_buffer_async(&bi.xq_recv.slice_view(0, n), &ie.compute)?;
+                .copy_from_buffer_async(&bi.xq_recv.as_ref().expect("xq_pushed").slice_view(0, n), &ie.compute)?;
         } else {
             // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks].
             let _t_q8k_pre = ie.events.stage("igpu.q8k_quantize_pre_iq2", &ie.compute)?;
