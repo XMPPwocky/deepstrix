@@ -2208,9 +2208,16 @@ struct ShardPool {
 // A decode-mode search is unchanged (prefill-class first, then decode LRU).
 // Every decode victim a prefill-mode search takes is recorded with its stamp
 // (`decode_delta`) for the delta restore that follows (not yet built).
-// Prefill's early-page / park reads land prefill-class. The mode is the
-// request's shape (`prefill_shaped`), noted at every `ensure`; a change of
-// mode is a PHASE switch (the hub runs prefill and decode in bursts).
+// Prefill's early-page / park reads land prefill-class. The PHASE is the hub's
+// own (`REQ_FLAG_DECODE`, set on every request of its arena decode drivers and
+// clear on every prefill-job request, tails and replay included), noted once
+// per request before anything is claimed or landed, with hysteresis: a prefill
+// phase ends only after `ME_DECODE_STREAK` consecutive decode-flagged requests
+// (a decode request served inside a parked prefill chunk must not restart it).
+// Inside a prefill phase every claim ranks in tiers and stamps prefill-class,
+// whatever its shape (a 6-row prompt tail is prefill); outside one, nothing
+// ranks in tiers (a prefill landing then takes the plain LRU: prefill-class
+// first). Requires the global pool (tiers across the whole band).
 // ---------------------------------------------------------------------------
 
 /// Per-phase counters of mode-aware eviction (logged at each phase switch).
@@ -2224,10 +2231,15 @@ pub struct ModeEvictCounters {
     pub took_decode_touched: u64,
 }
 
+/// Consecutive decode-flagged requests that end a prefill phase.
+const ME_DECODE_STREAK: u32 = 16;
+
 /// Mode-aware eviction state (see the block above).
 #[derive(Debug, Default)]
 struct ModeEvict {
     on: bool,
+    /// Decode-flagged requests seen since the last prefill-flagged one.
+    decode_streak: u32,
     /// Decode victims one prefill phase may take before preferring its own.
     budget: u64,
     budget_left: u64,
@@ -2239,9 +2251,9 @@ struct ModeEvict {
     phase_start: u64,
     /// Per slot: the prefill phase that last HIT this decode-class slot.
     phase_touch: Vec<u32>,
-    /// Decode experts evicted by prefill-mode searches `(layer, e, stamp)`,
-    /// oldest first, capped (`MODE_EVICT_DELTA_CAP`).
-    decode_delta: std::collections::VecDeque<(u32, u32, u64)>,
+    /// Decode experts evicted by prefill-mode searches `(layer, e, stamp,
+    /// prefill phase)`, oldest first, capped (`MODE_EVICT_DELTA_CAP`).
+    decode_delta: std::collections::VecDeque<(u32, u32, u64, u32)>,
     c: ModeEvictCounters,
 }
 
@@ -2804,22 +2816,40 @@ impl ShardPool {
         self.me = ModeEvict::enabled(self.owner_of.len(), budget);
     }
 
-    /// Note the mode of the request about to claim / land (`ensure`): a change
-    /// is a phase switch. Starting a prefill phase resets its budget and stamps
-    /// its start; the ending phase's counters are logged.
-    fn me_note_mode(&mut self, prefill: bool) {
-        if !self.me.on || prefill == self.me.prefill_phase {
+    /// Note the HUB's phase of the request about to be served (`prefill` =
+    /// no `REQ_FLAG_DECODE`), before it claims or lands anything. A prefill
+    /// request starts a prefill phase at once; a prefill phase ends after
+    /// `ME_DECODE_STREAK` consecutive decode requests.
+    fn me_note_request(&mut self, prefill: bool) {
+        if !self.me.on {
             return;
         }
+        if prefill {
+            self.me.decode_streak = 0;
+            if !self.me.prefill_phase {
+                self.me_switch(true);
+            }
+        } else if self.me.prefill_phase {
+            self.me.decode_streak += 1;
+            if self.me.decode_streak >= ME_DECODE_STREAK {
+                self.me_switch(false);
+            }
+        }
+    }
+
+    /// A phase switch: log the ending prefill phase, start the new one (a
+    /// prefill phase gets a fresh budget and stamps its start).
+    fn me_switch(&mut self, prefill: bool) {
         let c = self.me.c;
         if self.me.prefill_phase {
             eprintln!(
-                "expertd: mode-evict prefill phase {} ended: victims free {} stale-prefill {} decode {} (budget {}, {} left) own-prefill {} decode-over-budget {} decode-in-use {}; decode delta {}",
-                self.me.phase, c.took_free, c.took_stale, c.took_decode, self.me.budget, self.me.budget_left,
-                c.took_own, c.took_decode_over, c.took_decode_touched, self.me.decode_delta.len()
+                "expertd: mode-evict prefill phase {} ended: victims free {} stale-prefill {} decode {} (of which in use {}; budget {}, {} left) own-prefill {} decode-over-budget {}; decode delta {}",
+                self.me.phase, c.took_free, c.took_stale, c.took_decode, c.took_decode_touched, self.me.budget,
+                self.me.budget_left, c.took_own, c.took_decode_over, self.me.decode_delta.len()
             );
         }
         self.me.prefill_phase = prefill;
+        self.me.decode_streak = 0;
         self.me.c = ModeEvictCounters::default();
         if prefill {
             self.me.phase += 1;
@@ -2828,10 +2858,16 @@ impl ShardPool {
         }
     }
 
+    /// Mode-aware eviction applies to this search: on, in a prefill phase, and
+    /// the search is a prefill claim / landing.
+    fn me_tiered(&self, prefill_mode: bool) -> bool {
+        prefill_mode && self.me.on && self.me.prefill_phase
+    }
+
     /// Account the victim a search in `prefill_mode` is about to evict (call
     /// BEFORE `evict`, which clears the owner): budget, counters, the delta.
     fn me_account(&mut self, slot: u32, prefill_mode: bool) {
-        if !(self.me.on && prefill_mode) {
+        if !self.me_tiered(prefill_mode) {
             return;
         }
         let lu = self.last_use[slot as usize];
@@ -2852,7 +2888,7 @@ impl ShardPool {
             if self.me.decode_delta.len() >= MODE_EVICT_DELTA_CAP {
                 self.me.decode_delta.pop_front();
             }
-            self.me.decode_delta.push_back((l, e, lu));
+            self.me.decode_delta.push_back((l, e, lu, self.me.phase));
         } else if lu < self.me.phase_start {
             self.me.c.took_stale += 1;
         } else {
@@ -2908,8 +2944,9 @@ impl ShardPool {
     ) -> Option<u32> {
         let n = self.owner_of.len() as u32;
         let range = range.start.min(n)..range.end.min(n);
-        // Mode-aware eviction: a prefill-mode search ranks by (tier, recency).
-        let tiered = prefill_mode && self.me.on;
+        // Mode-aware eviction: a prefill-mode search in a prefill phase ranks by
+        // (tier, recency).
+        let tiered = self.me_tiered(prefill_mode);
         let mut best: Option<((u8, u64), u32)> = None;
         for sl in range {
             let ok = match self.owner_of[sl as usize] {
@@ -3000,7 +3037,7 @@ impl ShardPool {
         if scan_class || staged {
             if *lu < PREFILL_AGE {
                 *lu = self.tick;
-            } else if self.me.on && scan_class {
+            } else if self.me.on && self.me.prefill_phase && scan_class {
                 // Mode-aware eviction: this prefill phase is using decode's slot;
                 // its own later claims take it last (tier 5).
                 self.me.phase_touch[slot as usize] = self.me.phase;
@@ -3820,6 +3857,14 @@ impl ExpertShard {
         self.prefetch_words_full(words, certain, stage, false)
     }
 
+    /// Mode-aware eviction: note the hub's phase of a request (`flags`) before
+    /// serving it.
+    pub fn note_request_phase(&mut self, flags: u32) {
+        if let Some(pool) = self.pool.as_mut() {
+            pool.me_note_request(flags & proto::REQ_FLAG_DECODE == 0);
+        }
+    }
+
     /// Hub prefetch words carried by a PREFILL-shaped request (layer-major group
     /// prefetch, `V41_LM_PREFETCH`): speculative, but they land PREFILL-class
     /// (evicted before decode's residents, like the prefill's own demand pages)
@@ -4290,11 +4335,11 @@ impl ExpertShard {
         // budget a connection will get is stated here once, at startup.
         let stage = pool.set_stage(b2_prefill_stage());
         if b2_mode_evict() {
-            if stage == 0 && b2_scan_class() {
+            if stage == 0 && b2_scan_class() && b2_global_pool() {
                 pool.enable_mode_evict(b2_prefill_budget());
                 eprintln!("expertd: mode-aware eviction ON (prefill budget {} decode victims per phase)", b2_prefill_budget());
             } else {
-                eprintln!("expertd: V41_B2_MODE_EVICT=1 IGNORED: needs V41_B2_PREFILL_STAGE=0 and the two-class LRU (V41_B2_SCAN_CLASS != 0)");
+                eprintln!("expertd: V41_B2_MODE_EVICT=1 IGNORED: needs V41_B2_PREFILL_STAGE=0, the two-class LRU (V41_B2_SCAN_CLASS != 0) and the global pool (V41_B2_GLOBAL_POOL != 0)");
             }
         }
         let floors: usize = pool.floor.iter().map(|&f| f as usize).sum();
@@ -4628,8 +4673,6 @@ impl ExpertShard {
             pool.dirty[layer as usize] = false;
         }
         let ev_t_dirty = if ev_on { super::evtrace::now() } else { nan };
-        // Mode-aware eviction: this request's shape is the phase.
-        pool.me_note_mode(prefill_shaped);
         // `evtrace`: staging claims / hits / spills across this call.
         let ev_sc0 = pool.sc;
         // ONE POOL for all layers. The per-layer carve was never load-bearing: it
@@ -4648,7 +4691,10 @@ impl ExpertShard {
         // a decode hit promotes. Victims come from the prefill class first and
         // only then from decode's, so decode's set survives a burst intact.
         // `V41_B2_SCAN_CLASS=0` restores the single LRU.
-        let scan_class = prefill_shaped && b2_scan_class();
+        // Mode-aware eviction: inside the hub's prefill phase every claim is a
+        // prefill claim (a small prompt tail too); otherwise the request shape.
+        let prefill_mode = if pool.me.on { pool.me.prefill_phase } else { prefill_shaped };
+        let scan_class = prefill_mode && b2_scan_class();
         let global = b2_global_pool();
         let r = &mut self.routed;
         // Disjoint field borrows, hoisted: the per-role read closures below must
@@ -4687,7 +4733,7 @@ impl ExpertShard {
                 m.push(e);
             }
             let ev_t_scan = std::time::Instant::now();
-            let claim = pool.claim_miss(layer, e, &want, &pinned, region, global, prefill_shaped, scan_class);
+            let claim = pool.claim_miss(layer, e, &want, &pinned, region, global, prefill_mode, scan_class);
             let ev_scan = ev_t_scan.elapsed().as_nanos() as f64;
             ev_scan_ns += ev_scan;
             let Some((victim, ev_victim)) = claim else {
@@ -6346,6 +6392,12 @@ pub fn serve_connection(
                 if req.flags & proto::REQ_FLAG_PIN != 0 || reqb.as_ref().is_some_and(|rb| rb.flags & proto::REQ_FLAG_PIN != 0) {
                     shard.pin_enable();
                 }
+                // Mode-aware eviction: the hub's phase, before this pass (and
+                // its partner's) claims or lands anything.
+                shard.note_request_phase(req.flags);
+                if let Some(rb) = reqb.as_ref() {
+                    shard.note_request_phase(rb.flags);
+                }
                 let ev_pin0 = shard.pin_counters();
                 let ev_sc0 = shard.stage_counters();
                 // A prefill-shaped request's prefetch words are layer-major group
@@ -6996,6 +7048,7 @@ fn serve_interleaved(
     if req.flags & proto::REQ_FLAG_PIN != 0 {
         shard.pin_enable();
     }
+    shard.note_request_phase(req.flags);
     let ev_pin0 = shard.pin_counters();
     let ev_sc0 = shard.stage_counters();
     shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { req.prefetch });
@@ -8487,7 +8540,7 @@ mod tests {
             assert!(pool.touch_hit(2, e, false));
             assert!(pool.touch_hit(3, e, false));
         }
-        pool.me_note_mode(true);
+        pool.me_note_request(true);
         assert_eq!((pool.me.phase, pool.me.budget_left), (1, 2));
         let region = (0, 12);
         let want5: Vec<u32> = (20..27).collect();
@@ -8513,17 +8566,147 @@ mod tests {
         pool.commit(6, 30, s3);
         let c = pool.me.c;
         assert_eq!((c.took_stale, c.took_decode, c.took_own, c.took_decode_over), (4, 2, 1, 0));
-        let delta: Vec<(u32, u32)> = pool.me.decode_delta.iter().map(|&(l, e, _)| (l, e)).collect();
+        let delta: Vec<(u32, u32)> = pool.me.decode_delta.iter().map(|&(l, e, _, _)| (l, e)).collect();
         assert_eq!(delta, vec![(2, 0), (3, 0)]);
-        assert!(pool.me.decode_delta.iter().all(|&(_, _, t)| t >= PREFILL_AGE), "the delta keeps decode stamps");
+        assert!(pool.me.decode_delta.iter().all(|&(_, _, t, ph)| t >= PREFILL_AGE && ph == 1), "the delta keeps decode stamps");
         // Decode mode is unchanged: prefill-class (layer 5/6 pages) first.
-        pool.me_note_mode(false);
+        for _ in 0..ME_DECODE_STREAK {
+            pool.me_note_request(false);
+        }
+        assert!(!pool.me.prefill_phase);
         let (s4, ev4) = pool.claim_miss(8, 40, &[40], &[], region, true, false, false).unwrap();
         assert_eq!(ev4.map(|x| x.0), Some(5), "a decode claim takes prefill-class first");
         pool.commit(8, 40, s4);
         // The next prefill phase gets a fresh budget.
-        pool.me_note_mode(true);
+        pool.me_note_request(true);
         assert_eq!((pool.me.phase, pool.me.budget_left, pool.me.c), (2, 2, ModeEvictCounters::default()));
+    }
+
+    /// SF1 regression: a few decode-flagged requests inside a prefill burst (a
+    /// decode request served inside a parked chunk) must not restart the phase
+    /// -- that would reset the budget and turn the ongoing prefill's pages
+    /// stale. A full streak ends it; outside a prefill phase nothing is tiered.
+    #[test]
+    fn pool_mode_evict_phase_does_not_flap() {
+        let ids: Vec<u32> = (0..4).collect();
+        let mut pool = ShardPool::seeded(8, &[(1, 0, &ids), (2, 4, &ids)], 0.0);
+        pool.enable_mode_evict(3);
+        for e in 0..4 {
+            assert!(pool.touch_hit(2, e, false)); // decode-class
+        }
+        pool.me_note_request(true);
+        let (phase, start) = (pool.me.phase, pool.me.phase_start);
+        // Spend one unit of budget: stale prefill first (layer 1), then decode.
+        for e in 10..15 {
+            let (slot, _) = pool.claim_miss(3, e, &[10, 11, 12, 13, 14], &[], (0, 8), true, true, true).unwrap();
+            pool.commit(3, e, slot);
+        }
+        assert_eq!((pool.me.c.took_stale, pool.me.c.took_decode, pool.me.budget_left), (4, 1, 2));
+        for _ in 0..ME_DECODE_STREAK - 1 {
+            pool.me_note_request(false);
+        }
+        pool.me_note_request(true);
+        assert_eq!((pool.me.phase, pool.me.phase_start, pool.me.budget_left), (phase, start, 2), "no restart");
+        assert!(pool.me.prefill_phase && pool.me_tiered(true));
+        for _ in 0..ME_DECODE_STREAK {
+            pool.me_note_request(false);
+        }
+        assert!(!pool.me.prefill_phase && !pool.me_tiered(true), "a full streak ends it; untiered outside");
+        pool.me_note_request(true);
+        assert_eq!((pool.me.phase, pool.me.budget_left), (phase + 1, 3));
+    }
+
+    /// Randomized: prefill and decode phases, hits, claims and landings through
+    /// the real claim / landing calls; every victim is checked against the
+    /// tier rule computed independently, plus budget, delta and map invariants.
+    #[test]
+    fn pool_mode_evict_randomized_against_oracle() {
+        const LAYERS: u32 = 4;
+        const PER: u32 = 12;
+        const IDS: u32 = 20;
+        let n = (LAYERS * PER) as usize;
+        let ids: Vec<u32> = (0..PER).collect();
+        let regions: Vec<(u32, u32, &[u32])> = (0..LAYERS).map(|l| (l, l * PER, &ids[..])).collect();
+        for seed in 1..=8u64 {
+            let mut rng = SimRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut pool = ShardPool::seeded(n, &regions, 0.0);
+            pool.enable_mode_evict(6);
+            let (mut prefill_victims, mut checked) = (0u64, 0u64);
+            let mut phase_decode_victims = 0u64;
+            let mut last_phase = 0u32;
+            for step in 0..4000u32 {
+                // Phases in runs of requests (with occasional stray decode ones).
+                let prefill_req = (step / 200) % 2 == 1 && rng.below(10) != 0;
+                pool.me_note_request(prefill_req);
+                if pool.me.phase != last_phase {
+                    last_phase = pool.me.phase;
+                    phase_decode_victims = 0;
+                }
+                let prefill_mode = if pool.me.prefill_phase { true } else { prefill_req };
+                let layer = rng.below(LAYERS as u64) as u32;
+                let want: Vec<u32> = (0..1 + rng.below(6)).map(|_| rng.below(IDS as u64) as u32).collect();
+                let landing = rng.below(8) == 0;
+                for &e in &want {
+                    if pool.touch_hit(layer, e, prefill_mode) {
+                        continue;
+                    }
+                    // Oracle: eligible = free, or not one of `want` on `layer`;
+                    // rank (tier, last_use) in a tiered search, else last_use.
+                    let tiered = pool.me.on && pool.me.prefill_phase && prefill_mode;
+                    let rank = |sl: usize| -> (u8, u64) {
+                        let lu = pool.last_use[sl];
+                        let t = match pool.owner_of[sl] {
+                            _ if !tiered => 0,
+                            None => 0,
+                            Some(_) if lu < PREFILL_AGE => if lu < pool.me.phase_start { 1 } else { 3 },
+                            Some(_) if pool.me.phase_touch[sl] == pool.me.phase => 5,
+                            Some(_) if pool.me.budget_left > 0 => 2,
+                            Some(_) => 4,
+                        };
+                        (t, lu)
+                    };
+                    let expect = (0..n)
+                        .filter(|&sl| !matches!(pool.owner_of[sl], Some((ol, oe)) if ol == layer && want.contains(&oe)))
+                        .min_by_key(|&sl| (rank(sl), sl))
+                        .map(|sl| sl as u32);
+                    let exp_tier = expect.map(|v| rank(v as usize).0);
+                    let exp_decode = expect.is_some_and(|v| pool.owner_of[v as usize].is_some() && pool.last_use[v as usize] >= PREFILL_AGE);
+                    let got = if landing {
+                        let v = pool.pick_victim_any((0, n as u32), true, Band::Main, layer, &want, &[], layer, false, prefill_mode);
+                        if let Some(v) = v {
+                            pool.me_account(v, prefill_mode);
+                            pool.evict(v, layer);
+                            pool.land(v, (layer, e), prefill_mode);
+                        }
+                        v
+                    } else {
+                        let c = pool.claim_miss(layer, e, &want, &[], (layer * PER, (layer + 1) * PER), true, prefill_mode, prefill_mode);
+                        c.map(|(v, _)| {
+                            pool.commit(layer, e, v);
+                            v
+                        })
+                    };
+                    assert_eq!(got, expect, "seed {seed} step {step}: victim");
+                    checked += 1;
+                    if got.is_some() && tiered {
+                        prefill_victims += 1;
+                        if exp_decode && exp_tier == Some(2) {
+                            phase_decode_victims += 1;
+                        }
+                    }
+                    assert!(phase_decode_victims <= pool.me.budget, "seed {seed}: budget overrun");
+                }
+                // Map invariants.
+                for (sl, o) in pool.owner_of.iter().enumerate() {
+                    if let Some(k) = o {
+                        assert_eq!(pool.slot_of.get(k), Some(&(sl as u32)), "seed {seed}: maps disagree");
+                    }
+                }
+                assert_eq!(pool.slot_of.len(), pool.owner_of.iter().filter(|o| o.is_some()).count());
+            }
+            assert!(pool.me.decode_delta.iter().all(|&(_, _, t, ph)| t >= PREFILL_AGE && ph >= 1), "seed {seed}: delta stamps");
+            assert!(checked > 2000 && prefill_victims > 300 && pool.me.phase >= 5, "seed {seed}: not exercised ({checked}, {prefill_victims}, {})", pool.me.phase);
+        }
     }
 
     /// Past its budget a prefill phase takes decode slots it is NOT using
@@ -8536,7 +8719,7 @@ mod tests {
         for e in 0..3 {
             assert!(pool.touch_hit(2, e, false)); // all decode-class, (2,0) oldest
         }
-        pool.me_note_mode(true);
+        pool.me_note_request(true);
         assert!(pool.touch_hit(2, 0, true), "a prefill hit on decode's slot");
         assert!(pool.last_use[0] >= PREFILL_AGE, "it stays decode-class");
         let (_, ev) = pool.claim_miss(7, 50, &[50], &[], (0, 3), true, true, true).unwrap();
