@@ -112,6 +112,34 @@ fn remote_exclude() -> bool {
     *E
 }
 
+/// Box 2's picks for one lane-layer's submit, masked by the hub's OWN
+/// `owns_eff` (`NO_PICK` elsewhere), or empty = "submit masked by box 2's
+/// advertised HELLO set" (`RemoteExpertClient::submit_dispatch`).
+///
+/// The HELLO-masked submit is right only when `owns_eff` IS that set: no T2
+/// partition and nothing reassigned. Under the partition box 1's share is its
+/// measured hot set (any ids, `expert_pager::partition_box2`) and `owns` is all
+/// false, so a lane-layer with no pick in box 2's partition had `owns_eff` all
+/// false -- box 1 computed EVERY pick -- while the HELLO-masked submit had box
+/// 2 compute each pick in its static `--experts` range too, and the combine
+/// added both: those experts counted twice (KNOWN_BUGS #29, the class of #0).
+/// `verify_routing_exactly_once` checks `owns_eff`, not what box 2 computes,
+/// so it could not see it. Dry (`!remote_exclude`) keeps the old debug paths.
+fn remote_sel_override(partition: bool, dry: bool, extra_remote: &[bool], owns_eff: &[bool], sel: &[i32]) -> Vec<i32> {
+    if dry || !(partition || extra_remote.iter().any(|&x| x)) {
+        return Vec::new();
+    }
+    sel.iter()
+        .map(|&e| {
+            if (0..N_EXPERT as i32).contains(&e) && owns_eff[e as usize] {
+                e
+            } else {
+                super::remote_experts::NO_PICK
+            }
+        })
+        .collect()
+}
+
 /// Add the remote partial at the combine? Mode 1 only.
 ///
 /// The 2/3 split exists to separate the two halves of the change: mode 3
@@ -8134,22 +8162,16 @@ impl HeterogeneousEngine {
                         owns_eff = (0..N_EXPERT as usize)
                             .map(|e| replay_offload || extra_remote[e] || (!dry && owns[e]))
                             .collect();
-                        // Only when the hub actually reassigned something. With
-                        // nothing reassigned `owns_eff` IS box 2's advertised
-                        // bitmap, so this would be a no-op — but leaving the old
-                        // path untouched keeps the default byte-identical.
-                        if !dry && extra_remote.iter().any(|&x| x) {
-                            sel_for_remote = sel_host_remote
-                                .iter()
-                                .map(|&e| {
-                                    if (0..N_EXPERT as i32).contains(&e) && owns_eff[e as usize] {
-                                        e
-                                    } else {
-                                        super::remote_experts::NO_PICK
-                                    }
-                                })
-                                .collect();
-                        }
+                        // The hub's own split whenever it reassigned something or
+                        // the T2 partition decides ownership (`remote_sel_override`:
+                        // under the partition an empty override double-counted).
+                        sel_for_remote = remote_sel_override(
+                            super::expert_pager::t2_partition(),
+                            dry,
+                            &extra_remote,
+                            &owns_eff,
+                            &sel_host_remote,
+                        );
                 }
                 // SUBMIT BEFORE PAGING. Box 2 needs only the router's picks and the
                 // activations, both ready above; it does NOT need box 1 to have
@@ -8244,7 +8266,11 @@ impl HeterogeneousEngine {
                             [n_picks as f64, ids.len() as f64, f64::from(miss), f64::from(inc), f64::from(pend)]
                         });
                         let ev_t_submit = super::evtrace::now();
-                        let ticket = remote
+                        // Every pick is box 1's (T2 partition): send nothing. `None`
+                        // is also what a masked submit returns when no pick survives
+                        // its mask; post-MoE then adds no remote partial.
+                        let box2_idle = !sel_for_remote.is_empty() && sel_for_remote.iter().all(|&e| e < 0);
+                        let ticket = if box2_idle { None } else { remote
                             .lock()
                             .map_err(|_| eyre!("remote expert client mutex poisoned"))?
                             // Last arg is `resp_f32`, NOT "is the split on". This used to
@@ -8295,7 +8321,7 @@ impl HeterogeneousEngine {
                                 // sequential path, where nothing follows.
                                 partner_follows,
                                 (!sel_wants.is_empty()).then_some(sel_wants.as_slice()),
-                            )?;
+                            )? };
                         let ev_t_submit_end = super::evtrace::now();
                         let t_sub_end = super::perfetto::now_ns();
                         if super::evtrace::enabled() {
@@ -10530,5 +10556,53 @@ impl<'scope> LazyEngramRows<'scope> {
             self.ready = Some(rows);
         }
         Ok(self.ready.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod remote_sel_tests {
+    use super::remote_sel_override;
+    use crate::config::N_EXPERT;
+    use crate::het::remote_experts::NO_PICK;
+
+    fn mask(ids: &[usize]) -> Vec<bool> {
+        let mut m = vec![false; N_EXPERT as usize];
+        for &i in ids {
+            m[i] = true;
+        }
+        m
+    }
+
+    /// KNOWN_BUGS #29: under the T2 partition a lane-layer whose picks are all
+    /// box 1's gets an ALL-`NO_PICK` override (nothing for box 2), never the
+    /// empty "mask by box 2's HELLO set" that had box 2 compute them again.
+    #[test]
+    fn partition_with_nothing_for_box2_sends_nothing() {
+        let sel = [3, 250, 17, 300, 5, 383];
+        let none = mask(&[]);
+        let o = remote_sel_override(true, false, &none, &none, &sel);
+        assert_eq!(o, vec![NO_PICK; 6]);
+    }
+
+    #[test]
+    fn partition_masks_by_owns_eff() {
+        let sel = [3, 250, 17, 300, 5, -1];
+        let own = mask(&[17, 250]);
+        let o = remote_sel_override(true, false, &own, &own, &sel);
+        assert_eq!(o, vec![NO_PICK, 250, 17, NO_PICK, NO_PICK, NO_PICK]);
+    }
+
+    /// Without the partition an empty override keeps the HELLO-masked path
+    /// (there `owns_eff` is the HELLO set); a reassignment masks by `owns_eff`.
+    #[test]
+    fn no_partition_keeps_the_hello_path() {
+        let sel = [3, 250];
+        let hello = mask(&[250]);
+        assert!(remote_sel_override(false, false, &mask(&[]), &hello, &sel).is_empty());
+        let extra = mask(&[3]);
+        let eff = mask(&[3, 250]);
+        assert_eq!(remote_sel_override(false, false, &extra, &eff, &sel), vec![3, 250]);
+        // Dry (debug split modes): the old path, partition or not.
+        assert!(remote_sel_override(true, true, &extra, &eff, &sel).is_empty());
     }
 }

@@ -10,6 +10,27 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+### 29. FIXED 2026-09-30 (NOT deployed) — under the T2 partition, a lane-layer with no box-2 pick was sent to box 2 masked by its static HELLO set while box 1 computed every pick: experts in box 2's `--experts` range were added TWICE
+
+`pre_moe_route` built the hub's own box-2 pick list (`sel_for_remote`, masked by
+`owns_eff`) only when `extra_remote` had an entry. Under `V41_T2_PARTITION=1`
+`owns` is all false, so when every pick of a lane-layer is box 1's (its hot set),
+`owns_eff` was all false: box 1 computed every pick, and the empty override sent
+the picks masked by box 2's ADVERTISED bitmap (production box 2 runs
+`--experts L0-L39:230-383`). Box 2 computed the picks in 230-383 and the mode-1
+combine added its partial: those experts double-added. `verify_routing_exactly_once`
+checks `owns_eff`, not what box 2 computes, and passed. Same class as #0 (the
+serial path, fixed 2026-09-16). Exposure (not measured live): decode lanes whose
+picks are all box 1's; box 1's hot set carries ~73% of the pick mass, so ~15% of
+layers at 1 row per lane by independence, more with the cache prior boosting
+box-1-held experts, rare at >= 2 rows. Box 2 also paged and pinned those box-1
+experts. Found by review 2026-09-30.
+Fix: `remote_sel_override`: under the partition the override is always built
+(all `NO_PICK` when nothing is box 2's) and such a lane-layer submits nothing.
+Regression: `forward_prefill::remote_sel_tests` (pure; the GPU path is not
+exercised). Live check after deploy: with the partition on, no `hub_req` record
+has `unmasked == 0`.
+
 ### 28. FIXED 2026-09-23 (cc47607, deployed 23:38 UTC) — a restored continuation with a suffix longer than SWA_WINDOW replayed onto STALE decoder rings
 
 `prefill_job_finish` (forward_prefill.rs) emptied the decoder rings (layers
