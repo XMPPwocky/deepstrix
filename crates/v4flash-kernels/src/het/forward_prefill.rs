@@ -7442,8 +7442,9 @@ impl HeterogeneousEngine {
         let mut sel_host_remote: Vec<i32> = Vec::new();
         let mut sel_host_audit: Vec<i32> = Vec::new();
         let mut sel_for_remote: Vec<i32> = Vec::new();
-        // The router's own picks when a live cache prior changed them: the pin
-        // ledger ranks by these, not by what box 2 is sent (`b2_mirror::pin_wants`).
+        // The router's own picks, box 2's share, when a cache prior or a mode-2
+        // substitution changed what is sent: the pin ledger ranks by these, not
+        // by what box 2 is sent (`b2_mirror::pin_wants`).
         let mut sel_wants: Vec<i32> = Vec::new();
         let mut owns_eff: Vec<bool> = Vec::new();
         let mut ew_for_remote: Vec<f32> = Vec::new();
@@ -8114,11 +8115,12 @@ impl HeterogeneousEngine {
                 // before any paging, so nothing here reads residency that `ensure`
                 // is about to change. Only the exclusion/audit below genuinely
                 // need post-`ensure` state, and they stay there.
-                // `sel_host` (sent below) is the prior's choice under a live
-                // prior; the router's own picks go to the pin ledger with it.
-                // Dry run: `sel_host` already holds the plain picks.
-                if sub3 && prior_on && !super::b2_mirror::dry() && orig_host.len() == sel_host.len() && super::b2_mirror::pin_wanted() {
-                    sel_wants = orig_host;
+                // What is sent below is the prior's (or the mode-2 planner's)
+                // choice; the router's own picks (`sel_orig`, what box 1's hot
+                // set ranks by) go to the pin ledger with it, masked to box 2's
+                // partition. Dry runs leave `sel_orig` empty: `sel_host` is plain.
+                if !sel_orig.is_empty() && super::b2_mirror::pin_wanted() && super::expert_pager::t2_partition() {
+                    sel_wants = super::b2_mirror::wants_for_box2(&sel_orig, |e| super::expert_pager::partition_box2(layer, e));
                 }
                 sel_host_remote = sel_host;
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} C before remote submit: remote_split_on={remote_split_on} remote={} replay_offload={} ids={}", self.remote.is_some(), replay_offload, ids.len()); }

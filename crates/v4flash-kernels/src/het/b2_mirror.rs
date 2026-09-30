@@ -417,9 +417,10 @@ pub fn pin_wanted() -> bool {
             let on = matches!(std::env::var("V41_B2_PIN").as_deref(), Ok("1") | Ok("on"));
             if on {
                 eprintln!(
-                    "b2 mirror: V41_B2_PIN=1 PINNING (headroom {}, decay every {} steps{})",
+                    "b2 mirror: V41_B2_PIN=1 PINNING (headroom {}, decay every {} steps, rank by {}{})",
                     pin_headroom(),
                     pin_decay_steps(),
+                    if pin_wants() { "the router's picks (V41_B2_PIN_WANTS)" } else { "the picks sent (V41_B2_PIN_WANTS=0)" },
                     if assert_no_surprise() { ", V41_B2_ASSERT_NO_SURPRISE" } else { "" }
                 );
             }
@@ -464,7 +465,10 @@ pub fn pin_decay_steps() -> u32 {
 /// a count of ~0, tied for coldest, and went at the next release: box 2 paid
 /// the read, released it unused, and the prior swapped it away on its next
 /// want. Box 1's hot set ranks by the router's picks for the same reason
-/// (`forward_prefill`, "rank the hot set by the ROUTER's picks").
+/// (`forward_prefill`, "rank the hot set by the ROUTER's picks"). The wants
+/// are masked to box 2's partition (`wants_for_box2`): an expert box 1 owns
+/// must not earn box-2 pin credit from box 1's demand. And held experts box 2
+/// no longer owns (a hot-set promotion moved them) are released first.
 pub fn pin_wants() -> bool {
     static W: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_B2_PIN_WANTS").as_deref() != Ok("0"));
@@ -524,9 +528,9 @@ pub struct PinLedger {
     /// adds `N_EXPERT_USED`, a rank-6 pick adds 1), halved every `decay_steps`
     /// steps. The ROUTER's picks and ranks with `by_wants`, else the picks sent
     /// (see `pin_wants`). The reads box 2 still pays are the PROTECTED-rank
-    /// picks the cache prior may not swap, so the pool should keep the experts
-    /// that win at rank 1-2 and release the ones only ever picked at swappable
-    /// ranks (2026-09-27: blocked picks were 4-6 of ~5 reads per 3-row step).
+    /// picks the cache prior may not swap, so an expert that wins at rank 1-2
+    /// outranks one wanted only at swappable ranks (2026-09-27: blocked picks
+    /// were 4-6 of ~5 reads per 3-row step); a displaced want still counts.
     counts: Vec<u32>,
     steps: u32,
     /// `(epoch, pinned, budget)` of the reply with the newest epoch.
@@ -536,14 +540,15 @@ pub struct PinLedger {
     by_wants: bool,
     /// Per `layer * NE + e`: `steps + 1` at the last want (0 = never).
     last_want: Vec<u32>,
-    /// Per `layer * NE + e`: `steps + 1` when a background admission was
-    /// queued (`note_admits`), 0 = none or used since: sent to box 2 (the
-    /// read, in flight or landed, served it), or wanted in a LATER step. A
-    /// want in the same step does not count: the want the prior displaced
-    /// (the admission's cause) is noted at submit, after the admission.
+    /// Per `layer * NE + e`: `steps + 1` when a background admission was last
+    /// queued (`note_admits`); 0 = none since the last release.
     admitted: Vec<u32>,
-    /// Releases of `admitted` experts since the last `take_released_unused`:
-    /// reads box 2 paid for experts the hub let go before using them.
+    /// Per `layer * NE + e`: `steps + 1` when a request last SENT it to box 2
+    /// (any shape; `note_sent`). A release with `admitted != 0 && last_sent <
+    /// admitted` let go of an admission no request used since it was queued
+    /// (a send in the same step counts as a use: the other lane's).
+    last_sent: Vec<u32>,
+    /// Such releases since the last `take_released_unused`.
     released_unused: u32,
 }
 
@@ -566,6 +571,7 @@ impl PinLedger {
             by_wants: pin_wants(),
             last_want: vec![0; LAYERS * NE],
             admitted: vec![0; LAYERS * NE],
+            last_sent: vec![0; LAYERS * NE],
             released_unused: 0,
         }
     }
@@ -635,18 +641,25 @@ impl PinLedger {
         }
     }
 
-    /// The router wanted `(layer, e)`: stamp its recency and, unless the
-    /// admission was queued in this same step (by this want), clear its
-    /// admitted-unused mark.
+    /// The router wanted `(layer, e)`: stamp its recency.
     pub fn note_wanted(&mut self, layer: u32, e: u32) {
         let (l, e) = (layer as usize, e as usize);
         if l < LAYERS && e < NE {
             // +1 so that 0 keeps meaning "never".
-            let now = self.steps.wrapping_add(1);
-            let k = l * NE + e;
-            self.last_want[k] = now;
-            if self.admitted[k] != now {
-                self.admitted[k] = 0;
+            self.last_want[l * NE + e] = self.steps.wrapping_add(1);
+        }
+    }
+
+    /// A request sent these picks to box 2 (any shape): stamp `last_sent`.
+    pub fn note_sent(&mut self, layer: u32, sent: &[i32]) {
+        let l = layer as usize;
+        if l >= LAYERS {
+            return;
+        }
+        let now = self.steps.wrapping_add(1);
+        for &e in sent {
+            if (0..N_EXPERT as i32).contains(&e) {
+                self.last_sent[l * NE + e as usize] = now;
             }
         }
     }
@@ -654,14 +667,15 @@ impl PinLedger {
     /// One decode-shaped request's picks, for the release ranking. `sent`: the
     /// picks sent to box 2 (`[b, nu]`, `NO_PICK` where box 1 computes).
     /// `wants`: the ROUTER's own picks for the same rows (`[b, nu]`, its rank
-    /// order), when the caller has them; under a live cache prior they differ
-    /// from `sent`. With `by_wants` the counts come from `wants` (else `sent`);
-    /// without, from `sent` (the 2026-09-27 ledger). Recency and the
-    /// admitted-unused marks follow `wants` (else `sent`) in both modes, so
-    /// `released_unused` compares across the knob; a `sent` pick always
-    /// clears its mark. A `wants` of another shape is ignored.
+    /// order, masked to box 2's partition: `wants_for_box2`), when the caller
+    /// has them; under a cache prior or a mode-2 substitution they differ from
+    /// `sent`. With `by_wants` the counts come from `wants` (else `sent`);
+    /// without, from `sent` (the 2026-09-27 ledger). Recency follows `wants`
+    /// (else `sent`) in both modes. A `wants` of another shape is a wiring bug:
+    /// it asserts in debug builds and is ignored in release.
     pub fn note_decode_picks(&mut self, layer: u32, sent: &[i32], wants: Option<&[i32]>) {
         let nu = crate::config::N_EXPERT_USED;
+        debug_assert!(wants.is_none_or(|w| w.len() == sent.len()), "pin wants {:?} vs sent {}", wants.map(<[i32]>::len), sent.len());
         let wants = wants.filter(|w| w.len() == sent.len());
         let router = wants.unwrap_or(sent);
         let ranked = if self.by_wants { router } else { sent };
@@ -673,15 +687,6 @@ impl PinLedger {
         for &e in router {
             if (0..N_EXPERT as i32).contains(&e) {
                 self.note_wanted(layer, e as u32);
-            }
-        }
-        // Box 2 computes what it is sent: an admission of it, in flight or
-        // landed, served a pick even within its own step (the other lane's).
-        if (layer as usize) < LAYERS {
-            for &e in sent {
-                if (0..N_EXPERT as i32).contains(&e) {
-                    self.admitted[layer as usize * NE + e as usize] = 0;
-                }
             }
         }
     }
@@ -707,6 +712,12 @@ impl PinLedger {
     /// Count ties go to the longest-unwanted with `by_wants`, else to the
     /// lowest `(layer, e)`.
     pub fn step(&mut self, headroom: u32, decay_steps: u32, max: usize) -> Vec<u32> {
+        self.step_ranked(headroom, decay_steps, max, |_, _| false)
+    }
+
+    /// `step`, where (with `by_wants` only) a held expert `stale(layer, e)`
+    /// -- box 2 no longer owns it -- ranks below every other one.
+    pub fn step_ranked(&mut self, headroom: u32, decay_steps: u32, max: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
         self.steps = self.steps.wrapping_add(1);
         if decay_steps > 0 && self.steps % decay_steps == 0 {
             for c in self.counts.iter_mut() {
@@ -718,9 +729,9 @@ impl PinLedger {
             return Vec::new();
         }
         let want = (est - budget.saturating_sub(2 * headroom)) as usize;
-        // `(count, recency, key)`; recency is constant without `by_wants`, so
-        // the order is exactly the old `(count, key)` one.
-        let mut cand: Vec<(u32, u32, u32)> = Vec::new();
+        // `(tier, count, recency, key)`; tier and recency are constant without
+        // `by_wants`, so the order is exactly the old `(count, key)` one.
+        let mut cand: Vec<(u32, u32, u32, u32)> = Vec::new();
         for (wi, &w) in self.held.iter().enumerate() {
             let mut bits = w;
             while bits != 0 {
@@ -728,7 +739,12 @@ impl PinLedger {
                 bits &= bits - 1;
                 let (l, e) = (wi / WORDS, (wi % WORDS) * 64 + b);
                 let k = l * NE + e;
-                cand.push((self.counts[k], if self.by_wants { self.last_want[k] } else { 0 }, k as u32));
+                if self.by_wants {
+                    let tier = u32::from(!stale(l as u32, e as u32));
+                    cand.push((tier, self.counts[k], self.last_want[k], k as u32));
+                } else {
+                    cand.push((1, self.counts[k], 0, k as u32));
+                }
             }
         }
         let n = want.min(max).min(cand.len());
@@ -739,9 +755,10 @@ impl PinLedger {
             cand.select_nth_unstable(n - 1);
         }
         let mut out = Vec::with_capacity(n);
-        for &(_, _, k) in &cand[..n] {
+        for &(_, _, _, k) in &cand[..n] {
             let (l, e) = (k as usize / NE, k as usize % NE);
-            if std::mem::take(&mut self.admitted[k as usize]) != 0 {
+            let adm = std::mem::take(&mut self.admitted[k as usize]);
+            if adm != 0 && self.last_sent[k as usize] < adm {
                 self.released_unused += 1;
             }
             self.held[l * WORDS + e / 64] &= !(1u64 << (e % 64));
@@ -852,8 +869,9 @@ pub fn pin_note_submit(layer: u32, sel: &[i32], wants: Option<&[i32]>, decode_sh
             held[e as usize / 32] |= 1 << (e % 32);
         }
     }
-    if decode_shaped {
-        if let Ok(mut g) = LEDGER.lock() {
+    if let Ok(mut g) = LEDGER.lock() {
+        g.note_sent(layer, sel);
+        if decode_shaped {
             g.note_decode_picks(layer, sel, wants);
         }
     }
@@ -881,7 +899,10 @@ fn pin_begin_step() {
         return;
     }
     let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
-    let words = g.step(pin_headroom(), pin_decay_steps(), PIN_RELEASE_MAX_PER_STEP);
+    let partition = super::expert_pager::t2_partition();
+    let words = g.step_ranked(pin_headroom(), pin_decay_steps(), PIN_RELEASE_MAX_PER_STEP, |l, e| {
+        partition && !super::expert_pager::partition_box2(l as i32, e)
+    });
     for &w in &words {
         let (l, e) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
         BITS[l][e / 64].fetch_and(!(1u64 << (e % 64)), Ordering::Relaxed);
@@ -925,9 +946,11 @@ pub fn check_surprises(layer: u32, seq: u32, held: &[u32; RESID_WORDS], paged: &
 
 /// `(surprises, held picks sent, release words queued, box 2's pinned count
 /// net of releases in flight, its budget, releases of background-admitted
-/// experts the router had not wanted since)` since the last call; `None`
-/// unless pinning is on. The last is box-2 reads paid for nothing: compare it
-/// with `sub_admits_queued` (`take_sub_stats`).
+/// experts no request sent to box 2 after the admission was queued)` since the
+/// last call; `None` unless pinning is on. The last approximates box-2 reads
+/// paid for nothing (an admission box 2 dropped counts too, if it was ever
+/// pinned); `sub_admits_queued` is only a rough denominator (it counts each
+/// lane's duplicates, and admissions while pinning was not yet active).
 pub fn take_pin_stats() -> Option<[f64; 6]> {
     if !pin_wanted() {
         return None;
@@ -971,6 +994,17 @@ static N_BLOCKED: AtomicU64 = AtomicU64::new(0);
 static N_FAILED: AtomicU64 = AtomicU64::new(0);
 static N_ADMITS: AtomicU64 = AtomicU64::new(0);
 static N_INCOMING: AtomicU64 = AtomicU64::new(0);
+
+/// The router's picks `router` (`[b, nu]`) with every expert box 2 does not
+/// own replaced by `NO_PICK`, positions kept (the ledger's rank weights come
+/// from them): the pin ledger's `wants`. Box 1's own experts must not earn
+/// box-2 pin credit.
+pub fn wants_for_box2(router: &[i32], is_box2: impl Fn(u32) -> bool) -> Vec<i32> {
+    router
+        .iter()
+        .map(|&e| if (0..N_EXPERT as i32).contains(&e) && is_box2(e as u32) { e } else { super::remote_experts::NO_PICK })
+        .collect()
+}
 
 /// Background admissions queued (`V41_SUB_ADMIT`, words `layer << 16 | e`),
 /// for the profile and, in pin mode, the ledger's admitted-unused marks.
@@ -1779,7 +1813,10 @@ mod tests {
         let mut none = PinLedger::new();
         none.by_wants = true;
         none.note_decode_picks(3, &sent, None);
-        none.note_decode_picks(3, &sent, Some(&wants[..nu - 1]));
+        // A mis-shaped `wants` asserts in debug builds and falls back to the
+        // sent picks in release.
+        let short = if cfg!(debug_assertions) { None } else { Some(&wants[..nu - 1]) };
+        none.note_decode_picks(3, &sent, short);
         assert_eq!((none.counts[3 * NE + 40], none.counts[3 * NE + 12]), (2 * (nu - 2) as u32, 0));
         // Recency follows the router's picks in both modes.
         assert!(on.last_want[3 * NE + 12] != 0 && off.last_want[3 * NE + 12] != 0);
@@ -1813,15 +1850,11 @@ mod tests {
     /// (admission queued at route time, then the submit notes the picks): the
     /// prior displaces a want for 3 and box 2 admits it; a stale held 9 was
     /// never wanted. Off, 3 has no count, loses the (layer, e) tie and is
-    /// released unused. On, its displaced want keeps it, and 9 goes. A want in
-    /// a LATER step clears the admitted mark; the causing want does not.
+    /// released unused. On, its displaced want keeps it, and 9 goes.
     #[test]
     fn pin_admitted_displaced_want_survives() {
         let nu = crate::config::N_EXPERT_USED;
-        let mut wants = vec![20i32; nu];
-        for (i, w) in wants.iter_mut().enumerate() {
-            *w = 20 + i as i32;
-        }
+        let mut wants: Vec<i32> = (0..nu as i32).map(|i| 20 + i).collect();
         wants[nu - 1] = 3; // the router's rank-6 pick
         let mut sent = wants.clone();
         sent[nu - 1] = 21 + nu as i32; // the prior's held substitute
@@ -1829,8 +1862,8 @@ mod tests {
             let mut g = PinLedger::new();
             g.by_wants = by_wants;
             g.note_admitted(2, 3);
+            g.note_sent(2, &sent);
             g.note_decode_picks(2, &sent, Some(&wants));
-            assert!(g.admitted[2 * NE + 3] != 0, "the causing want leaves the mark");
             // Box 2 lands and pins 3; 9 is stale. Over budget by one.
             g.apply_map(2, &map(&[3, 9]), 0);
             g.note_reply(0, 2, 2);
@@ -1838,24 +1871,218 @@ mod tests {
             if by_wants {
                 assert_eq!(w, vec![(2 << 16) | 9]);
                 assert_eq!(g.take_released_unused(), 0);
-                assert!(g.admitted[2 * NE + 3] != 0, "still unused, still held");
-                // Wanted in a later step: the admission paid off.
-                g.note_decode_picks(2, &wants, None);
-                assert_eq!(g.admitted[2 * NE + 3], 0);
             } else {
                 assert_eq!(w, vec![(2 << 16) | 3], "the old ledger releases the fresh admission first");
                 assert_eq!(g.take_released_unused(), 1);
                 assert_eq!(g.take_released_unused(), 0, "drained");
             }
         }
-        // Sent to box 2 in the admission's own step (another lane's protected
-        // pick): the read in flight served it.
+    }
+
+    /// `released_unused` counts a release of an admitted expert that no
+    /// request sent to box 2 since the admission was queued. A send in the
+    /// same step (the other lane's, before or after it) is a use; a send in an
+    /// earlier step is not; a later want the prior displaced again is not.
+    #[test]
+    fn pin_released_unused_means_never_sent_since_admission() {
+        // (when box 2 was sent the expert, relative to the admission's step)
+        for (sent_at, unused) in [(None, 1u32), (Some(0i32), 0), (Some(-1), 1), (Some(1), 0)] {
+            let mut g = PinLedger::new();
+            if sent_at == Some(-1) {
+                g.steps = 9;
+                g.note_sent(0, &[5]);
+            }
+            g.steps = 10;
+            if sent_at == Some(0) {
+                g.note_sent(0, &[5]);
+            }
+            g.note_admitted(0, 5);
+            g.note_wanted(0, 5);
+            if sent_at == Some(1) {
+                g.steps = 11;
+                g.note_sent(0, &[5]);
+            }
+            g.apply_map(0, &map(&[5]), 0);
+            g.note_reply(0, 1, 1);
+            assert_eq!(g.step(1, 0, 512), vec![5], "{sent_at:?}");
+            assert_eq!(g.take_released_unused(), unused, "{sent_at:?}");
+        }
+    }
+
+    /// The wants keep their positions (rank weights) with box 1's experts,
+    /// invalid ids and out-of-range ids masked out.
+    #[test]
+    fn wants_for_box2_masks_box1_experts() {
+        let w = wants_for_box2(&[7, 300, -1, 12, 384, 250], |e| e >= 200);
+        assert_eq!(w, vec![-1, 300, -1, -1, -1, 250]);
+    }
+
+    /// With `by_wants`, a held expert box 2 no longer owns is released first,
+    /// even when it is the hottest; without, the closure is ignored.
+    #[test]
+    fn pin_release_takes_experts_box2_no_longer_owns_first() {
+        for by_wants in [true, false] {
+            let mut g = PinLedger::new();
+            g.by_wants = by_wants;
+            g.apply_map(3, &map(&[1, 2, 3]), 0);
+            g.note_reply(0, 3, 3);
+            g.note_pick_w(3, 2, 50);
+            // est 3 > 3 - 1: release down to 3 - 2 = 1.
+            let mut w = g.step_ranked(1, 0, 512, |l, e| l == 3 && e == 2);
+            w.sort();
+            let gone: &[u32] = if by_wants { &[1, 2] } else { &[1, 3] };
+            assert_eq!(w, gone.iter().map(|&e| (3 << 16) | e).collect::<Vec<_>>(), "by_wants {by_wants}");
+        }
+    }
+
+    /// Rank weights come from each row's own positions.
+    #[test]
+    fn pin_ledger_weights_wants_per_row() {
+        let nu = crate::config::N_EXPERT_USED;
+        let mut wants = vec![-1i32; 2 * nu];
+        wants[0] = 40; // row 0, rank 1
+        wants[nu + 1] = 41; // row 1, rank 2
+        wants[2 * nu - 1] = 40; // row 1, rank 6
         let mut g = PinLedger::new();
-        g.note_admitted(2, 11);
-        let mut row = vec![-1i32; nu];
-        row[0] = 11;
-        g.note_decode_picks(2, &row, None);
-        assert_eq!(g.admitted[2 * NE + 11], 0);
+        g.by_wants = true;
+        g.note_decode_picks(6, &vec![-1i32; 2 * nu], Some(&wants));
+        assert_eq!(g.counts[6 * NE + 40], nu as u32 + 1);
+        assert_eq!(g.counts[6 * NE + 41], (nu - 1) as u32);
+    }
+
+    /// The real glue: `pin_note_submit` counts the wants it is handed and
+    /// stamps what it sends.
+    #[test]
+    fn pin_note_submit_forwards_wants() {
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let mut l = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+            *l = PinLedger::new();
+            l.by_wants = true;
+        }
+        let nu = crate::config::N_EXPERT_USED;
+        let mut sent = vec![-1i32; nu];
+        sent[0] = 50;
+        let mut wants = vec![-1i32; nu];
+        wants[0] = 60;
+        let _ = pin_note_submit(7, &sent, Some(&wants), true);
+        let mut l = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!((l.counts[7 * NE + 60], l.counts[7 * NE + 50]), (nu as u32, 0));
+        assert!(l.last_sent[7 * NE + 50] != 0 && l.last_sent[7 * NE + 60] == 0);
+        *l = PinLedger::new();
+    }
+
+    /// `V41_B2_PIN_WANTS=0` is the 2026-09-27 ledger exactly: random maps,
+    /// replies, submits (with and without wants), admissions and steps drive a
+    /// knob-off ledger and a verbatim copy of the old counting and `step`; the
+    /// release words (in order) and the old state agree after every operation.
+    #[test]
+    fn pin_ledger_knob_off_is_the_0927_ledger() {
+        fn old_note(g: &mut PinLedger, layer: u32, sel: &[i32]) {
+            let nu = crate::config::N_EXPERT_USED;
+            for (i, &e) in sel.iter().enumerate() {
+                if (0..N_EXPERT as i32).contains(&e) {
+                    g.note_pick_w(layer, e as u32, (nu - i % nu) as u32);
+                }
+            }
+        }
+        fn old_step(g: &mut PinLedger, headroom: u32, decay_steps: u32, max: usize) -> Vec<u32> {
+            g.steps = g.steps.wrapping_add(1);
+            if decay_steps > 0 && g.steps % decay_steps == 0 {
+                for c in g.counts.iter_mut() {
+                    *c /= 2;
+                }
+            }
+            let Some((est, budget)) = g.est_pinned() else { return Vec::new() };
+            if est <= budget.saturating_sub(headroom) {
+                return Vec::new();
+            }
+            let want = (est - budget.saturating_sub(2 * headroom)) as usize;
+            let mut cand: Vec<(u32, u32)> = Vec::new();
+            for (wi, &w) in g.held.iter().enumerate() {
+                let mut bits = w;
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let (l, e) = (wi / WORDS, (wi % WORDS) * 64 + b);
+                    cand.push((g.counts[l * NE + e], (l * NE + e) as u32));
+                }
+            }
+            let n = want.min(max).min(cand.len());
+            if n == 0 {
+                return Vec::new();
+            }
+            if n < cand.len() {
+                cand.select_nth_unstable(n - 1);
+            }
+            let mut out = Vec::with_capacity(n);
+            for &(_, k) in &cand[..n] {
+                let (l, e) = (k as usize / NE, k as usize % NE);
+                g.held[l * WORDS + e / 64] &= !(1u64 << (e % 64));
+                g.rel_sent = g.rel_sent.wrapping_add(1);
+                if g.rel_sent == 0 {
+                    g.rel_sent = 1;
+                }
+                g.rel_idx[k as usize] = g.rel_sent;
+                let w = ((l as u32) << 16) | e as u32;
+                g.queue.push_back(w);
+                out.push(w);
+            }
+            out
+        }
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n.max(1)
+            }
+        }
+        let nu = crate::config::N_EXPERT_USED;
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut releases = 0usize;
+        for trial in 0..100 {
+            let (mut new, mut old) = (PinLedger::new(), PinLedger::new());
+            new.by_wants = false;
+            let layers = 1 + rng.next(3);
+            let mut epoch = 0u32;
+            for op in 0..200 {
+                match rng.next(10) {
+                    0 | 1 => {
+                        let l = rng.next(layers) as u32;
+                        let ids: Vec<u32> = (0..rng.next(48)).map(|_| rng.next(64) as u32).collect();
+                        assert_eq!(new.apply_map(l, &map(&ids), epoch), old.apply_map(l, &map(&ids), epoch));
+                    }
+                    2 => {
+                        epoch = epoch.wrapping_add(rng.next(3) as u32);
+                        let (pinned, budget) = (rng.next(120) as u32, 40 + rng.next(80) as u32);
+                        new.note_reply(epoch, pinned, budget);
+                        old.note_reply(epoch, pinned, budget);
+                    }
+                    3..=6 => {
+                        let l = rng.next(layers) as u32;
+                        let n = (1 + rng.next(3) as usize) * nu;
+                        let sent: Vec<i32> = (0..n).map(|_| if rng.next(4) == 0 { -1 } else { rng.next(64) as i32 }).collect();
+                        let wants: Vec<i32> = (0..n).map(|_| if rng.next(4) == 0 { -1 } else { rng.next(64) as i32 }).collect();
+                        new.note_sent(l, &sent);
+                        new.note_decode_picks(l, &sent, (rng.next(2) == 0).then_some(&wants[..]));
+                        old_note(&mut old, l, &sent);
+                    }
+                    7 => new.note_admitted(rng.next(layers) as u32, rng.next(64) as u32),
+                    _ => {
+                        let (h, d, m) = (rng.next(20) as u32, rng.next(4) as u32, 1 + rng.next(64) as usize);
+                        let a = new.step_ranked(h, d, m, |_, e| e % 2 == 0);
+                        let b = old_step(&mut old, h, d, m);
+                        releases += a.len();
+                        assert_eq!(a, b, "trial {trial} op {op}");
+                    }
+                }
+                assert!(new.held == old.held && new.counts == old.counts && new.rel_idx == old.rel_idx, "trial {trial} op {op}");
+                assert_eq!((new.rel_sent, new.steps, new.last, &new.queue), (old.rel_sent, old.steps, old.last, &old.queue));
+            }
+        }
+        assert!(releases > 1000, "not vacuous: {releases} releases");
     }
 
     /// Release indices wrap without ever becoming 0 (= never released), and
