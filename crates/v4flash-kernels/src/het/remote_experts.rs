@@ -3182,6 +3182,46 @@ pub fn push_prefetch_words(words: &[u32]) -> bool {
     }
 }
 
+/// RESTORE words (`b2_mirror::pin_enter_decode`): experts released to open a
+/// prefill band, sent back to box 2 as admission words when decode resumes.
+/// A separate queue from `PREFETCH_WORDS` so they never go ahead of the cache
+/// prior's admissions or the look-ahead words: a request carries at most
+/// `b2_mirror::pin_restore_per_request` of them, in the room those leave, and
+/// none while a release word is still queued (see `submit_inner`).
+static RESTORE_WORDS: std::sync::Mutex<std::collections::VecDeque<u32>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Most restore words waiting at once.
+pub const RESTORE_WORDS_MAX: usize = 8192;
+
+/// Queue restore words (in order); returns how many fit under `RESTORE_WORDS_MAX`.
+pub fn push_restore_words(words: &[u32]) -> usize {
+    let mut g = RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner());
+    let n = words.len().min(RESTORE_WORDS_MAX.saturating_sub(g.len()));
+    g.extend(&words[..n]);
+    n
+}
+
+/// Up to `max` restore words, oldest first.
+pub fn take_restore_words(max: usize) -> Vec<u32> {
+    let mut g = RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner());
+    let n = g.len().min(max);
+    g.drain(..n).collect()
+}
+
+/// The pin ledger's view of one request (`b2_mirror::pin_note_submit`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PinNote<'a> {
+    /// The router's own picks for these rows (`[b, nu]`, its rank order),
+    /// box 2's share (`b2_mirror::wants_for_box2`), when a cache prior or a
+    /// mode-2 substitution changed what is sent. `None` ranks by `sel`.
+    pub wants: Option<&'a [i32]>,
+    /// The rows are DECODE rows (the arena). Only decode picks rank experts
+    /// for release: a prefill chunk of <= 16 rows (a prompt's tail, a short
+    /// suffix) must not earn credit. `None` = by row count alone.
+    pub decode: Option<bool>,
+}
+
 pub fn take_prefetch_words(max: usize) -> Vec<u32> {
     let mut g = PREFETCH_WORDS.lock().unwrap();
     let n = g.len().min(max);
@@ -7270,12 +7310,12 @@ impl RemoteExpertClient {
     /// it validates the hub's INTENT (the remap encoding), not the outcome.
     pub fn submit_unmasked(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
         let flags = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 };
-        self.submit_inner(layer, b, xq, sel, ew, flags, false, None)
+        self.submit_inner(layer, b, xq, sel, ew, flags, false, PinNote::default())
     }
 
     /// As [`Self::submit_unmasked`] with explicit `proto::REQ_FLAG_*` bits.
     pub fn submit_unmasked_flags(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
-        self.submit_inner(layer, b, xq, sel, ew, flags, false, None)
+        self.submit_inner(layer, b, xq, sel, ew, flags, false, PinNote::default())
     }
 
     /// `submit` or `submit_unmasked`, chosen by whether box 1 is computing any
@@ -7293,11 +7333,9 @@ impl RemoteExpertClient {
     /// unmasked submit while box 1 still computes its share DOUBLE-COUNTS every
     /// expert both devices claim.
     ///
-    /// `wants`: the ROUTER's own picks for these rows when a cache prior
-    /// changed them (`[b, nu]`, its rank order); only the pin ledger reads
-    /// them (`b2_mirror::pin_wants`). `None` ranks by `sel`.
+    /// `pin`: what the pin ledger should learn from this request (`PinNote`).
     #[allow(clippy::too_many_arguments)]
-    pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool, partner: bool, wants: Option<&[i32]>) -> eyre::Result<Option<Ticket>> {
+    pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool, partner: bool, pin: PinNote<'_>) -> eyre::Result<Option<Ticket>> {
         let extra = if partner { proto::REQ_FLAG_PARTNER } else { 0 };
         let resid = if super::b2_mirror::wanted() {
             // These picks will be resident on box 2 by the time the other lane's
@@ -7308,7 +7346,7 @@ impl RemoteExpertClient {
             0
         };
         let f = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 } | extra | resid;
-        self.submit_inner(layer, b, xq, sel, ew, f, !unmasked, wants)
+        self.submit_inner(layer, b, xq, sel, ew, f, !unmasked, pin)
     }
 
     pub fn submit(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
@@ -7317,7 +7355,7 @@ impl RemoteExpertClient {
 
     /// As [`Self::submit`] with explicit `proto::REQ_FLAG_*` bits.
     pub fn submit_flags(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
-        self.submit_inner(layer, b, xq, sel, ew, flags, true, None)
+        self.submit_inner(layer, b, xq, sel, ew, flags, true, PinNote::default())
     }
 
     /// [`Self::submit_flags`] without the advertised-ownership mask — i.e. what
@@ -7326,14 +7364,12 @@ impl RemoteExpertClient {
     /// exercise the miss path at all: masked submits can only ever request
     /// resident experts, so they never fault.
     pub fn submit_flags_unmasked(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
-        self.submit_inner(layer, b, xq, sel, ew, flags, false, None)
+        self.submit_inner(layer, b, xq, sel, ew, flags, false, PinNote::default())
     }
 
-    /// `wants`: the router's own picks for these rows (`[b, nu]`, its rank
-    /// order), for the pin ledger's release ranking only (see
-    /// `b2_mirror::pin_note_submit`); `None` ranks by `sel`.
+    /// `pin`: the pin ledger's view of the request (`PinNote`).
     #[allow(clippy::too_many_arguments)]
-    fn submit_inner(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32, mask: bool, wants: Option<&[i32]>) -> eyre::Result<Option<Ticket>> {
+    fn submit_inner(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32, mask: bool, pin: PinNote<'_>) -> eyre::Result<Option<Ticket>> {
         let nu = N_EXPERT_USED;
         if b == 0 || b > self.info.max_batch as usize {
             return Err(eyre!("remote submit: b={b} outside 1..={}", self.info.max_batch));
@@ -7396,17 +7432,26 @@ impl RemoteExpertClient {
             (Vec::new(), Vec::new())
         };
         let flags = if ha.is_empty() && he.is_empty() { flags } else { flags | proto::REQ_FLAG_HINTS };
-        let pf = take_prefetch_words(128);
+        // Pin mode: the queued RELEASE words, which only go out once box 2 has
+        // shown it understands them; what the mirror HOLDS among the picks
+        // actually sent (the surprise check on the reply).
+        let pin_req = flags & proto::REQ_FLAG_PIN != 0;
+        let rel = if pin_req { super::b2_mirror::take_release_words(128) } else { Vec::new() };
+        let mut pf = take_prefetch_words(128);
+        // RESTORE words fill the room the admission / look-ahead words leave,
+        // a few per request, and only once every release is on the wire: box
+        // 2 applies a request's releases before its prefetch grants, so a
+        // restore can never reach it before the release it undoes.
+        if pin_req && pf.len() < 128 && super::b2_mirror::releases_queued() == 0 {
+            pf.extend(take_restore_words((128 - pf.len()).min(super::b2_mirror::pin_restore_per_request())));
+        }
         let flags = if pf.is_empty() { flags } else { flags | proto::REQ_FLAG_PREFETCH };
-        // Pin mode: what the mirror HOLDS among the picks actually sent (the
-        // surprise check on the reply), and the queued RELEASE words, which
-        // only go out once box 2 has shown it understands them.
-        let (held, n_held) = if flags & proto::REQ_FLAG_PIN != 0 {
-            super::b2_mirror::pin_note_submit(layer, &self.sel_scratch[..b * nu], wants, b as u32 <= proto::PIN_DECODE_MAX_ROWS)
+        let (held, n_held) = if pin_req {
+            let decode_shaped = b as u32 <= proto::PIN_DECODE_MAX_ROWS && pin.decode.unwrap_or(true);
+            super::b2_mirror::pin_note_submit(layer, &self.sel_scratch[..b * nu], pin.wants, decode_shaped)
         } else {
             ([0u32; proto::RESID_WORDS], 0)
         };
-        let rel = if flags & proto::REQ_FLAG_PIN != 0 { super::b2_mirror::take_release_words(128) } else { Vec::new() };
         let flags = if rel.is_empty() { flags } else { flags | proto::REQ_FLAG_RELEASE };
         // `wait` matches by seq, so any reply order is fine from here.
         let flags = flags | proto::REQ_FLAG_OOO;

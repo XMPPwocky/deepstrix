@@ -185,7 +185,7 @@ fn run(addr: &str, stream: &[Vec<(Spec, Spec, bool)>], pin: bool) -> eyre::Resul
                     assert!(push_prefetch_words(&s.admit));
                 }
                 let t = client
-                    .submit_dispatch(true, s.layer, s.b, &s.xq, &s.sel, &s.ew, true, s.partner, None)?
+                    .submit_dispatch(true, s.layer, s.b, &s.xq, &s.sel, &s.ew, true, s.partner, Default::default())?
                     .ok_or_else(|| eyre!("request with picks not sent"))?;
                 tickets.push(t);
             }

@@ -592,9 +592,14 @@ impl Sched {
         if next != self.phase {
             // Box-2 pinning (`V41_B2_PIN`): a prefill phase gets a band of
             // unpinned slots, and the next decode phase restores what it released.
+            // `pin_released`: the band's opening release (-> Prefill), or the
+            // phase's per-chunk reopens (-> Decode).
             let (pin_released, pin_restore) = match next {
                 Phase::Prefill => (v4flash_kernels::het::b2_mirror::pin_enter_prefill(), 0),
-                Phase::Decode => (0, v4flash_kernels::het::b2_mirror::pin_enter_decode()),
+                Phase::Decode => (
+                    v4flash_kernels::het::b2_mirror::take_band_reopened(),
+                    v4flash_kernels::het::b2_mirror::pin_enter_decode(),
+                ),
             };
             tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(),
                 burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, starved,
@@ -609,7 +614,11 @@ impl Sched {
             self.phase_since = Instant::now();
         }
         match self.phase {
-            Phase::Prefill => self.prefill_tick(state)?,
+            Phase::Prefill => {
+                // Keep the box-2 prefill band open (`b2_mirror::pin_prefill_tick`).
+                v4flash_kernels::het::b2_mirror::pin_prefill_tick();
+                self.prefill_tick(state)?
+            }
             Phase::Decode => self.decode_step(state)?,
         }
         Ok(())

@@ -408,7 +408,7 @@ pub fn lookup(layer: i32, e: u32) -> Option<Residency> {
 
 // ---- pinning (module doc, PINNING) ----
 
-use super::remote_experts::proto::{RESID_WORDS, REQ_FLAG_PIN};
+use super::remote_experts::proto::{PIN_DECODE_MAX_ROWS, RESID_WORDS, REQ_FLAG_PIN};
 
 /// `V41_B2_PIN` (0 = unread, 1 = off, 2 = on); `set_pin_wanted` overrides.
 static PIN_KNOB: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -420,7 +420,7 @@ pub fn pin_wanted() -> bool {
             let on = matches!(std::env::var("V41_B2_PIN").as_deref(), Ok("1") | Ok("on"));
             if on {
                 eprintln!(
-                    "b2 mirror: V41_B2_PIN=1 PINNING (headroom {}, decay every {} steps, rank by {}, prefill band {} slots, restore {}{})",
+                    "b2 mirror: V41_B2_PIN=1 PINNING (headroom {}, decay every {} steps, rank by {}, prefill band {} slots (box 2 must not stage: V41_B2_PREFILL_STAGE=0), restore {}{})",
                     pin_headroom(),
                     pin_decay_steps(),
                     if pin_wants() { "the router's picks (V41_B2_PIN_WANTS)" } else { "the picks sent (V41_B2_PIN_WANTS=0)" },
@@ -460,7 +460,9 @@ pub fn pin_decay_steps() -> u32 {
     *D
 }
 
-/// `V41_B2_PIN_WANTS` (default ON; `0` = the ledger as deployed 2026-09-27):
+/// `V41_B2_PIN_WANTS` (default ON; `0` = the 2026-09-27 counting and release
+/// order; the prefill band, `V41_B2_PIN_PREFILL_BAND`, is separate: set it to 0
+/// too for the 09-27 pin behaviour as a whole):
 /// rank held experts for release by the ROUTER's own decode picks (in its rank
 /// order), not by the picks sent after the cache prior, and break count ties by
 /// the last want (the longest-unwanted goes first) instead of by (layer, id).
@@ -518,6 +520,17 @@ pub fn pin_restore() -> bool {
     static R: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_B2_PIN_RESTORE").as_deref() != Ok("0"));
     *R
+}
+
+/// `V41_B2_PIN_RESTORE_PER_REQ` (default 16): most restore words one request
+/// carries, after its admission / look-ahead words (`remote_experts::submit_inner`).
+/// A decode step sends ~80 requests, so a ~2000-word restore takes ~2 steps,
+/// and box 2's read sets stay free for the cache prior's admissions.
+pub fn pin_restore_per_request() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_PIN_RESTORE_PER_REQ").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+    });
+    *N
 }
 
 /// Most release words planned at one prefill entry.
@@ -772,11 +785,11 @@ impl PinLedger {
     }
 
     /// A DECODE phase starts: the experts released for the last prefill that
-    /// are not held again, hottest first (count, then recency), as admission
-    /// words. Clears the list.
-    pub fn take_restore(&mut self) -> Vec<u32> {
+    /// are not held again and that box 2 still owns (not `stale`), hottest
+    /// first (count, then recency), as admission words. Clears the list.
+    pub fn take_restore(&mut self, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
         let mut words = std::mem::take(&mut self.prefill_released);
-        words.retain(|&w| !self.held(w >> 16, w & 0xFFFF));
+        words.retain(|&w| !self.held(w >> 16, w & 0xFFFF) && !stale(w >> 16, w & 0xFFFF));
         words.sort_by_key(|&w| {
             let k = (w >> 16) as usize * NE + (w & 0xFFFF) as usize;
             (std::cmp::Reverse(self.counts[k]), std::cmp::Reverse(self.last_want[k]), w)
@@ -1001,52 +1014,97 @@ fn pin_begin_step() {
     N_RELEASED_UNUSED.fetch_add(u64::from(unused), Ordering::Relaxed);
 }
 
-/// The multistream scheduler enters a PREFILL phase: open the prefill band
-/// (`pin_prefill_band`) by releasing the coldest pins, clearing them from the
-/// mirror at once; the words ride on the prefill's first requests. Returns the
-/// number released. No-op unless pinning is active.
-pub fn pin_enter_prefill() -> usize {
-    if !pin_active() {
-        return 0;
-    }
-    let band = pin_prefill_band();
-    if band == 0 {
-        return 0;
-    }
-    let partition = super::expert_pager::t2_partition();
-    let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
-    let words = g.release_for_prefill(band, PIN_PREFILL_RELEASE_MAX, |l, e| {
-        partition && !super::expert_pager::partition_box2(l as i32, e)
-    });
+/// Box 2 no longer owns `(layer, e)`: the T2 partition moved it to box 1.
+fn box2_lost(layer: u32, e: u32) -> bool {
+    super::expert_pager::t2_partition() && !super::expert_pager::partition_box2(layer as i32, e)
+}
+
+/// Release pins down to `budget - band`, clearing them from the mirror at
+/// once. Not counted in the per-step `N_RELEASED` (the phase records carry
+/// it); `TOT_RELEASED` counts every release.
+fn band_release(g: &mut PinLedger, band: u32) -> usize {
+    let words = g.release_for_prefill(band, PIN_PREFILL_RELEASE_MAX, box2_lost);
     for &w in &words {
         let (l, e) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
         BITS[l][e / 64].fetch_and(!(1u64 << (e % 64)), Ordering::Relaxed);
     }
     let unused = g.take_released_unused();
-    drop(g);
-    N_RELEASED.fetch_add(words.len() as u64, Ordering::Relaxed);
     TOT_RELEASED.fetch_add(words.len() as u64, Ordering::Relaxed);
     N_RELEASED_UNUSED.fetch_add(u64::from(unused), Ordering::Relaxed);
     words.len()
 }
 
+/// Band releases by `pin_prefill_tick` since the last `take_band_reopened`.
+static N_BAND_REOPENED: AtomicU64 = AtomicU64::new(0);
+
+/// The multistream scheduler enters a PREFILL phase: open the prefill band
+/// (`pin_prefill_band`) by releasing the coldest pins; the words ride on the
+/// prefill's first requests. Restore words still waiting from the last decode
+/// phase go back on the ledger's list (they are restored at the next one).
+/// Returns the number released. No-op unless pinning is active.
+pub fn pin_enter_prefill() -> usize {
+    let band = pin_prefill_band();
+    if !pin_active() || band == 0 {
+        return 0;
+    }
+    let left = super::remote_experts::take_restore_words(usize::MAX);
+    let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+    g.prefill_released.extend(left);
+    band_release(&mut g, band)
+}
+
+/// Every prefill tick (chunk): reopen the band. Box 2 pins what a request of
+/// <= 16 rows picks, prefill chunks included (a prompt's tail, a short
+/// suffix), and nothing else releases during a prefill phase; those pins have
+/// no decode credit, so they are the first to go. Returns the number released.
+pub fn pin_prefill_tick() -> usize {
+    let band = pin_prefill_band();
+    if !pin_active() || band == 0 {
+        return 0;
+    }
+    let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+    let n = band_release(&mut g, band);
+    N_BAND_REOPENED.fetch_add(n as u64, Ordering::Relaxed);
+    n
+}
+
+/// Band releases made by `pin_prefill_tick` since the last call.
+pub fn take_band_reopened() -> usize {
+    N_BAND_REOPENED.swap(0, Ordering::Relaxed) as usize
+}
+
 /// The multistream scheduler enters a DECODE phase: queue the restore of what
-/// `pin_enter_prefill` released (`pin_restore`) as box-2 admission words.
-/// Returns the number queued (the hub's prefetch queue takes them 128 per
-/// request; it refuses more past 4096 waiting).
+/// the band released (`pin_restore`), less what box 2 no longer owns, on the
+/// low-priority restore queue (`remote_experts::push_restore_words`). Returns
+/// the number queued.
 pub fn pin_enter_decode() -> usize {
-    let words = LEDGER.lock().map(|mut g| g.take_restore()).unwrap_or_default();
+    let words = LEDGER.lock().map(|mut g| g.take_restore(box2_lost)).unwrap_or_default();
     if words.is_empty() || !pin_active() || !pin_restore() {
         return 0;
     }
-    let mut n = 0;
-    for chunk in words.chunks(512) {
-        if !super::remote_experts::push_prefetch_words(chunk) {
-            break;
-        }
-        n += chunk.len();
+    let n = super::remote_experts::push_restore_words(&words);
+    if n < words.len() {
+        tracing::warn!(queued = n, dropped = words.len() - n, "b2 pin: restore queue full, the coldest restores dropped");
     }
     n
+}
+
+/// A lane-layer that sends box 2 nothing (every pick box 1's after the cache
+/// prior) still WANTED what the prior displaced from box 2: count it (no send).
+/// `rows` / `decode`: as `pin_note_submit`'s decode-shaped rule.
+pub fn pin_note_idle(layer: u32, wants: &[i32], rows: usize, decode: bool) {
+    if wants.is_empty() || !decode || rows as u32 > PIN_DECODE_MAX_ROWS || pin_request_flag() == 0 {
+        return;
+    }
+    if let Ok(mut g) = LEDGER.lock() {
+        let none = vec![super::remote_experts::NO_PICK; wants.len()];
+        g.note_decode_picks(layer, &none, Some(wants));
+    }
+}
+
+/// Release words queued and not yet taken by a request.
+pub fn releases_queued() -> usize {
+    LEDGER.lock().map(|g| g.queued()).unwrap_or(0)
 }
 
 /// The end-to-end check on a pin-mode reply: sent picks the mirror held at
@@ -1079,7 +1137,8 @@ pub fn check_surprises(layer: u32, seq: u32, held: &[u32; RESID_WORDS], paged: &
     n
 }
 
-/// `(surprises, held picks sent, release words queued, box 2's pinned count
+/// `(surprises, held picks sent, release words queued by decode steps (the
+/// prefill band's are in the `hub_phase` records), box 2's pinned count
 /// net of releases in flight, its budget, releases of background-admitted
 /// experts no request sent to box 2 after the admission was queued)` since the
 /// last call; `None` unless pinning is on. The last approximates box-2 reads
@@ -2242,10 +2301,32 @@ mod tests {
         h.apply_map(1, &map(&ids), 0);
         h.note_reply(0, 10, 10);
         assert_eq!(h.release_for_prefill(8, 3, |_, _| false).len(), 3, "capped by max");
-        // Box 2 applied all 4 releases and re-pinned 2 during the phase.
+        // Box 2 applied all 4 releases and re-pinned 2 during the phase; box 1
+        // took 1 over (stale): neither is restored.
         g.apply_map(1, &map(&[2, 4, 5, 6, 7, 8, 9]), 4);
-        assert_eq!(g.take_restore(), vec![(1 << 16) | 3, (1 << 16) | 1, (1 << 16) | 0], "hottest first, re-held skipped");
-        assert!(g.take_restore().is_empty(), "taken once");
+        assert_eq!(g.take_restore(|l, e| l == 1 && e == 1), vec![(1 << 16) | 3, (1 << 16) | 0], "hottest first; re-held and stale skipped");
+        assert!(g.take_restore(|_, _| false).is_empty(), "taken once");
+    }
+
+    /// Box 2 pins what a <= 16-row prefill request picks (no decode credit on
+    /// the hub): the next band reopen releases those first and remembers them.
+    #[test]
+    fn pin_band_reopen_releases_uncredited_pins_first() {
+        let mut g = PinLedger::new();
+        let ids: Vec<u32> = (0..10).collect();
+        g.apply_map(1, &map(&ids), 0);
+        g.note_reply(0, 10, 10);
+        for e in 0..10u32 {
+            g.note_pick_w(1, e, 1 + e);
+        }
+        assert_eq!(g.release_for_prefill(4, 4096, |_, _| false).len(), 4);
+        // Box 2 applied the 4 releases, then pinned prefill picks 20 and 21.
+        g.apply_map(1, &map(&[4, 5, 6, 7, 8, 9, 20, 21]), 4);
+        g.note_reply(4, 8, 10);
+        let mut w = g.release_for_prefill(4, 4096, |_, _| false);
+        w.sort();
+        assert_eq!(w, vec![(1 << 16) | 20, (1 << 16) | 21], "the uncredited prefill pins go first");
+        assert_eq!(g.prefill_released.len(), 6, "both releases are restored later");
     }
 
     /// The phase hooks on the statics: entering prefill releases (the words
@@ -2255,6 +2336,10 @@ mod tests {
     #[test]
     fn pin_phase_hooks_end_to_end() {
         let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
+        if ["V41_B2_PIN_PREFILL_BAND", "V41_B2_PIN_PREFILL_BAND_FILE", "V41_B2_PIN_RESTORE"].iter().any(|k| std::env::var(k).is_ok()) {
+            eprintln!("pin_phase_hooks_end_to_end: skipped (a band / restore knob is set in the environment)");
+            return;
+        }
         let l = (LAYERS - 3) as u32;
         set_pin_wanted(true);
         on_connect();
@@ -2262,22 +2347,74 @@ mod tests {
         let all: Vec<u32> = (0..100).collect();
         update_pinned(l, &map(&all), 0, 3000, 5000);
         pin_reply_seen(true);
-        let _ = crate::het::remote_experts::take_prefetch_words(1 << 20);
+        let _ = crate::het::remote_experts::take_restore_words(usize::MAX);
+        let _ = take_band_reopened();
         // est 3000 > 5000 - 2048 = 2952: 48 released.
         assert_eq!(pin_enter_prefill(), 48);
+        assert_eq!(pin_prefill_tick(), 0, "the band is open");
+        assert!(releases_queued() == 48);
         let words = take_release_words(4096);
-        assert_eq!(words.len(), 48);
+        assert_eq!((words.len(), releases_queued()), (48, 0));
         assert!(words.iter().all(|&w| w >> 16 == l && !held(l, w & 0xFFFF)));
-        assert_eq!(pin_enter_decode(), 48);
-        let mut pf = crate::het::remote_experts::take_prefetch_words(1 << 20);
-        pf.sort_unstable();
-        let mut want = words.clone();
-        want.sort_unstable();
-        assert_eq!(pf, want);
+        // Box 2 applied them, then pinned 10 prefill picks (<= 16 rows): the
+        // next tick reopens the band.
+        let more: Vec<u32> = (0..100).filter(|e| !words.iter().any(|&w| w & 0xFFFF == *e)).chain(200..210).collect();
+        update_pinned(l, &map(&more), 48, 2962, 5000);
+        assert_eq!(pin_prefill_tick(), 10);
+        assert_eq!(take_band_reopened(), 10);
+        assert_eq!(take_release_words(4096).len(), 10);
+        // Decode: all 58 go back on the low-priority restore queue, once.
+        assert_eq!(pin_enter_decode(), 58);
+        assert_eq!(crate::het::remote_experts::take_prefetch_words(1 << 20), Vec::<u32>::new(), "not on the admission queue");
+        let mut rs = crate::het::remote_experts::take_restore_words(usize::MAX);
+        rs.sort_unstable();
+        assert_eq!(rs.len(), 58);
+        assert!(words.iter().all(|w| rs.contains(w)));
         assert_eq!(pin_enter_decode(), 0, "restored once");
         set_pin_wanted(false);
         on_connect();
         assert_eq!(pin_enter_prefill(), 0, "pinning off");
+    }
+
+    /// A lane-layer that sends box 2 nothing still counts its box-2 wants
+    /// (decode rows of <= 16 only, pinning asked for or on).
+    #[test]
+    fn pin_note_idle_counts_displaced_wants() {
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
+        let nu = crate::config::N_EXPERT_USED;
+        let mut wants = vec![-1i32; nu];
+        wants[2] = 77;
+        set_pin_wanted(true);
+        on_connect();
+        {
+            let mut l = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+            l.by_wants = true;
+        }
+        pin_note_idle(9, &wants, 1, true);
+        pin_note_idle(9, &wants, 1, false);
+        pin_note_idle(9, &wants, 17, true);
+        {
+            let l = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(l.counts[9 * NE + 77], (nu - 2) as u32, "counted once: decode rows <= 16 only");
+            assert_eq!(l.last_sent[9 * NE + 77], 0, "nothing was sent");
+        }
+        set_pin_wanted(false);
+        on_connect();
+        pin_note_idle(9, &wants, 1, true);
+        assert_eq!(LEDGER.lock().unwrap_or_else(|p| p.into_inner()).counts[9 * NE + 77], 0, "pinning off");
+    }
+
+    /// The restore queue keeps order and refuses past its cap.
+    #[test]
+    fn restore_queue_caps_and_keeps_order() {
+        use crate::het::remote_experts::{push_restore_words, take_restore_words, RESTORE_WORDS_MAX};
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = take_restore_words(usize::MAX);
+        let words: Vec<u32> = (0..RESTORE_WORDS_MAX as u32 + 10).collect();
+        assert_eq!(push_restore_words(&words), RESTORE_WORDS_MAX);
+        assert_eq!(push_restore_words(&[1, 2]), 0, "full");
+        assert_eq!(take_restore_words(3), vec![0, 1, 2]);
+        assert_eq!(take_restore_words(usize::MAX).len(), RESTORE_WORDS_MAX - 3);
     }
 
     /// Release indices wrap without ever becoming 0 (= never released), and

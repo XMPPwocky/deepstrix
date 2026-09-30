@@ -8272,6 +8272,14 @@ impl HeterogeneousEngine {
                         // is also what a masked submit returns when no pick survives
                         // its mask; post-MoE then adds no remote partial.
                         let box2_idle = !sel_for_remote.is_empty() && sel_for_remote.iter().all(|&e| e < 0);
+                        // Only arena (decode) rows rank experts for the pin ledger:
+                        // a prefill chunk of <= 16 rows must not earn release credit.
+                        let decode_rows = matches!(rows, RowLayout::Arena { .. });
+                        if box2_idle {
+                            // Nothing goes to box 2, but what the prior displaced from
+                            // it is still a want: the pin ledger must count it.
+                            super::b2_mirror::pin_note_idle(layer as u32, &sel_wants, b as usize, decode_rows);
+                        }
                         let ticket = if box2_idle { None } else { remote
                             .lock()
                             .map_err(|_| eyre!("remote expert client mutex poisoned"))?
@@ -8322,7 +8330,10 @@ impl HeterogeneousEngine {
                                 // and run both as one MoE pass. False on the
                                 // sequential path, where nothing follows.
                                 partner_follows,
-                                (!sel_wants.is_empty()).then_some(sel_wants.as_slice()),
+                                super::remote_experts::PinNote {
+                                    wants: (!sel_wants.is_empty()).then_some(sel_wants.as_slice()),
+                                    decode: Some(decode_rows),
+                                },
                             )? };
                         let ev_t_submit_end = super::evtrace::now();
                         let t_sub_end = super::perfetto::now_ns();
