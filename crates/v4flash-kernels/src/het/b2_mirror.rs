@@ -848,14 +848,19 @@ impl PinLedger {
             return Vec::new();
         };
         if est <= budget.saturating_sub(headroom) {
-            if est <= budget.saturating_sub(2 * headroom) {
+            // Strictly below the release target: right after a release the
+            // estimate sits exactly on it, which is not room.
+            if est < budget.saturating_sub(2 * headroom) {
                 self.watermark = 0;
             }
             return Vec::new();
         }
         let want = (est - budget.saturating_sub(2 * headroom)) as usize;
         let (words, watermark) = self.release_coldest_ex(want.min(max), stale);
-        self.watermark = watermark;
+        // A sweep of only stale experts says nothing about the pressure.
+        if let Some(w) = watermark {
+            self.watermark = w;
+        }
         words
     }
 
@@ -878,8 +883,8 @@ impl PinLedger {
     }
 
     /// `release_coldest`, also returning the highest count released among
-    /// experts box 2 still owns (the admission watermark).
-    fn release_coldest_ex(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool) -> (Vec<u32>, u32) {
+    /// experts box 2 still owns (the admission watermark; `None` if none went).
+    fn release_coldest_ex(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool) -> (Vec<u32>, Option<u32>) {
         // `(tier, count, recency, key)`; tier and recency are constant without
         // `by_wants`, so the order is exactly the old `(count, key)` one.
         let mut cand: Vec<(u32, u32, u32, u32)> = Vec::new();
@@ -900,16 +905,16 @@ impl PinLedger {
         }
         let n = n.min(cand.len());
         if n == 0 {
-            return (Vec::new(), 0);
+            return (Vec::new(), None);
         }
         if n < cand.len() {
             cand.select_nth_unstable(n - 1);
         }
         let mut out = Vec::with_capacity(n);
-        let mut watermark = 0u32;
+        let mut watermark: Option<u32> = None;
         for &(tier, count, _, k) in &cand[..n] {
             if tier == 1 {
-                watermark = watermark.max(count);
+                watermark = Some(watermark.map_or(count, |w| w.max(count)));
             }
             let (l, e) = (k as usize / NE, k as usize % NE);
             let adm = std::mem::take(&mut self.admitted[k as usize]);
@@ -2560,11 +2565,18 @@ mod tests {
         h.note_reply(0, 2, 2);
         h.note_pick_w(1, 1, 80);
         h.note_pick_w(1, 2, 7);
+        h.watermark = 33;
         assert_eq!(h.step_ranked(1, 0, 1, |_, e| e == 1), vec![(1 << 16) | 1]);
-        assert_eq!(h.watermark, 0, "only a stale expert went");
-        // Real room (est 2 <= 4 - 2*1): the watermark drops to 0, everything passes.
+        assert_eq!(h.watermark, 33, "only a stale expert went: the watermark is kept");
+        // Right after the release est sits exactly on the target (2 = 4 - 2*1):
+        // not room, the watermark is kept.
         let _ = g.step_ranked(1, 0, 512, |_, _| false);
-        assert_eq!(g.watermark, 0, "est at the release target: room");
+        assert_eq!(g.watermark, 5, "est exactly at the release target: kept");
+        // Box 2 applied the releases and one more pin went: est 1 < 2 -> room.
+        g.apply_map(1, &map(&[3]), 2);
+        g.note_reply(2, 1, 4);
+        let _ = g.step_ranked(1, 0, 512, |_, _| false);
+        assert_eq!(g.watermark, 0, "real room");
         assert!(g.admission_passes(1, 20, 1));
         // Without by_wants the gate is inert (a displaced want never earns a count).
         g.watermark = 50;
