@@ -7770,8 +7770,16 @@ impl HeterogeneousEngine {
                                 super::expert_pager::pick_trace(&format!("{tag} {layer} {b} {r} {f} {t}"));
                             }
                             // Admit a displaced box-2 miss in the background, unless
-                            // another row still runs it (then box 2 reads it anyway).
-                            if !dry && super::b2_mirror::admit_on() && box2_missing(f) && !boosted.contains(&f) {
+                            // another row still runs it (then box 2 reads it anyway)
+                            // or the admission gate says it would not outlast the
+                            // next release (`b2_mirror::admit_passes`).
+                            let rank_w = prow.iter().position(|&x| x == f).map_or(1, |p| (cs_n_used - p) as u32);
+                            if !dry
+                                && super::b2_mirror::admit_on()
+                                && box2_missing(f)
+                                && !boosted.contains(&f)
+                                && super::b2_mirror::admit_passes(layer as u32, f as u32, rank_w)
+                            {
                                 let w = ((layer as u32) << 16) | f as u32;
                                 if !admit.contains(&w) {
                                     admit.push(w);
@@ -7858,6 +7866,7 @@ impl HeterogeneousEngine {
                             if super::b2_mirror::admit_on()
                                 && (0..N_EXPERT as i32).contains(&f)
                                 && super::expert_pager::partition_box2(layer, f as u32)
+                                && super::b2_mirror::admit_passes(layer as u32, f as u32, (cs_n_used - i % cs_n_used) as u32)
                             {
                                 let w = ((layer as u32) << 16) | f as u32;
                                 if !admit.contains(&w) {

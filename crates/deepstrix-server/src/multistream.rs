@@ -1292,13 +1292,14 @@ impl Sched {
             // accuracy (dry run: `V41_SUB=1`).
             if v4flash_kernels::het::b2_mirror::wanted() {
                 let (p, av, sw, bl, fl, ad, inc) = v4flash_kernels::het::b2_mirror::take_sub_stats();
+                let gated = v4flash_kernels::het::b2_mirror::take_admit_gated();
                 if ev_on {
                     for (k, v) in [("sub_predicted_miss", p), ("sub_reads_avoided", av), ("sub_picks_swapped", sw), ("sub_blocked", bl),
-                        ("sub_plan_failed", fl), ("sub_admits_queued", ad), ("sub_incoming_covered", inc)] {
+                        ("sub_plan_failed", fl), ("sub_admits_queued", ad), ("sub_incoming_covered", inc), ("sub_admits_gated", gated)] {
                         ev.insert(k.into(), v as f64);
                     }
                 }
-                for (name, v) in [("sub.predicted_miss", p as f64), ("sub.reads_avoided", av as f64), ("sub.picks_swapped", sw as f64), ("sub.blocked", bl as f64), ("sub.plan_failed", fl as f64), ("sub.admits_queued", ad as f64), ("sub.incoming_covered", inc as f64)] {
+                for (name, v) in [("sub.predicted_miss", p as f64), ("sub.reads_avoided", av as f64), ("sub.picks_swapped", sw as f64), ("sub.blocked", bl as f64), ("sub.plan_failed", fl as f64), ("sub.admits_queued", ad as f64), ("sub.incoming_covered", inc as f64), ("sub.admits_gated", gated as f64)] {
                     let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                     e.0 += v; e.1 += 1;
                 }

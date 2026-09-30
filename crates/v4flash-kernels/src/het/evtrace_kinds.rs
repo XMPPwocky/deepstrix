@@ -84,6 +84,8 @@ pub static HUB_STEP: Kind = Kind {
         "hop_submit_to_write_us", "hop_wake_us", "hop_slack_us", "hop_blocked", "hop_waits",
         // cache-prior / substitution (b2_mirror::take_sub_stats)
         "sub_predicted_miss", "sub_reads_avoided", "sub_picks_swapped", "sub_blocked", "sub_plan_failed", "sub_admits_queued", "sub_incoming_covered",
+        // admissions the TinyLFU gate refused (`b2_mirror::admit_passes`, V41_SUB_ADMIT_GATE)
+        "sub_admits_gated",
         // pinning (b2_mirror::take_pin_stats; NaN when `V41_B2_PIN` is off):
         // SURPRISES = sent picks the mirror held that box 2 paged anyway (must
         // be 0), held picks sent, release words queued, box 2's pinned count

@@ -614,6 +614,11 @@ pub struct PinLedger {
     /// Words released when the current (or last) prefill phase started,
     /// awaiting the restore at the next decode phase (`take_restore`).
     prefill_released: Vec<u32>,
+    /// Admission watermark (`admit_passes`): the highest count the last decode
+    /// step released under budget pressure (experts box 2 lost excluded), 0
+    /// when that step had room. A newcomer that cannot beat it would be the
+    /// next thing released.
+    watermark: u32,
 }
 
 impl Default for PinLedger {
@@ -638,6 +643,7 @@ impl PinLedger {
             last_sent: vec![0; LAYERS * NE],
             released_unused: 0,
             prefill_released: Vec::new(),
+            watermark: 0,
         }
     }
 
@@ -829,18 +835,38 @@ impl PinLedger {
                 *c /= 2;
             }
         }
-        let Some((est, budget)) = self.est_pinned() else { return Vec::new() };
+        let Some((est, budget)) = self.est_pinned() else {
+            self.watermark = 0;
+            return Vec::new();
+        };
         if est <= budget.saturating_sub(headroom) {
+            self.watermark = 0;
             return Vec::new();
         }
         let want = (est - budget.saturating_sub(2 * headroom)) as usize;
-        self.release_coldest(want.min(max), stale)
+        let (words, watermark) = self.release_coldest_ex(want.min(max), stale);
+        self.watermark = watermark;
+        words
+    }
+
+    /// TinyLFU-style admission (`admit_passes`): would a displaced want of
+    /// `(layer, e)` at rank weight `weight` outlast the last release, i.e. beat
+    /// the watermark with this want counted?
+    pub fn admission_passes(&self, layer: u32, e: u32, weight: u32) -> bool {
+        let (l, e) = (layer as usize, e as usize);
+        l >= LAYERS || e >= NE || self.counts[l * NE + e].saturating_add(weight) > self.watermark
     }
 
     /// RELEASE the `n` coldest held experts (all, if fewer are held), ranked
     /// as in `step_ranked`: each is not held from now on, gets the next release
     /// index, and its word is queued. Returns the words.
     pub fn release_coldest(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
+        self.release_coldest_ex(n, stale).0
+    }
+
+    /// `release_coldest`, also returning the highest count released among
+    /// experts box 2 still owns (the admission watermark).
+    fn release_coldest_ex(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool) -> (Vec<u32>, u32) {
         // `(tier, count, recency, key)`; tier and recency are constant without
         // `by_wants`, so the order is exactly the old `(count, key)` one.
         let mut cand: Vec<(u32, u32, u32, u32)> = Vec::new();
@@ -861,13 +887,17 @@ impl PinLedger {
         }
         let n = n.min(cand.len());
         if n == 0 {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         if n < cand.len() {
             cand.select_nth_unstable(n - 1);
         }
         let mut out = Vec::with_capacity(n);
-        for &(_, _, _, k) in &cand[..n] {
+        let mut watermark = 0u32;
+        for &(tier, count, _, k) in &cand[..n] {
+            if tier == 1 {
+                watermark = watermark.max(count);
+            }
             let (l, e) = (k as usize / NE, k as usize % NE);
             let adm = std::mem::take(&mut self.admitted[k as usize]);
             if adm != 0 && self.last_sent[k as usize] < adm {
@@ -886,7 +916,7 @@ impl PinLedger {
             self.queue.push_back(w);
             out.push(w);
         }
-        out
+        (out, watermark)
     }
 
     /// Up to `max` queued release words, in queue (= index) order.
@@ -1203,6 +1233,42 @@ static N_BLOCKED: AtomicU64 = AtomicU64::new(0);
 static N_FAILED: AtomicU64 = AtomicU64::new(0);
 static N_ADMITS: AtomicU64 = AtomicU64::new(0);
 static N_INCOMING: AtomicU64 = AtomicU64::new(0);
+
+/// `V41_SUB_ADMIT_GATE=1` (default off): TinyLFU-style admission for the
+/// background admissions of displaced box-2 wants (`V41_SUB_ADMIT`), in pin
+/// mode. Admit only an expert whose decayed want count, this want included,
+/// beats the ledger's watermark (`PinLedger::admission_passes`). Otherwise it
+/// would be pinned and then released as the coldest before any use: measured
+/// 2026-09-30, 73% of pin-mode step releases were such unused admissions,
+/// each a box-2 read. Gated wants stay swapped, and are admitted once their
+/// count grows. With room (no release pressure) the watermark is 0 and
+/// everything is admitted.
+pub fn admit_gate_on() -> bool {
+    static G: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| matches!(std::env::var("V41_SUB_ADMIT_GATE").as_deref(), Ok("1") | Ok("on")));
+    *G
+}
+
+static N_ADMIT_GATED: AtomicU64 = AtomicU64::new(0);
+
+/// Admit a displaced box-2 want of `(layer, e)` at rank weight `weight`
+/// (`N_EXPERT_USED - rank`)? True unless the gate is on, pinning is active,
+/// and it would not outlast the last release. Counts refusals.
+pub fn admit_passes(layer: u32, e: u32, weight: u32) -> bool {
+    if !admit_gate_on() || !pin_active() {
+        return true;
+    }
+    let ok = LEDGER.lock().unwrap_or_else(|p| p.into_inner()).admission_passes(layer, e, weight);
+    if !ok {
+        N_ADMIT_GATED.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
+}
+
+/// Admissions the gate refused since the last call.
+pub fn take_admit_gated() -> u64 {
+    N_ADMIT_GATED.swap(0, Ordering::Relaxed)
+}
 
 /// The router's picks `router` (`[b, nu]`) with every expert box 2 does not
 /// own replaced by `NO_PICK`, positions kept (the ledger's rank weights come
@@ -2446,6 +2512,45 @@ mod tests {
         assert_eq!(push_restore_words(&[1, 2]), 0, "full");
         assert_eq!(take_restore_words(3), vec![0, 1, 2]);
         assert_eq!(take_restore_words(usize::MAX).len(), RESTORE_WORDS_MAX - 3);
+    }
+
+    /// TinyLFU watermark: a step that releases under pressure sets it to the
+    /// hottest count it released (a stale expert box 2 lost does not count);
+    /// a step with room resets it to 0. A newcomer passes only if its count,
+    /// this want included, beats it.
+    #[test]
+    fn admission_watermark_follows_release_pressure() {
+        let mut g = PinLedger::new();
+        g.by_wants = true;
+        g.apply_map(1, &map(&[1, 2, 3, 4]), 0);
+        g.note_reply(0, 4, 4);
+        g.note_pick_w(1, 1, 2);
+        g.note_pick_w(1, 2, 5);
+        g.note_pick_w(1, 3, 90);
+        g.note_pick_w(1, 4, 90);
+        assert_eq!(g.watermark, 0);
+        // est 4 > 4 - 1: release down to 4 - 2 = 2 -> the two coldest: 1 (2), 2 (5).
+        let mut w = g.step_ranked(1, 0, 512, |_, _| false);
+        w.sort();
+        assert_eq!(w, vec![(1 << 16) | 1, (1 << 16) | 2]);
+        assert_eq!(g.watermark, 5);
+        assert!(!g.admission_passes(1, 9, 5), "5 does not beat 5");
+        assert!(g.admission_passes(1, 9, 6));
+        g.note_pick_w(1, 9, 3);
+        assert!(g.admission_passes(1, 9, 3), "its own count counts");
+        // A stale release is not pressure information.
+        let mut h = PinLedger::new();
+        h.by_wants = true;
+        h.apply_map(1, &map(&[1, 2]), 0);
+        h.note_reply(0, 2, 2);
+        h.note_pick_w(1, 1, 80);
+        h.note_pick_w(1, 2, 7);
+        assert_eq!(h.step_ranked(1, 0, 1, |_, e| e == 1), vec![(1 << 16) | 1]);
+        assert_eq!(h.watermark, 0, "only a stale expert went");
+        // Room: the watermark drops to 0 and everything passes.
+        let _ = g.step_ranked(1, 0, 512, |_, _| false);
+        assert_eq!(g.watermark, 0, "est at target: no pressure");
+        assert!(g.admission_passes(1, 20, 1));
     }
 
     /// Release indices wrap without ever becoming 0 (= never released), and
