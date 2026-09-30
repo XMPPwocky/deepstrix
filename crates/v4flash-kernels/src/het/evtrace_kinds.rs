@@ -120,7 +120,10 @@ pub static HUB_STEP: Kind = Kind {
 pub static HUB_PHASE: Kind = Kind {
     id: 12,
     name: "hub_phase",
-    fields: &["t", "from", "to", "live", "prefills", "queued", "burst_ms", "next_budget_ms", "starved"],
+    // `b2_pin_released`: pins released to open the prefill band on entering a
+    // prefill phase; `b2_pin_restore`: admission words queued to restore them
+    // on entering decode (`b2_mirror::pin_enter_prefill` / `pin_enter_decode`).
+    fields: &["t", "from", "to", "live", "prefills", "queued", "burst_ms", "next_budget_ms", "starved", "b2_pin_released", "b2_pin_restore"],
 };
 
 // ---- box 2 (expertd) ----

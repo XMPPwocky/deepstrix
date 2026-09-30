@@ -590,13 +590,20 @@ impl Sched {
             }
         };
         if next != self.phase {
+            // Box-2 pinning (`V41_B2_PIN`): a prefill phase gets a band of
+            // unpinned slots, and the next decode phase restores what it released.
+            let (pin_released, pin_restore) = match next {
+                Phase::Prefill => (v4flash_kernels::het::b2_mirror::pin_enter_prefill(), 0),
+                Phase::Decode => (0, v4flash_kernels::het::b2_mirror::pin_enter_decode()),
+            };
             tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(),
-                burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, starved, "ms.phase");
+                burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, starved,
+                pin_released, pin_restore, "ms.phase");
             let code = |p: &Phase| match p { Phase::Decode => 0.0, Phase::Prefill => 1.0 };
             v4flash_kernels::het::evtrace::emit(&v4flash_kernels::het::evtrace_kinds::HUB_PHASE, &[
                 v4flash_kernels::het::evtrace::now(), code(&self.phase), code(&next), self.streams.len() as f64,
                 self.prefills.len() as f64, self.queue.len() as f64, self.phase_since.elapsed().as_secs_f64() * 1e3,
-                budget(next).as_secs_f64() * 1e3, f64::from(u8::from(starved)),
+                budget(next).as_secs_f64() * 1e3, f64::from(u8::from(starved)), pin_released as f64, pin_restore as f64,
             ]);
             self.phase = next;
             self.phase_since = Instant::now();
@@ -925,7 +932,8 @@ impl Sched {
             // reservation: run the prefill (it becomes a runnable stream)
             // instead of spinning here until the decode burst ends.
             if !self.prefills.is_empty() && self.phase == Phase::Decode {
-                tracing::info!(stalled = stalled.len(), prefills = self.prefills.len(), "multistream: every stream stalled; prefill phase");
+                let pin_released = v4flash_kernels::het::b2_mirror::pin_enter_prefill();
+                tracing::info!(stalled = stalled.len(), prefills = self.prefills.len(), pin_released, "multistream: every stream stalled; prefill phase");
                 self.phase = Phase::Prefill;
                 self.phase_since = Instant::now();
             }
