@@ -420,12 +420,17 @@ pub fn pin_wanted() -> bool {
             let on = matches!(std::env::var("V41_B2_PIN").as_deref(), Ok("1") | Ok("on"));
             if on {
                 eprintln!(
-                    "b2 mirror: V41_B2_PIN=1 PINNING (headroom {}, decay every {} steps, rank by {}, prefill band {} slots (box 2 must not stage: V41_B2_PREFILL_STAGE=0), restore {}{})",
+                    "b2 mirror: V41_B2_PIN=1 PINNING (headroom {}, decay every {} steps, rank by {}, prefill band {} slots (box 2 must not stage: V41_B2_PREFILL_STAGE=0), restore {}, admission gate {}{})",
                     pin_headroom(),
                     pin_decay_steps(),
                     if pin_wants() { "the router's picks (V41_B2_PIN_WANTS)" } else { "the picks sent (V41_B2_PIN_WANTS=0)" },
                     pin_prefill_band(),
                     if pin_restore() { "on" } else { "off" },
+                    match (admit_gate_on(), pin_wants()) {
+                        (false, _) => "off",
+                        (true, true) => "on (V41_SUB_ADMIT_GATE)",
+                        (true, false) => "INERT (needs V41_B2_PIN_WANTS)",
+                    },
                     if assert_no_surprise() { ", V41_B2_ASSERT_NO_SURPRISE" } else { "" }
                 );
             }
@@ -614,10 +619,12 @@ pub struct PinLedger {
     /// Words released when the current (or last) prefill phase started,
     /// awaiting the restore at the next decode phase (`take_restore`).
     prefill_released: Vec<u32>,
-    /// Admission watermark (`admit_passes`): the highest count the last decode
-    /// step released under budget pressure (experts box 2 lost excluded), 0
-    /// when that step had room. A newcomer that cannot beat it would be the
-    /// next thing released.
+    /// Admission watermark (`admit_passes`): the highest count the last
+    /// releasing decode step let go (experts box 2 lost excluded). It holds
+    /// between releases (they fire in bursts of >= `headroom`), halves with the
+    /// counts, and is 0 only with real room (the estimate at or below `budget -
+    /// 2 * headroom` and nothing released: after a prefill band, a restore, a
+    /// reconnect). A newcomer that cannot reach it is the next thing released.
     watermark: u32,
 }
 
@@ -834,13 +841,16 @@ impl PinLedger {
             for c in self.counts.iter_mut() {
                 *c /= 2;
             }
+            self.watermark /= 2;
         }
         let Some((est, budget)) = self.est_pinned() else {
             self.watermark = 0;
             return Vec::new();
         };
         if est <= budget.saturating_sub(headroom) {
-            self.watermark = 0;
+            if est <= budget.saturating_sub(2 * headroom) {
+                self.watermark = 0;
+            }
             return Vec::new();
         }
         let want = (est - budget.saturating_sub(2 * headroom)) as usize;
@@ -850,11 +860,14 @@ impl PinLedger {
     }
 
     /// TinyLFU-style admission (`admit_passes`): would a displaced want of
-    /// `(layer, e)` at rank weight `weight` outlast the last release, i.e. beat
-    /// the watermark with this want counted?
+    /// `(layer, e)` at rank weight `weight` outlast the next release, i.e.
+    /// reach the watermark with this want counted? (At a tie the newcomer, the
+    /// most recently wanted, survives: recency breaks count ties.) Only with
+    /// `by_wants`: without it a displaced want never earns a count, and the gate
+    /// would refuse it for good.
     pub fn admission_passes(&self, layer: u32, e: u32, weight: u32) -> bool {
         let (l, e) = (layer as usize, e as usize);
-        l >= LAYERS || e >= NE || self.counts[l * NE + e].saturating_add(weight) > self.watermark
+        !self.by_wants || l >= LAYERS || e >= NE || self.counts[l * NE + e].saturating_add(weight) >= self.watermark
     }
 
     /// RELEASE the `n` coldest held experts (all, if fewer are held), ranked
@@ -1265,7 +1278,9 @@ pub fn admit_passes(layer: u32, e: u32, weight: u32) -> bool {
     ok
 }
 
-/// Admissions the gate refused since the last call.
+/// Admission CANDIDATES the gate refused since the last call: one per (row,
+/// displaced pick), so an expert displaced in several rows or both lanes counts
+/// more than once (unlike `sub_admits_queued`, roughly distinct per lane-layer).
 pub fn take_admit_gated() -> u64 {
     N_ADMIT_GATED.swap(0, Ordering::Relaxed)
 }
@@ -2534,9 +2549,9 @@ mod tests {
         w.sort();
         assert_eq!(w, vec![(1 << 16) | 1, (1 << 16) | 2]);
         assert_eq!(g.watermark, 5);
-        assert!(!g.admission_passes(1, 9, 5), "5 does not beat 5");
-        assert!(g.admission_passes(1, 9, 6));
-        g.note_pick_w(1, 9, 3);
+        assert!(!g.admission_passes(1, 9, 4), "4 cannot reach 5");
+        assert!(g.admission_passes(1, 9, 5), "a tie survives: the newcomer is the freshest");
+        g.note_pick_w(1, 9, 2);
         assert!(g.admission_passes(1, 9, 3), "its own count counts");
         // A stale release is not pressure information.
         let mut h = PinLedger::new();
@@ -2547,10 +2562,40 @@ mod tests {
         h.note_pick_w(1, 2, 7);
         assert_eq!(h.step_ranked(1, 0, 1, |_, e| e == 1), vec![(1 << 16) | 1]);
         assert_eq!(h.watermark, 0, "only a stale expert went");
-        // Room: the watermark drops to 0 and everything passes.
+        // Real room (est 2 <= 4 - 2*1): the watermark drops to 0, everything passes.
         let _ = g.step_ranked(1, 0, 512, |_, _| false);
-        assert_eq!(g.watermark, 0, "est at target: no pressure");
+        assert_eq!(g.watermark, 0, "est at the release target: room");
         assert!(g.admission_passes(1, 20, 1));
+        // Without by_wants the gate is inert (a displaced want never earns a count).
+        g.watermark = 50;
+        g.by_wants = false;
+        assert!(g.admission_passes(1, 20, 1));
+    }
+
+    /// The watermark holds on the steps between releases (est between the
+    /// release target and the trigger) and halves with the counts.
+    #[test]
+    fn admission_watermark_holds_between_releases_and_decays() {
+        let mut g = PinLedger::new();
+        g.by_wants = true;
+        let ids: Vec<u32> = (0..10).collect();
+        g.apply_map(1, &map(&ids), 0);
+        g.note_reply(0, 10, 10);
+        for e in 0..10u32 {
+            g.note_pick_w(1, e, 10 * (e + 1));
+        }
+        // headroom 2: est 10 > 8 -> release down to 6: the 4 coldest (counts 10..40).
+        assert_eq!(g.step_ranked(2, 0, 512, |_, _| false).len(), 4);
+        assert_eq!(g.watermark, 40);
+        // Box 2 applied them and pinned one more: est 7, between 6 and 8 -> no release, watermark kept.
+        g.apply_map(1, &map(&[4, 5, 6, 7, 8, 9, 20]), 4);
+        g.note_reply(4, 7, 10);
+        assert!(g.step_ranked(2, 0, 512, |_, _| false).is_empty());
+        assert_eq!(g.watermark, 40, "held between releases");
+        assert!(!g.admission_passes(1, 30, 6));
+        // A decay tick halves it with the counts (decay every 3 steps: this is step 3).
+        assert!(g.step_ranked(2, 3, 512, |_, _| false).is_empty());
+        assert_eq!(g.watermark, 20);
     }
 
     /// Release indices wrap without ever becoming 0 (= never released), and
