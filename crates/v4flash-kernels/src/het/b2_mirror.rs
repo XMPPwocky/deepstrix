@@ -772,7 +772,10 @@ impl PinLedger {
 
     /// A PREFILL phase starts: release the coldest pins until the pinned
     /// estimate is at most `budget - band` (at most `max`), and remember them
-    /// for the restore. Returns the words (none before any pin reply).
+    /// for the restore. Returns the words (none before any pin reply). The
+    /// ranking is `step_ranked`'s: with `V41_B2_PIN_WANTS=0` that is plain
+    /// `(count, layer, e)`, so uncredited prefill pins go first only as count-0
+    /// ties.
     pub fn release_for_prefill(&mut self, band: u32, max: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
         let Some((est, budget)) = self.est_pinned() else { return Vec::new() };
         let target = budget.saturating_sub(band);
@@ -785,11 +788,20 @@ impl PinLedger {
     }
 
     /// A DECODE phase starts: the experts released for the last prefill that
-    /// are not held again and that box 2 still owns (not `stale`), hottest
-    /// first (count, then recency), as admission words. Clears the list.
+    /// the router has wanted (`last_want`: not a pin box 2 made on a short
+    /// prefill request, nor one only the cache prior's boost kept), are not
+    /// held again, and box 2 still owns (not `stale`), hottest first (count,
+    /// then recency), as admission words. Clears the list.
     pub fn take_restore(&mut self, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
         let mut words = std::mem::take(&mut self.prefill_released);
-        words.retain(|&w| !self.held(w >> 16, w & 0xFFFF) && !stale(w >> 16, w & 0xFFFF));
+        words.retain(|&w| {
+            let (l, e) = (w >> 16, w & 0xFFFF);
+            (l as usize) < LAYERS
+                && (e as usize) < NE
+                && self.last_want[l as usize * NE + e as usize] != 0
+                && !self.held(l, e)
+                && !stale(l, e)
+        });
         words.sort_by_key(|&w| {
             let k = (w >> 16) as usize * NE + (w & 0xFFFF) as usize;
             (std::cmp::Reverse(self.counts[k]), std::cmp::Reverse(self.last_want[k]), w)
@@ -897,6 +909,8 @@ pub fn surprise_count(held: &[u32; RESID_WORDS], paged: &[u32; RESID_WORDS]) -> 
 /// mirror (held, pending, seen) and the pin ledger; asks for pins again if the
 /// knob is on.
 pub fn on_connect() {
+    // Restore words for the old connection's pins mean nothing to the new one.
+    let _ = super::remote_experts::take_restore_words(usize::MAX);
     let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
     *g = PinLedger::new();
     for l in 0..LAYERS {
@@ -1021,7 +1035,8 @@ fn box2_lost(layer: u32, e: u32) -> bool {
 
 /// Release pins down to `budget - band`, clearing them from the mirror at
 /// once. Not counted in the per-step `N_RELEASED` (the phase records carry
-/// it); `TOT_RELEASED` counts every release.
+/// it); `TOT_RELEASED` counts every release, and `N_RELEASED_UNUSED` (the
+/// next `hub_step`) counts these too.
 fn band_release(g: &mut PinLedger, band: u32) -> usize {
     let words = g.release_for_prefill(band, PIN_PREFILL_RELEASE_MAX, box2_lost);
     for &w in &words {
@@ -1104,7 +1119,7 @@ pub fn pin_note_idle(layer: u32, wants: &[i32], rows: usize, decode: bool) {
 
 /// Release words queued and not yet taken by a request.
 pub fn releases_queued() -> usize {
-    LEDGER.lock().map(|g| g.queued()).unwrap_or(0)
+    LEDGER.lock().unwrap_or_else(|p| p.into_inner()).queued()
 }
 
 /// The end-to-end check on a pin-mode reply: sent picks the mirror held at
@@ -2290,6 +2305,7 @@ mod tests {
         g.note_reply(0, 10, 10);
         for e in 0..10u32 {
             g.note_pick_w(1, e, e);
+            g.note_wanted(1, e);
         }
         let mut w = g.release_for_prefill(4, 4096, |_, _| false);
         w.sort();
@@ -2318,6 +2334,7 @@ mod tests {
         g.note_reply(0, 10, 10);
         for e in 0..10u32 {
             g.note_pick_w(1, e, 1 + e);
+            g.note_wanted(1, e);
         }
         assert_eq!(g.release_for_prefill(4, 4096, |_, _| false).len(), 4);
         // Box 2 applied the 4 releases, then pinned prefill picks 20 and 21.
@@ -2326,7 +2343,8 @@ mod tests {
         let mut w = g.release_for_prefill(4, 4096, |_, _| false);
         w.sort();
         assert_eq!(w, vec![(1 << 16) | 20, (1 << 16) | 21], "the uncredited prefill pins go first");
-        assert_eq!(g.prefill_released.len(), 6, "both releases are restored later");
+        assert_eq!(g.prefill_released.len(), 6, "both releases are remembered");
+        assert_eq!(g.take_restore(|_, _| false).len(), 4, "but only what the router wanted is restored");
     }
 
     /// The phase hooks on the statics: entering prefill releases (the words
@@ -2347,6 +2365,13 @@ mod tests {
         let all: Vec<u32> = (0..100).collect();
         update_pinned(l, &map(&all), 0, 3000, 5000);
         pin_reply_seen(true);
+        {
+            // Decode wanted the layer's experts at some point.
+            let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+            for e in 0..100 {
+                g.note_wanted(l, e);
+            }
+        }
         let _ = crate::het::remote_experts::take_restore_words(usize::MAX);
         let _ = take_band_reopened();
         // est 3000 > 5000 - 2048 = 2952: 48 released.
@@ -2363,14 +2388,20 @@ mod tests {
         assert_eq!(pin_prefill_tick(), 10);
         assert_eq!(take_band_reopened(), 10);
         assert_eq!(take_release_words(4096).len(), 10);
-        // Decode: all 58 go back on the low-priority restore queue, once.
-        assert_eq!(pin_enter_decode(), 58);
+        // Decode: the 48 the router wanted go back on the low-priority restore
+        // queue, once (the 10 prefill-only pins do not).
+        assert_eq!(pin_enter_decode(), 48);
         assert_eq!(crate::het::remote_experts::take_prefetch_words(1 << 20), Vec::<u32>::new(), "not on the admission queue");
         let mut rs = crate::het::remote_experts::take_restore_words(usize::MAX);
         rs.sort_unstable();
-        assert_eq!(rs.len(), 58);
-        assert!(words.iter().all(|w| rs.contains(w)));
+        let mut want = words.clone();
+        want.sort_unstable();
+        assert_eq!(rs, want);
         assert_eq!(pin_enter_decode(), 0, "restored once");
+        // A reconnect drops restore words still waiting.
+        assert_eq!(crate::het::remote_experts::push_restore_words(&[1, 2, 3]), 3);
+        on_connect();
+        assert!(crate::het::remote_experts::take_restore_words(usize::MAX).is_empty());
         set_pin_wanted(false);
         on_connect();
         assert_eq!(pin_enter_prefill(), 0, "pinning off");
