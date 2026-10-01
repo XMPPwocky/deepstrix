@@ -38,6 +38,22 @@ impl HeterogeneousEngine {
         b: u32,
         weights: &HetGlobalWeights,
     ) -> eyre::Result<bool> {
+        self.forward_head_batch_multi(scratch, &[(residual, carry, b)], weights)
+    }
+
+    /// `forward_head_batch` over the rows of several sources (`(residual, carry,
+    /// rows)`, e.g. the lanes of a multi-stream step) concatenated in order into
+    /// `logits_b`: ONE read of the projection instead of one per source. The
+    /// per-row prep and `matvec_bpack` are bit-identical per (row, b), so the
+    /// logits equal one `forward_head_batch` per source.
+    #[cfg(feature = "v41")]
+    pub fn forward_head_batch_multi(
+        &self,
+        scratch: &mut DgpuScratch,
+        srcs: &[(&DeviceBuffer<f32>, &DeviceBuffer<f32>, u32)],
+        weights: &HetGlobalWeights,
+    ) -> eyre::Result<bool> {
+        let b: u32 = srcs.iter().map(|s| s.2).sum();
         if b == 0 || b as usize > super::scratch::HEAD_BATCH_MAX {
             return Ok(false);
         }
@@ -49,7 +65,8 @@ impl HeterogeneousEngine {
         let _t_head = de.events.stage("dgpu.head_batch", &de.compute)?;
         let ne = N_EMBD as usize;
         let nblk = ne / 32;
-        for i in 0..b as usize {
+        let rows = srcs.iter().flat_map(|&(residual, carry, n)| (0..n as usize).map(move |r| (residual, carry, r)));
+        for (i, (residual, carry, r)) in rows.enumerate() {
             // Identical kernels to the per-row path, just writing into row i of
             // the batched staging buffers.
             {
@@ -57,8 +74,8 @@ impl HeterogeneousEngine {
                 de.hc_weighted.launch(
                     &de.compute,
                     &mut scratch.head_embd,
-                    &residual.slice_view(i * HC_DIM as usize, HC_DIM as usize),
-                    &carry.slice_view(i * crate::config::HC_MIX_DIM as usize,
+                    &residual.slice_view(r * HC_DIM as usize, HC_DIM as usize),
+                    &carry.slice_view(r * crate::config::HC_MIX_DIM as usize,
                                       crate::config::HC_MIX_DIM as usize),
                     N_EMBD,
                     N_HC,

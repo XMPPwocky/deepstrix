@@ -38,6 +38,17 @@ pub fn hc_pre_onehot_rows() -> &'static [f32] {
 /// (16 x N_VOCAB x 4 B = 8.3 MB) and mirrors GEMV_BPACK_MAX.
 pub const HEAD_BATCH_MAX: usize = 16;
 
+/// Candidates per logit row the decode head ships to the host
+/// (`head_cands`): every token within `HEAD_CAND_BAND` nats of the max at the
+/// row's temperature. On real V4.1 logits (golden agentic fixture, 1,006 rows,
+/// T = 1) a 10-nat band holds p50 26 / p90 425 / p99 1,707 tokens and contains
+/// the top-p 0.95 nucleus in 99.0% of rows at this cap; the rest fall back to
+/// the full row.
+pub const HEAD_CAND_CAP: usize = 2048;
+pub const HEAD_CAND_BAND: f32 = 10.0;
+/// u32 words per row of `head_cands` (`vec_add.hip` `logits_nucleus_cands`).
+pub const HEAD_CAND_STRIDE: usize = 4 + 2 * HEAD_CAND_CAP;
+
 pub struct DgpuScratch {
     // Cross-layer residual
     pub residual: DeviceBuffer<f32>,
@@ -230,6 +241,9 @@ pub struct DgpuScratch {
     pub head_xq_b: DeviceBuffer<i8>,
     pub head_xscale_b: DeviceBuffer<f32>,
     pub logits_b: DeviceBuffer<f32>,
+    /// `head_cands`: per row `[inv_t, lo, band]`, and the kernel's output.
+    pub head_cand_params: DeviceBuffer<f32>,
+    pub head_cands: DeviceBuffer<u32>,
 
     // Sampler scratch (see crate::sampler). partials_max / partials_z
     // hold per-WG reductions consumed by softmax_sample_one. u01 is a
@@ -414,6 +428,8 @@ impl DgpuScratch {
             head_xq_b: DeviceBuffer::new(device_id, HEAD_BATCH_MAX * N_EMBD as usize)?,
             head_xscale_b: DeviceBuffer::new(device_id, HEAD_BATCH_MAX * (N_EMBD as usize / 32))?,
             logits_b: DeviceBuffer::new(device_id, HEAD_BATCH_MAX * N_VOCAB as usize)?,
+            head_cand_params: DeviceBuffer::new(device_id, HEAD_BATCH_MAX * 3)?,
+            head_cands: DeviceBuffer::new(device_id, HEAD_BATCH_MAX * HEAD_CAND_STRIDE)?,
             head_embd: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             head_norm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             head_xq: DeviceBuffer::new(device_id, N_EMBD as usize)?,

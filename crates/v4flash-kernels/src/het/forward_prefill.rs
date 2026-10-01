@@ -2183,6 +2183,61 @@ impl HeterogeneousEngine {
         Ok(out)
     }
 
+    /// Decode head of a multi-stream step without the logits crossing the link:
+    /// the rows of `lanes` (`(bd, rows)`, concatenated in order) through ONE
+    /// batched head (`forward_head_batch_multi`: one read of the projection
+    /// for every lane), then per row the host sampler's inputs -- max, survivor
+    /// weight sum, candidates within `params[3r + 2]` nats
+    /// (`launch_nucleus_cands`) -- into `out` (pinned, `rows *
+    /// HEAD_CAND_STRIDE` words), synchronized. ~16 KB per row instead of the
+    /// 517 KB row (4.1 MB at 8 rows: ~5 ms over the Gen1 OCuLink link, then a
+    /// 129K-float host scan per row). `Ok(false)`: the batched head does not
+    /// apply; use `head_rows`. `logits_b` keeps the full rows until the next
+    /// head (`head_logits_row`, for a row the candidates cannot serve).
+    #[cfg(feature = "v41")]
+    pub fn head_cands(
+        &self,
+        head_scratch: &mut DgpuScratch,
+        lanes: &[(&BatchDgpuScratch, usize)],
+        weights: &HetModelWeights,
+        params: &[f32],
+        out: &mut v4flash_hip::PinnedBuffer<u32>,
+    ) -> eyre::Result<bool> {
+        use super::scratch::{HEAD_CAND_CAP, HEAD_CAND_STRIDE};
+        let b: usize = lanes.iter().map(|l| l.1).sum();
+        if params.len() != 3 * b || out.len() < b * HEAD_CAND_STRIDE {
+            return Err(eyre!("head_cands: {} params / {} out words for {b} rows", params.len(), out.len()));
+        }
+        let srcs: Vec<(&DeviceBuffer<f32>, &DeviceBuffer<f32>, u32)> =
+            lanes.iter().filter(|l| l.1 > 0).map(|&(bd, n)| (&bd.residual, &bd.hc_pre_carry, n as u32)).collect();
+        if !self.forward_head_batch_multi(head_scratch, &srcs, &weights.global)? {
+            return Ok(false);
+        }
+        let de = &self.dgpu;
+        head_scratch.head_cand_params.slice_view_mut(0, 3 * b).copy_from_host_async(params, &de.compute)?;
+        de.vec_add.launch_nucleus_cands(
+            &de.compute,
+            &mut head_scratch.head_cands,
+            &head_scratch.logits_b,
+            &head_scratch.head_cand_params,
+            b as u32,
+            N_VOCAB,
+            HEAD_CAND_CAP as u32,
+        )?;
+        head_scratch.head_cands.slice_view(0, b * HEAD_CAND_STRIDE).copy_to_pinned_async(out, 0, &de.compute)?;
+        de.compute.synchronize()?;
+        Ok(true)
+    }
+
+    /// Full logits of row `r` of the last `head_cands` (a row its candidates
+    /// cannot serve).
+    pub fn head_logits_row(&self, head_scratch: &DgpuScratch, r: usize) -> eyre::Result<Vec<f32>> {
+        let nv = N_VOCAB as usize;
+        let mut v = vec![0f32; nv];
+        head_scratch.logits_b.slice_view(r * nv, nv).copy_to_host(&mut v)?;
+        Ok(v)
+    }
+
     /// Head over one batched row `idx` of `bd`: residual (+ under V4.1 the mHC
     /// carry the head's collapse reads — decode twin: `forward_head` after
     /// layer N-1 reads `dgpu_scratch.hc_pre_carry`) → logits `[N_VOCAB]`.

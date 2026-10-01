@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use v4flash_kernels::config::{ENGRAM_IN, HC_DIM, N_VOCAB};
 use v4flash_kernels::het::forward_prefill::{LazyEngramRows, PrefillJob};
 use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev, ARENA_ROWS_PER_STREAM};
+use v4flash_kernels::het::scratch::{HEAD_BATCH_MAX, HEAD_CAND_BAND, HEAD_CAND_CAP, HEAD_CAND_STRIDE};
 use v4flash_kernels::het::SampleMode;
 use v4flash_kernels::sampler::SamplerRng;
 
@@ -199,7 +200,14 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
-    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 120_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), "multistream scheduler ON");
+    let head_out = match v4flash_hip::PinnedBuffer::<u32>::new(HEAD_BATCH_MAX * HEAD_CAND_STRIDE) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "multistream: head candidate buffer alloc failed");
+            return;
+        }
+    };
+    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 120_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), head_cands = ?head_cands_mode(), "multistream scheduler ON");
     // Event trace (`V41_EVTRACE_DIR`): every V41_* knob goes in the header.
     {
         let knobs: serde_json::Map<String, serde_json::Value> = std::env::vars()
@@ -242,7 +250,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         (true, None) => { tracing::error!("multistream: V41_MS_DSPARK set but no drafter loaded; DSpark off"); None }
         _ => None,
     };
-    let mut sched = Sched { dsp, profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { dsp, profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -323,6 +331,184 @@ fn ms_profile() -> bool {
     *ON
 }
 
+/// How a decode step's head reaches the sampler (`V41_MS_HEAD_CANDS`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HeadCands {
+    /// `0`: the full logit rows (`head_rows` per lane, 517 KB a row).
+    Off,
+    /// Default: one head for every lane, then per row only the sampler's
+    /// candidates (`HeterogeneousEngine::head_cands`), the full row only for a
+    /// row they cannot serve.
+    On,
+    /// `check`: both, every row compared (`ms.head_cands mismatch` warns); the
+    /// full rows are what is sampled.
+    Check,
+}
+
+fn parse_head_cands(s: &str) -> HeadCands {
+    match s.trim() {
+        "0" => HeadCands::Off,
+        "check" => HeadCands::Check,
+        _ => HeadCands::On,
+    }
+}
+
+/// `V41_MS_HEAD_CANDS`, overridden at run time by the contents of
+/// `V41_MS_HEAD_CANDS_FILE` when set (re-read every 2 s): `check` -> `1` ->
+/// `0` without a restart.
+fn head_cands_mode() -> HeadCands {
+    static ENV: std::sync::LazyLock<HeadCands> =
+        std::sync::LazyLock::new(|| parse_head_cands(&std::env::var("V41_MS_HEAD_CANDS").unwrap_or_default()));
+    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_HEAD_CANDS_FILE").ok());
+    static CACHE: std::sync::Mutex<Option<(Instant, HeadCands)>> = std::sync::Mutex::new(None);
+    let Some(path) = FILE.as_ref() else { return *ENV };
+    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((t, m)) = *g {
+        if t.elapsed() < std::time::Duration::from_secs(2) {
+            return m;
+        }
+    }
+    let m = std::fs::read_to_string(path).map(|s| parse_head_cands(&s)).unwrap_or(*ENV);
+    if g.is_some_and(|(_, old)| old != m) {
+        tracing::info!(mode = ?m, "multistream: head candidates mode changed");
+    }
+    *g = Some((Instant::now(), m));
+    m
+}
+
+/// `logits_nucleus_cands` params of a row sampled under `mode`: `[inv_t, lo,
+/// band]`, as `TargetDist::from_cands` reads them back.
+fn head_cand_params(mode: &SampleMode) -> [f32; 3] {
+    match *mode {
+        // The maxima only (l >= 0); no survivor total.
+        SampleMode::Argmax => [1.0, f32::INFINITY, 0.0],
+        SampleMode::Multinomial { temperature, min_p_rel, .. } => {
+            [1.0 / temperature, min_p_rel.max(crate::spec_sample::FLOOR).ln(), HEAD_CAND_BAND]
+        }
+    }
+}
+
+/// The sampler's distribution for row `r` of the last `head_cands` (`out`),
+/// or `None` when its candidates cannot serve it (the caller reads the row).
+fn row_from_cands(out: &[u32], r: usize, mode: &SampleMode) -> Option<TargetDist> {
+    let o = &out[r * HEAD_CAND_STRIDE..(r + 1) * HEAD_CAND_STRIDE];
+    let n = o[0] as usize;
+    if n > HEAD_CAND_CAP {
+        return None;
+    }
+    let cands: Vec<(f32, u32)> = (0..n).map(|k| (f32::from_bits(o[4 + 2 * k]), o[5 + 2 * k])).collect();
+    let band = match *mode {
+        SampleMode::Argmax => 0.0,
+        SampleMode::Multinomial { .. } => HEAD_CAND_BAND,
+    };
+    TargetDist::from_cands(f32::from_bits(o[1]), f32::from_bits(o[2]), &cands, band, mode)
+}
+
+/// What a step's head did (`ms.step` `head_full` / `head_mismatch`).
+#[derive(Default, Clone, Copy)]
+struct HeadStats {
+    /// Rows sampled from their full logit row.
+    full: usize,
+    /// `V41_MS_HEAD_CANDS=check`: rows whose candidates gave another
+    /// distribution than the full row.
+    mismatch: usize,
+    /// `check`: rows whose merged-head logits differ from the per-lane head's.
+    head_diff: usize,
+}
+
+/// The step's head: per row (lanes' rows concatenated in `srcs` order) the
+/// distribution its stream samples from. Candidates first (`head_cands`,
+/// `V41_MS_HEAD_CANDS`), the full row for a row they cannot serve; the full
+/// rows of every lane when the candidates are off or the batched head does
+/// not apply.
+#[allow(clippy::too_many_arguments)]
+fn head_targets(
+    engine: &v4flash_kernels::het::HeterogeneousEngine,
+    head: &mut v4flash_kernels::het::scratch::DgpuScratch,
+    srcs: &[(&v4flash_kernels::het::batch_scratch::BatchDgpuScratch, usize)],
+    weights: &v4flash_kernels::het::HetModelWeights,
+    modes: &[SampleMode],
+    params: &[f32],
+    out: &mut v4flash_hip::PinnedBuffer<u32>,
+    mode: HeadCands,
+) -> eyre::Result<(Vec<TargetDist>, HeadStats)> {
+    let mut st = HeadStats::default();
+    let nv = N_VOCAB as usize;
+    // `check`: the per-lane rows first (`head_rows`, today's head), to compare
+    // the merged head against them.
+    let per_lane: Option<Vec<f32>> = if mode == HeadCands::Check {
+        let mut l = Vec::with_capacity(modes.len() * nv);
+        for &(bd, n) in srcs {
+            if n > 0 {
+                l.extend(engine.head_rows(head, bd, n, weights)?);
+            }
+        }
+        Some(l)
+    } else {
+        None
+    };
+    if mode != HeadCands::Off && engine.head_cands(head, srcs, weights, params, out)? {
+        let mut ts = Vec::with_capacity(modes.len());
+        for (r, m) in modes.iter().enumerate() {
+            let c = row_from_cands(out.as_slice(), r, m);
+            let t = match (mode, c) {
+                (HeadCands::On, Some(t)) => t,
+                (HeadCands::Check, c) => {
+                    let old = &per_lane.as_ref().expect("check mode")[r * nv..(r + 1) * nv];
+                    let merged = engine.head_logits_row(head, r)?;
+                    if merged.iter().zip(old).any(|(a, b)| a.to_bits() != b.to_bits()) {
+                        st.head_diff += 1;
+                        tracing::warn!(row = r, "ms.head_cands merged head differs from the per-lane head");
+                    }
+                    let full = TargetDist::from_logits(old, m);
+                    st.full += 1;
+                    if let Some(c) = c {
+                        if !same_target(&c, &full) {
+                            st.mismatch += 1;
+                            tracing::warn!(row = r, mode = ?m, cands = ?summary(&c), full = ?summary(&full), "ms.head_cands mismatch");
+                        }
+                    }
+                    full
+                }
+                (_, _) => {
+                    st.full += 1;
+                    TargetDist::from_logits(&engine.head_logits_row(head, r)?, m)
+                }
+            };
+            ts.push(t);
+        }
+        return Ok((ts, st));
+    }
+    let mut logits = Vec::with_capacity(modes.len() * nv);
+    for &(bd, n) in srcs {
+        if n > 0 {
+            logits.extend(engine.head_rows(head, bd, n, weights)?);
+        }
+    }
+    st.full = modes.len();
+    Ok((modes.iter().enumerate().map(|(r, m)| TargetDist::from_logits(&logits[r * nv..(r + 1) * nv], m)).collect(), st))
+}
+
+/// The same distribution: support, weights and normaliser bit for bit (the
+/// unused `fallback` pick may differ between tied maxima).
+fn same_target(a: &TargetDist, b: &TargetDist) -> bool {
+    match (a, b) {
+        (TargetDist::Argmax(x), TargetDist::Argmax(y)) => x == y,
+        (TargetDist::Weighted { ids: i1, w: w1, z: z1, .. }, TargetDist::Weighted { ids: i2, w: w2, z: z2, .. }) => {
+            i1 == i2 && z1.to_bits() == z2.to_bits() && w1.len() == w2.len() && w1.iter().zip(w2).all(|(p, q)| p.to_bits() == q.to_bits())
+        }
+        _ => false,
+    }
+}
+
+/// `(support size, z)` for a mismatch log line.
+fn summary(t: &TargetDist) -> (usize, f32) {
+    match t {
+        TargetDist::Argmax(a) => (1, *a as f32),
+        TargetDist::Weighted { ids, z, .. } => (ids.len(), *z),
+    }
+}
+
 struct Sched {
     /// DSpark on the arena (`ms_dspark`); `None` = off.
     dsp: Option<MsDspark>,
@@ -332,6 +518,8 @@ struct Sched {
     dev_b: RowTablesDev,
     /// Lane-C tables for the three-lane step (`V41_MS_LANES=3`).
     dev_c: RowTablesDev,
+    /// Host side of `head_cands` (pinned; `V41_MS_HEAD_CANDS`).
+    head_out: v4flash_hip::PinnedBuffer<u32>,
     /// Prefilled requests waiting for arena room (their scratch state stays
     /// parked with them; admission is retried every tick).
     parked: Vec<(Prefill, Vec<f32>)>,
@@ -1242,7 +1430,18 @@ impl Sched {
             bd_b.mtp_captured = 0;
             bd_c.mtp_captured = 0;
         }
-        let logits = std::thread::scope(|sc| {
+        // Each row's sampling mode (a speculating stream's draft rows share
+        // its stream's) and its `head_cands` params.
+        let mut row_modes: Vec<SampleMode> = Vec::with_capacity(b);
+        for (s, d) in self.streams.iter().zip(&drafts) {
+            row_modes.extend(std::iter::repeat_n(s.sample_mode, 1 + d.len()));
+        }
+        if row_modes.len() != b {
+            return Err(eyre!("ms.step: {} row modes for {b} rows", row_modes.len()));
+        }
+        let cand_params: Vec<f32> = row_modes.iter().flat_map(head_cand_params).collect();
+        let hc_mode = head_cands_mode();
+        let (targets, head_stats) = std::thread::scope(|sc| {
         let mut engram_rows = if engram_on && !live.is_empty() {
             let ec: &crate::engine_worker::EngramCtx = engram.as_ref().expect("engram_on");
             let live = &live;
@@ -1253,20 +1452,15 @@ impl Sched {
         } else {
             LazyEngramRows::ready(None)
         };
-        let logits = if lanes3 {
-            let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 3] =
-                [(&mut *bd_a, &mut *bi_a, &mut self.dev), (&mut *bd_b, &mut *bi_b, &mut self.dev_b), (&mut *bd_c, &mut *bi_c, &mut self.dev_c)];
-            engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
-            fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
-            let mut l = Vec::with_capacity(b);
-            let mut off = 0;
-            for (i, (bd, _, _)) in lanes.iter_mut().enumerate() {
-                let sz = b / 3 + usize::from(i < b % 3);
-                l.extend(engine.head_rows(dgpu_scratch, bd, sz, weights)?);
-                off += sz;
+        let targets = if lanes3 {
+            {
+                let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 3] =
+                    [(&mut *bd_a, &mut *bi_a, &mut self.dev), (&mut *bd_b, &mut *bi_b, &mut self.dev_b), (&mut *bd_c, &mut *bi_c, &mut self.dev_c)];
+                engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             }
-            debug_assert_eq!(off, b);
-            l
+            fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+            let sz = |i: usize| b / 3 + usize::from(i < b % 3);
+            head_targets(engine, dgpu_scratch, &[(&*bd_a, sz(0)), (&*bd_b, sz(1)), (&*bd_c, sz(2))], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         } else if stagger2 {
             {
                 let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 2] =
@@ -1280,22 +1474,18 @@ impl Sched {
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             // Same split as the lanes driver: the first lane takes the odd row.
             let b_a = b.div_ceil(2);
-            let mut l = engine.head_rows(dgpu_scratch, bd_a, b_a, weights)?;
-            l.extend(engine.head_rows(dgpu_scratch, bd_b, b - b_a, weights)?);
-            l
+            head_targets(engine, dgpu_scratch, &[(&*bd_a, b_a), (&*bd_b, b - b_a)], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         } else if pipelined {
             engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             let b_a = b.div_ceil(2);
-            let mut l = engine.head_rows(dgpu_scratch, bd_a, b_a, weights)?;
-            l.extend(engine.head_rows(dgpu_scratch, bd_b, b - b_a, weights)?);
-            l
+            head_targets(engine, dgpu_scratch, &[(&*bd_a, b_a), (&*bd_b, b - b_a)], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         } else {
             engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
-            engine.head_rows(dgpu_scratch, bd_a, b, weights)?
+            head_targets(engine, dgpu_scratch, &[(&*bd_a, b)], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         };
-        Ok::<_, eyre::Report>(logits)
+        Ok::<_, eyre::Report>(targets)
         })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
         // The drafter's input for every row (lane-local captures, in row order).
@@ -1533,7 +1723,6 @@ impl Sched {
                 acc.wall_ms = 0.0;
             }
         }
-        let nv = N_VOCAB as usize;
         // Sample, emit, retire. A stream with drafts runs the block procedure
         // (plan 2.3) over its rows and emits token by token, stopping at the
         // first stop; it keeps one KV row per token emitted.
@@ -1544,15 +1733,14 @@ impl Sched {
         for (i, s) in self.streams.iter_mut().enumerate() {
             let r = row0[i];
             if drafts[i].is_empty() {
-                let tok = sample_row(&logits[r * nv..(r + 1) * nv], &s.sample_mode, &mut s.rng);
+                let tok = targets[r].sample(&mut s.rng);
                 s.next = tok;
                 if !emit(state, s, tok) { done.push((i, FinishReason::Stop)); continue; }
                 if let Some(f) = stop_reason(s, tok) { done.push((i, f)); }
                 continue;
             }
             let k = drafts[i].len();
-            let rows: Vec<TargetDist> =
-                (0..=k).map(|j| TargetDist::from_logits(&logits[(r + j) * nv..(r + j + 1) * nv], &s.sample_mode)).collect();
+            let rows: Vec<TargetDist> = targets[r..=r + k].to_vec();
             let ds: Vec<Draft> = drafts[i]
                 .iter()
                 .enumerate()
@@ -1612,7 +1800,8 @@ impl Sched {
             finish(state, &mut self.arena, s, f)?;
         }
         tracing::info!(rows = b, spec = ?spec_out, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
-            engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(), "ms.step");
+            engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
+            head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff, "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),

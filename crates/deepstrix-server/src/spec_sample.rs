@@ -26,7 +26,7 @@ use v4flash_kernels::sampler::SamplerRng;
 
 /// Weights below this (relative to the top token) cannot move a top-p cutoff
 /// by more than `N_VOCAB * FLOOR` of the mass; see `from_logits`.
-const FLOOR: f32 = 1e-10;
+pub(crate) const FLOOR: f32 = 1e-10;
 
 /// Below this total, `max(0, p - q)` is treated as empty (p ~= q to rounding):
 /// draw from `p` instead of normalising ~0 (plan 2.3).
@@ -122,6 +122,85 @@ impl TargetDist {
                     }
                 }
                 TargetDist::Weighted { ids, w, z, fallback }
+            }
+        }
+    }
+
+    /// `from_logits` from what a decode head ships INSTEAD of the 517 KB row
+    /// (`HeterogeneousEngine::head_cands`): the row's `max`, `z_all` = the
+    /// survivors' weight sum computed on the device, and `cands` = every
+    /// `(logit, id)` within `band` nats of the max at the row's temperature,
+    /// in any order. `None` when they cannot serve the row -- top-p >= 1 (the
+    /// whole survivor set is the support), the nucleus reaching past the
+    /// band, no candidate, a non-finite total -- and the caller uses the row.
+    ///
+    /// The same computation as `from_logits` over the same tokens, except the
+    /// top-p target `top_p * z`: `from_logits` sums every survivor on the host
+    /// in weight-descending order, this takes the device's sum of the same set
+    /// (both f32, ~1e-7 relative apart), so the cutoff can only differ when
+    /// the cumulative mass crosses the target within that much. When every
+    /// survivor is a candidate (min-p above the band) the host sum is used and
+    /// the result is bit-identical; Argmax is bit-identical (lowest id among
+    /// the maxima). The cutoff must sit a margin inside the band, so a
+    /// device/host rounding difference in a token's log-weight (the device
+    /// fuses `x * inv_t - gmax`; ~ulp of `x * inv_t`, which grows with the
+    /// logits' magnitude) cannot leave out a token that ties into the nucleus.
+    pub fn from_cands(max: f32, z_all: f32, cands: &[(f32, u32)], band: f32, mode: &SampleMode) -> Option<Self> {
+        let margin = |inv_t: f32| 1e-3 + 4.0 * (max.abs() + band / inv_t) * inv_t * f32::EPSILON;
+        match *mode {
+            SampleMode::Argmax => cands.iter().filter(|c| c.0 == max).map(|c| c.1).min().map(|id| TargetDist::Argmax(id as i32)),
+            SampleMode::Multinomial { temperature, min_p_rel, top_p } => {
+                if top_p >= 1.0 || !(z_all.is_finite() && z_all > 0.0) {
+                    return None;
+                }
+                let inv_t = 1.0f32 / temperature;
+                let gmax = max * inv_t;
+                let lo = (min_p_rel.max(FLOOR)).ln();
+                // Survivors among the candidates, pushed in VOCAB order as
+                // `from_logits` pushes them.
+                let mut by_id: Vec<(f32, u32)> = cands.to_vec();
+                by_id.sort_unstable_by_key(|c| c.1);
+                let mut cand: Vec<(f32, u32)> = Vec::with_capacity(by_id.len());
+                for &(x, id) in &by_id {
+                    let l = x * inv_t - gmax;
+                    if l >= lo {
+                        cand.push((l.exp(), id));
+                    }
+                }
+                if cand.is_empty() {
+                    return None;
+                }
+                let m = margin(inv_t);
+                let all_survivors = lo >= -band + m;
+                cand.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                let z = if all_survivors { cand.iter().map(|c| c.0).sum::<f32>() } else { z_all };
+                let target = top_p * z;
+                let mut cum = 0.0f32;
+                let mut cut = None;
+                for c in &cand {
+                    cum += c.0;
+                    if cum >= target {
+                        cut = Some(c.0);
+                        break;
+                    }
+                }
+                let t = cut?;
+                if !all_survivors && t < (-band + m).exp() {
+                    return None;
+                }
+                let thr = t.max(min_p_rel);
+                let z: f32 = cand.iter().filter(|c| c.0 >= thr).map(|c| c.0).sum();
+                let fallback = cand.first().map(|c| c.1 as i32).unwrap_or(0);
+                cand.sort_unstable_by_key(|c| c.1);
+                let mut ids = Vec::with_capacity(cand.len());
+                let mut w = Vec::with_capacity(cand.len());
+                for c in &cand {
+                    if c.0 >= thr {
+                        ids.push(c.1);
+                        w.push(c.0);
+                    }
+                }
+                Some(TargetDist::Weighted { ids, w, z, fallback })
             }
         }
     }
@@ -447,6 +526,146 @@ mod tests {
             }
         }
         assert!(checked > 10_000);
+    }
+
+    /// What `logits_nucleus_cands` ships for row `r` (host emulation, its `z`
+    /// summed in `from_logits`' order so equality can be exact).
+    fn emulate_cands(r: &[f32], mode: &SampleMode, band: f32) -> (f32, f32, Vec<(f32, u32)>) {
+        let max = r.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let (inv_t, lo, band) = match *mode {
+            SampleMode::Argmax => (1.0f32, f32::INFINITY, 0.0f32),
+            SampleMode::Multinomial { temperature, min_p_rel, .. } => (1.0 / temperature, min_p_rel.max(FLOOR).ln(), band),
+        };
+        let gmax = max * inv_t;
+        let mut surv: Vec<f32> = Vec::new();
+        let mut cands = Vec::new();
+        for (i, &x) in r.iter().enumerate() {
+            let l = x * inv_t - gmax;
+            if l >= lo {
+                surv.push(l.exp());
+            }
+            if l >= -band {
+                cands.push((x, i as u32));
+            }
+        }
+        surv.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+        let z = surv.iter().sum::<f32>();
+        cands.reverse(); // the device ships them in any order
+        (max, z, cands)
+    }
+
+    fn same_dist(a: &TargetDist, b: &TargetDist) -> bool {
+        match (a, b) {
+            (TargetDist::Argmax(x), TargetDist::Argmax(y)) => x == y,
+            (TargetDist::Weighted { ids: i1, w: w1, z: z1, .. }, TargetDist::Weighted { ids: i2, w: w2, z: z2, .. }) => {
+                i1 == i2 && z1.to_bits() == z2.to_bits() && w1.iter().zip(w2).all(|(p, q)| p.to_bits() == q.to_bits())
+            }
+            _ => false,
+        }
+    }
+
+    /// G-RS3: the decode head's candidates (`from_cands`) give the SAME
+    /// distribution as the full row (`from_logits`) whenever they serve the
+    /// row, given the same survivor total; they decline top-p 1.
+    #[test]
+    fn g_rs3_head_candidates_reproduce_the_row_sampler() {
+        let mut modes = vec![SampleMode::Argmax];
+        for &temperature in &[0.3f32, 0.7, 1.0, 1.5] {
+            for &top_p in &[1.0f32, 0.95, 0.8, 0.5] {
+                for &min_p_rel in &[0.0f32, 0.05] {
+                    modes.push(SampleMode::Multinomial { temperature, min_p_rel, top_p });
+                }
+            }
+        }
+        let mut data = SamplerRng::new(11);
+        let (mut served, mut declined) = (0usize, 0usize);
+        for shape in 0..6 {
+            for row_i in 0..40 {
+                let v = if row_i % 2 == 0 { 3000 } else { 20_000 };
+                let row: Vec<f32> = (0..v)
+                    .map(|_| match shape {
+                        0 => gauss(&mut data) * 2.0,
+                        1 => gauss(&mut data) * 8.0,
+                        2 => gauss(&mut data) * 0.2,
+                        3 => (gauss(&mut data) * 2.0).round(),
+                        4 => -1e4 + gauss(&mut data),
+                        _ => if data.next_f32() < 0.01 { 5.0 } else { -3.0 },
+                    })
+                    .collect();
+                for mode in &modes {
+                    for band in [10.0f32, 4.0] {
+                        let (max, z, cands) = emulate_cands(&row, mode, band);
+                        match TargetDist::from_cands(max, z, &cands, band, mode) {
+                            Some(d) => {
+                                assert!(same_dist(&d, &TargetDist::from_logits(&row, mode)), "shape {shape} v {v} mode {mode:?} band {band}");
+                                served += 1;
+                            }
+                            None => {
+                                declined += 1;
+                                // Declining is only ever about the support: top-p 1,
+                                // or a nucleus holding a token outside (the margin of)
+                                // the band.
+                                match (*mode, TargetDist::from_logits(&row, mode)) {
+                                    (SampleMode::Multinomial { top_p, temperature, .. }, TargetDist::Weighted { w, .. }) => assert!(
+                                        top_p >= 1.0
+                                            || w.iter().any(|&x| x < (-band + 1e-3 + 4.0 * (max.abs() + band * temperature) / temperature * f32::EPSILON).exp()),
+                                        "declined a nucleus inside the band: shape {shape} mode {mode:?} band {band}"
+                                    ),
+                                    _ => panic!("declined an argmax row: shape {shape}"),
+                                }
+                            }
+                        }
+                    }
+                    if let SampleMode::Multinomial { top_p, .. } = *mode {
+                        if top_p >= 1.0 {
+                            let (max, z, cands) = emulate_cands(&row, mode, 10.0);
+                            assert!(TargetDist::from_cands(max, z, &cands, 10.0, mode).is_none());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(served > 10_000, "served {served} declined {declined}");
+    }
+
+    /// The device sums the survivors in another order: a 1e-6 relative change
+    /// of the total may move the top-p cutoff, but only for cumulative masses
+    /// within that much of the target -- draws almost never change.
+    #[test]
+    fn g_rs3_a_device_order_total_barely_moves_draws() {
+        let mode = SampleMode::Multinomial { temperature: 1.0, min_p_rel: 0.0, top_p: 0.95 };
+        let mut data = SamplerRng::new(5);
+        let (mut draws, mut moved) = (0usize, 0usize);
+        for _ in 0..200 {
+            let row: Vec<f32> = (0..20_000).map(|_| gauss(&mut data) * 3.0).collect();
+            let (max, z, cands) = emulate_cands(&row, &mode, 10.0);
+            let (Some(a), Some(b)) = (
+                TargetDist::from_cands(max, z, &cands, 10.0, &mode),
+                TargetDist::from_cands(max, z * (1.0 + 1e-6), &cands, 10.0, &mode),
+            ) else {
+                continue;
+            };
+            for k in 0..500 {
+                let u = (k as f32 + 0.5) / 500.0;
+                draws += 1;
+                moved += usize::from(a.draw(u) != b.draw(u));
+            }
+        }
+        assert!(draws > 50_000, "draws {draws}");
+        assert!((moved as f64) < draws as f64 * 1e-3, "moved {moved} of {draws}");
+    }
+
+    /// A nucleus that reaches past the band is declined, not truncated.
+    #[test]
+    fn g_rs3_a_nucleus_past_the_band_is_declined() {
+        let mode = SampleMode::Multinomial { temperature: 1.0, min_p_rel: 0.0, top_p: 0.95 };
+        // One token at 0, 100,000 at -11 (each e^-11, 1.67 in all): the
+        // nucleus needs them, the 10-nat band does not hold them.
+        let mut row = vec![-11.0f32; 100_001];
+        row[7] = 0.0;
+        let (max, z, cands) = emulate_cands(&row, &mode, 10.0);
+        assert_eq!(cands.len(), 1);
+        assert!(TargetDist::from_cands(max, z, &cands, 10.0, &mode).is_none());
     }
 
     // ---- G-RS1: the emitted sequence is distributed as plain sampling ------

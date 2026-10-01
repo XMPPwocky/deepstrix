@@ -170,4 +170,34 @@ impl VecAddInplace {
         let cfg = LaunchConfig { grid: (n.div_ceil(64), 1, 1), block: (64, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [out.raw(), src.raw(), idx.raw(), n])
     }
+
+    /// Per logit row of `logits` (`rows` x `nv`): its max, the survivors'
+    /// weight sum and the candidates within `band` of the max
+    /// (`vec_add.hip` `logits_nucleus_cands`; layout there). `params` =
+    /// `[inv_t, lo, band]` per row; `out` holds `rows * (4 + 2 * cap)` words.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_nucleus_cands(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<u32>,
+        logits: &DeviceBuffer<f32>,
+        params: &DeviceBuffer<f32>,
+        rows: u32,
+        nv: u32,
+        cap: u32,
+    ) -> eyre::Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let stride = 4 + 2 * cap as usize;
+        if logits.len() < rows as usize * nv as usize || params.len() < 3 * rows as usize || out.len() < rows as usize * stride {
+            return Err(eyre!(
+                "logits_nucleus_cands: logits {} / params {} / out {} too small for {rows} rows x {nv} (cap {cap})",
+                logits.len(), params.len(), out.len()
+            ));
+        }
+        let function = self.module.get_function("logits_nucleus_cands")?;
+        let cfg = LaunchConfig { grid: (rows, 1, 1), block: (1024, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [logits.raw(), nv, params.raw(), out.raw(), cap])
+    }
 }
