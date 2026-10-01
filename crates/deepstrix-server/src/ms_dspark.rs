@@ -996,7 +996,9 @@ impl StepCost {
             *v *= self.decay;
         }
         for c in self.cells.iter_mut() {
-            c.0 *= self.decay;
+            // Flush a long-idle weight to 0 rather than age a subnormal forever
+            // (the mean is unaffected; the next sample carries the cell).
+            c.0 = if c.0 < 1e-30 { 0.0 } else { c.0 * self.decay };
         }
         self.refit();
     }
