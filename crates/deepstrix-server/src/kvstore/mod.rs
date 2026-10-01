@@ -26,7 +26,9 @@
 
 pub mod format;
 pub mod index;
+pub mod io;
 pub mod keys;
+pub mod scan;
 
 /// Positions per chunk (4.2). Equals the production prefill chunk
 /// (`V41_MS_CHUNK_ROWS` = `B_MAX`), so cold prefills already end their chunks
