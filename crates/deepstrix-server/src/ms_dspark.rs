@@ -148,6 +148,8 @@ struct Stats {
     keep_ms: f64,
     /// Async ring writes that failed (the slot was reset).
     ring_errors: u64,
+    /// Blocks that verified one draft more than the policy chose (`explore`).
+    explored: u64,
 }
 
 pub struct MsDspark {
@@ -168,6 +170,8 @@ pub struct MsDspark {
     calib: Calib,
     stats: Stats,
     since: Instant,
+    /// Drafting blocks decided so far (`explore`'s cadence).
+    drafting_blocks: u64,
 }
 
 impl MsDspark {
@@ -189,7 +193,7 @@ impl MsDspark {
         let cost = StepCost::from_env();
         let two_from = std::env::var("V41_MS_PIPELINE_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize).max(2);
         let cost2 = StepCost::from_env_two_lane(two_from);
-        Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now() })
+        Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), drafting_blocks: 0 })
     }
 
     /// K for the lone stream's drafted block (plan section 6): the stopping
@@ -197,13 +201,17 @@ impl MsDspark {
     /// both over the live step cost of the regime each candidate block would
     /// run in (`two_from`: the row count from which the verify runs two lanes,
     /// the same snapshot the step's lane choice uses).
-    pub fn k_for(&self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool, two_from: Option<usize>) -> usize {
+    pub fn k_for(&mut self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool, two_from: Option<usize>) -> usize {
         let cost = Regimes { one: &self.cost, two: &self.cost2, two_from };
-        if sampled {
-            choose_k_stopping(conf, cap, &cost)
-        } else {
-            choose_k(conf, cap, &cost)
+        let k = if sampled { choose_k_stopping(conf, cap, &cost) } else { choose_k(conf, cap, &cost) };
+        if fixed_k().is_some() || k == 0 {
+            return k;
         }
+        let n = self.drafting_blocks;
+        self.drafting_blocks += 1;
+        let ke = explore(k, cap, n);
+        self.stats.explored += u64::from(ke != k);
+        ke
     }
 
     fn slot(&mut self, slot: u32) -> eyre::Result<&mut SlotDraft> {
@@ -498,6 +506,7 @@ impl MsDspark {
                 cost_ms = format!("{:.1}+{:.1}/row", self.cost.a, self.cost.b),
                 cost2_ms = format!("{:.1}+{:.1}/row", self.cost2.a, self.cost2.b),
                 two_lane_blocks = s.two_lane,
+                explored = s.explored,
                 keep_ms = format!("{:.2}", s.keep_ms / (s.keeps as f64).max(1.0)),
                 ring_errors = s.ring_errors,
                 draft_est_ms = format!("{:.1}", self.cost.draft_ms()),
@@ -617,12 +626,50 @@ fn ladder_cost(ladder: &[f64], rows: usize) -> f64 {
 /// rows 1..=MTP_BLOCK+1, held with SEPARATE weights: its slope as strongly as
 /// 24 pseudo-samples spread over those rows (24/6 * sum (x - 3.5)^2 = 70), so
 /// the slope stays put while the data sit at one row count; its level (at the
-/// ladder's centroid) as half a sample, so the level follows the data at
-/// whatever row count they are. One ladder held as points instead turned a
-/// uniform slowdown seen only at 6 rows into a doubled slope (60 ms pinned at
-/// 1 row): K would shrink exactly when a fixed cost grew.
+/// ladder's centroid) as `level_prior(n)` samples: ~4 while the fit has seen
+/// only a handful (n = the decayed sample count), so a few samples cannot
+/// swing it, falling to `PRIOR_LEVEL` = half a sample once the memory fills,
+/// so the level then follows the data at whatever row count they are without
+/// bending the slope (a level held at 4 for good steepened the slope 15 -> 21
+/// ms/row when every sample sat at 6 rows, 60 ms slow). At half a sample from
+/// the start (until 10-01) ONE 222 ms warm-up step -- the first two-lane
+/// verify after a restart -- lifted the two-lane 4-row estimate from 110 to
+/// 185 ms, and the policy never verified 4+ rows again in that process (no
+/// new two-lane samples could correct it). One ladder held as points instead
+/// turned a uniform slowdown seen only at 6 rows into a doubled slope (60 ms
+/// pinned at 1 row): K would shrink exactly when a fixed cost grew.
 const PRIOR_SLOPE: f64 = 70.0;
 const PRIOR_LEVEL: f64 = 0.5;
+/// The extra level weight while the fit is young, and the sample count at
+/// which it has halved.
+const PRIOR_LEVEL_EARLY: f64 = 4.0;
+const PRIOR_LEVEL_HALF: f64 = 16.0;
+
+/// The level prior's weight after `n` (decayed) samples.
+fn level_prior(n: f64) -> f64 {
+    PRIOR_LEVEL + PRIOR_LEVEL_EARLY * PRIOR_LEVEL_HALF / (PRIOR_LEVEL_HALF + n)
+}
+
+/// A step sample counts at most as this multiple of the CURRENT estimate: one
+/// stall (box-2 paging, a warm-up) moves the fit a bounded step, while a real,
+/// lasting slowdown is still followed (the bound rises with the estimate).
+const STALL_CLAMP: f64 = 1.5;
+
+/// Every `EXPLORE_EVERY`-th drafting block verifies one draft MORE than the
+/// policy chose (`explore`): the fits only learn from rows the policy picks,
+/// so without it a few bad samples at a row count (one regime) could make the
+/// policy avoid it -- and never sample it again -- for good. ~6% of blocks,
+/// one extra row each (~15 ms, partly repaid by its acceptance).
+const EXPLORE_EVERY: u64 = 16;
+
+/// `k` for the `n`-th drafting block (0-based): one more on every
+/// `EXPLORE_EVERY`-th, when the policy drafts at all and `cap` allows.
+/// Exactness of the stopping rule is kept: whether draft `k` is verified then
+/// depends on `conf[..=k]` (already read to stop at `k`) and the block count,
+/// never on draft `k` itself.
+pub fn explore(k: usize, cap: usize, n: u64) -> usize {
+    if k >= 1 && k < cap && n % EXPLORE_EVERY == EXPLORE_EVERY - 1 { k + 1 } else { k }
+}
 
 /// What a lone stream's step and draft cost (ms), for the K policy and the
 /// stage-1 baseline.
@@ -750,9 +797,9 @@ impl StepCost {
         if !self.live || rows == 0 || !(ms.is_finite() && ms > 0.0) {
             return;
         }
-        // A stall (box-2 hiccup, seconds of paging) counts, but at most as 3x
-        // the estimate: one sample must not drag the whole memory.
-        let (x, y) = (rows as f64, ms.min(3.0 * self.cost(rows)));
+        // A stall (box-2 hiccup, seconds of paging, a warm-up) counts, but at
+        // most as `STALL_CLAMP` x the estimate: one sample must not drag the fit.
+        let (x, y) = (rows as f64, ms.min(STALL_CLAMP * self.cost(rows)));
         for (s, v) in self.data.iter_mut().zip([1.0, x, x * x, y, x * y]) {
             *s = self.decay * *s + v;
         }
@@ -767,11 +814,11 @@ impl StepCost {
         }
     }
 
-    /// Minimize `sum_data w (y - a - b x)^2 + PRIOR_LEVEL (a + b xc - yc)^2 +
+    /// Minimize `sum_data w (y - a - b x)^2 + level_prior(n) (a + b xc - yc)^2 +
     /// PRIOR_SLOPE (b - prior_b)^2` (2x2 normal equations).
     fn refit(&mut self) {
         let [n, sx, sxx, sy, sxy] = self.data;
-        let (l, s, xc, yc) = (PRIOR_LEVEL, PRIOR_SLOPE, self.prior_xc, self.prior_yc);
+        let (l, s, xc, yc) = (level_prior(n), PRIOR_SLOPE, self.prior_xc, self.prior_yc);
         let (m00, m01, m11) = (n + l, sx + l * xc, sxx + l * xc * xc + s);
         let (r0, r1) = (sy + l * yc, sxy + l * xc * yc + s * self.prior_b);
         let det = m00 * m11 - m01 * m01; // > 0: l, s > 0
@@ -1066,6 +1113,44 @@ mod tests {
         let before = c.cost(4);
         c.observe_step(4, 10_000.0);
         assert!(c.cost(4) - before < 2.0, "{before} -> {}", c.cost(4));
+    }
+
+    #[test]
+    fn a_few_bad_samples_cannot_close_a_regime() {
+        // 10-01: the first two-lane verifies after restarts took 222, 1709,
+        // 565, 738 ms (warm-up, a cold box 2) where ~110 is normal. They may
+        // raise the estimate a bounded step, and a run of normal steps (which
+        // exploration keeps supplying) must bring it back.
+        let mut c2 = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0);
+        let prior4 = c2.cost(4);
+        for (rows, ms) in [(4, 222.0), (4, 1709.0), (5, 565.0), (6, 738.0)] {
+            c2.observe_step(rows, ms);
+        }
+        // Each clamp is relative to the risen estimate, so four in a row compound
+        // (~1.38x here) -- bounded; the old fit sat at ~3.4x (377.5 + 21.4/row).
+        assert!(c2.cost(4) < 1.45 * prior4, "4 stalls: cost2(4) {} vs prior {prior4}", c2.cost(4));
+        for _ in 0..40 {
+            c2.observe_step(4, 110.0);
+            c2.observe_step(5, 126.0);
+        }
+        assert!((c2.cost(4) - 110.0).abs() < 8.0, "after 80 normal steps: cost2(4) {}", c2.cost(4));
+        // At half a sample of level prior and a 3x clamp the first stall alone
+        // put the 4-row estimate at ~185 (what production logged).
+        let mut one = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0);
+        one.observe_step(4, 222.0);
+        assert!(one.cost(4) < 130.0, "one warm-up step: cost2(4) {}", one.cost(4));
+    }
+
+    #[test]
+    fn exploration_adds_one_draft_every_sixteenth_drafting_block() {
+        let ks: Vec<usize> = (0..32).map(|n| explore(2, MTP_BLOCK, n)).collect();
+        assert_eq!(ks.iter().filter(|&&k| k == 3).count(), 2);
+        assert_eq!((ks[15], ks[31]), (3, 3));
+        assert!(ks.iter().enumerate().all(|(n, &k)| k == if n % 16 == 15 { 3 } else { 2 }));
+        // Never past the cap, never drafts when the policy does not.
+        assert_eq!(explore(MTP_BLOCK, MTP_BLOCK, 15), MTP_BLOCK);
+        assert_eq!(explore(3, 3, 15), 3);
+        assert_eq!(explore(0, MTP_BLOCK, 15), 0);
     }
 
     #[test]
