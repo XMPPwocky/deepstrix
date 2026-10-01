@@ -311,7 +311,19 @@ is the compressor accumulator.
     ~4725 / ~5086 (`after == (pos+1)/ratio`) become free checks. CPU unit test on
     the tables.
 
-3.2 **Compressor accumulator: stash, gather, pool, commit.** Today every row of a
+3.2 **BUILT DIFFERENTLY (2026-10-01, commit 1ddedf3): no stash, no gather.** Each
+    slot owns `1 + ceil((ARENA_ROWS_PER_STREAM - 1) / ratio)` accumulator blocks
+    (`kv_arena.rs` `blocks_per_slot`). Row `j` at `q = pos + j` state-writes block
+    `q / ratio - pos / ratio` at row `q % ratio`, so rows share a block only when
+    they share a compressor group, and a firing row pools a block holding its whole
+    group in place (written earlier in the same launch, or block 0 carried from the
+    previous step). `KvArena::accept(slot, keep)` advances `keep` positions and,
+    when the new position's group is open, copies that group's block to block 0.
+    A one-row step never copies. The existing state-write and pool kernels are
+    unchanged: only the tables and one block copy. Host test
+    `multi_row_tables_match_one_row_steps`. The text below is the original design.
+
+    **Compressor accumulator: stash, gather, pool, commit.** Today every row of a
     stream would state-write into, and pool out of, the stream's ONE block
     (`state_base_per = slot*ratio*width`); at ratio 1 even K=1 races. Replace:
     (a) state-write into a stash, ONE PER RATIO-2 STORE (L2/8/14), owned by
@@ -832,6 +844,19 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
   (draft-value-dependent K) scores 38,483 vs 215.9; temperature 0 emits exactly
   the greedy chain. G-RS3 (device-side draft sampling) waits for the drafter's
   device sampler (M3).
+* **SINGLE-STREAM BUILD (2026-10-01, owner "how do we get to 22 t/s now?"),
+  commits 1ddedf3, 24df0e9; `V41_MS_DSPARK=accept`**: the cores of M2, M3 and M5
+  for a LONE stream. Done: multi-row tables + per-slot group blocks + `accept`
+  (3.1-3.4, host-tested), drivers refuse lane cuts through a stream (3.5),
+  capture on arena rows, one ring per slot swapped into the shared `MtpState`,
+  seeding from the CED replay at prefill finish, kept rows ring-written every
+  step (`V41_MS_DSPARK_RING=solo` limits it to the speculating stream),
+  point-mass verify with confidence-gated K over the p50 ladder
+  (`V41_MS_DSPARK_COST`, `_DRAFT_MS`, `_K`, `_KMAX`), drafter failures cost
+  only the drafts. Left out: the batched multi-stream drafter, device-side
+  sampling, ring in snapshots (short continuations draft from a ring seeded
+  only by their suffix), shadow mode, online calibration, M2.5. G5f in
+  `tests/multistream_step.rs`.
 * **M2: arena multi-row streams, no drafter**: 3.1-3.6; G5f, the tables unit
   test, the golden gate with teacher-forced blocks (K>0 must equal K=0 KL).
 * **M2.5: prompt-lookup drafter in production** (7.6): point-mass, zero drafter
