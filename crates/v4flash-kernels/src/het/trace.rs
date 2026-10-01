@@ -66,6 +66,25 @@ struct EventPoolInner {
     dropped: usize,
 }
 
+/// Event slots a new stage leaves free: more than the deepest nesting of open
+/// stages, so a stage that started can always record its END (an end that
+/// found no slot failed its caller through `.end()?`).
+const END_RESERVE: usize = 32;
+
+/// Pool-full drops are logged at most this often, process-wide (the reset
+/// epochs are one decode step / one prefill unit: ~2 per second).
+const DROP_LOG_EVERY_S: u64 = 10;
+
+fn note_drop(label: &'static str, stage: &'static str, events: usize, dropped: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if now >= last + DROP_LOG_EVERY_S && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::warn!(pool = label, events, stage, dropped_this_epoch = dropped, "event pool full: stages dropped (timing gaps; logged at most every 10 s)");
+    }
+}
+
 struct TimingPair {
     name: &'static str,
     start_idx: usize,
@@ -179,14 +198,13 @@ impl EventPool {
         let start_idx = {
             let mut inner = self.inner.borrow_mut();
             let idx = inner.next;
-            if idx >= inner.events.len() {
+            if idx + END_RESERVE >= inner.events.len() {
                 // FULL: drop the stage (a timing gap) rather than fail the
                 // caller -- a decode step (every live stream) or a prefill job.
                 // Reachable from a live perfetto trace (`V41_PERFETTO_KERNELS`).
+                // `END_RESERVE` slots stay free for the ends of open stages.
                 inner.dropped += 1;
-                if inner.dropped == 1 {
-                    tracing::warn!(pool = self.label, events = inner.events.len(), stage = name, "event pool full: stages dropped until the next reset");
-                }
+                note_drop(self.label, name, inner.events.len(), inner.dropped);
                 return Ok(StageScope { pool: self, stream, name, start_idx: usize::MAX, done: true });
             }
             inner.next += 1;
@@ -295,11 +313,14 @@ impl<'a> StageScope<'a> {
         let mut inner = self.pool.inner.borrow_mut();
         let end_idx = inner.next;
         if end_idx >= inner.events.len() {
-            return Err(color_eyre::eyre::eyre!(
-                "EventPool[{}] exhausted on stage `{}` end",
-                self.pool.label,
-                self.name
-            ));
+            // Backstop (`END_RESERVE` should make this unreachable): no pair,
+            // a timing gap, never an error for the caller.
+            inner.dropped += 1;
+            let (n, len) = (inner.dropped, inner.events.len());
+            drop(inner);
+            note_drop(self.pool.label, self.name, len, n);
+            self.done = true;
+            return Ok(());
         }
         inner.next += 1;
         inner.events[end_idx].record(self.stream)?;
