@@ -1560,7 +1560,18 @@ impl MtpState {
         // (tests/dspark_parity.rs: transformer-only first draft matched the
         // reference 57% of the time, confidence systematically low).
         e.q8.quantize_input_batched(s, &mut self.xq, &mut self.xscale, &self.normed, N_EMBD, B)?;
-        for j in 0..MTP_BLOCK {
+        // B-PACKED when the shared expert is Q8_0 (it is): the per-row loop
+        // below re-read each of gate/up/down once per draft row, 5x the bytes
+        // (MEASURED 2026-10-01: the drafter is DEVICE-bound, 9.2 ms per draft,
+        // enqueue 0.4 ms). `matvec_bpack` is bit-identical per row to the
+        // `q8.matvec` that `dense_matvec` runs for Q8_0.
+        let q8 = v4flash_core::gguf::GgufType::Q8_0;
+        let bpack = w.shared.gate.dtype == q8 && w.shared.up.dtype == q8 && w.shared.down.dtype == q8;
+        if bpack {
+            e.q8.matvec_bpack(s, &mut self.gate_sh, &w.shared.gate.buffer, &self.xq, &self.xscale, N_FF_SHARED, N_EMBD, B)?;
+            e.q8.matvec_bpack(s, &mut self.up_sh, &w.shared.up.buffer, &self.xq, &self.xscale, N_FF_SHARED, N_EMBD, B)?;
+        }
+        for j in 0..(if bpack { 0 } else { MTP_BLOCK }) {
             let xr = self.normed.slice_view(j * ne, ne);
             let xqr = self.xq.slice_view(j * ne, ne);
             let xsr = self.xscale.slice_view(j * ne.div_ceil(32), ne.div_ceil(32));
@@ -1580,7 +1591,12 @@ impl MtpState {
         e.q8.quantize_input_batched(
             s, &mut self.mid_sh_xq, &mut self.mid_sh_xscale, &self.mid_sh, N_FF_SHARED, B,
         )?;
-        for j in 0..MTP_BLOCK {
+        if bpack {
+            e.q8.matvec_bpack(
+                s, &mut self.ffn_shared, &w.shared.down.buffer, &self.mid_sh_xq, &self.mid_sh_xscale, N_EMBD, N_FF_SHARED, B,
+            )?;
+        }
+        for j in 0..(if bpack { 0 } else { MTP_BLOCK }) {
             let nf = N_FF_SHARED as usize;
             let mr = self.mid_sh.slice_view(j * nf, nf);
             let mq = self.mid_sh_xq.slice_view(j * nf, nf);
