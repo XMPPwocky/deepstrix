@@ -2027,15 +2027,16 @@ pub mod knobs {
     /// experts displaced per prefill phase -- is not priced yet.
     pub fn prefill_budget() -> u64 { init(); PREFILL_BUDGET.load(Relaxed) }
     /// When a prefill phase takes DECODE-class victims (mode-aware tiers 2 and
-    /// 4), take those of ENCODER layers (< `CED_DECODER_START`) before any
-    /// decoder layer's, least recently used within each. A CED prefill's chunks
-    /// run only the encoder layers, but its replay (the last 128 rows through
-    /// the decoder layers, right after) needs the decoder layers' experts --
-    /// exactly the decode pages a global-LRU victim choice had just evicted:
-    /// 640-750 box-2 reads per replay, 2.3-2.9 s, 90% of it waiting on box 2
-    /// (MEASURED 2026-10-01). Decode after the prefill loses as many pages
-    /// either way, only from other layers. Env `V41_B2_ENCODER_VICTIMS_FIRST`
-    /// (`0` = off), file key `encoder_victims_first`, default on.
+    /// 4), rank them by the prefill's layer SWEEP (`sweep_rank`): pages of
+    /// layers this pass has gone past first, then the other region's, last the
+    /// layers this pass will reach next. A CED prefill's windows sweep the
+    /// encoder layers, and its replay (the last 128 rows through the decoder
+    /// layers, right after) needs the decoder layers' experts -- exactly the
+    /// decode pages a global-LRU victim choice had evicted: 640-750 box-2 reads
+    /// per replay, 2.3-2.9 s, 90% of it waiting on box 2 (MEASURED 2026-10-01).
+    /// Decode after the prefill loses as many pages either way, only from other
+    /// layers. Env `V41_B2_ENCODER_VICTIMS_FIRST` (`0` = off), file key
+    /// `encoder_victims_first`, default on.
     pub fn encoder_victims_first() -> bool { init(); ENCODER_VICTIMS_FIRST.load(Relaxed) }
     pub fn route_urgency() -> bool {
         init();
@@ -2293,12 +2294,31 @@ struct ShardPool {
 // first). Requires the global pool (tiers across the whole band).
 // ---------------------------------------------------------------------------
 
-/// Within the DECODE tiers (2 and 4) of a prefill-mode search: 1 for a
-/// decoder layer's page, 0 for an encoder layer's (`knobs::encoder_victims_first`),
-/// so encoder layers' decode pages go first. 0 everywhere else.
-fn decoder_layer_rank(enc_first: bool, tier: u8, owner: Option<(u32, u32)>) -> u8 {
+/// Within the DECODE tiers (2 and 4) of a prefill-mode search for `for_layer`
+/// (`knobs::encoder_victims_first`), by the prefill's layer sweep -- an encoder
+/// window sweeps layers `< CED_DECODER_START` upward, the replay the decoder
+/// layers upward:
+///   0  an encoder layer this pass has gone past (`l < for_layer`; untouched,
+///      else it would be tier 5): not needed until the next window -- and the
+///      replay needs no encoder layer at all;
+///   1  the other region (decoder layers during an encoder window, needed by
+///      the replay; decoder layers the replay has gone past);
+///   2  a layer this pass will still reach (`l >= for_layer`, same region):
+///      evicting it turns a coming hit into a re-read (10-01 review: ~90% of an
+///      encoder window's untouched decode pages are about to be touched).
+/// 0 everywhere else.
+fn sweep_rank(enc_first: bool, tier: u8, owner: Option<(u32, u32)>, for_layer: u32) -> u8 {
     match owner {
-        Some((l, _)) if enc_first && (tier == 2 || tier == 4) => u8::from(l as usize >= crate::config::CED_DECODER_START),
+        Some((l, _)) if enc_first && (tier == 2 || tier == 4) => {
+            let split = crate::config::CED_DECODER_START as u32;
+            if l >= for_layer && ((l < split) == (for_layer < split)) {
+                2
+            } else if l < split && l < for_layer {
+                0
+            } else {
+                1
+            }
+        }
         _ => 0,
     }
 }
@@ -3132,7 +3152,7 @@ impl ShardPool {
         let n = self.owner_of.len() as u32;
         let range = range.start.min(n)..range.end.min(n);
         // Mode-aware eviction: a prefill-mode search in a prefill phase ranks by
-        // (tier, encoder-layer-first within the decode tiers, recency).
+        // (tier, sweep position within the decode tiers, recency).
         let tiered = self.me_tiered(prefill_mode);
         let enc_first = tiered && knobs::encoder_victims_first();
         let mut best: Option<((u8, u8, u64), u32)> = None;
@@ -3157,7 +3177,7 @@ impl ShardPool {
             let t = self.last_use[sl as usize];
             let key = if tiered {
                 let tier = self.me.tier(sl, t, self.owner_of[sl as usize].is_none());
-                (tier, decoder_layer_rank(enc_first, tier, self.owner_of[sl as usize]), t)
+                (tier, sweep_rank(enc_first, tier, self.owner_of[sl as usize], for_layer), t)
             } else {
                 (0, 0, t)
             };
@@ -9164,30 +9184,31 @@ mod tests {
     /// -- that would reset the budget and turn the ongoing prefill's pages
     /// stale. A full streak ends it; outside a prefill phase nothing is tiered.
     #[test]
-    fn pool_mode_evict_takes_encoder_layers_decode_pages_first() {
+    fn pool_mode_evict_ranks_decode_victims_by_the_sweep() {
         // Decoder layer 25's decode pages are OLDER than encoder layer 3's, yet
-        // a prefill claim in the decode tier takes layer 3's first (the replay
-        // right after the prefill needs the decoder layers), LRU within each
-        // (`knobs::encoder_victims_first`, default on).
+        // a layer-7 prefill claim in the decode tier takes layer 3's first (the
+        // sweep has passed it; the replay right after needs the decoder layers),
+        // LRU within each (`knobs::encoder_victims_first`, default on).
+        // Plus encoder layer 12, AHEAD of a layer-7 claim's sweep: last, even
+        // though its pages are the oldest of all.
         let ids: Vec<u32> = (0..2).collect();
-        let mut pool = ShardPool::seeded(4, &[(25, 0, &ids), (3, 2, &ids)], 0.0);
+        let mut pool = ShardPool::seeded(6, &[(12, 0, &ids), (25, 2, &ids), (3, 4, &ids)], 0.0);
         pool.enable_mode_evict(8);
-        for e in 0..2 {
-            assert!(pool.touch_hit(25, e, false));
-        }
-        for e in 0..2 {
-            assert!(pool.touch_hit(3, e, false));
+        for l in [12, 25, 3] {
+            for e in 0..2 {
+                assert!(pool.touch_hit(l, e, false));
+            }
         }
         pool.me_note_request(true);
-        let want: Vec<u32> = (10..14).collect();
+        let want: Vec<u32> = (10..16).collect();
         let mut order = Vec::new();
-        for e in 10..14 {
-            let (slot, ev) = pool.claim_miss(7, e, &want, &[], (0, 4), true, true, true).unwrap();
+        for e in 10..16 {
+            let (slot, ev) = pool.claim_miss(7, e, &want, &[], (0, 6), true, true, true).unwrap();
             order.push(ev.unwrap());
             pool.commit(7, e, slot);
         }
-        assert_eq!(order, vec![(3, 0), (3, 1), (25, 0), (25, 1)]);
-        assert_eq!(pool.me.c.took_decode, 4);
+        assert_eq!(order, vec![(3, 0), (3, 1), (25, 0), (25, 1), (12, 0), (12, 1)]);
+        assert_eq!(pool.me.c.took_decode, 6);
     }
 
     #[test]
@@ -9226,11 +9247,13 @@ mod tests {
     #[test]
     fn pool_mode_evict_randomized_against_oracle() {
         const LAYERS: u32 = 4;
+        // Real layer ids on both sides of CED_DECODER_START (the sweep rank).
+        const LAYER_IDS: [u32; LAYERS as usize] = [3, 9, 21, 30];
         const PER: u32 = 12;
         const IDS: u32 = 20;
         let n = (LAYERS * PER) as usize;
         let ids: Vec<u32> = (0..PER).collect();
-        let regions: Vec<(u32, u32, &[u32])> = (0..LAYERS).map(|l| (l, l * PER, &ids[..])).collect();
+        let regions: Vec<(u32, u32, &[u32])> = (0..LAYERS).map(|i| (LAYER_IDS[i as usize], i * PER, &ids[..])).collect();
         for seed in 1..=8u64 {
             let mut rng = SimRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let mut pool = ShardPool::seeded(n, &regions, 0.0);
@@ -9249,7 +9272,8 @@ mod tests {
                 // As `ensure_layer_inner` with the mode on: a prefill claim only
                 // inside a prefill phase AND for a prefill-flagged request.
                 let prefill_mode = pool.me.prefill_phase && prefill_req;
-                let layer = rng.below(LAYERS as u64) as u32;
+                let li = rng.below(LAYERS as u64) as u32;
+                let layer = LAYER_IDS[li as usize];
                 let want: Vec<u32> = (0..1 + rng.below(6)).map(|_| rng.below(IDS as u64) as u32).collect();
                 let landing = rng.below(8) == 0;
                 for &e in &want {
@@ -9269,9 +9293,14 @@ mod tests {
                             Some(_) if pool.me.budget_left > 0 => 2,
                             Some(_) => 4,
                         };
-                        // Encoder layers' decode pages first (knob default on).
+                        // The sweep rank (knob default on): encoder layers behind
+                        // the claim's layer, then the other region, then layers
+                        // the sweep still reaches.
+                        let split = crate::config::CED_DECODER_START as u32;
                         let dl = match pool.owner_of[sl] {
-                            Some((l, _)) if tiered && (t == 2 || t == 4) => u8::from(l as usize >= crate::config::CED_DECODER_START),
+                            Some((l, _)) if tiered && (t == 2 || t == 4) => {
+                                if l >= layer && ((l < split) == (layer < split)) { 2 } else if l < split && l < layer { 0 } else { 1 }
+                            }
                             _ => 0,
                         };
                         (t, dl, lu)
@@ -9291,7 +9320,7 @@ mod tests {
                         }
                         v
                     } else {
-                        let c = pool.claim_miss(layer, e, &want, &[], (layer * PER, (layer + 1) * PER), true, prefill_mode, prefill_mode);
+                        let c = pool.claim_miss(layer, e, &want, &[], (li * PER, (li + 1) * PER), true, prefill_mode, prefill_mode);
                         c.map(|(v, _)| {
                             pool.commit(layer, e, v);
                             v

@@ -623,7 +623,8 @@ fn widen_partial(src: &[u16], layer: i32) -> Vec<f32> {
 
 /// IEEE half bits -> f32, into `out` (resized): F16C when the CPU has it.
 pub fn widen_f16(src: &[u16], out: &mut Vec<f32>) {
-    out.clear();
+    // Every element is overwritten below; resizing a reused buffer of the same
+    // length zero-fills nothing.
     out.resize(src.len(), 0.0);
     #[cfg(target_arch = "x86_64")]
     {

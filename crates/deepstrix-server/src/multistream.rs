@@ -164,22 +164,47 @@ struct Prefill {
 /// (groups 1..) gather the next window's sub-chunks, so its group-0 units find
 /// their rows ready. Positions are absolute (`p0 + index`), so a block serves
 /// any later chunk cut.
+/// `V41_MS_ENGRAM_AHEAD=0` turns it off (each sub-chunk gathers its own rows,
+/// as before). Memory: at most one window + one block of rows cached (~250
+/// MB at 4096 + 1024 rows x 2 tables x 6144 f32), beside the window's own copy.
 #[derive(Default)]
 struct EngramAhead {
     /// `(start, end, rows per Engram table [(end - start) * ENGRAM_IN])`.
     blocks: VecDeque<(usize, usize, Vec<Vec<f32>>)>,
     /// First job token index whose rows are neither consumed nor cached.
     next: usize,
+    /// Rows before this index have been served to a chunk (or gathered for it).
+    consumed: usize,
+}
+
+/// `V41_MS_ENGRAM_AHEAD` (default on; `0` off): `EngramAhead`.
+fn engram_ahead_on() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_ENGRAM_AHEAD").as_deref() != Ok("0"));
+    *B
 }
 
 impl EngramAhead {
+    /// Cached rows not yet consumed (a partly consumed block counts its rest).
     fn cached_rows(&self) -> usize {
-        self.blocks.iter().map(|b| b.1 - b.0).sum()
+        self.blocks.iter().map(|b| b.1.saturating_sub(b.0.max(self.consumed))).sum()
     }
 
-    /// The rows of `[a, z)` if the cache covers them (consumed: blocks
-    /// wholly before `z` are dropped). `None` = not cached (gather now).
+    /// Rows `[a, z)` (non-empty) from the cache if it covers them, else `None`
+    /// (the caller gathers them). Either way everything before `z` counts as
+    /// consumed: blocks wholly before `z` are dropped, later ones are KEPT (a
+    /// miss must not throw away the look-ahead -- 10-01 review: dropping it on
+    /// layer-major's empty-input units discarded every window's look-ahead).
     fn take(&mut self, a: usize, z: usize, n_tables: usize) -> Option<Vec<Vec<f32>>> {
+        let out = self.assemble(a, z, n_tables);
+        self.consumed = self.consumed.max(z);
+        self.next = self.next.max(z);
+        while self.blocks.front().is_some_and(|b| b.1 <= z) {
+            self.blocks.pop_front();
+        }
+        out
+    }
+
+    fn assemble(&mut self, a: usize, z: usize, n_tables: usize) -> Option<Vec<Vec<f32>>> {
         let ein = ENGRAM_IN as usize;
         while self.blocks.front().is_some_and(|b| b.1 <= a) {
             self.blocks.pop_front();
@@ -207,10 +232,16 @@ impl EngramAhead {
                 out[t][(lo - a) * ein..(hi - a) * ein].copy_from_slice(&r[(lo - s) * ein..(hi - s) * ein]);
             }
         }
-        while self.blocks.front().is_some_and(|b| b.1 <= z) {
-            self.blocks.pop_front();
-        }
         Some(out)
+    }
+
+    /// The next block worth gathering ahead (`engram_lookahead`): from the
+    /// first row neither consumed nor cached (and not before `done_rows`),
+    /// `block` rows, while fewer than `span` cached rows are unconsumed.
+    fn next_block(&self, done_rows: usize, block: usize, total: usize, span: usize) -> Option<(usize, usize)> {
+        let start = self.next.max(done_rows);
+        let end = (start + block).min(total);
+        (start < end && self.cached_rows() < span).then_some((start, end))
     }
 }
 
@@ -2165,14 +2196,12 @@ fn chunk_inputs(pf: &mut Prefill, state: &mut WorkerState) -> eyre::Result<()> {
         hcs.push(v);
     }
     let engram = match (state.pager.as_ref(), state.engram.as_ref()) {
+        // A unit that takes no inputs (layer-major groups after the first):
+        // empty rows, the look-ahead untouched.
+        (Some(_), Some(ec)) if a == z => Some(vec![Vec::new(); ec.tables.len()]),
         (Some(_), Some(ec)) => Some(match pf.engram_ahead.take(a, z, ec.tables.len()) {
             Some(rows) => rows,
-            None => {
-                let rows = gather_prefill_engram(ec, &pf.compressed, p0, a, z)?;
-                pf.engram_ahead.blocks.clear();
-                pf.engram_ahead.next = pf.engram_ahead.next.max(z);
-                rows
-            }
+            None => gather_prefill_engram(ec, &pf.compressed, p0, a, z)?,
         }),
         _ => None,
     };
@@ -2208,13 +2237,10 @@ fn gather_prefill_engram(ec: &crate::engine_worker::EngramCtx, compressed: &[i32
 /// long, while the cache holds less than the job's look-ahead span. `None` when
 /// Engram is off, the job is done, or the cache is full.
 fn engram_lookahead(pf: &Prefill, engram_on: bool) -> Option<(usize, usize)> {
-    if !engram_on || !pf.job.lazy_inputs() || pf.job.chunks_done() {
+    if !engram_on || !engram_ahead_on() || !pf.job.lazy_inputs() || pf.job.chunks_done() {
         return None;
     }
-    let ahead = &pf.engram_ahead;
-    let start = ahead.next.max(pf.job.done_rows());
-    let end = (start + pf.job.chunk_rows()).min(pf.job.total());
-    (start < end && ahead.cached_rows() < pf.job.input_lookahead_rows()).then_some((start, end))
+    pf.engram_ahead.next_block(pf.job.done_rows(), pf.job.chunk_rows(), pf.job.total(), pf.job.input_lookahead_rows())
 }
 
 fn finish(state: &mut WorkerState, arena: &mut KvArena, s: Stream, f: FinishReason) -> eyre::Result<()> {
@@ -2318,5 +2344,73 @@ mod reservation_tests {
         }
         assert_eq!(reservation(170_000, 65536), 170_000 + 16384 + 2);
         assert_eq!(reservation(170_000, 500), 170_502);
+    }
+}
+
+#[cfg(test)]
+mod engram_ahead_tests {
+    use super::*;
+
+    /// A block of 2 tables whose row r holds r (+0.5 in table 1) in every column.
+    fn block(a: usize, z: usize) -> (usize, usize, Vec<Vec<f32>>) {
+        let ein = ENGRAM_IN as usize;
+        let rows = (0..2).map(|t| (a..z).flat_map(|r| std::iter::repeat_n(r as f32 + 0.5 * t as f32, ein)).collect()).collect();
+        (a, z, rows)
+    }
+
+    fn check(rows: &[Vec<f32>], a: usize, z: usize) {
+        let ein = ENGRAM_IN as usize;
+        for (t, r) in rows.iter().enumerate() {
+            assert_eq!(r.len(), (z - a) * ein);
+            for (i, &v) in r.iter().enumerate() {
+                assert_eq!(v, (a + i / ein) as f32 + 0.5 * t as f32);
+            }
+        }
+    }
+
+    #[test]
+    fn layer_major_windows_find_their_rows_gathered_ahead() {
+        // Two 4096-row windows of four 1024-row sub-chunks; groups 1.. take no
+        // inputs (16 empty units per window). Drive the scheduler's sequence:
+        // inputs for the unit (a hit or a gather), then one look-ahead block.
+        let (total, chunk, span) = (8192usize, 1024usize, 4096usize);
+        let mut ahead = EngramAhead::default();
+        let mut gathered_sync = Vec::new();
+        let mut done_rows = 0usize;
+        for w in 0..2 {
+            for unit in 0..20 {
+                let (a, z) = if unit < 4 { (w * span + unit * chunk, w * span + (unit + 1) * chunk) } else { (done_rows, done_rows) };
+                if a < z {
+                    match ahead.take(a, z, 2) {
+                        Some(rows) => check(&rows, a, z),
+                        None => gathered_sync.push((a, z)),
+                    }
+                }
+                if let Some((s, e)) = ahead.next_block(done_rows, chunk, total, span) {
+                    ahead.blocks.push_back(block(s, e));
+                    ahead.next = e;
+                }
+            }
+            done_rows += span;
+        }
+        // Only the job's very first sub-chunk was gathered on the spot.
+        assert_eq!(gathered_sync, vec![(0, 1024)]);
+        assert!(ahead.blocks.is_empty() && ahead.next == total);
+    }
+
+    #[test]
+    fn a_miss_keeps_later_blocks_and_partial_blocks_count_their_rest() {
+        let mut ahead = EngramAhead::default();
+        ahead.blocks.push_back(block(2000, 3000));
+        ahead.next = 3000;
+        // [1000, 1500) is not cached: a miss that keeps the later block.
+        assert!(ahead.take(1000, 1500, 2).is_none());
+        assert_eq!((ahead.blocks.len(), ahead.consumed), (1, 1500));
+        // A chunk cut across blocks (an image-shortened chunk) assembles.
+        ahead.blocks.push_back(block(3000, 4000));
+        let rows = ahead.take(2500, 3300, 2).expect("covered by two blocks");
+        check(&rows, 2500, 3300);
+        // The partly consumed block counts only its unconsumed rest.
+        assert_eq!(ahead.cached_rows(), 700);
     }
 }
