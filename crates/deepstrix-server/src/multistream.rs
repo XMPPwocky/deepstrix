@@ -803,6 +803,13 @@ impl Sched {
         // prefill / admission work blocks on the iGPU, so a write's fault is
         // charged to its slot, not to an unrelated request.
         if let Some(dsp) = self.dsp.as_mut() { dsp.settle_writes(); }
+        // Under a perfetto trace: the last decode step's leftovers (its ring
+        // writes) go out before a prefill unit resets the pools.
+        if state.engine.perfetto_attached() {
+            if let Err(e) = state.engine.export_pending_perfetto() {
+                tracing::warn!(error = %e, "perfetto: export failed");
+            }
+        }
         self.tick += 1;
         // Cancelled / dead streams leave before the step.
         let mut i = 0;

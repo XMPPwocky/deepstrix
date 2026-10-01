@@ -62,6 +62,8 @@ struct EventPoolInner {
     /// How many `pairs` have already been handed to the perfetto exporter, so
     /// work recorded after the per-token export still gets emitted exactly once.
     exported: usize,
+    /// Stages dropped since the last reset because the pool was full.
+    dropped: usize,
 }
 
 struct TimingPair {
@@ -92,6 +94,7 @@ impl EventPool {
                 next: 0,
                 pairs: Vec::with_capacity(capacity / 2),
                 exported: 0,
+                dropped: 0,
             }),
             label,
             // DEEPSTRIX_TOKEN_PROFILE=1 turns per-kernel event timing on without
@@ -142,6 +145,15 @@ impl EventPool {
         inner.next = 0;
         inner.pairs.clear();
         inner.exported = 0;
+        inner.dropped = 0;
+    }
+
+    /// Treat every pair recorded so far as exported: a perfetto exporter
+    /// attached now has no anchor for them (their slices would land at the
+    /// anchor with garbage durations).
+    pub fn mark_exported(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.exported = inner.pairs.len();
     }
 
     /// Open a timing scope on `stream` named `name`. Records a start event
@@ -168,11 +180,14 @@ impl EventPool {
             let mut inner = self.inner.borrow_mut();
             let idx = inner.next;
             if idx >= inner.events.len() {
-                return Err(color_eyre::eyre::eyre!(
-                    "EventPool[{}] exhausted at {} events",
-                    self.label,
-                    inner.events.len()
-                ));
+                // FULL: drop the stage (a timing gap) rather than fail the
+                // caller -- a decode step (every live stream) or a prefill job.
+                // Reachable from a live perfetto trace (`V41_PERFETTO_KERNELS`).
+                inner.dropped += 1;
+                if inner.dropped == 1 {
+                    tracing::warn!(pool = self.label, events = inner.events.len(), stage = name, "event pool full: stages dropped until the next reset");
+                }
+                return Ok(StageScope { pool: self, stream, name, start_idx: usize::MAX, done: true });
             }
             inner.next += 1;
             inner.events[idx].record(stream)?;

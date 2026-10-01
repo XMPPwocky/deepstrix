@@ -2673,10 +2673,11 @@ impl HeterogeneousEngine {
             pager.as_deref_mut(),
 )?;
 
-            // After this chunk: if perfetto is attached, emit slices + re-anchor.
+            // After this chunk: if perfetto is attached, emit slices + re-anchor
+            // (by the watermark, like every export).
             if let Some(exp_lock) = &self.perfetto {
                 let mut exp = exp_lock.lock().unwrap();
-                self.dgpu.events.for_each_pair(|name, s, e| {
+                self.dgpu.events.for_each_pair_new(|name, s, e| {
                     let track = if name.contains(".xfer") || name.contains(".peer_push") {
                         &exp.dgpu_xfer
                     } else {
@@ -2684,7 +2685,7 @@ impl HeterogeneousEngine {
                     };
                     exp.emit_slice(track, name, s, e)
                 })?;
-                self.igpu.events.for_each_pair(|name, s, e| {
+                self.igpu.events.for_each_pair_new(|name, s, e| {
                     let track = if name.contains(".xfer") || name.contains(".peer_push") {
                         &exp.igpu_xfer
                     } else {
@@ -3216,7 +3217,7 @@ impl HeterogeneousEngine {
 
             if let Some(exp_lock) = &self.perfetto {
                 let mut exp = exp_lock.lock().unwrap();
-                self.dgpu.events.for_each_pair(|name, s, e| {
+                self.dgpu.events.for_each_pair_new(|name, s, e| {
                     let track = if name.contains(".xfer") || name.contains(".peer_push") {
                         &exp.dgpu_xfer
                     } else {
@@ -3224,7 +3225,7 @@ impl HeterogeneousEngine {
                     };
                     exp.emit_slice(track, name, s, e)
                 })?;
-                self.igpu.events.for_each_pair(|name, s, e| {
+                self.igpu.events.for_each_pair_new(|name, s, e| {
                     let track = if name.contains(".xfer") || name.contains(".peer_push") {
                         &exp.igpu_xfer
                     } else {

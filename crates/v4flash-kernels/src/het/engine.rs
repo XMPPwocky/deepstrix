@@ -2024,6 +2024,10 @@ impl HeterogeneousEngine {
             &self.igpu.xfer,
         )?;
         self.perfetto = Some(std::sync::Mutex::new(exporter));
+        // Pairs already in the pools (a profile records every step) predate
+        // the anchors: never export them.
+        self.dgpu.events.mark_exported();
+        self.igpu.events.mark_exported();
         self.dgpu.events.set_enabled(true);
         self.igpu.events.set_enabled(true);
         self.dgpu.events.set_kernel_stages(true);

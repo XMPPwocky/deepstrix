@@ -94,7 +94,9 @@ v4flash_kernels::knobs! {
     /// `V41_PERFETTO_DIR`, then detaches. Device stages of both GPUs, box-1
     /// paging, the remote-expert round trips and box 2's paging as reported
     /// over the wire, and every knob. Ignored while `V41_PERFETTO_OUT` holds a
-    /// trace open.
+    /// trace open. A traced step reads a little long: each re-anchors the
+    /// device clocks (four stream syncs, one may wait on in-flight box-1
+    /// prefetch copies).
     pub static PERFETTO_STEPS = Knob::int("V41_PERFETTO_STEPS", 0, 0, 1_000_000).live();
     /// `V41_PERFETTO_KERNELS` (live, default off): also each kernel (`k.*`
     /// sub-stages). Several x the events: a full pool (16384 per device)
