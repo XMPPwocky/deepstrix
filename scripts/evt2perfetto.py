@@ -45,12 +45,14 @@ STOP_MARGIN = 30e9
 
 
 def header_of(path):
+    """(header length, header) -- read to its exact length: a format_rev 2
+    header carries the string table (up to ~43 MB)."""
     with open(path, 'rb') as f:
-        head = f.read(1 << 22)
-    if head[:4] != b'EVT1':
-        raise ValueError(f'{path}: not an EVT1 file')
-    hlen = struct.unpack_from('<I', head, 4)[0]
-    return hlen, json.loads(head[8:8 + hlen])
+        head = f.read(8)
+        if head[:4] != b'EVT1':
+            raise ValueError(f'{path}: not an EVT1 file')
+        hlen = struct.unpack_from('<I', head, 4)[0]
+        return hlen, json.loads(f.read(hlen))
 
 
 def decode_str(vals):
@@ -272,6 +274,8 @@ def cmd_trace(a):
     hub_hdr = header_of(a.files[0])[1]
     offs, hub = Offsets(), defaultdict(list)
     keep_lo, keep_hi = a.t_from - 5e9, a.t_to + 5e9
+    # String ids are PER PROCESS: decode each file's against its own table
+    # (a box-2 window can span a daemon restart: two interners).
     hub_str = dict(enumerate(hub_hdr.get('strings', [])))
     for t, name, fields, vals in records(a.files[0], a.t_from - 300e9, a.t_to + 300e9, stop=a.t_to + 300e9 + STOP_MARGIN, strings=hub_str):
         if name == 'hub_req':
@@ -281,12 +285,15 @@ def cmd_trace(a):
                 hub[name].append(r)
         elif keep_lo <= t <= keep_hi:
             hub[name].append(dict(zip(fields, vals)))
-    b2_hdr, b2, b2_str = None, defaultdict(list), {}
+    b2_hdr, b2 = None, defaultdict(list)
     for p in a.files[1:]:
         b2_hdr = header_of(p)[1]
-        b2_str.update(enumerate(b2_hdr.get('strings', [])))
-        for _, name, fields, vals in records(p, strings=b2_str):
-            b2[name].append(dict(zip(fields, vals)))
+        f_str = dict(enumerate(b2_hdr.get('strings', [])))
+        for _, name, fields, vals in records(p, strings=f_str):
+            r = dict(zip(fields, vals))
+            if name == 'knob':
+                r['name_s'], r['value_s'] = f_str.get(int(r['name']), '?'), f_str.get(int(r['value']), '?')
+            b2[name].append(r)
     tr = Tracks(a.t_from)
     tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 1, 'args': {'name': 'hub (box 1)'}})
     tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 2, 'args': {'name': 'box 2 (expertd), on hub clock'}})
@@ -331,7 +338,7 @@ def cmd_trace(a):
         for k in b2.get('knob', []):
             t = to_hub(k['t'])
             if inside(t):
-                nm, val = b2_str.get(int(k['name']), '?'), b2_str.get(int(k['value']), '?')
+                nm, val = k['name_s'], k['value_s']
                 tr.instant(2, 'knobs', f'knob {nm}={val}', t, {'source': src_name.get(int(k['source']), '?')})
         b2ex = (b2_hdr or {}).get('extras', {})
         tr.instant(2, 'knobs', 'knobs (box 2)', a.t_from, {**b2ex.get('env', {}), **{f'knob {k}': v for k, v in b2ex.get('knobs', {}).items()}})

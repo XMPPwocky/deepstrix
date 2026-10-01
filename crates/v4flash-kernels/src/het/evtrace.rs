@@ -203,6 +203,8 @@ pub fn decode_str(v: &[f64]) -> (u32, String) {
 }
 
 /// A live knob changed (the knobs watcher, after it released its own locks).
+/// Knob VALUES are the one interned non-name: bounded by the distinct values a
+/// run sets (a long live sweep adds entries; fine under `STR_CAP`).
 pub fn emit_knob(t_raw: f64, name: &str, value: &str, source: u8) {
     if !enabled() {
         return;
