@@ -150,12 +150,14 @@ struct Stats {
     keep_ms: f64,
     /// Async ring writes that failed (the slot was reset).
     ring_errors: u64,
-    /// Blocks whose K was a uniform exploration draw (`explore_k`), K >= 1.
+    /// Blocks whose K (and lanes) was an exploration draw (`explore`), K >= 1.
     explored: u64,
     /// Exploration draws of K = 0: plain steps, so not in `blocks` / `k_hist`.
     explored_k0: u64,
     /// Exploration draws by K (K = 0 included).
     explored_hist: [u64; MTP_BLOCK + 1],
+    /// Exploration draws that verified on two lanes.
+    explored_two: u64,
 }
 
 pub struct MsDspark {
@@ -167,16 +169,14 @@ pub struct MsDspark {
     /// stream, 2026-10-01). With the live model, `cost.cost(1)` is that
     /// baseline (fitted from every lone step, not only the rare plain ones).
     plain_ms: f64,
-    cost: StepCost,
-    /// The two-lane regime's fit (an ordered verify cut from
-    /// `V41_MS_PIPELINE_MIN_ROWS` rows): observed only from steps that ran
-    /// two lanes, so the step change where the second lane switches on cannot
-    /// bend either line.
-    cost2: StepCost,
+    /// A block's step cost by rows on one lane and on two (an ordered verify
+    /// cut): each table observed only from steps that ran its lane count, so
+    /// the step change where the second lane switches on bends neither.
+    lanes: LaneTables,
     calib: Calib,
     stats: Stats,
     since: Instant,
-    /// Exploration draws (`explore_k`); `V41_MS_DSPARK_EXPLORE_SEED` for a
+    /// Exploration draws (`explore`); `V41_MS_DSPARK_EXPLORE_SEED` for a
     /// reproducible replay, else entropy.
     rng: StdRng,
 }
@@ -197,46 +197,51 @@ impl MsDspark {
                 write_done, write_pending: false,
             });
         }
-        let cost = StepCost::from_env();
-        // The threshold at startup shapes the two-lane line's prior only; the
-        // cells cover every row count, so a live change (`pipeline_min_rows`)
-        // just starts feeding cells 2.. of this fit.
-        let cost2 = StepCost::from_env_two_lane(crate::multistream::pipeline_min_rows());
-        Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng() })
+        // The threshold at startup shapes the two-lane line's prior and the
+        // cells' starts only (`LaneTables::new`); both tables cover every row
+        // count, so a live change of the threshold or the rule just changes
+        // which cells the steps feed.
+        let m = crate::multistream::pipeline_min_rows();
+        let lanes = LaneTables::new(StepCost::from_env(), StepCost::from_env_two_lane(m), m);
+        Ok(Self { slots, plain_ms: lanes.one.cost(1), lanes, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng() })
     }
 
-    /// K for the lone stream's drafted block (plan section 6): the stopping
-    /// rule for sampled drafts, the global search for point-mass ones (2.4),
-    /// both over the live step cost of the regime each candidate block would
-    /// run in (`two_from`: the row count from which the verify runs two lanes,
-    /// the same snapshot the step's lane choice uses).
-    pub fn k_for(&mut self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool, two_from: Option<usize>) -> usize {
+    /// K and the lane count for the lone stream's drafted block (plan section
+    /// 6): the stopping rule for sampled drafts, the global search for
+    /// point-mass ones (2.4), both pricing a block of `rows` rows at the
+    /// cheapest lane count `rule` allows it (`LaneTables::best`); the lanes are
+    /// then that cheapest count for the chosen rows. `rule` = this step's
+    /// snapshot; the step runs what this returns.
+    pub fn k_for(&mut self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool, rule: LaneRule) -> (usize, usize) {
         if fixed_k().is_none() {
-            // Drawn before `conf` is read (block comment at `explore_p`), from
-            // the time-aged weight of the cost cell each K would feed: its rows,
-            // in the regime this step would run them in.
-            let (one, two) = (self.cost.cell_weights(), self.cost2.cell_weights());
-            let weight = |k: usize| {
-                let rows = (k + 1).min(CELLS);
-                if two_from.is_some_and(|m| rows >= m) { two[rows - 1] } else { one[rows - 1] }
-            };
-            if let Some(k) = explore_k(&mut self.rng, cap, explore_p(), weight) {
-                self.stats.explored_hist[k.min(MTP_BLOCK)] += 1;
+            // Drawn before `conf` is read (block comment at `explore_p`): one
+            // (K, lanes) of the rule's, from the time-aged weight of the cost
+            // cell each would feed.
+            let t = &self.lanes;
+            let cands = t.block_choices(cap, rule);
+            if let Some(i) = explore(&mut self.rng, cands.len(), explore_p(), |i| t.weight(cands[i].0 + 1, cands[i].1)) {
+                let (k, l) = cands[i];
+                self.stats.explored_hist[k] += 1;
                 // A K = 0 draw runs as a plain step (no `record`): counted apart.
                 if k == 0 {
                     self.stats.explored_k0 += 1;
                 } else {
                     self.stats.explored += 1;
                 }
-                return k;
+                if l >= 2 {
+                    self.stats.explored_two += 1;
+                }
+                return (k, l);
             }
         }
-        let cost = Regimes { one: &self.cost, two: &self.cost2, two_from };
-        if sampled { choose_k_stopping(conf, cap, &cost) } else { choose_k(conf, cap, &cost) }
+        let cost = self.lanes.priced(rule);
+        let k = if sampled { choose_k_stopping(conf, cap, &cost) } else { choose_k(conf, cap, &cost) };
+        (k, self.lanes.best(1 + k, rule).1)
     }
 
-    /// One lone step's sample: BOTH fits age by one step, then `rows`/`ms`
-    /// joins the one it ran in. Fits forget by time (lone steps), not by their
+    /// One lone step's sample: BOTH tables age by one step, then `rows`/`ms`
+    /// joins the one it ran in (`LaneTables::observe`). Fits forget by time
+    /// (lone steps), not by their
     /// own samples: a fit the policy stops using must not keep stale data --
     /// e.g. a cold-start level -- for good (10-01: the one-lane line froze at
     /// 135 + 15/row while every block ran two lanes). "Time" = LONE steps:
@@ -245,10 +250,8 @@ impl MsDspark {
     /// resume at once). The regime the policy does not use thus stays YOUNG for
     /// good (~8 exploration samples per memory: a strong level prior and the
     /// tight clamp) -- intended: that is what undoes a gross trap either way.
-    fn observe(&mut self, two_lane: bool, rows: usize, ms: f64) {
-        self.cost.age();
-        self.cost2.age();
-        if two_lane { self.cost2.add(rows, ms) } else { self.cost.add(rows, ms) }
+    fn observe(&mut self, lanes: usize, rows: usize, ms: f64) {
+        self.lanes.observe(rows, lanes, ms);
     }
 
     fn slot(&mut self, slot: u32) -> eyre::Result<&mut SlotDraft> {
@@ -477,7 +480,7 @@ impl MsDspark {
         sd.last_ring_pos = Some(pos);
         sd.last_draft_ms = ms;
         self.stats.draft_ms += ms;
-        self.cost.observe_draft(ms);
+        self.lanes.one.observe_draft(ms);
         let q = sampling.map(|_| std::mem::take(&mut mtp.exit.q));
         Ok(Some(Drafted { ids, conf: mtp.exit.conf, q }))
     }
@@ -487,7 +490,7 @@ impl MsDspark {
         if ms.is_finite() && ms > 0.0 {
             self.plain_ms = 0.9 * self.plain_ms + 0.1 * ms;
         }
-        self.observe(false, 1, ms);
+        self.observe(1, 1, ms);
     }
 
     /// Account one verified block of `slot` (stage-1 gain, step cost,
@@ -496,8 +499,8 @@ impl MsDspark {
     /// (the cost fit it feeds).
     #[allow(clippy::too_many_arguments)]
     pub fn record(&mut self, slot: u32, conf: &[f32; MTP_BLOCK], k: usize, accepted: usize, emitted: usize, step_ms: f64, lanes: usize) {
-        let plain_ms = if self.cost.live { self.cost.cost(1) } else { self.plain_ms };
-        self.observe(lanes >= 2, 1 + k, step_ms);
+        let plain_ms = if self.lanes.one.live { self.lanes.one.cost(1) } else { self.plain_ms };
+        self.observe(lanes, 1 + k, step_ms);
         if lanes >= 2 {
             self.stats.two_lane += 1;
         }
@@ -538,22 +541,23 @@ impl MsDspark {
                 no_hidden = s.no_hidden,
                 skipped_steps = s.skipped,
                 plain_ms = format!("{:.1}", self.plain_ms),
-                cost_ms = format!("{:.1}+{:.1}/row", self.cost.a, self.cost.b),
-                cost2_ms = format!("{:.1}+{:.1}/row", self.cost2.a, self.cost2.b),
-                cost_shape = ?self.cost.shape,
-                cells = cells_str(&self.cost.cell_costs(), 1),
-                cells_w = cells_str(&self.cost.cell_weights(), 1),
-                cells2 = cells_str(&self.cost2.cell_costs(), 2),
-                cells2_w = cells_str(&self.cost2.cell_weights(), 2),
+                cost_ms = format!("{:.1}+{:.1}/row", self.lanes.one.a, self.lanes.one.b),
+                cost2_ms = format!("{:.1}+{:.1}/row", self.lanes.two.a, self.lanes.two.b),
+                cost_shape = ?self.lanes.one.shape,
+                cells = cells_str(self.lanes.one.cell_costs(), 1),
+                cells_w = cells_str(&self.lanes.one.cell_weights(), 1),
+                cells2 = cells_str(self.lanes.two.cell_costs(), 2),
+                cells2_w = cells_str(&self.lanes.two.cell_weights(), 2),
                 two_lane_blocks = s.two_lane,
                 explored = s.explored,
                 explored_k0 = s.explored_k0,
                 explored_hist = ?s.explored_hist,
+                explored_two = s.explored_two,
                 keep_ms = format!("{:.2}", s.keep_ms / (s.keeps as f64).max(1.0)),
                 ring_errors = s.ring_errors,
-                draft_est_ms = format!("{:.1}", self.cost.draft_ms()),
-                cost_samples = self.cost.samples,
-                cost2_samples = self.cost2.samples,
+                draft_est_ms = format!("{:.1}", self.lanes.one.draft_ms()),
+                cost_samples = self.lanes.one.samples,
+                cost2_samples = self.lanes.two.samples,
                 window_s = self.since.elapsed().as_secs(),
                 "ms dspark: blocks"
             );
@@ -602,9 +606,9 @@ pub fn prefill_captures(lanes: &[&BatchDgpuScratch]) -> eyre::Result<BTreeMap<u3
     Ok(m)
 }
 
-/// `a,b,c,...` (ms, rows `first..=6`) for the blocks log line.
-fn cells_str(c: &[f64; CELLS], first: usize) -> String {
-    c[first.clamp(1, CELLS) - 1..].iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>().join(",")
+/// `a,b,c,...` (one value per row count, rows `first..`) for the log lines.
+fn cells_str(c: &[f64], first: usize) -> String {
+    c[(first.max(1) - 1).min(c.len())..].iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>().join(",")
 }
 
 fn env_f64(k: &str, d: f64) -> f64 {
@@ -637,23 +641,235 @@ impl CostModel for StepCost {
     }
 }
 
-/// The one- and two-lane regimes: rows from `two_from` on run as an ordered
-/// two-lane cut and are priced by the two-lane fit.
-pub struct Regimes<'a> {
-    pub one: &'a StepCost,
-    pub two: &'a StepCost,
-    pub two_from: Option<usize>,
+/// How a step's lane count is chosen (one snapshot per step).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneRule {
+    /// One lane at any row count.
+    Off,
+    /// Two lanes from this many rows on (`V41_MS_PIPELINE_MIN_ROWS`).
+    Threshold(usize),
+    /// Per row count, whichever lane count its table prices cheaper
+    /// (`V41_MS_LANES_LEARNED`; `LaneTables`).
+    Learned,
 }
 
-impl CostModel for Regimes<'_> {
-    fn cost(&self, rows: usize) -> f64 {
-        match self.two_from {
-            Some(m) if rows >= m => self.two.cost(rows),
-            _ => self.one.cost(rows),
+impl LaneRule {
+    /// The lane counts this rule may run `rows` rows on: the threshold leaves
+    /// no choice, and one row cannot be split.
+    pub fn choices(self, rows: usize) -> &'static [usize] {
+        match self {
+            LaneRule::Learned if rows >= 2 => &[1, 2],
+            LaneRule::Threshold(m) if rows >= m.max(2) => &[2],
+            _ => &[1],
         }
     }
+}
+
+/// A cell's start on the lane count the startup threshold would NOT pick is
+/// this much dearer than the other's start: until the first samples arrive the
+/// learned rule makes the threshold's choice (`LaneTables::new`).
+const START_MARGIN: f64 = 1.03;
+
+/// Step cost by row count on ONE lane and on TWO (owner, 10-01: "if we have
+/// cells1 and cells2, why have a fixed min_rows at all?"). Under
+/// `LaneRule::Learned` each row count runs on whichever lane count its own
+/// cell prices cheaper -- no threshold, and no assumption that the cheaper
+/// count changes only once (the two-lane step hides box-2 waits and costs a
+/// longer dGPU chain, both of which move with load). Both tables only learn
+/// from steps that ran them, so exploration (`explore`, at `explore_p`) draws
+/// over (rows, lanes) pairs: the lane count the rule avoids at some row count
+/// keeps being sampled, and the time-aged cells follow drift (a cold pool, a
+/// warm one, context length). Time = the steps this pair of tables prices:
+/// each step ages BOTH (`observe`). Two pairs exist: a lone stream's DSpark
+/// blocks (`MsDspark`; rows = 1 + K of ONE stream, an ordered verify cut) and
+/// the plain multi-stream steps (`PlainLanes`; rows = streams).
+pub struct LaneTables {
+    pub one: StepCost,
+    pub two: StepCost,
+    /// The startup threshold (`new`); stands in for `Learned` when the costs
+    /// are static (`V41_MS_DSPARK_COST_LIVE=0`: nothing to learn from).
+    start_from: usize,
+}
+
+impl LaneTables {
+    /// Cells start from the tables' ladders, except that at each row count
+    /// the lane count `Threshold(start_from)` would not pick starts at the
+    /// other's start x `START_MARGIN`: a cold `Learned` rule reproduces the
+    /// threshold (the ladders are mixed measurements -- the production means
+    /// had rows 1-3 on one lane and 4-8 on two -- and comparing them directly
+    /// would flip 4-row steps to one lane at start). One sample of each cell
+    /// outweighs its start (`CELL_START_W`).
+    pub fn new(mut one: StepCost, mut two: StepCost, start_from: usize) -> Self {
+        let start_from = start_from.max(2);
+        for rows in 2..=one.cells.len().min(two.cells.len()) {
+            if rows >= start_from {
+                let c = two.cells[rows - 1].1 * START_MARGIN;
+                one.set_start(rows, c);
+            } else {
+                let c = one.cells[rows - 1].1 * START_MARGIN;
+                two.set_start(rows, c);
+            }
+        }
+        Self { one, two, start_from }
+    }
+
+    fn rule(&self, rule: LaneRule) -> LaneRule {
+        if rule == LaneRule::Learned && !self.one.live { LaneRule::Threshold(self.start_from) } else { rule }
+    }
+
+    /// The lane counts `rule` may run `rows` rows on (`LaneRule::choices`).
+    pub fn choices(&self, rows: usize, rule: LaneRule) -> &'static [usize] {
+        self.rule(rule).choices(rows)
+    }
+
+    /// A drafted block's `(K, lanes)` candidates under `rule`, K in
+    /// `0..=cap` (exploration draws one).
+    pub fn block_choices(&self, cap: usize, rule: LaneRule) -> Vec<(usize, usize)> {
+        (0..=cap.min(MTP_BLOCK)).flat_map(|k| self.choices(k + 1, rule).iter().map(move |&l| (k, l))).collect()
+    }
+
+    fn table(&self, lanes: usize) -> &StepCost {
+        if lanes >= 2 { &self.two } else { &self.one }
+    }
+
+    /// Step time (ms) of `rows` rows on `lanes` lanes.
+    pub fn cost(&self, rows: usize, lanes: usize) -> f64 {
+        self.table(lanes).cost(rows)
+    }
+
+    /// The time-aged sample weight of the cell `(rows, lanes)` feeds.
+    pub fn weight(&self, rows: usize, lanes: usize) -> f64 {
+        self.table(lanes).cell_weight(rows)
+    }
+
+    /// The cheapest of `rule`'s lane counts for `rows` rows: `(cost, lanes)`
+    /// (a tie keeps one lane).
+    pub fn best(&self, rows: usize, rule: LaneRule) -> (f64, usize) {
+        let mut best = (f64::INFINITY, 1);
+        for &l in self.choices(rows, rule) {
+            let c = self.cost(rows, l);
+            if c < best.0 {
+                best = (c, l);
+            }
+        }
+        best
+    }
+
+    /// The lane count for a step whose rows are given (a plain step): with
+    /// probability `explore_p` an exploration draw among `rule`'s choices
+    /// (`true`), else the cheapest (`false`).
+    pub fn pick(&self, rng: &mut impl Rng, rows: usize, rule: LaneRule) -> (usize, bool) {
+        let opts = self.choices(rows, rule);
+        match explore(rng, opts.len(), explore_p(), |i| self.weight(rows, opts[i])) {
+            Some(i) => (opts[i], true),
+            None => (self.best(rows, rule).1, false),
+        }
+    }
+
+    /// One step (time): both tables age, then `(rows, ms)` joins the table of
+    /// the lane count it ran on.
+    pub fn observe(&mut self, rows: usize, lanes: usize, ms: f64) {
+        self.one.age();
+        self.two.age();
+        if lanes >= 2 { self.two.add(rows, ms) } else { self.one.add(rows, ms) }
+    }
+
+    /// What the K policy prices a block with under `rule`: `best`.
+    pub fn priced(&self, rule: LaneRule) -> Priced<'_> {
+        Priced { t: self, rule }
+    }
+}
+
+/// `LaneTables` under one rule, as the K policy's `CostModel`.
+pub struct Priced<'a> {
+    t: &'a LaneTables,
+    rule: LaneRule,
+}
+
+impl CostModel for Priced<'_> {
+    fn cost(&self, rows: usize) -> f64 {
+        self.t.best(rows, self.rule).0
+    }
     fn draft_ms(&self) -> f64 {
-        self.one.draft_ms()
+        self.t.one.draft_ms()
+    }
+}
+
+/// Plain multi-stream steps between `ms lanes` log lines.
+const PLAIN_LOG_EVERY: u64 = 2000;
+
+/// The plain multi-stream steps' lane choice: a `LaneTables` of their own,
+/// rows = the step's streams (2 ..= the arena's slots), fed by every plain
+/// step of two or more streams (`observe`; three-lane steps feed nothing) and
+/// aged by those steps alone (`V41_MS_LANES_MEMORY` steps, default 1000 =
+/// ~2 min). Not the DSpark tables: a block's rows are ONE stream's (one KV, an
+/// ordered verify cut), a plain step's one per stream (the cross-stream split).
+/// Always live cells (`V41_MS_DSPARK_COST_LIVE` / `_COST_SHAPE` are the DSpark
+/// policy's knobs). Logs both tables every `PLAIN_LOG_EVERY` steps.
+pub struct PlainLanes {
+    t: LaneTables,
+    rng: StdRng,
+    rule: LaneRule,
+    /// Since the last log line, by rows: steps on one lane, on two.
+    hist: Vec<[u64; 2]>,
+    explored: u64,
+    steps: u64,
+    since: Instant,
+}
+
+impl PlainLanes {
+    /// Cells for 1 ..= `max_rows` streams; `start_from` = the startup threshold
+    /// (`LaneTables::new`).
+    pub fn from_env(max_rows: usize, start_from: usize) -> Self {
+        let memory = env_f64("V41_MS_LANES_MEMORY", 1000.0);
+        let rows = max_rows.max(2);
+        let one = StepCost::new(DEFAULT_LADDER.to_vec(), 0.0, true, memory).with_shape(CostShape::Cells).with_rows(rows);
+        let two = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), start_from, 0.0, true, memory).with_shape(CostShape::Cells).with_rows(rows);
+        Self {
+            t: LaneTables::new(one, two, start_from),
+            rng: explore_rng(),
+            rule: LaneRule::Off,
+            hist: vec![[0; 2]; rows],
+            explored: 0,
+            steps: 0,
+            since: Instant::now(),
+        }
+    }
+
+    /// The lane count for a plain step of `rows` streams under `rule`.
+    pub fn pick(&mut self, rows: usize, rule: LaneRule) -> usize {
+        self.rule = rule;
+        let (lanes, explored) = self.t.pick(&mut self.rng, rows, rule);
+        self.explored += explored as u64;
+        lanes
+    }
+
+    /// A plain step of `rows` streams on `lanes` lanes took `ms`.
+    pub fn observe(&mut self, rows: usize, lanes: usize, ms: f64) {
+        self.t.observe(rows, lanes, ms);
+        if let Some(h) = self.hist.get_mut(rows.wrapping_sub(1)) {
+            h[(lanes >= 2) as usize] += 1;
+        }
+        self.steps += 1;
+        if self.steps >= PLAIN_LOG_EVERY {
+            let hist: Vec<String> = self.hist.iter().enumerate().skip(1).map(|(i, h)| format!("{}:{}/{}", i + 1, h[0], h[1])).collect();
+            tracing::info!(
+                steps = self.steps,
+                rule = ?self.rule,
+                one = cells_str(self.t.one.cell_costs(), 2),
+                two = cells_str(self.t.two.cell_costs(), 2),
+                one_w = cells_str(&self.t.one.cell_weights(), 2),
+                two_w = cells_str(&self.t.two.cell_weights(), 2),
+                lanes_by_rows = hist.join(" "),
+                explored = self.explored,
+                window_s = self.since.elapsed().as_secs(),
+                "ms lanes: plain steps"
+            );
+            self.hist.iter_mut().for_each(|h| *h = [0; 2]);
+            self.explored = 0;
+            self.steps = 0;
+            self.since = Instant::now();
+        }
     }
 }
 
@@ -721,8 +937,9 @@ fn young(n: f64) -> bool {
 /// restart a one-lane line frozen at its cold level kept K = 5 on two lanes for
 /// good. So with probability `explore_p()` a drafting block verifies a random
 /// number of drafts in `0..=cap` instead of the policy's K -- weighted toward
-/// the cost cells sampled least lately (`explore_k`; uniform until 10-01
-/// evening).
+/// the cost cells sampled least lately (`explore`; uniform until 10-01
+/// evening) -- and, under `LaneRule::Learned`, a random lane count for them;
+/// a plain multi-stream step a random lane count (`LaneTables::pick`).
 ///
 /// Chosen over Thompson sampling: TS explores only where the posterior is
 /// uncertain, and ours is a hand-set Gaussian (decayed pseudo-counts, a clamped
@@ -746,11 +963,13 @@ fn explore_rng() -> StdRng {
     }
 }
 
-/// With probability `p`, a K in `0..=cap`: half the draws UNIFORM, half by
-/// STALENESS (owner, 10-01: "focus exploration on cells we haven't explored in
-/// a while"). K feeds one cost cell, and a staleness draw picks it with
-/// probability proportional to `1 / (1 + w)`, `w = weight(K)` that cell's
-/// time-aged sample weight: cells nobody has sampled lately -- an idle
+/// With probability `p`, one of `n` candidates (0..n; none when `n < 2`):
+/// half the draws UNIFORM, half by STALENESS (owner, 10-01: "focus exploration
+/// on cells we haven't explored in a while"). A candidate -- a K, or a (K,
+/// lanes) pair, or a lane count -- feeds one cost cell, and a staleness draw
+/// picks it with probability proportional to `1 / (1 + w)`, `w = weight(i)`
+/// that cell's time-aged sample weight: cells nobody has sampled lately -- an
+/// idle
 /// regime's rows, a row count the policy avoids, a cell left behind by a
 /// restart (the 1-row cell held at its cold-start mean while every block
 /// drafted) -- get most of those. The uniform half is the floor (review round
@@ -760,25 +979,26 @@ fn explore_rng() -> StdRng {
 /// revert their mean -- without the floor its stale estimate could stand for
 /// minutes. Still epsilon-exploration (`explore_p` sets how often); `weight`
 /// reads only past samples, so the draw is exact under the stopping rule.
-pub fn explore_k(rng: &mut impl Rng, cap: usize, p: f64, weight: impl Fn(usize) -> f64) -> Option<usize> {
-    if cap == 0 || p <= 0.0 || rng.gen::<f64>() >= p {
+pub fn explore(rng: &mut impl Rng, n: usize, p: f64, weight: impl Fn(usize) -> f64) -> Option<usize> {
+    if n < 2 || p <= 0.0 || rng.gen::<f64>() >= p {
         return None;
     }
     if rng.gen::<bool>() {
-        return Some(rng.gen_range(0..=cap));
+        return Some(rng.gen_range(0..n));
     }
-    let scores: Vec<f64> = (0..=cap).map(|k| 1.0 / (1.0 + weight(k).max(0.0))).collect();
+    let scores: Vec<f64> = (0..n).map(|i| 1.0 / (1.0 + weight(i).max(0.0))).collect();
     let mut x = rng.gen::<f64>() * scores.iter().sum::<f64>();
-    for (k, &sc) in scores.iter().enumerate() {
+    for (i, &sc) in scores.iter().enumerate() {
         if x < sc {
-            return Some(k);
+            return Some(i);
         }
         x -= sc;
     }
-    Some(cap)
+    Some(n - 1)
 }
 
-/// Rows the per-row cost CELLS cover (1 ..= MTP_BLOCK + 1: every block's rows).
+/// Rows the per-row cost CELLS cover by default (1 ..= MTP_BLOCK + 1: every
+/// block's rows; `StepCost::with_rows` for more).
 const CELLS: usize = MTP_BLOCK + 1;
 /// A cell starts at its ladder value, weighted as this many samples (it
 /// washes out with the first real ones; bounds a first warm-up stall).
@@ -856,10 +1076,10 @@ pub struct StepCost {
     /// cell keeps its value however long it idles (10-01: as `(weight, sum)`
     /// with `sum / weight.max(1e-9)`, a cell idle for ~30K lone steps -- one-
     /// lane rows 4-6 while two lanes ran them -- underflowed below the clamp
-    /// and read ~0 ms).
-    cells: [(f64, f64); CELLS],
+    /// and read ~0 ms). Rows 1..=`CELLS` unless `with_rows`.
+    cells: Vec<(f64, f64)>,
     /// `cells`' means (what `cost` returns).
-    cell_cost: [f64; CELLS],
+    cell_cost: Vec<f64>,
 }
 
 impl StepCost {
@@ -876,7 +1096,7 @@ impl StepCost {
         let xc = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
         let yc = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
         let prior_b = pts.iter().map(|&(x, y)| (x - xc) * (y - yc)).sum::<f64>() / pts.iter().map(|&(x, _)| (x - xc) * (x - xc)).sum::<f64>();
-        let cells = std::array::from_fn(|i| (CELL_START_W, ladder_cost(&ladder, i + 1)));
+        let cells = (1..=CELLS).map(|r| (CELL_START_W, ladder_cost(&ladder, r))).collect();
         let mut c = Self {
             live,
             ladder,
@@ -891,7 +1111,7 @@ impl StepCost {
             samples: 0,
             shape: cost_shape(),
             cells,
-            cell_cost: [0.0; CELLS],
+            cell_cost: vec![0.0; CELLS],
         };
         c.refit();
         c
@@ -903,15 +1123,37 @@ impl StepCost {
         self
     }
 
-    /// The per-row cells' costs (logging): rows 1..=6.
-    pub fn cell_costs(&self) -> [f64; CELLS] {
-        self.cell_cost
+    /// This fit with cells for rows `1..=rows` (at least 2), each starting at
+    /// its ladder value: before any sample (a constructor step).
+    pub fn with_rows(mut self, rows: usize) -> Self {
+        self.cells = (1..=rows.max(2)).map(|r| (CELL_START_W, ladder_cost(&self.ladder, r))).collect();
+        self.cell_cost = vec![0.0; self.cells.len()];
+        self.refit();
+        self
+    }
+
+    /// Cell `rows`' starting mean: before any sample (`LaneTables::new`).
+    fn set_start(&mut self, rows: usize, ms: f64) {
+        if let Some(c) = self.cells.get_mut(rows.wrapping_sub(1)) {
+            c.1 = ms;
+        }
+        self.refit();
+    }
+
+    /// The per-row cells' costs (logging): rows 1, 2, ...
+    pub fn cell_costs(&self) -> &[f64] {
+        &self.cell_cost
     }
 
     /// The per-row cells' (time-aged) sample weights (logging): a cell under
     /// ~16 is young -- its mean is a handful of recent samples.
-    pub fn cell_weights(&self) -> [f64; CELLS] {
-        std::array::from_fn(|i| self.cells[i].0)
+    pub fn cell_weights(&self) -> Vec<f64> {
+        self.cells.iter().map(|c| c.0).collect()
+    }
+
+    /// Cell `rows`' weight (0 past the cells: never sampled).
+    pub fn cell_weight(&self, rows: usize) -> f64 {
+        self.cells.get(rows.wrapping_sub(1)).map_or(0.0, |c| c.0)
     }
 
     /// The line's `(a, b)` (logging).
@@ -962,13 +1204,14 @@ impl StepCost {
         if !self.live {
             return ladder_cost(&self.ladder, rows);
         }
+        let n = self.cell_cost.len();
         match self.shape {
             CostShape::Line => (self.a + self.b * rows as f64).max(1.0),
-            CostShape::Cells if rows <= CELLS => self.cell_cost[rows - 1].max(1.0),
+            CostShape::Cells if rows <= n => self.cell_cost[rows - 1].max(1.0),
             // Past the cells (never a block's rows): extend the last step.
             CostShape::Cells => {
-                let (l, p) = (self.cell_cost[CELLS - 1], self.cell_cost[CELLS - 2]);
-                (l + (l - p).max(0.0) * (rows - CELLS) as f64).max(1.0)
+                let (l, p) = (self.cell_cost[n - 1], self.cell_cost[n - 2]);
+                (l + (l - p).max(0.0) * (rows - n) as f64).max(1.0)
             }
         }
     }
@@ -1016,7 +1259,7 @@ impl StepCost {
             *s += v;
         }
         // Each cell clamps against ITS OWN estimate and youth.
-        if rows <= CELLS {
+        if rows <= self.cells.len() {
             let c = &mut self.cells[rows - 1];
             let y = ms.min(stall_clamp(c.0) * c.1);
             c.0 += 1.0;
@@ -1319,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn two_lane_prior_starts_at_its_first_row_and_regimes_route_by_rows() {
+    fn two_lane_prior_starts_at_its_first_row_and_the_rule_routes_by_rows() {
         // The two-lane ladder is indexed from row 1 like the one-lane one; only
         // rows >= first_row shape its prior line (09-30: 109.1 / 127.4 / 141.4).
         let c2 = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0);
@@ -1327,13 +1570,14 @@ mod tests {
             assert!((c2.cost(rows) - want).abs() < 3.0, "cost2({rows}) = {} vs {want}", c2.cost(rows));
         }
         let c1 = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
-        let on = Regimes { one: &c1, two: &c2, two_from: Some(4) };
-        assert_eq!(on.cost(3), c1.cost(3));
-        assert_eq!(on.cost(4), c2.cost(4));
-        assert_eq!(on.draft_ms(), c1.draft_ms());
-        // Snapshot off: the one-lane fit only.
-        let off = Regimes { one: &c1, two: &c2, two_from: None };
-        assert_eq!(off.cost(5), c1.cost(5));
+        let t = LaneTables::new(c1, c2, 4);
+        let on = t.priced(LaneRule::Threshold(4));
+        assert_eq!(on.cost(3), t.one.cost(3));
+        assert_eq!(on.cost(4), t.two.cost(4));
+        assert_eq!(on.draft_ms(), t.one.draft_ms());
+        // Lanes off: the one-lane table only.
+        let off = t.priced(LaneRule::Off);
+        assert_eq!(off.cost(5), t.one.cost(5));
         // Cheaper deep blocks on two lanes push K deeper for the same confidences.
         let conf = [2.0f32, 1.0, 0.5, 0.2, 0.0];
         assert!(choose_k_stopping(&conf, MTP_BLOCK, &on) >= choose_k_stopping(&conf, MTP_BLOCK, &off));
@@ -1385,7 +1629,7 @@ mod tests {
         let mut hist = [0u32; MTP_BLOCK + 1];
         let mut hits = 0;
         for _ in 0..n {
-            if let Some(k) = explore_k(&mut rng, MTP_BLOCK, p, |k| w[k]) {
+            if let Some(k) = explore(&mut rng, MTP_BLOCK + 1, p, |k| w[k]) {
                 hist[k] += 1;
                 hits += 1;
             }
@@ -1405,12 +1649,12 @@ mod tests {
         // Equal weights: uniform. Never past the cap; nothing without room; off at p = 0.
         let mut rng = StdRng::seed_from_u64(1);
         let mut h2 = [0u32; 3];
-        for k in (0..30_000).filter_map(|_| explore_k(&mut rng, 2, 1.0, |_| 5.0)) {
+        for k in (0..30_000).filter_map(|_| explore(&mut rng, 3, 1.0, |_| 5.0)) {
             h2[k] += 1;
         }
         assert!(h2.iter().all(|&c| (c as f64 - 10_000.0).abs() < 600.0), "{h2:?}");
-        assert_eq!(explore_k(&mut rng, 0, 1.0, |_| 0.0), None);
-        assert_eq!(explore_k(&mut rng, MTP_BLOCK, 0.0, |_| 0.0), None);
+        assert_eq!(explore(&mut rng, 1, 1.0, |_| 0.0), None);
+        assert_eq!(explore(&mut rng, MTP_BLOCK + 1, 0.0, |_| 0.0), None);
     }
 
     #[test]
@@ -1527,6 +1771,105 @@ mod tests {
         // ~0.17 samples of weight left (e^-8 of ~500): the new sample carries it.
         c.observe_step(2, 100.0);
         assert!(c.cost(2) > 96.0, "{}", c.cost(2));
+    }
+
+    fn cold_tables(start_from: usize) -> LaneTables {
+        LaneTables::new(
+            StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0).with_shape(CostShape::Cells),
+            StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), start_from, 12.0, true, 500.0).with_shape(CostShape::Cells),
+            start_from,
+        )
+    }
+
+    #[test]
+    fn a_cold_learned_rule_makes_the_threshold_choice_then_follows_the_cells() {
+        // Cold: the startup threshold's choice at every row count (the ladders
+        // alone would put 4 rows on one lane: 107 vs 109.1).
+        for m in [2, 3, 4, 6] {
+            let t = cold_tables(m);
+            for rows in 1..=CELLS {
+                let want = if rows >= m { 2 } else { 1 };
+                assert_eq!(t.best(rows, LaneRule::Learned).1, want, "start {m}, rows {rows}");
+                assert_eq!(t.best(rows, LaneRule::Threshold(m)).1, want, "start {m}, rows {rows}");
+            }
+        }
+        // Then row by row, whichever cell measured cheaper -- non-monotone in
+        // rows included (owner: "the cost may legit be nonmonotonic").
+        let mut t = cold_tables(4);
+        let truth = |rows: usize, lanes: usize| -> f64 {
+            match (rows, lanes) {
+                (1, _) => 60.0,
+                (2, 1) => 80.0,
+                (2, _) => 75.0,
+                (3, 1) => 95.0,
+                (3, _) => 99.0,
+                (4, 1) => 104.0,
+                (4, _) => 100.0,
+                (5, 1) => 110.0,
+                (5, _) => 118.0,
+                (6, 1) => 140.0,
+                _ => 130.0,
+            }
+        };
+        for _ in 0..50 {
+            for rows in 1..=CELLS {
+                for &l in LaneRule::Learned.choices(rows) {
+                    t.observe(rows, l, truth(rows, l));
+                }
+            }
+        }
+        let picks: Vec<usize> = (2..=CELLS).map(|r| t.best(r, LaneRule::Learned).1).collect();
+        assert_eq!(picks, [2, 1, 2, 1, 2]);
+        for r in 2..=CELLS {
+            let want = truth(r, 1).min(truth(r, 2));
+            assert!((t.best(r, LaneRule::Learned).0 - want).abs() < 1.0, "rows {r}: {:?} vs {want}", t.best(r, LaneRule::Learned));
+            assert!((t.priced(LaneRule::Learned).cost(r) - want).abs() < 1.0);
+        }
+        // The other rules ignore what the cells say.
+        assert_eq!((2..=CELLS).map(|r| t.best(r, LaneRule::Threshold(4)).1).collect::<Vec<_>>(), [1, 1, 2, 2, 2]);
+        assert!((1..=CELLS).all(|r| t.best(r, LaneRule::Off).1 == 1));
+        // Static costs (`V41_MS_DSPARK_COST_LIVE=0`): nothing to learn from, so
+        // `Learned` is the startup threshold.
+        let t = LaneTables::new(static_cost(), StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 3, 20.0, false, 500.0), 3);
+        assert_eq!((1..=CELLS).map(|r| t.best(r, LaneRule::Learned).1).collect::<Vec<_>>(), [1, 1, 2, 2, 2, 2]);
+        assert_eq!(t.choices(5, LaneRule::Learned), &[2]);
+    }
+
+    #[test]
+    fn learned_exploration_reaches_every_row_and_lane_cell() {
+        let t = cold_tables(4);
+        // A block's candidates: (K, lanes), one lane only at K = 0 (one row).
+        let cands = t.block_choices(MTP_BLOCK, LaneRule::Learned);
+        assert_eq!(cands.len(), 1 + 2 * MTP_BLOCK);
+        assert_eq!(cands[0], (0, 1));
+        assert_eq!(t.block_choices(MTP_BLOCK, LaneRule::Threshold(4)), [(0, 1), (1, 1), (2, 1), (3, 2), (4, 2), (5, 2)]);
+        assert_eq!(t.block_choices(2, LaneRule::Off), [(0, 1), (1, 1), (2, 1)]);
+        // Every pair keeps the uniform floor (half the draws, 1/11 each).
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut hist = vec![0u32; cands.len()];
+        let n = 44_000;
+        for _ in 0..n {
+            if let Some(i) = explore(&mut rng, cands.len(), 1.0, |i| t.weight(cands[i].0 + 1, cands[i].1)) {
+                hist[i] += 1;
+            }
+        }
+        let floor = n as f64 / (2.0 * cands.len() as f64);
+        assert!(hist.iter().all(|&c| c as f64 >= 0.9 * floor), "{hist:?}");
+        // A plain step: no choice (no draw) under the threshold; under Learned
+        // the cheaper count, and the other at the exploration rate.
+        let mut pl = PlainLanes::from_env(8, 4);
+        assert!((0..2000).all(|_| pl.pick(3, LaneRule::Threshold(4)) == 1 && pl.pick(5, LaneRule::Threshold(4)) == 2));
+        assert_eq!(pl.explored, 0);
+        let ones = (0..20_000).filter(|_| pl.pick(5, LaneRule::Learned) == 1).count();
+        // p/4 from the uniform half + p/4 from the staleness half (equal
+        // weights: neither cell has a sample yet).
+        let want = 20_000.0 * explore_p() * 0.5;
+        assert!((ones as f64 - want).abs() < 0.3 * want + 20.0, "{ones} vs {want:.0}");
+        // Rows past the table extend it; rows within are counted.
+        pl.observe(8, 2, 170.0);
+        pl.observe(9, 2, 180.0);
+        assert_eq!(pl.hist[7], [0, 1]);
+        assert!(pl.t.cost(9, 2) > pl.t.cost(8, 2));
     }
 
     #[test]

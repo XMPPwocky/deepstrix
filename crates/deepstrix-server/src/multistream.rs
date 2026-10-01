@@ -31,7 +31,7 @@ use crate::engine_worker::{
     byte_aligned_lcp_vl, encode_request_images, flush_expert_stats, handle_generate_stream, save_live_if_dirty, trim_heap_and_log, EncodedImages,
     EngineRequest, FinishReason, GenerateReq, WorkerEvent, WorkerState,
 };
-use crate::ms_dspark::{self, MsDspark};
+use crate::ms_dspark::{self, LaneRule, MsDspark, PlainLanes};
 use crate::snapshot;
 use crate::spec_sample::{verify_block, Draft, DraftDist, TargetDist};
 use crate::tokens::{is_turn_end, TOK_ASSISTANT, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END, TOK_USER};
@@ -346,7 +346,8 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         (true, None) => { tracing::error!("multistream: V41_MS_DSPARK set but no drafter loaded; DSpark off"); None }
         _ => None,
     };
-    let mut sched = Sched { dsp, profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let plain_lanes = PlainLanes::from_env(n_slots as usize, pipeline_min_rows());
+    let mut sched = Sched { dsp, plain_lanes, profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -530,7 +531,8 @@ fn lm_prefill_override() -> Option<bool> {
 
 /// `V41_MS_PIPELINE_MIN_ROWS` (default 6; production 4): a step of at least
 /// this many rows runs two lanes -- a plain multi-stream step, and a
-/// speculating lone stream's verify (`spec_two_lane_from`). Overridden at run
+/// speculating lone stream's verify -- under `LaneRule::Threshold`, i.e.
+/// unless the lane choice is learned (`lanes_learned`). Overridden at run
 /// time by the contents of `V41_MS_PIPELINE_MIN_ROWS_FILE` (re-read every 2 s),
 /// like `spec_lanes_on`. Never below 2 (one row cannot be split). The ONE
 /// reader of the knob (it was parsed in three places with different clamps);
@@ -556,14 +558,53 @@ pub(crate) fn pipeline_min_rows() -> usize {
     v
 }
 
-/// The row count from which a speculating lone stream's verify runs two
-/// lanes (an ordered cut, `forward_step_arena_ready_first`), or `None` when it
-/// cannot: spec lanes off, lanes off, or not the ready-first driver
-/// (`V41_MS_STAGGER=2`). Also what the K policy prices a block's rows by.
-/// `min_rows` = this step's `pipeline_min_rows` (one read per step).
-pub(crate) fn spec_two_lane_from(min_rows: usize) -> Option<usize> {
+/// `V41_MS_LANES_LEARNED` (default off; `1` on), overridden at run time by the
+/// contents of `V41_MS_LANES_LEARNED_FILE` (re-read every 2 s), like
+/// `spec_lanes_on`. On: every step's lane count is learned per row count
+/// (`LaneRule::Learned`, `ms_dspark::LaneTables`) and `pipeline_min_rows` is
+/// only the cold start; off: the fixed threshold (owner, 10-01: "if we have
+/// cells1 and cells2, why have a fixed min_rows at all?").
+fn lanes_learned() -> bool {
+    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_LANES_LEARNED").as_deref() == Ok("1"));
+    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_LANES_LEARNED_FILE").ok());
+    static CACHE: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+    let Some(path) = FILE.as_ref() else { return *ENV };
+    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((t, on)) = *g {
+        if t.elapsed() < std::time::Duration::from_secs(2) {
+            return on;
+        }
+    }
+    let on = std::fs::read_to_string(path).map(|s| s.trim() == "1").unwrap_or(*ENV);
+    if g.is_some_and(|(_, old)| old != on) {
+        tracing::info!(on, "multistream: learned lane choice changed");
+    }
+    *g = Some((Instant::now(), on));
+    on
+}
+
+/// How a speculating lone stream's verify picks its lanes (two = an ordered
+/// cut, `forward_step_arena_ready_first`): `Off` when it cannot -- spec lanes
+/// off, lanes off, or not the ready-first driver (`V41_MS_STAGGER=2`). Also
+/// what the K policy prices a block's rows by. `min_rows` / `learned` = this
+/// step's snapshot (one read per step).
+pub(crate) fn spec_lane_rule(min_rows: usize, learned: bool) -> LaneRule {
     let ready_first = std::env::var("V41_MS_STAGGER").as_deref() == Ok("2");
-    (ready_first && ms_pipeline() && spec_lanes_on()).then_some(min_rows.max(2))
+    match (ready_first && ms_pipeline() && spec_lanes_on(), learned) {
+        (false, _) => LaneRule::Off,
+        (true, true) => LaneRule::Learned,
+        (true, false) => LaneRule::Threshold(min_rows.max(2)),
+    }
+}
+
+/// How a plain multi-stream step picks its lanes: `Off` with lanes off
+/// (`V41_MS_PIPELINE=0`).
+fn plain_lane_rule(min_rows: usize, learned: bool) -> LaneRule {
+    match (ms_pipeline(), learned) {
+        (false, _) => LaneRule::Off,
+        (true, true) => LaneRule::Learned,
+        (true, false) => LaneRule::Threshold(min_rows.max(2)),
+    }
 }
 
 /// `logits_nucleus_cands` params of a row sampled under `mode`: `[inv_t, lo,
@@ -702,6 +743,8 @@ fn summary(t: &TargetDist) -> (usize, f32) {
 struct Sched {
     /// DSpark on the arena (`ms_dspark`); `None` = off.
     dsp: Option<MsDspark>,
+    /// The plain multi-stream steps' lane choice (`LaneRule::Learned`).
+    plain_lanes: PlainLanes,
     profile_acc: ProfileAcc,
     legacy_wait_logged: Option<Instant>,
     /// Lane-B tables for the two-lane step (`V41_MS_PIPELINE`).
@@ -1540,13 +1583,15 @@ impl Sched {
         let mut draft_q: Vec<Option<Vec<Vec<(i32, f64)>>>> = vec![None; self.streams.len()];
         // The lone stream's confidence logits (calibration, `MsDspark::record`).
         let mut draft_conf = [0f32; v4flash_kernels::het::mtp::MTP_BLOCK];
-        // The lane regime, ONE snapshot per step (the run-time file can change
-        // between reads): the K decision prices blocks by it and the driver
-        // choice below uses it (docs/v41/DSPARK_SINGLE_STREAM_PERF.md section 2).
-        // One read of the two-lane threshold per step: the K policy, the spec
-        // lane choice and the plain lane choice below all use it.
+        // The lane rules, ONE snapshot per step (the run-time files can change
+        // between reads): the K decision prices blocks by the spec rule and
+        // returns the block's lanes (docs/v41/DSPARK_SINGLE_STREAM_PERF.md
+        // section 2); the plain lane choice below uses the plain rule.
         let min_rows = pipeline_min_rows();
-        let two_from = spec_two_lane_from(min_rows);
+        let learned = lanes_learned();
+        let spec_rule = spec_lane_rule(min_rows, learned);
+        // The drafted block's lane count (`MsDspark::k_for`).
+        let mut spec_two = false;
         if self.streams.len() == 1 {
             if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
                 let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
@@ -1565,7 +1610,8 @@ impl Sched {
                         Ok(Some(d)) => {
                             // Sampled drafts need the stopping rule; point-mass
                             // tests allow the global search (plan 2.4).
-                            let k = dsp.k_for(&d.conf, cap, d.q.is_some(), two_from);
+                            let (k, lanes) = dsp.k_for(&d.conf, cap, d.q.is_some(), spec_rule);
+                            spec_two = lanes >= 2;
                             draft_conf = d.conf;
                             drafts[0] = d.ids[..k].to_vec();
                             draft_q[0] = d.q.map(|mut q| { q.truncate(k); q });
@@ -1670,12 +1716,16 @@ impl Sched {
         // (~30 ms), at 4 it is a wash; default to lanes from 6 rows.
         // A speculating stream (only a lone stream speculates) runs two lanes
         // only as an ORDERED cut through its rows: the ready-first driver, whose
-        // later lane enters each layer after the earlier one (`spec_two_lane_from`,
+        // later lane enters each layer after the earlier one (`spec_lane_rule`,
         // docs/v41/DSPARK_SINGLE_STREAM_PERF.md); the other drivers refuse it.
         // One lane takes turns between the dGPU attention and the MoE legs; two
         // overlap them (09-30: 2->3 rows +19.5 ms on one lane, 3->4 +5.7 on two).
-        let spec_lanes = spec && two_from.is_some_and(|m| b >= m);
-        let pipelined = (!spec && b >= min_rows && ms_pipeline()) || spec_lanes;
+        // Both lane counts come from a rule (`LaneRule`): the fixed threshold, or
+        // learned per row count (`lanes_learned`; a plain step's from its own
+        // tables, `PlainLanes`, a block's from `k_for`).
+        let spec_lanes = spec && spec_two;
+        let plain_two = !spec && b >= 2 && self.plain_lanes.pick(b, plain_lane_rule(min_rows, learned)) >= 2;
+        let pipelined = plain_two || spec_lanes;
         // Three lanes (`V41_MS_LANES=3`, DEFAULT 2) from `V41_MS_LANES3_MIN_ROWS`
         // rows (default 6). MEASURED 2026-09-21 at 8 rows, box-1 hot set warm:
         // 2 lanes 272 ms/step (27.2 tok/s), 3 lanes 324 (23.3). The third lane
@@ -2078,11 +2128,17 @@ impl Sched {
                 dsp.note_plain_step(t0.elapsed().as_secs_f64() * 1e3);
             }
         }
+        // A plain multi-stream step feeds its lane tables (a three-lane step
+        // feeds nothing: no table prices it).
+        if !spec && b >= 2 && !lanes3 {
+            self.plain_lanes.observe(b, if pipelined { 2 } else { 1 }, t0.elapsed().as_secs_f64() * 1e3);
+        }
         for (r, f) in done.into_iter().rev() {
             let s = self.streams.remove(r);
             finish(state, &mut self.arena, s, f)?;
         }
-        tracing::info!(rows = b, spec = ?spec_out, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
+        tracing::info!(rows = b, spec = ?spec_out, lanes = if lanes3 { 3 } else if pipelined { 2 } else { 1 },
+            step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
             head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff,
             chain_waits, chain_wait_us, ring_settle_ms = format!("{ring_settle_ms:.2}"),
