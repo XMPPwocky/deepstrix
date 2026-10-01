@@ -28,6 +28,7 @@ pub mod format;
 pub mod index;
 pub mod io;
 pub mod keys;
+pub mod knobs;
 pub mod scan;
 
 /// Positions per chunk (4.2). Equals the production prefill chunk
