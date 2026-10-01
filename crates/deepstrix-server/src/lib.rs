@@ -10,6 +10,10 @@ pub mod multistream;
 #[cfg(feature = "v41")]
 pub mod ms_dspark;
 pub mod expert_stats;
+/// KV prefix store (docs/v41/KV_PREFIX_STORE_DESIGN.md). M1: not reachable
+/// from any request path yet.
+#[cfg(feature = "v41")]
+pub mod kvstore;
 pub mod openai;
 pub mod prompt;
 pub mod prompt_v41;
