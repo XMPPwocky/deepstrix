@@ -20,7 +20,7 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre};
 use tokio::sync::mpsc;
 use v4flash_kernels::config::{ENGRAM_IN, HC_DIM, N_VOCAB};
-use v4flash_kernels::het::forward_prefill::{lane_rows, LazyEngramRows, PrefillJob};
+use v4flash_kernels::het::forward_prefill::{lane_rows, lm_rows, LazyEngramRows, PrefillJob};
 use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev, ARENA_ROWS_PER_STREAM};
 use v4flash_kernels::het::scratch::{HEAD_BATCH_MAX, HEAD_CAND_BAND, HEAD_CAND_CAP, HEAD_CAND_STRIDE};
 use v4flash_kernels::het::SampleMode;
@@ -393,6 +393,29 @@ fn spec_lanes_on() -> bool {
     let on = std::fs::read_to_string(path).map(|s| s.trim() != "0").unwrap_or(*ENV);
     if g.is_some_and(|(_, old)| old != on) {
         tracing::info!(on, "multistream: spec two-lane verify changed");
+    }
+    *g = Some((Instant::now(), on));
+    on
+}
+
+/// Run-time override of layer-major prefill for NEW jobs: the contents of
+/// `V41_MS_LM_FILE` (`0` chunked, anything else layer-major; re-read every
+/// 2 s), like `spec_lanes_on`. `None` (no file knob, or the file unreadable) =
+/// `PrefillJob::new`'s own choice (`V41_LM_PREFILL`). A job keeps the mode it
+/// started with: the A/B of the two prefill drivers needs no restart.
+fn lm_prefill_override() -> Option<bool> {
+    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_LM_FILE").ok());
+    static CACHE: std::sync::Mutex<Option<(Instant, Option<bool>)>> = std::sync::Mutex::new(None);
+    let path = FILE.as_ref()?;
+    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((t, on)) = *g {
+        if t.elapsed() < std::time::Duration::from_secs(2) {
+            return on;
+        }
+    }
+    let on = std::fs::read_to_string(path).ok().map(|s| s.trim() != "0");
+    if g.is_some_and(|(_, old)| old != on) {
+        tracing::info!(?on, "multistream: layer-major prefill override changed");
     }
     *g = Some((Instant::now(), on));
     on
@@ -960,10 +983,16 @@ impl Sched {
         // (bidirectional raw window, cut planning) do not apply. Image rows still
         // get the tower rows (`chunk_inputs`), DEAD Engram ids and `bias_vl`
         // routing off their synthetic ids.
-        let job = match PrefillJob::new(suffix.clone(), Vec::new(), None, None, pos0, if self.streams.is_empty() { chunk_rows_idle() } else { chunk_rows_busy() }) {
+        let mut job = match PrefillJob::new(suffix.clone(), Vec::new(), None, None, pos0, if self.streams.is_empty() { chunk_rows_idle() } else { chunk_rows_busy() }) {
             Ok(j) => j,
             Err(e) => return Err((p, kv, e)),
         };
+        if let Some(on) = lm_prefill_override() {
+            // Fails only for layer-major without CED: the job stays chunked.
+            if let Err(e) = job.set_layer_major_rows(if on { lm_rows() } else { 0 }) {
+                tracing::warn!(error = %e, "multistream: layer-major override not applied");
+            }
+        }
         // Vision: run the tower now (dGPU, between steps) so the chunk inputs
         // can splice the aligned rows in at the image positions.
         let vl = match encode_request_images(state, &p.req) {
@@ -1216,7 +1245,7 @@ impl Sched {
             }
         }
         tracing::info!(slot, prompt = pf.prefix.len(), restored = pf.prefix.len() - pf.job.total(), prefill_ms = pf.started.elapsed().as_millis() as u64,
-            reserved = self.arena.reserved_positions(slot), live = self.streams.len() + 1, "multistream: stream admitted");
+            lm_windows = pf.job.lm_windows_run(), reserved = self.arena.reserved_positions(slot), live = self.streams.len() + 1, "multistream: stream admitted");
         self.streams.push(s);
         Ok(())
     }
