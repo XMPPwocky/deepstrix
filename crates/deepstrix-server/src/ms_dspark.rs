@@ -174,8 +174,10 @@ impl MsDspark {
     /// One ring per arena slot, shaped like `mtp.state`'s.
     pub fn alloc(mtp: &MtpCtx, igpu_id: i32, n_slots: u32) -> eyre::Result<Self> {
         let mut slots = Vec::with_capacity(n_slots as usize);
-        // The ring-write events live on the iGPU, where the writes run.
-        v4flash_hip::Device::new(igpu_id).set_current()?;
+        // The ring-write events live on the iGPU, where the writes run. A
+        // SCOPED switch: a bare set_current would leave the engine's cached
+        // current-device mirror stale (KNOWN_BUGS #10).
+        let _dev = v4flash_hip::Device::new(igpu_id).scoped_current()?;
         for _ in 0..n_slots {
             let rings = mtp.state.rings.iter().map(|r| DeviceBuffer::<u16>::new(igpu_id, r.len())).collect::<eyre::Result<Vec<_>>>()?;
             let write_done = v4flash_hip::Event::new_no_timing()?;
@@ -234,7 +236,8 @@ impl MsDspark {
     /// would return the earlier write's fault as its own. Normally free: the
     /// write finished under the previous step's host tail. A sticky device
     /// fault poisons the context and fails the step regardless, as before.
-    pub fn settle_writes(&mut self) {
+    pub fn settle_writes(&mut self) -> f64 {
+        let t = Instant::now();
         for i in 0..self.slots.len() {
             if !self.slots[i].write_pending {
                 continue;
@@ -246,6 +249,7 @@ impl MsDspark {
                 let _ = self.reset(i as u32);
             }
         }
+        t.elapsed().as_secs_f64() * 1e3
     }
 
     /// Forget `slot`'s stream (a new request took the slot).
@@ -498,6 +502,7 @@ impl MsDspark {
                 ring_errors = s.ring_errors,
                 draft_est_ms = format!("{:.1}", self.cost.draft_ms()),
                 cost_samples = self.cost.samples,
+                cost2_samples = self.cost2.samples,
                 window_s = self.since.elapsed().as_secs(),
                 "ms dspark: blocks"
             );

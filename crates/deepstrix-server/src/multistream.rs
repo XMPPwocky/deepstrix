@@ -603,6 +603,10 @@ impl Sched {
 
     /// One scheduler tick: a prefill chunk (or its start/finish) or a decode step.
     fn tick(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
+        // The drafter's async ring writes (`MsDspark::settle_writes`): before any
+        // prefill / admission work blocks on the iGPU, so a write's fault is
+        // charged to its slot, not to an unrelated request.
+        if let Some(dsp) = self.dsp.as_mut() { dsp.settle_writes(); }
         self.tick += 1;
         // Cancelled / dead streams leave before the step.
         let mut i = 0;
@@ -1301,7 +1305,8 @@ impl Sched {
         // `forward_one!`; without this the multistream path never warmed box 1.
         // The drafter's async ring writes first: the pager's blocking copies
         // would otherwise return a write's fault as their own (`settle_writes`).
-        if let Some(dsp) = self.dsp.as_mut() { dsp.settle_writes(); }
+        // (The wait is what the step's host tail did not hide of the last write.)
+        let ring_settle_ms = self.dsp.as_mut().map(|d| d.settle_writes()).unwrap_or(0.0);
         if let Some(pg) = state.pager.as_mut() { pg.drain_prefetched()?; }
         // DSpark (`V41_MS_DSPARK`): a LONE stream drafts from its last row in KV
         // and verifies K of the drafts in this step's rows, K from the drafter's
@@ -1854,7 +1859,7 @@ impl Sched {
         tracing::info!(rows = b, spec = ?spec_out, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
             head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff,
-            chain_waits, chain_wait_us,
+            chain_waits, chain_wait_us, ring_settle_ms = format!("{ring_settle_ms:.2}"),
             engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3), "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };

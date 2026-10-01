@@ -1448,17 +1448,9 @@ mod tests {
         }
     }
 
-    /// DSPARK_ARENA_PLAN 3.1-3.4 on the host: a stream runs steps of 1..=8
-    /// rows (positions pos..pos+R) and keeps a random prefix. A model of the
-    /// raw region and of the accumulator blocks replays exactly what the
-    /// kernels do with the tables (append at `slot_per`; attend the driver's
-    /// window; state-write `state_base_per + (q % ratio) * width`; pool block
-    /// `fire_state_idx`; then `accept`'s block copies), keeping the rejected
-    /// rows' writes in place. Every row must see exactly its causal window
-    /// (positions q-W+1..=q, in order) and every fire must pool exactly its
-    /// group, into the next comp row of the region. A second stream steps one
-    /// row at a time in the same steps (rows before and after the run) and
-    /// must get the tables it gets alone.
+    /// One `tables` call split by row range (`RowTables::rows`, the lanes of
+    /// an ordered two-lane verify): reassembles exactly, equals per-lane calls
+    /// at a cut between streams, continues positions at a cut through one.
     #[cfg(feature = "v41")]
     #[test]
     fn lane_ranges_of_one_tables_call() {
@@ -1515,6 +1507,18 @@ mod tests {
         }
     }
 
+    /// DSPARK_ARENA_PLAN 3.1-3.4 on the host: a stream runs steps of 1..=8
+    /// rows (positions pos..pos+R) and keeps a random prefix. A model of the
+    /// raw region and of the accumulator blocks replays exactly what the
+    /// kernels do with the tables (append at `slot_per`; attend the driver's
+    /// window; state-write `state_base_per + (q % ratio) * width`; pool block
+    /// `fire_state_idx`; then `accept`'s block copies), keeping the rejected
+    /// rows' writes in place. Every row must see exactly its causal window
+    /// (positions q-W+1..=q, in order) and every fire must pool exactly its
+    /// group, into the next comp row of the region. A second stream steps one
+    /// row at a time in the same steps (rows before and after the run) and
+    /// must get the tables it gets alone.
+    #[cfg(feature = "v41")]
     #[test]
     fn multi_row_tables_match_one_row_steps() {
         let mut ar = host_arena(3, 100_000);

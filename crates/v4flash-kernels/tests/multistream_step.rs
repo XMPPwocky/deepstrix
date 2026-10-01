@@ -819,6 +819,33 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
          (Chain waits {waits_hold}, unforced {waits_ord}); UNORDERED control differs on {g5g_unord} of {} rows (want > 0)",
         n_streams * n_steps
     );
+    // KL against alone (for runs that cross a lane-wide host decision, e.g. the
+    // TOP_K crossing, judged under MS_ALLOW_INEXACT=1 by the same bars as G5f).
+    let kls_g5g: Vec<f64> = (0..n_streams)
+        .flat_map(|s| (0..n_steps).map(move |t| (s, t)))
+        .flat_map(|(s, t)| [kld(&logits_alone[s][t], &logits_spec2[s][t]), kld(&logits_alone[s][t], &logits_spec2_hold[s][t])])
+        .collect();
+    let mean_g = kls_g5g.iter().sum::<f64>() / kls_g5g.len().max(1) as f64;
+    let max_g = kls_g5g.iter().cloned().fold(0.0, f64::max);
+    eprintln!("G5g: KL(alone||two-lane) mean {mean_g:.5} max {max_g:.5}");
+    // The state the LAST block left (later blocks only test it indirectly): one
+    // more one-row step (not accepted) from each two-lane arena must give the
+    // logits it gives from the single-lane spec arena -- same blocks, same keeps.
+    let mut g5g_state = 0usize;
+    for s in 0..n_streams {
+        let tok = cont[s][0];
+        let mut probe = |arena: &mut KvArena, slot: u32| -> eyre::Result<Vec<f32>> {
+            engine.forward_step_arena(
+                &mut bd_a, &mut bi_a, &mut sd, &mut si, arena, &mut dev_spec, &[slot], &weights,
+                &[embed(tok)?], &[tok], &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(vec![vec![0f32; ein_spec]; ENGRAM_LAYERS.len()])), Some(&mut pg),
+            )?;
+            engine.head_rows(&mut ds, &bd_a, 1, &weights)
+        };
+        let base = probe(&mut arena_spec, slots_spec[s])?;
+        g5g_state += usize::from(max_abs_diff(&probe(&mut arena_spec2, slots_spec2[s])?, &base) != 0.0);
+        g5g_state += usize::from(max_abs_diff(&probe(&mut arena_spec2_hold, slots_spec2_hold[s])?, &base) != 0.0);
+    }
+    eprintln!("G5g: final-state probes differing from the single-lane arena {g5g_state} of {} (want 0)", 2 * n_streams);
 
     // 4. Arena, all rows co-batched.
     let mut logits_batch: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
@@ -1100,8 +1127,11 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     if g5f_alone > 0 && !allow_inexact {
         return Err(eyre!("G5f failed: {g5f_alone} speculative rows differ from one-row steps (MS_ALLOW_INEXACT=1 to report only)"));
     }
-    if (g5g_ord > 0 || g5g_hold > 0 || g5g_spec > 0) && !allow_inexact {
-        return Err(eyre!("G5g failed: ordered two-lane verify rows differ (alone {g5g_ord}, forced-overtake {g5g_hold}, single-lane spec {g5g_spec})"));
+    if (g5g_ord > 0 || g5g_hold > 0 || g5g_spec > 0 || g5g_state > 0) && !allow_inexact {
+        return Err(eyre!("G5g failed: ordered two-lane verify rows differ (alone {g5g_ord}, forced-overtake {g5g_hold}, single-lane spec {g5g_spec}, final state {g5g_state})"));
+    }
+    if mean_g > kld_mean_bar || max_g > kld_max_bar {
+        return Err(eyre!("G5g failed: two-lane KL(alone||spec2) mean {mean_g:.5} / max {max_g:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
     }
     if waits_hold == 0 {
         return Err(eyre!("G5g failed: the forced overtake recorded no Chain waits -- the ordering was never exercised"));

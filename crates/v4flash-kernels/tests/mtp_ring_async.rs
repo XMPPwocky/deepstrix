@@ -1,10 +1,9 @@
 //! DSpark kept-row ring writes enqueued WITHOUT a sync (docs/v41/DSPARK_SINGLE_STREAM_PERF.md 4;
 //! `MsDspark::keep_rows` / `settle_writes`): the same sequence of ring writes and drafter forwards
 //! run (a) synchronizing after every write, as before, and (b) async -- an event recorded after
-//! the write and waited on only before the next write or draft -- with TWO slots' rings swapped
-//! into one `MtpState` by pointer, as `MsDspark::with_ring` does, so a write of one slot is still
-//! in flight when the other slot's upload starts. Every drafter output (`h` after `forward`) and
-//! both slots' final ring bytes must be bit-identical.
+//! the write and waited on only before the next write or draft (as production settles) -- with
+//! TWO slots' rings swapped into one `MtpState` by pointer, as `MsDspark::with_ring` does. Every
+//! drafter output (`h` after `forward`) and both slots' final ring bytes must be bit-identical.
 //!
 //! Loads the drafter only (iGPU, ~8.7 GB): hub DOWN. Run:
 //! ```text
