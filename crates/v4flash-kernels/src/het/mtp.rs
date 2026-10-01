@@ -468,6 +468,25 @@ pub fn mtp_graphs() -> bool {
     *V.get_or_init(|| std::env::var("V41_MTP_GRAPH").as_deref() == Ok("1"))
 }
 
+/// `V41_MTP_EXPERT_STATS=1`: record each layer's routed picks of every draft
+/// and log, every 200 drafts, how many DISTINCT experts the block's 5 rows
+/// touch per layer (of 15 picks), among the 4 noise rows (of 12), and how many
+/// of row 0's 3 the noise rows reuse. Prices batching the drafter's routed MoE
+/// by expert (it reads 5 x 3 experts per layer row by row). One 15-int D2D
+/// copy per layer; the readback rides the draft's own sync.
+pub fn mtp_expert_stats() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_MTP_EXPERT_STATS").as_deref() == Ok("1"))
+}
+
+#[derive(Default)]
+struct ExpertStats {
+    drafts: u64,
+    distinct: [u64; 8],
+    noise_distinct: [u64; 8],
+    row0_reused: [u64; 8],
+}
+
 /// Batch every drafter kernel runs at.
 const B: u32 = MTP_BLOCK as u32;
 /// Ring slots: the window, plus the block's own transient KV packed right after
@@ -508,6 +527,9 @@ pub struct MtpState {
     /// prefix, re-based to whenever the drafter started.
     ring_writes: usize,
 
+    /// `mtp_expert_stats`: per layer, the block's `[B x TOPK]` picks.
+    sel_stats: DeviceBuffer<i32>,
+    expert_stats: ExpertStats,
     /// Captured entry + layers (`mtp_graphs`), keyed by the address of the
     /// ring in use (`rings` is swapped per stream by the multistream arena).
     graphs: std::collections::HashMap<usize, v4flash_hip::GraphExec>,
@@ -651,6 +673,8 @@ impl MtpState {
             captured: [false; MTP_SRC_LAYERS.len()],
             ring_writes: 0,
             graphs: std::collections::HashMap::new(),
+            sel_stats: DeviceBuffer::new(device_id, 8 * b * MTP_TOPK as usize)?,
+            expert_stats: ExpertStats::default(),
 
             h: DeviceBuffer::new(device_id, b * N_HC as usize * ne)?,
             h_next: DeviceBuffer::new(device_id, b * N_HC as usize * ne)?,
@@ -821,6 +845,48 @@ impl MtpState {
     /// so rows beyond it are never attended and do not need zeroing.
     pub fn reset_ring(&mut self) {
         self.ring_writes = 0;
+    }
+
+    /// `mtp_expert_stats`: tally the last draft's per-layer picks (call after
+    /// the drafter's stream is synchronized) and log a rollup every 200.
+    pub fn tally_expert_stats(&mut self, n_layers: usize) -> eyre::Result<()> {
+        if !mtp_expert_stats() {
+            return Ok(());
+        }
+        let tk = MTP_TOPK as usize;
+        let n = MTP_BLOCK * tk;
+        let nl = n_layers.min(8);
+        let mut h = vec![0i32; nl * n];
+        self.sel_stats.slice_view(0, nl * n).copy_to_host(&mut h)?;
+        let st = &mut self.expert_stats;
+        st.drafts += 1;
+        for l in 0..nl {
+            let sel = &h[l * n..(l + 1) * n];
+            let mut all: Vec<i32> = sel.to_vec();
+            all.sort_unstable();
+            all.dedup();
+            let mut noise: Vec<i32> = sel[tk..].to_vec();
+            noise.sort_unstable();
+            noise.dedup();
+            st.distinct[l] += all.len() as u64;
+            st.noise_distinct[l] += noise.len() as u64;
+            st.row0_reused[l] += sel[..tk].iter().filter(|x| noise.binary_search(x).is_ok()).count() as u64;
+        }
+        if st.drafts >= 200 {
+            let d = st.drafts as f64;
+            let per = (0..nl)
+                .map(|l| {
+                    format!(
+                        "L{l} {:.2}/{} noise {:.2}/{} row0-in-noise {:.2}/{tk}",
+                        st.distinct[l] as f64 / d, n, st.noise_distinct[l] as f64 / d, n - tk, st.row0_reused[l] as f64 / d
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::info!(drafts = st.drafts, per_layer = %per, "mtp expert overlap (distinct experts per draft block)");
+            *st = ExpertStats::default();
+        }
+        Ok(())
     }
 
     /// Ring rows written so far, capped at the window.
@@ -998,6 +1064,11 @@ impl MtpState {
         {
             let _h = HostUs::start_dev(&MTP_H_MOE, s);
             self.moe(e, s, w)?;
+        }
+        if mtp_expert_stats() && li < 8 {
+            let n = MTP_BLOCK * MTP_TOPK as usize;
+            let mut dst = self.sel_stats.slice_view_mut(li * n, n);
+            dst.copy_from_buffer_async(&self.d_selected.slice_view(0, n), s)?;
         }
         {
             let _h = HostUs::start_dev(&MTP_H_POST, s);

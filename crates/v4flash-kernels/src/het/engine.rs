@@ -831,6 +831,7 @@ impl HeterogeneousEngine {
         }
         let t_enq = std::time::Instant::now();
         self.igpu.compute.synchronize()?;
+        mtp_state.tally_expert_stats(w.layers.len())?;
         // The drafter's whole forward is now complete on the device, so every
         // mode-3 event pair has resolved and can be charged to its counter.
         super::mtp::drain_event_spans();
