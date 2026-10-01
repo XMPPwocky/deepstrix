@@ -732,6 +732,11 @@ impl Sched {
         if let Some(ec) = state.engram.as_ref() {
             for &t in prefix.iter().chain(suffix.iter()) { compressed.push(ec.hasher.compress(t)); }
         }
+        // No image spans, as `prefill_suffix`: V4.1 image tokens attend causally
+        // (`model.py` has no `get_image_visible`), so the engine's span rules
+        // (bidirectional raw window, cut planning) do not apply. Image rows still
+        // get the tower rows (`chunk_inputs`), DEAD Engram ids and `bias_vl`
+        // routing off their synthetic ids.
         let job = match PrefillJob::new(suffix.clone(), Vec::new(), None, None, pos0, if self.streams.is_empty() { chunk_rows_idle() } else { chunk_rows_busy() }) {
             Ok(j) => j,
             Err(e) => return Err((p, kv, e)),
