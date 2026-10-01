@@ -134,11 +134,15 @@ struct Stats {
 
 pub struct MsDspark {
     slots: Vec<SlotDraft>,
-    /// EWMA of a plain one-row step's wall (ms), the stage-1 baseline: a
-    /// drafted block pays when it emits more per ms than a plain step NOW
-    /// (a cold pool slows both; the static ladder made cold blocks look like
-    /// losses and backed off 324 steps of a code stream, 2026-10-01).
+    /// EWMA of a plain one-row step's wall (ms), the stage-1 baseline when the
+    /// cost model is static: a drafted block pays when it emits more per ms
+    /// than a plain step NOW (a cold pool slows both; the static ladder made
+    /// cold blocks look like losses and backed off 324 steps of a code
+    /// stream, 2026-10-01). With the live model, `cost.cost(1)` is that
+    /// baseline (fitted from every lone step, not only the rare plain ones).
     plain_ms: f64,
+    cost: StepCost,
+    calib: Calib,
     stats: Stats,
     since: Instant,
 }
@@ -151,7 +155,19 @@ impl MsDspark {
             let rings = mtp.state.rings.iter().map(|r| DeviceBuffer::<u16>::new(igpu_id, r.len())).collect::<eyre::Result<Vec<_>>>()?;
             slots.push(SlotDraft { rings, writes: 0, last_ring_pos: None, hidden: None, gain: GAIN0, skip_left: 0, backoff: 0, last_draft_ms: 0.0 });
         }
-        Ok(Self { slots, plain_ms: step_cost(1), stats: Stats::default(), since: Instant::now() })
+        let cost = StepCost::from_env();
+        Ok(Self { slots, plain_ms: cost.cost(1), cost, calib: Calib::default(), stats: Stats::default(), since: Instant::now() })
+    }
+
+    /// K for the lone stream's drafted block (plan section 6): the stopping
+    /// rule for sampled drafts, the global search for point-mass ones (2.4),
+    /// both over the live step cost.
+    pub fn k_for(&self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool) -> usize {
+        if sampled {
+            choose_k_stopping(conf, cap, &self.cost)
+        } else {
+            choose_k(conf, cap, &self.cost)
+        }
     }
 
     fn slot(&mut self, slot: u32) -> eyre::Result<&mut SlotDraft> {
@@ -331,6 +347,7 @@ impl MsDspark {
         sd.last_ring_pos = Some(pos);
         sd.last_draft_ms = ms;
         self.stats.draft_ms += ms;
+        self.cost.observe_draft(ms);
         let q = sampling.map(|_| std::mem::take(&mut mtp.exit.q));
         Ok(Some(Drafted { ids, conf: mtp.exit.conf, q }))
     }
@@ -340,12 +357,19 @@ impl MsDspark {
         if ms.is_finite() && ms > 0.0 {
             self.plain_ms = 0.9 * self.plain_ms + 0.1 * ms;
         }
+        self.cost.observe_step(1, ms);
     }
 
-    /// Account one verified block of `slot` (stage-1 gain, stats) and log a
-    /// rollup every 50 blocks.
-    pub fn record(&mut self, slot: u32, k: usize, accepted: usize, emitted: usize, step_ms: f64) {
-        let plain_ms = self.plain_ms;
+    /// Account one verified block of `slot` (stage-1 gain, step cost,
+    /// calibration, stats) and log a rollup every 50 blocks. `conf` = the
+    /// block's confidence logits.
+    pub fn record(&mut self, slot: u32, conf: &[f32; MTP_BLOCK], k: usize, accepted: usize, emitted: usize, step_ms: f64) {
+        let plain_ms = if self.cost.live { self.cost.cost(1) } else { self.plain_ms };
+        self.cost.observe_step(1 + k, step_ms);
+        self.calib.observe(conf, k, accepted);
+        if self.calib.blocks % CALIB_EVERY == 0 {
+            self.calib.log();
+        }
         if let Ok(sd) = self.slot(slot) {
             let g = emitted as f64 * plain_ms / (step_ms + sd.last_draft_ms).max(1.0);
             // A probe after a back-off moves the estimate half way at once.
@@ -379,6 +403,9 @@ impl MsDspark {
                 no_hidden = s.no_hidden,
                 skipped_steps = s.skipped,
                 plain_ms = format!("{:.1}", self.plain_ms),
+                cost_ms = format!("{:.1}+{:.1}/row", self.cost.a, self.cost.b),
+                draft_est_ms = format!("{:.1}", self.cost.draft_ms()),
+                cost_samples = self.cost.samples,
                 window_s = self.since.elapsed().as_secs(),
                 "ms dspark: blocks"
             );
@@ -431,26 +458,166 @@ fn env_f64(k: &str, d: f64) -> f64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
-/// Step cost (ms) of `rows` rows of one stream: `V41_MS_DSPARK_COST`, a comma
-/// list for 1, 2, ... rows (default: the 2026-09-30..10-01 production p50
-/// ladder), extrapolated linearly past its end.
-fn step_cost(rows: usize) -> f64 {
-    static C: LazyLock<Vec<f64>> = LazyLock::new(|| {
-        std::env::var("V41_MS_DSPARK_COST")
-            .ok()
-            .and_then(|v| v.split(',').map(|x| x.trim().parse().ok()).collect::<Option<Vec<f64>>>())
-            .filter(|v| v.len() >= 2)
-            .unwrap_or_else(|| vec![60.0, 81.0, 101.0, 107.0, 125.0, 139.0, 156.0, 172.0])
-    });
-    let c = &*C;
+/// The 2026-09-30..10-01 production p50 ladder (ms of 1, 2, ... rows): the
+/// default PRIOR of `StepCost`.
+const DEFAULT_LADDER: [f64; 8] = [60.0, 81.0, 101.0, 107.0, 125.0, 139.0, 156.0, 172.0];
+
+/// `ladder[rows - 1]`, extrapolated linearly past its end.
+fn ladder_cost(ladder: &[f64], rows: usize) -> f64 {
     if rows == 0 {
         return 0.0;
     }
-    if rows <= c.len() {
-        return c[rows - 1];
+    if rows <= ladder.len() {
+        return ladder[rows - 1];
     }
-    let n = c.len();
-    c[n - 1] + (c[n - 1] - c[n - 2]) * (rows - n) as f64
+    let n = ladder.len();
+    ladder[n - 1] + (ladder[n - 1] - ladder[n - 2]) * (rows - n) as f64
+}
+
+/// The live fit's prior is the configured ladder's least-squares line over
+/// rows 1..=MTP_BLOCK+1, held with SEPARATE weights: its slope as strongly as
+/// 24 pseudo-samples spread over those rows (24/6 * sum (x - 3.5)^2 = 70), so
+/// the slope stays put while the data sit at one row count; its level (at the
+/// ladder's centroid) as half a sample, so the level follows the data at
+/// whatever row count they are. One ladder held as points instead turned a
+/// uniform slowdown seen only at 6 rows into a doubled slope (60 ms pinned at
+/// 1 row): K would shrink exactly when a fixed cost grew.
+const PRIOR_SLOPE: f64 = 70.0;
+const PRIOR_LEVEL: f64 = 0.5;
+
+/// What a lone stream's step and draft cost (ms), for the K policy and the
+/// stage-1 baseline.
+///
+/// LIVE (default): `cost(rows) = a + b * rows`, least squares over the lone
+/// stream's recent steps (exponential forgetting, `V41_MS_DSPARK_COST_MEMORY`
+/// samples, default 500 = ~75 s of steps) with the configured ladder
+/// (`V41_MS_DSPARK_COST`) as the prior (`PRIOR_SLOPE`, `PRIOR_LEVEL`); the
+/// draft is an EWMA of measured drafts starting at `V41_MS_DSPARK_DRAFT_MS`.
+/// MEASURED 2026-10-01 over 3,128 warm lone steps: 53.2 + 15.1 ms/row, every
+/// row count within 1.6 ms of the line, draft 12.0 ms. The static p50 ladder
+/// had its 4-row entry 8 ms low, which made a 3rd draft look nearly free
+/// (verified at predicted acceptance >= 0.15 where the line says 0.42), and
+/// assumed a 20 ms draft. A LINE rather than per-row means: row counts the
+/// policy rarely picks (1 and 3 rows, ~2% of steps each) borrow strength from
+/// the others, and a noise bump cannot carve a kink into K. It also follows
+/// a pool warming after a restart (steps 1.3-1.9x slower for ~5 min).
+///
+/// `V41_MS_DSPARK_COST_LIVE=0`: the configured ladder and draft as given,
+/// never updated (the policy before 10-01).
+///
+/// Only past steps feed it, so a K decision still reads nothing of its own
+/// block but `conf` (exactness of the stopping rule, plan 2.4).
+pub struct StepCost {
+    live: bool,
+    ladder: Vec<f64>,
+    decay: f64,
+    /// Exponentially weighted `[n, sum x, sum x^2, sum y, sum x*y]` of the
+    /// observed `(rows, ms)` samples.
+    data: [f64; 5],
+    /// The prior line: slope, and its level at `prior_xc`.
+    prior_b: f64,
+    prior_xc: f64,
+    prior_yc: f64,
+    a: f64,
+    b: f64,
+    draft: f64,
+    samples: u64,
+}
+
+impl StepCost {
+    pub fn new(ladder: Vec<f64>, draft_ms: f64, live: bool, memory: f64) -> Self {
+        let ladder = if ladder.len() >= 2 { ladder } else { DEFAULT_LADDER.to_vec() };
+        let pts: Vec<(f64, f64)> = (1..=MTP_BLOCK + 1).map(|r| (r as f64, ladder_cost(&ladder, r))).collect();
+        let xc = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
+        let yc = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
+        let prior_b = pts.iter().map(|&(x, y)| (x - xc) * (y - yc)).sum::<f64>() / pts.iter().map(|&(x, _)| (x - xc) * (x - xc)).sum::<f64>();
+        let mut c = Self {
+            live,
+            ladder,
+            decay: 1.0 - 1.0 / memory.max(10.0),
+            data: [0.0; 5],
+            prior_b,
+            prior_xc: xc,
+            prior_yc: yc,
+            a: 0.0,
+            b: 0.0,
+            draft: draft_ms,
+            samples: 0,
+        };
+        c.refit();
+        c
+    }
+
+    /// From `V41_MS_DSPARK_COST`, `_DRAFT_MS`, `_COST_LIVE`, `_COST_MEMORY`.
+    pub fn from_env() -> Self {
+        let ladder = std::env::var("V41_MS_DSPARK_COST")
+            .ok()
+            .and_then(|v| v.split(',').map(|x| x.trim().parse().ok()).collect::<Option<Vec<f64>>>())
+            .filter(|v| v.len() >= 2)
+            .unwrap_or_else(|| DEFAULT_LADDER.to_vec());
+        Self::new(
+            ladder,
+            env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0),
+            std::env::var("V41_MS_DSPARK_COST_LIVE").as_deref() != Ok("0"),
+            env_f64("V41_MS_DSPARK_COST_MEMORY", 500.0),
+        )
+    }
+
+    /// Step time (ms) of `rows` rows of one stream.
+    pub fn cost(&self, rows: usize) -> f64 {
+        if rows == 0 {
+            return 0.0;
+        }
+        if !self.live {
+            return ladder_cost(&self.ladder, rows);
+        }
+        (self.a + self.b * rows as f64).max(1.0)
+    }
+
+    /// Draft time (ms).
+    pub fn draft_ms(&self) -> f64 {
+        self.draft
+    }
+
+    /// A lone stream's step of `rows` rows took `ms` (draft excluded).
+    pub fn observe_step(&mut self, rows: usize, ms: f64) {
+        if !self.live || rows == 0 || !(ms.is_finite() && ms > 0.0) {
+            return;
+        }
+        // A stall (box-2 hiccup, seconds of paging) counts, but at most as 3x
+        // the estimate: one sample must not drag the whole memory.
+        let (x, y) = (rows as f64, ms.min(3.0 * self.cost(rows)));
+        for (s, v) in self.data.iter_mut().zip([1.0, x, x * x, y, x * y]) {
+            *s = self.decay * *s + v;
+        }
+        self.samples += 1;
+        self.refit();
+    }
+
+    /// A draft took `ms`.
+    pub fn observe_draft(&mut self, ms: f64) {
+        if self.live && ms.is_finite() && ms > 0.0 {
+            self.draft = 0.95 * self.draft + 0.05 * ms.min(3.0 * self.draft);
+        }
+    }
+
+    /// Minimize `sum_data w (y - a - b x)^2 + PRIOR_LEVEL (a + b xc - yc)^2 +
+    /// PRIOR_SLOPE (b - prior_b)^2` (2x2 normal equations).
+    fn refit(&mut self) {
+        let [n, sx, sxx, sy, sxy] = self.data;
+        let (l, s, xc, yc) = (PRIOR_LEVEL, PRIOR_SLOPE, self.prior_xc, self.prior_yc);
+        let (m00, m01, m11) = (n + l, sx + l * xc, sxx + l * xc * xc + s);
+        let (r0, r1) = (sy + l * yc, sxy + l * xc * yc + s * self.prior_b);
+        let det = m00 * m11 - m01 * m01; // > 0: l, s > 0
+        // Never cheaper per extra row than free: b >= 0, `a` refitted for it.
+        let b = ((m00 * r1 - m01 * r0) / det).max(0.0);
+        self.b = b;
+        self.a = (r0 - b * m01) / m00;
+    }
+}
+
+fn sigmoid(c: f32) -> f64 {
+    1.0 / (1.0 + (-(c as f64)).exp())
 }
 
 /// `V41_MS_DSPARK_K`: verify exactly this many drafts (capped like the policy).
@@ -475,22 +642,21 @@ pub fn k_max() -> usize {
 /// sigmoid(conf_k). So no decision reads the value it would test. The global
 /// search of `choose_k` lets conf_{k+1}, which depends on d_k, decide whether
 /// d_k is verified: exact for point-mass tests only (review N1).
-pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize) -> usize {
+pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize, cost: &StepCost) -> usize {
     let cap = cap.min(MTP_BLOCK);
     if let Some(k) = fixed_k() {
         return k.min(cap);
     }
-    let draft = env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0);
-    let sig = |c: f32| 1.0 / (1.0 + (-(c as f64)).exp());
+    let draft = cost.draft_ms();
     let (mut k, mut run, mut e) = (0usize, 1.0f64, 1.0f64);
     while k < cap {
-        let p = sig(conf[k]);
-        let stop = e / (step_cost(1 + k) + draft);
+        let p = sigmoid(conf[k]);
+        let stop = e / (cost.cost(1 + k) + draft);
         let (mut r, mut ee, mut go) = (run, e, f64::MIN);
         for kk in k + 1..=cap {
             r *= p;
             ee += r;
-            go = go.max(ee / (step_cost(1 + kk) + draft));
+            go = go.max(ee / (cost.cost(1 + kk) + draft));
         }
         if go <= stop {
             break;
@@ -506,18 +672,18 @@ pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize) -> usize {
 /// exact, 2.4): maximize expected tokens per ms, `E(K) = 1 + sum_{k<=K}
 /// prod_{j<k} sigmoid(conf_j)` over `cost(1 + K) + draft`, the draft being
 /// paid either way. `V41_MS_DSPARK_K` fixes K (capped like the policy).
-pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize) -> usize {
+pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize, cost: &StepCost) -> usize {
     let cap = cap.min(MTP_BLOCK);
     if let Some(k) = fixed_k() {
         return k.min(cap);
     }
-    let draft = env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0);
-    let (mut best_k, mut best) = (0usize, 1.0 / (step_cost(1) + draft));
+    let draft = cost.draft_ms();
+    let (mut best_k, mut best) = (0usize, 1.0 / (cost.cost(1) + draft));
     let (mut run, mut e) = (1.0f64, 1.0f64);
     for k in 1..=cap {
-        run *= 1.0 / (1.0 + (-(conf[k - 1] as f64)).exp());
+        run *= sigmoid(conf[k - 1]);
         e += run;
-        let r = e / (step_cost(1 + k) + draft);
+        let r = e / (cost.cost(1 + k) + draft);
         if r > best {
             best = r;
             best_k = k;
@@ -526,49 +692,210 @@ pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize) -> usize {
     best_k
 }
 
+/// Calibration of the confidence head: sigmoid(conf_k) is read as P(draft k
+/// accepted | drafts before it accepted). Draft k of a block is OBSERVED when
+/// the block verified it and accepted every draft before it. Per decile of
+/// the prediction and per depth: observed drafts, the predictions' sum, and
+/// the accepted ones. Cumulative since start; logged every `CALIB_EVERY`
+/// blocks.
+#[derive(Default)]
+struct Calib {
+    blocks: u64,
+    n: [u64; 10],
+    pred: [f64; 10],
+    acc: [u64; 10],
+    depth_n: [u64; MTP_BLOCK],
+    depth_pred: [f64; MTP_BLOCK],
+    depth_acc: [u64; MTP_BLOCK],
+}
+
+const CALIB_EVERY: u64 = 500;
+
+impl Calib {
+    fn observe(&mut self, conf: &[f32; MTP_BLOCK], k: usize, accepted: usize) {
+        self.blocks += 1;
+        for j in 0..k.min(accepted + 1).min(MTP_BLOCK) {
+            let p = sigmoid(conf[j]);
+            let b = ((p * 10.0) as usize).min(9);
+            let hit = u64::from(j < accepted);
+            self.n[b] += 1;
+            self.pred[b] += p;
+            self.acc[b] += hit;
+            self.depth_n[j] += 1;
+            self.depth_pred[j] += p;
+            self.depth_acc[j] += hit;
+        }
+    }
+
+    /// `"label:predicted/accepted/n"` per non-empty cell.
+    fn table(n: &[u64], pred: &[f64], acc: &[u64], label: impl Fn(usize) -> String) -> String {
+        (0..n.len())
+            .filter(|&i| n[i] > 0)
+            .map(|i| format!("{}:{:.2}/{:.2}/{}", label(i), pred[i] / n[i] as f64, acc[i] as f64 / n[i] as f64, n[i]))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn log(&self) {
+        let (n, p, a) = (self.n.iter().sum::<u64>(), self.pred.iter().sum::<f64>(), self.acc.iter().sum::<u64>());
+        tracing::info!(
+            blocks = self.blocks,
+            drafts = n,
+            predicted = format!("{:.3}", p / (n as f64).max(1.0)),
+            accepted = format!("{:.3}", a as f64 / (n as f64).max(1.0)),
+            by_decile = %Self::table(&self.n, &self.pred, &self.acc, |i| format!("{:.1}", i as f64 / 10.0)),
+            by_depth = %Self::table(&self.depth_n, &self.depth_pred, &self.depth_acc, |i| format!("d{i}")),
+            "ms dspark: confidence calibration (predicted/accepted/n)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The pre-10-01 policy: the static p50 ladder, a 20 ms draft.
+    fn static_cost() -> StepCost {
+        StepCost::new(DEFAULT_LADDER.to_vec(), 20.0, false, 500.0)
+    }
+
+    /// Deterministic noise in [-1, 1).
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*state >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
+    }
+
     #[test]
     fn choose_k_follows_confidence() {
+        let c = static_cost();
         // Confident blocks go deep, unconfident ones verify nothing.
-        assert_eq!(choose_k(&[6.0; MTP_BLOCK], MTP_BLOCK), MTP_BLOCK);
-        assert_eq!(choose_k(&[-6.0; MTP_BLOCK], MTP_BLOCK), 0);
+        assert_eq!(choose_k(&[6.0; MTP_BLOCK], MTP_BLOCK, &c), MTP_BLOCK);
+        assert_eq!(choose_k(&[-6.0; MTP_BLOCK], MTP_BLOCK, &c), 0);
         // The cap binds.
-        assert_eq!(choose_k(&[6.0; MTP_BLOCK], 2), 2);
-        assert_eq!(choose_k(&[6.0; MTP_BLOCK], 0), 0);
+        assert_eq!(choose_k(&[6.0; MTP_BLOCK], 2, &c), 2);
+        assert_eq!(choose_k(&[6.0; MTP_BLOCK], 0, &c), 0);
         // One confident draft then noise: stop after it.
-        assert_eq!(choose_k(&[6.0, -6.0, -6.0, -6.0, -6.0], MTP_BLOCK), 1);
+        assert_eq!(choose_k(&[6.0, -6.0, -6.0, -6.0, -6.0], MTP_BLOCK, &c), 1);
     }
 
     #[test]
     fn stopping_rule_never_reads_past_its_stop() {
         // Changing any confidence AFTER the chosen K must not change K: the
         // decision on draft k reads conf[..=k] only (exactness for sampled
-        // drafts, plan 2.4).
-        let mut rng = 0x1234_5678u64;
-        let mut next = || {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((rng >> 33) as f32 / (1u64 << 31) as f32) * 12.0 - 6.0
-        };
+        // drafts, plan 2.4). Under the static ladder and a live-fitted one.
+        let mut live = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
+        let mut st = 7u64;
         for _ in 0..2000 {
-            let conf: [f32; MTP_BLOCK] = std::array::from_fn(|_| next());
-            let k = choose_k_stopping(&conf, MTP_BLOCK);
-            for j in (k + 1)..MTP_BLOCK {
-                let mut c2 = conf;
-                c2[j] = next();
-                assert_eq!(choose_k_stopping(&c2, MTP_BLOCK), k, "conf {conf:?}: K moved when conf[{j}] changed");
-            }
+            let rows = 1 + (lcg(&mut st).abs() * 6.0) as usize;
+            live.observe_step(rows, 53.2 + 15.1 * rows as f64 + 10.0 * lcg(&mut st));
         }
-        assert_eq!(choose_k_stopping(&[6.0; MTP_BLOCK], MTP_BLOCK), MTP_BLOCK);
-        assert_eq!(choose_k_stopping(&[-6.0; MTP_BLOCK], MTP_BLOCK), 0);
+        for c in [static_cost(), live] {
+            let mut rng = 0x1234_5678u64;
+            let mut next = || {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((rng >> 33) as f32 / (1u64 << 31) as f32) * 12.0 - 6.0
+            };
+            for _ in 0..2000 {
+                let conf: [f32; MTP_BLOCK] = std::array::from_fn(|_| next());
+                let k = choose_k_stopping(&conf, MTP_BLOCK, &c);
+                for j in (k + 1)..MTP_BLOCK {
+                    let mut c2 = conf;
+                    c2[j] = next();
+                    assert_eq!(choose_k_stopping(&c2, MTP_BLOCK, &c), k, "conf {conf:?}: K moved when conf[{j}] changed");
+                }
+            }
+            assert_eq!(choose_k_stopping(&[6.0; MTP_BLOCK], MTP_BLOCK, &c), MTP_BLOCK);
+            assert_eq!(choose_k_stopping(&[-6.0; MTP_BLOCK], MTP_BLOCK, &c), 0);
+        }
     }
 
     #[test]
-    fn step_cost_extrapolates() {
-        assert_eq!(step_cost(1), 60.0);
-        assert_eq!(step_cost(8), 172.0);
-        assert_eq!(step_cost(9), 188.0);
+    fn ladder_extrapolates() {
+        assert_eq!(ladder_cost(&DEFAULT_LADDER, 1), 60.0);
+        assert_eq!(ladder_cost(&DEFAULT_LADDER, 8), 172.0);
+        assert_eq!(ladder_cost(&DEFAULT_LADDER, 9), 188.0);
+    }
+
+    #[test]
+    fn static_cost_is_the_ladder_and_ignores_samples() {
+        let mut c = static_cost();
+        for _ in 0..1000 {
+            c.observe_step(4, 500.0);
+            c.observe_draft(5.0);
+        }
+        for rows in 1..=9 {
+            assert_eq!(c.cost(rows), ladder_cost(&DEFAULT_LADDER, rows));
+        }
+        assert_eq!(c.draft_ms(), 20.0);
+    }
+
+    #[test]
+    fn live_fit_recovers_the_measured_line() {
+        // The 10-01 production mix (rows 4 and 6 dominate; 1, 2, 3, 5 rare),
+        // true cost 53.2 + 15.1 * rows with +-20 ms noise, prior = the
+        // static ladder (4-row entry 8 ms low).
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 20.0, true, 500.0);
+        let mix = [(1usize, 2), (2, 12), (3, 3), (4, 52), (5, 6), (6, 25)];
+        let mut st = 42u64;
+        for _ in 0..40 {
+            for &(rows, n) in &mix {
+                for _ in 0..n {
+                    c.observe_step(rows, 53.2 + 15.1 * rows as f64 + 20.0 * lcg(&mut st));
+                }
+            }
+            for _ in 0..100 {
+                c.observe_draft(12.0 + lcg(&mut st));
+            }
+        }
+        for rows in 1..=6 {
+            let want = 53.2 + 15.1 * rows as f64;
+            assert!((c.cost(rows) - want).abs() < 3.0, "rows {rows}: {} vs {want}", c.cost(rows));
+        }
+        assert!((c.draft_ms() - 12.0).abs() < 0.5, "draft {}", c.draft_ms());
+        // Monotone: no kink can make a deeper block cheaper.
+        for rows in 1..6 {
+            assert!(c.cost(rows + 1) > c.cost(rows));
+        }
+    }
+
+    #[test]
+    fn one_row_count_shifts_the_level_and_keeps_the_prior_slope() {
+        // Every block verifies 5 drafts: the data pin cost(6), the prior the slope.
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
+        let prior_slope = c.b;
+        for _ in 0..3000 {
+            c.observe_step(6, 200.0);
+        }
+        assert!((c.cost(6) - 200.0).abs() < 3.0, "cost(6) {}", c.cost(6));
+        assert!((c.b - prior_slope).abs() < 2.0, "slope {} vs prior {prior_slope}", c.b);
+    }
+
+    #[test]
+    fn a_stall_is_clamped() {
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
+        for _ in 0..3000 {
+            c.observe_step(4, 114.0);
+        }
+        let before = c.cost(4);
+        c.observe_step(4, 10_000.0);
+        assert!(c.cost(4) - before < 2.0, "{before} -> {}", c.cost(4));
+    }
+
+    #[test]
+    fn calibration_observes_up_to_the_first_rejection() {
+        let mut cal = Calib::default();
+        // p ~ 0.95, 0.73, 0.5, 0.27, 0.05; 4 verified, 1 accepted: draft 0
+        // accepted, draft 1 rejected, drafts 2-3 never tested.
+        cal.observe(&[3.0, 1.0, 0.0, -1.0, -3.0], 4, 1);
+        assert_eq!(cal.n.iter().sum::<u64>(), 2);
+        assert_eq!((cal.n[9], cal.acc[9]), (1, 1));
+        assert_eq!((cal.n[7], cal.acc[7]), (1, 0));
+        assert_eq!(cal.depth_n, [1, 1, 0, 0, 0]);
+        assert_eq!(cal.depth_acc, [1, 0, 0, 0, 0]);
+        // All K accepted: every verified draft observed and accepted.
+        cal.observe(&[3.0; MTP_BLOCK], 3, 3);
+        assert_eq!(cal.depth_n, [2, 2, 1, 0, 0]);
+        assert_eq!(cal.depth_acc, [2, 1, 1, 0, 0]);
+        assert_eq!(cal.blocks, 2);
     }
 }

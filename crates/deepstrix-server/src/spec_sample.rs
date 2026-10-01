@@ -532,6 +532,12 @@ mod tests {
         Stopping,
     }
 
+    /// The stopping rule's cost model, as configured (exactness must hold
+    /// under any cost model).
+    #[cfg(feature = "v41")]
+    static STOPPING_COST: std::sync::LazyLock<crate::ms_dspark::StepCost> =
+        std::sync::LazyLock::new(crate::ms_dspark::StepCost::from_env);
+
     /// Generate the first `len` tokens after `start` with speculative blocks.
     fn generate(toy: &Toy, start: i32, len: usize, drafter: Drafter, k: KPolicy, rng: &mut SamplerRng) -> Vec<i32> {
         let mut seq = Vec::with_capacity(len + 6);
@@ -578,7 +584,7 @@ mod tests {
                     conf[j] = (mx - r.iter().sum::<f32>() / r.len() as f32) * 2.0 - 2.0;
                     before = d.token;
                 }
-                let kk = crate::ms_dspark::choose_k_stopping(&conf, 5);
+                let kk = crate::ms_dspark::choose_k_stopping(&conf, 5, &STOPPING_COST);
                 drafts.truncate(kk);
             }
             let mut rows = vec![toy.p(prev)];

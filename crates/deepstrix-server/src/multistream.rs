@@ -1088,6 +1088,8 @@ impl Sched {
         let mut drafts: Vec<Vec<i32>> = vec![Vec::new(); self.streams.len()];
         // Sampled drafts: each draft's q (plan 2.2); `None` = point mass.
         let mut draft_q: Vec<Option<Vec<Vec<(i32, f64)>>>> = vec![None; self.streams.len()];
+        // The lone stream's confidence logits (calibration, `MsDspark::record`).
+        let mut draft_conf = [0f32; v4flash_kernels::het::mtp::MTP_BLOCK];
         if self.streams.len() == 1 {
             if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
                 let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
@@ -1106,7 +1108,8 @@ impl Sched {
                         Ok(Some(d)) => {
                             // Sampled drafts need the stopping rule; point-mass
                             // tests allow the global search (plan 2.4).
-                            let k = if d.q.is_some() { ms_dspark::choose_k_stopping(&d.conf, cap) } else { ms_dspark::choose_k(&d.conf, cap) };
+                            let k = dsp.k_for(&d.conf, cap, d.q.is_some());
+                            draft_conf = d.conf;
                             drafts[0] = d.ids[..k].to_vec();
                             draft_q[0] = d.q.map(|mut q| { q.truncate(k); q });
                         }
@@ -1599,7 +1602,7 @@ impl Sched {
                 }
             }
             if let Some((k, accepted, emitted)) = spec_out {
-                dsp.record(self.streams[0].slot, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3);
+                dsp.record(self.streams[0].slot, &draft_conf, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3);
             } else if b == 1 {
                 dsp.note_plain_step(t0.elapsed().as_secs_f64() * 1e3);
             }
