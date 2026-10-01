@@ -297,15 +297,34 @@ pub(crate) fn init(role: &str, tier_a_dir: &Path) {
 fn dump_loop(cfg: DumpCfg) {
     let req = cfg.dir.join("dump-request");
     let mut n = 0u32;
+    let mut warned_stuck = false;
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let Ok(text) = std::fs::read_to_string(&req) else { continue };
-        let text = text.trim();
+        let text = text.trim().to_string();
         if text.is_empty() {
             continue; // a non-atomic write caught half-way: read it again next poll
         }
-        let _ = std::fs::remove_file(&req);
-        let secs = if text.eq_ignore_ascii_case("all") { None } else { text.parse::<f64>().ok().filter(|s| *s > 0.0) };
+        // A request that cannot be removed would fire every poll: act on none.
+        if let Err(e) = std::fs::remove_file(&req) {
+            if !warned_stuck {
+                tracing::warn!(error = %e, path = %req.display(), "evtrace ring: cannot remove the dump request; ignoring it");
+                warned_stuck = true;
+            }
+            continue;
+        }
+        let secs = if text.eq_ignore_ascii_case("all") {
+            None
+        } else {
+            match text.parse::<f64>().ok().filter(|s| *s > 0.0) {
+                Some(s) => Some(s),
+                None => {
+                    // Only `all` means everything (a 128 MB dump).
+                    tracing::warn!(request = %text, "evtrace ring: dump request is neither seconds nor `all`; ignored");
+                    continue;
+                }
+            }
+        };
         let t0 = Instant::now();
         match dump(&cfg, n, secs) {
             Ok((path, bytes, recs)) => {
@@ -341,9 +360,9 @@ fn dump(cfg: &DumpCfg, n: u32, secs: Option<f64>) -> std::io::Result<(PathBuf, u
     // does nothing on these drives).
     let (mut bytes, mut recs, mut since_sync) = (8 + header.len() as u64, 0u64, 0usize);
     let tidx = tidx();
-    let mut write_err = None;
-    for data in blocks.into_iter().map(|b| b.to_vec()).chain(std::iter::once(open)) {
-        recs += for_each_selected(&data, t_min, tidx, |r| {
+    let mut piece = |data: &[u8], f: &mut std::io::BufWriter<&std::fs::File>| -> std::io::Result<()> {
+        let mut write_err = None;
+        recs += for_each_selected(data, t_min, tidx, |r| {
             if write_err.is_none() {
                 if let Err(e) = f.write_all(r) {
                     write_err = Some(e);
@@ -352,7 +371,7 @@ fn dump(cfg: &DumpCfg, n: u32, secs: Option<f64>) -> std::io::Result<(PathBuf, u
                 since_sync += r.len();
             }
         });
-        if let Some(e) = write_err.take() {
+        if let Some(e) = write_err {
             return Err(e);
         }
         if since_sync >= 4 << 20 {
@@ -361,7 +380,13 @@ fn dump(cfg: &DumpCfg, n: u32, secs: Option<f64>) -> std::io::Result<(PathBuf, u
             since_sync = 0;
             std::thread::sleep(Duration::from_millis(2));
         }
+        Ok(())
+    };
+    // Each block's Arc is released once written (no copy).
+    for b in blocks {
+        piece(&b, &mut f)?;
     }
+    piece(&open, &mut f)?;
     f.flush()?;
     file.sync_data()?;
     drop(f);

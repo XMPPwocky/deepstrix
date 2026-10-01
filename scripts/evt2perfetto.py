@@ -246,10 +246,21 @@ def cmd_cut(a):
     an earlier boot are skipped (their RAW clock restarted)."""
     now = boot_now()
     same_boot = [p for p in a.files if abs(boot_of(p) - now) < 60]
-    opened = sorted((first_t(p), p) for p in same_boot)
+    # Tier A files span from their first record to the next file's; a Tier B
+    # dump (batch order: its first record is not its earliest) spans the
+    # window its header names.
+    spans = []
+    tier_a = sorted((first_t(p), p) for p in same_boot if header_of(p)[1].get('tier') != 'B')
+    for i, (t_open, p) in enumerate(tier_a):
+        spans.append((t_open, tier_a[i + 1][0] if i + 1 < len(tier_a) else math.inf, p))
+    for p in same_boot:
+        h = header_of(p)[1]
+        if h.get('tier') == 'B':
+            d = h.get('dump', {})
+            lo = d.get('t_from_raw')
+            spans.append((-math.inf if lo is None else lo, d.get('t_to_raw', math.inf), p))
     written = []
-    for i, (t_open, p) in enumerate(opened):
-        t_next = opened[i + 1][0] if i + 1 < len(opened) else math.inf
+    for i, (t_open, t_next, p) in enumerate(spans):
         if t_open > a.t_to or t_next < a.t_from:
             continue
         # The cut's header carries every string defined up to the cut's end
