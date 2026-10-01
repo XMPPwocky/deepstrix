@@ -1724,7 +1724,12 @@ impl Sched {
         // learned per row count (`lanes_learned`; a plain step's from its own
         // tables, `PlainLanes`, a block's from `k_for`).
         let spec_lanes = spec && spec_two;
-        let plain_two = !spec && b >= 2 && self.plain_lanes.pick(b, plain_lane_rule(min_rows, learned)) >= 2;
+        // Rows that would run THREE lanes keep the threshold even when learned:
+        // a three-lane step feeds no table, so a learned choice there would
+        // compare a live one-lane cell with a frozen two-lane one (review 12).
+        let lanes3_rows = env_usize("V41_MS_LANES", 2) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
+        let plain_rule = plain_lane_rule(min_rows, learned && !lanes3_rows);
+        let plain_two = !spec && b >= 2 && self.plain_lanes.pick(b, plain_rule) >= 2;
         let pipelined = plain_two || spec_lanes;
         // Three lanes (`V41_MS_LANES=3`, DEFAULT 2) from `V41_MS_LANES3_MIN_ROWS`
         // rows (default 6). MEASURED 2026-09-21 at 8 rows, box-1 hot set warm:
@@ -1735,7 +1740,7 @@ impl Sched {
         // box-2 compute 94 -> 135 ms, dGPU 91 -> 126, box-1 iGPU 72 -> 93 per
         // step, and box 2 -- the saturated resource -- ends up busier, not
         // idler. Lanes cost bytes; only worth it when the pole has slack.
-        let lanes3 = pipelined && !spec && env_usize("V41_MS_LANES", 2) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
+        let lanes3 = pipelined && !spec && lanes3_rows;
         // STAGGERED two lanes (`V41_MS_STAGGER=1`, default OFF until A/B'd on real
         // traffic; gated bit-exact by `multistream_step` G5d). The lockstep driver
         // above fuses both lanes into ONE box-2 pass per layer, so box 1 and box 2

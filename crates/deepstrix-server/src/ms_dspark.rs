@@ -173,6 +173,8 @@ pub struct MsDspark {
     /// cut): each table observed only from steps that ran its lane count, so
     /// the step change where the second lane switches on bends neither.
     lanes: LaneTables,
+    /// The policy's lane count changes by rows (`Switches`; blocks line).
+    switches: Switches,
     calib: Calib,
     stats: Stats,
     since: Instant,
@@ -203,7 +205,7 @@ impl MsDspark {
         // which cells the steps feed.
         let m = crate::multistream::pipeline_min_rows();
         let lanes = LaneTables::new(StepCost::from_env(), StepCost::from_env_two_lane(m), m);
-        Ok(Self { slots, plain_ms: lanes.one.cost(1), lanes, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng() })
+        Ok(Self { slots, plain_ms: lanes.one.cost(1), lanes, switches: Switches::default(), calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng() })
     }
 
     /// K and the lane count for the lone stream's drafted block (plan section
@@ -236,7 +238,11 @@ impl MsDspark {
         }
         let cost = self.lanes.priced(rule);
         let k = if sampled { choose_k_stopping(conf, cap, &cost) } else { choose_k(conf, cap, &cost) };
-        (k, self.lanes.best(1 + k, rule).1)
+        let lanes = self.lanes.best(1 + k, rule).1;
+        if k >= 1 {
+            self.switches.note(1 + k, lanes);
+        }
+        (k, lanes)
     }
 
     /// One lone step's sample: BOTH tables age by one step, then `rows`/`ms`
@@ -553,6 +559,7 @@ impl MsDspark {
                 explored_k0 = s.explored_k0,
                 explored_hist = ?s.explored_hist,
                 explored_two = s.explored_two,
+                lane_switches = self.switches.take(),
                 keep_ms = format!("{:.2}", s.keep_ms / (s.keeps as f64).max(1.0)),
                 ring_errors = s.ring_errors,
                 draft_est_ms = format!("{:.1}", self.lanes.one.draft_ms()),
@@ -780,7 +787,10 @@ impl LaneTables {
     }
 }
 
-/// `LaneTables` under one rule, as the K policy's `CostModel`.
+/// `LaneTables` under one rule, as the K policy's `CostModel`. Under
+/// `Learned` the min of two noisy cells reads slightly LOW where they are
+/// close (the winner's curse): a little over-drafting, bounded by the cells'
+/// noise (review round 12).
 pub struct Priced<'a> {
     t: &'a LaneTables,
     rule: LaneRule,
@@ -795,6 +805,41 @@ impl CostModel for Priced<'_> {
     }
 }
 
+/// How often the POLICY's lane count for a row count changed (exploration
+/// draws excluded), since the last log line: `LaneRule::Learned` flip-flop
+/// (review round 12: a slow spell lands on the active lane's mature cell
+/// while the other keeps its pre-spell mean, so the rule may flip and sit on
+/// the worse lane for about a memory; measure how often before correcting
+/// for it). `"rows:switches ..."`, nonzero only.
+#[derive(Default)]
+struct Switches {
+    last: Vec<usize>,
+    n: Vec<u64>,
+}
+
+impl Switches {
+    fn note(&mut self, rows: usize, lanes: usize) {
+        if rows == 0 {
+            return;
+        }
+        if self.last.len() < rows {
+            self.last.resize(rows, 0);
+            self.n.resize(rows, 0);
+        }
+        let last = &mut self.last[rows - 1];
+        if *last != 0 && *last != lanes {
+            self.n[rows - 1] += 1;
+        }
+        *last = lanes;
+    }
+
+    fn take(&mut self) -> String {
+        let out: Vec<String> = self.n.iter().enumerate().filter(|&(_, &c)| c > 0).map(|(i, c)| format!("{}:{c}", i + 1)).collect();
+        self.n.iter_mut().for_each(|c| *c = 0);
+        out.join(" ")
+    }
+}
+
 /// Plain multi-stream steps between `ms lanes` log lines.
 const PLAIN_LOG_EVERY: u64 = 2000;
 
@@ -805,11 +850,15 @@ const PLAIN_LOG_EVERY: u64 = 2000;
 /// ~2 min). Not the DSpark tables: a block's rows are ONE stream's (one KV, an
 /// ordered verify cut), a plain step's one per stream (the cross-stream split).
 /// Always live cells (`V41_MS_DSPARK_COST_LIVE` / `_COST_SHAPE` are the DSpark
-/// policy's knobs). Logs both tables every `PLAIN_LOG_EVERY` steps.
+/// policy's knobs). Logs both tables every `PLAIN_LOG_EVERY` steps. A step's
+/// time runs to the end of its accept / ring tail, like a block's: the same
+/// for both lane counts, so comparisons are fair, but the logged absolutes
+/// include it.
 pub struct PlainLanes {
     t: LaneTables,
     rng: StdRng,
     rule: LaneRule,
+    switches: Switches,
     /// Since the last log line, by rows: steps on one lane, on two.
     hist: Vec<[u64; 2]>,
     explored: u64,
@@ -827,8 +876,10 @@ impl PlainLanes {
         let two = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), start_from, 0.0, true, memory).with_shape(CostShape::Cells).with_rows(rows);
         Self {
             t: LaneTables::new(one, two, start_from),
-            rng: explore_rng(),
+            // Not the DSpark stream under a fixed seed.
+            rng: explore_rng_salted(0x9e37_79b9_7f4a_7c15),
             rule: LaneRule::Off,
+            switches: Switches::default(),
             hist: vec![[0; 2]; rows],
             explored: 0,
             steps: 0,
@@ -840,7 +891,11 @@ impl PlainLanes {
     pub fn pick(&mut self, rows: usize, rule: LaneRule) -> usize {
         self.rule = rule;
         let (lanes, explored) = self.t.pick(&mut self.rng, rows, rule);
-        self.explored += explored as u64;
+        if explored {
+            self.explored += 1;
+        } else {
+            self.switches.note(rows, lanes);
+        }
         lanes
     }
 
@@ -862,6 +917,7 @@ impl PlainLanes {
                 two_w = cells_str(&self.t.two.cell_weights(), 2),
                 lanes_by_rows = hist.join(" "),
                 explored = self.explored,
+                switches = self.switches.take(),
                 window_s = self.since.elapsed().as_secs(),
                 "ms lanes: plain steps"
             );
@@ -957,8 +1013,13 @@ fn explore_p() -> f64 {
 
 /// `V41_MS_DSPARK_EXPLORE_SEED` (a u64) seeds the exploration draws; else entropy.
 fn explore_rng() -> StdRng {
-    match std::env::var("V41_MS_DSPARK_EXPLORE_SEED").ok().and_then(|v| v.parse().ok()) {
-        Some(seed) => StdRng::seed_from_u64(seed),
+    explore_rng_salted(0)
+}
+
+/// `explore_rng` with the seed XOR `salt` (a second stream under one seed).
+fn explore_rng_salted(salt: u64) -> StdRng {
+    match std::env::var("V41_MS_DSPARK_EXPLORE_SEED").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(seed) => StdRng::seed_from_u64(seed ^ salt),
         None => StdRng::from_entropy(),
     }
 }
@@ -1865,6 +1926,13 @@ mod tests {
         // weights: neither cell has a sample yet).
         let want = 20_000.0 * explore_p() * 0.5;
         assert!((ones as f64 - want).abs() < 0.3 * want + 20.0, "{ones} vs {want:.0}");
+        // Switches count policy changes per row count, exploration excluded.
+        let mut sw = Switches::default();
+        for (rows, lanes) in [(3, 1), (3, 1), (3, 2), (5, 2), (3, 1), (5, 2)] {
+            sw.note(rows, lanes);
+        }
+        assert_eq!(sw.take(), "3:2");
+        assert_eq!(sw.take(), "");
         // Rows past the table extend it; rows within are counted.
         pl.observe(8, 2, 170.0);
         pl.observe(9, 2, 180.0);
