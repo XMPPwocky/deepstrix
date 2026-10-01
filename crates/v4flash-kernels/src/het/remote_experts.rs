@@ -2036,7 +2036,8 @@ pub mod knobs {
     /// per replay, 2.3-2.9 s, 90% of it waiting on box 2 (MEASURED 2026-10-01).
     /// Decode after the prefill loses as many pages either way, only from other
     /// layers. Env `V41_B2_ENCODER_VICTIMS_FIRST` (`0` = off), file key
-    /// `encoder_victims_first`, default on.
+    /// `encoder_victims_first`, default on (the name predates the sweep rank:
+    /// on = rank decode victims by the sweep, off = plain LRU within a tier).
     pub fn encoder_victims_first() -> bool { init(); ENCODER_VICTIMS_FIRST.load(Relaxed) }
     pub fn route_urgency() -> bool {
         init();
@@ -2299,8 +2300,10 @@ struct ShardPool {
 /// window sweeps layers `< CED_DECODER_START` upward, the replay the decoder
 /// layers upward:
 ///   0  an encoder layer this pass has gone past (`l < for_layer`; untouched,
-///      else it would be tier 5): not needed until the next window -- and the
-///      replay needs no encoder layer at all;
+///      else it would be tier 5): the group's remaining sub-chunks may still
+///      revisit it (a sub-chunk's union, ~203 per layer, is smaller than the
+///      window's ~255), but nothing sooner needs it -- and the replay needs no
+///      encoder layer at all;
 ///   1  the other region (decoder layers during an encoder window, needed by
 ///      the replay; decoder layers the replay has gone past);
 ///   2  a layer this pass will still reach (`l >= for_layer`, same region):
