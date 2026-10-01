@@ -28,7 +28,8 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::DeviceBuffer;
 use v4flash_kernels::config::N_EMBD;
 use v4flash_kernels::het::batch_scratch::{BatchDgpuScratch, MTP_CAP_ROWS};
-use v4flash_kernels::het::mtp::{MTP_BLOCK, MTP_SRC_LAYERS, MTP_WINDOW, RING_ROWS_MAX};
+use v4flash_kernels::het::mtp::{DraftSampling, MTP_BLOCK, MTP_DRAFT_TOP_M, MTP_SRC_LAYERS, MTP_WINDOW, RING_ROWS_MAX};
+use v4flash_kernels::het::SampleMode;
 use v4flash_kernels::het::{HetModelWeights, HeterogeneousEngine};
 
 use crate::engine_worker::MtpCtx;
@@ -49,6 +50,38 @@ pub fn enabled() -> bool {
 fn ring_all() -> bool {
     static ALL: LazyLock<bool> = LazyLock::new(|| std::env::var("V41_MS_DSPARK_RING").as_deref() != Ok("solo"));
     *ALL
+}
+
+/// `V41_MS_DSPARK_DRAFTS=argmax`: point-mass drafts (the drafter's argmax,
+/// accepted with probability p(d)) for every request. Default `sampled`: a
+/// request that samples (temperature > 0) gets SAMPLED drafts, each drawn from
+/// the drafter's own tempered top-M distribution q and accepted with
+/// min(1, p/q) (plan 2.2, M6) -- the drafter as designed; at temperature 0 a
+/// draft is the argmax either way.
+fn sampled_drafts() -> bool {
+    static S: LazyLock<bool> = LazyLock::new(|| std::env::var("V41_MS_DSPARK_DRAFTS").as_deref() != Ok("argmax"));
+    *S
+}
+
+/// How a stream's drafts are drawn: `Some` (sampled, plan 2.2) when its
+/// requests sample and sampled drafts are on, else `None` (point mass). `u`
+/// are the drafter RNG's uniforms for the block's positions.
+pub fn draft_sampling(mode: &SampleMode, u: [f32; MTP_BLOCK]) -> Option<DraftSampling> {
+    match *mode {
+        SampleMode::Multinomial { temperature, top_p, .. } if temperature > 0.0 && sampled_drafts() => {
+            Some(DraftSampling { temperature, top_p, m: MTP_DRAFT_TOP_M, u })
+        }
+        _ => None,
+    }
+}
+
+/// One drafted block.
+pub struct Drafted {
+    pub ids: [i32; MTP_BLOCK],
+    /// Confidence logits (`MtpExit::conf`).
+    pub conf: [f32; MTP_BLOCK],
+    /// Sampled drafts: each position's q, `(token, prob)`; `None` for argmax.
+    pub q: Option<Vec<Vec<(i32, f64)>>>,
 }
 
 /// Floats of one row's drafter input: `cat(mean_hc(resid@37), @38, @39)`.
@@ -258,9 +291,9 @@ impl MsDspark {
 
     /// Draft a block for `slot`'s stream: its last row in KV is `pos`, its
     /// next input `next` (at `pos + 1`, embedded in `token_row`). Returns the
-    /// drafts for `pos + 2 ..= pos + 1 + MTP_BLOCK` and their confidence
-    /// logits, or `None` when the stream has no residual for `pos` (then it
-    /// steps without drafts).
+    /// drafts for `pos + 2 ..= pos + 1 + MTP_BLOCK`, their confidence logits
+    /// and (sampled drafts) their q, or `None` when the stream has no residual
+    /// for `pos` (then it steps without drafts).
     #[allow(clippy::too_many_arguments)]
     pub fn draft(
         &mut self,
@@ -271,7 +304,8 @@ impl MsDspark {
         pos: u32,
         next: i32,
         token_row: &[f32],
-    ) -> eyre::Result<Option<([i32; MTP_BLOCK], [f32; MTP_BLOCK])>> {
+        sampling: Option<&DraftSampling>,
+    ) -> eyre::Result<Option<Drafted>> {
         let t = Instant::now();
         let (hidden, rewind) = {
             let sd = self.slot(slot)?;
@@ -288,7 +322,7 @@ impl MsDspark {
         let ids = self.with_ring(mtp, slot, rewind, |m| {
             let MtpCtx { state, exit, w, xw, markov_embd, markov_dtype, noise_row, .. } = m;
             engine
-                .dspark_draft(state, exit, &hidden, w, xw, weights, markov_embd, *markov_dtype, pos, token_row, noise_row, next, false)
+                .dspark_draft(state, exit, &hidden, w, xw, weights, markov_embd, *markov_dtype, pos, token_row, noise_row, next, false, sampling)
                 .map(|(ids, _plain)| ids)
         })?;
         let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -296,7 +330,8 @@ impl MsDspark {
         sd.last_ring_pos = Some(pos);
         sd.last_draft_ms = ms;
         self.stats.draft_ms += ms;
-        Ok(Some((ids, mtp.exit.conf)))
+        let q = sampling.map(|_| std::mem::take(&mut mtp.exit.q));
+        Ok(Some(Drafted { ids, conf: mtp.exit.conf, q }))
     }
 
     /// A plain one-row decode step took `ms` (no drafts): the stage-1 baseline.
@@ -433,6 +468,39 @@ pub fn k_max() -> usize {
     fixed_k().unwrap_or(*KMAX).min(MTP_BLOCK)
 }
 
+/// K for SAMPLED drafts (plan 2.4 / section 6): a STOPPING rule. Whether draft
+/// k is verified is decided from `conf[..=k]` only -- conf_k reads the markov
+/// row of draft k-1, never draft k -- with the depths beyond k forecast at
+/// sigmoid(conf_k). So no decision reads the value it would test. The global
+/// search of `choose_k` lets conf_{k+1}, which depends on d_k, decide whether
+/// d_k is verified: exact for point-mass tests only (review N1).
+pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize) -> usize {
+    let cap = cap.min(MTP_BLOCK);
+    if let Some(k) = fixed_k() {
+        return k.min(cap);
+    }
+    let draft = env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0);
+    let sig = |c: f32| 1.0 / (1.0 + (-(c as f64)).exp());
+    let (mut k, mut run, mut e) = (0usize, 1.0f64, 1.0f64);
+    while k < cap {
+        let p = sig(conf[k]);
+        let stop = e / (step_cost(1 + k) + draft);
+        let (mut r, mut ee, mut go) = (run, e, f64::MIN);
+        for kk in k + 1..=cap {
+            r *= p;
+            ee += r;
+            go = go.max(ee / (step_cost(1 + kk) + draft));
+        }
+        if go <= stop {
+            break;
+        }
+        run *= p;
+        e += run;
+        k += 1;
+    }
+    k
+}
+
 /// How many drafts to verify (plan section 6, point-mass tests: any K rule is
 /// exact, 2.4): maximize expected tokens per ms, `E(K) = 1 + sum_{k<=K}
 /// prod_{j<k} sigmoid(conf_j)` over `cost(1 + K) + draft`, the draft being
@@ -471,6 +539,29 @@ mod tests {
         assert_eq!(choose_k(&[6.0; MTP_BLOCK], 0), 0);
         // One confident draft then noise: stop after it.
         assert_eq!(choose_k(&[6.0, -6.0, -6.0, -6.0, -6.0], MTP_BLOCK), 1);
+    }
+
+    #[test]
+    fn stopping_rule_never_reads_past_its_stop() {
+        // Changing any confidence AFTER the chosen K must not change K: the
+        // decision on draft k reads conf[..=k] only (exactness for sampled
+        // drafts, plan 2.4).
+        let mut rng = 0x1234_5678u64;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 33) as f32 / (1u64 << 31) as f32) * 12.0 - 6.0
+        };
+        for _ in 0..2000 {
+            let conf: [f32; MTP_BLOCK] = std::array::from_fn(|_| next());
+            let k = choose_k_stopping(&conf, MTP_BLOCK);
+            for j in (k + 1)..MTP_BLOCK {
+                let mut c2 = conf;
+                c2[j] = next();
+                assert_eq!(choose_k_stopping(&c2, MTP_BLOCK), k, "conf {conf:?}: K moved when conf[{j}] changed");
+            }
+        }
+        assert_eq!(choose_k_stopping(&[6.0; MTP_BLOCK], MTP_BLOCK), MTP_BLOCK);
+        assert_eq!(choose_k_stopping(&[-6.0; MTP_BLOCK], MTP_BLOCK), 0);
     }
 
     #[test]

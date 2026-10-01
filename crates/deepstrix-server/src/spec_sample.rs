@@ -524,6 +524,12 @@ mod tests {
         Fixed(usize),
         Random(usize),
         PeekFirstDraft { a: i32 },
+        /// The production stopping rule (`ms_dspark::choose_k_stopping`) over
+        /// a synthetic confidence that depends on the drafts through the
+        /// markov-prev channel, as the real head does: conf_k is a function
+        /// of d_{k-1}.
+        #[cfg(feature = "v41")]
+        Stopping,
     }
 
     /// Generate the first `len` tokens after `start` with speculative blocks.
@@ -535,6 +541,8 @@ mod tests {
                 KPolicy::Fixed(k) => k,
                 KPolicy::Random(k) => (rng.next_f32() * (k + 1) as f32) as usize,
                 KPolicy::PeekFirstDraft { .. } => 1,
+                #[cfg(feature = "v41")]
+                KPolicy::Stopping => 5,
             };
             let mut drafts = Vec::with_capacity(k_max);
             let mut dp = prev;
@@ -557,6 +565,21 @@ mod tests {
                 if drafts[0].token != a {
                     drafts.clear(); // the forbidden, draft-value-dependent truncation
                 }
+            }
+            #[cfg(feature = "v41")]
+            if let KPolicy::Stopping = k {
+                // conf_j from the token BEFORE draft j (the stream's prev for
+                // j = 0): strongly varying, so K really depends on the drafts.
+                let mut conf = [0f32; 5];
+                let mut before = prev;
+                for (j, d) in drafts.iter().enumerate() {
+                    let r = &toy.drafter[before as usize];
+                    let mx = r.iter().cloned().fold(f32::MIN, f32::max);
+                    conf[j] = (mx - r.iter().sum::<f32>() / r.len() as f32) * 2.0 - 2.0;
+                    before = d.token;
+                }
+                let kk = crate::ms_dspark::choose_k_stopping(&conf, 5);
+                drafts.truncate(kk);
             }
             let mut rows = vec![toy.p(prev)];
             for d in &drafts {
@@ -637,6 +660,14 @@ mod tests {
 
     fn sampled_mode(top_p: f32) -> SampleMode {
         SampleMode::Multinomial { temperature: 1.0, min_p_rel: 0.0, top_p }
+    }
+
+    #[cfg(feature = "v41")]
+    #[test]
+    fn g_rs1_sampled_drafts_with_the_production_stopping_rule_are_exact() {
+        let toy = Toy::new(sampled_mode(0.9));
+        assert_exact("sampled + stopping rule", &toy, Drafter::Sampled { tau: 1.0, m: 4 }, KPolicy::Stopping, 107);
+        assert_exact("q = p + stopping rule", &toy, Drafter::QEqualsP, KPolicy::Stopping, 108);
     }
 
     #[test]

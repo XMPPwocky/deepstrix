@@ -4339,7 +4339,7 @@ fn finish_decode(
             let m = state.mtp.as_mut().expect("mtp");
             let (d2, _) = state.engine.dspark_draft(
                 &mut m.state, &mut m.exit, &m.main_hidden, &m.w, &m.xw, &state.weights,
-                &m.markov_embd, m.markov_dtype, pos + n as u32, &token_row, &m.noise_row, head, true,
+                &m.markov_embd, m.markov_dtype, pos + n as u32, &token_row, &m.noise_row, head, true, None,
             )?;
             m.pending = Some(d2);
             m.pending_conf = m.exit.conf;
@@ -4518,6 +4518,7 @@ fn finish_decode(
                 &m.noise_row,
                 next,
                 true,
+                None,
             )?;
             m.drafts.push((pos + 1, drafts));
             m.drafts_plain.push((pos + 1, drafts_plain));

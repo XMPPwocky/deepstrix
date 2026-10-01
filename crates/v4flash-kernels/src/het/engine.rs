@@ -799,6 +799,7 @@ impl HeterogeneousEngine {
         noise_row: &[f32],
         first_token: i32,
         want_plain: bool,
+        sampling: Option<&super::mtp::DraftSampling>,
     ) -> color_eyre::eyre::Result<([i32; super::mtp::MTP_BLOCK], [i32; super::mtp::MTP_BLOCK])> {
         // `V41_DSPARK_DRAFT_TIMING=1`: split the draft into its three parts. The
         // drafter is only 3 layers but costs ~26 ms/step against the 40-layer
@@ -885,6 +886,7 @@ impl HeterogeneousEngine {
             markov_dtype,
             first_token,
             want_plain,
+            sampling,
         );
         if dt {
             tracing::info!(

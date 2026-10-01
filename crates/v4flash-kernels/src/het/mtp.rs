@@ -1779,6 +1779,63 @@ impl MtpState {
 /// `head` is the MAIN model's `output` weight: `Transformer.__init__` assigns
 /// `mtp[s].head = self.head` for every stage, so the drafter adds no vocab
 /// projection of its own.
+/// Candidates per draft position in a SAMPLED draft (plan 2.2): the draft is
+/// drawn from the drafter's tempered distribution truncated to its top-M, and
+/// exactly that q is exported to the verifier.
+pub const MTP_DRAFT_TOP_M: usize = 64;
+
+/// How the exit draws SAMPLED drafts (DSpark plan 2.2 / M6): at the request's
+/// temperature and top-p over the drafter's top-`m` biased logits, each
+/// position with its own uniform from the drafter's RNG (independent of the
+/// verifier's, plan 2.4).
+#[derive(Clone, Debug)]
+pub struct DraftSampling {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub m: usize,
+    pub u: [f32; MTP_BLOCK],
+}
+
+/// The draft distribution of one position and its draw. `ids` / `logits` are
+/// the top-M candidates (any order) with their biased logits. q = softmax at
+/// `temperature` over them, cut to the smallest prefix (by logit, ties to the
+/// lower id) whose mass reaches `top_p`, renormalised; the draft is the first
+/// candidate whose cumulative q reaches `u`. q is EXACTLY what the draft is
+/// drawn from, so `min(1, p/q)` in the verifier is exact (plan 2.2); tokens
+/// outside the top-M have q = 0.
+pub fn draft_dist(ids: &[i32], logits: &[f32], temperature: f32, top_p: f32, u: f32) -> eyre::Result<(Vec<(i32, f64)>, i32)> {
+    if ids.len() != logits.len() || !(temperature > 0.0) {
+        return Err(eyre!("draft_dist: {} ids / {} logits at temperature {temperature}", ids.len(), logits.len()));
+    }
+    let mut c: Vec<(i32, f32)> = ids.iter().copied().zip(logits.iter().copied()).filter(|(i, l)| *i >= 0 && l.is_finite()).collect();
+    if c.is_empty() {
+        return Err(eyre!("draft_dist: no finite candidate"));
+    }
+    c.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    let mx = c[0].1 as f64;
+    let w: Vec<f64> = c.iter().map(|&(_, l)| ((l as f64 - mx) / temperature as f64).exp()).collect();
+    let z: f64 = w.iter().sum();
+    let top_p = (top_p as f64).clamp(0.0, 1.0);
+    let mut keep = 0usize;
+    let mut acc = 0.0f64;
+    while keep < w.len() && (keep == 0 || acc < top_p * z) {
+        acc += w[keep];
+        keep += 1;
+    }
+    let q: Vec<(i32, f64)> = c[..keep].iter().zip(&w[..keep]).map(|(&(t, _), &wi)| (t, wi / acc)).collect();
+    let target = (u as f64).clamp(0.0, 1.0);
+    let mut cum = 0.0f64;
+    let mut pick = q[q.len() - 1].0;
+    for &(t, pr) in &q {
+        cum += pr;
+        if cum >= target {
+            pick = t;
+            break;
+        }
+    }
+    Ok((q, pick))
+}
+
 pub struct MtpExit {
     /// The drafter's final residual and carried pre-mix, staged on THIS device.
     /// The layer stack runs on the iGPU and the exit on the dGPU (that is where
@@ -1807,6 +1864,15 @@ pub struct MtpExit {
     pub conf: [f32; MTP_BLOCK],
     /// Host copy of the `[1, N_EMBD + MTP_MARKOV_RANK]` projection, read once.
     conf_w: Option<Vec<f32>>,
+    /// Sampled drafts (`forward_ex` with a `DraftSampling`): each position's q,
+    /// `(token, prob)` over its kept candidates; empty for argmax drafts.
+    pub q: Vec<Vec<(i32, f64)>>,
+    /// Top-M selection of one position's biased logits (`indexer_topk_bitonic`,
+    /// sorted descending, ties to the lower id) and the gathered logits.
+    topk_sel: DeviceBuffer<i32>,
+    topk_bits: DeviceBuffer<u32>,
+    topk_scratch: DeviceBuffer<u32>,
+    cand: DeviceBuffer<f32>,
 }
 
 impl MtpExit {
@@ -1830,6 +1896,14 @@ impl MtpExit {
             tok_dev: DeviceBuffer::new(device_id, 1)?,
             conf: [0.0; MTP_BLOCK],
             conf_w: None,
+            q: Vec::new(),
+            topk_sel: DeviceBuffer::new(device_id, MTP_DRAFT_TOP_M)?,
+            topk_bits: DeviceBuffer::new(device_id, nv.div_ceil(32))?,
+            topk_scratch: DeviceBuffer::new(
+                device_id,
+                crate::indexer::topk_merge_levels(N_VOCAB, MTP_DRAFT_TOP_M as u32).iter().map(|&n| n as usize).sum::<usize>().max(1),
+            )?,
+            cand: DeviceBuffer::new(device_id, MTP_DRAFT_TOP_M)?,
         })
     }
 
@@ -1879,7 +1953,7 @@ impl MtpExit {
         markov_dtype: v4flash_core::gguf::GgufType,
         first_token: i32,
     ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
-        self.forward_ex(e, s, h_host, pre_host, w, head, markov_embd, markov_dtype, first_token, true)
+        self.forward_ex(e, s, h_host, pre_host, w, head, markov_embd, markov_dtype, first_token, true, None)
     }
 
     /// `forward`, with the transformer-only `plain` drafts optional: they are
@@ -1898,7 +1972,14 @@ impl MtpExit {
         markov_dtype: v4flash_core::gguf::GgufType,
         first_token: i32,
         want_plain: bool,
+        sampling: Option<&DraftSampling>,
     ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
+        if let Some(ds) = sampling {
+            if ds.m == 0 || ds.m > MTP_DRAFT_TOP_M || !(ds.temperature > 0.0) {
+                return Err(eyre!("mtp exit: sampling m={} temperature={} (m in 1..={MTP_DRAFT_TOP_M}, T > 0)", ds.m, ds.temperature));
+            }
+        }
+        self.q.clear();
         // Runs on the dGPU (the head is tied to the main model's `output`), so
         // this lands on dgpu.compute while `mtp.layer` lands on igpu.compute --
         // the split is visible on the timeline rather than inferred.
@@ -2019,11 +2100,37 @@ impl MtpExit {
             )?;
             let mut lj = self.logits.slice_view_mut(i * nv, nv);
             e.vec_add.launch(s, &mut lj, &self.bias, N_VOCAB)?;
-            e.sampler.launch_argmax(s, &mut self.tok_dev, &lj, N_VOCAB)?;
-            s.synchronize()?;
-            self.tok_dev.copy_to_host(&mut got)?;
-            ids[i] = got[0];
-            prev = got[0];
+            match sampling {
+                None => {
+                    e.sampler.launch_argmax(s, &mut self.tok_dev, &lj, N_VOCAB)?;
+                    s.synchronize()?;
+                    self.tok_dev.copy_to_host(&mut got)?;
+                    ids[i] = got[0];
+                }
+                Some(ds) => {
+                    // SAMPLED draft (plan 2.2): the top-M of the biased logits
+                    // on device, only M (id, logit) pairs to the host, q and the
+                    // draw there (`draft_dist`). Same one sync per position as
+                    // the argmax path.
+                    let m = ds.m as u32;
+                    let lv = self.logits.slice_view(i * nv, nv);
+                    e.indexer_topk_bitonic.launch(
+                        s, &mut self.topk_sel, &mut self.topk_bits, &mut self.topk_scratch, &lv, N_VOCAB, m,
+                    )?;
+                    e.vec_add.launch_gather(s, &mut self.cand, &lv, &self.topk_sel, m)?;
+                    s.synchronize()?;
+                    let mut cid = vec![0i32; ds.m];
+                    let mut clg = vec![0f32; ds.m];
+                    self.topk_sel.slice_view(0, ds.m).copy_to_host(&mut cid)?;
+                    self.cand.slice_view(0, ds.m).copy_to_host(&mut clg)?;
+                    let (q, d) = draft_dist(&cid, &clg, ds.temperature, ds.top_p, ds.u[i])?;
+                    self.q.push(q);
+                    ids[i] = d;
+                }
+            }
+            // The markov head of the NEXT position reads this draft (a sampled
+            // one is the draw itself, as in the reference).
+            prev = ids[i];
         }
         Ok((ids, plain))
     }
@@ -2088,5 +2195,43 @@ impl MtpCapture {
         out.resize(MTP_SRC_LAYERS.len() * N_EMBD as usize, 0.0);
         self.src.copy_to_host(out)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_dist_tests {
+    use super::draft_dist;
+
+    #[test]
+    fn q_is_a_distribution_and_the_draw_follows_it() {
+        let ids = [7, 3, 9, 1, 4];
+        let lg = [2.0f32, 1.0, 1.0, -1.0, f32::NEG_INFINITY];
+        let (q, _) = draft_dist(&ids, &lg, 1.0, 1.0, 0.5).unwrap();
+        assert_eq!(q.iter().map(|x| x.0).collect::<Vec<_>>(), vec![7, 3, 9, 1], "sorted by logit, ties to the lower id, -inf dropped");
+        assert!((q.iter().map(|x| x.1).sum::<f64>() - 1.0).abs() < 1e-12);
+        // Draws over a fine grid of u reproduce q.
+        let n = 100_000;
+        let mut cnt = std::collections::HashMap::new();
+        for k in 0..n {
+            let u = (k as f32 + 0.5) / n as f32;
+            *cnt.entry(draft_dist(&ids, &lg, 1.0, 1.0, u).unwrap().1).or_insert(0usize) += 1;
+        }
+        for &(t, pr) in &q {
+            let f = *cnt.get(&t).unwrap_or(&0) as f64 / n as f64;
+            assert!((f - pr).abs() < 1e-3, "token {t}: frequency {f} vs q {pr}");
+        }
+    }
+
+    #[test]
+    fn top_p_keeps_the_smallest_prefix_and_temperature_sharpens() {
+        let ids = [0, 1, 2, 3];
+        let lg = [3.0f32, 2.0, 1.0, 0.0];
+        let (q_all, _) = draft_dist(&ids, &lg, 1.0, 1.0, 0.0).unwrap();
+        let (q_p, _) = draft_dist(&ids, &lg, 1.0, 0.7, 0.0).unwrap();
+        assert_eq!(q_all.len(), 4);
+        assert!(q_p.len() < 4 && q_p[0].0 == 0, "top-p 0.7 keeps a prefix");
+        let (q_cold, _) = draft_dist(&ids, &lg, 0.25, 1.0, 0.0).unwrap();
+        assert!(q_cold[0].1 > q_all[0].1, "lower temperature puts more mass on the top candidate");
+        assert!(draft_dist(&ids, &lg, 0.0, 1.0, 0.5).is_err(), "T = 0 is point-mass territory");
     }
 }

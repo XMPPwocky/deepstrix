@@ -149,4 +149,25 @@ impl VecAddInplace {
         };
         launch_kernel!(function, cfg, stream, [out.raw(), rhs.raw(), n])
     }
+
+    /// `out[i] = src[idx[i]]` for `i < n` (negative ids give -inf): the DSpark
+    /// exit's top-M candidate logits (`vec_add.hip` `gather_f32`).
+    pub fn launch_gather(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        src: &DeviceBuffer<f32>,
+        idx: &DeviceBuffer<i32>,
+        n: u32,
+    ) -> eyre::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if out.len() < n as usize || idx.len() < n as usize {
+            return Err(eyre!("gather_f32: out {} / idx {} < n {n}", out.len(), idx.len()));
+        }
+        let function = self.module.get_function("gather_f32")?;
+        let cfg = LaunchConfig { grid: (n.div_ceil(64), 1, 1), block: (64, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [out.raw(), src.raw(), idx.raw(), n])
+    }
 }

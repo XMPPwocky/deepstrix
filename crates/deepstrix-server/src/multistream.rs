@@ -97,6 +97,9 @@ struct Stream {
     max_new: usize,
     sample_mode: SampleMode,
     rng: SamplerRng,
+    /// DSpark's draft draws (sampled drafts): its own stream, independent of
+    /// the verifier's `rng` (plan 2.4).
+    draft_rng: SamplerRng,
     in_think: bool,
     send_failures: u32,
     started: Instant,
@@ -940,9 +943,10 @@ impl Sched {
             SampleMode::Multinomial { temperature: pf.p.req.temperature, min_p_rel: pf.p.req.min_p_rel, top_p }
         };
         let mut rng = SamplerRng::new(pf.p.req.seed);
+        let draft_rng = SamplerRng::new(pf.p.req.seed ^ 0xD5A9_C3E1_7B24_6F01);
         let mut s = Stream {
             slot, tx: pf.p.tx.clone(), cancel: pf.p.cancel.clone(), next: 0, seq: pf.prefix.clone(), compressed: pf.compressed.clone(),
-            prompt_tokens: pf.p.prompt_tokens, completion_tokens: 0, max_new: pf.p.req.max_new, sample_mode, rng,
+            prompt_tokens: pf.p.prompt_tokens, completion_tokens: 0, max_new: pf.p.req.max_new, sample_mode, rng, draft_rng,
             in_think: false, send_failures: 0, started: pf.started, session_id: pf.p.session_id.clone(),
             ctx_full: pf.prefix.len() as u32 + pf.p.req.max_new as u32 + 2, stalled_since: None,
         };
@@ -1077,9 +1081,13 @@ impl Sched {
         // confidence (`ms_dspark::choose_k`). Several live streams step plainly.
         // A drafter failure only costs the drafts (plan 5.8), never the step.
         let mut drafts: Vec<Vec<i32>> = vec![Vec::new(); self.streams.len()];
+        // Sampled drafts: each draft's q (plan 2.2); `None` = point mass.
+        let mut draft_q: Vec<Option<Vec<Vec<(i32, f64)>>>> = vec![None; self.streams.len()];
         if self.streams.len() == 1 {
             if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
+                let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
                 let s = &self.streams[0];
+                let sampling = ms_dspark::draft_sampling(&s.sample_mode, u);
                 let pos = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
                 let remaining = s.max_new.saturating_sub(s.completion_tokens as usize);
                 let mut cap = remaining.saturating_sub(1).min(ms_dspark::k_max());
@@ -1089,8 +1097,14 @@ impl Sched {
                 if cap > 0 && pos > 0 && dsp.should_draft(s.slot) {
                     let mut row = vec![0f32; HC_DIM as usize];
                     embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, s.next, &mut row);
-                    match dsp.draft(&state.engine, &state.weights, m, s.slot, pos - 1, s.next, &row) {
-                        Ok(Some((ids, conf))) => drafts[0] = ids[..ms_dspark::choose_k(&conf, cap)].to_vec(),
+                    match dsp.draft(&state.engine, &state.weights, m, s.slot, pos - 1, s.next, &row, sampling.as_ref()) {
+                        Ok(Some(d)) => {
+                            // Sampled drafts need the stopping rule; point-mass
+                            // tests allow the global search (plan 2.4).
+                            let k = if d.q.is_some() { ms_dspark::choose_k_stopping(&d.conf, cap) } else { ms_dspark::choose_k(&d.conf, cap) };
+                            drafts[0] = d.ids[..k].to_vec();
+                            draft_q[0] = d.q.map(|mut q| { q.truncate(k); q });
+                        }
                         Ok(None) => {}
                         Err(e) => tracing::warn!(slot = s.slot, error = %e, "ms dspark: draft failed; plain step"),
                     }
@@ -1531,7 +1545,17 @@ impl Sched {
             let k = drafts[i].len();
             let rows: Vec<TargetDist> =
                 (0..=k).map(|j| TargetDist::from_logits(&logits[(r + j) * nv..(r + j + 1) * nv], &s.sample_mode)).collect();
-            let ds: Vec<Draft> = drafts[i].iter().map(|&t| Draft { token: t, q: DraftDist::PointMass }).collect();
+            let ds: Vec<Draft> = drafts[i]
+                .iter()
+                .enumerate()
+                .map(|(j, &t)| Draft {
+                    token: t,
+                    q: match draft_q[i].as_ref() {
+                        Some(q) => DraftDist::Sampled(q[j].clone()),
+                        None => DraftDist::PointMass,
+                    },
+                })
+                .collect();
             let out = verify_block(&rows, &ds, &mut s.rng);
             let mut n = 0u32;
             for &tok in &out.tokens {
