@@ -210,8 +210,15 @@ impl MsDspark {
     /// the same snapshot the step's lane choice uses).
     pub fn k_for(&mut self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool, two_from: Option<usize>) -> usize {
         if fixed_k().is_none() {
-            // Drawn before `conf` is read (block comment at `explore_p`).
-            if let Some(k) = explore_k(&mut self.rng, cap, explore_p()) {
+            // Drawn before `conf` is read (block comment at `explore_p`), from
+            // the time-aged weight of the cost cell each K would feed: its rows,
+            // in the regime this step would run them in.
+            let (one, two) = (self.cost.cell_weights(), self.cost2.cell_weights());
+            let weight = |k: usize| {
+                let rows = (k + 1).min(CELLS);
+                if two_from.is_some_and(|m| rows >= m) { two[rows - 1] } else { one[rows - 1] }
+            };
+            if let Some(k) = explore_k(&mut self.rng, cap, explore_p(), weight) {
                 // A K = 0 draw runs as a plain step (no `record`): counted apart.
                 if k == 0 {
                     self.stats.explored_k0 += 1;
@@ -708,17 +715,20 @@ fn young(n: f64) -> bool {
 /// -- or a whole regime -- and never sample it again. It happened both ways on
 /// 10-01: a slow first two-lane verify kept K <= 2 for good; after a cold
 /// restart a one-lane line frozen at its cold level kept K = 5 on two lanes for
-/// good. So with probability `explore_p()` a drafting block verifies a
-/// UNIFORMLY random number of drafts in `0..=cap` instead of the policy's K.
+/// good. So with probability `explore_p()` a drafting block verifies a random
+/// number of drafts in `0..=cap` instead of the policy's K -- weighted toward
+/// the cost cells sampled least lately (`explore_k`; uniform until 10-01
+/// evening).
 ///
 /// Chosen over Thompson sampling: TS explores only where the posterior is
 /// uncertain, and ours is a hand-set Gaussian (decayed pseudo-counts, a clamped
 /// heavy-tailed stall distribution, warm-up drift) -- a confidently WRONG fit,
-/// the failure here, is what TS rarely revisits. Uniform K covers every row
-/// count of both regimes at a known rate whatever the model believes, spreads
-/// samples over rows (what a line fit wants), and costs well under 1% at 1/32.
-/// Exact under the stopping rule: K is drawn before `conf` is read,
-/// independent of the drafts.
+/// the failure here, is what TS rarely revisits. The staleness weighting reads
+/// only how much recent data each cell has, never what the model believes it
+/// costs: every row count of both regimes keeps a known minimum rate, and the
+/// draws go where data is thinnest. Costs well under 1% at 1/32. Exact under
+/// the stopping rule: K is drawn before `conf` is read, independent of the
+/// drafts.
 fn explore_p() -> f64 {
     static P: LazyLock<f64> = LazyLock::new(|| env_f64("V41_MS_DSPARK_EXPLORE", 1.0 / 32.0).clamp(0.0, 1.0));
     *P
@@ -732,9 +742,29 @@ fn explore_rng() -> StdRng {
     }
 }
 
-/// With probability `p`, a uniformly random K in `0..=cap` (`explore_p`).
-pub fn explore_k(rng: &mut impl Rng, cap: usize, p: f64) -> Option<usize> {
-    (cap > 0 && p > 0.0 && rng.gen::<f64>() < p).then(|| rng.gen_range(0..=cap))
+/// With probability `p`, a K in `0..=cap` drawn by STALENESS (owner, 10-01:
+/// "focus exploration on cells we haven't explored in a while"): K feeds one
+/// cost cell, and is picked with probability proportional to `1 / (1 + w)`,
+/// `w = weight(K)` that cell's time-aged sample weight. Cells nobody has
+/// sampled lately -- an idle regime's rows, a row count the policy avoids, a
+/// cell left behind by a restart (e.g. the 1-row cell held at its cold-start
+/// mean while every block drafted) -- get most draws; well-measured ones
+/// (w ~ 50-250) a trickle, never none. Still epsilon-exploration (`explore_p`
+/// sets how often); `weight` reads only past samples, so the draw is exact
+/// under the stopping rule.
+pub fn explore_k(rng: &mut impl Rng, cap: usize, p: f64, weight: impl Fn(usize) -> f64) -> Option<usize> {
+    if cap == 0 || p <= 0.0 || rng.gen::<f64>() >= p {
+        return None;
+    }
+    let scores: Vec<f64> = (0..=cap).map(|k| 1.0 / (1.0 + weight(k).max(0.0))).collect();
+    let mut x = rng.gen::<f64>() * scores.iter().sum::<f64>();
+    for (k, &sc) in scores.iter().enumerate() {
+        if x < sc {
+            return Some(k);
+        }
+        x -= sc;
+    }
+    Some(cap)
 }
 
 /// Rows the per-row cost CELLS cover (1 ..= MTP_BLOCK + 1: every block's rows).
@@ -1330,27 +1360,37 @@ mod tests {
     }
 
     #[test]
-    fn exploration_draws_every_k_uniformly_at_its_rate() {
+    fn exploration_favours_stale_cells_at_its_rate() {
         let mut rng = StdRng::seed_from_u64(7);
         let (n, p) = (64_000, 1.0 / 32.0);
+        // Cells K=0 (w 0, stale), K=1..4 (w 100, well measured), K=5 (w 1).
+        let w = [0.0, 100.0, 100.0, 100.0, 100.0, 1.0];
         let mut hist = [0u32; MTP_BLOCK + 1];
         let mut hits = 0;
         for _ in 0..n {
-            if let Some(k) = explore_k(&mut rng, MTP_BLOCK, p) {
+            if let Some(k) = explore_k(&mut rng, MTP_BLOCK, p, |k| w[k]) {
                 hist[k] += 1;
                 hits += 1;
             }
         }
         let rate = hits as f64 / n as f64;
         assert!((rate - p).abs() < 0.004, "rate {rate}");
-        // Every K in 0..=cap (both regimes, one lane at 0..2, two at 3..5).
-        let each = hits as f64 / (MTP_BLOCK + 1) as f64;
-        assert!(hist.iter().all(|&c| (c as f64 - each).abs() < 0.2 * each), "{hist:?}");
-        // Never past the cap; nothing to explore without room; off at p = 0.
+        // Shares follow 1 / (1 + w): K=0 ~ 1, K=5 ~ 0.5, the measured ~ 0.0099 each.
+        let total: f64 = w.iter().map(|x| 1.0 / (1.0 + x)).sum();
+        for (k, &c) in hist.iter().enumerate() {
+            let want = hits as f64 * (1.0 / (1.0 + w[k])) / total;
+            assert!((c as f64 - want).abs() < 0.25 * want + 6.0, "K={k}: {c} vs {want:.0} ({hist:?})");
+        }
+        assert!(hist.iter().all(|&c| c > 0), "every K stays possible: {hist:?}");
+        // Equal weights: uniform. Never past the cap; nothing without room; off at p = 0.
         let mut rng = StdRng::seed_from_u64(1);
-        assert!((0..1000).filter_map(|_| explore_k(&mut rng, 2, 1.0)).all(|k| k <= 2));
-        assert_eq!(explore_k(&mut rng, 0, 1.0), None);
-        assert_eq!(explore_k(&mut rng, MTP_BLOCK, 0.0), None);
+        let mut h2 = [0u32; 3];
+        for k in (0..30_000).filter_map(|_| explore_k(&mut rng, 2, 1.0, |_| 5.0)) {
+            h2[k] += 1;
+        }
+        assert!(h2.iter().all(|&c| (c as f64 - 10_000.0).abs() < 600.0), "{h2:?}");
+        assert_eq!(explore_k(&mut rng, 0, 1.0, |_| 0.0), None);
+        assert_eq!(explore_k(&mut rng, MTP_BLOCK, 0.0, |_| 0.0), None);
     }
 
     #[test]
