@@ -158,6 +158,8 @@ struct Stats {
     explored_hist: [u64; MTP_BLOCK + 1],
     /// Exploration draws that verified on two lanes.
     explored_two: u64,
+    /// Blocks by rows (index rows - 1): on one lane, on two.
+    lanes_by_rows: [[u64; 2]; CELLS],
 }
 
 pub struct MsDspark {
@@ -239,8 +241,8 @@ impl MsDspark {
         let cost = self.lanes.priced(rule);
         let k = if sampled { choose_k_stopping(conf, cap, &cost) } else { choose_k(conf, cap, &cost) };
         let lanes = self.lanes.best(1 + k, rule).1;
-        if k >= 1 {
-            self.switches.note(1 + k, lanes);
+        if k >= 1 && self.switches.note(1 + k, lanes) {
+            self.lanes.log_switch("dspark", 1 + k, lanes);
         }
         (k, lanes)
     }
@@ -532,6 +534,7 @@ impl MsDspark {
         s.accepted += accepted as u64;
         s.emitted += emitted as u64;
         s.k_hist[k.min(MTP_BLOCK)] += 1;
+        s.lanes_by_rows[k.min(MTP_BLOCK)][(lanes >= 2) as usize] += 1;
         s.step_ms += step_ms;
         if s.blocks >= 50 {
             let n = s.blocks as f64;
@@ -560,6 +563,7 @@ impl MsDspark {
                 explored_hist = ?s.explored_hist,
                 explored_two = s.explored_two,
                 lane_switches = self.switches.take(),
+                lanes_by_rows = s.lanes_by_rows.iter().enumerate().skip(1).map(|(i, h)| format!("{}:{}/{}", i + 1, h[0], h[1])).collect::<Vec<_>>().join(" "),
                 keep_ms = format!("{:.2}", s.keep_ms / (s.keeps as f64).max(1.0)),
                 ring_errors = s.ring_errors,
                 draft_est_ms = format!("{:.1}", self.lanes.one.draft_ms()),
@@ -744,6 +748,22 @@ impl LaneTables {
         self.table(lanes).cost(rows)
     }
 
+    /// One `ms lanes: switch` line per policy switch (`Switches`): both cells,
+    /// so a switch can be lined up with the `ms.phase` burst boundaries.
+    fn log_switch(&self, what: &'static str, rows: usize, lanes: usize) {
+        tracing::info!(
+            what,
+            rows,
+            from = if lanes >= 2 { 1 } else { 2 },
+            to = lanes,
+            one_ms = format!("{:.1}", self.cost(rows, 1)),
+            two_ms = format!("{:.1}", self.cost(rows, 2)),
+            one_w = format!("{:.1}", self.weight(rows, 1)),
+            two_w = format!("{:.1}", self.weight(rows, 2)),
+            "ms lanes: switch"
+        );
+    }
+
     /// The time-aged sample weight of the cell `(rows, lanes)` feeds.
     pub fn weight(&self, rows: usize, lanes: usize) -> f64 {
         self.table(lanes).cell_weight(rows)
@@ -818,19 +838,22 @@ struct Switches {
 }
 
 impl Switches {
-    fn note(&mut self, rows: usize, lanes: usize) {
+    /// Whether this choice switched the row count's lane count.
+    fn note(&mut self, rows: usize, lanes: usize) -> bool {
         if rows == 0 {
-            return;
+            return false;
         }
         if self.last.len() < rows {
             self.last.resize(rows, 0);
             self.n.resize(rows, 0);
         }
         let last = &mut self.last[rows - 1];
-        if *last != 0 && *last != lanes {
+        let switched = *last != 0 && *last != lanes;
+        if switched {
             self.n[rows - 1] += 1;
         }
         *last = lanes;
+        switched
     }
 
     fn take(&mut self) -> String {
@@ -893,8 +916,8 @@ impl PlainLanes {
         let (lanes, explored) = self.t.pick(&mut self.rng, rows, rule);
         if explored {
             self.explored += 1;
-        } else {
-            self.switches.note(rows, lanes);
+        } else if self.switches.note(rows, lanes) {
+            self.t.log_switch("plain", rows, lanes);
         }
         lanes
     }
@@ -1928,9 +1951,8 @@ mod tests {
         assert!((ones as f64 - want).abs() < 0.3 * want + 20.0, "{ones} vs {want:.0}");
         // Switches count policy changes per row count, exploration excluded.
         let mut sw = Switches::default();
-        for (rows, lanes) in [(3, 1), (3, 1), (3, 2), (5, 2), (3, 1), (5, 2)] {
-            sw.note(rows, lanes);
-        }
+        let flips: Vec<bool> = [(3, 1), (3, 1), (3, 2), (5, 2), (3, 1), (5, 2)].iter().map(|&(r, l)| sw.note(r, l)).collect();
+        assert_eq!(flips, [false, false, true, false, true, false]);
         assert_eq!(sw.take(), "3:2");
         assert_eq!(sw.take(), "");
         // Rows past the table extend it; rows within are counted.
