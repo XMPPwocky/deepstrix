@@ -28,6 +28,16 @@ NAN = float('nan')
 
 # ------------------------------------------------------------------ reading
 
+def decode_str(vals):
+    """A `str` record (format_rev 2): id, len, then the UTF-8 bytes six per f64
+    slot as an exact integer (byte i at bit 8 i)."""
+    sid, ln = int(vals[0]), int(vals[1])
+    b = bytearray()
+    for x in vals[2:]:
+        b += int(x).to_bytes(6, 'little')
+    return sid, bytes(b[:ln]).decode('utf-8', 'replace')
+
+
 def read_file(path):
     """-> (header dict, {kind name: [record dict]})."""
     with open(path, 'rb') as f:
@@ -38,6 +48,8 @@ def read_file(path):
     header = json.loads(data[8:8 + hlen])
     kinds = {k['id']: (k['name'], k['fields']) for k in header['kinds']}
     out = defaultdict(list)
+    # format_rev 2: the header's table + `str` records (header['_strings']).
+    strings = dict(enumerate(header.get('strings', [])))
     off, n_data = 8 + hlen, len(data)
     cache = {}
     while off + 4 <= n_data:
@@ -51,9 +63,17 @@ def read_file(path):
         vals = s.unpack_from(data, off)
         off += 8 * n
         name, fields = kinds.get(kid, (f'kind{kid}', [f'f{i}' for i in range(n)]))
+        if name == 'str':
+            sid, s = decode_str(vals)
+            strings[sid] = s
+            continue
         rec = dict(zip(fields, vals))
         rec['_role'] = header.get('role', '?')
         out[name].append(rec)
+    header['_strings'] = strings
+    for r in out.get('knob', []):
+        r['name_s'] = strings.get(int(r['name']), '?')
+        r['value_s'] = strings.get(int(r['value']), '?')
     return header, out
 
 

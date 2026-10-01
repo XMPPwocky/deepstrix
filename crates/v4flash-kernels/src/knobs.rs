@@ -64,7 +64,7 @@ impl Source {
             _ => Source::Default,
         }
     }
-    fn as_u8(self) -> u8 {
+    pub(crate) fn as_u8(self) -> u8 {
         match self {
             Source::Default => 0,
             Source::Env => 1,
@@ -510,6 +510,8 @@ pub struct Change {
     pub seq: u64,
     /// CLOCK_REALTIME ns (the perfetto exporters' clock).
     pub t_ns: u64,
+    /// CLOCK_MONOTONIC_RAW ns (evtrace's clock).
+    pub t_raw: u64,
     pub name: &'static str,
     pub from: String,
     pub to: String,
@@ -654,19 +656,26 @@ fn step(warned: &mut HashSet<String>) {
         }
     }
     if !p.changed.is_empty() {
-        let t_ns = wall_ns();
-        let mut log = CHANGES.lock().unwrap_or_else(|p| p.into_inner());
-        for (name, old, new, src) in &p.changed {
-            tracing::info!(knob = *name, from = %old, to = %new, source = ?src, "knob changed");
-            if echo {
-                eprintln!("knobs: {name} {old} -> {new} ({src:?})");
+        let (t_ns, t_raw) = (wall_ns(), crate::het::evtrace::now() as u64);
+        {
+            let mut log = CHANGES.lock().unwrap_or_else(|p| p.into_inner());
+            for (name, old, new, src) in &p.changed {
+                tracing::info!(knob = *name, from = %old, to = %new, source = ?src, "knob changed");
+                if echo {
+                    eprintln!("knobs: {name} {old} -> {new} ({src:?})");
+                }
+                log.0 += 1;
+                let seq = log.0;
+                log.1.push_back(Change { seq, t_ns, t_raw, name, from: old.clone(), to: new.clone(), source: *src });
+                if log.1.len() > CHANGES_KEPT {
+                    log.1.pop_front();
+                }
             }
-            log.0 += 1;
-            let seq = log.0;
-            log.1.push_back(Change { seq, t_ns, name, from: old.clone(), to: new.clone(), source: *src });
-            if log.1.len() > CHANGES_KEPT {
-                log.1.pop_front();
-            }
+        }
+        // evtrace `knob` records AFTER `CHANGES` is released: no nested locks
+        // (the interner is a leaf, docs/v41/EVTRACE_REBUILD_PLAN.md 2.6).
+        for (name, _, new, src) in &p.changed {
+            crate::het::evtrace::emit_knob(t_raw as f64, name, new, src.as_u8());
         }
     }
     static WRITTEN: Mutex<bool> = Mutex::new(false);

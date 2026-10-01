@@ -53,10 +53,23 @@ def header_of(path):
     return hlen, json.loads(head[8:8 + hlen])
 
 
-def records(path, lo=-math.inf, hi=math.inf, raw=False, stop=math.inf):
+def decode_str(vals):
+    """A `str` record (format_rev 2): id, len, then the UTF-8 bytes six per f64
+    slot as an exact integer."""
+    sid, ln = int(vals[0]), int(vals[1])
+    b = bytearray()
+    for x in vals[2:]:
+        b += int(x).to_bytes(6, 'little')
+    return sid, bytes(b[:ln]).decode('utf-8', 'replace')
+
+
+def records(path, lo=-math.inf, hi=math.inf, raw=False, stop=math.inf, strings=None):
     """Yield (t, kind name, fields, values[, raw bytes]) of the records whose
     first finite t-field `t` is in [lo, hi]; stop at the first record past
-    `stop`. Streams the file (64 MB chunks, POSIX_FADV_DONTNEED after each)."""
+    `stop`. Streams the file (64 MB chunks, POSIX_FADV_DONTNEED after each).
+    With `strings` (a dict), every `str` record read (whatever its position)
+    is decoded into it: `str` records have no time, so a window never keeps
+    them."""
     hlen, header = header_of(path)
     kinds = {k['id']: (k['name'], k['fields']) for k in header['kinds']}
     tidx = {kid: [i for i, n in enumerate(fs) if TFIELD.match(n)] for kid, (_, fs) in kinds.items()}
@@ -76,6 +89,9 @@ def records(path, lo=-math.inf, hi=math.inf, raw=False, stop=math.inf):
                     break  # continues in the next chunk (or a file still being written)
                 s = cache.get(n) or cache.setdefault(n, struct.Struct(f'<{n}d'))
                 vals = s.unpack_from(data, off + 4)
+                if strings is not None and kinds.get(kid, ('',))[0] == 'str':
+                    sid, text = decode_str(vals)
+                    strings[sid] = text
                 t = next((vals[i] for i in tidx.get(kid, []) if i < n and not math.isnan(vals[i])), NAN)
                 if t > stop:
                     return
@@ -231,19 +247,22 @@ def cmd_cut(a):
         t_next = opened[i + 1][0] if i + 1 < len(opened) else math.inf
         if t_open > a.t_to or t_next < a.t_from:
             continue
-        out = None
-        for _, _, _, _, rawb in records(p, a.t_from, a.t_to, raw=True, stop=a.t_to + STOP_MARGIN):
-            if out is None:
-                hlen, _ = header_of(p)
-                with open(p, 'rb') as f:
-                    head = f.read(8 + hlen)
-                path = f'{a.o}.{i}.evt'
-                out = open(path, 'wb')
-                out.write(head)
-                written.append(path)
-            out.write(rawb)
-        if out is not None:
-            out.close()
+        # The cut's header carries every string defined up to the cut's end
+        # (format_rev 2): the window filter drops `str` records (no time).
+        _, header = header_of(p)
+        strings = dict(enumerate(header.get('strings', [])))
+        body = [rawb for _, _, _, _, rawb in records(p, a.t_from, a.t_to, raw=True, stop=a.t_to + STOP_MARGIN, strings=strings)]
+        if not body:
+            continue
+        if strings:
+            header['strings'] = [strings.get(k, '') for k in range(max(strings) + 1)]
+        hb = json.dumps(header).encode()
+        path = f'{a.o}.{i}.evt'
+        with open(path, 'wb') as out:
+            out.write(b'EVT1' + struct.pack('<I', len(hb)) + hb)
+            for rawb in body:
+                out.write(rawb)
+        written.append(path)
     if not written:
         sys.exit('cut: no records in the window')
     print(' '.join(written))
@@ -253,7 +272,8 @@ def cmd_trace(a):
     hub_hdr = header_of(a.files[0])[1]
     offs, hub = Offsets(), defaultdict(list)
     keep_lo, keep_hi = a.t_from - 5e9, a.t_to + 5e9
-    for t, name, fields, vals in records(a.files[0], a.t_from - 300e9, a.t_to + 300e9, stop=a.t_to + 300e9 + STOP_MARGIN):
+    hub_str = dict(enumerate(hub_hdr.get('strings', [])))
+    for t, name, fields, vals in records(a.files[0], a.t_from - 300e9, a.t_to + 300e9, stop=a.t_to + 300e9 + STOP_MARGIN, strings=hub_str):
         if name == 'hub_req':
             r = dict(zip(fields, vals))
             offs.add(r)
@@ -261,10 +281,11 @@ def cmd_trace(a):
                 hub[name].append(r)
         elif keep_lo <= t <= keep_hi:
             hub[name].append(dict(zip(fields, vals)))
-    b2_hdr, b2 = None, defaultdict(list)
+    b2_hdr, b2, b2_str = None, defaultdict(list), {}
     for p in a.files[1:]:
         b2_hdr = header_of(p)[1]
-        for _, name, fields, vals in records(p):
+        b2_str.update(enumerate(b2_hdr.get('strings', [])))
+        for _, name, fields, vals in records(p, strings=b2_str):
             b2[name].append(dict(zip(fields, vals)))
     tr = Tracks(a.t_from)
     tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 1, 'args': {'name': 'hub (box 1)'}})
@@ -286,6 +307,12 @@ def cmd_trace(a):
                         'b1_misses', 'b1_read_ms', 'rf_chain_waits', 'dgpu_busy_ms', 'igpu_busy_ms', 'pos_max'), **stages})
         for c in ('remote_wait_ms', 'b2_page_ms', 'b2_misses', 'b1_misses', 'b1_read_ms', 'step_ms'):
             tr.counter(1, c, s['t_start'], s.get(c, NAN))
+    # Live knob changes (format_rev 2 `knob` records).
+    src_name = {0: 'default', 1: 'env', 2: 'legacy file', 3: 'knob file', 4: 'set'}
+    for k in hub.get('knob', []):  # (box 2's: below, on the hub clock)
+        if inside(k['t']):
+            nm, val = hub_str.get(int(k['name']), '?'), hub_str.get(int(k['value']), '?')
+            tr.instant(1, 'knobs', f'knob {nm}={val}', k['t'], {'source': src_name.get(int(k['source']), '?')})
     for p in hub.get('hub_phase', []):
         if inside(p['t']):
             tr.instant(1, 'phases', 'prefill' if p['to'] == 1 else 'decode', p['t'], fin(p, 'live', 'prefills', 'queued', 'burst_ms', 'starved'))
@@ -301,6 +328,11 @@ def cmd_trace(a):
     if b2:
         off = offs.fn(a.t_from - 300e9, a.t_to + 300e9)
         to_hub = lambda t: t - off(t - off(a.t_to)) if not math.isnan(t) else NAN
+        for k in b2.get('knob', []):
+            t = to_hub(k['t'])
+            if inside(t):
+                nm, val = b2_str.get(int(k['name']), '?'), b2_str.get(int(k['value']), '?')
+                tr.instant(2, 'knobs', f'knob {nm}={val}', t, {'source': src_name.get(int(k['source']), '?')})
         b2ex = (b2_hdr or {}).get('extras', {})
         tr.instant(2, 'knobs', 'knobs (box 2)', a.t_from, {**b2ex.get('env', {}), **{f'knob {k}': v for k, v in b2ex.get('knobs', {}).items()}})
         for r in b2.get('b2_req', []):

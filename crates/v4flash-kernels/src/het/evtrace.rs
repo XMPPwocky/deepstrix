@@ -20,13 +20,22 @@
 //! CLOCK_MONOTONIC_RAW ns of the EMITTING box -- the clock of the wire's
 //! t1..t4 -- so the hub's per-request NTP quadruples put both boxes on one
 //! timeline. Reader: scripts/evtrace.py.
+//!
+//! `format_rev` 2 (docs/v41/EVTRACE_REBUILD_PLAN.md, P0), additive under the
+//! same `EVT1` magic: INTERNED STRINGS (`intern`; names, never formatted
+//! values) -- the header's `"strings"` (the table when the file opened, index =
+//! id; id 0 = `<overflow>`, the table is capped) plus `str` records for strings
+//! interned later, each written before any record that can use it (the writer
+//! emits every new string before the next record it writes); `knob` records for
+//! live knob changes (RAW time); and `"knobs_at_open"`, every knob's value when
+//! the file opened.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, Ordering::Relaxed};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::remote_experts::{monotonic_raw_ns, realtime_ns};
@@ -70,9 +79,27 @@ pub static SYS: Kind = Kind {
     ],
 };
 
+/// An interned string defined after the header: `id`, `len` (bytes), then the
+/// UTF-8 bytes packed SIX per f64 slot as an exact integer (little endian:
+/// byte i of the slot at bit 8 i) -- never as raw bit patterns, which can form
+/// NaNs a reader might not preserve. At most `STR_MAX_BYTES`.
+pub static STR: Kind = Kind { id: 3, name: "str", fields: &["id", "len"] };
+
+/// A span callsite (P2): its name, target, level and up to four field names
+/// (string ids).
+pub static SITE: Kind = Kind {
+    id: 4,
+    name: "site",
+    fields: &["id", "name", "target", "level", "nfields", "f0", "f1", "f2", "f3"],
+};
+
+/// A live knob changed (`crate::knobs`): RAW time, name and new value (string
+/// ids), source (0 default, 1 env, 2 legacy file, 3 knob file, 4 set).
+pub static KNOB: Kind = Kind { id: 5, name: "knob", fields: &["t", "name", "value", "source"] };
+
 /// Every kind this binary can emit, in the header of every file.
 fn kinds() -> Vec<&'static Kind> {
-    let mut v: Vec<&'static Kind> = vec![&META, &SYS];
+    let mut v: Vec<&'static Kind> = vec![&META, &SYS, &STR, &SITE, &KNOB];
     v.extend(super::evtrace_kinds::ALL.iter().copied());
     v
 }
@@ -89,6 +116,99 @@ static TX: OnceLock<SyncSender<Rec>> = OnceLock::new();
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
 const QUEUE_CAP: usize = 8192;
+
+// ---------------------------------------------------------------- strings
+
+/// Strings the table holds at most; later ones get id 0 (`<overflow>`).
+pub const STR_CAP: usize = 65_536;
+/// Bytes a string keeps (longer ones are cut at a char boundary).
+pub const STR_MAX_BYTES: usize = (MAX_FIELDS - 2) * 6;
+
+struct Interner {
+    ids: std::collections::HashMap<String, u32>,
+    table: Vec<String>,
+}
+
+/// Table length, published after each append (the writer's cheap check).
+static N_STR: AtomicUsize = AtomicUsize::new(0);
+
+fn interner() -> &'static Mutex<Interner> {
+    static I: OnceLock<Mutex<Interner>> = OnceLock::new();
+    I.get_or_init(|| {
+        let mut ids = std::collections::HashMap::new();
+        ids.insert("<overflow>".to_string(), 0);
+        N_STR.store(1, Ordering::Release);
+        Mutex::new(Interner { ids, table: vec!["<overflow>".to_string()] })
+    })
+}
+
+/// The id of `s` (as the f64 a record carries), interning it on first use.
+/// Lock order: the interner's lock is a LEAF -- nothing else is taken, no
+/// tracing macro runs, while it is held.
+pub fn intern(s: &str) -> f64 {
+    let mut end = s.len().min(STR_MAX_BYTES);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let s = &s[..end];
+    let mut g = interner().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(&id) = g.ids.get(s) {
+        return id as f64;
+    }
+    if g.table.len() >= STR_CAP {
+        return 0.0;
+    }
+    let id = g.table.len() as u32;
+    g.table.push(s.to_string());
+    g.ids.insert(s.to_string(), id);
+    N_STR.store(g.table.len(), Ordering::Release);
+    id as f64
+}
+
+/// The table from `from` on (the writer's cursor), copied out of the lock.
+fn strings_from(from: usize) -> Vec<String> {
+    let g = interner().lock().unwrap_or_else(|p| p.into_inner());
+    g.table.get(from..).map(|t| t.to_vec()).unwrap_or_default()
+}
+
+/// One `str` record.
+fn str_rec(id: usize, s: &str) -> Rec {
+    let b = s.as_bytes();
+    let slots = b.len().div_ceil(6).min(MAX_FIELDS - 2);
+    let mut r = Rec { kind: STR.id, n: (2 + slots) as u16, v: [f64::NAN; MAX_FIELDS] };
+    r.v[0] = id as f64;
+    r.v[1] = b.len().min(slots * 6) as f64;
+    for (i, chunk) in b.chunks(6).take(slots).enumerate() {
+        let mut x = 0u64;
+        for (j, &byte) in chunk.iter().enumerate() {
+            x |= (byte as u64) << (8 * j);
+        }
+        r.v[2 + i] = x as f64;
+    }
+    r
+}
+
+/// Decode a `str` record's values (tests; the readers do the same).
+pub fn decode_str(v: &[f64]) -> (u32, String) {
+    let (id, len) = (v[0] as u32, v[1] as usize);
+    let mut b = Vec::with_capacity(len);
+    for &x in &v[2..] {
+        let x = x as u64;
+        for j in 0..6 {
+            b.push((x >> (8 * j)) as u8);
+        }
+    }
+    b.truncate(len);
+    (id, String::from_utf8_lossy(&b).into_owned())
+}
+
+/// A live knob changed (the knobs watcher, after it released its own locks).
+pub fn emit_knob(t_raw: f64, name: &str, value: &str, source: u8) {
+    if !enabled() {
+        return;
+    }
+    emit(&KNOB, &[t_raw, intern(name), intern(value), source as f64]);
+}
 
 /// Is the trace on? One relaxed load: call sites that must gather fields
 /// check this first.
@@ -158,7 +278,8 @@ struct Cfg {
     role: String,
     max_bytes: u64,
     keep: usize,
-    header: Vec<u8>,
+    /// The header without the per-file parts (strings, knobs at open).
+    header: serde_json::Value,
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -205,6 +326,7 @@ pub fn init(role: &str, extras: serde_json::Value) {
         .collect();
     let header = serde_json::json!({
         "format": "EVT1",
+        "format_rev": 2,
         "role": role,
         "pid": std::process::id(),
         "clock": "CLOCK_MONOTONIC_RAW ns",
@@ -219,7 +341,7 @@ pub fn init(role: &str, extras: serde_json::Value) {
         role: role.to_string(),
         max_bytes: env_u64("V41_EVTRACE_MAX_MB", 1024) << 20,
         keep: env_u64("V41_EVTRACE_KEEP", 16).max(1) as usize,
-        header: serde_json::to_vec(&header).unwrap_or_default(),
+        header,
     };
     let (tx, rx) = sync_channel::<Rec>(QUEUE_CAP);
     if TX.set(tx).is_err() {
@@ -267,14 +389,44 @@ fn utc_stamp() -> String {
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", sod / 3600, sod % 3600 / 60, sod % 60)
 }
 
-fn open_file(cfg: &Cfg, n: u32) -> std::io::Result<(BufWriter<File>, u64)> {
+/// Open the next file: its header carries the string table and every knob's
+/// value AS OF NOW (a rotated file must not repeat the startup values).
+/// Returns the writer, its size so far, and the string cursor (the table
+/// length the header holds). Called with no lock held: the knob snapshot may
+/// resolve knobs, the string copy takes the interner briefly.
+fn open_file(cfg: &Cfg, n: u32) -> std::io::Result<(BufWriter<File>, u64, usize)> {
     let path = cfg.dir.join(format!("{}-{}-{}-{:03}.evt", cfg.role, utc_stamp(), std::process::id(), n));
+    let strings = strings_from(0);
+    let knobs: serde_json::Map<String, serde_json::Value> = crate::knobs::snapshot()
+        .into_iter()
+        .map(|(k, v, src, _)| (k.to_string(), serde_json::Value::String(format!("{v} ({src:?})"))))
+        .collect();
+    let mut header = cfg.header.clone();
+    if let Some(h) = header.as_object_mut() {
+        h.insert("strings".into(), serde_json::json!(strings));
+        h.insert("knobs_at_open".into(), serde_json::Value::Object(knobs));
+    }
+    let header = serde_json::to_vec(&header).unwrap_or_default();
     let mut w = BufWriter::with_capacity(1 << 20, File::create(&path)?);
     w.write_all(b"EVT1")?;
-    w.write_all(&(cfg.header.len() as u32).to_le_bytes())?;
-    w.write_all(&cfg.header)?;
+    w.write_all(&(header.len() as u32).to_le_bytes())?;
+    w.write_all(&header)?;
     prune(&cfg.dir, &cfg.role, cfg.keep, &path);
-    Ok((w, 8 + cfg.header.len() as u64))
+    Ok((w, 8 + header.len() as u64, strings.len()))
+}
+
+/// Write the strings interned since `cursor` (before the record about to be
+/// written, which may use them).
+fn write_new_strings(w: &mut BufWriter<File>, cursor: &mut usize) -> std::io::Result<u64> {
+    if N_STR.load(Ordering::Acquire) <= *cursor {
+        return Ok(0);
+    }
+    let mut bytes = 0;
+    for s in strings_from(*cursor) {
+        bytes += write_rec(w, &str_rec(*cursor, &s))?;
+        *cursor += 1;
+    }
+    Ok(bytes)
 }
 
 /// Keep only the newest `keep` files of `role`, newest by MODIFICATION time
@@ -316,7 +468,7 @@ fn writer(rx: Receiver<Rec>, cfg: Cfg) {
         ENABLED.store(false, Relaxed);
     };
     let mut n_file = 0u32;
-    let (mut w, mut bytes) = match open_file(&cfg, n_file) {
+    let (mut w, mut bytes, mut cursor) = match open_file(&cfg, n_file) {
         Ok(x) => x,
         Err(e) => return fail(e),
     };
@@ -330,7 +482,7 @@ fn writer(rx: Receiver<Rec>, cfg: Cfg) {
             Err(RecvTimeoutError::Disconnected) => break,
         };
         if let Some(r) = r {
-            match write_rec(&mut w, &r) {
+            match write_new_strings(&mut w, &mut cursor).and_then(|b| write_rec(&mut w, &r).map(|b2| b + b2)) {
                 Ok(b) => {
                     bytes += b;
                     dirty = true;
@@ -369,9 +521,10 @@ fn writer(rx: Receiver<Rec>, cfg: Cfg) {
             }
             n_file += 1;
             match open_file(&cfg, n_file) {
-                Ok((nw, nb)) => {
+                Ok((nw, nb, nc)) => {
                     w = nw;
                     bytes = nb;
+                    cursor = nc;
                 }
                 Err(e) => return fail(e),
             }
@@ -485,8 +638,8 @@ mod tests {
     fn record_round_trip_bytes() {
         let dir = std::env::temp_dir().join(format!("evtrace-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = Cfg { dir: dir.clone(), role: "t".into(), max_bytes: 1 << 30, keep: 2, header: b"{}".to_vec() };
-        let (mut w, _) = open_file(&cfg, 0).unwrap();
+        let cfg = Cfg { dir: dir.clone(), role: "t".into(), max_bytes: 1 << 30, keep: 2, header: serde_json::json!({ "format": "EVT1" }) };
+        let (mut w, _, cursor) = open_file(&cfg, 0).unwrap();
         let mut r = Rec { kind: 7, n: 3, v: [0.0; MAX_FIELDS] };
         r.v[..3].copy_from_slice(&[1.5, f64::NAN, 1e15]);
         assert_eq!(write_rec(&mut w, &r).unwrap(), 4 + 24);
@@ -495,8 +648,14 @@ mod tests {
         let f = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
         let b = std::fs::read(&f).unwrap();
         assert_eq!(&b[..4], b"EVT1");
-        assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 2);
-        let p = &b[10..];
+        let hlen = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        let h: serde_json::Value = serde_json::from_slice(&b[8..8 + hlen]).unwrap();
+        // format_rev 2: the string table and the knobs as of the file's open.
+        let strings = h["strings"].as_array().unwrap();
+        assert_eq!(strings.len(), cursor);
+        assert_eq!(strings[0], "<overflow>");
+        assert!(h["knobs_at_open"].is_object());
+        let p = &b[8 + hlen..];
         assert_eq!(u16::from_le_bytes([p[0], p[1]]), 7);
         assert_eq!(u16::from_le_bytes([p[2], p[3]]), 3);
         assert_eq!(f64::from_le_bytes(p[4..12].try_into().unwrap()), 1.5);
@@ -512,6 +671,72 @@ mod tests {
         let left = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(left, 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A string interned after the file opened reaches the file as a `str`
+    /// record BEFORE the record written next (which may use it).
+    #[test]
+    fn new_strings_precede_the_next_record() {
+        let dir = std::env::temp_dir().join(format!("evtrace-str-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Cfg { dir: dir.clone(), role: "s".into(), max_bytes: 1 << 30, keep: 2, header: serde_json::json!({}) };
+        let (mut w, _, mut cursor) = open_file(&cfg, 0).unwrap();
+        let id = intern("evtrace-test-late-name") as usize;
+        assert!(id >= cursor, "a fresh string is past the header's table");
+        let mut r = Rec { kind: KNOB.id, n: 4, v: [f64::NAN; MAX_FIELDS] };
+        r.v[..4].copy_from_slice(&[1.0, id as f64, 0.0, 3.0]);
+        write_new_strings(&mut w, &mut cursor).unwrap();
+        write_rec(&mut w, &r).unwrap();
+        w.flush().unwrap();
+        drop(w);
+        let f = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let b = std::fs::read(&f).unwrap();
+        let hlen = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        let mut off = 8 + hlen;
+        let mut seen_name_at = None;
+        let mut knob_at = None;
+        let mut i = 0;
+        while off + 4 <= b.len() {
+            let kind = u16::from_le_bytes([b[off], b[off + 1]]);
+            let n = u16::from_le_bytes([b[off + 2], b[off + 3]]) as usize;
+            let v: Vec<f64> = (0..n).map(|j| f64::from_le_bytes(b[off + 4 + 8 * j..off + 12 + 8 * j].try_into().unwrap())).collect();
+            if kind == STR.id {
+                let (sid, text) = decode_str(&v);
+                if text == "evtrace-test-late-name" {
+                    assert_eq!(sid as usize, id);
+                    seen_name_at = Some(i);
+                }
+            } else if kind == KNOB.id {
+                knob_at = Some(i);
+            }
+            off += 4 + 8 * n;
+            i += 1;
+        }
+        assert!(seen_name_at.unwrap() < knob_at.unwrap(), "the str record precedes its user");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn str_records_round_trip_and_never_hold_nan_patterns() {
+        let long = "x".repeat(STR_MAX_BYTES);
+        for s in ["", "a", "abcdef", "abcdefg", "dgpu.attn_compute", "ünïcødé ✓", long.as_str()] {
+            let r = str_rec(7, s);
+            assert!(r.v[..r.n as usize].iter().all(|x| x.is_finite()), "{s:?}");
+            let (id, back) = decode_str(&r.v[..r.n as usize]);
+            assert_eq!((id, back.as_str()), (7, s));
+        }
+    }
+
+    #[test]
+    fn intern_is_stable_and_cuts_long_names_at_a_char_boundary() {
+        let a = intern("evtrace-test-a");
+        assert_eq!(intern("evtrace-test-a"), a);
+        assert_ne!(intern("evtrace-test-b"), a);
+        let long = "é".repeat(STR_MAX_BYTES);
+        let id = intern(&long) as usize;
+        let t = strings_from(id);
+        assert!(t[0].len() <= STR_MAX_BYTES && long.starts_with(&t[0]));
+        assert_eq!(strings_from(0)[0], "<overflow>");
     }
 
     #[test]
