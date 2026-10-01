@@ -42,7 +42,8 @@ pub fn enabled() -> bool {
     *ON
 }
 
-/// `V41_MS_DSPARK_RING=solo`: ring-write only the speculating stream's rows.
+/// `V41_MS_DSPARK_RING=solo`: ring-write only a LONE stream's rows (every step,
+/// drafted or not); steps with 2+ live streams write none.
 /// Default `all`: every live stream's kept rows go into its ring every step
 /// (about one `main_proj` + 3 `attn_kv` matvecs on the iGPU per row), so a
 /// stream that becomes the lone stream drafts from a dense window instead of

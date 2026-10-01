@@ -1574,7 +1574,13 @@ impl Sched {
         }
         // Kept rows into the drafter rings; the last one feeds the next draft.
         if let (Some(dsp), Some(m), Some(caps)) = (self.dsp.as_mut(), state.mtp.as_mut(), caps.as_ref()) {
-            let write = dsp.ring_all() || spec;
+            // A LONE stream's ring is written every step, drafted or not: it is
+            // the stream that drafts. Writing only on speculating steps
+            // (2026-10-01 09:54-10:05) left a gap of every plain step the
+            // draft-or-not gate took while backing off; the next probe drafted
+            // from that stale window, accepted less, and extended the back-off
+            // (73% of lone steps plain). `solo` only skips the 2+-stream steps.
+            let write = dsp.ring_all() || self.streams.len() == 1;
             for (i, s) in self.streams.iter().enumerate() {
                 if done.iter().any(|&(d, _)| d == i) {
                     continue;
