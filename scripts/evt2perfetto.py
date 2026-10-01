@@ -71,8 +71,11 @@ def records(path, lo=-math.inf, hi=math.inf, raw=False, stop=math.inf, strings=N
     `stop`. Streams the file (64 MB chunks, POSIX_FADV_DONTNEED after each).
     With `strings` (a dict), every `str` record read (whatever its position)
     is decoded into it: `str` records have no time, so a window never keeps
-    them."""
+    them. A Tier B dump (`"tier": "B"`) is in BATCH order, not time order:
+    `stop` is ignored there (a newer thread's batch can precede an older one)."""
     hlen, header = header_of(path)
+    if header.get('tier') == 'B':
+        stop = math.inf
     kinds = {k['id']: (k['name'], k['fields']) for k in header['kinds']}
     tidx = {kid: [i for i, n in enumerate(fs) if TFIELD.match(n)] for kid, (_, fs) in kinds.items()}
     fd = os.open(path, os.O_RDONLY)

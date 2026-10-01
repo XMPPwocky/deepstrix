@@ -380,7 +380,7 @@ pub fn init(role: &str, extras: serde_json::Value) {
         "extras": extras,
     });
     let _ = BASE_HEADER.set(header.clone());
-    let ring_dir = PathBuf::from(format!("{}-ring", dir.display()));
+    let tier_a_dir = dir.clone();
     let cfg = Cfg {
         dir,
         role: role.to_string(),
@@ -398,7 +398,7 @@ pub fn init(role: &str, extras: serde_json::Value) {
         return;
     }
     ENABLED.store(true, Relaxed);
-    super::evtrace_ring::init(role, ring_dir);
+    super::evtrace_ring::init(role, &tier_a_dir);
     let period = env_u64("V41_EVTRACE_SYS_MS", 100);
     if period > 0 {
         let _ = std::thread::Builder::new()
