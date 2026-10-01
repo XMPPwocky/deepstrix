@@ -154,6 +154,8 @@ struct Stats {
     explored: u64,
     /// Exploration draws of K = 0: plain steps, so not in `blocks` / `k_hist`.
     explored_k0: u64,
+    /// Exploration draws by K (K = 0 included).
+    explored_hist: [u64; MTP_BLOCK + 1],
 }
 
 pub struct MsDspark {
@@ -219,6 +221,7 @@ impl MsDspark {
                 if two_from.is_some_and(|m| rows >= m) { two[rows - 1] } else { one[rows - 1] }
             };
             if let Some(k) = explore_k(&mut self.rng, cap, explore_p(), weight) {
+                self.stats.explored_hist[k.min(MTP_BLOCK)] += 1;
                 // A K = 0 draw runs as a plain step (no `record`): counted apart.
                 if k == 0 {
                     self.stats.explored_k0 += 1;
@@ -545,6 +548,7 @@ impl MsDspark {
                 two_lane_blocks = s.two_lane,
                 explored = s.explored,
                 explored_k0 = s.explored_k0,
+                explored_hist = ?s.explored_hist,
                 keep_ms = format!("{:.2}", s.keep_ms / (s.keeps as f64).max(1.0)),
                 ring_errors = s.ring_errors,
                 draft_est_ms = format!("{:.1}", self.cost.draft_ms()),
@@ -742,19 +746,26 @@ fn explore_rng() -> StdRng {
     }
 }
 
-/// With probability `p`, a K in `0..=cap` drawn by STALENESS (owner, 10-01:
-/// "focus exploration on cells we haven't explored in a while"): K feeds one
-/// cost cell, and is picked with probability proportional to `1 / (1 + w)`,
-/// `w = weight(K)` that cell's time-aged sample weight. Cells nobody has
-/// sampled lately -- an idle regime's rows, a row count the policy avoids, a
-/// cell left behind by a restart (e.g. the 1-row cell held at its cold-start
-/// mean while every block drafted) -- get most draws; well-measured ones
-/// (w ~ 50-250) a trickle, never none. Still epsilon-exploration (`explore_p`
-/// sets how often); `weight` reads only past samples, so the draw is exact
-/// under the stopping rule.
+/// With probability `p`, a K in `0..=cap`: half the draws UNIFORM, half by
+/// STALENESS (owner, 10-01: "focus exploration on cells we haven't explored in
+/// a while"). K feeds one cost cell, and a staleness draw picks it with
+/// probability proportional to `1 / (1 + w)`, `w = weight(K)` that cell's
+/// time-aged sample weight: cells nobody has sampled lately -- an idle
+/// regime's rows, a row count the policy avoids, a cell left behind by a
+/// restart (the 1-row cell held at its cold-start mean while every block
+/// drafted) -- get most of those. The uniform half is the floor (review round
+/// 10): a cell the policy has just ABANDONED while its weight is still high
+/// (say ~250, inflated by a slow spell) gets almost no staleness draws until
+/// its weight has decayed for a few hundred lone steps, and cells do not
+/// revert their mean -- without the floor its stale estimate could stand for
+/// minutes. Still epsilon-exploration (`explore_p` sets how often); `weight`
+/// reads only past samples, so the draw is exact under the stopping rule.
 pub fn explore_k(rng: &mut impl Rng, cap: usize, p: f64, weight: impl Fn(usize) -> f64) -> Option<usize> {
     if cap == 0 || p <= 0.0 || rng.gen::<f64>() >= p {
         return None;
+    }
+    if rng.gen::<bool>() {
+        return Some(rng.gen_range(0..=cap));
     }
     let scores: Vec<f64> = (0..=cap).map(|k| 1.0 / (1.0 + weight(k).max(0.0))).collect();
     let mut x = rng.gen::<f64>() * scores.iter().sum::<f64>();
@@ -1375,11 +1386,14 @@ mod tests {
         }
         let rate = hits as f64 / n as f64;
         assert!((rate - p).abs() < 0.004, "rate {rate}");
-        // Shares follow 1 / (1 + w): K=0 ~ 1, K=5 ~ 0.5, the measured ~ 0.0099 each.
+        // Shares: half uniform (1/6 each) + half by 1 / (1 + w) (K=0 ~ 1, K=5 ~
+        // 0.5, the measured ~ 0.0099 each) -- every K keeps >= 1/12 (the floor).
         let total: f64 = w.iter().map(|x| 1.0 / (1.0 + x)).sum();
         for (k, &c) in hist.iter().enumerate() {
-            let want = hits as f64 * (1.0 / (1.0 + w[k])) / total;
-            assert!((c as f64 - want).abs() < 0.25 * want + 6.0, "K={k}: {c} vs {want:.0} ({hist:?})");
+            let share = 0.5 / 6.0 + 0.5 * (1.0 / (1.0 + w[k])) / total;
+            let want = hits as f64 * share;
+            assert!((c as f64 - want).abs() < 0.15 * want + 6.0, "K={k}: {c} vs {want:.0} ({hist:?})");
+            assert!(c as f64 >= 0.8 * hits as f64 / 12.0, "K={k} below the uniform floor: {c} ({hist:?})");
         }
         assert!(hist.iter().all(|&c| c > 0), "every K stays possible: {hist:?}");
         // Equal weights: uniform. Never past the cap; nothing without room; off at p = 0.
