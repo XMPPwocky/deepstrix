@@ -150,8 +150,10 @@ struct Stats {
     keep_ms: f64,
     /// Async ring writes that failed (the slot was reset).
     ring_errors: u64,
-    /// Blocks whose K was a uniform exploration draw (`explore_k`).
+    /// Blocks whose K was a uniform exploration draw (`explore_k`), K >= 1.
     explored: u64,
+    /// Exploration draws of K = 0: plain steps, so not in `blocks` / `k_hist`.
+    explored_k0: u64,
 }
 
 pub struct MsDspark {
@@ -172,7 +174,8 @@ pub struct MsDspark {
     calib: Calib,
     stats: Stats,
     since: Instant,
-    /// Exploration draws (`explore_k`).
+    /// Exploration draws (`explore_k`); `V41_MS_DSPARK_EXPLORE_SEED` for a
+    /// reproducible replay, else entropy.
     rng: StdRng,
 }
 
@@ -195,7 +198,7 @@ impl MsDspark {
         let cost = StepCost::from_env();
         let two_from = std::env::var("V41_MS_PIPELINE_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize).max(2);
         let cost2 = StepCost::from_env_two_lane(two_from);
-        Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: StdRng::from_entropy() })
+        Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng() })
     }
 
     /// K for the lone stream's drafted block (plan section 6): the stopping
@@ -207,7 +210,12 @@ impl MsDspark {
         if fixed_k().is_none() {
             // Drawn before `conf` is read (block comment at `explore_p`).
             if let Some(k) = explore_k(&mut self.rng, cap, explore_p()) {
-                self.stats.explored += 1;
+                // A K = 0 draw runs as a plain step (no `record`): counted apart.
+                if k == 0 {
+                    self.stats.explored_k0 += 1;
+                } else {
+                    self.stats.explored += 1;
+                }
                 return k;
             }
         }
@@ -219,7 +227,12 @@ impl MsDspark {
     /// joins the one it ran in. Fits forget by time (lone steps), not by their
     /// own samples: a fit the policy stops using must not keep stale data --
     /// e.g. a cold-start level -- for good (10-01: the one-lane line froze at
-    /// 135 + 15/row while every block ran two lanes).
+    /// 135 + 15/row while every block ran two lanes). "Time" = LONE steps:
+    /// multi-stream steps age nothing, so a lone stream after a long
+    /// multi-stream stretch starts from the fits it left (aging and exploration
+    /// resume at once). The regime the policy does not use thus stays YOUNG for
+    /// good (~8 exploration samples per memory: a strong level prior and the
+    /// tight clamp) -- intended: that is what undoes a gross trap either way.
     fn observe(&mut self, two_lane: bool, rows: usize, ms: f64) {
         self.cost.age();
         self.cost2.age();
@@ -517,6 +530,7 @@ impl MsDspark {
                 cost2_ms = format!("{:.1}+{:.1}/row", self.cost2.a, self.cost2.b),
                 two_lane_blocks = s.two_lane,
                 explored = s.explored,
+                explored_k0 = s.explored_k0,
                 keep_ms = format!("{:.2}", s.keep_ms / (s.keeps as f64).max(1.0)),
                 ring_errors = s.ring_errors,
                 draft_est_ms = format!("{:.1}", self.cost.draft_ms()),
@@ -698,6 +712,14 @@ fn explore_p() -> f64 {
     *P
 }
 
+/// `V41_MS_DSPARK_EXPLORE_SEED` (a u64) seeds the exploration draws; else entropy.
+fn explore_rng() -> StdRng {
+    match std::env::var("V41_MS_DSPARK_EXPLORE_SEED").ok().and_then(|v| v.parse().ok()) {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_entropy(),
+    }
+}
+
 /// With probability `p`, a uniformly random K in `0..=cap` (`explore_p`).
 pub fn explore_k(rng: &mut impl Rng, cap: usize, p: f64) -> Option<usize> {
     (cap > 0 && p > 0.0 && rng.gen::<f64>() < p).then(|| rng.gen_range(0..=cap))
@@ -825,7 +847,9 @@ impl StepCost {
     }
 
     /// A lone stream's step of `rows` rows took `ms` (draft excluded): `age`
-    /// then `add`, for a fit that sees every step itself.
+    /// then `add`. Tests only: production goes through `MsDspark::observe`,
+    /// which ages BOTH fits once per step (calling this there would age twice).
+    #[cfg(test)]
     pub fn observe_step(&mut self, rows: usize, ms: f64) {
         self.age();
         self.add(rows, ms);
