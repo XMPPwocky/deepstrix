@@ -214,6 +214,19 @@ fn prefill_hot_active(
 /// Kernels index by `b`, not by the allocation size, so an oversized
 /// batch would silently overrun the B-scaled buffers — refuse it up
 /// front.
+fn check_lane_cuts(who: &str, slots: &[u32], cuts: &[usize]) -> eyre::Result<()> {
+    // A stream's rows (DSpark: next token + drafts) stay in ONE lane: row `j`
+    // of a stream gets its tables from its offset in the lane's slot list
+    // (`KvArena::tables`), and the compressor state of a group written by one
+    // lane is not ordered before the other lane's pool (plan 3.5).
+    for &c in cuts {
+        if c > 0 && c < slots.len() && slots[c - 1] == slots[c] {
+            return Err(eyre!("{who}: lane cut at row {c} splits slot {}'s rows", slots[c]));
+        }
+    }
+    Ok(())
+}
+
 fn check_scratch_rows(
     who: &str,
     b: usize,
@@ -2787,8 +2800,12 @@ impl HeterogeneousEngine {
     /// `RowLayout::Arena`. `input_hcs[i]` is `embed(tokens[i])` broadcast to
     /// HC_DIM (as for the prompt drivers); `engram_rows` one flattened
     /// `[b * ENGRAM_IN]` buffer per Engram layer, in `ENGRAM_LAYERS` order,
-    /// rows in slot order. Compacts any stream whose raw region is full first,
-    /// uploads the step's tables, runs the 40 layers, advances every stream.
+    /// rows in slot order. A stream may run several consecutive rows (its next
+    /// token and DSpark draft rows at the following positions; `KvArena::
+    /// tables`). Compacts any stream whose raw region cannot take its rows,
+    /// uploads the step's tables, runs the 40 layers. The counters do NOT
+    /// move: the caller `KvArena::accept`s each stream's kept rows (1 for a
+    /// plain decode row).
     /// On return `bd.residual` holds the post-last-layer HC per row and
     /// `bd.hc_pre_carry` the carries: `head_rows(ds, bd, b, weights)` turns
     /// them into `[b * N_VOCAB]` logits.
@@ -2828,20 +2845,13 @@ impl HeterogeneousEngine {
             }
         }
         check_scratch_rows("forward_step_arena", b, bd, bi, sd, si)?;
-        if bd.mtp_capture_rows > 0 {
-            return Err(eyre!("forward_step_arena: MTP capture is not supported on arena rows (v1)"));
-        }
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
         arena.state.restore_compressor_lending();
 
         // A full raw region moves its window down before the tables are
         // derived (the tables carry the append slot).
-        for &slot in slots {
-            if arena.needs_compaction(slot) {
-                arena.compact_raw(slot, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
-            }
-        }
+        arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         let tables = arena.tables(slots)?;
         dev.upload(&tables, &self.dgpu.compute)?;
 
@@ -2879,9 +2889,6 @@ impl HeterogeneousEngine {
             std::mem::swap(&mut bd.residual, &mut bd.residual_next);
         }
         self.dgpu.compute.synchronize()?;
-        for &slot in slots {
-            arena.advance(slot)?;
-        }
         Ok(tables)
     }
 
@@ -2930,19 +2937,13 @@ impl HeterogeneousEngine {
         }
         let b_a = b.div_ceil(2);
         let b_b = b - b_a;
+        check_lane_cuts("forward_step_arena_pipelined", slots, &[b_a])?;
         check_scratch_rows("forward_step_arena_pipelined", b_a, bd_a, bi_a, sd, si)?;
         check_scratch_rows("forward_step_arena_pipelined", b_b, bd_b, bi_b, sd, si)?;
-        if bd_a.mtp_capture_rows > 0 || bd_b.mtp_capture_rows > 0 {
-            return Err(eyre!("forward_step_arena_pipelined: MTP capture is not supported on arena rows"));
-        }
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
         arena.state.restore_compressor_lending();
-        for &slot in slots {
-            if arena.needs_compaction(slot) {
-                arena.compact_raw(slot, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
-            }
-        }
+        arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         let (slots_a, slots_b) = slots.split_at(b_a);
         let (tokens_a, tokens_b) = tokens.split_at(b_a);
         let tables_a = arena.tables(slots_a)?;
@@ -3072,9 +3073,6 @@ impl HeterogeneousEngine {
         self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_b)?;
         std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
         self.dgpu.compute.synchronize()?;
-        for &slot in slots {
-            arena.advance(slot)?;
-        }
         Ok((tables_a, tables_b))
     }
 
@@ -3122,21 +3120,15 @@ impl HeterogeneousEngine {
             let sz = b / n + usize::from(i < b % n);
             offs.push(offs[i] + sz);
         }
+        check_lane_cuts("forward_step_arena_lanes", slots, &offs)?;
         for (i, (bd, bi, _)) in lanes.iter().enumerate() {
             let bl = offs[i + 1] - offs[i];
             check_scratch_rows("forward_step_arena_lanes", bl, bd, bi, sd, si)?;
-            if bd.mtp_capture_rows > 0 {
-                return Err(eyre!("forward_step_arena_lanes: MTP capture is not supported on arena rows"));
-            }
         }
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
         arena.state.restore_compressor_lending();
-        for &slot in slots {
-            if arena.needs_compaction(slot) {
-                arena.compact_raw(slot, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
-            }
-        }
+        arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         let mut tables: Vec<RowTables> = Vec::with_capacity(n);
         for (i, (bd, _, dev)) in lanes.iter_mut().enumerate() {
             let (lo, hi) = (offs[i], offs[i + 1]);
@@ -3207,9 +3199,6 @@ impl HeterogeneousEngine {
             post!(i, last);
         }
         self.dgpu.compute.synchronize()?;
-        for &slot in slots {
-            arena.advance(slot)?;
-        }
         Ok(tables)
     }
 
@@ -3273,21 +3262,15 @@ impl HeterogeneousEngine {
             let sz = b / n + usize::from(i < b % n);
             offs.push(offs[i] + sz);
         }
+        check_lane_cuts("forward_step_arena_ready_first", slots, &offs)?;
         for (i, (bd, bi, _)) in lanes.iter().enumerate() {
             let bl = offs[i + 1] - offs[i];
             check_scratch_rows("forward_step_arena_ready_first", bl, bd, bi, sd, si)?;
-            if bd.mtp_capture_rows > 0 {
-                return Err(eyre!("forward_step_arena_ready_first: MTP capture is not supported on arena rows"));
-            }
         }
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
         arena.state.restore_compressor_lending();
-        for &slot in slots {
-            if arena.needs_compaction(slot) {
-                arena.compact_raw(slot, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
-            }
-        }
+        arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         let mut tables: Vec<RowTables> = Vec::with_capacity(n);
         for (i, (bd, _, dev)) in lanes.iter_mut().enumerate() {
             let (lo, hi) = (offs[i], offs[i + 1]);
@@ -3414,9 +3397,6 @@ impl HeterogeneousEngine {
         }
         READY_FIRST_SPINS.fetch_add(spins, std::sync::atomic::Ordering::Relaxed);
         self.dgpu.compute.synchronize()?;
-        for &slot in slots {
-            arena.advance(slot)?;
-        }
         Ok(tables)
     }
 
@@ -3548,10 +3528,8 @@ impl HeterogeneousEngine {
                     tokens.len()
                 ));
             }
-            if vis.is_some() || ced != CedMode::Exact || bd.mtp_capture_rows > 0 {
-                return Err(eyre!(
-                    "L{layer}: RowLayout::Arena is text-only, CedMode::Exact, no MTP capture (v1)"
-                ));
+            if vis.is_some() || ced != CedMode::Exact {
+                return Err(eyre!("L{layer}: RowLayout::Arena is text-only, CedMode::Exact (v1)"));
             }
             if t.stores.len() != d.stores.len() || (dlw.ratio > 0 && arena_store.map_or(true, |si| si >= t.stores.len())) {
                 return Err(eyre!("L{layer}: arena tables have no store for this layer"));
@@ -3586,6 +3564,9 @@ impl HeterogeneousEngine {
         // DSpark: the drafter eats the hc-collapsed residual ENTERING layers
         // 37/38/39. A batched verify does not know until AFTER it runs which
         // row becomes the next head, so capture EVERY row and select later.
+        // Arena rows (multistream DSpark) are captured the same way, indexed
+        // by the row's place in THIS lane's batch (`mtp_captured_pos0` means
+        // nothing there: the rows belong to different streams).
         // Stored slot-major, `[3][MTP_CAP_ROWS][N_EMBD]`, because
         // `hc_weighted.launch_batched` writes one contiguous `[b, n_embd]`
         // block per call.
@@ -6408,8 +6389,8 @@ impl HeterogeneousEngine {
         // own wrap path compacts later when the append region fills.
         if arena.is_some() {
             // ARENA: the windows and store counters are the KvArena's; the
-            // caller advances every row's stream after the step
-            // (`KvArena::advance`) and compacts a full region before it.
+            // caller keeps each stream's rows after the step
+            // (`KvArena::accept`) and compacts a full region before it.
         } else if speculative_append() {
             // Keep the SWA invariant even before the caller's rollback: the
             // appended speculative rows live past the window in the oversized

@@ -7,6 +7,8 @@ pub mod embed;
 pub mod engine_worker;
 #[cfg(feature = "v41")]
 pub mod multistream;
+#[cfg(feature = "v41")]
+pub mod ms_dspark;
 pub mod expert_stats;
 pub mod openai;
 pub mod prompt;

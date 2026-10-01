@@ -56,6 +56,23 @@ pub const ARENA_RAW_SLACK: usize = 128;
 /// Raw rows per slot per layer (`raw_region_base`, `needs_compaction`).
 pub const ARENA_RAW_ROWS: usize = SWA_WINDOW as usize + ARENA_RAW_SLACK;
 
+/// Most rows ONE stream may run in one step: its next token plus DSpark draft
+/// rows (docs/v41/DSPARK_ARENA_PLAN.md 3.1-3.2). Sizes the per-slot
+/// accumulator blocks (`CompStore::blocks_per_slot`).
+pub const ARENA_ROWS_PER_STREAM: u32 = 8;
+
+/// Accumulator blocks per slot in a store of `ratio`: one per compressor
+/// group a step of `ARENA_ROWS_PER_STREAM` rows can touch. Row `j` at `q =
+/// pos + j` state-writes block `q / ratio - pos / ratio` (row `q % ratio`), so
+/// the rows of one stream never share a block unless they share a group, and a
+/// firing row pools a block that holds its whole group: positions written
+/// earlier in the same launch, or (block 0) carried from the previous step.
+/// Block 0 is the only one that lives across steps; `accept` moves the live
+/// partial group there.
+fn blocks_per_slot(ratio: u32) -> u32 {
+    1 + (ARENA_ROWS_PER_STREAM - 1).div_ceil(ratio)
+}
+
 /// Index into `KvArena::stores` / `RowTables::stores` of the store `layer`
 /// reads (its KV source's), `None` for the dense layers.
 pub fn store_index_of(layer: usize) -> Option<usize> {
@@ -97,6 +114,33 @@ pub struct StreamKv {
     pub n_raw_dec: u32,
     /// One region per KV-source store, in `KV_SOURCE_LAYERS` order.
     pub comp: Vec<CompRegion>,
+}
+
+impl StreamKv {
+    /// The counters after appending position `pos` (`ratios` in store
+    /// order): the raw windows slide once full, a store whose boundary fires
+    /// at `pos` gains a comp row and a key. `KvArena::advance` and the
+    /// per-row tables of a multi-row step both use this, so row `j` of a step
+    /// sees exactly what a one-row step would after `j` advances.
+    fn step(&mut self, ratios: impl IntoIterator<Item = u32>) {
+        if self.n_raw < SWA_WINDOW {
+            self.n_raw += 1;
+        } else {
+            self.raw_off += 1;
+        }
+        if self.n_raw_dec < SWA_WINDOW {
+            self.n_raw_dec += 1;
+        } else {
+            self.raw_off_dec += 1;
+        }
+        for (r, ratio) in self.comp.iter_mut().zip(ratios) {
+            if (self.pos + 1) % ratio == 0 {
+                r.n_comp += 1;
+                r.n_index_comp += 1;
+            }
+        }
+        self.pos += 1;
+    }
 }
 
 /// First-fit row allocator with a sorted, coalesced free list.
@@ -241,6 +285,17 @@ pub struct CompStore {
     pub width: u32,
     pub rows_cap: u32,
     pub free: RowFreeList,
+    /// Accumulator blocks (`ratio * width` floats each) per slot; slot `s`
+    /// owns blocks `[s * blocks_per_slot, (s + 1) * blocks_per_slot)` and its
+    /// carried state is the first (`blocks_per_slot` fn).
+    pub blocks_per_slot: u32,
+}
+
+impl CompStore {
+    /// First accumulator block of `slot` (the one carried across steps).
+    fn slot_block(&self, slot: u32) -> u32 {
+        slot * self.blocks_per_slot
+    }
 }
 
 /// Per-row tables for one step, in the order the rows were given. Host
@@ -359,7 +414,7 @@ pub struct KvArena {
     /// The buffers, as the layer driver takes them (module doc). Layer `l`:
     /// `kv_cache` = `n_slots * ARENA_RAW_ROWS * N_HEAD_DIM` f16; KV-source
     /// layers: `compressor = Some(..)` with `state_kv`/`state_score` =
-    /// `[n_slots, ratio * width]` f32, `comp_kv = F16([rows_cap, width])`,
+    /// `[n_slots * blocks_per_slot, ratio * width]` f32, `comp_kv = F16([rows_cap, width])`,
     /// `index_k = Some([rows_cap, E2M1_KEY_ROW_BYTES])`. Counters stay 0.
     pub state: HetModelState,
     pub stores: Vec<CompStore>,
@@ -399,7 +454,8 @@ impl KvArena {
                 }
                 let width = N_HEAD_DIM;
                 let comp_rows_cap = cap_of(ratio);
-                let n_state = (n_slots as usize) * (ratio * width) as usize;
+                let bps = blocks_per_slot(ratio);
+                let n_state = (n_slots * bps) as usize * (ratio * width) as usize;
                 let mut state_kv = DeviceBuffer::<f32>::new(dgpu.id, n_state)?;
                 let mut state_score = DeviceBuffer::<f32>::new(dgpu.id, n_state)?;
                 state_kv.copy_from_host(&vec![0f32; n_state])?;
@@ -410,6 +466,7 @@ impl KvArena {
                     width,
                     rows_cap: comp_rows_cap,
                     free: RowFreeList::new(comp_rows_cap),
+                    blocks_per_slot: bps,
                 });
                 Some(HetCompressorState {
                     state_kv,
@@ -540,9 +597,30 @@ impl KvArena {
     /// exact condition `tables` enforces: every store whose compressor boundary
     /// fires at `pos` has a free row left.
     pub fn can_step(&self, slot: u32) -> bool {
-        self.stream(slot).is_some_and(|s| {
-            s.comp.iter().zip(&self.stores).all(|(r, st)| (s.pos + 1) % st.ratio != 0 || r.n_comp < r.cap)
-        })
+        self.can_step_rows(slot, 1)
+    }
+
+    /// `can_step` for `rows` consecutive positions in one step (the next token
+    /// plus `rows - 1` draft rows): every boundary among them has a free row.
+    /// The raw region is not checked: a full one is compacted before the
+    /// tables are built (`compact_for_step`).
+    pub fn can_step_rows(&self, slot: u32, rows: u32) -> bool {
+        let Some(s) = self.stream(slot) else { return false };
+        if rows == 0 || rows > ARENA_ROWS_PER_STREAM {
+            return false;
+        }
+        let mut cur = s.clone();
+        for _ in 0..rows {
+            if cur.comp.iter().zip(&self.stores).any(|(r, st)| (cur.pos + 1) % st.ratio == 0 && r.n_comp >= r.cap) {
+                return false;
+            }
+            cur.step(self.ratios());
+        }
+        true
+    }
+
+    fn ratios(&self) -> impl Iterator<Item = u32> + '_ {
+        self.stores.iter().map(|st| st.ratio)
     }
 
     /// Would `reserve(ctx_cap)` fit, after a compaction if need be, with
@@ -810,9 +888,10 @@ impl KvArena {
                 return Err(eyre!("kv arena: L{l} source accumulator has {} floats, arena block {block}", scs.state_kv.len()));
             }
             {
-                let mut dv = dcs.state_kv.slice_view_mut(slot as usize * block, block);
+                let at = st.slot_block(slot) as usize * block;
+                let mut dv = dcs.state_kv.slice_view_mut(at, block);
                 dv.copy_from_buffer_async(&scs.state_kv.slice_view(0, block), stream)?;
-                let mut dv = dcs.state_score.slice_view_mut(slot as usize * block, block);
+                let mut dv = dcs.state_score.slice_view_mut(at, block);
                 dv.copy_from_buffer_async(&scs.state_score.slice_view(0, block), stream)?;
             }
             comp.push(CompRegion { n_comp: scs.n_comp, n_index_comp: scs.n_index_comp, ..region });
@@ -884,10 +963,11 @@ impl KvArena {
                 return Err(eyre!("kv arena: L{l} export target accumulator has {} floats, arena block {block}", dcs.state_kv.len()));
             }
             {
+                let at = st.slot_block(slot) as usize * block;
                 let mut dv = dcs.state_kv.slice_view_mut(0, block);
-                dv.copy_from_buffer_async(&scs.state_kv.slice_view(slot as usize * block, block), stream)?;
+                dv.copy_from_buffer_async(&scs.state_kv.slice_view(at, block), stream)?;
                 let mut dv = dcs.state_score.slice_view_mut(0, block);
-                dv.copy_from_buffer_async(&scs.state_score.slice_view(slot as usize * block, block), stream)?;
+                dv.copy_from_buffer_async(&scs.state_score.slice_view(at, block), stream)?;
             }
             dcs.n_comp = r.n_comp;
             dcs.n_index_comp = r.n_index_comp;
@@ -954,17 +1034,38 @@ impl KvArena {
         slot * ARENA_RAW_ROWS as u32
     }
 
-    /// The step's tables for `slots` (one row per slot, in order). Every row is
-    /// at its stream's `pos`; draft rows (K>1) are the caller's business.
+    /// The step's tables for `slots`, one row per entry, in order. A stream
+    /// may run several CONSECUTIVE rows (its next token, then draft rows at the
+    /// following positions; `ARENA_ROWS_PER_STREAM` at most): row `j` of a run
+    /// gets the tables a one-row step would after `j` advances (`StreamKv::
+    /// step`), so it attends to the rows before it in the same step and to
+    /// nothing after it. Its accumulator rows go to the block of its own
+    /// compressor group (`blocks_per_slot`). A slot that reappears after
+    /// another slot's rows is refused. The counters do not move: the caller
+    /// `accept`s each stream's kept rows after the step.
     pub fn tables(&self, slots: &[u32]) -> eyre::Result<RowTables> {
         let mut t = RowTables { stores: vec![StoreTables::default(); self.stores.len()], ..Default::default() };
+        let mut cur: Option<(u32, StreamKv, u32)> = None; // (slot, counters at row j, pre-step pos)
+        let mut j = 0u32;
         for (b, &slot) in slots.iter().enumerate() {
-            // K=1 in v1: one row per stream (two rows of one stream would
-            // write the same accumulator block / append slot in one launch).
-            if slots[..b].contains(&slot) {
-                return Err(eyre!("kv arena: slot {slot} appears twice in the step"));
+            match cur.as_mut() {
+                Some((s0, c, _)) if *s0 == slot => {
+                    c.step(self.stores.iter().map(|st| st.ratio));
+                    j += 1;
+                    if j >= ARENA_ROWS_PER_STREAM {
+                        return Err(eyre!("kv arena: slot {slot} runs more than {ARENA_ROWS_PER_STREAM} rows in one step"));
+                    }
+                }
+                _ => {
+                    if slots[..b].contains(&slot) {
+                        return Err(eyre!("kv arena: slot {slot} appears twice in the step, not in consecutive rows"));
+                    }
+                    let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
+                    cur = Some((slot, s.clone(), s.pos));
+                    j = 0;
+                }
             }
-            let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
+            let (_, s, pos0) = cur.as_ref().expect("set above");
             // The append would land past the slot's raw region, in the NEXT
             // slot's window (the layer buffer's own bound would not catch it).
             if (s.raw_off + s.n_raw) as usize >= ARENA_RAW_ROWS || (s.raw_off_dec + s.n_raw_dec) as usize >= ARENA_RAW_ROWS {
@@ -981,11 +1082,12 @@ impl KvArena {
             for (si, st) in self.stores.iter().enumerate() {
                 let r = s.comp[si];
                 let ts = &mut t.stores[si];
+                let block = st.slot_block(slot) + (s.pos / st.ratio - pos0 / st.ratio);
                 ts.n_comp_per.push(r.n_comp as i32);
                 ts.comp_base_per.push(r.base as i32);
                 ts.keys_base_per.push(r.base);
-                ts.state_base_per.push((slot * st.ratio * st.width) as i32);
-                ts.state_idx_per.push(slot as i32);
+                ts.state_base_per.push((block * st.ratio * st.width) as i32);
+                ts.state_idx_per.push(block as i32);
                 if (s.pos + 1) % st.ratio == 0 {
                     if r.n_comp >= r.cap {
                         return Err(eyre!(
@@ -994,7 +1096,7 @@ impl KvArena {
                         ));
                     }
                     ts.fire_rows.push(b as i32);
-                    ts.fire_state_idx.push(slot as i32);
+                    ts.fire_state_idx.push(block as i32);
                     ts.fire_dst_row.push((r.base + r.n_comp) as i32);
                     ts.fire_comp_pos.push((s.pos + 1 - st.ratio) as i32);
                 }
@@ -1003,11 +1105,40 @@ impl KvArena {
         Ok(t)
     }
 
+    /// Rows per slot in a step's `slots` list (runs of one slot; `tables`
+    /// refuses anything else).
+    pub fn step_rows(slots: &[u32]) -> Vec<(u32, u32)> {
+        let mut v: Vec<(u32, u32)> = Vec::new();
+        for &s in slots {
+            match v.last_mut() {
+                Some((l, n)) if *l == s => *n += 1,
+                _ => v.push((s, 1)),
+            }
+        }
+        v
+    }
+
+    /// Compact every stream of the step whose raw region cannot take its rows
+    /// (`needs_compaction_rows`). Call before `tables`.
+    pub fn compact_for_step(&mut self, slots: &[u32], stream: &Stream, scratch: &mut DeviceBuffer<u16>) -> eyre::Result<()> {
+        for (slot, rows) in Self::step_rows(slots) {
+            if self.needs_compaction_rows(slot, rows) {
+                self.compact_raw(slot, stream, scratch)?;
+            }
+        }
+        Ok(())
+    }
+
     /// True when the next append of `slot` would run off its raw region: the
     /// caller must `compact_raw` first (a D2D copy per layer, on `stream`).
     pub fn needs_compaction(&self, slot: u32) -> bool {
+        self.needs_compaction_rows(slot, 1)
+    }
+
+    /// `needs_compaction` for a step that appends `rows` rows of `slot`.
+    pub fn needs_compaction_rows(&self, slot: u32, rows: u32) -> bool {
         self.stream(slot).is_some_and(|s| {
-            (s.raw_off + s.n_raw) as usize >= ARENA_RAW_ROWS || (s.raw_off_dec + s.n_raw_dec) as usize >= ARENA_RAW_ROWS
+            (s.raw_off + s.n_raw + rows) as usize > ARENA_RAW_ROWS || (s.raw_off_dec + s.n_raw_dec + rows) as usize > ARENA_RAW_ROWS
         })
     }
 
@@ -1051,26 +1182,59 @@ impl KvArena {
     /// with the SWA_WINDOW cap, as `forward_layer` keeps it), each store's
     /// counters where its boundary fired at this position, and `pos`.
     pub fn advance(&mut self, slot: u32) -> eyre::Result<()> {
-        let ratios: Vec<u32> = self.stores.iter().map(|st| st.ratio).collect();
+        let ratios: Vec<u32> = self.ratios().collect();
         let s = self.stream_mut(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
-        if s.n_raw < SWA_WINDOW {
-            s.n_raw += 1;
-        } else {
-            s.raw_off += 1;
+        s.step(ratios);
+        Ok(())
+    }
+
+    /// After a step: keep the first `keep` of the rows `slot` ran (1 for a
+    /// plain decode row; DSpark keeps the accepted prefix). Advances the
+    /// counters `keep` positions, which is the whole rollback: nothing past
+    /// the counters is ever read, so the rejected rows' raw KV, comp rows and
+    /// keys are dead (plan 3.4). Then the commit: a store whose group is still
+    /// open at the new position has that group's rows in the block the step
+    /// wrote them to, and the next step expects them in the slot's first block
+    /// (`blocks_per_slot`); one block copy on `stream`, after the step's
+    /// kernels (same stream). A one-row step never copies (its group's block
+    /// IS the first). `keep` must not exceed the rows the stream ran.
+    pub fn accept(&mut self, slot: u32, keep: u32, stream: &Stream) -> eyre::Result<()> {
+        if keep == 0 || keep > ARENA_ROWS_PER_STREAM {
+            return Err(eyre!("kv arena: accept of {keep} rows for slot {slot}"));
         }
-        if s.n_raw_dec < SWA_WINDOW {
-            s.n_raw_dec += 1;
-        } else {
-            s.raw_off_dec += 1;
+        let pos0 = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?.pos;
+        for _ in 0..keep {
+            self.advance(slot)?;
         }
-        for (r, ratio) in s.comp.iter_mut().zip(ratios) {
-            if (s.pos + 1) % ratio == 0 {
-                r.n_comp += 1;
-                r.n_index_comp += 1;
+        for (from, to, layer, block) in self.commit_copies(slot, pos0, keep) {
+            let cs = self.state.layers[layer].compressor.as_mut().ok_or_else(|| {
+                eyre!("kv arena: store L{layer} is lent out (accept between steps)")
+            })?;
+            for buf in [&mut cs.state_kv, &mut cs.state_score] {
+                let src = buf.slice_view(from, block);
+                let mut dst = buf.slice_view_mut(to, block);
+                dst.copy_from_buffer_async(&src, stream)?;
             }
         }
-        s.pos += 1;
         Ok(())
+    }
+
+    /// The commit's block copies for a stream that ran from `pos0` and kept
+    /// `keep` rows: `(from, to, layer, len)` in floats of the store's
+    /// accumulator buffers. Pure, for `accept` and the unit test.
+    fn commit_copies(&self, slot: u32, pos0: u32, keep: u32) -> Vec<(usize, usize, usize, usize)> {
+        let pos1 = pos0 + keep;
+        self.stores
+            .iter()
+            .filter_map(|st| {
+                let rel = (pos1 - 1) / st.ratio - pos0 / st.ratio;
+                if pos1 % st.ratio == 0 || rel == 0 {
+                    return None;
+                }
+                let block = (st.ratio * st.width) as usize;
+                Some(((st.slot_block(slot) + rel) as usize * block, st.slot_block(slot) as usize * block, st.layer, block))
+            })
+            .collect()
     }
 
     /// Restore `slot` to a saved copy of its counters (speculative rollback;
@@ -1212,5 +1376,170 @@ mod tests {
             assert_eq!(free.1, fl.free_rows(), "case {case}: free run holds every free row");
             assert!(spans.iter().all(|&(a, b)| b <= free.0 || a >= free.0 + free.1), "case {case}: free run overlaps a region");
         }
+    }
+
+    /// A `KvArena` with stores and streams but no device buffers: `tables`,
+    /// `can_step_rows`, `advance` and `commit_copies` touch only host state.
+    #[cfg(feature = "v41")]
+    fn host_arena(n_slots: u32, rows_cap: u32) -> KvArena {
+        let stores = KV_SOURCE_LAYERS
+            .iter()
+            .map(|&l| {
+                let ratio = COMPRESS_RATIOS[l as usize];
+                CompStore { layer: l as usize, ratio, width: N_HEAD_DIM, rows_cap, free: RowFreeList::new(rows_cap), blocks_per_slot: blocks_per_slot(ratio) }
+            })
+            .collect();
+        KvArena {
+            dgpu: Device::new(0),
+            n_slots,
+            state: HetModelState { layers: Vec::new(), n_kv_max: 0 },
+            stores,
+            streams: vec![None; n_slots as usize],
+        }
+    }
+
+    /// DSPARK_ARENA_PLAN 3.1-3.4 on the host: a stream runs steps of 1..=8
+    /// rows (positions pos..pos+R) and keeps a random prefix. A model of the
+    /// raw region and of the accumulator blocks replays exactly what the
+    /// kernels do with the tables (append at `slot_per`; attend the driver's
+    /// window; state-write `state_base_per + (q % ratio) * width`; pool block
+    /// `fire_state_idx`; then `accept`'s block copies), keeping the rejected
+    /// rows' writes in place. Every row must see exactly its causal window
+    /// (positions q-W+1..=q, in order) and every fire must pool exactly its
+    /// group, into the next comp row of the region. A second stream steps one
+    /// row at a time in the same steps (rows before and after the run) and
+    /// must get the tables it gets alone.
+    #[cfg(feature = "v41")]
+    #[test]
+    fn multi_row_tables_match_one_row_steps() {
+        let mut ar = host_arena(3, 100_000);
+        let pos_a = 37u32; // odd: the first step carries an open ratio-2 group
+        let pos_b = 200u32;
+        for (slot, pos) in [(0u32, pos_a), (1, pos_b)] {
+            let comp = ar.stores.iter().map(|st| CompRegion {
+                base: 100 + slot * 30_000,
+                cap: 30_000,
+                n_comp: pos / st.ratio,
+                n_index_comp: pos / st.ratio,
+            }).collect();
+            let n_raw = pos.min(SWA_WINDOW);
+            ar.streams[slot as usize] = Some(StreamKv { pos, raw_off: 0, n_raw, raw_off_dec: 0, n_raw_dec: n_raw, comp });
+        }
+        let region = |slot: u32| KvArena::raw_region_base(slot) as usize;
+        let rows = ARENA_RAW_ROWS * 3;
+        // raw[row] = the position whose KV the row holds.
+        let mut raw: Vec<Option<u32>> = vec![None; rows];
+        for (slot, pos) in [(0u32, pos_a), (1, pos_b)] {
+            let s = ar.stream(slot).unwrap();
+            for i in 0..s.n_raw {
+                raw[region(slot) + i as usize] = Some(pos - s.n_raw + i);
+            }
+        }
+        // blocks[store][block][row] = the position the accumulator row holds.
+        let mut blocks: Vec<Vec<Vec<Option<u32>>>> = ar.stores.iter()
+            .map(|st| vec![vec![None; st.ratio as usize]; (3 * st.blocks_per_slot) as usize]).collect();
+        // The carried open group of stream 0 (pos 37 odd: position 36 in row 0).
+        for (si, st) in ar.stores.iter().enumerate() {
+            for (slot, pos) in [(0u32, pos_a), (1, pos_b)] {
+                let g = pos - pos % st.ratio;
+                for q in g..pos {
+                    blocks[si][st.slot_block(slot) as usize][(q % st.ratio) as usize] = Some(q);
+                }
+            }
+        }
+        let mut rng = 0x5eed_u64;
+        let mut lcg = |m: u32| -> u32 { rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rng >> 33) as u32) % m };
+        for step in 0..3000 {
+            let r = 1 + lcg(ARENA_ROWS_PER_STREAM);
+            let keep = 1 + lcg(r);
+            let b_first = lcg(2) == 0;
+            let mut slots: Vec<u32> = vec![0; r as usize];
+            if b_first { slots.insert(0, 1) } else { slots.push(1) }
+            assert!(ar.can_step_rows(0, r));
+            for (slot, n) in KvArena::step_rows(&slots) {
+                if ar.needs_compaction_rows(slot, n) {
+                    // compact_raw on the model: both windows to the region start.
+                    let s = ar.stream_mut(slot).unwrap();
+                    assert_eq!((s.raw_off, s.n_raw), (s.raw_off_dec, s.n_raw_dec));
+                    let (off, n_raw) = (s.raw_off as usize, s.n_raw as usize);
+                    let base = KvArena::raw_region_base(slot) as usize;
+                    let win: Vec<_> = raw[base + off..base + off + n_raw].to_vec();
+                    raw[base..base + n_raw].copy_from_slice(&win);
+                    s.raw_off = 0;
+                    s.raw_off_dec = 0;
+                }
+            }
+            let t = ar.tables(&slots).unwrap();
+            // Stream 1's row equals its one-row tables.
+            let alone = ar.tables(&[1]).unwrap();
+            let b1 = if b_first { 0 } else { r as usize };
+            assert_eq!(t.pos_per[b1], alone.pos_per[0]);
+            assert_eq!(t.slot_per[b1], alone.slot_per[0]);
+            assert_eq!(t.n_raw_per[b1], alone.n_raw_per[0]);
+            for (ts, ta) in t.stores.iter().zip(&alone.stores) {
+                assert_eq!(ts.state_base_per[b1], ta.state_base_per[0]);
+                assert_eq!(ts.n_comp_per[b1], ta.n_comp_per[0]);
+            }
+            let pos0 = ar.stream(0).unwrap().pos;
+            // The kernels: raw append for every row, then each row's window.
+            for b in 0..slots.len() {
+                raw[t.slot_per[b] as usize] = Some(t.pos_per[b] as u32);
+                assert_eq!(t.slot_per[b], t.slot_per_dec[b]);
+            }
+            for b in 0..slots.len() {
+                let q = t.pos_per[b] as u32;
+                if slots[b] == 0 {
+                    assert_eq!(q, pos0 + (b - usize::from(b_first)) as u32, "step {step}: row positions");
+                }
+                let n = (t.n_raw_per[b] as u32 + 1).min(SWA_WINDOW);
+                let off = (t.slot_per[b] as u32 + 1 - n) as usize;
+                let want: Vec<Option<u32>> = (q + 1 - n..=q).map(Some).collect();
+                assert_eq!(&raw[off..off + n as usize], &want[..], "step {step} row {b}: raw window");
+                assert!(off >= region(slots[b]) && off + (n as usize) <= region(slots[b]) + ARENA_RAW_ROWS);
+            }
+            // The compressor: state-write every row, then pool every fire.
+            for (si, st) in ar.stores.iter().enumerate() {
+                let ts = &t.stores[si];
+                for b in 0..slots.len() {
+                    let q = t.pos_per[b] as u32;
+                    let blk = ts.state_base_per[b] as u32 / (st.ratio * st.width);
+                    assert_eq!(blk as i32, ts.state_idx_per[b]);
+                    let lo = st.slot_block(slots[b]);
+                    assert!(blk >= lo && blk < lo + st.blocks_per_slot, "step {step}: block in the slot's range");
+                    blocks[si][blk as usize][(q % st.ratio) as usize] = Some(q);
+                }
+                for (k, &fr) in ts.fire_rows.iter().enumerate() {
+                    let q = t.pos_per[fr as usize] as u32;
+                    let got = &blocks[si][ts.fire_state_idx[k] as usize];
+                    let want: Vec<Option<u32>> = (q + 1 - st.ratio..=q).map(Some).collect();
+                    assert_eq!(got, &want, "step {step} L{}: pooled group of pos {q}", st.layer);
+                    assert_eq!(ts.fire_comp_pos[k] as u32, q + 1 - st.ratio);
+                    let base = 100 + slots[fr as usize] * 30_000;
+                    assert_eq!(ts.fire_dst_row[k] as u32, base + (q + 1) / st.ratio - 1, "step {step}: comp row of pos {q}");
+                    assert_eq!(ts.n_comp_per[fr as usize] as u32 + 1, (q + 1) / st.ratio);
+                }
+            }
+            // Accept: keep a prefix of stream 0, the one row of stream 1.
+            for (slot, k) in [(0u32, keep), (1, 1)] {
+                let p = ar.stream(slot).unwrap().pos;
+                for (from, to, layer, len) in ar.commit_copies(slot, p, k) {
+                    let si = ar.stores.iter().position(|st| st.layer == layer).unwrap();
+                    let bl = (ar.stores[si].ratio * ar.stores[si].width) as usize;
+                    assert_eq!(len, bl);
+                    blocks[si][to / bl] = blocks[si][from / bl].clone();
+                }
+                for _ in 0..k {
+                    ar.advance(slot).unwrap();
+                }
+                assert_eq!(ar.stream(slot).unwrap().pos, p + k);
+                if slot == 1 {
+                    assert!(ar.commit_copies(1, p, 1).is_empty(), "a one-row step never copies");
+                }
+            }
+        }
+        // Refusals.
+        assert!(ar.tables(&[0, 1, 0]).is_err(), "a slot split by another slot's rows");
+        assert!(ar.tables(&[0; ARENA_ROWS_PER_STREAM as usize + 1]).is_err(), "more rows than the blocks hold");
+        assert!(!ar.can_step_rows(0, ARENA_ROWS_PER_STREAM + 1));
     }
 }

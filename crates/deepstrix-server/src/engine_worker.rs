@@ -984,12 +984,13 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let mut weights = HetModelWeights::load_all(src, dgpu, igpu, &rope)?;
     tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "weights loaded");
 
-    // DSpark drafter (`V41_DSPARK=1`). 7.93 GB of iGPU residency, so opt-in.
+    // DSpark drafter (`V41_DSPARK=1`, or `V41_MS_DSPARK=accept` on the
+    // multistream arena). 7.93 GB of iGPU residency, so opt-in.
     #[cfg(feature = "v41")]
     let mtp: Option<MtpCtx> = if matches!(
         std::env::var("V41_DSPARK").as_deref(),
         Ok("1") | Ok("on") | Ok("shadow") | Ok("accept")
-    ) {
+    ) || (crate::multistream::enabled() && crate::ms_dspark::enabled()) {
         use v4flash_kernels::het::mtp::{MtpCapture, MtpExit, MtpState, MTP_NOISE_TOKEN};
         use v4flash_kernels::het::weights::{MtpExitWeights, MtpWeights};
         let t = std::time::Instant::now();
@@ -1095,7 +1096,12 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // --ctx 368640 (921,600 comp rows x 1,104 B + raw windows) = ~390K arena
     // positions, so allocate a stub; the legacy handler refuses to run on it.
     #[cfg(feature = "v41")]
-    let legacy_ctx = if crate::multistream::enabled() && mtp.is_none() { LEGACY_STUB_CTX.min(cfg.n_kv_max) } else { cfg.n_kv_max };
+    // DSpark on the arena (`V41_MS_DSPARK`) runs no request on the legacy path either.
+    let legacy_ctx = if crate::multistream::enabled() && (mtp.is_none() || crate::ms_dspark::enabled()) {
+        LEGACY_STUB_CTX.min(cfg.n_kv_max)
+    } else {
+        cfg.n_kv_max
+    };
     #[cfg(not(feature = "v41"))]
     let legacy_ctx = cfg.n_kv_max;
     let state = HetModelState::alloc(dgpu, igpu, legacy_ctx)?;

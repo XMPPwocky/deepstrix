@@ -41,6 +41,20 @@
 //!        running whichever lane is ready (`forward_step_arena_ready_first`),
 //!        whose interleave varies with timing.
 //!
+//!   G5f  SPECULATIVE BLOCKS (docs/v41/DSPARK_ARENA_PLAN.md 3.1-3.4): each
+//!        stream alone runs blocks of 1-8 rows of ITSELF at consecutive
+//!        positions (its next token plus "draft" rows) and keeps a prefix
+//!        (`KvArena::accept`). Arm `spec` puts WRONG tokens in the rows past the
+//!        kept prefix (a rejected tail), arm `spec_true` the right ones; both
+//!        run the same block shapes. Gates: spec == spec_true bit-exactly on
+//!        every kept row (a rejected tail leaves nothing behind: raw KV, comp
+//!        rows, keys and accumulator blocks past the counters are dead, and a
+//!        row does not depend on the rows after it), and spec vs alone like
+//!        G5a (bit-exact unless MS_ALLOW_INEXACT=1) / G5b (KL bars). The block
+//!        schedule starts blocks at both ratio-2 parities; long prompts
+//!        (MS_LENS past 1024) cross the indexer's gathered path and MS_STEPS
+//!        past ~130 the raw-region compaction.
+//!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
 //! HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 \
@@ -61,7 +75,7 @@ use v4flash_kernels::config::{
     COMPRESS_RATIOS, ENGRAM_IN, ENGRAM_LAYERS, HC_DIM, KV_SOURCE_LAYERS, N_VOCAB, SWA_WINDOW,
 };
 use v4flash_kernels::embed::embed_lookup;
-use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev};
+use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev, ARENA_ROWS_PER_STREAM};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, DgpuScratch, ExecMode,
     ExpertPager, HetModelState, HetModelWeights, HeterogeneousEngine, IgpuScratch,
@@ -351,6 +365,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut arena_pipe = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_stag = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_rf = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut arena_spec = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut arena_spec_true = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut dev_spec = RowTablesDev::alloc(dgpu, ARENA_ROWS_PER_STREAM, KV_SOURCE_LAYERS.len())?;
     let mut dev_b = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
     let mut dev = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
 
@@ -363,6 +380,8 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut slots_pipe: Vec<u32> = Vec::new();
     let mut slots_stag: Vec<u32> = Vec::new();
     let mut slots_rf: Vec<u32> = Vec::new();
+    let mut slots_spec: Vec<u32> = Vec::new();
+    let mut slots_spec_true: Vec<u32> = Vec::new();
     for (s, toks) in prompts.iter().enumerate() {
         let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
         let hcs: Vec<Vec<f32>> = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
@@ -381,6 +400,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         slots_pipe.push(arena_pipe.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         slots_stag.push(arena_stag.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         slots_rf.push(arena_rf.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
+        let cap_spec = cap + ARENA_ROWS_PER_STREAM;
+        slots_spec.push(arena_spec.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
+        slots_spec_true.push(arena_spec_true.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
         engine.dgpu.compute.synchronize()?;
         first_tok.push(if s == 0 { forced.as_ref().map(|f| *f.last().unwrap()) } else { None }.unwrap_or(argmax(&logits) as i32));
         prefill_logits.push(logits);
@@ -619,10 +641,62 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 &mut bd_a, &mut bi_a, &mut sd, &mut si, &mut arena_alone, &mut dev, &[slots_alone[s]], &weights,
                 &[embed(tok)?], &[tok], &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
             )?;
+            arena_alone.accept(slots_alone[s], 1, &engine.dgpu.compute)?;
             let l = engine.head_rows(&mut ds, &bd_a, 1, &weights)?;
             logits_alone[s].push(l);
         }
     }
+
+    // 3b. G5f: speculative blocks (see the module doc). (R, keep) per block,
+    // cycled; R is the rows of the block, keep its kept prefix.
+    let schedule: [(usize, usize); 10] = [(1, 1), (2, 2), (3, 1), (6, 4), (5, 5), (4, 2), (2, 1), (8, 6), (3, 3), (7, 3)];
+    let ein_spec = ENGRAM_IN as usize;
+    let mut run_spec = |arena: &mut KvArena, slots: &[u32], wrong_tail: bool| -> eyre::Result<(Vec<Vec<Vec<f32>>>, usize)> {
+        let mut out: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
+        let mut blocks = 0usize;
+        for s in 0..n_streams {
+            let mut seq = prompts[s].clone();
+            let (mut t, mut blk) = (0usize, 0usize);
+            while t < n_steps {
+                let (r_want, k_want) = schedule[blk % schedule.len()];
+                blk += 1;
+                let keep = k_want.min(n_steps - t);
+                let r = r_want.max(keep);
+                let toks: Vec<i32> = (0..r)
+                    .map(|j| match cont[s].get(t + j) {
+                        Some(&c) if j < keep || !wrong_tail => c,
+                        _ => ((cont[s][t] as i64 + 7919 * (j as i64 + 1)) % 100_000) as i32,
+                    })
+                    .collect();
+                let pos = seq.len();
+                let mut ext = seq.clone();
+                ext.extend_from_slice(&toks);
+                let mut rows_b = vec![vec![0f32; r * ein_spec]; ENGRAM_LAYERS.len()];
+                for j in 0..r {
+                    for (li, x) in engram.rows_at(pg.raw(), &ext, pos + j)?.iter().enumerate() {
+                        rows_b[li][j * ein_spec..(j + 1) * ein_spec].copy_from_slice(x);
+                    }
+                }
+                let hcs: Vec<Vec<f32>> = toks.iter().map(|&x| embed(x)).collect::<eyre::Result<_>>()?;
+                engine.forward_step_arena(
+                    &mut bd_a, &mut bi_a, &mut sd, &mut si, arena, &mut dev_spec, &vec![slots[s]; r], &weights,
+                    &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b)), Some(&mut pg),
+                )?;
+                arena.accept(slots[s], keep as u32, &engine.dgpu.compute)?;
+                let l = engine.head_rows(&mut ds, &bd_a, r, &weights)?;
+                for j in 0..keep {
+                    out[s].push(l[j * nv..(j + 1) * nv].to_vec());
+                }
+                seq.extend_from_slice(&toks[..keep]);
+                t += keep;
+                blocks += 1;
+            }
+        }
+        Ok((out, blocks))
+    };
+    let (logits_spec, spec_blocks) = run_spec(&mut arena_spec, &slots_spec, true)?;
+    let (logits_spec_true, _) = run_spec(&mut arena_spec_true, &slots_spec_true, false)?;
+    eprintln!("G5f: {spec_blocks} speculative blocks over {n_streams} streams");
 
     // 4. Arena, all rows co-batched.
     let mut logits_batch: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
@@ -647,6 +721,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             &mut bd_a, &mut bi_a, &mut sd, &mut si, &mut arena_batch, &mut dev, &slots_batch, &weights,
             &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
         )?;
+        for &sl in &slots_batch { arena_batch.accept(sl, 1, &engine.dgpu.compute)?; }
         let all = engine.head_rows(&mut ds, &bd_a, n_streams, &weights)?;
         step_ms.push(t0.elapsed().as_secs_f64() * 1e3);
         for s in 0..n_streams {
@@ -684,6 +759,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut arena_pipe, &mut dev, &mut dev_b, &slots_pipe, &weights,
             &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
         )?;
+        for &sl in &slots_pipe { arena_pipe.accept(sl, 1, &engine.dgpu.compute)?; }
         let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
         all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
         step_ms_p.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -724,6 +800,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
             )?;
         }
+        for &sl in &slots_stag { arena_stag.accept(sl, 1, &engine.dgpu.compute)?; }
         let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
         all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
         step_ms_s.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -767,6 +844,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
             )?;
         }
+        for &sl in &slots_rf { arena_rf.accept(sl, 1, &engine.dgpu.compute)?; }
         let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
         all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
         step_ms_rf.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -867,6 +945,42 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         kls_stag.len()
     );
     eprintln!("G5e: {} of {} (stream, step) rows differ between PIPELINED and READY-FIRST (want 0)", g5e_fail, kls_stag.len());
+    let (mut g5f_leak, mut g5f_alone) = (0usize, 0usize);
+    let mut kls_spec = Vec::new();
+    for s in 0..n_streams {
+        for t in 0..n_steps {
+            let dl = max_abs_diff(&logits_spec[s][t], &logits_spec_true[s][t]);
+            let da = max_abs_diff(&logits_spec[s][t], &logits_alone[s][t]);
+            let k = kld(&logits_dec[s][t], &logits_spec[s][t]);
+            g5f_leak += usize::from(dl != 0.0);
+            g5f_alone += usize::from(da != 0.0);
+            kls_spec.push(k);
+            if dl != 0.0 || da != 0.0 {
+                eprintln!("   G5f row s={s} t={t}: |spec-spec_true| {dl:.3e}  |spec-alone| {da:.3e}  KL(dec||spec) {k:.5}  argmax spec/alone {}/{}",
+                    argmax(&logits_spec[s][t]), argmax(&logits_alone[s][t]));
+            }
+        }
+    }
+    let mean_f = kls_spec.iter().sum::<f64>() / kls_spec.len() as f64;
+    let max_f = kls_spec.iter().cloned().fold(0.0, f64::max);
+    eprintln!(
+        "G5f: {g5f_leak} of {} kept rows differ between a rejected tail and a correct one (want 0); {g5f_alone} differ from alone; KL(dec||spec) mean {mean_f:.5} max {max_f:.5}",
+        kls_spec.len()
+    );
+    // Inexact mode (two-box split: the tail's routing changes the kept rows'
+    // expert batches on box 2): a leak still shows as a large KL between arms.
+    let leak_kl = (0..n_streams).flat_map(|s| (0..n_steps).map(move |t| (s, t)))
+        .map(|(s, t)| kld(&logits_spec_true[s][t], &logits_spec[s][t])).fold(0.0, f64::max);
+    eprintln!("G5f: max KL(spec_true||spec) {leak_kl:.5}");
+    if g5f_leak > 0 && (!allow_inexact || leak_kl > kld_mean_bar) {
+        return Err(eyre!("G5f failed: {g5f_leak} kept rows depend on the REJECTED rows of their block or an earlier one (rollback leaks; max KL {leak_kl:.5})"));
+    }
+    if g5f_alone > 0 && !allow_inexact {
+        return Err(eyre!("G5f failed: {g5f_alone} speculative rows differ from one-row steps (MS_ALLOW_INEXACT=1 to report only)"));
+    }
+    if mean_f > kld_mean_bar || max_f > kld_max_bar {
+        return Err(eyre!("G5f failed: speculative KL mean {mean_f:.5} / max {max_f:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
+    }
     if g5a_fail > 0 && !allow_inexact {
         return Err(eyre!("G5a failed: {g5a_fail} rows not batch-invariant (MS_ALLOW_INEXACT=1 to report only)"));
     }

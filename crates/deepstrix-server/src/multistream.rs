@@ -21,7 +21,7 @@ use color_eyre::eyre::{self, eyre};
 use tokio::sync::mpsc;
 use v4flash_kernels::config::{ENGRAM_IN, HC_DIM, N_VOCAB};
 use v4flash_kernels::het::forward_prefill::{LazyEngramRows, PrefillJob};
-use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev};
+use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev, ARENA_ROWS_PER_STREAM};
 use v4flash_kernels::het::SampleMode;
 use v4flash_kernels::sampler::SamplerRng;
 
@@ -30,7 +30,9 @@ use crate::engine_worker::{
     byte_aligned_lcp_vl, encode_request_images, flush_expert_stats, handle_generate_stream, save_live_if_dirty, trim_heap_and_log, EncodedImages,
     EngineRequest, FinishReason, GenerateReq, WorkerEvent, WorkerState,
 };
+use crate::ms_dspark::{self, MsDspark};
 use crate::snapshot;
+use crate::spec_sample::{verify_block, Draft, DraftDist, TargetDist};
 use crate::tokens::{is_turn_end, TOK_ASSISTANT, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END, TOK_USER};
 
 pub fn enabled() -> bool {
@@ -171,21 +173,23 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
-    let dev = match RowTablesDev::alloc(state.dgpu, n_slots, arena.stores.len()) {
+    // Rows per step: one per stream, plus a speculating stream's draft rows.
+    let rows_cap = n_slots * ARENA_ROWS_PER_STREAM;
+    let dev = match RowTablesDev::alloc(state.dgpu, rows_cap, arena.stores.len()) {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, "multistream: row tables alloc failed");
             return;
         }
     };
-    let dev_b = match RowTablesDev::alloc(state.dgpu, n_slots, arena.stores.len()) {
+    let dev_b = match RowTablesDev::alloc(state.dgpu, rows_cap, arena.stores.len()) {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, "multistream: row tables (lane B) alloc failed");
             return;
         }
     };
-    let dev_c = match RowTablesDev::alloc(state.dgpu, n_slots, arena.stores.len()) {
+    let dev_c = match RowTablesDev::alloc(state.dgpu, rows_cap, arena.stores.len()) {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, "multistream: row tables (lane C) alloc failed");
@@ -217,7 +221,25 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         Ok(b) => b,
         Err(e) => { tracing::error!(error = %e, "multistream: bounce alloc failed"); return; }
     };
-    let mut sched = Sched { profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    // DSpark on the arena (`V41_MS_DSPARK=accept`): one drafter ring per slot,
+    // and every step (and the prefill replay that seeds a ring) captures the
+    // drafter's input residuals on its rows.
+    let dsp = match (ms_dspark::enabled(), state.mtp.as_ref()) {
+        (true, Some(m)) => match MsDspark::alloc(m, state.igpu.id, n_slots) {
+            Ok(d) => {
+                let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
+                state.bd_a.mtp_capture_rows = cap;
+                state.bd_b.mtp_capture_rows = cap;
+                state.bd_c.mtp_capture_rows = cap;
+                tracing::info!(n_slots, ring_all = d.ring_all(), "multistream: DSpark ON (lone stream verifies its drafts in the arena step)");
+                Some(d)
+            }
+            Err(e) => { tracing::error!(error = %e, "multistream: DSpark rings alloc failed; DSpark off"); None }
+        },
+        (true, None) => { tracing::error!("multistream: V41_MS_DSPARK set but no drafter loaded; DSpark off"); None }
+        _ => None,
+    };
+    let mut sched = Sched { dsp, profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -299,6 +321,8 @@ fn ms_profile() -> bool {
 }
 
 struct Sched {
+    /// DSpark on the arena (`ms_dspark`); `None` = off.
+    dsp: Option<MsDspark>,
     profile_acc: ProfileAcc,
     legacy_wait_logged: Option<Instant>,
     /// Lane-B tables for the two-lane step (`V41_MS_PIPELINE`).
@@ -395,9 +419,10 @@ impl Sched {
         // longer than `V41_MS_AGING_S` (default 60 s) goes first regardless.
         let aging = std::time::Duration::from_secs(env_usize("V41_MS_AGING_S", 60) as u64);
         let starve = std::time::Duration::from_secs(env_usize("V41_MS_STARVE_S", 600) as u64);
-        let mtp_on = state.mtp.is_some();
         // Images ride the multistream path since 2026-09-21 (tower rows spliced
-        // into the chunk inputs); only DSpark still needs the legacy driver.
+        // into the chunk inputs); only legacy DSpark (`V41_DSPARK` without
+        // `V41_MS_DSPARK`) still needs the serial driver.
+        let mtp_on = state.mtp.is_some() && self.dsp.is_none();
         let is_legacy = move |_p: &Pending| mtp_on;
         // A legacy (vision / DSpark) request can only run on an empty arena. It
         // must NOT block the requests behind it (2026-09-21: one screenshot
@@ -831,12 +856,31 @@ impl Sched {
                 return Ok(());
             }
         }
-        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
+        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, mtp, .. } = state;
         let kv = &mut pf.kv;
+        // The CED replay runs layers 37-39 over the prompt's last window: it
+        // captures exactly the rows a drafter ring holds.
+        bd_a.mtp_captured = 0;
+        bd_b.mtp_captured = 0;
         let logits = match engine.prefill_job_finish(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut()) {
             Ok(l) => l,
             Err(e) => return Err((Some(pf.kv), e)),
         };
+        if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), mtp.as_mut()) {
+            let t = Instant::now();
+            let last = pf.prefix.len() as u32 - 1;
+            let seeded = dsp.reset(pf.slot).and_then(|()| {
+                let rows = ms_dspark::prefill_captures(&[&*bd_a, &*bd_b])?;
+                dsp.seed(engine, m, pf.slot, rows, last)
+            });
+            match seeded {
+                Ok(n) => tracing::info!(slot = pf.slot, seeded = n, last, ms = t.elapsed().as_millis() as u64, "ms dspark: ring seeded"),
+                Err(e) => {
+                    let _ = dsp.reset(pf.slot);
+                    tracing::warn!(slot = pf.slot, error = %e, "ms dspark: ring seeding failed; the stream drafts once it has decoded a row");
+                }
+            }
+        }
         kv.restore_compressor_lending();
         // Snapshot the prompt (the legacy path saves here too, before the marker).
         flush_expert_stats(state);
@@ -1028,8 +1072,48 @@ impl Sched {
         // read from box 1's disk off the critical path). Same as decode's
         // `forward_one!`; without this the multistream path never warmed box 1.
         if let Some(pg) = state.pager.as_mut() { pg.drain_prefetched()?; }
+        // DSpark (`V41_MS_DSPARK`): a LONE stream drafts from its last row in KV
+        // and verifies K of the drafts in this step's rows, K from the drafter's
+        // confidence (`ms_dspark::choose_k`). Several live streams step plainly.
+        // A drafter failure only costs the drafts (plan 5.8), never the step.
+        let mut drafts: Vec<Vec<i32>> = vec![Vec::new(); self.streams.len()];
+        if self.streams.len() == 1 {
+            if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
+                let s = &self.streams[0];
+                let pos = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
+                let remaining = s.max_new.saturating_sub(s.completion_tokens as usize);
+                let mut cap = remaining.saturating_sub(1).min(v4flash_kernels::het::mtp::MTP_BLOCK);
+                while cap > 0 && !self.arena.can_step_rows(s.slot, 1 + cap as u32) {
+                    cap -= 1;
+                }
+                if cap > 0 && pos > 0 {
+                    let mut row = vec![0f32; HC_DIM as usize];
+                    embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, s.next, &mut row);
+                    match dsp.draft(&state.engine, &state.weights, m, s.slot, pos - 1, s.next, &row) {
+                        Ok(Some((ids, conf))) => drafts[0] = ids[..ms_dspark::choose_k(&conf, cap)].to_vec(),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(slot = s.slot, error = %e, "ms dspark: draft failed; plain step"),
+                    }
+                }
+            }
+        }
+        let spec = drafts.iter().any(|d| !d.is_empty());
+        // Rows: per stream its next token, then its draft rows (positions
+        // pos+1.., consecutive, in one lane: `KvArena::tables`).
+        let mut row0: Vec<usize> = Vec::with_capacity(self.streams.len());
+        let mut slots: Vec<u32> = Vec::with_capacity(self.streams.len());
+        let mut toks: Vec<i32> = Vec::with_capacity(self.streams.len());
+        for (s, d) in self.streams.iter().zip(&drafts) {
+            row0.push(slots.len());
+            slots.push(s.slot);
+            toks.push(s.next);
+            for &t in d {
+                slots.push(s.slot);
+                toks.push(t);
+            }
+        }
         let t0 = Instant::now();
-        let b = self.streams.len();
+        let b = slots.len();
         // Event trace: one `hub_step` per step, fields filled BY NAME (see
         // `evtrace_kinds::HUB_STEP`); `hub_req` records carry this step number.
         let ev_on = v4flash_kernels::het::evtrace::enabled();
@@ -1046,8 +1130,6 @@ impl Sched {
             ev.insert("pos_min".into(), pos.clone().fold(f64::INFINITY, f64::min));
             ev.insert("pos_max".into(), pos.fold(f64::NEG_INFINITY, f64::max));
         }
-        let slots: Vec<u32> = self.streams.iter().map(|s| s.slot).collect();
-        let toks: Vec<i32> = self.streams.iter().map(|s| s.next).collect();
         let mut hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
         for &t in &toks {
             let mut v = vec![0f32; HC_DIM as usize];
@@ -1064,11 +1146,21 @@ impl Sched {
         let engram_on = state.pager.is_some() && state.engram.is_some();
         let mut live: Vec<(usize, [[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS])> = Vec::with_capacity(b);
         if let Some(ec) = state.engram.as_ref().filter(|_| engram_on) {
-            for (r, s) in self.streams.iter().enumerate() {
+            for ((s, d), &r) in self.streams.iter().zip(&drafts).zip(&row0) {
                 // `seq` already ends with `next` (pushed when it was chosen).
                 let pos = s.seq.len() - 1;
-                if s.compressed[pos] == v4flash_core::engram_hash::DEAD { continue; }
-                live.push((r, ec.hasher.hash_ids(&s.compressed, pos)));
+                if d.is_empty() {
+                    if s.compressed[pos] == v4flash_core::engram_hash::DEAD { continue; }
+                    live.push((r, ec.hasher.hash_ids(&s.compressed, pos)));
+                    continue;
+                }
+                // Draft rows hash the sequence as the drafts extend it.
+                let mut ext = s.compressed.clone();
+                ext.extend(d.iter().map(|&t| ec.hasher.compress(t)));
+                for j in 0..=d.len() {
+                    if ext[pos + j] == v4flash_core::engram_hash::DEAD { continue; }
+                    live.push((r + j, ec.hasher.hash_ids(&ext, pos + j)));
+                }
             }
         }
         let engram_ms = t_eng.elapsed().as_secs_f64() * 1e3;
@@ -1092,7 +1184,9 @@ impl Sched {
         // MEASURED 2026-09-22 with partitioned paging: at 2 rows the two-lane
         // step's doubled dGPU chain (+55 ms) exceeds the box-2 wait it hides
         // (~30 ms), at 4 it is a wash; default to lanes from 6 rows.
-        let pipelined = b >= env_usize("V41_MS_PIPELINE_MIN_ROWS", 6) && ms_pipeline();
+        // A speculating stream's rows stay in ONE lane (plan 3.5; the drivers
+        // refuse a cut through them), and only a lone stream speculates.
+        let pipelined = !spec && b >= env_usize("V41_MS_PIPELINE_MIN_ROWS", 6) && ms_pipeline();
         // Three lanes (`V41_MS_LANES=3`, DEFAULT 2) from `V41_MS_LANES3_MIN_ROWS`
         // rows (default 6). MEASURED 2026-09-21 at 8 rows, box-1 hot set warm:
         // 2 lanes 272 ms/step (27.2 tok/s), 3 lanes 324 (23.3). The third lane
@@ -1121,6 +1215,11 @@ impl Sched {
         let ready_first = stagger_mode == "2";
         let mut fwd_only_ms = 0.0f64;
         let n_tables = engram.as_ref().map(|ec| ec.tables.len()).unwrap_or(0);
+        if self.dsp.is_some() {
+            bd_a.mtp_captured = 0;
+            bd_b.mtp_captured = 0;
+            bd_c.mtp_captured = 0;
+        }
         let logits = std::thread::scope(|sc| {
         let mut engram_rows = if engram_on && !live.is_empty() {
             let ec: &crate::engine_worker::EngramCtx = engram.as_ref().expect("engram_on");
@@ -1134,7 +1233,7 @@ impl Sched {
         };
         let logits = if lanes3 {
             let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 3] =
-                [(bd_a, bi_a, &mut self.dev), (bd_b, bi_b, &mut self.dev_b), (bd_c, bi_c, &mut self.dev_c)];
+                [(&mut *bd_a, &mut *bi_a, &mut self.dev), (&mut *bd_b, &mut *bi_b, &mut self.dev_b), (&mut *bd_c, &mut *bi_c, &mut self.dev_c)];
             engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             let mut l = Vec::with_capacity(b);
@@ -1177,6 +1276,24 @@ impl Sched {
         Ok::<_, eyre::Report>(logits)
         })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+        // The drafter's input for every row (lane-local captures, in row order).
+        let caps: Vec<Vec<f32>> = if self.dsp.is_some() {
+            let sizes: Vec<usize> = if lanes3 {
+                (0..3).map(|i| b / 3 + usize::from(i < b % 3)).collect()
+            } else if stagger2 || pipelined {
+                vec![b.div_ceil(2), b - b.div_ceil(2)]
+            } else {
+                vec![b]
+            };
+            let lanes: [&v4flash_kernels::het::batch_scratch::BatchDgpuScratch; 3] = [&*bd_a, &*bd_b, &*bd_c];
+            let mut v = Vec::with_capacity(b);
+            for (bd, n) in lanes.iter().zip(sizes) {
+                v.extend(ms_dspark::lane_captures(bd, n)?);
+            }
+            v
+        } else {
+            Vec::new()
+        };
         // Box-2 pinning (`V41_B2_PIN`), drained EVERY step so `hub_step`
         // carries them with or without the profile: `b2_surprises` must stay
         // 0 -- a held pick box 2 paged anyway (ERROR-logged where it happens).
@@ -1386,21 +1503,68 @@ impl Sched {
             }
         }
         let nv = N_VOCAB as usize;
-        // Sample, emit, retire.
+        // Sample, emit, retire. A stream with drafts runs the block procedure
+        // (plan 2.3) over its rows and emits token by token, stopping at the
+        // first stop; it keeps one KV row per token emitted.
         let t_s = Instant::now();
         let mut done: Vec<(usize, FinishReason)> = Vec::new();
-        for (r, s) in self.streams.iter_mut().enumerate() {
-            let tok = sample_row(&logits[r * nv..(r + 1) * nv], &s.sample_mode, &mut s.rng);
-            s.next = tok;
-            if !emit(state, s, tok) { done.push((r, FinishReason::Stop)); continue; }
-            if let Some(f) = stop_reason(s, tok) { done.push((r, f)); }
+        let mut keeps: Vec<u32> = vec![1; self.streams.len()];
+        let mut spec_out: Option<(usize, usize, usize)> = None;
+        for (i, s) in self.streams.iter_mut().enumerate() {
+            let r = row0[i];
+            if drafts[i].is_empty() {
+                let tok = sample_row(&logits[r * nv..(r + 1) * nv], &s.sample_mode, &mut s.rng);
+                s.next = tok;
+                if !emit(state, s, tok) { done.push((i, FinishReason::Stop)); continue; }
+                if let Some(f) = stop_reason(s, tok) { done.push((i, f)); }
+                continue;
+            }
+            let k = drafts[i].len();
+            let rows: Vec<TargetDist> =
+                (0..=k).map(|j| TargetDist::from_logits(&logits[(r + j) * nv..(r + j + 1) * nv], &s.sample_mode)).collect();
+            let ds: Vec<Draft> = drafts[i].iter().map(|&t| Draft { token: t, q: DraftDist::PointMass }).collect();
+            let out = verify_block(&rows, &ds, &mut s.rng);
+            let mut n = 0u32;
+            for &tok in &out.tokens {
+                n += 1;
+                s.next = tok;
+                if !emit(state, s, tok) { done.push((i, FinishReason::Stop)); break; }
+                if let Some(f) = stop_reason(s, tok) { done.push((i, f)); break; }
+            }
+            keeps[i] = n;
+            spec_out = Some((k, out.accepted, n as usize));
         }
         let sample_ms = t_s.elapsed().as_secs_f64() * 1e3;
+        // Keep each stream's emitted rows (rollback = the counters stop there).
+        for (s, &keep) in self.streams.iter().zip(&keeps) {
+            self.arena.accept(s.slot, keep, &state.engine.dgpu.compute)?;
+        }
+        // Kept rows into the drafter rings; the last one feeds the next draft.
+        if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
+            let write = dsp.ring_all() || spec;
+            for (i, s) in self.streams.iter().enumerate() {
+                if done.iter().any(|&(d, _)| d == i) {
+                    continue;
+                }
+                let pos_end = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
+                for j in 0..keeps[i] as usize {
+                    let pos = pos_end - keeps[i] + j as u32;
+                    if let Err(e) = dsp.keep_row(&state.engine, m, s.slot, pos, caps[row0[i] + j].clone(), write) {
+                        tracing::warn!(slot = s.slot, pos, error = %e, "ms dspark: ring write failed; the stream's ring restarts");
+                        let _ = dsp.reset(s.slot);
+                        break;
+                    }
+                }
+            }
+            if let Some((k, accepted, emitted)) = spec_out {
+                dsp.record(k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
         for (r, f) in done.into_iter().rev() {
             let s = self.streams.remove(r);
             finish(state, &mut self.arena, s, f)?;
         }
-        tracing::info!(rows = b, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
+        tracing::info!(rows = b, spec = ?spec_out, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(), "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };

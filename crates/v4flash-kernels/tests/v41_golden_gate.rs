@@ -578,6 +578,7 @@ fn v41_golden_gate() -> eyre::Result<()> {
                         &mut bd_a, &mut bi_a, &mut sd, &mut si, arena.as_mut().unwrap(), dev.as_mut().unwrap(), &[slot], &weights,
                         &[hc], &[tok], &mut LazyEngramRows::ready(Some(rows)), Some(&mut pg),
                     )?;
+                    arena.as_mut().unwrap().accept(slot, 1, &engine.dgpu.compute)?;
                     engine.head_rows(&mut ds, &bd_a, 1, &weights)?
                 };
                 steps.push(fx, pos, &logits)?;

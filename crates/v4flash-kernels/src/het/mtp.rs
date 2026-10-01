@@ -787,6 +787,21 @@ impl MtpState {
         self.ring_writes.min(MTP_WINDOW)
     }
 
+    /// The ring write counter (`ring_writes`). With `set_ring_writes` and a
+    /// swap of `rings`, one `MtpState`'s scratch serves several streams, each
+    /// with its own ring (the multistream arena keeps one ring per slot).
+    pub fn ring_writes(&self) -> usize {
+        self.ring_writes
+    }
+
+    /// Set the ring write counter: a swapped-in ring's own count, or one less
+    /// to make the next `forward` REWRITE the latest row (same position, same
+    /// residual, so the same values) instead of appending a duplicate when
+    /// that row was already written by `ring_write_only`.
+    pub fn set_ring_writes(&mut self, n: usize) {
+        self.ring_writes = n;
+    }
+
     /// `forward_embed`: seed the residual stream from the accepted token.
     ///
     /// The reference embeds `[token, noise, noise, noise, noise]` and repeats
