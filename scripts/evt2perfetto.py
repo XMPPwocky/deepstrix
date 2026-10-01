@@ -201,7 +201,7 @@ def first_t(path):
         if not math.isnan(t):
             return t
         off += 4 + 8 * n
-    return math.inf
+    return -math.inf  # none in the first MB: span it from the start (scanned, not skipped)
 
 
 def boot_of(path):
@@ -211,14 +211,20 @@ def boot_of(path):
     return (h['t_realtime_at_open'] - h['t_mono_raw_at_open']) / 1e9
 
 
+def boot_now():
+    """This box's current boot, from its own clocks (`cut` runs on the box that
+    wrote the files; a header's realtime can be skewed or stepped)."""
+    import time
+    return time.time() - time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+
+
 def cmd_cut(a):
     """One cut per input file whose time span can hold the window (a file spans
     from its first record to the next file's), each with ITS OWN header: a
     window across a daemon restart may span two binaries' kind tables. Files of
     an earlier boot are skipped (their RAW clock restarted)."""
-    boots = {p: boot_of(p) for p in a.files}
-    newest = max(a.files, key=lambda p: header_of(p)[1]['t_realtime_at_open'])
-    same_boot = [p for p in a.files if abs(boots[p] - boots[newest]) < 60]
+    now = boot_now()
+    same_boot = [p for p in a.files if abs(boot_of(p) - now) < 60]
     opened = sorted((first_t(p), p) for p in same_boot)
     written = []
     for i, (t_open, p) in enumerate(opened):
@@ -260,12 +266,6 @@ def cmd_trace(a):
         b2_hdr = header_of(p)[1]
         for _, name, fields, vals in records(p):
             b2[name].append(dict(zip(fields, vals)))
-    # Slices are assigned to sub-tracks in START order (records are written at
-    # completion, lanes interleaved, replies out of order).
-    for d, key in ((hub, {'hub_step': 't_start', 'hub_req': 't_submit', 'hub_phase': 't'}),
-                   (b2, {'b2_req': 't_frame', 'b2_ensure': 't_start', 'b2_read': 't_read_start', 'b2_write': 't3'})):
-        for k, f in key.items():
-            d[k].sort(key=lambda r: r[f] if not math.isnan(r[f]) else math.inf)
     tr = Tracks(a.t_from)
     tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 1, 'args': {'name': 'hub (box 1)'}})
     tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 2, 'args': {'name': 'box 2 (expertd), on hub clock'}})
@@ -327,6 +327,7 @@ def cmd_trace(a):
             t = to_hub(w['t3'])
             if inside(t):
                 tr.slice(2, 'reply writes', f"seq {int(w['seq'])}", t, to_hub(w['t_written']), fin(w, 'bytes'))
+    tr.finish()
     out = {'traceEvents': tr.ev, 'displayTimeUnit': 'ms',
            'otherData': {'t0_hub_mono_raw_ns': a.t_from, 'window_s': (a.t_to - a.t_from) / 1e9,
                          'hub_realtime_at_open': hub_hdr.get('t_realtime_at_open'), 'hub_mono_raw_at_open': hub_hdr.get('t_mono_raw_at_open')}}
@@ -337,11 +338,13 @@ def cmd_trace(a):
 
 
 class Tracks:
-    """Chrome JSON events; overlapping slices of a kind go on numbered
-    sub-tracks (greedy, so feed each kind in start order)."""
+    """Chrome JSON events. Slices are buffered per track and, at `finish`,
+    sorted by start and spread over numbered sub-tracks so that no two overlap
+    on one (records arrive in completion order: lanes interleaved, replies out
+    of order, parked requests served inside others)."""
 
     def __init__(self, t0):
-        self.t0, self.ev, self.lanes, self.tids = t0, [], defaultdict(list), {}
+        self.t0, self.ev, self.pending, self.tids = t0, [], defaultdict(list), {}
 
     def tid(self, pid, name):
         key = (pid, name)
@@ -357,19 +360,26 @@ class Tracks:
     def slice(self, pid, track, name, a, b, args=None):
         if math.isnan(a) or math.isnan(b) or b < a:
             return
-        ends = self.lanes[(pid, track)]
-        for i, e in enumerate(ends):
-            if e <= a:
-                ends[i] = b
-                break
-        else:
-            i = len(ends)
-            ends.append(b)
-        label = track if i == 0 else f'{track} #{i + 1}'
-        ev = {'ph': 'X', 'pid': pid, 'tid': self.tid(pid, label), 'name': name, 'ts': self.us(a), 'dur': max((b - a) / 1e3, 0.001)}
-        if args:
-            ev['args'] = args
-        self.ev.append(ev)
+        self.pending[(pid, track)].append((a, b, name, args))
+
+    def finish(self):
+        for (pid, track), sl in self.pending.items():
+            sl.sort(key=lambda x: (x[0], x[1]))
+            ends = []
+            for a, b, name, args in sl:
+                for i, e in enumerate(ends):
+                    if e <= a:
+                        ends[i] = b
+                        break
+                else:
+                    i = len(ends)
+                    ends.append(b)
+                label = track if i == 0 else f'{track} #{i + 1}'
+                ev = {'ph': 'X', 'pid': pid, 'tid': self.tid(pid, label), 'name': name, 'ts': self.us(a), 'dur': max((b - a) / 1e3, 0.001)}
+                if args:
+                    ev['args'] = args
+                self.ev.append(ev)
+        self.pending.clear()
 
     def instant(self, pid, track, name, t, args=None):
         if math.isnan(t):

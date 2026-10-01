@@ -5,9 +5,11 @@
 #   LONE=1: a window inside the latest run of lone-stream (DSpark) steps
 #   HUB=<hub .evt>: that file instead of the newest
 # Open OUT in https://ui.perfetto.dev (drag and drop).
-# Gentle on production: every pass streams at idle I/O + CPU priority; box 2's
-# cut runs off expertd's cores (8-15,24-31), reads only the files that can hold
-# the window, and only a gzipped slice crosses the expert link, rate-limited.
+# Gentle on production: Python parses at tens of MB/s, box 2's cut reads only
+# the files that can hold the window and stops just past it, runs off
+# expertd's cores (8-15,24-31) at nice 19, and only a gzipped slice crosses the
+# expert link, rate-limited. (ionice is set but both boxes' NVMe use the `none`
+# scheduler, which ignores it.)
 set -euo pipefail
 # A hard cap: a bug here must fail with MemoryError, not push the hub (tens of
 # GB resident, ~3-5 GB free) toward the OOM killer.
@@ -20,9 +22,11 @@ LINK_KBIT=${LINK_KBIT:-80000}
 HERE=$(cd "$(dirname "$0")" && pwd)
 LOW=(nice -n 19 ionice -c3)
 TMP=$(mktemp -d)
+RDIR=$(ssh "$B2" 'mktemp -d /tmp/evt2perfetto.XXXXXX')
 cleanup() {
   rm -rf "$TMP"
-  ssh "$B2" 'rm -f /tmp/b2cut.*.evt /tmp/b2cut.*.evt.gz /tmp/evt2perfetto.py' || true
+  # shellcheck disable=SC2029
+  ssh "$B2" "rm -rf '$RDIR'" || true
 }
 trap cleanup EXIT
 mkdir -p "$(dirname "$OUT")"
@@ -30,9 +34,9 @@ HUB=${HUB:-$(ls -t "$HOME"/logs/evtrace/hub-*.evt | head -1)}
 W=$("${LOW[@]}" python3 "$HERE/evt2perfetto.py" window "$HUB" --last "$S" ${LONE:+--lone})
 get() { python3 -c "import json,sys; print(repr(json.loads(sys.argv[1])['$1']))" "$W"; }
 HF=$(get hub_from); HT=$(get hub_to); BF=$(get b2_from); BT=$(get b2_to)
-scp -q -l "$LINK_KBIT" "$HERE/evt2perfetto.py" "$B2:/tmp/evt2perfetto.py"
+scp -q -l "$LINK_KBIT" "$HERE/evt2perfetto.py" "$B2:$RDIR/evt2perfetto.py"
 # shellcheck disable=SC2029
-CUTS=$(ssh "$B2" "taskset -c $B2_CPUS ionice -c3 nice -n 19 python3 /tmp/evt2perfetto.py cut ~/logs/evtrace/b2-*.evt --from $BF --to $BT -o /tmp/b2cut >/dev/null && taskset -c $B2_CPUS nice -n 19 gzip -1 -f /tmp/b2cut.*.evt && ls /tmp/b2cut.*.evt.gz")
+CUTS=$(ssh "$B2" "taskset -c $B2_CPUS ionice -c3 nice -n 19 python3 $RDIR/evt2perfetto.py cut ~/logs/evtrace/b2-*.evt --from $BF --to $BT -o $RDIR/b2cut >/dev/null && taskset -c $B2_CPUS nice -n 19 gzip -1 -f $RDIR/b2cut.*.evt && ls $RDIR/b2cut.*.evt.gz")
 LOCAL=()
 for c in $CUTS; do
   scp -q -l "$LINK_KBIT" "$B2:$c" "$TMP/"
