@@ -1206,7 +1206,11 @@ impl KvArena {
         for _ in 0..keep {
             self.advance(slot)?;
         }
-        for (from, to, layer, block) in self.commit_copies(slot, pos0, keep) {
+        let copies = self.commit_copies(slot, pos0, keep);
+        if !copies.is_empty() {
+            self.dgpu.set_current()?;
+        }
+        for (from, to, layer, block) in copies {
             let cs = self.state.layers[layer].compressor.as_mut().ok_or_else(|| {
                 eyre!("kv arena: store L{layer} is lent out (accept between steps)")
             })?;
