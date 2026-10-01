@@ -330,9 +330,13 @@ def cmd_trace(a):
             tr.counter(1, c, s['t_start'], s.get(c, NAN))
     # Live knob changes (format_rev 2 `knob` records).
     src_name = {0: 'default', 1: 'env', 2: 'legacy file', 3: 'knob file', 4: 'set'}
+    # Knob changes are recorded in BOTH tiers: a Tier A file and a Tier B dump
+    # of one window hold each change twice -- drawn once per (box, t, name).
+    knobs_drawn = set()
     for k in hub.get('knob', []):  # (box 2's: below, on the hub clock)
-        if inside(k['t']):
-            nm, val = hub_str.get(int(k['name']), '?'), hub_str.get(int(k['value']), '?')
+        nm, val = hub_str.get(int(k['name']), '?'), hub_str.get(int(k['value']), '?')
+        if inside(k['t']) and (1, k['t'], nm) not in knobs_drawn:
+            knobs_drawn.add((1, k['t'], nm))
             tr.instant(1, 'knobs', f'knob {nm}={val}', k['t'], {'source': src_name.get(int(k['source']), '?')})
     for p in hub.get('hub_phase', []):
         if inside(p['t']):
@@ -351,8 +355,9 @@ def cmd_trace(a):
         to_hub = lambda t: t - off(t - off(a.t_to)) if not math.isnan(t) else NAN
         for k in b2.get('knob', []):
             t = to_hub(k['t'])
-            if inside(t):
-                nm, val = k['name_s'], k['value_s']
+            nm, val = k['name_s'], k['value_s']
+            if inside(t) and (2, k['t'], nm) not in knobs_drawn:
+                knobs_drawn.add((2, k['t'], nm))
                 tr.instant(2, 'knobs', f'knob {nm}={val}', t, {'source': src_name.get(int(k['source']), '?')})
         b2ex = (b2_hdr or {}).get('extras', {})
         tr.instant(2, 'knobs', 'knobs (box 2)', a.t_from, {**b2ex.get('env', {}), **{f'knob {k}': v for k, v in b2ex.get('knobs', {}).items()}})
