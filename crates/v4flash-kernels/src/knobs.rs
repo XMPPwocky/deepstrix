@@ -21,10 +21,14 @@
 //!
 //! `start` (once per process, at startup) resolves every knob, logs the ones
 //! off their default, and runs a watcher thread that re-resolves the live ones
-//! every second. A key removed from a file reverts its knob to the next source
-//! down; an INVALID value warns and keeps the current one (a typo must not
-//! silently reset a knob mid-A/B); an unknown key, or a static knob's key,
-//! warns. Every change is logged (`knob changed`), and the whole effective
+//! every second (at once after `request_pass`, e.g. box 2's SIGUSR2). A key
+//! removed from a file reverts its knob to the next source down; an INVALID
+//! value warns and keeps the current one (a typo must not silently reset a
+//! knob mid-A/B); an EMPTY value -- and an existing but empty knob file, what a
+//! truncating `printf ... > file` shows a reader for an instant -- keeps the
+//! current values silently (clear the file on purpose by deleting it or
+//! leaving a comment line; or write a temp file and `mv` it); an unknown key,
+//! or a static knob's key, warns. Every change is logged (`knob changed`), and the whole effective
 //! table goes to `<V41_KNOBS_FILE>.effective` after every change. A process
 //! that never calls `start` (tests, tools) resolves each knob once, at first
 //! use.
@@ -318,6 +322,16 @@ impl Knob {
         }
         match cands.into_iter().next() {
             None => (self.kind.default_bits(), Source::Default, None),
+            // Empty (a truncating write in progress, `V41_X=`): keep the
+            // current value, silently (the default on first use).
+            Some((_, raw)) if raw.trim().is_empty() && !matches!(self.kind, Kind::Text) => {
+                let st = self.state.load(Ordering::Acquire);
+                if st == 0 {
+                    (self.kind.default_bits(), Source::Default, None)
+                } else {
+                    (self.bits.load(Ordering::Relaxed), Source::from_u8(st - 1), None)
+                }
+            }
             Some((src, raw)) => match self.kind.parse(&raw) {
                 Some(bits) => (bits, src, None),
                 None => {
@@ -552,9 +566,16 @@ pub fn start_with(tables: &[&'static [&'static Knob]], default_file: Option<Stri
         eprintln!("knobs: resolved {} ({} live) file={:?} set: {}", knobs.len(), knobs.iter().filter(|k| k.live).count(), knob_file(), set.join(" "));
     }
     if first {
-        let spawned = std::thread::Builder::new().name("knobs".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            step_now();
+        let spawned = std::thread::Builder::new().name("knobs".into()).spawn(|| {
+            let mut ticks = 0u32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                ticks += 1;
+                if REQUEST.swap(false, Ordering::Relaxed) || ticks >= 10 {
+                    ticks = 0;
+                    step_now();
+                }
+            }
         });
         if let Err(e) = spawned {
             tracing::error!(error = %e, "knobs: watcher not started; live knobs keep their startup values");
@@ -562,8 +583,17 @@ pub fn start_with(tables: &[&'static [&'static Knob]], default_file: Option<Stri
     }
 }
 
-/// One watcher pass over every registered knob, now (the watcher's step; also
-/// box 2's SIGUSR2).
+static REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the watcher for a pass now (within ~100 ms) instead of at its next
+/// second. One atomic store: safe from a signal handler (box 2's SIGUSR2), and
+/// keeps the pass's I/O off the caller's thread.
+pub fn request_pass() {
+    REQUEST.store(true, Ordering::Relaxed);
+}
+
+/// One watcher pass over every registered knob, now, on the calling thread
+/// (the watcher; startup).
 pub fn step_now() {
     static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let mut g = WARNED.lock().unwrap_or_else(|p| p.into_inner());
@@ -572,8 +602,21 @@ pub fn step_now() {
 
 fn step(warned: &mut HashSet<String>) {
     let knobs = REGISTERED.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    let text = knob_file().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-    let file = parse_file(&text);
+    // An existing but EMPTY knob file is a truncating write in progress: the
+    // last file's keys stand (a missing file clears them).
+    static LAST: Mutex<Option<BTreeMap<String, String>>> = Mutex::new(None);
+    let read = knob_file().and_then(|p| std::fs::read_to_string(p).ok());
+    let text = read.clone().unwrap_or_default();
+    let file = {
+        let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        let file = match read {
+            Some(t) if t.trim().is_empty() => last.clone().unwrap_or_default(),
+            Some(t) => parse_file(&t),
+            None => BTreeMap::new(),
+        };
+        *last = Some(file.clone());
+        file
+    };
     let mut p = {
         let _g = RESOLVE.lock().unwrap_or_else(|p| p.into_inner());
         pass(&knobs, &file, &|k| std::env::var(k).ok(), &|p| std::fs::read_to_string(p).ok(), warned)
@@ -705,6 +748,9 @@ mod tests {
         assert_eq!((K.get(), K.source()), (4, Source::Env));
         pass(&knobs, &BTreeMap::new(), &env_of(&[]), &read, &mut warned);
         assert_eq!((K.get(), K.source()), (6, Source::Default));
+        // an empty value (a truncating write) keeps the current one, silently
+        let p = pass(&knobs, &parse_file("T_MIN_ROWS=\n"), &env_of(&[]), &read, &mut warned);
+        assert_eq!((K.get(), p.warnings.len(), p.changed.len()), (6, 0, 0));
         // a bad value that was fixed (the passes above resolved valid) and
         // comes back is reported again, once
         assert_eq!(pass(&knobs, &bad, &env, &read, &mut warned).warnings.len(), 1);

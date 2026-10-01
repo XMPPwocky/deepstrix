@@ -1913,7 +1913,6 @@ fn b2_merge() -> bool {
 /// sizes the pinned staging sets.
 pub mod knobs {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    pub static DIRTY: AtomicBool = AtomicBool::new(false);
     /// Every shard's mirror opened (`set_mirror_ok`, at `enable_paging`).
     static MIRROR_OK: AtomicBool = AtomicBool::new(false);
     const MAX: u64 = u32::MAX as u64;
@@ -2039,8 +2038,9 @@ pub mod knobs {
             format!("{}/expertd-knobs.txt", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
         })
     }
-    /// Re-read the knob file now (SIGUSR2; the watcher also does every
-    /// second); returns a one-line summary for the log.
+    /// Re-read the knob file now, on the CALLING thread (tools; the daemon's
+    /// SIGUSR2 goes to the watcher, `crate::knobs::request_pass`); returns a
+    /// one-line summary.
     pub fn reload() -> String {
         crate::knobs::step_now();
         format!("knobs reloaded from {:?}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={}",
@@ -2051,7 +2051,9 @@ pub mod knobs {
 }
 
 extern "C" fn knobs_signal(_sig: i32) {
-    knobs::DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+    // The watcher thread runs the pass (and logs it): no file I/O on the
+    // compute thread.
+    crate::knobs::request_pass();
 }
 
 /// Install the SIGUSR2 handler for [`knobs::reload`] (daemon main).
@@ -2061,15 +2063,11 @@ pub fn install_knobs_toggle() -> String {
     }
     const SIGUSR2: i32 = 12;
     // The file is read at startup (`crate::knobs::start_with` in the daemon's
-    // main, and once more here), not only on SIGUSR2. Without that it was inert
-    // until someone signalled, so a launch script that wrote `miss_par=1` into it
-    // while passing `V41_B2_MISS_PAR=4` ran at 4 and looked like 1 (2026-09-22
-    // audit, B4).
-    let _ = knobs::reload();
-    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={} (SIGUSR2 reloads {})",
-        u8::from(knobs::merge()), knobs::merge_wait_us(), knobs::miss_par(), u8::from(knobs::coalesce()),
-        v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" },
-        if knobs::prefill_route_split() { "split" } else { "mirror" }, u8::from(knobs::fast_chain()), knobs::prefill_budget(), u8::from(knobs::encoder_victims_first()), knobs::path());
+    // main, which prints the knobs), not only on SIGUSR2. Without that it was
+    // inert until someone signalled, so a launch script that wrote `miss_par=1`
+    // into it while passing `V41_B2_MISS_PAR=4` ran at 4 and looked like 1
+    // (2026-09-22 audit, B4).
+    let init = format!("knobs: watched every second; SIGUSR2 re-reads {:?} at once", crate::knobs::knob_file());
     unsafe { signal(SIGUSR2, knobs_signal); }
     init
 }
@@ -6809,9 +6807,6 @@ pub fn serve_connection(
                 Inbound::Closed(Some(e)) => return Err(eyre!("reader: {e}")),
                 Inbound::Frame { hdr, buf, t_first, t_done, t2 } => (hdr, buf, t_first, t_done, t2),
             };
-            if knobs::DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("expertd: {}", knobs::reload());
-            }
             let t_start = Instant::now();
             // `evtrace` (`b2_req`): stamps + reader state at dequeue.
             let ev_on = super::evtrace::enabled();
@@ -8589,7 +8584,9 @@ mod tests {
 
     /// Box 2's knob file and env as deployed on 2026-10-01 resolve to what the
     /// daemon ran with before the move to `crate::knobs` (short keys as aliases;
-    /// the file over the env: `miss_par=1` beats `V41_B2_MISS_PAR=4`).
+    /// the file over the env: `miss_par=1` beats `V41_B2_MISS_PAR=4`). NOTE it
+    /// sets the REAL box-2 knob statics in this test process: a lib test that
+    /// reads them must not depend on their defaults.
     #[test]
     fn box2s_deployed_knob_file_resolves_as_before() {
         let file = crate::knobs::parse_file("merge=1\nmerge_wait_us=400\nmiss_par=1\ncoalesce=0\nmirror_frac=0.70\npark=1\nroute=urgency\n");
