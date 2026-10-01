@@ -1,8 +1,10 @@
 # KV prefix store: chunked, content-addressed (design)
 
-Status: DESIGN, revision 6 (2026-10-01), APPROVED in review round 5. No code. It
-replaces the whole-prompt snapshot store (`crates/deepstrix-server/src/snapshot.rs`, format v6)
-on the multistream path. Appendix A lists each review finding and what changed.
+Status: DESIGN, revision 7 (2026-10-01). Revision 6 was APPROVED in review round 5; revision 7
+records what the M1 implementation (`crates/deepstrix-server/src/kvstore/`) changed or measured,
+marked "(M1)" in the text and listed in Appendix B. It replaces the whole-prompt snapshot store
+(`crates/deepstrix-server/src/snapshot.rs`, format v6) on the multistream path. Appendix A lists
+each design review finding and what changed.
 
 - **MEASURED:** hub logs for 2026-09-28 16:00 .. 10-01 09:00 (65 h; files in 1.0), or the
   snapshot root `~/.cache/deepstrix/snapshots-v41`.
@@ -369,6 +371,9 @@ bit-changing (0193166, 1c5972f, cba1b00).
 - The meaning of the stored state: `V41_CED`, which decides what a full tail's decoder windows
   mean, and index keys on or off (`V41_INDEX_K`).
 - `KV_EPOCH` (4.4.1).
+- The file format version (M1). A format bump then starts a new namespace: neither the new
+  binary's scan nor a rolled-back one unlinks the other's files as a bad version, and the old
+  namespace is kept as the inactive one (and evicted first).
 
 **Headers only, not the namespace:**
 
@@ -379,6 +384,13 @@ bit-changing (0193166, 1c5972f, cba1b00).
   - `V41_ENGRAM_CHUNK128`, `DEEPSTRIX_COMP_GATHER`, `V41_SWA_MIXED`;
   - the small-batch dense dp4a knobs in `dispatch.rs`;
   - the MoE small-b arms, and so on.
+
+  **Only the knobs that are set are hashed** (name, length, value; sorted by name), so
+  classifying a new knob changes no hash until someone sets it (M1). Two kinds of knobs escape a
+  hash of the launch env: knobs re-read at run time (`V41_MS_LM_FILE` re-reads its file every
+  2 s per job; `V41_B2_KNOBS` is the path of box 2's runtime knob file), and knobs read by the
+  box-2 daemon itself. M2 closes both: a write carries the knob hash of the values its job
+  resolved, and box 2 reports its own (e.g. in HELLO).
 - The **knob classification test** covers the whole prefill call graph, not two files.
   - **It scans string literals of knob names,** not only `std::env::var` calls. Some reads go
     through wrappers whose key is a variable: `env_f` / `env_u` in `expert_pager.rs`,
@@ -388,7 +400,13 @@ bit-changing (0193166, 1c5972f, cba1b00).
     `v4flash-vision` reads `VIT_GEMM` (WMMA against scalar GEMM), which changes tower rows and
     so the KV of image rows.
   - **It fails on any literal not classified** as numerics-relevant or not. Whole crates are
-    scanned because the reads hide in leaf helpers.
+    scanned because the reads hide in leaf helpers. It also fails on a classified name that no
+    longer occurs.
+  - **The rule** (M1): a knob is numerics-relevant iff it can change what a prefill row computes
+    (kernel arm, precision, fusion, the batch / lane / chunk geometry arms are picked by, Engram,
+    the tower) or which device computes it (box-1 ownership and residency: hot set, box-1 pool
+    geometry, catch-all, partition). Box-2 residency, prefetch and IO pacing are not: box 2
+    computes what the hub's split assigns it, whatever is resident there.
 
 **Purges are explicit operator actions, never routine retention.**
 
@@ -471,8 +489,13 @@ not match is dropped (a cold ring), because a drafter swap must not invalidate t
 - At startup the store keeps the active namespace and the most recently active other one (for
   rollback). It **renames** all older ones into `kvstore-v1/trash/`: one rename each, so
   startup never waits on deletion. The IO thread unlinks the trash in the background.
-  - A full 100 GiB namespace is ~37K files. ESTIMATE: 2-10 s of unlinks on btrfs over
-    dm-crypt; M1 measures it.
+  - A full 100 GiB namespace is ~37K files. MEASURED (M1 bench, 10-01, btrfs over dm-crypt):
+    16K unlinks/s of 2.76 MB files, so ~2.3 s of background unlinks.
+  - The kept inactive namespace counts against the cap with its persisted byte total
+    (`<ns16>/bytes`, written at shutdown and hourly), not by statting its files (M1).
+- **One process per root** (M1): opening takes `flock(LOCK_EX | LOCK_NB)` on
+  `kvstore-v1/.lock` before any rename. If that fails, the store stays off and logs why: a
+  second process would otherwise rename a live store's namespace or `tmp/` into the trash.
 - Under pressure, the inactive namespace is evicted first, whole, the same way.
 - Now that only semantics/ABI changes or an epoch bump create a namespace, this is rare: a
   model, tower or Engram swap, a store-layout change, or a 4.4.1 bump. Each strands at most
@@ -487,20 +510,28 @@ not match is dropped (a cold ring), because a drafter swap must not invalidate t
   - per store: rows, row bytes, key bytes;
   - provenance `prefill|decode|mixed|backfill-v6`, build id (`v6` for backfill),
     `KV_NUMERICS_GEN`, knob hash, created;
-  - payload length and blake3.
+  - payload length and blake3;
+  - a 16 B header checksum (M1). 256 B in all.
 
   Then the token ids, the image records and the payload.
 - **`tails/<h2>/<key>.kvt`.** Header:
   - magic `DSKVT`, ns, key, base chain, T, kind `full|enc`, flag `anchor` (8.2);
+  - flag `demoted` and an `origin` byte (prompt end, waypoint, anchor, cancel, turn end) (M1):
+    thinning (8.2) applies only to demoted prompt ends, never to waypoints or cancel tails;
   - `n_raw`, `n_raw_dec`, drafter fingerprint, `session_id` if present (telemetry only);
   - hits, build id, `KV_NUMERICS_GEN`, knob hash;
-  - **two** payload sections, each with its own length and blake3.
+  - **two** payload sections, each with its own length and blake3;
+  - a 16 B header checksum over every header byte except the 4 B `hits`, so a touch stays one
+    pwrite; `hits` is clamped on read so a damaged value cannot make a tail immortal (M1).
+    512 B in all.
 
   Then the open tokens and images, and the two sections:
   - **section E:** the open rows and keys and the accumulators of each store, then the encoder
     windows;
-  - **section D (full tails only):** the decoder windows, the ring, `ring_writes` and
-    `last_ring_pos`.
+  - **section D (full tails only):** the decoder windows (`n_raw_dec` rows), then, iff the
+    drafter fingerprint is not zero, the ring, `ring_writes` and `last_ring_pos`. M2 defines its
+    exact layout; M1 stores it as opaque bytes with its length and blake3. Asking for section D
+    of an encoder tail is an error, never an empty section (the #25 signature).
 
   **Every mutation of an existing file runs on the IO thread:** the hits pwrite, the mtime
   update, the truncate and the header rewrite. The scheduler thread keeps its view (hits,
@@ -704,8 +735,11 @@ When present, it is logged.
 - **`prefill_job_finish`** is unchanged, apart from the check in 5.3.
 - **DSpark:** 5.4.
 - **`fill_reserved` / `try_admit`** are unchanged.
-- **Pins:**
-  - the restore plan's files, until the restore completes;
+- **Pins** are PATH pins (M1): pinning a chunk also pins its ancestors, otherwise an in-flight
+  job's restored prefix could cascade away under the chunks it is writing, and its next tail
+  would find a hole. Refs and pins are then both monotone up a path.
+  - the restore plan's tail and chunk path, until the restore completes, owned by the job (and
+    released at its end at the latest);
   - an in-flight job's written chunks, until the completion message of the next tail on its
     path (9.4).
 - **Optional (M3):** walk at enqueue and order the queue by the real suffix length (SJF on the
@@ -722,8 +756,8 @@ takes 2.1 s at Gen1 (0.44 GB/s) and 1.1 s at Gen4 (~0.8 GB/s).
   allocation per restore, given the hub's history of heap growth.
 - **Pass 1: verify every file before the first host-to-device copy.** Pass 1 reads and checks
   the checksums of every chunk and tail section from the page cache.
-  - blake3 runs at about 0.15-0.3 s per 911 MB single-threaded, an ESTIMATE that M1 measures.
-    It is counted in the restore budget, and run per chunk in parallel if needed.
+  - blake3 MEASURED (M1 bench, this box, one thread): 7.2 GB/s, 911 MB in 126 ms. It is
+    counted in the restore budget; parallel hashing is not needed.
   - A per-file "verified since startup" bit stops an active conversation's ~900 MB of chunks
     from being re-hashed every turn.
 - **Pass 2: copy.** Read each chunk straight into staging (the bytes as they are) and do one
@@ -916,9 +950,11 @@ already known: the job's walk matched them (tails at T' < T whose tokens prefix 
 
 **Demotion.** The newest N = 2 on the path stay full. Two cover "regenerate the last turn",
 whose request is the previous prompt (t = 1). Older ones are **demoted** to encoder tails:
-`ftruncate` section D, which frees 3.03 MB each (4.5).
+`ftruncate` section D, which frees 3.03 MB each (4.5). "Newest" on one path means deepest T: a
+conversation's prompt ends grow with its turns. Anchors are exempt and do not count toward N
+(M1).
 
-**Thinning.** The path keeps at most one demoted tail per K-window [jK, (j+1)K), the newest.
+**Thinning.** The path keeps at most one demoted tail per K-window [jK, (j+1)K), the deepest.
 Waypoints are kept separately. This is ds4's continued-prefix discount, made structural.
 
 **Pins block demotion and thinning, not only deletion.** The M3 prefetch and a restore in
@@ -972,8 +1008,12 @@ pending writes.
 
 - The cap is enforced on the index, so removed entries leave the count at once.
 - The unlink backlog is reported (`kv.store trash_bytes`). In the worst case, a whole 100 GiB
-  namespace, it lasts 2-10 s (ESTIMATE, 4.4). The filesystem keeps ≥ 380 GB of slack (8.5)
-  for it.
+  namespace, it lasts ~2.3 s (MEASURED in M1: 16K unlinks/s at 2.76 MB, 4.4). The filesystem
+  keeps ≥ 380 GB of slack (8.5) for it.
+- **An unlink never deletes a newer file** (M1). A later write to a path cancels a queued unlink
+  of it; and an unlink of a key with a write in flight is skipped, because that write already
+  ran or will run and the file at the path is the new one. If that write then fails, the stale
+  file goes when nothing is in flight for the key.
 - Neither the backlog nor the unlinks ever block the scheduler.
 
 ### 8.4 Capacity (ESTIMATE)
@@ -1064,7 +1104,22 @@ The only cost is a sync device-to-host copy of contiguous rows from the idle scr
     completion.
   - If that write is dropped, the job re-enqueues k from its own scratch state, which still
     holds rows [0, done). If it no longer can, it marks k broken for itself.
-- **Pins are released on the tail's completion message,** not at enqueue.
+- **Chunks may land before their parent** (M1): a dropped chunk k is re-enqueued behind k+1.
+  The index holds such a chunk detached, unreachable for walks until its parent lands. A tail
+  whose chunk path is incomplete when it lands is dropped (`kv.write_dropped why=broken_path`)
+  and its file removed; the startup scan drops chunks that do not reach the root.
+- **Writes in flight are queued per key, oldest first** (M1): an encoder tail and then the full
+  tail of the same key (a waypoint at L % K = 0, an anchor on a K multiple, two jobs) both land,
+  in order; a second write of the same kind is `Pending`.
+- **Pins are released on the tail's completion message,** not at enqueue. A tail dropped as
+  `broken_path` releases them too.
+- **A job may end with writes in flight** (M1): M2 ends it in the tick that queues its last
+  writes. Its late completions land unowned (no pins); a failed job's late chunks go at once if
+  nothing references them; the store forgets the job when its writes drain. The invariant
+  checker fails if a finished job still owns a pin.
+- **Only data-attributable failures evict** (M1): a format verdict, a short or missing file. A
+  read that fails transiently (EIO, EMFILE, ENOMEM, EACCES) returns an error, logs
+  `kv.suspect` and evicts nothing; so does a demotion that fails that way.
 - **Completion messages are processed at the top of every scheduler tick and before every
   walk.**
 - **Shutdown drains the queue,** bounded by the queue size: ≤ 512 MB, under 1 s at disk speed.
@@ -1093,14 +1148,21 @@ The only cost is a sync device-to-host copy of contiguous rows from the idle scr
 ### 9.5 Atomicity and crash safety
 
 - **Writes:** `tmp/` then rename, no fsync: this is a cache. The FIFO order puts tails after
-  their chunks, but without fsync the filesystem may reorder them.
+  their chunks, but without fsync the filesystem may reorder them. MEASURED (M1): create + fsync
+  costs 2.1-3.5 ms per file here; the checksums and the startup scan already turn an unsynced
+  file into a miss, so no fsync stays. A new file's mtime is set to its header's `created`: a
+  tail's mtime is its persisted `last_used` (8.3).
 - **Startup:**
-  - clear `tmp/`;
+  - take the root lock (4.4);
+  - clear `tmp/` (one rename into `trash/`);
   - rename stale namespaces into `trash/` (4.4); the unlinks run in the background;
   - scan the headers (~38K files, ~2 s, ESTIMATE);
   - check each tail's section lengths against its file size (4.5);
   - rebuild the index, the refcounts and `path_last_used`;
-  - remove from the index the tails that have missing ancestors, and queue their unlinks.
+  - remove from the index the tails that have missing ancestors and the chunks that do not reach
+    the root, and queue their unlinks. If any header read failed transiently, leave those on
+    disk unindexed instead (the missing link may be the unreadable file) and judge them at the
+    next startup (M1).
 - **Startup time** is the header scan plus renames: a few seconds. It never waits on unlinks.
 - **On every read:** checksums per section and a token-id comparison (6.6).
 - **Invariant checker:** in debug builds and in shadow, every hour, a full refcount rebuild is
@@ -1116,8 +1178,11 @@ The only cost is a sync device-to-host copy of contiguous rows from the idle scr
 
 ### 9.7 Code layout
 
-- `crates/deepstrix-server/src/kvstore/`: `format.rs`, `index.rs` (trie nodes, tails,
-  refcounts, pins, the eviction order, demotion), `io.rs`, `mod.rs`.
+- `crates/deepstrix-server/src/kvstore/` (M1): `keys.rs` (namespace, chain, the golden key
+  vector), `format.rs` (headers, readers), `index.rs` (trie nodes, tails, refcounts, pins, the
+  eviction order, demotion, thinning, walk, selection, the invariant checker), `io.rs` (the IO
+  thread), `scan.rs` (root lock, namespace GC, startup scan), `knobs.rs` (the classification and
+  the knob hash), `mod.rs` (the `Store` facade the scheduler thread uses), `tests.rs`.
 - GPU side, `het/kv_capture.rs` next to `KvArena::export_to_state`: `capture_rows`,
   `capture_tail`, `restore_into`, plus the arena-slot variants for M4.
 
@@ -1401,3 +1466,29 @@ last:
 | R5-1 | env-only knob changes bypass `KV_NUMERICS_GEN` | fixed. The effective generation is the pair (`KV_NUMERICS_GEN`, knob hash): `kv.store gens=` and the oldest-present release check use pairs, and a new pair is logged at startup (`kv.gen_new`) like an unmeasured generation (4.4, 4.4.1). |
 | R5-2 | frontier entries that selection would reject | fixed. Only frontier entries usable for this request count; entries 6.2 would reject (an encoder tail with L − f ≤ 128, or below T ≥ 64) are ignored, so a plan that legitimately stops below them is not `unexplained` (11.1). |
 | R5-3 | wording | "per distinct system prefix" became "per recurring prefix" (8.2, 11.1). |
+
+## Appendix B: M1 implementation (code review round 1)
+
+M1 is on branch `worktree-kv-prefix-store`. Its deviations from revision 6, all accepted in code
+review round 1, and the review's fixes that change what this document says:
+
+| item | what M1 does | where |
+|---|---|---|
+| files | `keys.rs`, `scan.rs`, `knobs.rs` and `tests.rs` beside the four files of 9.7 | 9.7 |
+| tail header | `origin` byte and `demoted` flag; 16 B header checksum skipping `hits`; `hits` clamped | 4.5 |
+| section D | opaque in M1; M2 defines it: `n_raw_dec` decoder rows, ring present iff drafter id != 0 | 4.5 |
+| pins | path pins; a plan pin is owned by its job | 6.5, 9.4 |
+| arrival order | chunks may land before their parent; `broken_path` drops a tail over a hole | 9.4, 9.5 |
+| demotion | newest = deepest T; anchors exempt and not counted in N = 2; thinning keeps the deepest | 8.2 |
+| cap | evict above the cap down to cap − 1% | 8.3 |
+| GC | `last_active` stamp per namespace; persisted byte total; `tmp/` renamed into the trash | 4.4, 9.5 |
+| unlinks | a write cancels a queued unlink of its path; an unlink is skipped while the key has a write in flight | 8.3 |
+| same-key writes | queued per key, oldest first (an encoder tail, then the full tail of the same key) | 9.4 |
+| late completions | a job may end with writes in flight; they land unowned | 9.4 |
+| transient errors | only data-attributable failures evict; IO errors log `kv.suspect` | 9.4, 9.5 |
+| namespace | the file format version is a namespace input | 4.4 |
+| root lock | `flock` on `kvstore-v1/.lock`; the store stays off if it is held | 4.4 |
+| knob hash | set knobs only; the classification rule stated; run-time and box-2 knobs: M2 | 4.4 |
+
+**Measured** (M1 bench, 10-01, this box): blake3 7.2 GB/s on one thread (911 MB in 126 ms);
+unlink 16K/s at 2.76 MB (~2.3 s per 37K files); create + fsync 2.1-3.5 ms per file.
