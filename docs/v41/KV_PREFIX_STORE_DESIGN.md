@@ -492,7 +492,8 @@ not match is dropped (a cold ring), because a drafter swap must not invalidate t
   - A full 100 GiB namespace is ~37K files. MEASURED (M1 bench, 10-01, btrfs over dm-crypt):
     16K unlinks/s of 2.76 MB files, so ~2.3 s of background unlinks.
   - The kept inactive namespace counts against the cap with its persisted byte total
-    (`<ns16>/bytes`, written at shutdown and hourly), not by statting its files (M1).
+    (`<ns16>/bytes`, written by the IO thread at shutdown and hourly), not by statting its
+    files (M1).
 - **One process per root** (M1): opening takes `flock(LOCK_EX | LOCK_NB)` on
   `kvstore-v1/.lock` before any rename. If that fails, the store stays off and logs why: a
   second process would otherwise rename a live store's namespace or `tmp/` into the trash.
@@ -542,7 +543,8 @@ not match is dropped (a cold ring), because a drafter swap must not invalidate t
   **Demotion (8.2)** works because section D is last. It is two steps: `ftruncate` first, then
   rewrite the header. The startup scan compares the section lengths with the file size:
   - **a crash after the truncate:** the header still claims section D but the file ends after
-    section E. The tail is treated as demoted and its header rewritten.
+    section E. The tail is treated as demoted and its header rewritten. Until then, a read that
+    does not want section D is served from such a file (M1).
   - **a file longer than its sections:** it is truncated.
 - **`tmp/`** holds writes in flight.
 
@@ -1492,3 +1494,19 @@ review round 1, and the review's fixes that change what this document says:
 
 **Measured** (M1 bench, 10-01, this box): blake3 7.2 GB/s on one thread (911 MB in 126 ms);
 unlink 16K/s at 2.76 MB (~2.3 s per 37K files); create + fsync 2.1-3.5 ms per file.
+
+**M2 notes** (from code review round 2):
+
+- **Events.** `ChunkStored` is reported only if the chunk is still indexed; a chunk that leaves
+  the store for any reason (a failed job's chunk deleted at once, an eviction, a corrupt file)
+  is reported as `ChunkDropped`, including the chunks `job_finished(failed)` deletes. A job that
+  subscribed to a pending write re-enqueues on `ChunkDropped` (9.4).
+- **Re-enqueue a dropped parent before queueing the job's next tail:** a tail over a hole is
+  refused as `broken_path`, and that refusal releases the job's pins on its path.
+- **Keep the restore plan's pin until the job's first own tail lands or the job ends,** not only
+  until the restore completes: until then the plan's tail and path hold the job's prefix.
+- **A job writes nothing after `job_finished`.** The store refuses such writes while it still
+  remembers the job; once its writes drain it forgets the job, and a later write would pin for a
+  job nobody releases. M2 either keeps that contract or refuses writes from finished job ids
+  with a monotonic high-water mark of job ids.
+- **Box-2 knob reporting** (4.4) stays M2 work.
