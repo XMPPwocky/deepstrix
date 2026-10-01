@@ -1899,62 +1899,51 @@ fn b2_merge() -> bool {
 
 /// RUNTIME KNOBS (2026-09-22). A daemon restart costs a 116 GB cold pool and
 /// ~10 minutes of warm-up, so A/B-ing two settings used to mean two restarts and
-/// two confounded warm-ups. These three are read from atomics instead of the
-/// env, seeded from the env at startup, and reloaded from a small key=value file
-/// when the daemon gets SIGUSR2 (the signal only sets a flag; the file is read
-/// by the compute loop, not the handler).
+/// two confounded warm-ups. Since 10-01 these are `crate::knobs` (one
+/// implementation for every process): seeded from the env, overridden by the
+/// knob file -- `V41_KNOBS_FILE`, else `path()` (`V41_B2_KNOBS`, default
+/// `~/expertd-knobs.txt`), with the short keys below as aliases -- re-read every
+/// second by the watcher (`crate::knobs::start_with`, daemon main) and at once on
+/// SIGUSR2. A key REMOVED from the file now reverts its knob to the env/default
+/// (until 10-01 the last value stuck).
 ///
-///     printf 'merge=0\nmiss_par=2\n' > ~/expertd-knobs.txt && kill -USR2 <pid>
+///     printf 'merge=0\nmiss_par=2\n' > ~/expertd-knobs.txt   # (kill -USR2 <pid>: now)
 ///
 /// `miss_par` can only be LOWERED below the startup `V41_B2_MISS_PAR`, which
 /// sizes the pinned staging sets.
 pub mod knobs {
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     pub static DIRTY: AtomicBool = AtomicBool::new(false);
-    static MERGE: AtomicBool = AtomicBool::new(true);
-    static COALESCE: AtomicBool = AtomicBool::new(false);
-    static MERGE_WAIT_US: AtomicU64 = AtomicU64::new(400);
-    static MISS_PAR: AtomicUsize = AtomicUsize::new(1);
-    static PARK: AtomicBool = AtomicBool::new(false);
-    static ROUTE_URGENCY: AtomicBool = AtomicBool::new(false);
-    /// `V41_B2_PREFILL_ROUTE` (`split` default | `mirror`): see `prefill_route_split`.
-    static PREFILL_ROUTE_SPLIT: AtomicBool = AtomicBool::new(true);
     /// Every shard's mirror opened (`set_mirror_ok`, at `enable_paging`).
     static MIRROR_OK: AtomicBool = AtomicBool::new(false);
-    /// `V41_B2_FAST_CHAIN` (default on; `0` = the old chain): see `fast_chain`.
-    static FAST_CHAIN: AtomicBool = AtomicBool::new(true);
-    /// `V41_B2_PREFILL_BUDGET` / key `prefill_budget`: see `prefill_budget`.
-    static PREFILL_BUDGET: AtomicU64 = AtomicU64::new(PREFILL_BUDGET_DEFAULT);
-    /// `V41_B2_ENCODER_VICTIMS_FIRST` / key `encoder_victims_first`: see
-    /// `encoder_victims_first`.
-    static ENCODER_VICTIMS_FIRST: AtomicBool = AtomicBool::new(true);
-    const PREFILL_BUDGET_DEFAULT: u64 = 3500;
-    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    fn init() {
-        INIT.get_or_init(|| {
-            MERGE.store(std::env::var("V41_B2_MERGE").as_deref() != Ok("0"), Relaxed);
-            MERGE_WAIT_US.store(
-                std::env::var("V41_B2_MERGE_WAIT_US").ok().and_then(|v| v.parse().ok()).unwrap_or(400),
-                Relaxed,
-            );
-            MISS_PAR.store(
-                std::env::var("V41_B2_MISS_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
-                Relaxed,
-            );
-            COALESCE.store(
-                matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on")),
-                Relaxed,
-            );
-            PARK.store(std::env::var("V41_B2_PARK").as_deref() == Ok("1"), Relaxed);
-            ROUTE_URGENCY.store(std::env::var("V41_B2_ROUTE").as_deref() == Ok("urgency"), Relaxed);
-            PREFILL_ROUTE_SPLIT.store(std::env::var("V41_B2_PREFILL_ROUTE").as_deref() != Ok("mirror"), Relaxed);
-            PREFILL_BUDGET.store(
-                std::env::var("V41_B2_PREFILL_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFILL_BUDGET_DEFAULT),
-                Relaxed,
-            );
-            ENCODER_VICTIMS_FIRST.store(std::env::var("V41_B2_ENCODER_VICTIMS_FIRST").as_deref() != Ok("0"), Relaxed);
-            FAST_CHAIN.store(std::env::var("V41_B2_FAST_CHAIN").as_deref() != Ok("0"), Relaxed);
-        });
+    const MAX: u64 = u32::MAX as u64;
+    fn sync_mirror_frac(k: &crate::knobs::Knob) {
+        v4flash_core::hf_v41::set_expert_mirror_frac(k.f64() as f32);
+    }
+    crate::knobs! {
+        /// `V41_B2_MERGE` (default on), key `merge`.
+        pub static MERGE = Knob::flag("V41_B2_MERGE", true).alias("merge");
+        /// `V41_B2_MERGE_WAIT_US` (default 400), key `merge_wait_us`.
+        pub static MERGE_WAIT_US = Knob::int("V41_B2_MERGE_WAIT_US", 400, 0, MAX).alias("merge_wait_us");
+        /// `V41_B2_MISS_PAR` (default 1, 1..=16), key `miss_par`.
+        pub static MISS_PAR = Knob::int("V41_B2_MISS_PAR", 1, 1, 16).alias("miss_par");
+        /// `V41_B2_COALESCE` (default off), key `coalesce`.
+        pub static COALESCE = Knob::flag("V41_B2_COALESCE", false).alias("coalesce");
+        /// `V41_B2_PARK` (default off), key `park`.
+        pub static PARK = Knob::flag("V41_B2_PARK", false).alias("park");
+        /// `V41_B2_ROUTE`: `split` (default) or `urgency`, key `route`.
+        pub static ROUTE = Knob::choice("V41_B2_ROUTE", 0, &[&["split"], &["urgency"]]).alias("route");
+        /// `V41_B2_PREFILL_ROUTE`: `split` (default) or `mirror`, key `prefill_route`.
+        pub static PREFILL_ROUTE = Knob::choice("V41_B2_PREFILL_ROUTE", 0, &[&["split"], &["mirror"]]).alias("prefill_route");
+        /// `V41_B2_FAST_CHAIN` (default on), key `fast_chain`.
+        pub static FAST_CHAIN = Knob::flag("V41_B2_FAST_CHAIN", true).alias("fast_chain");
+        /// `V41_B2_PREFILL_BUDGET` (default 3500), key `prefill_budget`.
+        pub static PREFILL_BUDGET = Knob::int("V41_B2_PREFILL_BUDGET", 3500, 0, MAX).alias("prefill_budget");
+        /// `V41_B2_ENCODER_VICTIMS_FIRST` (default on), key `encoder_victims_first`.
+        pub static ENCODER_VICTIMS_FIRST = Knob::flag("V41_B2_ENCODER_VICTIMS_FIRST", true).alias("encoder_victims_first");
+        /// `V41_EXPERT_MIRROR_FRAC` (default 0.6), key `mirror_frac`: pushed into
+        /// `v4flash_core::hf_v41::set_expert_mirror_frac` (the reader's state).
+        pub static MIRROR_FRAC = Knob::real("V41_EXPERT_MIRROR_FRAC", 0.6, 0.0, 1.0).alias("mirror_frac").hook(sync_mirror_frac);
     }
     /// `V41_B2_FAST_CHAIN` (default ON; `0` = the exact old chain); file key
     /// `fast_chain`. A batched pass of `b <= FAST_CHAIN_MAX_B` rows (every
@@ -1968,9 +1957,9 @@ pub mod knobs {
     /// (tests/remote_experts_chain_trace.rs, 2026-09-27, 1 distinct expert):
     /// 14 GPU commands -> 6, small commands 26.9 -> 12.7 us, gaps inside the
     /// chain 29.3 -> 17.5 us, host readback 25-39 us -> ~1 us.
-    pub fn fast_chain() -> bool { init(); FAST_CHAIN.load(Relaxed) }
+    pub fn fast_chain() -> bool { FAST_CHAIN.on() }
     /// In-process toggle (tests, A/B harnesses); the daemon uses the env/file.
-    pub fn set_fast_chain(on: bool) { init(); FAST_CHAIN.store(on, Relaxed) }
+    pub fn set_fast_chain(on: bool) { FAST_CHAIN.set(if on { "1" } else { "0" }); }
     /// `V41_B2_PREFILL_ROUTE=split` (default) | `mirror`; file key
     /// `prefill_route`. Under `route=urgency` a PREFILL-shaped pass's demand
     /// reads (and its early-page / park reads, `PfJob::stage`) are STRIPED
@@ -1979,10 +1968,10 @@ pub mod knobs {
     /// per layer otherwise monopolise the SN5000 alongside decode's demand
     /// reads while the E100 idles (owner's decision, 2026-09-27). `mirror`
     /// restores the pre-09-27 routing. No effect under `route=split`.
-    pub fn prefill_route_split() -> bool { init(); PREFILL_ROUTE_SPLIT.load(Relaxed) }
-    pub fn merge() -> bool { init(); MERGE.load(Relaxed) }
-    pub fn merge_wait_us() -> u64 { init(); MERGE_WAIT_US.load(Relaxed) }
-    pub fn miss_par() -> usize { init(); MISS_PAR.load(Relaxed).clamp(1, 16) }
+    pub fn prefill_route_split() -> bool { PREFILL_ROUTE.pick() == 0 }
+    pub fn merge() -> bool { MERGE.on() }
+    pub fn merge_wait_us() -> u64 { MERGE_WAIT_US.get() }
+    pub fn miss_par() -> usize { MISS_PAR.usize() }
     /// Two preads per miss instead of eight (the whole 3-role run at once).
     /// ROOT CAUSE of the 2026-09-18 corruption, for the record: the checkpoint
     /// stores w1/w2/w3 but the loader maps gate<-w1, up<-w3, down<-w2, so a
@@ -1994,14 +1983,14 @@ pub mod knobs {
     /// against the per-role one. NOTE it also gives up the mirror split (the
     /// span read only touches the primary drive), so it trades 8 preads at
     /// ~9.9 GB/s for 2 at ~4.5.
-    pub fn coalesce() -> bool { init(); COALESCE.load(Relaxed) }
+    pub fn coalesce() -> bool { COALESCE.on() }
     /// PARK a request that must page (batched hits-first path, sender set
     /// `REQ_FLAG_OOO`): its misses go to the prefetch readers and requests
     /// already queued behind it are served and ANSWERED while they read, on a
     /// second executor. Without it a queued request (the other hub lane) waits
     /// out the whole NVMe read: measured 2026-09-23 at 4 rows, ~131 ms/step of
     /// box-2 queueing, ~as much as box 2's own page time.
-    pub fn park() -> bool { init(); PARK.load(Relaxed) }
+    pub fn park() -> bool { PARK.on() }
     /// `route=urgency` (`V41_B2_ROUTE=urgency`; default `split`): which drive
     /// each expert read uses. `split` = every read split across both drives by
     /// `mirror_frac`, scales from the primary. `urgency` = reads a request is
@@ -2025,7 +2014,7 @@ pub mod knobs {
     /// for 3,398 distinct experts, MEASURED 2026-10-01); ~3500 covers a job's
     /// box-2 union (~170 per layer x 20 encoder layers). Its cost -- decode
     /// experts displaced per prefill phase -- is not priced yet.
-    pub fn prefill_budget() -> u64 { init(); PREFILL_BUDGET.load(Relaxed) }
+    pub fn prefill_budget() -> u64 { PREFILL_BUDGET.get() }
     /// When a prefill phase takes DECODE-class victims (mode-aware tiers 2 and
     /// 4), rank them by the prefill's layer SWEEP (`sweep_rank`): pages of
     /// layers this pass has gone past first, then the other region's, last the
@@ -2038,10 +2027,9 @@ pub mod knobs {
     /// layers. Env `V41_B2_ENCODER_VICTIMS_FIRST` (`0` = off), file key
     /// `encoder_victims_first`, default on (the name predates the sweep rank:
     /// on = rank decode victims by the sweep, off = plain LRU within a tier).
-    pub fn encoder_victims_first() -> bool { init(); ENCODER_VICTIMS_FIRST.load(Relaxed) }
+    pub fn encoder_victims_first() -> bool { ENCODER_VICTIMS_FIRST.on() }
     pub fn route_urgency() -> bool {
-        init();
-        ROUTE_URGENCY.load(Relaxed) && MIRROR_OK.load(Relaxed)
+        ROUTE.pick() == 1 && MIRROR_OK.load(Relaxed)
     }
     pub fn set_mirror_ok(ok: bool) {
         MIRROR_OK.store(ok, Relaxed);
@@ -2051,39 +2039,14 @@ pub mod knobs {
             format!("{}/expertd-knobs.txt", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
         })
     }
-    /// Re-read the file; returns a one-line summary for the log.
+    /// Re-read the knob file now (SIGUSR2; the watcher also does every
+    /// second); returns a one-line summary for the log.
     pub fn reload() -> String {
-        init();
-        let p = path();
-        let Ok(text) = std::fs::read_to_string(&p) else {
-            return format!("knobs: {p} unreadable; keeping merge={} wait_us={} miss_par={} coalesce={}", merge(), merge_wait_us(), miss_par(), coalesce());
-        };
-        for line in text.lines() {
-            let line = line.trim();
-            let Some((k, v)) = line.split_once('=') else { continue };
-            match (k.trim(), v.trim()) {
-                ("merge", v) => MERGE.store(v != "0", Relaxed),
-                ("merge_wait_us", v) => { if let Ok(n) = v.parse() { MERGE_WAIT_US.store(n, Relaxed) } }
-                ("miss_par", v) => { if let Ok(n) = v.parse::<usize>() { MISS_PAR.store(n.clamp(1, 16), Relaxed) } }
-                ("coalesce", v) => COALESCE.store(v != "0", Relaxed),
-                ("park", v) => PARK.store(v != "0", Relaxed),
-                ("route", "urgency") => ROUTE_URGENCY.store(true, Relaxed),
-                ("route", "split") => ROUTE_URGENCY.store(false, Relaxed),
-                ("route", v) => eprintln!("expertd: knobs: unknown route={v:?} (want split|urgency); unchanged"),
-                ("prefill_route", "split") => PREFILL_ROUTE_SPLIT.store(true, Relaxed),
-                ("prefill_route", "mirror") => PREFILL_ROUTE_SPLIT.store(false, Relaxed),
-                ("prefill_route", v) => eprintln!("expertd: knobs: unknown prefill_route={v:?} (want split|mirror); unchanged"),
-                ("mirror_frac", v) => { if let Ok(f) = v.parse::<f32>() { v4flash_core::hf_v41::set_expert_mirror_frac(f) } }
-                ("fast_chain", v) => FAST_CHAIN.store(v != "0", Relaxed),
-                ("prefill_budget", v) => { if let Ok(n) = v.parse() { PREFILL_BUDGET.store(n, Relaxed) } }
-                ("encoder_victims_first", v) => ENCODER_VICTIMS_FIRST.store(v != "0", Relaxed),
-                _ => {}
-            }
-        }
-        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={}", park(),
-            merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac(),
-            if route_urgency() { "urgency" } else { "split" }, if prefill_route_split() { "split" } else { "mirror" },
-            u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()))
+        crate::knobs::step_now();
+        format!("knobs reloaded from {:?}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={}",
+            crate::knobs::knob_file(), u8::from(park()), u8::from(merge()), merge_wait_us(), miss_par(), u8::from(coalesce()),
+            v4flash_core::hf_v41::expert_mirror_frac(), if route_urgency() { "urgency" } else { "split" },
+            if prefill_route_split() { "split" } else { "mirror" }, u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()))
     }
 }
 
@@ -2097,13 +2060,14 @@ pub fn install_knobs_toggle() -> String {
         fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     }
     const SIGUSR2: i32 = 12;
-    // Read the file ONCE at startup, not only on SIGUSR2. Without this the file is
-    // inert until someone signals, so a launch script that writes `miss_par=1` into
-    // it while passing `V41_B2_MISS_PAR=4` on the command line runs at 4 and looks
-    // like it is running at 1 (found by the 2026-09-22 audit, B4).
+    // The file is read at startup (`crate::knobs::start_with` in the daemon's
+    // main, and once more here), not only on SIGUSR2. Without that it was inert
+    // until someone signalled, so a launch script that wrote `miss_par=1` into it
+    // while passing `V41_B2_MISS_PAR=4` ran at 4 and looked like 1 (2026-09-22
+    // audit, B4).
     let _ = knobs::reload();
     let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={} (SIGUSR2 reloads {})",
-        knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::coalesce(),
+        u8::from(knobs::merge()), knobs::merge_wait_us(), knobs::miss_par(), u8::from(knobs::coalesce()),
         v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" },
         if knobs::prefill_route_split() { "split" } else { "mirror" }, u8::from(knobs::fast_chain()), knobs::prefill_budget(), u8::from(knobs::encoder_victims_first()), knobs::path());
     unsafe { signal(SIGUSR2, knobs_signal); }
@@ -6496,6 +6460,8 @@ pub const BOX2_IGPU_COMPUTE_UUID: u64 = 0x424f5832_0000_0001;
 pub const BOX2_IGPU_XFER_UUID: u64 = 0x424f5832_0000_0002;
 pub const BOX2_REQUEST_UUID: u64 = 0x424f5832_0000_0010;
 pub const BOX2_SSD_UUID: u64 = 0x424f5832_0000_0020;
+/// Box 2's knobs: every knob at open, then each live change.
+pub const BOX2_KNOBS_UUID: u64 = 0x424f5832_0000_0030;
 
 /// The daemon's perfetto exporter: box 2's iGPU compute/xfer device tracks plus
 /// host-time application tracks for the per-request phases and the SSD expert
@@ -6508,6 +6474,8 @@ pub struct ExpertdTracer {
     exporter: super::perfetto::TrackExporter,
     igpu_compute: std::sync::Mutex<super::perfetto::Track>,
     machine: String,
+    /// The last knob change on the `knobs` track (`TrackExporter::emit_knobs`).
+    knobs_seen: std::sync::Mutex<u64>,
 }
 
 // SAFETY: the only non-Send member is the HIP `Event` inside the device
@@ -6531,7 +6499,10 @@ impl ExpertdTracer {
         exporter.declare(BOX2_IGPU_XFER_UUID, &format!("{machine} igpu.xfer (device)"))?;
         exporter.declare(BOX2_REQUEST_UUID, &format!("{machine} expertd.request (host)"))?;
         exporter.declare(BOX2_SSD_UUID, &format!("{machine} expertd.ssd (host)"))?;
-        Ok(Self { exporter, igpu_compute: std::sync::Mutex::new(igpu_compute), machine: machine.into() })
+        exporter.declare(BOX2_KNOBS_UUID, &format!("{machine} knobs"))?;
+        let mut seen = 0;
+        exporter.emit_knobs(BOX2_KNOBS_UUID, true, &mut seen)?;
+        Ok(Self { exporter, igpu_compute: std::sync::Mutex::new(igpu_compute), machine: machine.into(), knobs_seen: std::sync::Mutex::new(seen) })
     }
 
     pub fn machine(&self) -> &str {
@@ -6539,8 +6510,12 @@ impl ExpertdTracer {
     }
 
     /// Host-time span on a track (ns are CLOCK_REALTIME, `super::perfetto::host_now_ns`).
+    /// Also drains knob changes onto the `knobs` track (a compare when none).
     pub fn span(&self, uuid: u64, name: &str, start_ns: u64, end_ns: u64) {
         let _ = self.exporter.emit_span(uuid, name, start_ns, end_ns);
+        if let Ok(mut seen) = self.knobs_seen.try_lock() {
+            let _ = self.exporter.emit_knobs(BOX2_KNOBS_UUID, false, &mut seen);
+        }
     }
 
     /// One SSD expert read, labelled with its (layer, expert) so a stall
@@ -8611,6 +8586,29 @@ pub fn f32_to_f16_bits(f: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Box 2's knob file and env as deployed on 2026-10-01 resolve to what the
+    /// daemon ran with before the move to `crate::knobs` (short keys as aliases;
+    /// the file over the env: `miss_par=1` beats `V41_B2_MISS_PAR=4`).
+    #[test]
+    fn box2s_deployed_knob_file_resolves_as_before() {
+        let file = crate::knobs::parse_file("merge=1\nmerge_wait_us=400\nmiss_par=1\ncoalesce=0\nmirror_frac=0.70\npark=1\nroute=urgency\n");
+        let env = |k: &str| match k {
+            "V41_EXPERT_MIRROR_FRAC" => Some("0.70".to_string()),
+            "V41_B2_MISS_PAR" => Some("4".to_string()),
+            _ => None,
+        };
+        let mut warned = std::collections::HashSet::new();
+        let p = crate::knobs::pass(knobs::ALL, &file, &env, &|_| None, &mut warned);
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert!(knobs::merge() && knobs::park() && !knobs::coalesce());
+        assert_eq!((knobs::merge_wait_us(), knobs::miss_par()), (400, 1));
+        assert_eq!(knobs::ROUTE.pick(), 1, "urgency");
+        assert!((knobs::MIRROR_FRAC.f64() - 0.70).abs() < 1e-12);
+        assert!(knobs::prefill_route_split() && knobs::fast_chain() && knobs::encoder_victims_first());
+        assert_eq!(knobs::prefill_budget(), 3500);
+        assert!(p.hooks.iter().any(|k| k.name == "V41_EXPERT_MIRROR_FRAC"), "mirror_frac is pushed to v4flash_core");
+    }
 
     #[test]
     fn assignment_grammar() {

@@ -14,8 +14,10 @@
 //! 2. the env var (`V41_X=...`);
 //! 3. LIVE knobs only: the legacy one-value file named by `<legacy>` (the
 //!    10-01 `V41_X_FILE=/dev/shm/x.txt` scheme, kept for the A/B scripts);
-//! 4. LIVE knobs only: the process's knob file `V41_KNOBS_FILE` -- `NAME=value`
-//!    lines (the env names themselves), `#` comments.
+//! 4. LIVE knobs only: the process's knob file `V41_KNOBS_FILE` (else the
+//!    default `start_with` names, e.g. box 2's `~/expertd-knobs.txt`) --
+//!    `NAME=value` lines (the env names, or a knob's short `alias`), `#`
+//!    comments.
 //!
 //! `start` (once per process, at startup) resolves every knob, logs the ones
 //! off their default, and runs a watcher thread that re-resolves the live ones
@@ -133,6 +135,11 @@ pub struct Knob {
     pub live: bool,
     /// The env var naming this knob's legacy one-value file (live knobs only).
     pub legacy: Option<&'static str>,
+    /// A second key for it in the knob file (box 2's pre-10-01 short keys).
+    pub alias: Option<&'static str>,
+    /// Called after the value is resolved or changes (`start`'s watcher, a
+    /// first use): pushes it into state another crate owns.
+    hook: Option<fn(&Knob)>,
     bits: AtomicU64,
     /// 0 = not yet resolved; else 1 + `Source`.
     state: AtomicU8,
@@ -141,7 +148,7 @@ pub struct Knob {
 
 impl Knob {
     const fn new(name: &'static str, kind: Kind) -> Self {
-        Self { name, kind, live: false, legacy: None, bits: AtomicU64::new(0), state: AtomicU8::new(0), text: OnceLock::new() }
+        Self { name, kind, live: false, legacy: None, alias: None, hook: None, bits: AtomicU64::new(0), state: AtomicU8::new(0), text: OnceLock::new() }
     }
 
     pub const fn flag(name: &'static str, default: bool) -> Self {
@@ -175,6 +182,19 @@ impl Knob {
     pub const fn legacy(mut self, file_env: &'static str) -> Self {
         self.live = true;
         self.legacy = Some(file_env);
+        self
+    }
+
+    /// Also accept the knob-file key `key` (implies `live`).
+    pub const fn alias(mut self, key: &'static str) -> Self {
+        self.live = true;
+        self.alias = Some(key);
+        self
+    }
+
+    /// Call `f` after the value is resolved or changes.
+    pub const fn hook(mut self, f: fn(&Knob)) -> Self {
+        self.hook = Some(f);
         self
     }
 
@@ -258,10 +278,19 @@ impl Knob {
     /// Under `RESOLVE`, like the watcher's pass: a first use cannot overwrite
     /// a value the watcher stored meanwhile.
     fn resolve_first(&self) {
-        let _g = RESOLVE.lock().unwrap_or_else(|p| p.into_inner());
-        if self.state.load(Ordering::Acquire) != 0 {
-            return;
+        {
+            let _g = RESOLVE.lock().unwrap_or_else(|p| p.into_inner());
+            if self.state.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            self.resolve_first_locked();
         }
+        if let Some(h) = self.hook {
+            h(self);
+        }
+    }
+
+    fn resolve_first_locked(&self) {
         let file = knob_file().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| parse_file(&t)).unwrap_or_default();
         let env = |k: &str| std::env::var(k).ok();
         let read = |p: &str| std::fs::read_to_string(p).ok();
@@ -277,7 +306,7 @@ impl Knob {
     fn resolve(&self, file: &BTreeMap<String, String>, env: &dyn Fn(&str) -> Option<String>, read: &dyn Fn(&str) -> Option<String>) -> (u64, Source, Option<String>) {
         let mut cands: Vec<(Source, String)> = Vec::new();
         if self.live {
-            if let Some(v) = file.get(self.name) {
+            if let Some(v) = file.get(self.name).or_else(|| self.alias.and_then(|a| file.get(a))) {
                 cands.push((Source::File, v.clone()));
             }
             if let Some(v) = self.legacy.and_then(|f| env(f)).and_then(|p| read(&p)) {
@@ -323,11 +352,15 @@ macro_rules! knobs {
     };
 }
 
-/// `V41_KNOBS_FILE`: the process's knob file (`NAME=value` lines).
-pub fn knob_file() -> Option<&'static str> {
-    static F: OnceLock<Option<String>> = OnceLock::new();
-    F.get_or_init(|| std::env::var("V41_KNOBS_FILE").ok().filter(|s| !s.is_empty())).as_deref()
+/// The process's knob file: `V41_KNOBS_FILE`, else `start_with`'s default.
+pub fn knob_file() -> Option<String> {
+    std::env::var("V41_KNOBS_FILE").ok().filter(|s| !s.is_empty()).or_else(|| DEFAULT_FILE.get().cloned())
 }
+
+static DEFAULT_FILE: OnceLock<String> = OnceLock::new();
+/// Also print the watcher's lines to stderr (a process without a tracing
+/// subscriber: box 2's daemon).
+static ECHO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `NAME=value` lines; `#` starts a comment; the last of a repeated key wins.
 pub fn parse_file(text: &str) -> BTreeMap<String, String> {
@@ -348,10 +381,13 @@ pub fn bad_lines(text: &str) -> Vec<String> {
 }
 
 /// What one pass of the watcher found.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Default)]
 pub struct Pass {
     /// `(name, old, new, source)` per changed knob.
     pub changed: Vec<(&'static str, String, String, Source)>,
+    /// Knobs resolved or changed whose `hook` is due (the caller runs them,
+    /// outside `RESOLVE`).
+    pub hooks: Vec<&'static Knob>,
     /// One line per problem (unknown / static key, invalid value).
     pub warnings: Vec<String>,
 }
@@ -364,6 +400,9 @@ pub fn pass(knobs: &[&'static Knob], file: &BTreeMap<String, String>, env: &dyn 
     let mut seen = HashSet::new();
     for k in knobs {
         seen.insert(k.name);
+        if let Some(a) = k.alias {
+            seen.insert(a);
+        }
         if file.contains_key(k.name) && !k.live {
             let w = format!("{}: static (restart to change); the knob file's value is ignored", k.name);
             if warned.insert(w.clone()) {
@@ -386,6 +425,9 @@ pub fn pass(knobs: &[&'static Knob], file: &BTreeMap<String, String>, env: &dyn 
                 out.warnings.push(format!("{}: invalid value {raw:?}; using {}", k.name, k.kind.show(bits)));
             }
             k.store(bits, src);
+            if k.hook.is_some() {
+                out.hooks.push(*k);
+            }
             continue;
         }
         if let Some(raw) = bad {
@@ -400,6 +442,9 @@ pub fn pass(knobs: &[&'static Knob], file: &BTreeMap<String, String>, env: &dyn 
             k.store(bits, src);
             if old_bits != bits {
                 out.changed.push((k.name, k.kind.show(old_bits), k.kind.show(bits), src));
+                if k.hook.is_some() {
+                    out.hooks.push(*k);
+                }
             }
         }
     }
@@ -475,6 +520,18 @@ fn wall_ns() -> u64 {
 /// `V41_KNOBS_FILE` and the legacy files, store and log what changed, and
 /// rewrite the effective table. Call once, at startup.
 pub fn start(tables: &[&'static [&'static Knob]]) {
+    start_with(tables, None, false)
+}
+
+/// `start` with a knob file to use when `V41_KNOBS_FILE` is unset, and with
+/// the watcher's lines also on stderr when `echo` (box 2's daemon).
+pub fn start_with(tables: &[&'static [&'static Knob]], default_file: Option<String>, echo: bool) {
+    if let Some(f) = default_file {
+        let _ = DEFAULT_FILE.set(f);
+    }
+    if echo {
+        ECHO.store(true, Ordering::Relaxed);
+    }
     let knobs: Vec<&'static Knob> = tables.iter().flat_map(|t| t.iter().copied()).collect();
     let mut names = HashSet::new();
     for k in &knobs {
@@ -488,14 +545,16 @@ pub fn start(tables: &[&'static [&'static Knob]]) {
         reg.extend(knobs.iter().copied());
         first
     };
-    let mut warned = HashSet::new();
-    step(&mut warned);
+    step_now();
     let set: Vec<String> = knobs.iter().filter(|k| k.source() != Source::Default).map(|k| format!("{}={}({:?})", k.name, k.show(), k.source())).collect();
     tracing::info!(knobs = knobs.len(), live = knobs.iter().filter(|k| k.live).count(), file = ?knob_file(), set = set.join(" "), "knobs: resolved");
+    if ECHO.load(Ordering::Relaxed) {
+        eprintln!("knobs: resolved {} ({} live) file={:?} set: {}", knobs.len(), knobs.iter().filter(|k| k.live).count(), knob_file(), set.join(" "));
+    }
     if first {
-        let spawned = std::thread::Builder::new().name("knobs".into()).spawn(move || loop {
+        let spawned = std::thread::Builder::new().name("knobs".into()).spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            step(&mut warned);
+            step_now();
         });
         if let Err(e) = spawned {
             tracing::error!(error = %e, "knobs: watcher not started; live knobs keep their startup values");
@@ -503,7 +562,14 @@ pub fn start(tables: &[&'static [&'static Knob]]) {
     }
 }
 
-/// One watcher pass over every registered knob.
+/// One watcher pass over every registered knob, now (the watcher's step; also
+/// box 2's SIGUSR2).
+pub fn step_now() {
+    static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut g = WARNED.lock().unwrap_or_else(|p| p.into_inner());
+    step(g.get_or_insert_with(HashSet::new));
+}
+
 fn step(warned: &mut HashSet<String>) {
     let knobs = REGISTERED.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let text = knob_file().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
@@ -517,14 +583,26 @@ fn step(warned: &mut HashSet<String>) {
             p.warnings.push(format!("{l:?}: not NAME=value; ignored"));
         }
     }
+    for k in &p.hooks {
+        if let Some(h) = k.hook {
+            h(k);
+        }
+    }
+    let echo = ECHO.load(Ordering::Relaxed);
     for w in &p.warnings {
         tracing::warn!("knobs: {w}");
+        if echo {
+            eprintln!("knobs: WARN {w}");
+        }
     }
     if !p.changed.is_empty() {
         let t_ns = wall_ns();
         let mut log = CHANGES.lock().unwrap_or_else(|p| p.into_inner());
         for (name, old, new, src) in &p.changed {
             tracing::info!(knob = *name, from = %old, to = %new, source = ?src, "knob changed");
+            if echo {
+                eprintln!("knobs: {name} {old} -> {new} ({src:?})");
+            }
             log.0 += 1;
             let seq = log.0;
             log.1.push_back(Change { seq, t_ns, name, from: old.clone(), to: new.clone(), source: *src });
@@ -640,6 +718,31 @@ mod tests {
         // the effective table lists both
         let e = effective(&knobs);
         assert!(e.contains("T_MIN_ROWS=6  # Default, live, default 6") && e.contains("T_SLOTS=6  # Env, static, default 8"), "{e}");
+    }
+
+    #[test]
+    fn an_alias_is_a_file_key_and_a_hook_runs_on_resolve_and_change() {
+        use std::sync::atomic::AtomicU64;
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        fn hook(k: &Knob) {
+            SEEN.store(k.get(), Ordering::Relaxed);
+        }
+        static A: Knob = Knob::int("T_B2_MISS_PAR", 1, 1, 16).alias("miss_par").hook(hook);
+        let knobs: [&'static Knob; 1] = [&A];
+        let mut warned = HashSet::new();
+        let read = |_: &str| None;
+        let p = pass(&knobs, &parse_file("miss_par=4\n"), &env_of(&[("T_B2_MISS_PAR", "2")]), &read, &mut warned);
+        assert_eq!((A.get(), A.source()), (4, Source::File));
+        assert!(p.warnings.is_empty(), "the alias is a known key: {:?}", p.warnings);
+        assert_eq!(p.hooks.len(), 1, "first resolution runs the hook");
+        p.hooks[0].hook.unwrap()(p.hooks[0]);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 4);
+        // the full name wins over the alias; a change runs the hook again
+        let p = pass(&knobs, &parse_file("miss_par=4\nT_B2_MISS_PAR=8\n"), &env_of(&[]), &read, &mut warned);
+        assert_eq!(A.get(), 8);
+        assert_eq!(p.hooks.len(), 1);
+        // no change, no hook
+        assert!(pass(&knobs, &parse_file("T_B2_MISS_PAR=8\n"), &env_of(&[]), &read, &mut warned).hooks.is_empty());
     }
 
     #[test]

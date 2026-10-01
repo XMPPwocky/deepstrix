@@ -156,6 +156,14 @@ fn main() -> eyre::Result<()> {
         return Err(eyre!("deepstrix-expertd must be built with --features v41 (V4.1 experts from the HF checkpoint)"));
     }
     let args = parse_args()?;
+    // Every knob resolved and printed once, the live ones watched: the knob
+    // file (`V41_KNOBS_FILE`, else `V41_B2_KNOBS` / ~/expertd-knobs.txt) every
+    // second, SIGUSR2 at once. Before anything reads a knob.
+    v4flash_kernels::knobs::start_with(
+        &[v4flash_kernels::het::remote_experts::knobs::ALL],
+        Some(v4flash_kernels::het::remote_experts::knobs::path()),
+        true,
+    );
     // A frequency-ranked placement file beats a contiguous id range by a wide
     // margin on V4.1 (Zipfian routing); see `Assignment::from_placement_file`.
     let asg = match args.experts_file.as_deref() {
