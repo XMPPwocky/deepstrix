@@ -784,6 +784,24 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// `dspark_ring_write_rows` WITHOUT the trailing sync: the write runs on
+    /// `igpu.compute` while the host goes on (the verify step's tail); the
+    /// caller records an event after it on that stream, so a fault can be
+    /// attributed to the slot that issued it (`MsDspark::settle_writes`). The
+    /// residuals are uploaded by a blocking copy before the kernels, so `hidden`
+    /// may go when this returns; the next blocking copy into the drafter's
+    /// scratch waits for the write.
+    pub fn dspark_ring_write_rows_async(
+        &self,
+        mtp_state: &mut super::mtp::MtpState,
+        w: &super::weights::MtpWeights,
+        pos0: u32,
+        hidden: &[f32],
+    ) -> color_eyre::eyre::Result<()> {
+        self.set_current_cached(self.igpu.device)?;
+        mtp_state.ring_write_rows(&self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos0, hidden)
+    }
+
     pub fn dspark_draft(
         &self,
         mtp_state: &mut super::mtp::MtpState,

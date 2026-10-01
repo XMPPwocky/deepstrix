@@ -55,6 +55,21 @@
 //!        (MS_LENS past 1024) cross the indexer's gathered path and MS_STEPS
 //!        past ~130 the raw-region compaction.
 //!
+//!   G5g  ORDERED TWO-LANE VERIFY (docs/v41/DSPARK_SINGLE_STREAM_PERF.md 1): the
+//!        G5f schedule through the READY-FIRST driver, every block of r >= 2
+//!        rows cut into two lanes of the SAME stream ([ceil(r/2), floor(r/2)]),
+//!        the later lane entering each layer only after the earlier one.
+//!        Before every block a junk block runs at the same positions and is NOT
+//!        accepted, so the dead state the block writes holds garbage (a lane
+//!        reading too early reads that, never stale-but-right data). Arms:
+//!        `spec2` (ordered), `spec2_hold` (ordered, lane 0 held until lane 1
+//!        has posted each layer: the overtaking the ordering exists for, forced;
+//!        must record Chain waits), `spec2_unord` (the hold with the ordering
+//!        OFF: the negative control, must differ somewhere). Gates: spec2 and
+//!        spec2_hold == alone and == spec bit-exactly on every kept row (with
+//!        V41_SUB unset; the cache prior reads residency per lane), hold
+//!        waits > 0, unord differs.
+//!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
 //! HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 \
@@ -367,7 +382,11 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut arena_rf = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_spec = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_spec_true = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut arena_spec2 = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut arena_spec2_hold = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut arena_spec2_unord = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut dev_spec = RowTablesDev::alloc(dgpu, ARENA_ROWS_PER_STREAM, KV_SOURCE_LAYERS.len())?;
+    let mut dev_spec_b = RowTablesDev::alloc(dgpu, ARENA_ROWS_PER_STREAM, KV_SOURCE_LAYERS.len())?;
     let mut dev_b = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
     let mut dev = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
 
@@ -382,6 +401,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut slots_rf: Vec<u32> = Vec::new();
     let mut slots_spec: Vec<u32> = Vec::new();
     let mut slots_spec_true: Vec<u32> = Vec::new();
+    let mut slots_spec2: Vec<u32> = Vec::new();
+    let mut slots_spec2_hold: Vec<u32> = Vec::new();
+    let mut slots_spec2_unord: Vec<u32> = Vec::new();
     for (s, toks) in prompts.iter().enumerate() {
         let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
         let hcs: Vec<Vec<f32>> = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
@@ -403,6 +425,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         let cap_spec = cap + ARENA_ROWS_PER_STREAM;
         slots_spec.push(arena_spec.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
         slots_spec_true.push(arena_spec_true.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
+        slots_spec2.push(arena_spec2.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
+        slots_spec2_hold.push(arena_spec2_hold.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
+        slots_spec2_unord.push(arena_spec2_unord.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
         engine.dgpu.compute.synchronize()?;
         first_tok.push(if s == 0 { forced.as_ref().map(|f| *f.last().unwrap()) } else { None }.unwrap_or(argmax(&logits) as i32));
         prefill_logits.push(logits);
@@ -698,6 +723,103 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let (logits_spec_true, _) = run_spec(&mut arena_spec_true, &slots_spec_true, false)?;
     eprintln!("G5f: {spec_blocks} speculative blocks over {n_streams} streams");
 
+    // 3c. G5g: the same blocks (rejected tails included) as ORDERED two-lane
+    // cuts through the ready-first driver; see the module doc.
+    use std::sync::atomic::Ordering::Relaxed;
+    use v4flash_kernels::het::forward_prefill::{
+        take_chain_waits, READY_FIRST_TEST_HOLD_LANE0, READY_FIRST_TEST_UNORDERED,
+    };
+    let mut run_spec2 = |arena: &mut KvArena, slots: &[u32], hold: bool, unordered: bool| -> eyre::Result<(Vec<Vec<Vec<f32>>>, u64)> {
+        let mut out: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
+        let _ = take_chain_waits();
+        let mut waits = 0u64;
+        for s in 0..n_streams {
+            let mut seq = prompts[s].clone();
+            let (mut t, mut blk) = (0usize, 0usize);
+            while t < n_steps {
+                let (r_want, k_want) = schedule[blk % schedule.len()];
+                blk += 1;
+                let keep = k_want.min(n_steps - t);
+                let r = r_want.max(keep);
+                let toks: Vec<i32> = (0..r)
+                    .map(|j| match cont[s].get(t + j) {
+                        Some(&c) if j < keep => c,
+                        _ => ((cont[s][t] as i64 + 7919 * (j as i64 + 1)) % 100_000) as i32,
+                    })
+                    .collect();
+                let pos = seq.len();
+                // Poison: a junk block at the same positions, NOT accepted
+                // (counters do not move; only the dead state it writes stays).
+                let junk: Vec<i32> = (0..r).map(|j| ((cont[s][t] as i64 * 31 + 104_729 * (j as i64 + 3)) % 100_000) as i32).collect();
+                let junk_hcs: Vec<Vec<f32>> = junk.iter().map(|&x| embed(x)).collect::<eyre::Result<_>>()?;
+                engine.forward_step_arena(
+                    &mut bd_a, &mut bi_a, &mut sd, &mut si, arena, &mut dev_spec, &vec![slots[s]; r], &weights,
+                    &junk_hcs, &junk, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(vec![vec![0f32; r * ein_spec]; ENGRAM_LAYERS.len()])), Some(&mut pg),
+                )?;
+                engine.dgpu.compute.synchronize()?;
+                let mut ext = seq.clone();
+                ext.extend_from_slice(&toks);
+                let mut rows_b = vec![vec![0f32; r * ein_spec]; ENGRAM_LAYERS.len()];
+                for j in 0..r {
+                    for (li, x) in engram.rows_at(pg.raw(), &ext, pos + j)?.iter().enumerate() {
+                        rows_b[li][j * ein_spec..(j + 1) * ein_spec].copy_from_slice(x);
+                    }
+                }
+                let hcs: Vec<Vec<f32>> = toks.iter().map(|&x| embed(x)).collect::<eyre::Result<_>>()?;
+                let l = if r >= 2 {
+                    READY_FIRST_TEST_HOLD_LANE0.store(hold, Relaxed);
+                    READY_FIRST_TEST_UNORDERED.store(unordered, Relaxed);
+                    let res = {
+                        let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev); 2] =
+                            [(&mut bd_a, &mut bi_a, &mut dev_spec), (&mut bd_b, &mut bi_b, &mut dev_spec_b)];
+                        engine.forward_step_arena_ready_first(
+                            &mut lanes, &mut sd, &mut si, arena, &vec![slots[s]; r], &weights,
+                            &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b)), Some(&mut pg),
+                        )
+                    };
+                    READY_FIRST_TEST_HOLD_LANE0.store(false, Relaxed);
+                    READY_FIRST_TEST_UNORDERED.store(false, Relaxed);
+                    res?;
+                    waits += take_chain_waits().0;
+                    let b_a = v4flash_kernels::het::forward_prefill::lane_rows(r, 2)[0];
+                    let mut l = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
+                    l.extend(engine.head_rows(&mut ds, &bd_b, r - b_a, &weights)?);
+                    l
+                } else {
+                    engine.forward_step_arena(
+                        &mut bd_a, &mut bi_a, &mut sd, &mut si, arena, &mut dev_spec, &vec![slots[s]; r], &weights,
+                        &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b)), Some(&mut pg),
+                    )?;
+                    engine.head_rows(&mut ds, &bd_a, r, &weights)?
+                };
+                arena.accept(slots[s], keep as u32, &engine.dgpu.compute)?;
+                for j in 0..keep {
+                    out[s].push(l[j * nv..(j + 1) * nv].to_vec());
+                }
+                seq.extend_from_slice(&toks[..keep]);
+                t += keep;
+            }
+        }
+        Ok((out, waits))
+    };
+    let (logits_spec2, waits_ord) = run_spec2(&mut arena_spec2, &slots_spec2, false, false)?;
+    let (logits_spec2_hold, waits_hold) = run_spec2(&mut arena_spec2_hold, &slots_spec2_hold, true, false)?;
+    let (logits_spec2_unord, _) = run_spec2(&mut arena_spec2_unord, &slots_spec2_unord, true, true)?;
+    let (mut g5g_ord, mut g5g_hold, mut g5g_spec, mut g5g_unord) = (0usize, 0usize, 0usize, 0usize);
+    for s in 0..n_streams {
+        for t in 0..n_steps {
+            g5g_ord += usize::from(max_abs_diff(&logits_spec2[s][t], &logits_alone[s][t]) != 0.0);
+            g5g_hold += usize::from(max_abs_diff(&logits_spec2_hold[s][t], &logits_alone[s][t]) != 0.0);
+            g5g_spec += usize::from(max_abs_diff(&logits_spec2[s][t], &logits_spec[s][t]) != 0.0);
+            g5g_unord += usize::from(max_abs_diff(&logits_spec2_unord[s][t], &logits_alone[s][t]) != 0.0);
+        }
+    }
+    eprintln!(
+        "G5g: ordered two-lane rows differing from alone {g5g_ord} / from single-lane spec {g5g_spec}; forced-overtake {g5g_hold} \
+         (Chain waits {waits_hold}, unforced {waits_ord}); UNORDERED control differs on {g5g_unord} of {} rows (want > 0)",
+        n_streams * n_steps
+    );
+
     // 4. Arena, all rows co-batched.
     let mut logits_batch: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
     let mut seqs: Vec<Vec<i32>> = prompts.clone();
@@ -977,6 +1099,15 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     }
     if g5f_alone > 0 && !allow_inexact {
         return Err(eyre!("G5f failed: {g5f_alone} speculative rows differ from one-row steps (MS_ALLOW_INEXACT=1 to report only)"));
+    }
+    if (g5g_ord > 0 || g5g_hold > 0 || g5g_spec > 0) && !allow_inexact {
+        return Err(eyre!("G5g failed: ordered two-lane verify rows differ (alone {g5g_ord}, forced-overtake {g5g_hold}, single-lane spec {g5g_spec})"));
+    }
+    if waits_hold == 0 {
+        return Err(eyre!("G5g failed: the forced overtake recorded no Chain waits -- the ordering was never exercised"));
+    }
+    if g5g_unord == 0 {
+        return Err(eyre!("G5g failed: the UNORDERED control matched alone -- the gate does not exercise the cross-lane dependency"));
     }
     if mean_f > kld_mean_bar || max_f > kld_max_bar {
         return Err(eyre!("G5f failed: speculative KL(alone||spec) mean {mean_f:.5} / max {max_f:.5} over bars {kld_mean_bar} / {kld_max_bar}"));

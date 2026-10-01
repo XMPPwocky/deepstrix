@@ -108,6 +108,17 @@ struct SlotDraft {
     backoff: u32,
     /// The last draft's wall time (ms), for its block's gain.
     last_draft_ms: f64,
+    /// Recorded on `igpu.compute` after this slot's last ASYNC ring write
+    /// (`keep_rows`); `write_pending` until `settle_writes` has waited on it.
+    write_done: v4flash_hip::Event,
+    write_pending: bool,
+}
+
+/// `V41_MS_DSPARK_RING_ASYNC=0`: kept-row ring writes synchronize as before
+/// (default: enqueued without a sync, overlapping the step's host tail).
+fn ring_async() -> bool {
+    static A: LazyLock<bool> = LazyLock::new(|| std::env::var("V41_MS_DSPARK_RING_ASYNC").as_deref() != Ok("0"));
+    *A
 }
 
 /// Initial `gain` of a stream: optimistic, so it drafts until measured.
@@ -132,6 +143,11 @@ struct Stats {
     skipped: u64,
     /// Blocks verified as an ordered two-lane cut.
     two_lane: u64,
+    /// `keep_rows` calls and their host wall time (ms).
+    keeps: u64,
+    keep_ms: f64,
+    /// Async ring writes that failed (the slot was reset).
+    ring_errors: u64,
 }
 
 pub struct MsDspark {
@@ -158,9 +174,15 @@ impl MsDspark {
     /// One ring per arena slot, shaped like `mtp.state`'s.
     pub fn alloc(mtp: &MtpCtx, igpu_id: i32, n_slots: u32) -> eyre::Result<Self> {
         let mut slots = Vec::with_capacity(n_slots as usize);
+        // The ring-write events live on the iGPU, where the writes run.
+        v4flash_hip::Device::new(igpu_id).set_current()?;
         for _ in 0..n_slots {
             let rings = mtp.state.rings.iter().map(|r| DeviceBuffer::<u16>::new(igpu_id, r.len())).collect::<eyre::Result<Vec<_>>>()?;
-            slots.push(SlotDraft { rings, writes: 0, last_ring_pos: None, hidden: None, gain: GAIN0, skip_left: 0, backoff: 0, last_draft_ms: 0.0 });
+            let write_done = v4flash_hip::Event::new_no_timing()?;
+            slots.push(SlotDraft {
+                rings, writes: 0, last_ring_pos: None, hidden: None, gain: GAIN0, skip_left: 0, backoff: 0, last_draft_ms: 0.0,
+                write_done, write_pending: false,
+            });
         }
         let cost = StepCost::from_env();
         let two_from = std::env::var("V41_MS_PIPELINE_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize).max(2);
@@ -204,9 +226,37 @@ impl MsDspark {
         r
     }
 
+    /// Wait for every slot's outstanding async ring write and attribute an
+    /// error to the slot that issued it (its ring restarts). Called before
+    /// anything that blocks on the iGPU on the step path -- the top of
+    /// `decode_rows` (before the pager's blocking copies), `keep_rows` (its
+    /// blocking `rows_in` upload), `seed`, `draft` -- because such a call
+    /// would return the earlier write's fault as its own. Normally free: the
+    /// write finished under the previous step's host tail. A sticky device
+    /// fault poisons the context and fails the step regardless, as before.
+    pub fn settle_writes(&mut self) {
+        for i in 0..self.slots.len() {
+            if !self.slots[i].write_pending {
+                continue;
+            }
+            self.slots[i].write_pending = false;
+            if let Err(e) = self.slots[i].write_done.synchronize() {
+                tracing::warn!(slot = i, error = %e, "ms dspark: async ring write failed; the stream's ring restarts");
+                self.stats.ring_errors += 1;
+                let _ = self.reset(i as u32);
+            }
+        }
+    }
+
     /// Forget `slot`'s stream (a new request took the slot).
     pub fn reset(&mut self, slot: u32) -> eyre::Result<()> {
         let sd = self.slot(slot)?;
+        if sd.write_pending {
+            // The old stream's write targets this slot's ring: let it land
+            // before the ring is reused (its outcome no longer matters).
+            sd.write_pending = false;
+            let _ = sd.write_done.synchronize();
+        }
         sd.writes = 0;
         sd.last_ring_pos = None;
         sd.hidden = None;
@@ -255,8 +305,11 @@ impl MsDspark {
     /// `keep_row` for the consecutive rows `pos0..pos0 + rows.len()` a step
     /// kept: rows not yet in the ring go in with ONE batched write per
     /// `RING_ROWS_MAX` (`MtpState::ring_write_rows`: one upload, one read of
-    /// each projection, one sync), and the last row's residual feeds the next
-    /// draft.
+    /// each projection), and the last row's residual feeds the next draft. The
+    /// write is enqueued WITHOUT a sync (`V41_MS_DSPARK_RING_ASYNC`, default
+    /// on): it runs under the step's host tail, and the next draft's blocking
+    /// upload finds it done; its event goes to `settle_writes`. Ring contents,
+    /// order and the draft's rewind are unchanged.
     pub fn keep_rows(
         &mut self,
         engine: &HeterogeneousEngine,
@@ -272,21 +325,36 @@ impl MsDspark {
         if rows.iter().any(|h| h.len() != HIDDEN) {
             return Err(eyre!("ms dspark: a kept row's residual is not {HIDDEN} floats"));
         }
+        let t = Instant::now();
         let last = pos0 + rows.len() as u32 - 1;
         if write_ring {
+            // The upload below blocks on the iGPU: settle every slot's write
+            // first, so an async fault is charged to the slot that issued it.
+            self.settle_writes();
             let skip = match self.slot(slot)?.last_ring_pos {
                 Some(p) if p >= pos0 => ((p - pos0) as usize + 1).min(rows.len()),
                 _ => 0,
             };
+            let asynchronous = ring_async();
             for (c, chunk) in rows[skip..].chunks(RING_ROWS_MAX).enumerate() {
                 let p = pos0 + (skip + c * RING_ROWS_MAX) as u32;
                 let flat: Vec<f32> = chunk.concat();
-                self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows(&mut m.state, &m.w, p, &flat))?;
+                if asynchronous {
+                    self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows_async(&mut m.state, &m.w, p, &flat))?;
+                    // After the write in `igpu.compute` order: its completion.
+                    let sd = self.slot(slot)?;
+                    sd.write_done.record(&engine.igpu.compute)?;
+                    sd.write_pending = true;
+                } else {
+                    self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows(&mut m.state, &m.w, p, &flat))?;
+                }
             }
             if skip < rows.len() {
                 self.slot(slot)?.last_ring_pos = Some(last);
             }
         }
+        self.stats.keeps += 1;
+        self.stats.keep_ms += t.elapsed().as_secs_f64() * 1e3;
         let h = rows.pop().expect("non-empty");
         self.slot(slot)?.hidden = Some((last, h));
         Ok(())
@@ -304,6 +372,7 @@ impl MsDspark {
         mut rows: BTreeMap<u32, Vec<f32>>,
         last: u32,
     ) -> eyre::Result<usize> {
+        self.settle_writes();
         self.reset(slot)?;
         let mut first = last;
         while first > 0 && rows.contains_key(&(first - 1)) && (last - first + 1) < MTP_WINDOW as u32 {
@@ -425,6 +494,8 @@ impl MsDspark {
                 cost_ms = format!("{:.1}+{:.1}/row", self.cost.a, self.cost.b),
                 cost2_ms = format!("{:.1}+{:.1}/row", self.cost2.a, self.cost2.b),
                 two_lane_blocks = s.two_lane,
+                keep_ms = format!("{:.2}", s.keep_ms / (s.keeps as f64).max(1.0)),
+                ring_errors = s.ring_errors,
                 draft_est_ms = format!("{:.1}", self.cost.draft_ms()),
                 cost_samples = self.cost.samples,
                 window_s = self.since.elapsed().as_secs(),

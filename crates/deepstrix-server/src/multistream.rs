@@ -1299,6 +1299,9 @@ impl Sched {
         // (`V41_B1_PREFETCH`, catch-all mode: misses are computed on box 2 and
         // read from box 1's disk off the critical path). Same as decode's
         // `forward_one!`; without this the multistream path never warmed box 1.
+        // The drafter's async ring writes first: the pager's blocking copies
+        // would otherwise return a write's fault as their own (`settle_writes`).
+        if let Some(dsp) = self.dsp.as_mut() { dsp.settle_writes(); }
         if let Some(pg) = state.pager.as_mut() { pg.drain_prefetched()?; }
         // DSpark (`V41_MS_DSPARK`): a LONE stream drafts from its last row in KV
         // and verifies K of the drafts in this step's rows, K from the drafter's
@@ -1337,7 +1340,12 @@ impl Sched {
                             draft_q[0] = d.q.map(|mut q| { q.truncate(k); q });
                         }
                         Ok(None) => {}
-                        Err(e) => tracing::warn!(slot = s.slot, error = %e, "ms dspark: draft failed; plain step"),
+                        Err(e) => {
+                            // The ring may be part-written: restart it (the next
+                            // kept rows reseed it) rather than draft from it.
+                            tracing::warn!(slot = s.slot, error = %e, "ms dspark: draft failed; plain step, ring restarts");
+                            let _ = dsp.reset(s.slot);
+                        }
                     }
                 }
             }
@@ -1846,7 +1854,8 @@ impl Sched {
         tracing::info!(rows = b, spec = ?spec_out, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
             head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff,
-            chain_waits, chain_wait_us, "ms.step");
+            chain_waits, chain_wait_us,
+            engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3), "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),
@@ -2026,12 +2035,41 @@ fn finish(state: &mut WorkerState, arena: &mut KvArena, s: Stream, f: FinishReas
 /// The Engram SSD gather for one step: one thread per table (the two tables
 /// used to be read back to back), each a batched `EngramTable::gather` over
 /// the live rows. Runs on the scoped helper thread `decode_step` spawns.
+/// Read threads per Engram table of a decode step's gather
+/// (`V41_MS_ENGRAM_THREADS`, default 32; run-time file
+/// `V41_MS_ENGRAM_THREADS_FILE`, re-read every 2 s). Cold reads cost ~0.8-1.7
+/// ms each, so 32 threads over a 5-row step's 120 ids per table is ~4 rounds;
+/// the spawns are serial (~15 us each), so more threads start the last read
+/// later -- measure (`ms.step` `engram_gather_ms` vs `lh_engram_join`).
+fn engram_threads() -> usize {
+    static ENV: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| env_usize("V41_MS_ENGRAM_THREADS", 32).clamp(1, 512));
+    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_ENGRAM_THREADS_FILE").ok());
+    static CACHE: std::sync::Mutex<Option<(Instant, usize)>> = std::sync::Mutex::new(None);
+    let Some(path) = FILE.as_ref() else { return *ENV };
+    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((t, n)) = *g {
+        if t.elapsed() < std::time::Duration::from_secs(2) {
+            return n;
+        }
+    }
+    let n = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<usize>().ok()).map(|n| n.clamp(1, 512)).unwrap_or(*ENV);
+    if g.is_some_and(|(_, old)| old != n) {
+        tracing::info!(threads = n, "multistream: Engram gather threads changed");
+    }
+    *g = Some((Instant::now(), n));
+    n
+}
+
+/// Wall time (us) of the last decode-step Engram gather (`ms.step`).
+static ENGRAM_GATHER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn gather_engram_rows(
     ec: &crate::engine_worker::EngramCtx,
     live: &[(usize, [[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS])],
     b: usize,
 ) -> eyre::Result<Vec<Vec<f32>>> {
-    const GATHER_THREADS: usize = 32;
+    let t0 = Instant::now();
+    let threads = engram_threads();
     let ein = ENGRAM_IN as usize;
     let mut rows = vec![vec![0f32; b * ein]; ec.tables.len()];
     std::thread::scope(|sc| {
@@ -2042,7 +2080,7 @@ fn gather_engram_rows(
                 sc.spawn(move || -> eyre::Result<()> {
                     let flat: Vec<i64> = live.iter().flat_map(|(_, h)| h[li]).collect();
                     let mut tmp = vec![0f32; live.len() * ein];
-                    ec.tables[li].gather(&ec.st, &flat, &mut tmp, GATHER_THREADS)?;
+                    ec.tables[li].gather(&ec.st, &flat, &mut tmp, threads)?;
                     for (k, (r, _)) in live.iter().enumerate() {
                         out[r * ein..(r + 1) * ein].copy_from_slice(&tmp[k * ein..(k + 1) * ein]);
                     }
@@ -2055,6 +2093,7 @@ fn gather_engram_rows(
         }
         Ok::<(), eyre::Report>(())
     })?;
+    ENGRAM_GATHER_US.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
     Ok(rows)
 }
 
