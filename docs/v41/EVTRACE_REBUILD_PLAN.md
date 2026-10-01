@@ -1,6 +1,7 @@
 # Tracing rebuilt around evtrace
 
-Status: PLAN rev 3 (2026-10-01), architect review round 3. Owner's call, 10-01:
+Status: PLAN rev 3, APPROVED by the architect review (round 3, 2026-10-01);
+the round-3 notes are in section 6. Owner's call, 10-01:
 keep building on evtrace rather than go back to emitting perfetto directly,
 with our own tracing layer for the CPU side.
 
@@ -345,6 +346,44 @@ deploy, as today).
 - **What we give up.** Perfetto-native data we do not emit (sampled stacks,
   kernel scheduler tracks); perfetto's `traced` can add those next to our output
   if ever wanted.
+
+## 6. Round-3 notes, binding on the implementation
+
+- **S1 step attribution.** A buffer handed off at step N+1's reset holds step
+  N's forward, head and ring writes AND step N+1's drafter. Tier B sums by EACH
+  PAIR's stage-context step and emits one `step_dev` per (step, device) present
+  in the buffer; the readers' merge SUMS partial `step_dev` records per
+  `(pid, step)`. `d_*` / `dgpu_busy` keep today's parent-prefix rule (`dgpu.*` /
+  `igpu.*` names only, multistream.rs ~1938-1947), so the newly covered `mtp.*`
+  drafter and ring-write stages do not change their meaning (they get their own
+  `ms.stage` rows). P3 test: synthetic steps with distinct per-step durations,
+  checked through the join.
+- **S2 calibrator under load.** `quality_us` grows with extrapolation distance
+  (|t - t_anchor| x 200 ppm), not just the bracket; the newest VALID anchor is
+  never retired before a new one is chained; P3 acceptance includes the anchor
+  success rate under full two-lane decode and the p99 extrapolation distance; if
+  anchors fail under load, try a high-priority calibration stream (verify CLR's
+  per-priority HW-queue pools on gfx1201 / gfx1151 first). The self-check
+  tolerance is both anchors' `quality_us` (bracket + the 1-3 us start/end bias,
+  which every chain link carries).
+- **S3 quiet threads.** Each thread's fine-span buffer is registered in a global
+  list (per-buffer mutex, uncontended on push, or an SPSC ring); the Tier B
+  thread drains them every ~100 ms and before every dump, and a dump includes
+  each thread's OPEN spans (its enter stack) as `open` records -- what every
+  thread was doing at the moment of an anomaly.
+- **N1** causality rule (b) applies to all four arena drivers (each ends in
+  `dgpu.compute.synchronize()`, forward_prefill.rs ~3672, ~3856, ~3982, ~4226):
+  `t_fwd_sync` is stamped at whichever returned.
+- **N2** the host stamp of rule (a) is taken BEFORE `hipEventRecord`, tolerance
+  `quality_us`.
+- **N3** `ms.stage` device rows and `ms.stage.total`'s `dgpu_busy_ms` /
+  `igpu_busy_ms` divide by `steps_dev`, not `steps`.
+- **N4** a step that got no buffer is counted scheduler-side in `hub_step`
+  (`dev_skipped`), so readers tell "skipped" from "profile off".
+- **N5** the scheduler thread flushes its fine-span buffer at every TICK end
+  (prefill-only ticks have no step end).
+- **N6** an `evtrace::Span` site id is cached per call site (a static in the
+  macro): the guard never takes the interner lock after first use.
 
 ## 5. Owner decisions
 
