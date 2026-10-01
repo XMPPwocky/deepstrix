@@ -174,9 +174,9 @@ fn admit_opts(s: &mut Store, tokens: &[i32], images: &[ImageRecord], now: u64, j
         let req = tail_req(tokens, images, l, TailKind::Full, TailOrigin::PromptEnd, Some(job));
         s.write_tail(&mut cur, req, &mut budget, now).unwrap();
     }
-    s.job_finished(job, o.fail, now);
+    let _ = s.job_finished(job, o.fail, now);
     if o.flush {
-        s.flush(false, now);
+        let _ = s.flush(false, now);
         s.check_invariants().unwrap();
         assert!(s.index().finished(job).is_none(), "a drained job is forgotten");
     }
@@ -309,14 +309,14 @@ fn roundtrip_restore_and_reopen() {
     let (w, _) = s.walk(&a[..10_600], &imgs(2), 3000);
     assert!(w.chunks.is_empty() && w.tails.is_empty());
     // Disk equals the index.
-    s.flush(true, 3000);
+    let _ = s.flush(true, 3000);
     assert_disk_is_index(&s);
     let before = snapshot(&s);
     // The hourly byte total goes through the IO thread (2.).
     let bytes_file = s.dirs().base.join(scan::NS_BYTES);
     let _ = fs::remove_file(&bytes_file);
-    s.tick(3000 + INVARIANT_CHECK_EVERY_S);
-    s.flush(false, 3000);
+    let _ = s.tick(3000 + INVARIANT_CHECK_EVERY_S);
+    let _ = s.flush(false, 3000);
     let persisted: u64 = fs::read_to_string(&bytes_file).unwrap().trim().parse().unwrap();
     assert_eq!(persisted, s.index().chunk_bytes() + s.index().tail_bytes());
     let stats = s.stats();
@@ -432,7 +432,7 @@ fn torn_short_and_corrupt_files_read_as_a_miss() {
     assert_eq!(s.index().n_chunks(), 0, "chunk 0 cascaded with its only tail");
     assert!(s.walk(&a, &im, 1000).0.chunks.is_empty());
     assert_eq!(s.recent_event(&ck).map(|e| e.0), Some(RecentEvent::Removed(Why::Corrupt)));
-    s.flush(true, 1000);
+    let _ = s.flush(true, 1000);
     assert!(!cpath.exists() && !tpath.exists(), "evicted files are unlinked");
     s.check_invariants().unwrap();
     // A token-id mismatch against the request is a data failure too.
@@ -559,7 +559,7 @@ fn startup_scan_repairs_and_drops() {
     assert_eq!((r.repaired_demotions, r.truncated, r.invalid), (1, 1, 0));
     let ea = s2.index().tail(&ta).unwrap();
     assert!(ea.kind == TailKind::Enc && ea.demoted && ea.bytes == ha.e_end());
-    s2.flush(true, 2000);
+    let _ = s2.flush(true, 2000);
     let fa = format::read_tail(&pa, &nsk, false).unwrap();
     assert!(fa.header.kind == TailKind::Enc && fa.header.demoted);
     assert!(format::read_tail(&pb, &nsk, true).is_ok());
@@ -578,7 +578,7 @@ fn startup_scan_repairs_and_drops() {
     assert_eq!((r.invalid, r.unreachable, r.missing_ancestor), (1, 4, 1), "{r:?}");
     assert!(s3.walk(&a, &[], 3000).0.tails.is_empty());
     assert_eq!(s3.walk(&b, &[], 3000).0.tails.len(), 1, "the other conversation is untouched");
-    s3.flush(true, 3000);
+    let _ = s3.flush(true, 3000);
     assert_disk_is_index(&s3);
 }
 
@@ -602,7 +602,7 @@ fn scan_keeps_the_valid_copy_of_a_misplaced_duplicate() {
     let mut s2 = Store::open(config(&root, 100 << 30, BUILD_A), &ns, 2000).unwrap();
     assert_eq!(s2.scan_report().invalid, 1);
     assert!(s2.index().chunk(&c0).is_some());
-    s2.flush(true, 2000);
+    let _ = s2.flush(true, 2000);
     assert!(good.exists() && !dup.exists());
     assert_disk_is_index(&s2);
 }
@@ -628,7 +628,7 @@ fn namespace_gc_keeps_active_and_previous_and_evicts_inactive_first() {
     let r = s.scan_report().clone();
     assert_eq!(r.trashed_namespaces, 1);
     assert_eq!(r.kept_inactive, Some((keys::ns16(&ns_inputs(12).key()), one_ns)));
-    s.flush(true, 2000);
+    let _ = s.flush(true, 2000);
     assert!(!ns_dir(10).exists() && !ns_dir(11).exists() && ns_dir(12).exists());
     assert_eq!(fs::read_dir(root.join("trash")).unwrap().count(), 0);
     // A second process cannot open the same root (8).
@@ -640,7 +640,7 @@ fn namespace_gc_keeps_active_and_previous_and_evicts_inactive_first() {
     s.index.set_cap_bytes(mine + one_ns / 2);
     assert!(s.index.enforce_cap(2200));
     s.apply(2200);
-    s.flush(true, 2200);
+    let _ = s.flush(true, 2200);
     assert!(!ns_dir(12).exists(), "the inactive namespace went first");
     assert_eq!(s.index().n_tails(), 1, "the active one is untouched");
 }
@@ -706,7 +706,7 @@ fn eviction_under_cap_keeps_disk_equal_to_index() {
         admit(&mut s, &p, 1000 + 100 * i, i + 1);
         assert!(s.index().total_bytes() <= cap);
     }
-    s.flush(true, 2000);
+    let _ = s.flush(true, 2000);
     assert_disk_is_index(&s);
     assert!(s.stats().evicted_bytes > 0);
     // The newest conversations survive, the oldest went.
@@ -731,7 +731,7 @@ fn write_dedup_pending_and_full_replaces_enc() {
         let req = chunk_req(&mut s, &a, &[], k, None);
         assert_eq!(s.write_chunk(&mut cur, req, &mut b, 1000).unwrap(), want, "chunk {k}");
     }
-    s.flush(false, 1000);
+    let _ = s.flush(false, 1000);
     let req = chunk_req(&mut s, &a, &[], 0, None);
     assert_eq!(s.write_chunk(&mut cur, req, &mut b, 1000).unwrap(), WriteOutcome::Stored);
     // The chunk's stored payload hash is kept for kv.dedup_mismatch (12f), and
@@ -748,7 +748,7 @@ fn write_dedup_pending_and_full_replaces_enc() {
     assert_eq!(s.write_tail(&mut cur, full(), &mut b, 1000).unwrap(), WriteOutcome::Queued);
     assert_eq!(s.write_tail(&mut cur, full(), &mut b, 1000).unwrap(), WriteOutcome::Pending);
     assert_eq!(s.write_tail(&mut cur, enc(), &mut b, 1000).unwrap(), WriteOutcome::Pending);
-    s.flush(true, 1000);
+    let _ = s.flush(true, 1000);
     let key = s.chain().tail_key(&mut cur, &a, &[], t).1;
     let e = s.index().tail(&key).unwrap();
     assert_eq!(e.kind, TailKind::Full);
@@ -782,7 +782,7 @@ fn same_key_writes_failures_and_late_unlinks() {
     // A tail at 2C keeps chunks 0-1 referenced through what follows.
     let req = tail_req(&a, &[], 2 * C, TailKind::Enc, TailOrigin::Waypoint, None);
     s.write_tail(&mut cur, req, &mut b, 1000).unwrap();
-    s.flush(false, 1000);
+    let _ = s.flush(false, 1000);
     let t = 2 * C + 100;
     let open = &a[2 * C as usize..t as usize];
     let key = s.chain().tail_key(&mut cur, &a, &[], t).1;
@@ -792,7 +792,7 @@ fn same_key_writes_failures_and_late_unlinks() {
     s.io.inject_write_faults(&[false, true]);
     assert_eq!(s.write_tail(&mut cur, tail_req(&a, &[], t, TailKind::Enc, TailOrigin::Cancel, None), &mut b, 1000).unwrap(), WriteOutcome::Queued);
     assert_eq!(s.write_tail(&mut cur, tail_req(&a, &[], t, TailKind::Full, TailOrigin::PromptEnd, None), &mut b, 1000).unwrap(), WriteOutcome::Queued);
-    s.flush(true, 1000);
+    let _ = s.flush(true, 1000);
     let e = s.index().tail(&key).unwrap();
     assert_eq!(e.kind, TailKind::Enc, "the failed full write left the encoder tail");
     assert_eq!(e.bytes, fs::metadata(&path).unwrap().len());
@@ -810,7 +810,7 @@ fn same_key_writes_failures_and_late_unlinks() {
     s.apply(1000);
     let ev = s.complete(done, 1000);
     assert!(ev.contains(&StoreEvent::TailStored(key)), "{ev:?}");
-    s.flush(true, 1000);
+    let _ = s.flush(true, 1000);
     assert!(path.exists(), "the stale unlink did not delete the new file");
     assert_eq!(s.index().tail(&key).unwrap().kind, TailKind::Full);
     assert!(s.read_tail(&key, open, true, 1000).is_ok());
@@ -821,14 +821,14 @@ fn same_key_writes_failures_and_late_unlinks() {
     let t2 = 2 * C + 200;
     let key2 = s.chain().tail_key(&mut cur, &a, &[], t2).1;
     s.write_tail(&mut cur, tail_req(&a, &[], t2, TailKind::Enc, TailOrigin::Cancel, None), &mut b, 1000).unwrap();
-    s.flush(false, 1000);
+    let _ = s.flush(false, 1000);
     s.io.inject_write_faults(&[true]);
     s.write_tail(&mut cur, tail_req(&a, &[], t2, TailKind::Full, TailOrigin::PromptEnd, None), &mut b, 1000).unwrap();
     let done = s.io.flush();
     s.index.remove_tail(&key2, Why::Cap, 1000);
     s.apply(1000);
     s.complete(done, 1000);
-    s.flush(true, 1000);
+    let _ = s.flush(true, 1000);
     assert!(s.index().tail(&key2).is_none() && !s.dirs().tail_path(&key2).exists());
     assert_eq!(s.recent_event(&key2).map(|e| e.0), Some(RecentEvent::Dropped));
     assert_disk_is_index(&s);
@@ -860,7 +860,7 @@ fn late_completions_after_job_finished() {
             s.write_tail(&mut cur, tail_req(&a, &[], 5_000, TailKind::Full, TailOrigin::PromptEnd, Some(job)), &mut b, 1000).unwrap();
         }
         let failed = case == 2;
-        s.job_finished(job, failed, 1000);
+        let _ = s.job_finished(job, failed, 1000);
         assert_eq!(s.index().finished(job), Some(failed), "remembered while its writes are in flight");
         // The contract: nothing is written for a job after it ended.
         let late = chunk_req(&mut s, &a, &[], 3, Some(job));
@@ -912,7 +912,7 @@ fn late_completions_after_job_finished() {
     s.index.set_cap_bytes(1);
     s.index.enforce_cap(2000);
     s.apply(2000);
-    s.flush(true, 2000);
+    let _ = s.flush(true, 2000);
     assert_eq!((s.index().n_chunks(), s.index().n_tails()), (0, 0), "no pin kept anything alive");
     assert_disk_is_index(&s);
 }
@@ -940,7 +940,7 @@ fn dropped_writes_are_deterministic_with_a_held_worker() {
     let k1 = cur.chain(&a, &[], 2);
     assert_eq!(s.recent_event(&k1).map(|e| e.0), Some(RecentEvent::Dropped));
     rx.recv().unwrap();
-    s.flush(false, 1000);
+    let _ = s.flush(false, 1000);
     assert_eq!(s.stats().writes_dropped, 1);
     let mut b = s.tick_budget();
     let req = tail_req(&a, &[], 2_500, TailKind::Enc, TailOrigin::Cancel, None);
@@ -1001,7 +1001,7 @@ fn corrupt_mutation_evicts() {
         }
         admit(&mut s, &a[..l], 1000 + i as u64, i as u64 + 1);
     }
-    s.flush(true, 1100);
+    let _ = s.flush(true, 1100);
     // The demotion found a bad header: the tail is evicted, not left half-done.
     assert_eq!(s.walk(&a[..2_000], &[], 1100).0.tails.iter().filter(|t| t.t == 2_000).count(), 0);
     s.check_invariants().unwrap();
@@ -1059,10 +1059,10 @@ fn randomized_store_with_restarts() {
                 warm += (admit_opts(&mut s, &tokens, &images, now, job, o) > 0) as u32;
             } else if op < 75 {
                 // Land whatever completed so far.
-                s.process_completions(now);
+                let _ = s.process_completions(now);
             } else if op < 85 {
                 // Damage a random file; the next read of it must evict it.
-                s.flush(true, now);
+                let _ = s.flush(true, now);
                 let files = store_files(&s);
                 if !files.is_empty() {
                     let p = &files[rng.gen_range(0..files.len())];
@@ -1077,7 +1077,7 @@ fn randomized_store_with_restarts() {
                     assert_eq!(scrub(&mut s, now), 1, "seed {seed} step {step}: the damaged file was not caught");
                 }
             } else {
-                s.flush(true, now);
+                let _ = s.flush(true, now);
                 let live = snapshot(&s);
                 s.shutdown(Duration::from_secs(5), now);
                 s = Store::open(config(&root, cap, BUILD_A), &ns, now).unwrap();
@@ -1094,13 +1094,13 @@ fn randomized_store_with_restarts() {
             assert!(!s.needs_rescan(), "seed {seed} step {step}: counter drift");
             assert!(s.index().total_bytes() <= cap, "seed {seed} step {step}: over the cap");
             if rng.gen_bool(0.4) {
-                s.flush(true, now);
+                let _ = s.flush(true, now);
                 flushes += 1;
                 s.check_invariants().unwrap_or_else(|e| panic!("seed {seed} step {step} (flushed): {e}"));
                 assert_disk_is_index(&s);
             }
         }
-        s.flush(true, now);
+        let _ = s.flush(true, now);
         assert_disk_is_index(&s);
         for j in 1..=job {
             assert_eq!(s.index().finished(JobId(j)), None, "seed {seed}: job {j} never forgotten");

@@ -1500,7 +1500,12 @@ unlink 16K/s at 2.76 MB (~2.3 s per 37K files); create + fsync 2.1-3.5 ms per fi
 - **Events.** `ChunkStored` is reported only if the chunk is still indexed; a chunk that leaves
   the store for any reason (a failed job's chunk deleted at once, an eviction, a corrupt file)
   is reported as `ChunkDropped`, including the chunks `job_finished(failed)` deletes. A job that
-  subscribed to a pending write re-enqueues on `ChunkDropped` (9.4).
+  subscribed to a pending write re-enqueues on `ChunkDropped` (9.4). The calls that hand out
+  events (`tick`, `walk`, `process_completions`, `flush`, `job_finished`) are `#[must_use]`, and
+  each returns every event queued so far, not only its own.
+- **Cap evictions produce `ChunkDropped` too:** thousands per batch in an eviction storm (shadow
+  phase B's restart at 15 GiB). M2 looks subscriptions up by key, so routing a batch costs
+  O(events), never O(events × subscriptions).
 - **Re-enqueue a dropped parent before queueing the job's next tail:** a tail over a hole is
   refused as `broken_path`, and that refusal releases the job's pins on its path.
 - **Keep the restore plan's pin until the job's first own tail lands or the job ends,** not only

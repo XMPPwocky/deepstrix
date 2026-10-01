@@ -509,6 +509,7 @@ impl Store {
 
     /// Top of every scheduler tick: completions, then the hourly checker and
     /// the namespace byte total.
+    #[must_use = "the events may hold ChunkDropped: a job that counted on that chunk must re-enqueue it (9.4)"]
     pub fn tick(&mut self, now: u64) -> Vec<StoreEvent> {
         let ev = self.process_completions(now);
         if now >= self.last_check + INVARIANT_CHECK_EVERY_S {
@@ -531,6 +532,7 @@ impl Store {
     }
 
     /// Apply the IO thread's completions to the index (9.4).
+    #[must_use = "the events may hold ChunkDropped: a job that counted on that chunk must re-enqueue it (9.4)"]
     pub fn process_completions(&mut self, now: u64) -> Vec<StoreEvent> {
         let done = self.io.completions();
         self.complete(done, now)
@@ -674,6 +676,7 @@ impl Store {
 
     /// The walk (6.1), after the writer's completions (so a retry right after
     /// the cancel that queued its tail finds it).
+    #[must_use = "the events may hold ChunkDropped: a job that counted on that chunk must re-enqueue it (9.4)"]
     pub fn walk(&mut self, tokens: &[i32], images: &[ImageRecord], now: u64) -> (Walk, Vec<StoreEvent>) {
         let ev = self.process_completions(now);
         (self.index.walk(tokens, images), ev)
@@ -894,13 +897,16 @@ impl Store {
 
     /// A job ended; `failed` = an error, not a cancel (9.4). It may be called
     /// while writes of the job are in flight: they land unowned, and a failed
-    /// job's late chunks go at once if nothing references them. Returns the
-    /// events this produced (a failed job's deleted chunks as `ChunkDropped`,
-    /// for the other jobs that counted on them).
+    /// job's late chunks go at once if nothing references them. Returns EVERY
+    /// event queued so far, not only this call's: a failed job's deleted
+    /// chunks as `ChunkDropped` (for the other jobs that counted on them), and
+    /// anything an earlier eviction, touch or unpin queued since the last
+    /// batch.
     ///
     /// Contract: a job writes nothing after this call (refused while the store
     /// still remembers the job; once forgotten, such a write would pin for a
     /// job nobody releases).
+    #[must_use = "the events may hold ChunkDropped: a job that counted on that chunk must re-enqueue it (9.4)"]
     pub fn job_finished(&mut self, job: JobId, failed: bool, now: u64) -> Vec<StoreEvent> {
         self.index.release_job(job, failed, now);
         if !self.job_writes.contains_key(&job) {
@@ -1044,6 +1050,7 @@ impl Store {
 
     /// Block until queued writes (and, with `all`, unlinks and trash) are done,
     /// then apply the completions. For tests and shutdown.
+    #[must_use = "the events may hold ChunkDropped: a job that counted on that chunk must re-enqueue it (9.4)"]
     pub fn flush(&mut self, all: bool, now: u64) -> Vec<StoreEvent> {
         let done = if all { self.io.flush_all() } else { self.io.flush() };
         let mut ev = self.complete(done, now);
