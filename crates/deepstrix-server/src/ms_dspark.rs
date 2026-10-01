@@ -196,8 +196,10 @@ impl MsDspark {
             });
         }
         let cost = StepCost::from_env();
-        let two_from = std::env::var("V41_MS_PIPELINE_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize).max(2);
-        let cost2 = StepCost::from_env_two_lane(two_from);
+        // The threshold at startup shapes the two-lane line's prior only; the
+        // cells cover every row count, so a live change (`pipeline_min_rows`)
+        // just starts feeding cells 2.. of this fit.
+        let cost2 = StepCost::from_env_two_lane(crate::multistream::pipeline_min_rows());
         Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng() })
     }
 
@@ -531,8 +533,8 @@ impl MsDspark {
                 cost_shape = ?self.cost.shape,
                 cells = cells_str(&self.cost.cell_costs(), 1),
                 cells_w = cells_str(&self.cost.cell_weights(), 1),
-                cells2 = cells_str(&self.cost2.cell_costs(), self.cost2.first_row),
-                cells2_w = cells_str(&self.cost2.cell_weights(), self.cost2.first_row),
+                cells2 = cells_str(&self.cost2.cell_costs(), 2),
+                cells2_w = cells_str(&self.cost2.cell_weights(), 2),
                 two_lane_blocks = s.two_lane,
                 explored = s.explored,
                 explored_k0 = s.explored_k0,
@@ -808,7 +810,6 @@ pub struct StepCost {
     draft: f64,
     samples: u64,
     shape: CostShape,
-    first_row: usize,
     /// Per row count (index rows - 1): time-aged `(weight, weighted sum)`.
     cells: [(f64, f64); CELLS],
     /// `cells`' means (what `cost` returns).
@@ -843,7 +844,6 @@ impl StepCost {
             draft: draft_ms,
             samples: 0,
             shape: cost_shape(),
-            first_row,
             cells,
             cell_cost: [0.0; CELLS],
         };

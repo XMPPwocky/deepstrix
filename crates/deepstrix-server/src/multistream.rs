@@ -528,13 +528,42 @@ fn lm_prefill_override() -> Option<bool> {
     on
 }
 
+/// `V41_MS_PIPELINE_MIN_ROWS` (default 6; production 4): a step of at least
+/// this many rows runs two lanes -- a plain multi-stream step, and a
+/// speculating lone stream's verify (`spec_two_lane_from`). Overridden at run
+/// time by the contents of `V41_MS_PIPELINE_MIN_ROWS_FILE` (re-read every 2 s),
+/// like `spec_lanes_on`. Never below 2 (one row cannot be split). The ONE
+/// reader of the knob (it was parsed in three places with different clamps);
+/// a step reads it once. Why live: at 1-3 rows one lane waits out box 2
+/// (14 / 27 / 39 ms per step exposed, MEASURED 2026-10-01 17:03-19:05) where
+/// two lanes at 4-5 rows hide most of it (13 / 3 ms).
+pub(crate) fn pipeline_min_rows() -> usize {
+    static ENV: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| env_usize("V41_MS_PIPELINE_MIN_ROWS", 6));
+    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_PIPELINE_MIN_ROWS_FILE").ok());
+    static CACHE: std::sync::Mutex<Option<(Instant, usize)>> = std::sync::Mutex::new(None);
+    let Some(path) = FILE.as_ref() else { return (*ENV).max(2) };
+    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((t, v)) = *g {
+        if t.elapsed() < std::time::Duration::from_secs(2) {
+            return v;
+        }
+    }
+    let v = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(*ENV).max(2);
+    if g.is_some_and(|(_, old)| old != v) {
+        tracing::info!(min_rows = v, "multistream: two-lane min rows changed");
+    }
+    *g = Some((Instant::now(), v));
+    v
+}
+
 /// The row count from which a speculating lone stream's verify runs two
 /// lanes (an ordered cut, `forward_step_arena_ready_first`), or `None` when it
 /// cannot: spec lanes off, lanes off, or not the ready-first driver
 /// (`V41_MS_STAGGER=2`). Also what the K policy prices a block's rows by.
-pub(crate) fn spec_two_lane_from() -> Option<usize> {
+/// `min_rows` = this step's `pipeline_min_rows` (one read per step).
+pub(crate) fn spec_two_lane_from(min_rows: usize) -> Option<usize> {
     let ready_first = std::env::var("V41_MS_STAGGER").as_deref() == Ok("2");
-    (ready_first && ms_pipeline() && spec_lanes_on()).then(|| env_usize("V41_MS_PIPELINE_MIN_ROWS", 6).max(2))
+    (ready_first && ms_pipeline() && spec_lanes_on()).then_some(min_rows.max(2))
 }
 
 /// `logits_nucleus_cands` params of a row sampled under `mode`: `[inv_t, lo,
@@ -1514,7 +1543,10 @@ impl Sched {
         // The lane regime, ONE snapshot per step (the run-time file can change
         // between reads): the K decision prices blocks by it and the driver
         // choice below uses it (docs/v41/DSPARK_SINGLE_STREAM_PERF.md section 2).
-        let two_from = spec_two_lane_from();
+        // One read of the two-lane threshold per step: the K policy, the spec
+        // lane choice and the plain lane choice below all use it.
+        let min_rows = pipeline_min_rows();
+        let two_from = spec_two_lane_from(min_rows);
         if self.streams.len() == 1 {
             if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
                 let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
@@ -1643,7 +1675,7 @@ impl Sched {
         // One lane takes turns between the dGPU attention and the MoE legs; two
         // overlap them (09-30: 2->3 rows +19.5 ms on one lane, 3->4 +5.7 on two).
         let spec_lanes = spec && two_from.is_some_and(|m| b >= m);
-        let pipelined = (!spec && b >= env_usize("V41_MS_PIPELINE_MIN_ROWS", 6) && ms_pipeline()) || spec_lanes;
+        let pipelined = (!spec && b >= min_rows && ms_pipeline()) || spec_lanes;
         // Three lanes (`V41_MS_LANES=3`, DEFAULT 2) from `V41_MS_LANES3_MIN_ROWS`
         // rows (default 6). MEASURED 2026-09-21 at 8 rows, box-1 hot set warm:
         // 2 lanes 272 ms/step (27.2 tok/s), 3 lanes 324 (23.3). The third lane
