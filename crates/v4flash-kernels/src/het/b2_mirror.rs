@@ -188,33 +188,11 @@ pub fn min_rank() -> usize {
 
 /// `V41_SUB_LAMBDA` (mode 3; default 0.1, clamped to [0, 1]): the cache-prior
 /// strength, as a fraction of the layer's running selection-score range.
-/// `V41_SUB_LAMBDA_FILE=<path>`: re-read the value from that file (a bare
-/// number) at most once a second, so lambda can be swept live without a
-/// restart (every hub restart cools box 1's pool). A missing or unparsable
-/// file keeps the last value.
+/// A LIVE knob (`crate::knobs::SUB_LAMBDA`; `V41_SUB_LAMBDA_FILE=<path>` still
+/// works), so lambda can be swept without a restart (every hub restart cools
+/// box 1's pool).
 pub fn lambda() -> f32 {
-    static BASE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_SUB_LAMBDA").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.1).clamp(0.0, 1.0)
-    });
-    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_SUB_LAMBDA_FILE").ok());
-    static CUR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-    let Some(path) = FILE.as_ref() else { return *BASE };
-    if let Ok(mut last) = LAST.try_lock() {
-        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
-            *last = Some(std::time::Instant::now());
-            if let Some(v) = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<f32>().ok()) {
-                let v = v.clamp(0.0, 1.0);
-                if CUR.swap(v.to_bits(), Ordering::Relaxed) != v.to_bits() {
-                    eprintln!("b2 mirror: cache-prior lambda = {v} (from {path})");
-                }
-            }
-        }
-    }
-    match CUR.load(Ordering::Relaxed) {
-        u32::MAX => *BASE,
-        bits => f32::from_bits(bits),
-    }
+    crate::knobs::SUB_LAMBDA.f64() as f32
 }
 
 /// `V41_SUB_DRY=1` (mode 3): compute the cache-prior's selection but route
@@ -499,18 +477,11 @@ pub fn pin_wants() -> bool {
 /// Decode does not run during a prefill phase, so nothing it needs is lost
 /// until the restore. Box 2 must run WITHOUT staging (`V41_B2_PREFILL_STAGE=0`
 /// or a pre-staging build): a staging band confines prefill whatever is
-/// released. `V41_B2_PIN_PREFILL_BAND_FILE=<path>` re-reads the value (a bare
-/// number) at every prefill entry, so the band can be swept live.
+/// released. A LIVE knob (`crate::knobs::B2_PIN_PREFILL_BAND`;
+/// `V41_B2_PIN_PREFILL_BAND_FILE=<path>` still works), read at every prefill
+/// entry, so the band can be swept live.
 pub fn pin_prefill_band() -> u32 {
-    static BASE: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_B2_PIN_PREFILL_BAND").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
-    });
-    static FILE: std::sync::LazyLock<Option<String>> =
-        std::sync::LazyLock::new(|| std::env::var("V41_B2_PIN_PREFILL_BAND_FILE").ok());
-    FILE.as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(*BASE)
+    crate::knobs::B2_PIN_PREFILL_BAND.get() as u32
 }
 
 /// `V41_B2_PIN_RESTORE` (default on; `0` = off): when the next DECODE phase

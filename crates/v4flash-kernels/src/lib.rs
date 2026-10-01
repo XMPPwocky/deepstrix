@@ -47,6 +47,7 @@ pub mod head;
 pub mod model_weights;
 pub mod routing;
 pub mod het;
+pub mod knobs;
 pub mod expert_sel_count;
 pub mod indexer;
 pub mod iq2_xxs;

@@ -122,6 +122,9 @@ async fn main() -> eyre::Result<()> {
                 .unwrap_or_else(|_| "deepstrix_server=info,info".into()),
         )
         .init();
+    // Every knob resolved and logged once, the live ones watched
+    // (`V41_KNOBS_FILE` + their legacy files), before anything reads one.
+    v4flash_kernels::knobs::start(&[v4flash_kernels::knobs::ALL, deepstrix_server::knobs::ALL]);
 
     let args = Args::parse();
     let snapshot_root = match args.snapshot_dir {

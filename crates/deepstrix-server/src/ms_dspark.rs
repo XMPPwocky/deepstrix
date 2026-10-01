@@ -21,7 +21,6 @@
 //! is wound back by one first, so the forward rewrites it with the same values
 //! (same residual, same position) instead of appending a duplicate key.
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
 use std::time::Instant;
 
 use color_eyre::eyre::{self, eyre};
@@ -39,9 +38,7 @@ use crate::engine_worker::MtpCtx;
 /// `V41_MS_DSPARK=accept`: DSpark on the arena path. Loads the drafter
 /// (as `V41_DSPARK` does) and keeps multistream on for every request.
 pub fn enabled() -> bool {
-    static ON: LazyLock<bool> =
-        LazyLock::new(|| matches!(std::env::var("V41_MS_DSPARK").as_deref(), Ok("accept") | Ok("1") | Ok("on")));
-    *ON
+    crate::knobs::MS_DSPARK.pick() == 1
 }
 
 /// `V41_MS_DSPARK_RING=solo`: ring-write only a LONE stream's rows (every step,
@@ -51,8 +48,7 @@ pub fn enabled() -> bool {
 /// stream that becomes the lone stream drafts from a dense window instead of
 /// one with a gap where it ran beside others.
 fn ring_all() -> bool {
-    static ALL: LazyLock<bool> = LazyLock::new(|| std::env::var("V41_MS_DSPARK_RING").as_deref() != Ok("solo"));
-    *ALL
+    crate::knobs::MS_DSPARK_RING.pick() == 0
 }
 
 /// `V41_MS_DSPARK_DRAFTS=argmax`: point-mass drafts (the drafter's argmax,
@@ -62,8 +58,7 @@ fn ring_all() -> bool {
 /// min(1, p/q) (plan 2.2, M6) -- the drafter as designed; at temperature 0 a
 /// draft is the argmax either way.
 fn sampled_drafts() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| std::env::var("V41_MS_DSPARK_DRAFTS").as_deref() != Ok("argmax"));
-    *S
+    crate::knobs::MS_DSPARK_DRAFTS.pick() == 0
 }
 
 /// How a stream's drafts are drawn: `Some` (sampled, plan 2.2) when its
@@ -119,16 +114,14 @@ struct SlotDraft {
 /// `V41_MS_DSPARK_RING_ASYNC=0`: kept-row ring writes synchronize as before
 /// (default: enqueued without a sync, overlapping the step's host tail).
 fn ring_async() -> bool {
-    static A: LazyLock<bool> = LazyLock::new(|| std::env::var("V41_MS_DSPARK_RING_ASYNC").as_deref() != Ok("0"));
-    *A
+    crate::knobs::MS_DSPARK_RING_ASYNC.on()
 }
 
 /// Initial `gain` of a stream: optimistic, so it drafts until measured.
 const GAIN0: f64 = 1.5;
 
 fn min_gain() -> f64 {
-    static G: LazyLock<f64> = LazyLock::new(|| env_f64("V41_MS_DSPARK_MIN_GAIN", 1.0));
-    *G
+    crate::knobs::MS_DSPARK_MIN_GAIN.f64()
 }
 
 #[derive(Default)]
@@ -622,9 +615,7 @@ fn cells_str(c: &[f64], first: usize) -> String {
     c[(first.max(1) - 1).min(c.len())..].iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>().join(",")
 }
 
-fn env_f64(k: &str, d: f64) -> f64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
-}
+
 
 /// The 2026-09-30..10-01 production p50 ladder (ms of 1, 2, ... rows): the
 /// default PRIOR of `StepCost`.
@@ -893,7 +884,7 @@ impl PlainLanes {
     /// Cells for 1 ..= `max_rows` streams; `start_from` = the startup threshold
     /// (`LaneTables::new`).
     pub fn from_env(max_rows: usize, start_from: usize) -> Self {
-        let memory = env_f64("V41_MS_LANES_MEMORY", 1000.0);
+        let memory = crate::knobs::MS_LANES_MEMORY.f64();
         let rows = max_rows.max(2);
         let one = StepCost::new(DEFAULT_LADDER.to_vec(), 0.0, true, memory).with_shape(CostShape::Cells).with_rows(rows);
         let two = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), start_from, 0.0, true, memory).with_shape(CostShape::Cells).with_rows(rows);
@@ -1030,8 +1021,7 @@ fn young(n: f64) -> bool {
 /// the stopping rule: K is drawn before `conf` is read, independent of the
 /// drafts.
 fn explore_p() -> f64 {
-    static P: LazyLock<f64> = LazyLock::new(|| env_f64("V41_MS_DSPARK_EXPLORE", 1.0 / 32.0).clamp(0.0, 1.0));
-    *P
+    crate::knobs::MS_DSPARK_EXPLORE.f64()
 }
 
 /// `V41_MS_DSPARK_EXPLORE_SEED` (a u64) seeds the exploration draws; else entropy.
@@ -1041,7 +1031,7 @@ fn explore_rng() -> StdRng {
 
 /// `explore_rng` with the seed XOR `salt` (a second stream under one seed).
 fn explore_rng_salted(salt: u64) -> StdRng {
-    match std::env::var("V41_MS_DSPARK_EXPLORE_SEED").ok().and_then(|v| v.parse::<u64>().ok()) {
+    match crate::knobs::MS_DSPARK_EXPLORE_SEED.str().and_then(|v| v.trim().parse::<u64>().ok()) {
         Some(seed) => StdRng::seed_from_u64(seed ^ salt),
         None => StdRng::from_entropy(),
     }
@@ -1098,11 +1088,7 @@ pub enum CostShape {
 }
 
 fn cost_shape() -> CostShape {
-    static S: LazyLock<CostShape> = LazyLock::new(|| match std::env::var("V41_MS_DSPARK_COST_SHAPE").as_deref() {
-        Ok("line") => CostShape::Line,
-        _ => CostShape::Cells,
-    });
-    *S
+    if crate::knobs::MS_DSPARK_COST_SHAPE.pick() == 1 { CostShape::Line } else { CostShape::Cells }
 }
 
 /// What a lone stream's step and draft cost (ms), for the K policy and the
@@ -1247,16 +1233,16 @@ impl StepCost {
 
     /// From `V41_MS_DSPARK_COST`, `_DRAFT_MS`, `_COST_LIVE`, `_COST_MEMORY`.
     pub fn from_env() -> Self {
-        let ladder = std::env::var("V41_MS_DSPARK_COST")
-            .ok()
+        let ladder = crate::knobs::MS_DSPARK_COST
+            .str()
             .and_then(|v| v.split(',').map(|x| x.trim().parse().ok()).collect::<Option<Vec<f64>>>())
             .filter(|v| v.len() >= 2)
             .unwrap_or_else(|| DEFAULT_LADDER.to_vec());
         Self::new(
             ladder,
-            env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0),
-            std::env::var("V41_MS_DSPARK_COST_LIVE").as_deref() != Ok("0"),
-            env_f64("V41_MS_DSPARK_COST_MEMORY", 500.0),
+            crate::knobs::MS_DSPARK_DRAFT_MS.f64(),
+            crate::knobs::MS_DSPARK_COST_LIVE.on(),
+            crate::knobs::MS_DSPARK_COST_MEMORY.f64(),
         )
     }
 
@@ -1266,17 +1252,17 @@ impl StepCost {
     /// step means, rows 4..8 on two lanes). Its own fit, so the step change in
     /// cost where the second lane switches on cannot bend the one-lane line.
     pub fn from_env_two_lane(first_row: usize) -> Self {
-        let ladder = std::env::var("V41_MS_DSPARK_COST2")
-            .ok()
+        let ladder = crate::knobs::MS_DSPARK_COST2
+            .str()
             .and_then(|v| v.split(',').map(|x| x.trim().parse().ok()).collect::<Option<Vec<f64>>>())
             .filter(|v| v.len() >= 2)
             .unwrap_or_else(|| DEFAULT_LADDER_TWO_LANE.to_vec());
         Self::with_first_row(
             ladder,
             first_row,
-            env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0),
-            std::env::var("V41_MS_DSPARK_COST_LIVE").as_deref() != Ok("0"),
-            env_f64("V41_MS_DSPARK_COST_MEMORY", 500.0),
+            crate::knobs::MS_DSPARK_DRAFT_MS.f64(),
+            crate::knobs::MS_DSPARK_COST_LIVE.on(),
+            crate::knobs::MS_DSPARK_COST_MEMORY.f64(),
         )
     }
 
@@ -1391,18 +1377,14 @@ fn sigmoid(c: f32) -> f64 {
 
 /// `V41_MS_DSPARK_K`: verify exactly this many drafts (capped like the policy).
 fn fixed_k() -> Option<usize> {
-    static FIXED: LazyLock<Option<usize>> =
-        LazyLock::new(|| std::env::var("V41_MS_DSPARK_K").ok().and_then(|v| v.parse().ok()));
-    *FIXED
+    crate::knobs::MS_DSPARK_K.str().and_then(|v| v.trim().parse().ok())
 }
 
 /// Most drafts a block may verify: `V41_MS_DSPARK_K` if set (0 = never draft,
 /// the plain-decode control on the same binary), else `V41_MS_DSPARK_KMAX`
 /// (default the block size).
 pub fn k_max() -> usize {
-    static KMAX: LazyLock<usize> =
-        LazyLock::new(|| std::env::var("V41_MS_DSPARK_KMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(MTP_BLOCK));
-    fixed_k().unwrap_or(*KMAX).min(MTP_BLOCK)
+    fixed_k().unwrap_or(crate::knobs::MS_DSPARK_KMAX.usize()).min(MTP_BLOCK)
 }
 
 /// K for SAMPLED drafts (plan 2.4 / section 6): a STOPPING rule. Whether draft

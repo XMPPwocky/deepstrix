@@ -929,6 +929,7 @@ impl HeterogeneousEngine {
     pub fn export_pending_perfetto(&self) -> eyre::Result<()> {
         let Some(exp_lock) = &self.perfetto else { return Ok(()) };
         let Ok(mut exp) = exp_lock.lock() else { return Ok(()) };
+        exp.emit_knobs(false)?;
         self.dgpu.events.for_each_pair_new(|name, s, e| {
             let track = if name.contains(".xfer") || name.contains(".peer_push") {
                 &exp.dgpu_xfer

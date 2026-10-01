@@ -22,6 +22,7 @@ use v4flash_hip::{Device, Event, Stream};
 
 pub const TYPE_SLICE_BEGIN: u32 = 1;
 pub const TYPE_SLICE_END: u32 = 2;
+pub const TYPE_INSTANT: u32 = 3;
 
 fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
@@ -60,6 +61,44 @@ fn encode_track_event(event_type: u32, name: Option<&str>, track_uuid: u64) -> V
         write_field_string(&mut buf, 23, s); // name
     }
     buf
+}
+
+/// An instant event with string debug annotations (TrackEvent.debug_annotations
+/// = 4; DebugAnnotation.name = 10, .string_value = 6).
+fn encode_instant(name: &str, track_uuid: u64, args: &[(&str, String)]) -> Vec<u8> {
+    let mut buf = encode_track_event(TYPE_INSTANT, Some(name), track_uuid);
+    for (k, v) in args {
+        let mut a = Vec::with_capacity(k.len() + v.len() + 8);
+        write_field_string(&mut a, 10, k);
+        write_field_string(&mut a, 6, v);
+        write_field_message(&mut buf, 4, &a);
+    }
+    buf
+}
+
+/// The `knobs` track's packets (owner, 10-01: traces should "contain the
+/// current value of all knobs"): with `snapshot`, one `knobs` instant carrying
+/// every registered knob (`NAME` = `value (source, live|static)`); then one
+/// `knob NAME=value` instant per live change after `*seen` (`from`, `to`,
+/// `source`), at the time it was applied. Advances `*seen`.
+fn knob_packets(track_uuid: u64, seq_id: u32, snapshot: bool, seen: &mut u64) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if snapshot {
+        // The seq BEFORE the snapshot: a change racing it is emitted again
+        // below next time (a duplicate, never a gap).
+        *seen = crate::knobs::change_seq();
+        let args: Vec<(&str, String)> = crate::knobs::snapshot()
+            .into_iter()
+            .map(|(n, v, src, live)| (n, format!("{v} ({src:?}, {})", if live { "live" } else { "static" })))
+            .collect();
+        out.push(encode_packet_event(now_ns(), &encode_instant("knobs", track_uuid, &args), seq_id));
+    }
+    for c in crate::knobs::changes_since(*seen) {
+        let args = [("from", c.from.clone()), ("to", c.to.clone()), ("source", format!("{:?}", c.source))];
+        out.push(encode_packet_event(c.t_ns, &encode_instant(&format!("knob {}={}", c.name, c.to), track_uuid, &args), seq_id));
+        *seen = c.seq;
+    }
+    out
 }
 
 fn encode_packet_descriptor(td: &[u8], seq_id: u32) -> Vec<u8> {
@@ -160,6 +199,9 @@ pub struct DeviceTimingExporter {
     /// drawn in hub time. Separate from `pager_uuid`, which is box 1's pager:
     /// a stall on this lane is box-2 NVMe, not box-1 residency.
     pub remote_pager_uuid: u64,
+    /// Every knob at open, then each live change (`knob_packets`).
+    pub knobs_uuid: u64,
+    knobs_seen: std::sync::atomic::AtomicU64,
 }
 
 impl DeviceTimingExporter {
@@ -209,6 +251,8 @@ impl DeviceTimingExporter {
             remote_device_uuid: 0x52454d54_0000_0003,
             pager_uuid: 0x50414745_0000_0001,
             remote_pager_uuid: 0x50414745_0000_0002,
+            knobs_uuid: 0x4b4e4f42_0000_0001,
+            knobs_seen: std::sync::atomic::AtomicU64::new(0),
         };
         this.declare_track(this.dgpu_compute.uuid, "dgpu.compute (device)")?;
         this.declare_track(this.dgpu_xfer.uuid, "dgpu.xfer (device)")?;
@@ -218,7 +262,25 @@ impl DeviceTimingExporter {
         this.declare_track(this.remote_device_uuid, "box2.igpu (device, shifted)")?;
         this.declare_track(this.pager_uuid, "expert pager (host)")?;
         this.declare_track(this.remote_pager_uuid, "remote.pager (box 2 NVMe)")?;
+        this.declare_track(this.knobs_uuid, "knobs")?;
+        this.emit_knobs(true)?;
         Ok(this)
+    }
+
+    /// The `knobs` track: the whole table when `snapshot`, then the live
+    /// changes not yet emitted (cheap when there are none: call per step).
+    pub fn emit_knobs(&self, snapshot: bool) -> eyre::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut seen = self.knobs_seen.load(Relaxed);
+        if !snapshot && seen == crate::knobs::change_seq() {
+            return Ok(());
+        }
+        let pkts = knob_packets(self.knobs_uuid, self.seq_id, snapshot, &mut seen);
+        self.knobs_seen.store(seen, Relaxed);
+        if !pkts.is_empty() {
+            self.writer.lock().unwrap().write_all(&encode_trace(&pkts))?;
+        }
+        Ok(())
     }
 
     /// Re-record the per-stream anchors and capture fresh host wall-times.
@@ -358,6 +420,19 @@ impl TrackExporter {
         let file = File::create(path)
             .wrap_err_with(|| format!("create perfetto trace file at {}", path.display()))?;
         Ok(Self { writer: Mutex::new(file), seq_id })
+    }
+
+    /// The `knobs` track on `uuid` (declare it first): the whole table when
+    /// `snapshot`, then the live changes after `*seen` (`DeviceTimingExporter::emit_knobs`).
+    pub fn emit_knobs(&self, uuid: u64, snapshot: bool, seen: &mut u64) -> eyre::Result<()> {
+        if !snapshot && *seen == crate::knobs::change_seq() {
+            return Ok(());
+        }
+        let pkts = knob_packets(uuid, self.seq_id, snapshot, seen);
+        if !pkts.is_empty() {
+            self.writer.lock().unwrap().write_all(&encode_trace(&pkts))?;
+        }
+        Ok(())
     }
 
     /// Declare a track. Call once per uuid before emitting on it.

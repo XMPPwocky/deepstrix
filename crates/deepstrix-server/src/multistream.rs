@@ -20,7 +20,7 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre};
 use tokio::sync::mpsc;
 use v4flash_kernels::config::{ENGRAM_IN, HC_DIM, N_VOCAB};
-use v4flash_kernels::het::forward_prefill::{lane_rows, lm_rows, LazyEngramRows, PrefillJob};
+use v4flash_kernels::het::forward_prefill::{lane_rows, LazyEngramRows, PrefillJob};
 use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev, ARENA_ROWS_PER_STREAM};
 use v4flash_kernels::het::scratch::{HEAD_BATCH_MAX, HEAD_CAND_BAND, HEAD_CAND_CAP, HEAD_CAND_STRIDE};
 use v4flash_kernels::het::SampleMode;
@@ -31,16 +31,15 @@ use crate::engine_worker::{
     byte_aligned_lcp_vl, encode_request_images, flush_expert_stats, handle_generate_stream, save_live_if_dirty, trim_heap_and_log, EncodedImages,
     EngineRequest, FinishReason, GenerateReq, WorkerEvent, WorkerState,
 };
+use crate::knobs;
 use crate::ms_dspark::{self, LaneRule, MsDspark, PlainLanes};
+use v4flash_kernels::knobs::Source;
 use crate::snapshot;
 use crate::spec_sample::{verify_block, Draft, DraftDist, TargetDist};
 use crate::tokens::{is_turn_end, TOK_ASSISTANT, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END, TOK_USER};
 
 pub fn enabled() -> bool {
-    matches!(std::env::var("V41_MULTISTREAM").as_deref(), Ok("1") | Ok("on"))
-}
-fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    knobs::MULTISTREAM.on()
 }
 
 /// Positions reserved beyond the prompt when a request is admitted
@@ -50,14 +49,16 @@ fn env_usize(k: &str, d: usize) -> usize {
 /// and the 844,800-row arena held ~3.6 of them. 09-27 (942 streams):
 /// completions p50 542, p99 5016, max 14,343, none hit the limit. A stream
 /// that runs past its reservation grows (`KvArena::grow`).
-fn kv_headroom() -> u32 { env_usize("V41_MS_KV_HEADROOM", 16384) as u32 }
+fn kv_headroom() -> u32 { knobs::MS_KV_HEADROOM.get() as u32 }
 /// Positions a growing stream adds per growth (`V41_MS_KV_GROW`).
-fn kv_grow_step() -> u32 { (env_usize("V41_MS_KV_GROW", 16384) as u32).max(1) }
+fn kv_grow_step() -> u32 { knobs::MS_KV_GROW.get() as u32 }
 /// Grow when this few positions are left in the reservation (`V41_MS_KV_GROW_AT`).
-fn kv_grow_at() -> u32 { env_usize("V41_MS_KV_GROW_AT", 256) as u32 }
+fn kv_grow_at() -> u32 { knobs::MS_KV_GROW_AT.get() as u32 }
 /// Positions of rows a new reservation must leave free while streams are live
 /// (`V41_MS_KV_SPARE`, default one grow step): the room they grow into.
-fn kv_spare() -> u32 { env_usize("V41_MS_KV_SPARE", kv_grow_step() as usize) as u32 }
+fn kv_spare() -> u32 {
+    if knobs::MS_KV_SPARE.source() == Source::Default { kv_grow_step() } else { knobs::MS_KV_SPARE.get() as u32 }
+}
 
 /// `max_new` for a request whose context will be `pos`: a defaulted one is
 /// shrunk to what the context leaves (never fail a long prompt for the
@@ -179,8 +180,7 @@ struct EngramAhead {
 
 /// `V41_MS_ENGRAM_AHEAD` (default on; `0` off): `EngramAhead`.
 fn engram_ahead_on() -> bool {
-    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_ENGRAM_AHEAD").as_deref() != Ok("0"));
-    *B
+    knobs::MS_ENGRAM_AHEAD.on()
 }
 
 impl EngramAhead {
@@ -256,14 +256,14 @@ struct PrefillDone {
 
 
 pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
-    let n_slots = env_usize("V41_MS_SLOTS", 8) as u32;
+    let n_slots = knobs::MS_SLOTS.get() as u32;
     // Context budget across all live streams (positions); each store gets
     // budget / ratio rows. Default 2 x --ctx: two 240K agents, or eight 75K
     // ones. ~1 KB per row at ratio 1 plus 0.5 KB per ratio-2 store; MEASURED
     // 2026-09-20 on the 16 GB dGPU with two prefill states: 3 x --ctx left
     // 190 MiB free (unsafe), 2 x --ctx 1.0 GiB.
-    let ctx_rows = env_usize("V41_MS_CTX_ROWS", 2 * state.n_kv_max as usize) as u32;
-    let chunk_rows = env_usize("V41_MS_CHUNK_ROWS", 1024);
+    let ctx_rows = if knobs::MS_CTX_ROWS.source() == Source::Default { 2 * state.n_kv_max } else { knobs::MS_CTX_ROWS.get() as u32 };
+    let chunk_rows = knobs::MS_CHUNK_ROWS.usize();
     let arena = match KvArena::alloc_ctx(state.dgpu, n_slots, ctx_rows) {
         Ok(a) => a,
         Err(e) => {
@@ -301,18 +301,23 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
-    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 120_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), head_cands = ?head_cands_mode(), "multistream scheduler ON");
+    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = knobs::MS_PREFILL_BURST_MS.get(), decode_burst_ms = knobs::MS_DECODE_BURST_MS.get(), head_cands = ?head_cands_mode(), "multistream scheduler ON");
     // Logs its UNTESTED-fidelity warning when on: at every start, not only on first use.
     let _ = v4flash_kernels::het::forward_prefill::prefill_f16_replies();
-    // Event trace (`V41_EVTRACE_DIR`): every V41_* knob goes in the header.
+    // Event trace (`V41_EVTRACE_DIR`): every V41_* env var goes in the header,
+    // and every registered knob's effective value (`v4flash_kernels::knobs`).
     {
-        let knobs: serde_json::Map<String, serde_json::Value> = std::env::vars()
+        let env: serde_json::Map<String, serde_json::Value> = std::env::vars()
             .filter(|(k, _)| k.starts_with("V41_") || k.starts_with("GPU_") || k.starts_with("HIP_"))
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        v4flash_kernels::het::evtrace::init("hub", serde_json::json!({ "n_slots": n_slots, "ctx_rows": ctx_rows, "chunk_rows": chunk_rows, "env": knobs }));
+        let eff: serde_json::Map<String, serde_json::Value> = v4flash_kernels::knobs::snapshot()
+            .into_iter()
+            .map(|(k, v, src, _)| (k.to_string(), serde_json::Value::String(format!("{v} ({src:?})"))))
+            .collect();
+        v4flash_kernels::het::evtrace::init("hub", serde_json::json!({ "n_slots": n_slots, "ctx_rows": ctx_rows, "chunk_rows": chunk_rows, "env": env, "knobs": eff }));
     }
-    let n_jobs = env_usize("V41_MS_PREFILL_JOBS", 2).max(1);
+    let n_jobs = knobs::MS_PREFILL_JOBS.usize();
     let mut spare_states = Vec::with_capacity(n_jobs);
     for _ in 0..n_jobs {
         match v4flash_kernels::het::HetModelState::alloc(state.dgpu, state.igpu, state.n_kv_max) {
@@ -419,13 +424,11 @@ struct ProfileAcc {
 }
 
 fn ms_pipeline() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_PIPELINE").as_deref() != Ok("0"));
-    *ON
+    knobs::MS_PIPELINE.on()
 }
 
 fn ms_profile() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| matches!(std::env::var("V41_MS_PROFILE").as_deref(), Ok("1")));
-    *ON
+    knobs::MS_PROFILE.on()
 }
 
 /// How a decode step's head reaches the sampler (`V41_MS_HEAD_CANDS`).
@@ -442,57 +445,20 @@ enum HeadCands {
     Check,
 }
 
-fn parse_head_cands(s: &str) -> HeadCands {
-    match s.trim() {
-        "0" => HeadCands::Off,
-        "check" => HeadCands::Check,
+
+
+/// `V41_MS_HEAD_CANDS` (live knob; `check` -> `1` -> `0` without a restart).
+fn head_cands_mode() -> HeadCands {
+    match knobs::MS_HEAD_CANDS.pick() {
+        1 => HeadCands::Off,
+        2 => HeadCands::Check,
         _ => HeadCands::On,
     }
 }
 
-/// `V41_MS_HEAD_CANDS`, overridden at run time by the contents of
-/// `V41_MS_HEAD_CANDS_FILE` when set (re-read every 2 s): `check` -> `1` ->
-/// `0` without a restart.
-fn head_cands_mode() -> HeadCands {
-    static ENV: std::sync::LazyLock<HeadCands> =
-        std::sync::LazyLock::new(|| parse_head_cands(&std::env::var("V41_MS_HEAD_CANDS").unwrap_or_default()));
-    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_HEAD_CANDS_FILE").ok());
-    static CACHE: std::sync::Mutex<Option<(Instant, HeadCands)>> = std::sync::Mutex::new(None);
-    let Some(path) = FILE.as_ref() else { return *ENV };
-    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((t, m)) = *g {
-        if t.elapsed() < std::time::Duration::from_secs(2) {
-            return m;
-        }
-    }
-    let m = std::fs::read_to_string(path).map(|s| parse_head_cands(&s)).unwrap_or(*ENV);
-    if g.is_some_and(|(_, old)| old != m) {
-        tracing::info!(mode = ?m, "multistream: head candidates mode changed");
-    }
-    *g = Some((Instant::now(), m));
-    m
-}
-
-/// `V41_MS_SPEC_LANES` (default on; `0` off), overridden at run time by the
-/// contents of `V41_MS_SPEC_LANES_FILE` (re-read every 2 s), like
-/// `head_cands_mode`.
+/// `V41_MS_SPEC_LANES` (default on; `0` off; live knob).
 fn spec_lanes_on() -> bool {
-    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_SPEC_LANES").as_deref() != Ok("0"));
-    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_SPEC_LANES_FILE").ok());
-    static CACHE: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
-    let Some(path) = FILE.as_ref() else { return *ENV };
-    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((t, on)) = *g {
-        if t.elapsed() < std::time::Duration::from_secs(2) {
-            return on;
-        }
-    }
-    let on = std::fs::read_to_string(path).map(|s| s.trim() != "0").unwrap_or(*ENV);
-    if g.is_some_and(|(_, old)| old != on) {
-        tracing::info!(on, "multistream: spec two-lane verify changed");
-    }
-    *g = Some((Instant::now(), on));
-    on
+    knobs::MS_SPEC_LANES.on()
 }
 
 /// `V41_MS_FINISH_GROUP` (default on; `0` off): a prefill burst whose budget
@@ -502,85 +468,30 @@ fn spec_lanes_on() -> bool {
 /// box-2 delta restore and the hub's pin restore all take the prefill class
 /// first) and the next unit page them all again (SF-B, owner's call 10-01).
 fn finish_group() -> bool {
-    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_FINISH_GROUP").as_deref() != Ok("0"));
-    *B
+    knobs::MS_FINISH_GROUP.on()
 }
 
-/// Run-time override of layer-major prefill for NEW jobs: the contents of
-/// `V41_MS_LM_FILE` (`0` chunked, anything else layer-major; re-read every
-/// 2 s), like `spec_lanes_on`. `None` (no file knob, or the file unreadable) =
-/// `PrefillJob::new`'s own choice (`V41_LM_PREFILL`). A job keeps the mode it
-/// started with: the A/B of the two prefill drivers needs no restart.
-fn lm_prefill_override() -> Option<bool> {
-    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_LM_FILE").ok());
-    static CACHE: std::sync::Mutex<Option<(Instant, Option<bool>)>> = std::sync::Mutex::new(None);
-    let path = FILE.as_ref()?;
-    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((t, on)) = *g {
-        if t.elapsed() < std::time::Duration::from_secs(2) {
-            return on;
-        }
-    }
-    let on = std::fs::read_to_string(path).ok().map(|s| s.trim() != "0");
-    if g.is_some_and(|(_, old)| old != on) {
-        tracing::info!(?on, "multistream: layer-major prefill override changed");
-    }
-    *g = Some((Instant::now(), on));
-    on
-}
 
-/// `V41_MS_PIPELINE_MIN_ROWS` (default 6; production 4): a step of at least
+
+/// `V41_MS_PIPELINE_MIN_ROWS` (live knob, default 6; production 4): a step of at least
 /// this many rows runs two lanes -- a plain multi-stream step, and a
 /// speculating lone stream's verify -- under `LaneRule::Threshold`, i.e.
-/// unless the lane choice is learned (`lanes_learned`). Overridden at run
-/// time by the contents of `V41_MS_PIPELINE_MIN_ROWS_FILE` (re-read every 2 s),
-/// like `spec_lanes_on`. Never below 2 (one row cannot be split). The ONE
-/// reader of the knob (it was parsed in three places with different clamps);
-/// a step reads it once. Why live: at 1-3 rows one lane waits out box 2
+/// unless the lane choice is learned (`lanes_learned`). Never below 2 (one
+/// row cannot be split). The ONE reader of the knob (it was parsed in three
+/// places with different clamps); a step reads it once. Why live: at 1-3 rows one lane waits out box 2
 /// (14 / 27 / 39 ms per step exposed, MEASURED 2026-10-01 17:03-19:05) where
 /// two lanes at 4-5 rows hide most of it (13 / 3 ms).
 pub(crate) fn pipeline_min_rows() -> usize {
-    static ENV: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| env_usize("V41_MS_PIPELINE_MIN_ROWS", 6));
-    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_PIPELINE_MIN_ROWS_FILE").ok());
-    static CACHE: std::sync::Mutex<Option<(Instant, usize)>> = std::sync::Mutex::new(None);
-    let Some(path) = FILE.as_ref() else { return (*ENV).max(2) };
-    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((t, v)) = *g {
-        if t.elapsed() < std::time::Duration::from_secs(2) {
-            return v;
-        }
-    }
-    let v = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(*ENV).max(2);
-    if g.is_some_and(|(_, old)| old != v) {
-        tracing::info!(min_rows = v, "multistream: two-lane min rows changed");
-    }
-    *g = Some((Instant::now(), v));
-    v
+    knobs::MS_PIPELINE_MIN_ROWS.usize()
 }
 
-/// `V41_MS_LANES_LEARNED` (default off; `1` on), overridden at run time by the
-/// contents of `V41_MS_LANES_LEARNED_FILE` (re-read every 2 s), like
-/// `spec_lanes_on`. On: every step's lane count is learned per row count
+/// `V41_MS_LANES_LEARNED` (default off; `1` on; live knob). On: every step's
+/// lane count is learned per row count
 /// (`LaneRule::Learned`, `ms_dspark::LaneTables`) and `pipeline_min_rows` is
 /// only the cold start; off: the fixed threshold (owner, 10-01: "if we have
 /// cells1 and cells2, why have a fixed min_rows at all?").
 fn lanes_learned() -> bool {
-    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_LANES_LEARNED").as_deref() == Ok("1"));
-    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_LANES_LEARNED_FILE").ok());
-    static CACHE: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
-    let Some(path) = FILE.as_ref() else { return *ENV };
-    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((t, on)) = *g {
-        if t.elapsed() < std::time::Duration::from_secs(2) {
-            return on;
-        }
-    }
-    let on = std::fs::read_to_string(path).map(|s| s.trim() == "1").unwrap_or(*ENV);
-    if g.is_some_and(|(_, old)| old != on) {
-        tracing::info!(on, "multistream: learned lane choice changed");
-    }
-    *g = Some((Instant::now(), on));
-    on
+    knobs::MS_LANES_LEARNED.on()
 }
 
 /// How a speculating lone stream's verify picks its lanes (two = an ordered
@@ -589,7 +500,7 @@ fn lanes_learned() -> bool {
 /// what the K policy prices a block's rows by. `min_rows` / `learned` = this
 /// step's snapshot (one read per step).
 pub(crate) fn spec_lane_rule(min_rows: usize, learned: bool) -> LaneRule {
-    let ready_first = std::env::var("V41_MS_STAGGER").as_deref() == Ok("2");
+    let ready_first = knobs::MS_STAGGER.pick() == 2;
     match (ready_first && ms_pipeline() && spec_lanes_on(), learned) {
         (false, _) => LaneRule::Off,
         (true, true) => LaneRule::Learned,
@@ -849,8 +760,8 @@ impl Sched {
         // (plan 5.3: SJF on the suffix; the prompt length is the proxy we have
         // before the snapshot probe), with aging: a request that has waited
         // longer than `V41_MS_AGING_S` (default 60 s) goes first regardless.
-        let aging = std::time::Duration::from_secs(env_usize("V41_MS_AGING_S", 60) as u64);
-        let starve = std::time::Duration::from_secs(env_usize("V41_MS_STARVE_S", 600) as u64);
+        let aging = std::time::Duration::from_secs(knobs::MS_AGING_S.get());
+        let starve = std::time::Duration::from_secs(knobs::MS_STARVE_S.get());
         // Images ride the multistream path since 2026-09-21 (tower rows spliced
         // into the chunk inputs); only legacy DSpark (`V41_DSPARK` without
         // `V41_MS_DSPARK`) still needs the serial driver.
@@ -1023,14 +934,14 @@ impl Sched {
         // instead of forcing the prefill phase.
         let starved = self.queue.iter().any(|p| p.room_wait.is_none() && p.queued.elapsed() >= starve)
             || self.prefills.iter().any(|pf| !pf.job.chunks_done() && pf.p.queued.elapsed() >= starve);
-        let scale = env_usize("V41_MS_BURST_SCALE", 0) == 1;
+        let scale = knobs::MS_BURST_SCALE.on();
         let waiting_pf = if scale { self.prefills.len() + self.queue.len() } else { 0 };
         let live = if scale { self.streams.len() } else { 0 };
         let budget = |ph: Phase| std::time::Duration::from_millis(match ph {
-            Phase::Prefill => (env_usize("V41_MS_PREFILL_BURST_MS", 120_000) / (1 + live))
-                .max(env_usize("V41_MS_PREFILL_BURST_MIN_MS", 10_000)) as u64,
-            Phase::Decode => (env_usize("V41_MS_DECODE_BURST_MS", 30_000) / (1 + waiting_pf))
-                .max(env_usize("V41_MS_DECODE_BURST_MIN_MS", 3_000)) as u64,
+            Phase::Prefill => (knobs::MS_PREFILL_BURST_MS.usize() / (1 + live))
+                .max(knobs::MS_PREFILL_BURST_MIN_MS.usize()) as u64,
+            Phase::Decode => (knobs::MS_DECODE_BURST_MS.usize() / (1 + waiting_pf))
+                .max(knobs::MS_DECODE_BURST_MIN_MS.usize()) as u64,
         });
         let next = match (have_pf, have_dec) {
             (true, false) => Phase::Prefill,
@@ -1186,12 +1097,9 @@ impl Sched {
             Ok(j) => j,
             Err(e) => return Err((p, kv, e)),
         };
-        if let Some(on) = lm_prefill_override() {
-            // Fails only for layer-major without CED: the job stays chunked.
-            if let Err(e) = job.set_layer_major_rows(if on { lm_rows() } else { 0 }) {
-                tracing::warn!(error = %e, "multistream: layer-major override not applied");
-            }
-        }
+        // Layer-major or chunked: `PrefillJob::new` reads the live knob
+        // `V41_LM_PREFILL` (the 10-01 `V41_MS_LM_FILE` still sets it); a job
+        // keeps the mode it started with.
         // Vision: run the tower now (dGPU, between steps) so the chunk inputs
         // can splice the aligned rows in at the image positions.
         let vl = match encode_request_images(state, &p.req) {
@@ -1332,7 +1240,7 @@ impl Sched {
                 // prompt lost 98K rows). The encoder state at a chunk boundary is
                 // what a resumed prefill restores; the decoder rings are saved
                 // empty (see the cancel checkpoint above).
-                let every = env_usize("V41_MS_CHECKPOINT_EVERY", 32768);
+                let every = knobs::MS_CHECKPOINT_EVERY.usize();
                 let done = pf.job.done_rows();
                 if every > 0 && done >= every && (done - rows) / every != done / every && pf.job.checkpoint_ok() {
                     let t = Instant::now();
@@ -1558,7 +1466,7 @@ impl Sched {
     fn decode_rows(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
         // Hot-set ownership refresh (see expert_pager::hot_set); `tick` is
         // advanced once per scheduler tick.
-        if self.tick % env_usize("V41_B1_HOT_REFRESH", 500) as u64 == 0 {
+        if self.tick % knobs::B1_HOT_REFRESH.get() == 0 {
             if let Some((owned, mass, changed)) = v4flash_kernels::het::expert_pager::hot_set::refresh() {
                 tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
                     picks = v4flash_kernels::het::expert_pager::hot_set::picks_seen(), "multistream: box-1 hot set refreshed");
@@ -1727,7 +1635,7 @@ impl Sched {
         // Rows that would run THREE lanes keep the threshold even when learned:
         // a three-lane step feeds no table, so a learned choice there would
         // compare a live one-lane cell with a frozen two-lane one (review 12).
-        let lanes3_rows = env_usize("V41_MS_LANES", 2) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
+        let lanes3_rows = knobs::MS_LANES.get() >= 3 && b >= knobs::MS_LANES3_MIN_ROWS.usize() && b >= 3;
         let plain_rule = plain_lane_rule(min_rows, learned && !lanes3_rows);
         let plain_two = !spec && b >= 2 && self.plain_lanes.pick(b, plain_rule) >= 2;
         let pipelined = plain_two || spec_lanes;
@@ -1754,9 +1662,9 @@ impl Sched {
         // the host runs whichever lane's next step is ready instead of a fixed
         // round robin (it was blocking 67 ms/step on its own dGPU router while
         // 52 of 80 box-2 replies sat ready). Gated by multistream_step G5e.
-        let stagger_mode = std::env::var("V41_MS_STAGGER").unwrap_or_default();
-        let stagger2 = pipelined && !lanes3 && (stagger_mode == "1" || stagger_mode == "2");
-        let ready_first = stagger_mode == "2";
+        let stagger_mode = knobs::MS_STAGGER.pick();
+        let stagger2 = pipelined && !lanes3 && stagger_mode >= 1;
+        let ready_first = stagger_mode == 2;
         let mut fwd_only_ms = 0.0f64;
         let n_tables = engram.as_ref().map(|ec| ec.tables.len()).unwrap_or(0);
         if self.dsp.is_some() {
@@ -2039,7 +1947,7 @@ impl Sched {
                 e.0 += fwd_ms - fwd_only_ms;
                 e.1 += 1;
             }
-            let every = env_usize("V41_MS_PROFILE_EVERY", 20) as u64;
+            let every = knobs::MS_PROFILE_EVERY.get();
             if acc.steps >= every {
                 let mut v: Vec<_> = acc.stages.iter().map(|(&(d, n), &(ms, c))| (d, n, ms / acc.steps as f64, c)).collect();
                 v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -2208,9 +2116,9 @@ mod restore_candidate_tests {
 
 /// Cancelled prefills with at least this many rows done are checkpointed
 /// (`V41_MS_CHECKPOINT_MIN_ROWS`, default 4096).
-fn checkpoint_min_rows() -> usize { env_usize("V41_MS_CHECKPOINT_MIN_ROWS", 4096) }
-fn chunk_rows_idle() -> usize { env_usize("V41_MS_CHUNK_ROWS_IDLE", 1024) }
-fn chunk_rows_busy() -> usize { env_usize("V41_MS_CHUNK_ROWS", 1024) }
+fn checkpoint_min_rows() -> usize { knobs::MS_CHECKPOINT_MIN_ROWS.usize() }
+fn chunk_rows_idle() -> usize { knobs::MS_CHUNK_ROWS_IDLE.usize() }
+fn chunk_rows_busy() -> usize { knobs::MS_CHUNK_ROWS.usize() }
 
 /// Same rule as `HeterogeneousEngine::sample_next` / the DSpark host twin.
 ///
@@ -2351,28 +2259,12 @@ fn finish(state: &mut WorkerState, arena: &mut KvArena, s: Stream, f: FinishReas
 /// used to be read back to back), each a batched `EngramTable::gather` over
 /// the live rows. Runs on the scoped helper thread `decode_step` spawns.
 /// Read threads per Engram table of a decode step's gather
-/// (`V41_MS_ENGRAM_THREADS`, default 32; run-time file
-/// `V41_MS_ENGRAM_THREADS_FILE`, re-read every 2 s). Cold reads cost ~0.8-1.7
+/// (`V41_MS_ENGRAM_THREADS`, default 32; live knob). Cold reads cost ~0.8-1.7
 /// ms each, so 32 threads over a 5-row step's 120 ids per table is ~4 rounds;
 /// the spawns are serial (~15 us each), so more threads start the last read
 /// later -- measure (`ms.step` `engram_gather_ms` vs `lh_engram_join`).
 fn engram_threads() -> usize {
-    static ENV: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| env_usize("V41_MS_ENGRAM_THREADS", 32).clamp(1, 512));
-    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_ENGRAM_THREADS_FILE").ok());
-    static CACHE: std::sync::Mutex<Option<(Instant, usize)>> = std::sync::Mutex::new(None);
-    let Some(path) = FILE.as_ref() else { return *ENV };
-    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((t, n)) = *g {
-        if t.elapsed() < std::time::Duration::from_secs(2) {
-            return n;
-        }
-    }
-    let n = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<usize>().ok()).map(|n| n.clamp(1, 512)).unwrap_or(*ENV);
-    if g.is_some_and(|(_, old)| old != n) {
-        tracing::info!(threads = n, "multistream: Engram gather threads changed");
-    }
-    *g = Some((Instant::now(), n));
-    n
+    knobs::MS_ENGRAM_THREADS.usize()
 }
 
 /// Wall time (us) of the last decode-step Engram gather (`ms.step`).

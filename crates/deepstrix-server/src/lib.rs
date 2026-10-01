@@ -5,6 +5,7 @@
 pub mod dsml;
 pub mod embed;
 pub mod engine_worker;
+pub mod knobs;
 #[cfg(feature = "v41")]
 pub mod multistream;
 #[cfg(feature = "v41")]

@@ -678,9 +678,10 @@ pub fn f16_bits_to_f32(h: u16) -> f32 {
 }
 
 /// `V41_LM_PREFILL=1`: layer-major CED prefill (see the block comment above).
+/// A LIVE knob (`crate::knobs::LM_PREFILL`), read when a job is created: a job
+/// keeps the mode it started with.
 pub fn lm_prefill_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("V41_LM_PREFILL").as_deref() == Ok("1"))
+    crate::knobs::LM_PREFILL.on()
 }
 
 /// `V41_LM_ROWS` (default 4096): rows per layer-major window (the device store's
