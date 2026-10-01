@@ -251,7 +251,7 @@ impl MsDspark {
         let ids = self.with_ring(mtp, slot, rewind, |m| {
             let MtpCtx { state, exit, w, xw, markov_embd, markov_dtype, noise_row, .. } = m;
             engine
-                .dspark_draft(state, exit, &hidden, w, xw, weights, markov_embd, *markov_dtype, pos, token_row, noise_row, next)
+                .dspark_draft(state, exit, &hidden, w, xw, weights, markov_embd, *markov_dtype, pos, token_row, noise_row, next, false)
                 .map(|(ids, _plain)| ids)
         })?;
         let ms = t.elapsed().as_secs_f64() * 1e3;

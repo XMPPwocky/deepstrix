@@ -783,6 +783,7 @@ impl HeterogeneousEngine {
         token_row: &[f32],
         noise_row: &[f32],
         first_token: i32,
+        want_plain: bool,
     ) -> color_eyre::eyre::Result<([i32; super::mtp::MTP_BLOCK], [i32; super::mtp::MTP_BLOCK])> {
         // `V41_DSPARK_DRAFT_TIMING=1`: split the draft into its three parts. The
         // drafter is only 3 layers but costs ~26 ms/step against the 40-layer
@@ -857,7 +858,7 @@ impl HeterogeneousEngine {
                 "dspark.draft.split"
             );
         }
-        let r = exit.forward(
+        let r = exit.forward_ex(
             &self.dgpu,
             &self.dgpu.compute,
             &h_host,
@@ -867,6 +868,7 @@ impl HeterogeneousEngine {
             markov_embd,
             markov_dtype,
             first_token,
+            want_plain,
         );
         if dt {
             tracing::info!(

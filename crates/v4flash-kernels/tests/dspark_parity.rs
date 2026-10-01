@@ -204,20 +204,31 @@ fn drafter_matches_reference() {
     let mut token_row = vec![0.0f32; HC_DIM as usize];
     let mut h_host = vec![0.0f32; st.h.len()];
     let mut pre_host = vec![0.0f32; st.pre_carry().len()];
+    // Wall split per draft (ms): drafter enqueue, drafter device (to sync),
+    // exit. V41_MTP_GRAPH=1 replays the drafter as one graph; the CSV
+    // (PARITY_OUT, full-precision conf) must be byte-identical either way.
+    let (mut t_enq, mut t_dev, mut t_exit) = (Vec::new(), Vec::new(), Vec::new());
     for (n, r) in refs.iter().enumerate() {
         let i = r.i;
         assert!(i + 1 + MTP_BLOCK < t, "step {i} runs past the transcript");
         let next = tok[i + 1];
         v4flash_kernels::embed::embed_lookup(&te_bytes, te_dtype, next, &mut token_row).expect("embed token");
         st.inject_main_hidden(&mh[i * row..(i + 1) * row]).expect("inject");
+        let t0 = std::time::Instant::now();
         st.forward(&e, &e.compute, &w, &rope, i as u32, &token_row, &noise_row).expect("drafter forward");
+        let t1 = std::time::Instant::now();
         e.compute.synchronize().expect("sync");
+        let t2 = std::time::Instant::now();
         st.h.copy_to_host(&mut h_host).expect("read h");
         st.pre_carry().copy_to_host(&mut pre_host).expect("read pre");
         let (ids, plain) = ex
             .forward(&e, &e.compute, &h_host, &pre_host, &xw, &head, &mk_bytes, mk_dtype, next)
             .expect("exit forward");
         e.compute.synchronize().expect("sync");
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        t_enq.push(ms(t0, t1));
+        t_dev.push(ms(t1, t2));
+        t_exit.push(ms(t2, std::time::Instant::now()));
         let ours = if use_plain { plain } else { ids };
 
         let (mut ok, mut rok) = (true, true);
@@ -258,9 +269,22 @@ fn drafter_matches_reference() {
             "{i},{},{},{}\n",
             ids.map(|x| x.to_string()).join(","),
             plain.map(|x| x.to_string()).join(","),
-            ex.conf.map(|x| format!("{x:.4}")).join(",")
+            ex.conf.map(|x| format!("{x}")).join(",")
         );
     }
+    // The first draft captures the graph (when on): report it apart.
+    let med = |v: &[f64]| {
+        let mut w = v[1.min(v.len())..].to_vec();
+        w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        w.get(w.len() / 2).copied().unwrap_or(f64::NAN)
+    };
+    println!(
+        "draft timing (median ms over {} steps after the first; first {:.2}): drafter enqueue {:.2}, drafter device-wait {:.2}, exit {:.2} (V41_MTP_GRAPH={})",
+        t_enq.len().saturating_sub(1),
+        t_enq.first().copied().unwrap_or(f64::NAN) + t_dev.first().copied().unwrap_or(f64::NAN),
+        med(&t_enq), med(&t_dev), med(&t_exit),
+        std::env::var("V41_MTP_GRAPH").unwrap_or_default()
+    );
 
     let n = refs.len() as f64;
     let e_of = |p: &[usize; MTP_BLOCK]| 1.0 + p.iter().map(|&x| x as f64 / n).sum::<f64>();

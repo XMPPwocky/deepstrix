@@ -424,9 +424,11 @@ fn kv_quant_legacy_v4() -> bool {
 }
 
 /// One drafter KV row (ring or block): weighted RMS norm, RoPE of the last
-/// `N_ROT` dims at `pos`, fake quantisation, f16 append into `ring` at the slot
-/// held in `slot_dev` (already staged on `s`). `pos_dev` carries the same `pos`
-/// for the legacy fused kernel; the V4.1 path passes `pos` as a kernel argument.
+/// `N_ROT` dims at the position in `pos_dev`, fake quantisation, f16 append
+/// into `ring` at the slot in `slot_dev` (both staged on `s` by
+/// `MtpState::stage_indices`). Device-side position (`rope_tail_pdev`, the
+/// same math as `rope_tail`): no per-draft scalar reaches a launch, so the
+/// drafter's layers can replay as a HIP graph.
 #[allow(clippy::too_many_arguments)]
 fn kv_post_row(
     e: &DeviceEngine,
@@ -435,7 +437,6 @@ fn kv_post_row(
     ring: &mut DeviceBuffer<u16>,
     kv_raw_row: &DeviceBuffer<f32>,
     norm_w: &DeviceBuffer<f32>,
-    pos: u32,
     pos_dev: &DeviceBuffer<u32>,
     slot_dev: &DeviceBuffer<u32>,
     rope: &crate::RopeParams,
@@ -446,9 +447,19 @@ fn kv_post_row(
         );
     }
     e.rms_w.launch_weighted(s, kv_normed, kv_raw_row, norm_w, N_HEAD_DIM, RMS_EPS)?;
-    e.rope.launch_forward(s, kv_normed, 1, N_HEAD_DIM, N_ROT, pos, rope)?;
+    e.rope.launch_forward_pdev(s, kv_normed, pos_dev, 1, N_HEAD_DIM, N_ROT, rope)?;
     e.fp4kv.launch_fp8_window(s, kv_normed, 1, N_HEAD_DIM)?;
     e.kv_append.launch_slotdev(s, ring, kv_normed, slot_dev, N_HEAD_DIM)
+}
+
+/// `V41_MTP_GRAPH=1`: replay the drafter's entry + layers as ONE HIP graph per
+/// ring once the ring is full (steady state: every launch argument is then
+/// fixed and every per-draft value is in a device buffer). The eager forward is
+/// launch-bound on gfx1151 (~350 launches per draft at 20-40 us each). Default
+/// off until `tests/dspark_parity.rs` shows eager == graph drafts.
+pub fn mtp_graphs() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_MTP_GRAPH").as_deref() == Ok("1"))
 }
 
 /// Batch every drafter kernel runs at.
@@ -490,6 +501,10 @@ pub struct MtpState {
     /// uninitialised ones. Counting real writes keeps the valid set a true
     /// prefix, re-based to whenever the drafter started.
     ring_writes: usize,
+
+    /// Captured entry + layers (`mtp_graphs`), keyed by the address of the
+    /// ring in use (`rings` is swapped per stream by the multistream arena).
+    graphs: std::collections::HashMap<usize, v4flash_hip::GraphExec>,
 
     // ---- residual stream ----
     /// The drafter's hyper-connection residual, `[B, N_HC, N_EMBD]`. `hc_post`
@@ -618,6 +633,7 @@ impl MtpState {
             x: DeviceBuffer::new(device_id, ne)?,
             captured: [false; MTP_SRC_LAYERS.len()],
             ring_writes: 0,
+            graphs: std::collections::HashMap::new(),
 
             h: DeviceBuffer::new(device_id, b * N_HC as usize * ne)?,
             h_next: DeviceBuffer::new(device_id, b * N_HC as usize * ne)?,
@@ -909,7 +925,6 @@ impl MtpState {
         w: &MtpLayerWeights,
         li: usize,
         rope: &crate::RopeParams,
-        pos: u32,
     ) -> eyre::Result<()> {
         // The drafter emitted NO perfetto stages at all, so its ~26 ms/step was
         // invisible on every trace -- it showed up only as an unexplained gap on
@@ -937,7 +952,7 @@ impl MtpState {
             self.attn_out.copy_from_host(&z)?;
         } else {
             let _h = HostUs::start_dev(&MTP_H_ATTN, s);
-            self.attn(e, s, w, li, rope, pos)?;
+            self.attn(e, s, w, li, rope)?;
         }
         {
             let _h = HostUs::start_dev(&MTP_H_POST, s);
@@ -984,13 +999,81 @@ impl MtpState {
         if pos == 0 {
             return Err(eyre!("mtp forward: pos 0 is prefill-seed only"));
         }
-        self.entry(e, s, w)?;
+        // Host-side inputs first (`embed` is a blocking copy; the indices go
+        // up async): the rest reads only device buffers.
         self.embed(s, token_row, noise_row)?;
-        for li in 0..w.layers.len() {
-            self.layer(e, s, &w.layers[li], li, rope, pos)?;
+        self.stage_indices(s, pos, true)?;
+        let (n_valid, _) = self.ring_geom();
+        let graph = mtp_graphs()
+            && n_valid == MTP_WINDOW
+            && mtp_timing_mode() == 0
+            && !no_attn()
+            && !no_routed()
+            && !debug_moe();
+        if graph {
+            let key = self.rings[0].raw() as usize;
+            if let Some(g) = self.graphs.get(&key) {
+                g.launch(s)?;
+            } else {
+                // Capture once per ring. `h`/`h_next` swap 6 times per forward
+                // (even), so every forward starts on the buffers it captured.
+                s.begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                e.events.set_capturing(true);
+                let r = self.entry_and_layers(e, s, w, rope);
+                e.events.set_capturing(false);
+                let g = s.end_capture();
+                r?;
+                let exec = g?.instantiate()?;
+                exec.launch(s)?;
+                self.graphs.insert(key, exec);
+            }
+        } else {
+            self.entry_and_layers(e, s, w, rope)?;
         }
         // One `main_kv` row per token, shared by all three layers.
         self.ring_writes += 1;
+        Ok(())
+    }
+
+    fn entry_and_layers(&mut self, e: &DeviceEngine, s: &Stream, w: &MtpWeights, rope: &crate::RopeParams) -> eyre::Result<()> {
+        self.entry(e, s, w)?;
+        for li in 0..w.layers.len() {
+            self.layer(e, s, &w.layers[li], li, rope)?;
+        }
+        Ok(())
+    }
+
+    /// Upload this draft's row indices ONCE, before the layers (they are the
+    /// same for all three): the main row's ring slot and position
+    /// (`slot_dev[0]`, `pos_dev[0]`), and for a full forward the block rows'
+    /// (`[1..=B]`) plus the draft positions of the q rope (`pos_per_b`). Async
+    /// from rotating host staging: a blocking copy drained the shared iGPU
+    /// stream (9.2 ms per draft). Nothing inside the layers uploads anything.
+    fn stage_indices(&mut self, s: &Stream, pos: u32, with_block: bool) -> eyre::Result<()> {
+        let (n_valid, main_slot) = self.ring_geom();
+        let si = self.stage_idx % STAGE_N;
+        self.stage_idx = self.stage_idx.wrapping_add(1);
+        {
+            let slots = &mut self.stage_slots[si];
+            let poss = &mut self.stage_poss[si];
+            slots[0] = main_slot as u32;
+            poss[0] = pos;
+            if with_block {
+                for j in 0..MTP_BLOCK {
+                    slots[j + 1] = (n_valid + j) as u32;
+                    poss[j + 1] = pos + 1 + j as u32;
+                }
+            }
+            for (j, d) in self.stage_dpos[si].iter_mut().enumerate() {
+                *d = (pos + 1 + j as u32) as i32;
+            }
+        }
+        let _hc = HostUs::start(&MTP_H_KVCOPY);
+        self.slot_dev.copy_from_host_async(&self.stage_slots[si], s)?;
+        self.pos_dev.copy_from_host_async(&self.stage_poss[si], s)?;
+        if with_block {
+            self.pos_per_b.copy_from_host_async(&self.stage_dpos[si], s)?;
+        }
         Ok(())
     }
 
@@ -1078,10 +1161,10 @@ impl MtpState {
         let _t = e.events.stage("mtp.ring_write_only", s)?;
         // `entry` produces `self.x` from the injected main residuals; the ring
         // row is a projection of exactly that.
+        self.stage_indices(s, pos, false)?;
         self.entry(e, s, w)?;
-        let (n_valid, main_slot) = self.ring_geom();
         for li in 0..w.layers.len() {
-            self.write_main_ring_row(e, s, &w.layers[li], li, rope, pos, n_valid, main_slot, false)?;
+            self.write_main_ring_row(e, s, &w.layers[li], li, rope)?;
         }
         // Same bookkeeping a full forward does — the ring advanced by one row.
         self.ring_writes += 1;
@@ -1096,9 +1179,8 @@ impl MtpState {
     /// produce the identical ring, or a cheap advance silently builds a
     /// different cache than a full forward would.
     ///
-    /// `with_block` also stages the block's own KV slots (1..=B), which only a
-    /// real draft needs; a ring-only advance has no draft stream.
-    #[allow(clippy::too_many_arguments)]
+    /// Its slot and position are `slot_dev[0]` / `pos_dev[0]`, staged by the
+    /// caller (`stage_indices`).
     fn write_main_ring_row(
         &mut self,
         e: &DeviceEngine,
@@ -1106,10 +1188,6 @@ impl MtpState {
         w: &MtpLayerWeights,
         li: usize,
         rope: &crate::RopeParams,
-        pos: u32,
-        n_valid: usize,
-        main_slot: usize,
-        with_block: bool,
     ) -> eyre::Result<()> {
         // --- the ring row, from main_x at the MAIN position ---
         e.q8
@@ -1118,30 +1196,9 @@ impl MtpState {
             s, &mut self.main_kv_raw, &w.attn_kv.buffer, &self.main_xq, &self.main_xscale,
             N_HEAD_DIM, N_EMBD,
         )?;
-        // Slot 0 of the scratch pair carries the main row, 1..=B the block's.
-        // Written into ROTATING staging and pushed ASYNC: the blocking form cost
-        // 9.2 ms per draft for these 48 bytes by draining the shared iGPU stream.
-        let si = self.stage_idx % STAGE_N;
-        self.stage_idx = self.stage_idx.wrapping_add(1);
-        {
-            let slots = &mut self.stage_slots[si];
-            let poss = &mut self.stage_poss[si];
-            slots[0] = main_slot as u32;
-            poss[0] = pos;
-            if with_block {
-                for j in 0..MTP_BLOCK {
-                    slots[j + 1] = (n_valid + j) as u32;
-                    poss[j + 1] = pos + 1 + j as u32;
-                }
-            }
-        }
-        {
-            let _hc = HostUs::start(&MTP_H_KVCOPY);
-            self.slot_dev.copy_from_host_async(&self.stage_slots[si], s)?;
-            self.pos_dev.copy_from_host_async(&self.stage_poss[si], s)?;
-        }
+        // Slot 0 of the staged pair carries the main row, 1..=B the block's.
         kv_post_row(
-            e, s, &mut self.kv_normed, &mut self.rings[li], &self.main_kv_raw, &w.kv_a_norm, pos,
+            e, s, &mut self.kv_normed, &mut self.rings[li], &self.main_kv_raw, &w.kv_a_norm,
             &self.pos_dev.slice_view(0, 1), &self.slot_dev.slice_view(0, 1), rope,
         )?;
         Ok(())
@@ -1155,16 +1212,15 @@ impl MtpState {
         w: &MtpLayerWeights,
         li: usize,
         rope: &crate::RopeParams,
-        pos: u32,
     ) -> eyre::Result<()> {
         let _hkv = HostUs::start_dev(&MTP_H_ATTNKV, s);
-        let (n_valid, main_slot) = self.ring_geom();
+        let (n_valid, _) = self.ring_geom();
         let n_kv = (n_valid + MTP_BLOCK) as u32;
         if n_kv > crate::attention::ATTN_MIXED_MAX_KEYS {
             return Err(eyre!("mtp attn: n_kv={n_kv} exceeds the attention key cap"));
         }
 
-        self.write_main_ring_row(e, s, w, li, rope, pos, n_valid, main_slot, true)?;
+        self.write_main_ring_row(e, s, w, li, rope)?;
 
         // --- the block's own KV, from the draft stream ---
         e.q8
@@ -1178,8 +1234,7 @@ impl MtpState {
             let row = self.kv_raw.slice_view(j * N_HEAD_DIM as usize, N_HEAD_DIM as usize);
             kv_post_row(
                 e, s, &mut self.kv_normed, &mut self.rings[li], &row, &w.kv_a_norm,
-                pos + 1 + j as u32, &self.pos_dev.slice_view(j + 1, 1),
-                &self.slot_dev.slice_view(j + 1, 1), rope,
+                &self.pos_dev.slice_view(j + 1, 1), &self.slot_dev.slice_view(j + 1, 1), rope,
             )?;
         }
 
@@ -1228,17 +1283,7 @@ impl MtpState {
         )?;
         drop(_hqa);
         // V4.1 has no per-head q RMSNorm after wq_b (same as the main model).
-        // Its own staging slot: the ring-row write above now takes (and
-        // advances) one of its own inside `write_main_ring_row`.
-        let si = self.stage_idx % STAGE_N;
-        self.stage_idx = self.stage_idx.wrapping_add(1);
-        {
-            let dpos = &mut self.stage_dpos[si];
-            for (j, d) in dpos.iter_mut().enumerate() {
-                *d = (pos + 1 + j as u32) as i32;
-            }
-        }
-        self.pos_per_b.copy_from_host_async(&self.stage_dpos[si], s)?;
+        // Draft positions: `pos_per_b`, staged once per forward.
         e.rope.launch_forward_batched(
             s, &mut self.q, &self.pos_per_b, N_HEAD, N_HEAD_DIM, N_ROT, B, rope,
         )?;
@@ -1596,6 +1641,26 @@ impl MtpExit {
         markov_dtype: v4flash_core::gguf::GgufType,
         first_token: i32,
     ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
+        self.forward_ex(e, s, h_host, pre_host, w, head, markov_embd, markov_dtype, first_token, true)
+    }
+
+    /// `forward`, with the transformer-only `plain` drafts optional: they are
+    /// a diagnostic (the markov ablation), five blocking argmax readbacks per
+    /// draft. Without them `plain` is all -1; the drafts are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_ex(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        h_host: &[f32],
+        pre_host: &[f32],
+        w: &MtpExitWeights,
+        head: &crate::weights::DeviceWeight,
+        markov_embd: &[u8],
+        markov_dtype: v4flash_core::gguf::GgufType,
+        first_token: i32,
+        want_plain: bool,
+    ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
         // Runs on the dGPU (the head is tied to the main model's `output`), so
         // this lands on dgpu.compute while `mtp.layer` lands on igpu.compute --
         // the split is visible on the timeline rather than inferred.
@@ -1661,9 +1726,9 @@ impl MtpExit {
         // Transformer-only drafts, before any markov bias. The markov head is
         // the one component with no counterpart in the main model, so scoring
         // both tells us which half is wrong without a second run.
-        let mut plain = [0i32; MTP_BLOCK];
+        let mut plain = [-1i32; MTP_BLOCK];
         let mut got = [0i32; 1];
-        for j in 0..MTP_BLOCK {
+        for j in 0..(if want_plain { MTP_BLOCK } else { 0 }) {
             let lj = self.logits.slice_view(j * nv, nv);
             e.sampler.launch_argmax(s, &mut self.tok_dev, &lj, N_VOCAB)?;
             s.synchronize()?;
