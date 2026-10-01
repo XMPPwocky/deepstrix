@@ -65,6 +65,23 @@ struct SlotDraft {
     /// `(pos, mtp_src of row pos)` for the stream's LAST row in KV: what its
     /// next draft reads.
     hidden: Option<(u32, Vec<f32>)>,
+    /// Draft-or-not (plan section 6, stage 1): EWMA of the realized speed-up
+    /// of a drafted step over a plain one, `emitted * cost(1) / (step +
+    /// draft)`; below `V41_MS_DSPARK_MIN_GAIN` the stream stops drafting for
+    /// `backoff` steps (4, doubling to 64), then probes with one block.
+    gain: f64,
+    skip_left: u32,
+    backoff: u32,
+    /// The last draft's wall time (ms), for its block's gain.
+    last_draft_ms: f64,
+}
+
+/// Initial `gain` of a stream: optimistic, so it drafts until measured.
+const GAIN0: f64 = 1.5;
+
+fn min_gain() -> f64 {
+    static G: LazyLock<f64> = LazyLock::new(|| env_f64("V41_MS_DSPARK_MIN_GAIN", 1.0));
+    *G
 }
 
 #[derive(Default)]
@@ -77,6 +94,8 @@ struct Stats {
     draft_ms: f64,
     step_ms: f64,
     no_hidden: u64,
+    /// Steps a stream sat out drafting (stage-1 back-off).
+    skipped: u64,
 }
 
 pub struct MsDspark {
@@ -91,7 +110,7 @@ impl MsDspark {
         let mut slots = Vec::with_capacity(n_slots as usize);
         for _ in 0..n_slots {
             let rings = mtp.state.rings.iter().map(|r| DeviceBuffer::<u16>::new(igpu_id, r.len())).collect::<eyre::Result<Vec<_>>>()?;
-            slots.push(SlotDraft { rings, writes: 0, last_ring_pos: None, hidden: None });
+            slots.push(SlotDraft { rings, writes: 0, last_ring_pos: None, hidden: None, gain: GAIN0, skip_left: 0, backoff: 0, last_draft_ms: 0.0 });
         }
         Ok(Self { slots, stats: Stats::default(), since: Instant::now() })
     }
@@ -124,7 +143,22 @@ impl MsDspark {
         sd.writes = 0;
         sd.last_ring_pos = None;
         sd.hidden = None;
+        sd.gain = GAIN0;
+        sd.skip_left = 0;
+        sd.backoff = 0;
         Ok(())
+    }
+
+    /// Stage 1: should `slot`'s stream draft this step? False while it backs
+    /// off after its drafted blocks stopped paying (each call counts a step).
+    pub fn should_draft(&mut self, slot: u32) -> bool {
+        let Ok(sd) = self.slot(slot) else { return false };
+        if sd.skip_left > 0 {
+            sd.skip_left -= 1;
+            self.stats.skipped += 1;
+            return false;
+        }
+        true
     }
 
     /// Record row `pos` of `slot`'s stream as kept: its residual becomes the
@@ -215,13 +249,29 @@ impl MsDspark {
                 .dspark_draft(state, exit, &hidden, w, xw, weights, markov_embd, *markov_dtype, pos, token_row, noise_row, next)
                 .map(|(ids, _plain)| ids)
         })?;
-        self.slot(slot)?.last_ring_pos = Some(pos);
-        self.stats.draft_ms += t.elapsed().as_secs_f64() * 1e3;
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let sd = self.slot(slot)?;
+        sd.last_ring_pos = Some(pos);
+        sd.last_draft_ms = ms;
+        self.stats.draft_ms += ms;
         Ok(Some((ids, mtp.exit.conf)))
     }
 
-    /// Account one verified block and log a rollup every 50.
-    pub fn record(&mut self, k: usize, accepted: usize, emitted: usize, step_ms: f64) {
+    /// Account one verified block of `slot` (stage-1 gain, stats) and log a
+    /// rollup every 50 blocks.
+    pub fn record(&mut self, slot: u32, k: usize, accepted: usize, emitted: usize, step_ms: f64) {
+        if let Ok(sd) = self.slot(slot) {
+            let g = emitted as f64 * step_cost(1) / (step_ms + sd.last_draft_ms).max(1.0);
+            // A probe after a back-off moves the estimate half way at once.
+            let a = if sd.backoff > 0 { 0.5 } else { 0.25 };
+            sd.gain = (1.0 - a) * sd.gain + a * g;
+            if sd.gain < min_gain() {
+                sd.backoff = (sd.backoff * 2).clamp(4, 64);
+                sd.skip_left = sd.backoff;
+            } else {
+                sd.backoff = 0;
+            }
+        }
         let s = &mut self.stats;
         s.blocks += 1;
         s.drafts_verified += k as u64;
@@ -241,6 +291,7 @@ impl MsDspark {
                 tok_per_s = format!("{:.2}", s.emitted as f64 / ((s.draft_ms + s.step_ms) / 1e3).max(1e-9)),
                 k_hist = ?s.k_hist,
                 no_hidden = s.no_hidden,
+                skipped_steps = s.skipped,
                 window_s = self.since.elapsed().as_secs(),
                 "ms dspark: blocks"
             );

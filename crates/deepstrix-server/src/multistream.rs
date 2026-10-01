@@ -1086,7 +1086,7 @@ impl Sched {
                 while cap > 0 && !self.arena.can_step_rows(s.slot, 1 + cap as u32) {
                     cap -= 1;
                 }
-                if cap > 0 && pos > 0 {
+                if cap > 0 && pos > 0 && dsp.should_draft(s.slot) {
                     let mut row = vec![0f32; HC_DIM as usize];
                     embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, s.next, &mut row);
                     match dsp.draft(&state.engine, &state.weights, m, s.slot, pos - 1, s.next, &row) {
@@ -1566,7 +1566,7 @@ impl Sched {
                 }
             }
             if let Some((k, accepted, emitted)) = spec_out {
-                dsp.record(k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3);
+                dsp.record(self.streams[0].slot, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3);
             }
         }
         for (r, f) in done.into_iter().rev() {
