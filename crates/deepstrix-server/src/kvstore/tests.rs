@@ -312,6 +312,13 @@ fn roundtrip_restore_and_reopen() {
     s.flush(true, 3000);
     assert_disk_is_index(&s);
     let before = snapshot(&s);
+    // The hourly byte total goes through the IO thread (2.).
+    let bytes_file = s.dirs().base.join(scan::NS_BYTES);
+    let _ = fs::remove_file(&bytes_file);
+    s.tick(3000 + INVARIANT_CHECK_EVERY_S);
+    s.flush(false, 3000);
+    let persisted: u64 = fs::read_to_string(&bytes_file).unwrap().trim().parse().unwrap();
+    assert_eq!(persisted, s.index().chunk_bytes() + s.index().tail_bytes());
     let stats = s.stats();
     assert!(stats.log_line().starts_with("kv.store chunks=10 tails=4"), "{}", stats.log_line());
     s.shutdown(Duration::from_secs(1), 3000);
@@ -855,8 +862,14 @@ fn late_completions_after_job_finished() {
         let failed = case == 2;
         s.job_finished(job, failed, 1000);
         assert_eq!(s.index().finished(job), Some(failed), "remembered while its writes are in flight");
+        // The contract: nothing is written for a job after it ended.
+        let late = chunk_req(&mut s, &a, &[], 3, Some(job));
+        assert!(matches!(s.write_chunk(&mut cur, late, &mut b, 1000), Err(StoreError::Invalid(_))));
         s.check_invariants().unwrap();
         let ev = s.flush(true, 1000);
+        let keys: Vec<Key> = (1..=4).map(|b| cur.chain(&a, &[], b)).collect();
+        let stored = |k: &Key| ev.contains(&StoreEvent::ChunkStored(*k));
+        let dropped = |k: &Key| ev.contains(&StoreEvent::ChunkDropped(*k));
         s.check_invariants().unwrap();
         assert_eq!(s.index().finished(job), None, "forgotten once drained");
         assert_eq!(s.index().job_pin_count(job), 0);
@@ -866,15 +879,35 @@ fn late_completions_after_job_finished() {
             1 => assert_eq!(w.tails.len(), 0, "cancelled without a tail: orphans"),
             2 => {
                 assert_eq!(w.chunks.len(), 0, "a failed job's late chunks are deleted at once");
-                let k0 = cur.chain(&a, &[], 1);
-                assert!(!s.dirs().chunk_path(&k0).exists());
+                assert!(!s.dirs().chunk_path(&keys[0]).exists());
+                // ... and reported dropped, never stored: a job subscribed on
+                // Pending re-enqueues them (9.4).
+                assert!(keys.iter().all(|k| dropped(k) && !stored(k)), "{ev:?}");
             }
             _ => {
                 assert!(ev.iter().any(|e| matches!(e, StoreEvent::TailDropped { why: "broken_path", .. })), "{ev:?}");
                 assert_eq!(w.chunks.len(), 1, "the walk stops at the dropped chunk");
+                assert!(dropped(&keys[1]) && stored(&keys[0]) && stored(&keys[2]), "{ev:?}");
             }
         }
     }
+    // A failed job whose chunks already LANDED: release_job deletes the
+    // unreferenced ones, and job_finished reports each as dropped.
+    let a = conv(74, 5_000);
+    let job = JobId(200);
+    let mut cur = s.chain().cursor();
+    let mut b = s.tick_budget();
+    for k in 0..4 {
+        let req = chunk_req(&mut s, &a, &[], k, Some(job));
+        s.write_chunk(&mut cur, req, &mut b, 1000).unwrap();
+    }
+    let landed = s.flush(false, 1000);
+    assert_eq!(landed.iter().filter(|e| matches!(e, StoreEvent::ChunkStored(_))).count(), 4);
+    let ev = s.job_finished(job, true, 1000);
+    for kb in 1..=4 {
+        assert!(ev.contains(&StoreEvent::ChunkDropped(cur.chain(&a, &[], kb))), "{ev:?}");
+    }
+    s.check_invariants().unwrap();
     // Everything not referenced is an orphan, unpinned: evictable first.
     s.index.set_cap_bytes(1);
     s.index.enforce_cap(2000);
@@ -917,6 +950,30 @@ fn dropped_writes_are_deterministic_with_a_held_worker() {
     assert_eq!(s.index().n_tails(), 0);
     assert_disk_is_index(&s);
     s.check_invariants().unwrap();
+}
+
+#[test]
+fn recent_log_forgets_the_least_recently_noted() {
+    // 7.: a re-noted key moves to the back; it is not forgotten as old.
+    let mut r = RecentLog::default();
+    let key = |i: u64| -> Key {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&i.to_le_bytes());
+        k
+    };
+    r.note(key(0), RecentEvent::Dropped, 1);
+    for i in 1..RECENT_EVENTS as u64 {
+        r.note(key(i), RecentEvent::Demoted, 2);
+    }
+    r.note(key(0), RecentEvent::Removed(Why::Cap), 3); // fresh again
+    r.note(key(RECENT_EVENTS as u64), RecentEvent::Demoted, 4); // over the cap by one
+    assert_eq!(r.get(&key(0)), Some((RecentEvent::Removed(Why::Cap), 3)), "the fresh event survived");
+    assert_eq!(r.get(&key(1)), None, "the least recently noted went");
+    assert_eq!(r.map.len(), RECENT_EVENTS);
+    for i in 0..5 * RECENT_EVENTS as u64 {
+        r.note(key(i % 7), RecentEvent::Dropped, 5);
+    }
+    assert!(r.order.len() <= 2 * RECENT_EVENTS + 1, "stale order entries are compacted");
 }
 
 #[test]

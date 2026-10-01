@@ -794,9 +794,10 @@ fn read_exact_at(f: &File, len: u64, off: u64) -> Result<Vec<u8>, FormatError> {
     Ok(v)
 }
 
-/// Read `len` bytes at `off` into `buf` (reused: its capacity is kept).
+/// Read `len` bytes at `off` into `buf` (reused: its capacity is kept). No
+/// `clear()`: `resize` zero-fills only growth, and the read overwrites all
+/// of it (zeroing 911 MB would cost a third of the blake3 pass).
 fn read_into(f: &File, buf: &mut Vec<u8>, len: u64, off: u64) -> Result<(), FormatError> {
-    buf.clear();
     buf.resize(len as usize, 0);
     f.read_exact_at(buf, off)?;
     Ok(())
@@ -915,7 +916,14 @@ pub fn read_tail_into(
     if key.is_some_and(|k| *k != header.key) {
         return Err(FormatError::Key);
     }
-    check_len(header.file_len(), size)?;
+    // A demotion whose truncate ran but whose header rewrite failed leaves a
+    // full header over a file that ends after section E: section E is
+    // intact, so a read that does not want D is served (the startup scan
+    // finishes the demotion).
+    let half_demoted = !want_d && header.kind == TailKind::Full && !header.anchor && size == header.e_end();
+    if !half_demoted {
+        check_len(header.file_len(), size)?;
+    }
     if &header.ns != ns {
         return Err(FormatError::Namespace);
     }
@@ -1247,6 +1255,13 @@ pub(crate) mod tests {
         let p = write_tail("full.kvt", TailKind::Full, &[]);
         let t = read_tail(&p, &ns, true).unwrap();
         assert_eq!(t.sec_d.unwrap().len(), 60);
+        // Half a demotion (truncate ran, header rewrite did not): section E is
+        // served, section D is not.
+        let half = dir.join("half.kvt");
+        std::fs::copy(&p, &half).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&half).unwrap().set_len(t.header.e_end()).unwrap();
+        assert_eq!(read_tail(&half, &ns, false).unwrap().sec_e, t.sec_e);
+        assert!(matches!(read_tail(&half, &ns, true), Err(FormatError::Short { .. })));
         assert_eq!(read_tail_into(&p, &ns, Some(&[0; 32]), false, &mut Vec::new(), &mut Vec::new()).map(|_| ()), Err(FormatError::Key));
         // Transient IO errors are not verdicts; data errors are.
         assert!(!FormatError::Io(std::io::ErrorKind::PermissionDenied, String::new()).evicts());

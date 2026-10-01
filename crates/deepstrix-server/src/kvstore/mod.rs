@@ -1,5 +1,5 @@
 //! KV prefix store: chunked, content-addressed
-//! (docs/v41/KV_PREFIX_STORE_DESIGN.md, rev 6).
+//! (docs/v41/KV_PREFIX_STORE_DESIGN.md, rev 7).
 //!
 //! The positional KV of a prompt is stored in chunks of C = 1024 positions,
 //! each one file keyed by a blake3 chain over the token ids and written once,
@@ -215,7 +215,12 @@ pub enum WriteOutcome {
 /// Completion news for M2's jobs (subscriptions, pins, frontier).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreEvent {
+    /// The chunk is indexed (and still there when this is reported).
     ChunkStored(Key),
+    /// The chunk's write failed or was dropped, OR an indexed chunk left the
+    /// store (a failed job's chunk deleted at once, an eviction, a corrupt
+    /// file): a job that counted on it re-enqueues it from its own state if
+    /// it still can (9.4).
     ChunkDropped(Key),
     TailStored(Key),
     /// `why`: "io" (the write failed) or "broken_path" (a chunk on the path
@@ -334,23 +339,35 @@ impl StoreStats {
     }
 }
 
-/// A bounded memory of recent events per key (oldest forgotten first).
+/// A bounded memory of recent events per key, the least recently NOTED
+/// forgotten first. A re-noted key moves to the back: `order` keeps a
+/// sequence number per entry and stale entries are skipped (and compacted).
 #[derive(Default)]
 struct RecentLog {
-    map: KeyMap<(RecentEvent, u64)>,
-    order: VecDeque<Key>,
+    map: KeyMap<(RecentEvent, u64, u64)>,
+    order: VecDeque<(Key, u64)>,
+    seq: u64,
 }
 
 impl RecentLog {
     fn note(&mut self, key: Key, ev: RecentEvent, now: u64) {
-        if self.map.insert(key, (ev, now)).is_none() {
-            self.order.push_back(key);
-            if self.order.len() > RECENT_EVENTS {
-                if let Some(old) = self.order.pop_front() {
-                    self.map.remove(&old);
-                }
+        self.seq += 1;
+        self.map.insert(key, (ev, now, self.seq));
+        self.order.push_back((key, self.seq));
+        while self.map.len() > RECENT_EVENTS {
+            let Some((k, seq)) = self.order.pop_front() else { break };
+            if self.map.get(&k).is_some_and(|e| e.2 == seq) {
+                self.map.remove(&k);
             }
         }
+        if self.order.len() > 2 * RECENT_EVENTS {
+            let map = &self.map;
+            self.order.retain(|(k, seq)| map.get(k).is_some_and(|e| e.2 == *seq));
+        }
+    }
+
+    fn get(&self, key: &Key) -> Option<(RecentEvent, u64)> {
+        self.map.get(key).map(|e| (e.0, e.1))
     }
 }
 
@@ -371,6 +388,9 @@ pub struct Store {
     /// Writes in flight per job: a finished job is forgotten when they drain.
     job_writes: HashMap<JobId, u32>,
     recent: RecentLog,
+    /// Events produced outside a completion (an eviction, a failed job's
+    /// chunks deleted), handed out with the next batch.
+    events: Vec<StoreEvent>,
     pool: Vec<Vec<u8>>,
     dropped: u64,
     evicted_bytes: u64,
@@ -432,6 +452,7 @@ impl Store {
             pending: KeyMap::default(),
             job_writes: HashMap::new(),
             recent: RecentLog::default(),
+            events: Vec::new(),
             pool: Vec::new(),
             dropped: 0,
             evicted_bytes: 0,
@@ -465,7 +486,7 @@ impl Store {
     /// The store's record of a recent removal, demotion or dropped write of
     /// `key` (shadow reason codes, 11.1).
     pub fn recent_event(&self, key: &Key) -> Option<(RecentEvent, u64)> {
-        self.recent.map.get(key).copied()
+        self.recent.get(key)
     }
     /// The stored payload blake3 of an indexed chunk (`kv.dedup_mismatch`).
     pub fn chunk_payload_hash(&self, key: &Key) -> Option<[u8; 32]> {
@@ -502,11 +523,11 @@ impl Store {
         ev
     }
 
+    /// Persist the namespace byte total (4.4) -- on the IO thread: the
+    /// scheduler thread never touches the disk (4.5, 8.3).
     fn persist_bytes(&self) {
         let b = self.index.chunk_bytes() + self.index.tail_bytes();
-        if let Err(e) = scan::write_small(&self.dirs().base.join(scan::NS_BYTES), &format!("{b}\n")) {
-            tracing::warn!(error = %e, "kv.store could not persist the namespace byte total");
-        }
+        self.io.submit(IoJob::WriteSmall { path: self.dirs().base.join(scan::NS_BYTES), contents: format!("{b}\n") });
     }
 
     /// Apply the IO thread's completions to the index (9.4).
@@ -566,7 +587,12 @@ impl Store {
                             ins.bytes = bytes;
                             ins.payload_hash = payload_hash.unwrap_or_default();
                             self.index.insert_chunk(ins, now);
-                            ev.push(StoreEvent::ChunkStored(key));
+                            // A failed job's late chunk is deleted inside the
+                            // insert: then it is reported dropped (by apply),
+                            // never stored.
+                            if self.index.chunk(&key).is_some() {
+                                ev.push(StoreEvent::ChunkStored(key));
+                            }
                         }
                         (PendingWrite::Tail(mut ins), Ok(bytes)) => {
                             ins.bytes = bytes;
@@ -603,20 +629,24 @@ impl Store {
                 }
             }
         }
+        // Events queued before this batch (outside a completion) come first.
+        self.events.extend(ev);
         self.index.enforce_cap(now);
         self.apply(now);
-        ev
+        std::mem::take(&mut self.events)
     }
 
     /// Hand the index's file work to the IO thread and record removals. An
     /// unlink of a key with a write in flight is skipped: that write already
     /// ran or will run, and the file at the path is (or will be) the new one;
-    /// if the write fails, `delete_if_unindexed` cleans up.
+    /// if the write fails, `delete_if_unindexed` cleans up. Every chunk that
+    /// leaves is reported as `ChunkDropped` with the next batch of events.
     fn apply(&mut self, now: u64) {
         for a in self.index.take_actions() {
             match a {
                 Action::UnlinkChunk { key, bytes, why } => {
                     self.recent.note(key, RecentEvent::Removed(why), now);
+                    self.events.push(StoreEvent::ChunkDropped(key));
                     if !self.pending.contains_key(&key) {
                         self.io.delete(self.io.dirs().chunk_path(&key), bytes);
                     }
@@ -679,6 +709,7 @@ impl Store {
     /// Queue chunk `k` of the request (w1). The key comes from the job's
     /// cursor over the request ids (the same `chunk_step` the walk uses).
     pub fn write_chunk(&mut self, cur: &mut ChainCursor, req: ChunkWriteReq<'_>, budget: &mut WaitBudget, now: u64) -> Result<WriteOutcome, StoreError> {
+        self.check_job_live(req.job)?;
         let a = req.k.checked_mul(C).ok_or_else(|| StoreError::Invalid("k overflows".into()))?;
         if (a + C) as usize > req.tokens.len() {
             return Err(StoreError::Invalid(format!("chunk {} past the request's {} ids", req.k, req.tokens.len())));
@@ -731,6 +762,7 @@ impl Store {
     /// the same key (5.1) and keeps its hits and anchor flag. The ancestors
     /// (8.2) are the indexed and in-flight tails on this request's path.
     pub fn write_tail(&mut self, cur: &mut ChainCursor, req: TailWriteReq<'_>, budget: &mut WaitBudget, now: u64) -> Result<WriteOutcome, StoreError> {
+        self.check_job_live(req.job)?;
         let t = req.t;
         if t as usize > req.tokens.len() {
             return Err(StoreError::Invalid(format!("tail at {t} past the request's {} ids", req.tokens.len())));
@@ -862,14 +894,28 @@ impl Store {
 
     /// A job ended; `failed` = an error, not a cancel (9.4). It may be called
     /// while writes of the job are in flight: they land unowned, and a failed
-    /// job's late chunks go at once if nothing references them.
-    pub fn job_finished(&mut self, job: JobId, failed: bool, now: u64) {
+    /// job's late chunks go at once if nothing references them. Returns the
+    /// events this produced (a failed job's deleted chunks as `ChunkDropped`,
+    /// for the other jobs that counted on them).
+    ///
+    /// Contract: a job writes nothing after this call (refused while the store
+    /// still remembers the job; once forgotten, such a write would pin for a
+    /// job nobody releases).
+    pub fn job_finished(&mut self, job: JobId, failed: bool, now: u64) -> Vec<StoreEvent> {
         self.index.release_job(job, failed, now);
         if !self.job_writes.contains_key(&job) {
             self.index.forget_job(job);
         }
         self.index.enforce_cap(now);
         self.apply(now);
+        std::mem::take(&mut self.events)
+    }
+
+    fn check_job_live(&self, job: Option<JobId>) -> Result<(), StoreError> {
+        match job {
+            Some(j) if self.index.finished(j).is_some() => Err(StoreError::Invalid(format!("write from finished job {j:?}"))),
+            _ => Ok(()),
+        }
     }
 
     /// Evict a file for a data-attributable failure the caller found (shape,

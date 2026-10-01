@@ -1274,7 +1274,8 @@ impl Index {
                 return Err("job pin list names a retired or foreign record".into());
             }
         }
-        if self.pins.values().any(|r| r.job.is_some_and(|j| !self.job_pins.get(&j).is_some_and(|v| v.iter().any(|id| self.pins[id].job == Some(j))))) {
+        let owned: std::collections::HashSet<(JobId, PinId)> = self.job_pins.iter().flat_map(|(j, ids)| ids.iter().map(move |id| (*j, *id))).collect();
+        if self.pins.iter().any(|(id, r)| r.job.is_some_and(|j| !owned.contains(&(j, *id)))) {
             return Err("a job-owned pin record is missing from its job's list".into());
         }
         // Bottom-up: children (k + 1) before parents; totals flow to existing
@@ -1939,6 +1940,22 @@ mod tests {
         s.idx.unpin(pin, 4);
         assert_eq!(s.idx.n_orphans(), 3);
         s.idx.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn checker_matches_pin_records_to_their_owner_lists() {
+        // 4.: job A owns two records; one is missing from A's list. The old
+        // check passed (A still owned "some" record); membership must fail.
+        let mut s = Sim::new(u64::MAX);
+        let base = conv(16, 3000);
+        s.admit(&base, 1, false, true);
+        let k = s.idx.walk(&base, &[]).tails[0].key;
+        let a = JobId(700);
+        s.idx.pin_plan(&k, Some(a)).unwrap();
+        let id2 = s.idx.pin_plan(&k, Some(a)).unwrap();
+        s.idx.check_invariants().unwrap();
+        s.idx.job_pins.get_mut(&a).unwrap().retain(|x| *x != id2);
+        assert!(s.idx.check_invariants().is_err(), "a record missing from its owner's list must fail");
     }
 
     #[test]

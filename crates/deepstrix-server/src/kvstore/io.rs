@@ -96,6 +96,8 @@ pub enum IoJob {
     Truncate { path: PathBuf, len: u64 },
     /// Rename a directory into `trash/` and remove it in the background.
     Trash { from: PathBuf },
+    /// Write a small file atomically (tmp + rename): the namespace byte total.
+    WriteSmall { path: PathBuf, contents: String },
     /// Signalled when every earlier main job is done.
     Barrier(mpsc::SyncSender<()>),
     /// Signalled when every earlier main job AND all deletions and trash are
@@ -281,7 +283,10 @@ impl IoHandle {
     /// Queue an unlink behind the pending writes.
     pub fn delete(&self, path: PathBuf, bytes: u64) {
         let mut q = self.shared.lock();
-        if q.delete_set.insert(path.clone(), bytes).is_none() {
+        // A second delete of a queued path keeps the first's byte count, the
+        // one the backlog was charged with.
+        if let std::collections::hash_map::Entry::Vacant(v) = q.delete_set.entry(path.clone()) {
+            v.insert(bytes);
             q.stats.delete_backlog_bytes += bytes;
             q.stats.delete_backlog_files += 1;
             q.deletes.push_back(path);
@@ -465,6 +470,11 @@ impl Worker {
                     }
                 }
             }
+            IoJob::WriteSmall { path, contents } => {
+                if let Err(e) = super::scan::write_small(&path, &contents) {
+                    tracing::warn!(path = %path.display(), error = %e, "kv.io small write failed");
+                }
+            }
             IoJob::Barrier(tx) => {
                 let _ = tx.send(());
             }
@@ -509,8 +519,8 @@ impl Worker {
     fn cancel_deletion(&self, path: &Path) {
         let mut q = self.shared.lock();
         if let Some(b) = q.delete_set.remove(path) {
-            q.stats.delete_backlog_bytes -= b;
-            q.stats.delete_backlog_files -= 1;
+            q.stats.delete_backlog_bytes = q.stats.delete_backlog_bytes.saturating_sub(b);
+            q.stats.delete_backlog_files = q.stats.delete_backlog_files.saturating_sub(1);
         }
     }
 
@@ -561,8 +571,8 @@ impl Worker {
         }
         let mut q = self.shared.lock();
         let backlog: u64 = batch.iter().map(|(_, b)| b).sum();
-        q.stats.delete_backlog_bytes -= backlog;
-        q.stats.delete_backlog_files -= batch.len() as u64;
+        q.stats.delete_backlog_bytes = q.stats.delete_backlog_bytes.saturating_sub(backlog);
+        q.stats.delete_backlog_files = q.stats.delete_backlog_files.saturating_sub(batch.len() as u64);
         q.stats.unlinked_files += files;
         q.stats.unlinked_bytes += bytes;
         q.stats.unlink_errors += errors;
@@ -848,6 +858,25 @@ pub(crate) mod tests {
         io.flush_all();
         assert!(!io.dirs().tail_path(&key).exists());
         assert_eq!(io.stats().unlinked_files, 1);
+    }
+
+    #[test]
+    fn a_repeated_delete_keeps_the_first_byte_count() {
+        let root = unique_dir("io-del2");
+        let io = spawn(&root, 1 << 30);
+        let (tx, rx) = mpsc::sync_channel(0);
+        io.submit(IoJob::Barrier(tx));
+        let p = root.join("x.kvc");
+        fs::write(&p, b"x").unwrap();
+        io.delete(p.clone(), 5000);
+        io.delete(p.clone(), 9999);
+        let s = io.stats();
+        assert_eq!((s.delete_backlog_files, s.delete_backlog_bytes), (1, 5000));
+        rx.recv().unwrap();
+        io.flush_all();
+        let s = io.stats();
+        assert_eq!((s.delete_backlog_files, s.delete_backlog_bytes, s.unlinked_files), (0, 0, 1));
+        assert!(!p.exists());
     }
 
     #[test]
