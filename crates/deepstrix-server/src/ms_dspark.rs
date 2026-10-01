@@ -528,8 +528,11 @@ impl MsDspark {
                 plain_ms = format!("{:.1}", self.plain_ms),
                 cost_ms = format!("{:.1}+{:.1}/row", self.cost.a, self.cost.b),
                 cost2_ms = format!("{:.1}+{:.1}/row", self.cost2.a, self.cost2.b),
+                cost_shape = ?self.cost.shape,
                 cells = cells_str(&self.cost.cell_costs(), 1),
+                cells_w = cells_str(&self.cost.cell_weights(), 1),
                 cells2 = cells_str(&self.cost2.cell_costs(), self.cost2.first_row),
+                cells2_w = cells_str(&self.cost2.cell_weights(), self.cost2.first_row),
                 two_lane_blocks = s.two_lane,
                 explored = s.explored,
                 explored_k0 = s.explored_k0,
@@ -859,6 +862,12 @@ impl StepCost {
         self.cell_cost
     }
 
+    /// The per-row cells' (time-aged) sample weights (logging): a cell under
+    /// ~16 is young -- its mean is a handful of recent samples.
+    pub fn cell_weights(&self) -> [f64; CELLS] {
+        std::array::from_fn(|i| self.cells[i].0)
+    }
+
     /// The line's `(a, b)` (logging).
     pub fn line(&self) -> (f64, f64) {
         (self.a, self.b)
@@ -1028,6 +1037,12 @@ pub fn k_max() -> usize {
 /// sigmoid(conf_k). So no decision reads the value it would test. The global
 /// search of `choose_k` lets conf_{k+1}, which depends on d_k, decide whether
 /// d_k is verified: exact for point-mass tests only (review N1).
+///
+/// With per-row cost cells (`CostShape::Cells`) the cost need not grow with
+/// rows; nothing here assumes it does (`go` is the best of EVERY deeper k). Being
+/// sequential, the rule can head for a cheap far row count and then stop one
+/// short once conf_{k+1} arrives, on a dearer count than stopping earlier --
+/// inherent to a stopping rule, and bounded.
 pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize, cost: &dyn CostModel) -> usize {
     let cap = cap.min(MTP_BLOCK);
     if let Some(k) = fixed_k() {
