@@ -1,6 +1,6 @@
 # Tracing rebuilt around evtrace
 
-Status: PLAN rev 2 (2026-10-01), architect review round 2. Owner's call, 10-01:
+Status: PLAN rev 3 (2026-10-01), architect review round 3. Owner's call, 10-01:
 keep building on evtrace rather than go back to emitting perfetto directly,
 with our own tracing layer for the CPU side.
 
@@ -9,6 +9,11 @@ sync stamp (R1.1); a separate Tier B path with batched device records converted
 off the critical path (R1.2, R1.4); harvest coverage of the drafter, ring writes
 and prefill (R1.3); spans that cost what the budget says (R1.5); and the
 format, naming, trigger, placement, sequencing and rollback items (R1.6-R1.22).
+Rev 3 answers round 2: one string drainer (R2.1); a numeric calibration history
+on the Tier B thread (R2.2-R2.3); `EventPool::reset()` as the handoff, with
+epochs, deferral timeouts and 6 pools (R2.4-R2.5); device sums still folded into
+`ms.stage` on the scheduler thread and `step_dev` merged back into `hub_step` by
+the readers (R2.6); P3 causality rules on host stamps (R2.7); and R2.8-R2.13.
 
 ## 1. Why
 
@@ -53,16 +58,20 @@ off.
 
 **Dumps.** A dedicated dump thread: a dump clones the deque of sealed block
 `Arc`s (O(blocks), no copy, no lock held while writing) plus the current open
-block's bytes, and writes `<dir>/ring/<role>-<utc>-<pid>.evt` -- its own
-directory and retention (`V41_EVTRACE_RING_KEEP`, default 8), so Tier A pruning
-and readers never see dumps. Default `<dir>/ring` is under `/dev/shm` on both
-boxes (box 2's paging is disk-bound and E100 writes are a measured source of
-step variance; ~/logs on box 2 sits on the E100, to be confirmed in P1);
-`trace_now.sh` moves a dump off `/dev/shm` after pulling it. Back-to-back dumps
-keep history (copies, not swaps).
+block's bytes, and writes `<ring_dir>/<role>-<utc>-<pid>.evt`, where
+`V41_EVTRACE_RING_DIR` is its own directory with its own retention -- Tier A
+pruning, `ls hub-*.evt` and `evtrace.py <dir>` never see dumps. Placement:
+the HUB writes dumps to disk (`~/logs/evtrace-ring`; its disk is not the
+bottleneck the way box 2's is); BOX 2 writes to `/dev/shm/evtrace-ring` (its
+paging is disk-bound and E100 writes are a measured source of step variance)
+and `trace_now.sh` DELETES a box-2 dump after pulling it. Both capped by bytes
+(`V41_EVTRACE_RING_KEEP_MB`, default 256: tmpfs pages are pinned RAM). While a
+dump writes, its cloned `Arc`s keep up to one extra ring alive (counted in the
+memory budget). Back-to-back dumps keep history (copies, not swaps).
 
-**Trigger.** A one-shot request file `<dir>/ring/dump-request` (contents: seconds,
-default all) polled by the dump thread every 250 ms and deleted when acted on:
+**Trigger.** A one-shot request file `<ring_dir>/dump-request` (contents: seconds,
+default all; written temp-then-rename, so a half-written file is never read as
+"all") polled by the dump thread every 250 ms and deleted when acted on:
 no edge-trigger traps, nothing left to fire at the next start, no race with the
 A/B scripts that rewrite the knob file. `trace_now.sh --dump N` writes it on both
 boxes. A dump selects records by their own time with a margin (device records
@@ -91,11 +100,14 @@ arrive after their step; box-2 background reads land seconds later).
   - `step_dev` (32, A): `step, d_*, i_*` -- the per-step stage sums, emitted by
     the Tier B thread (2.4).
   - `instant` (33, B): `t, site, level` -- WARN/ERROR events, rate-limited.
-- **Strings never lost**: a producer interns (lock, assign id, push bytes to a
-  pending list, bump an atomic pending count) BEFORE sending the record that
-  uses the id; each writer (A and B) checks the atomic count and drains pending
-  strings into its output before the record. Every new Tier A file and every dump
-  writes the full table into its header.
+- **Strings never lost**: a producer interns (lock, assign id, append to an
+  append-only table, bump an atomic length) BEFORE sending the record that uses
+  the id. ONLY the Tier A writer emits `str` / `site` records: it keeps a
+  cursor into the table and, before writing any record it dequeued, writes the
+  entries from its cursor to the table's current length. Every new Tier A file
+  and every dump writes the full table into its header; the Tier B ring holds no
+  `str` records (two drainers of one list would each take strings the other
+  needed -- review R2.1).
 - **`cut` keeps strings**: `cut` collects every `str` / `site` record up to `--to`
   and writes them into the cut's header (records without a time are otherwise
   dropped by the window filter). P0 test: cut -> trace keeps every name.
@@ -108,49 +120,107 @@ arrive after their step; box-2 background reads land seconds later).
 - **Subscriber.** The hub's `fmt().with_env_filter(..)` (main.rs:119-124)
   becomes a `Registry` with per-layer filters: `fmt` keeps today's filter AND
   excludes the target `evt` (so it never formats those spans); `EvtLayer` takes
-  target `evt` (and only it) through a `Targets` filter whose reload handle is
-  driven by a knob HOOK (2.6), never by reading knobs inside the layer.
+  `Targets` `evt=info` plus a default of `warn` (WARN/ERROR events from any
+  target become `instant` records), ignores non-`evt` spans in `on_new_span`,
+  and its reload handle is driven by a knob HOOK (2.6), never by reading knobs
+  inside the layer (R2.11).
 - **Coarse spans via `tracing`** (target `evt`, level `info`): scheduler tick,
   decode step, prefill unit, drafter, head + sampling, accept + ring writes,
-  knobs watcher pass, box-2 request phases -- ~10-30 per step, ~0.5-1 us each:
-  <= 30 us per step.
+  knobs watcher pass -- ~10-30 per step, ~0.5-1 us each: <= 30 us per step. A
+  coarse span is created and entered on the same thread (its fields live in the
+  thread-local stack; asserted in debug builds).
 - **Fine spans via `evtrace::Span`** (an RAII guard, no `tracing`): two RAW
-  reads and a push into a thread-local Tier B buffer flushed once per step
-  (~50-100 ns): per lane x layer x phase (pre-MoE, remote submit, pager ensure,
-  post-MoE wait / combine) ≈ 400-500 per step ≈ 40-50 us. Same `span` kind,
-  `site` registered once per static name.
+  reads and a push into a thread-local Tier B buffer (~50-100 ns): per lane x
+  layer x phase on the hub (pre-MoE, remote submit, pager ensure, post-MoE wait /
+  combine) ≈ 400-500 per step ≈ 40-50 us; on box 2, every request's phases
+  (dequeue, merge, run_path, ensure, D2H, reply) -- box 2's compute loop is the
+  bottleneck and never goes through `tracing` per request (R2.9). Same `span`
+  kind, `site` registered once per static name. Flushing (R2.10): the scheduler
+  thread flushes its buffer at the step end; other threads (pager, remote reader /
+  writer, the per-step Engram helper, box 2's readers) flush when the buffer
+  fills and on thread exit (a TLS destructor reached through `try_with`); spans
+  lost to a dying thread are counted.
 - **EvtLayer internals**: per-thread enter stamps in a preallocated thread-local
   stack (`try_with`: no TLS during thread teardown), no Registry extensions on
   the hot path, `span_no` from an atomic counter, numeric fields only (up to 4,
   recorded at span creation).
-- **Box 2** gets a subscriber for the first time: `fmt` at `warn` (the kernels'
-  `info!` lines do not suddenly flood its stderr; the knobs module stops echoing
-  what fmt now prints) + `EvtLayer`. `tracing-subscriber` becomes a dependency of
+- **Box 2** gets a subscriber for the first time: `fmt` at `warn` plus
+  `v4flash_kernels::knobs=info` (knob changes stay on its stderr; the knobs
+  module's own echo goes, so nothing prints twice -- R2.12) + `EvtLayer`. The
+  kernels' other `info!` lines do not suddenly flood its stderr. `tracing-subscriber` becomes a dependency of
   `deepstrix-expertd` (workspace dep already; owner sign-off per the deps rule).
 
 ### 2.4 Device stage intervals
 
-**Clock calibration (R1.1).** A calibrator per device, off the scheduler
-thread: every 200 ms it records an anchor event on a dedicated idle calibration
-stream of that device and spins on `query()` with a RAW stamp before and after
-each poll; the bracket width is the anchor's error bound (expect a few us). It
-keeps a ring of the last ~16 anchors (events stay alive). An event's RAW time =
-interpolation between the two nearest anchors (`t_a + elapsed(anchor, e)`),
-drift clamped to +-200 ppm like `Offsets`; `quality_us` = the bracket width.
-All streams of one device share the timestamp counter, so one calibration
-stream per device serves every stream.
+**Clock calibration (R1.1, R2.2, R2.3).** Runs ON THE TIER B THREAD (one owner
+of every calibration event: no re-record races). Every 200 ms, per device: record
+an anchor event `A_k` on that device's own calibration stream (created by the
+Tier B thread under a `DeviceGuard`; it never calls `HeterogeneousEngine`
+helpers -- `set_current_cached` caches a per-thread `hipSetDevice` in an
+engine-wide atomic, and one call from another thread would send the scheduler's
+kernels to the wrong GPU) and spin on `query()` with a RAW stamp before and
+after each poll, the spin BOUNDED at 2 ms (a HIP stream can share a hardware
+queue with a busy stream: then discard the anchor and retry later). The bracket
+width plus the CLR start/end bias of `elapsed` (start side = the event's start,
+host observes its completion: ~1-3 us) is the anchor's error, `quality_us`.
 
-**Pools double-buffered and harvested off the critical path (R1.2, R1.4).**
-Each device gets a small set of event pools (3). At every RESET point -- decode
-step start, prefill unit start, tick start -- the current pool is HANDED to the
-Tier B thread with its stage contexts and the step / unit ids, and a free pool
-is taken. The Tier B thread waits for the pool's last event (`query()` polling,
-never an error), measures each event against the calibration anchors (one
-elapsed call per event), emits `dev` records and the per-step `step_dev` sums,
-logs the `ms.stage` rollup, and returns the pool. If no pool is free (Tier B
-behind), the step records nothing (stages no-op, counted) -- never a wait.
+The HISTORY is numbers, not events: when `A_k` is taken, `elapsed(A_{k-1}, A_k)`
+is measured while both are alive, giving every anchor a coordinate on one
+continuous device timeline plus its RAW stamp -- minutes of history from 2-4
+live anchor events (generation-tagged; a generation mismatch drops the
+conversion, counted). An event converts with ONE call: `elapsed(A_live, e)`
+against the newest live anchor, then the piecewise-linear device-timeline -> RAW
+map; events after the newest anchor EXTRAPOLATE (never wait for a bracketing
+anchor, which would hold pools), slope clamped to +-200 ppm. Precision: f32 ms
+from `elapsed` is ~15 ns at 200 ms, ~2 us at 20 s (prefill units). The chain is
+a free self-check every 200 ms: `elapsed(A_{k-1}, A_k)` vs the RAW delta must
+agree within the two brackets plus 200 ms x drift; the residual is logged
+(catches counter jumps, clock-translation steps, runtime-PM resets). All streams
+of one device share the timestamp counter, so one calibration stream per device
+serves every stream.
+
+**Pools handed off at every reset, harvested off the critical path (R1.2,
+R1.4, R2.4, R2.5).** `EventPool::reset()` ITSELF becomes the handoff, so every
+reset site is covered (multistream.rs ~1715; forward_prefill.rs ~1170, ~1343,
+~1456, ~2658, ~3150, ~3343; engine.rs ~1022; the single-layer bench): if the
+buffer holds pairs, it goes to the Tier B thread with its stage contexts, its
+step / unit ids and its perfetto watermark (the watermark lives IN the buffer),
+and a free buffer is taken; an empty buffer is just cleared (tick-start resets
+do not burn buffers). Legacy callers that `harvest()` synchronously before their
+reset keep working on the same buffer. While the perfetto exporter lives (until
+P4) a reset point exports first, then hands off. Buffers per device: 6 (events
+are cheap; the ROCr signal budget for 6 x 16384 x 2 devices is verified in P3,
+fallback 4). The buffer type gets a justified `unsafe impl Send` (a raw
+`hipEvent_t`, the `Graph` pattern); the handoff and return channels have
+capacity = the buffer count, so no `try_send` ever drops a buffer.
+
+Every `StageScope` carries the buffer's EPOCH; a scope that ends after a handoff
+(not possible today -- resets are top-level -- but checked) drops its pair,
+counted. The step id is allocated at the TOP of `decode_rows` (today `EV_STEP`
+is incremented after the drafter runs, so the drafter would carry the previous
+step's id).
+
+The Tier B thread processes a buffer's pairs AS THEIR END EVENTS COMPLETE
+(sleep-poll `query()` every ~0.5 ms, never a spin, never an error), converts
+each event (one `elapsed`), emits `dev` records and the buffer's `step_dev`,
+and returns the buffer with its device SUMS (2.4.1). After a 2 s timeout the
+pairs still incomplete are dropped (counted) and the buffer returns: a wedged
+stream cannot hold buffers forever. If no buffer is free, the step records
+nothing (stages no-op, counted in `step_dev`) -- never a wait. The lag is NOT
+random: the async ring writes exist only in lone-stream DSpark steps, so their
+buffers return last; 6 buffers and the 2 s timeout keep that from biasing
+against DSpark steps, and `step_dev` carries Tier B's lag and the per-step
+deferred / dropped counts so a bias would show.
+
+Prefill units (R2.13): an LM window can exceed 8K pairs per unit; with kernel
+sub-stages off the expected drop rate is measured in P3, and prefill units
+get their own larger buffers if it is not ~0.
+
 This moves today's synchronous harvest (~0.4 ms per two-lane step, ~1840 pairs)
-OFF the scheduler thread: the critical path gets cheaper, not dearer.
+OFF the scheduler thread. The Tier B thread now makes ~2-4K HIP calls per step
+(`query` / `elapsed`) concurrently with the scheduler's launches; CLR takes
+per-queue locks on some of those paths, so P3 measures the scheduler thread's
+LAUNCH wall with Tier B busy vs idle, not only the harvest it removed.
 
 **Coverage (R1.3).** Handing over at every reset point covers what the
 current harvest misses: the drafter (recorded between the leftovers export and
@@ -165,9 +235,22 @@ stages get `(step, -, -, -)`, not the last layer's), captured into `TimingPair`
 at `stage()` along with the STREAM (today the track is guessed from a name
 substring, engine.rs ~934). The ready-first driver sets it per phase call.
 
-**Analyses.** `hub_step` keeps its non-device fields; `d_*` / `i_*` move to
-`step_dev` (joined by step). `evtrace.py`, `evt2perfetto.py` and tonight's
-scripts read either.
+**2.4.1 Consumers (R2.6).** `hub_step` stays on the scheduler thread, emitted
+at once (routing it through Tier B would let a Tier B drop lose a Tier A
+record), with its non-device fields and `profiled`; its `d_*` / `i_*` become
+NaN. The per-step device sums go to `step_dev` (Tier A, from the Tier B thread)
+with `t_start` = the step's start (a time field: windowed reads and `cut` keep
+it) and are joined back by `(pid, step)` -- `EV_STEP` is process-local.
+`evtrace.py load()` MERGES `step_dev` into `hub_step` by `(pid, step)`, so every
+existing expression (`report`'s `dgpu_busy_ms` / `igpu_busy_ms`, the `r(field,
+fwd_ms)` correlates, `hist` / `corr` / `csv -k hub_step -e d_...`, which today
+turn a missing field into NaN silently) keeps working; `evt2perfetto.py` does
+the same for its step args. The `ms.stage` rollup stays ONE block from ONE
+thread: a returned buffer carries its device sums and the scheduler folds them
+into `profile_acc` when it takes a free buffer (1-2 steps late, harmless for
+20-step means), with an explicit `steps_dev` count next to `steps`, so
+`windows.sh` / `audit_ab.sh` (which parse `ms.stage.total` as a block reset)
+are unaffected.
 
 **Box 2 (R1.12).** Its per-request GPU event pair exists only under `--trace`
 today (+2.7 us host / +5.5 us stream per pair on box 2's iGPU, the bottleneck;
@@ -221,13 +304,22 @@ end-to-end A/B that cannot resolve sub-millisecond effects.
 | --- | --- | --- | --- |
 | P0 | `format_rev 2`: interner, `str`/`site`/`knob` kinds, header table, readers + `cut` keep strings, knob snapshot per file, `knob.t` RAW | yes (b2 files) | unchanged readers read new files; cut -> trace keeps names; dropped records cannot orphan a string |
 | P1 | Tier B channel + thread + ring + dump thread + request file, `/dev/shm` dumps, `trace_now.sh --dump` | yes | synthetic ring tests; dump cost measured on the hub; Tier A `dropped` unchanged under dumps |
-| P3 | calibrator, double-buffered pools handed off at every reset, `dev` + `step_dev`, stage context + stream in `TimingPair`, box-2 `dev` behind a knob | yes | causality check clean; scheduler-thread time per step DROPS by the old harvest (~0.4 ms); parity vs the 10-01 exporter in a GPU gate window (box 2 attached) |
+| P3 | calibrator on the Tier B thread, `reset()` as the handoff, `dev` + `step_dev` + readers' merge, stage context + stream + a host stamp in `TimingPair`, box-2 `dev` behind a knob | yes | the causality rules below hold (violations counted, ~0); scheduler-thread time per step drops by the old harvest (~0.4 ms) with the LAUNCH wall unchanged with Tier B busy vs idle; calibration residual within its bound; parity vs the 10-01 exporter in a GPU gate window (box 2 attached) |
 | P2 | Registry + `EvtLayer` + `evtrace::Span`, coverage pass (2.3), box-2 subscriber | yes (sign-off: dep) | span cost per step measured (<= 80 us total); re-entrancy tests pass |
 | P4 | converter v2 (protobuf, flows, CPU / device tracks); retire `DeviceTimingExporter`, `ExpertdTracer` / `TrackExporter`, the tracing-perfetto test | yes | one `trace_now.sh --dump` yields both boxes' CPU + device + request + paging tracks for a DSpark window |
 | P5 | auto-dump on anomalies (a step > 3x the rolling median, a stream abort, a box-2 reconnect), rate-limited | yes | -- |
 
 P3 goes before P2: device intervals are what the DSpark request needed, and
 the layer carries the most re-entrancy risk.
+
+**P3 causality rules (R2.7)**, on data P3 has without P2's spans:
+(a) `stage()` takes a RAW host stamp when it records the start event (one read,
+~25 ns, ~45 us per two-lane step; every 4th stage if measured too costly):
+`dev.t_start >= t_host_record` -- a marker cannot run before it was enqueued;
+(b) every dGPU compute-stream forward stage of step N ends before the
+ready-first driver's `compute.synchronize()` returns (forward_prefill.rs ~4226;
+a RAW stamp at its return goes into `hub_step` as `t_fwd_sync`);
+(c) head stages end before the head readback returns (stamped likewise).
 
 **Deploys.** Box-2 parts of P0-P3 ride ONE box-2 restart (cold pool, two-box
 order); hub parts can go hub-only in between. P4 keeps `expertd --trace` and
@@ -241,9 +333,11 @@ deploy, as today).
 - **Critical path.** Net change on the scheduler thread: - the synchronous
   harvest (~0.4 ms) + coarse spans (<= 30 us) + fine spans (~40-50 us) + pool
   handoff (~us). Measured per step in P2/P3.
-- **Memory.** Hub ring 96 MB + 3 pools per device (events only) on ~3-5 GB free.
-- **Disk.** Tier A unchanged; dumps to `/dev/shm` (RAM), moved off by the
-  script.
+- **Memory.** Hub ring 96 MB (+ up to one cloned ring while a dump writes) +
+  6 buffers per device (events only) on ~3-5 GB free; box-2 dumps in tmpfs
+  capped at 256 MB.
+- **Disk.** Tier A unchanged; hub dumps to its disk; box-2 dumps to tmpfs,
+  deleted after the pull.
 - **Clock.** Device intervals carry their calibration bracket (`quality_us`);
   the converter's causality check catches a bad calibration.
 - **Box 2.** Device records off by default (its iGPU is the bottleneck); a
