@@ -25,6 +25,8 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use color_eyre::eyre::{self, eyre};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use v4flash_hip::DeviceBuffer;
 use v4flash_kernels::config::N_EMBD;
 use v4flash_kernels::het::batch_scratch::{BatchDgpuScratch, MTP_CAP_ROWS};
@@ -148,7 +150,7 @@ struct Stats {
     keep_ms: f64,
     /// Async ring writes that failed (the slot was reset).
     ring_errors: u64,
-    /// Blocks that verified one draft more than the policy chose (`explore`).
+    /// Blocks whose K was a uniform exploration draw (`explore_k`).
     explored: u64,
 }
 
@@ -170,8 +172,8 @@ pub struct MsDspark {
     calib: Calib,
     stats: Stats,
     since: Instant,
-    /// Drafting blocks decided so far (`explore`'s cadence).
-    drafting_blocks: u64,
+    /// Exploration draws (`explore_k`).
+    rng: StdRng,
 }
 
 impl MsDspark {
@@ -193,7 +195,7 @@ impl MsDspark {
         let cost = StepCost::from_env();
         let two_from = std::env::var("V41_MS_PIPELINE_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize).max(2);
         let cost2 = StepCost::from_env_two_lane(two_from);
-        Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), drafting_blocks: 0 })
+        Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: StdRng::from_entropy() })
     }
 
     /// K for the lone stream's drafted block (plan section 6): the stopping
@@ -202,18 +204,26 @@ impl MsDspark {
     /// run in (`two_from`: the row count from which the verify runs two lanes,
     /// the same snapshot the step's lane choice uses).
     pub fn k_for(&mut self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool, two_from: Option<usize>) -> usize {
-        let cost = Regimes { one: &self.cost, two: &self.cost2, two_from };
-        let k = if sampled { choose_k_stopping(conf, cap, &cost) } else { choose_k(conf, cap, &cost) };
-        if fixed_k().is_some() || k == 0 {
-            return k;
+        if fixed_k().is_none() {
+            // Drawn before `conf` is read (block comment at `explore_p`).
+            if let Some(k) = explore_k(&mut self.rng, cap, explore_p()) {
+                self.stats.explored += 1;
+                return k;
+            }
         }
-        let n = self.drafting_blocks;
-        self.drafting_blocks += 1;
-        // The fit an explored block (k + 2 rows) would feed.
-        let target = if two_from.is_some_and(|m| k + 2 >= m) { &self.cost2 } else { &self.cost };
-        let ke = explore(k, cap, n, target.young());
-        self.stats.explored += u64::from(ke != k);
-        ke
+        let cost = Regimes { one: &self.cost, two: &self.cost2, two_from };
+        if sampled { choose_k_stopping(conf, cap, &cost) } else { choose_k(conf, cap, &cost) }
+    }
+
+    /// One lone step's sample: BOTH fits age by one step, then `rows`/`ms`
+    /// joins the one it ran in. Fits forget by time (lone steps), not by their
+    /// own samples: a fit the policy stops using must not keep stale data --
+    /// e.g. a cold-start level -- for good (10-01: the one-lane line froze at
+    /// 135 + 15/row while every block ran two lanes).
+    fn observe(&mut self, two_lane: bool, rows: usize, ms: f64) {
+        self.cost.age();
+        self.cost2.age();
+        if two_lane { self.cost2.add(rows, ms) } else { self.cost.add(rows, ms) }
     }
 
     fn slot(&mut self, slot: u32) -> eyre::Result<&mut SlotDraft> {
@@ -452,7 +462,7 @@ impl MsDspark {
         if ms.is_finite() && ms > 0.0 {
             self.plain_ms = 0.9 * self.plain_ms + 0.1 * ms;
         }
-        self.cost.observe_step(1, ms);
+        self.observe(false, 1, ms);
     }
 
     /// Account one verified block of `slot` (stage-1 gain, step cost,
@@ -462,11 +472,9 @@ impl MsDspark {
     #[allow(clippy::too_many_arguments)]
     pub fn record(&mut self, slot: u32, conf: &[f32; MTP_BLOCK], k: usize, accepted: usize, emitted: usize, step_ms: f64, lanes: usize) {
         let plain_ms = if self.cost.live { self.cost.cost(1) } else { self.plain_ms };
+        self.observe(lanes >= 2, 1 + k, step_ms);
         if lanes >= 2 {
-            self.cost2.observe_step(1 + k, step_ms);
             self.stats.two_lane += 1;
-        } else {
-            self.cost.observe_step(1 + k, step_ms);
         }
         self.calib.observe(conf, k, accepted);
         if self.calib.blocks % CALIB_EVERY == 0 {
@@ -668,24 +676,31 @@ fn young(n: f64) -> bool {
     n < PRIOR_LEVEL_HALF
 }
 
-/// Every `EXPLORE_EVERY`-th drafting block verifies one draft MORE than the
-/// policy chose (`explore`): the fits only learn from rows the policy picks,
-/// so without it a few bad samples at a row count (one regime) could make the
-/// policy avoid it -- and never sample it again -- for good. ~6% of blocks,
-/// one extra row each (~15 ms, partly repaid by its acceptance). Every
-/// `EXPLORE_EVERY_YOUNG`-th while the fit those rows would feed is young (after
-/// a restart, or a regime that has not run yet): it matures in ~16 samples.
-const EXPLORE_EVERY: u64 = 16;
-const EXPLORE_EVERY_YOUNG: u64 = 4;
+/// EXPLORATION (owner, 10-01: "if we have a few really bad samples we
+/// shouldn't give up on larger batches forever"). The fits only learn from the
+/// rows the policy picks, so a few bad samples could make it avoid a row count
+/// -- or a whole regime -- and never sample it again. It happened both ways on
+/// 10-01: a slow first two-lane verify kept K <= 2 for good; after a cold
+/// restart a one-lane line frozen at its cold level kept K = 5 on two lanes for
+/// good. So with probability `explore_p()` a drafting block verifies a
+/// UNIFORMLY random number of drafts in `0..=cap` instead of the policy's K.
+///
+/// Chosen over Thompson sampling: TS explores only where the posterior is
+/// uncertain, and ours is a hand-set Gaussian (decayed pseudo-counts, a clamped
+/// heavy-tailed stall distribution, warm-up drift) -- a confidently WRONG fit,
+/// the failure here, is what TS rarely revisits. Uniform K covers every row
+/// count of both regimes at a known rate whatever the model believes, spreads
+/// samples over rows (what a line fit wants), and costs well under 1% at 1/32.
+/// Exact under the stopping rule: K is drawn before `conf` is read,
+/// independent of the drafts.
+fn explore_p() -> f64 {
+    static P: LazyLock<f64> = LazyLock::new(|| env_f64("V41_MS_DSPARK_EXPLORE", 1.0 / 32.0).clamp(0.0, 1.0));
+    *P
+}
 
-/// `k` for the `n`-th drafting block (0-based): one more on every
-/// `EXPLORE_EVERY`-th (`EXPLORE_EVERY_YOUNG`-th when `young`), when the policy
-/// drafts at all and `cap` allows. Exactness of the stopping rule is kept:
-/// whether draft `k` is verified then depends on `conf[..=k]` (already read to
-/// stop at `k`), the block count and the fits' past samples, never on draft `k`.
-pub fn explore(k: usize, cap: usize, n: u64, young: bool) -> usize {
-    let every = if young { EXPLORE_EVERY_YOUNG } else { EXPLORE_EVERY };
-    if k >= 1 && k < cap && n % every == every - 1 { k + 1 } else { k }
+/// With probability `p`, a uniformly random K in `0..=cap` (`explore_p`).
+pub fn explore_k(rng: &mut impl Rng, cap: usize, p: f64) -> Option<usize> {
+    (cap > 0 && p > 0.0 && rng.gen::<f64>() < p).then(|| rng.gen_range(0..=cap))
 }
 
 /// What a lone stream's step and draft cost (ms), for the K policy and the
@@ -809,8 +824,26 @@ impl StepCost {
         self.draft
     }
 
-    /// A lone stream's step of `rows` rows took `ms` (draft excluded).
+    /// A lone stream's step of `rows` rows took `ms` (draft excluded): `age`
+    /// then `add`, for a fit that sees every step itself.
     pub fn observe_step(&mut self, rows: usize, ms: f64) {
+        self.age();
+        self.add(rows, ms);
+    }
+
+    /// One step of forgetting (exponential, `V41_MS_DSPARK_COST_MEMORY` steps).
+    pub fn age(&mut self) {
+        if !self.live {
+            return;
+        }
+        for v in self.data.iter_mut() {
+            *v *= self.decay;
+        }
+        self.refit();
+    }
+
+    /// Add one sample (no forgetting: `age` does that).
+    pub fn add(&mut self, rows: usize, ms: f64) {
         if !self.live || rows == 0 || !(ms.is_finite() && ms > 0.0) {
             return;
         }
@@ -818,7 +851,7 @@ impl StepCost {
         // most as `stall_clamp` x the estimate: one sample must not drag the fit.
         let (x, y) = (rows as f64, ms.min(stall_clamp(self.data[0]) * self.cost(rows)));
         for (s, v) in self.data.iter_mut().zip([1.0, x, x * x, y, x * y]) {
-            *s = self.decay * *s + v;
+            *s += v;
         }
         self.samples += 1;
         self.refit();
@@ -1165,17 +1198,45 @@ mod tests {
     }
 
     #[test]
-    fn exploration_adds_one_draft_every_sixteenth_drafting_block_fourth_while_young() {
-        let ks: Vec<usize> = (0..32).map(|n| explore(2, MTP_BLOCK, n, false)).collect();
-        assert_eq!(ks.iter().filter(|&&k| k == 3).count(), 2);
-        assert_eq!((ks[15], ks[31]), (3, 3));
-        assert!(ks.iter().enumerate().all(|(n, &k)| k == if n % 16 == 15 { 3 } else { 2 }));
-        // A young target fit: every 4th.
-        assert_eq!((0..32).filter(|&n| explore(2, MTP_BLOCK, n, true) == 3).count(), 8);
-        // Never past the cap, never drafts when the policy does not.
-        assert_eq!(explore(MTP_BLOCK, MTP_BLOCK, 15, true), MTP_BLOCK);
-        assert_eq!(explore(3, 3, 15, false), 3);
-        assert_eq!(explore(0, MTP_BLOCK, 15, true), 0);
+    fn exploration_draws_every_k_uniformly_at_its_rate() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let (n, p) = (64_000, 1.0 / 32.0);
+        let mut hist = [0u32; MTP_BLOCK + 1];
+        let mut hits = 0;
+        for _ in 0..n {
+            if let Some(k) = explore_k(&mut rng, MTP_BLOCK, p) {
+                hist[k] += 1;
+                hits += 1;
+            }
+        }
+        let rate = hits as f64 / n as f64;
+        assert!((rate - p).abs() < 0.004, "rate {rate}");
+        // Every K in 0..=cap (both regimes, one lane at 0..2, two at 3..5).
+        let each = hits as f64 / (MTP_BLOCK + 1) as f64;
+        assert!(hist.iter().all(|&c| (c as f64 - each).abs() < 0.2 * each), "{hist:?}");
+        // Never past the cap; nothing to explore without room; off at p = 0.
+        let mut rng = StdRng::seed_from_u64(1);
+        assert!((0..1000).filter_map(|_| explore_k(&mut rng, 2, 1.0)).all(|k| k <= 2));
+        assert_eq!(explore_k(&mut rng, 0, 1.0), None);
+        assert_eq!(explore_k(&mut rng, MTP_BLOCK, 0.0), None);
+    }
+
+    #[test]
+    fn an_unused_fit_forgets_by_time() {
+        // The one-lane line learned a cold level, then every block ran two
+        // lanes: aging alone (others' steps) must bring it back to its prior.
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
+        let prior3 = c.cost(3);
+        for _ in 0..3000 {
+            c.observe_step(3, 1.4 * prior3);
+        }
+        assert!(c.cost(3) > 1.3 * prior3);
+        // ~8 memories of other regimes' steps (e^-8 of the data left).
+        for _ in 0..4000 {
+            c.age();
+        }
+        assert!(c.young(), "data weight {}", c.data[0]);
+        assert!((c.cost(3) - prior3).abs() < 0.05 * prior3, "cost(3) {} vs prior {prior3}", c.cost(3));
     }
 
     #[test]

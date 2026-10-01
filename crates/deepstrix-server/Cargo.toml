@@ -25,6 +25,8 @@ axum = { workspace = true }
 uuid = { workspace = true }
 futures-util = { workspace = true }
 blake3 = { workspace = true }
+# DSpark K exploration draws (owner OK 10-01); 0.8.6 is already in Cargo.lock.
+rand = "0.8"
 
 [[bin]]
 name = "deepstrix-server"
