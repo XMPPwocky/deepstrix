@@ -851,7 +851,12 @@ pub struct StepCost {
     draft: f64,
     samples: u64,
     shape: CostShape,
-    /// Per row count (index rows - 1): time-aged `(weight, weighted sum)`.
+    /// Per row count (index rows - 1): `(time-aged weight, mean)`. The MEAN is
+    /// stored, not a weighted sum: aging shrinks the weight only, so an idle
+    /// cell keeps its value however long it idles (10-01: as `(weight, sum)`
+    /// with `sum / weight.max(1e-9)`, a cell idle for ~30K lone steps -- one-
+    /// lane rows 4-6 while two lanes ran them -- underflowed below the clamp
+    /// and read ~0 ms).
     cells: [(f64, f64); CELLS],
     /// `cells`' means (what `cost` returns).
     cell_cost: [f64; CELLS],
@@ -871,7 +876,7 @@ impl StepCost {
         let xc = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
         let yc = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
         let prior_b = pts.iter().map(|&(x, y)| (x - xc) * (y - yc)).sum::<f64>() / pts.iter().map(|&(x, _)| (x - xc) * (x - xc)).sum::<f64>();
-        let cells = std::array::from_fn(|i| (CELL_START_W, CELL_START_W * ladder_cost(&ladder, i + 1)));
+        let cells = std::array::from_fn(|i| (CELL_START_W, ladder_cost(&ladder, i + 1)));
         let mut c = Self {
             live,
             ladder,
@@ -992,7 +997,6 @@ impl StepCost {
         }
         for c in self.cells.iter_mut() {
             c.0 *= self.decay;
-            c.1 *= self.decay;
         }
         self.refit();
     }
@@ -1012,9 +1016,9 @@ impl StepCost {
         // Each cell clamps against ITS OWN estimate and youth.
         if rows <= CELLS {
             let c = &mut self.cells[rows - 1];
-            let y = ms.min(stall_clamp(c.0) * (c.1 / c.0.max(1e-9)));
+            let y = ms.min(stall_clamp(c.0) * c.1);
             c.0 += 1.0;
-            c.1 += y;
+            c.1 += (y - c.1) / c.0;
         }
         self.samples += 1;
         self.refit();
@@ -1038,7 +1042,7 @@ impl StepCost {
     /// each its own mean.
     fn refit(&mut self) {
         for (cost, c) in self.cell_cost.iter_mut().zip(&self.cells) {
-            *cost = c.1 / c.0.max(1e-9);
+            *cost = c.1;
         }
         let [n, sx, sxx, sy, sxy] = self.data;
         let (l, s, xc, yc) = (level_prior(n), PRIOR_SLOPE, self.prior_xc, self.prior_yc);
@@ -1505,6 +1509,19 @@ mod tests {
         }
         // (The ladder start's pseudo-sample is all but gone: ~0.1 of ~500.)
         assert!((c.cost(2) - 80.0).abs() < 0.01, "{}", c.cost(2));
+        // Far longer than a weight can stay above any clamp (e^-60): the value
+        // stays put; and an untouched cell keeps its ladder start.
+        let mut long = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0).with_shape(CostShape::Cells);
+        for _ in 0..1000 {
+            long.observe_step(4, 107.0);
+        }
+        for _ in 0..30_000 {
+            long.age();
+        }
+        assert!((long.cost(4) - 107.0).abs() < 0.01, "idle 30K steps: {}", long.cost(4));
+        assert!((long.cost(6) - ladder_cost(&DEFAULT_LADDER, 6)).abs() < 1e-9, "never-sampled cell: {}", long.cost(6));
+        long.observe_step(4, 120.0);
+        assert!((long.cost(4) - 120.0).abs() < 0.01, "first sample after the idle: {}", long.cost(4));
         // ~0.17 samples of weight left (e^-8 of ~500): the new sample carries it.
         c.observe_step(2, 100.0);
         assert!(c.cost(2) > 96.0, "{}", c.cost(2));
