@@ -21,6 +21,7 @@ pub mod batch_scratch;
 pub mod dispatch;
 pub mod engine;
 pub mod evtrace;
+pub mod evtrace_ring;
 pub mod evtrace_kinds;
 pub mod expert_pager;
 pub mod probe_dump;

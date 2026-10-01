@@ -56,7 +56,7 @@ pub struct Kind {
 pub static META: Kind = Kind {
     id: 0,
     name: "meta",
-    fields: &["t_mono_raw", "t_realtime", "written", "dropped", "files", "queue_cap"],
+    fields: &["t_mono_raw", "t_realtime", "written", "dropped", "files", "queue_cap", "dropped_b", "ring_bytes"],
 };
 
 /// Periodic system sample (`V41_EVTRACE_SYS_MS`, default 100). `dK_*` are the
@@ -98,7 +98,7 @@ pub static SITE: Kind = Kind {
 pub static KNOB: Kind = Kind { id: 5, name: "knob", fields: &["t", "name", "value", "source"] };
 
 /// Every kind this binary can emit, in the header of every file.
-fn kinds() -> Vec<&'static Kind> {
+pub(crate) fn kinds() -> Vec<&'static Kind> {
     let mut v: Vec<&'static Kind> = vec![&META, &SYS, &STR, &SITE, &KNOB];
     v.extend(super::evtrace_kinds::ALL.iter().copied());
     v
@@ -165,6 +165,44 @@ pub fn intern(s: &str) -> f64 {
     id as f64
 }
 
+/// Per kind, the indices of its time fields (`t`, `t_*`, `t<digit>*`): a
+/// record's time is the first of them that is not NaN (the readers' rule).
+pub(crate) fn time_fields() -> std::collections::HashMap<u16, Vec<usize>> {
+    let is_t = |f: &str| f == "t" || f.starts_with("t_") || (f.starts_with('t') && f[1..].starts_with(|c: char| c.is_ascii_digit()));
+    kinds().iter().map(|k| (k.id, k.fields.iter().enumerate().filter(|(_, f)| is_t(f)).map(|(i, _)| i).collect())).collect()
+}
+
+/// The header every file starts with (set by `init`; dumps reuse it).
+static BASE_HEADER: OnceLock<serde_json::Value> = OnceLock::new();
+
+/// A file's header: `base` (or the one `init` stored) + the string table and
+/// every knob's value as of now + `extra`'s keys. Returns the bytes and the
+/// number of strings it holds (the writer's cursor). Call with no lock held.
+pub(crate) fn header_bytes_from(base: &serde_json::Value, extra: &serde_json::Value) -> (Vec<u8>, usize) {
+    let strings = strings_from(0);
+    let knobs: serde_json::Map<String, serde_json::Value> = crate::knobs::snapshot()
+        .into_iter()
+        .map(|(k, v, src, _)| (k.to_string(), serde_json::Value::String(format!("{v} ({src:?})"))))
+        .collect();
+    let mut header = base.clone();
+    if let Some(h) = header.as_object_mut() {
+        h.insert("strings".into(), serde_json::json!(strings));
+        h.insert("knobs_at_open".into(), serde_json::Value::Object(knobs));
+        if let Some(x) = extra.as_object() {
+            for (k, v) in x {
+                h.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    (serde_json::to_vec(&header).unwrap_or_default(), strings.len())
+}
+
+/// `header_bytes_from` with `init`'s header (Tier B dumps).
+pub(crate) fn header_bytes(extra: &serde_json::Value) -> (Vec<u8>, usize) {
+    let empty = serde_json::json!({});
+    header_bytes_from(BASE_HEADER.get().unwrap_or(&empty), extra)
+}
+
 /// The table from `from` on (the writer's cursor), copied out of the lock.
 fn strings_from(from: usize) -> Vec<String> {
     let g = interner().lock().unwrap_or_else(|p| p.into_inner());
@@ -209,7 +247,10 @@ pub fn emit_knob(t_raw: f64, name: &str, value: &str, source: u8) {
     if !enabled() {
         return;
     }
-    emit(&KNOB, &[t_raw, intern(name), intern(value), source as f64]);
+    let v = [t_raw, intern(name), intern(value), source as f64];
+    emit(&KNOB, &v);
+    // Tier B too: a dump shows the knob changes inside its window.
+    super::evtrace_ring::emit_b(&KNOB, &v);
 }
 
 /// Is the trace on? One relaxed load: call sites that must gather fields
@@ -338,6 +379,8 @@ pub fn init(role: &str, extras: serde_json::Value) {
         "kinds": kinds_json,
         "extras": extras,
     });
+    let _ = BASE_HEADER.set(header.clone());
+    let ring_dir = PathBuf::from(format!("{}-ring", dir.display()));
     let cfg = Cfg {
         dir,
         role: role.to_string(),
@@ -355,6 +398,7 @@ pub fn init(role: &str, extras: serde_json::Value) {
         return;
     }
     ENABLED.store(true, Relaxed);
+    super::evtrace_ring::init(role, ring_dir);
     let period = env_u64("V41_EVTRACE_SYS_MS", 100);
     if period > 0 {
         let _ = std::thread::Builder::new()
@@ -375,7 +419,7 @@ pub fn init_env(role: &str) {
     init(role, serde_json::json!({ "argv": argv, "env": env }));
 }
 
-fn utc_stamp() -> String {
+pub(crate) fn utc_stamp() -> String {
     // yyyymmdd-hhmmss from CLOCK_REALTIME, without a date crate (days-from-civil).
     let s = (realtime_ns() / 1_000_000_000) as i64;
     let (days, sod) = (s.div_euclid(86_400), s.rem_euclid(86_400));
@@ -398,23 +442,13 @@ fn utc_stamp() -> String {
 /// resolve knobs, the string copy takes the interner briefly.
 fn open_file(cfg: &Cfg, n: u32) -> std::io::Result<(BufWriter<File>, u64, usize)> {
     let path = cfg.dir.join(format!("{}-{}-{}-{:03}.evt", cfg.role, utc_stamp(), std::process::id(), n));
-    let strings = strings_from(0);
-    let knobs: serde_json::Map<String, serde_json::Value> = crate::knobs::snapshot()
-        .into_iter()
-        .map(|(k, v, src, _)| (k.to_string(), serde_json::Value::String(format!("{v} ({src:?})"))))
-        .collect();
-    let mut header = cfg.header.clone();
-    if let Some(h) = header.as_object_mut() {
-        h.insert("strings".into(), serde_json::json!(strings));
-        h.insert("knobs_at_open".into(), serde_json::Value::Object(knobs));
-    }
-    let header = serde_json::to_vec(&header).unwrap_or_default();
+    let (header, n_strings) = header_bytes_from(&cfg.header, &serde_json::json!({}));
     let mut w = BufWriter::with_capacity(1 << 20, File::create(&path)?);
     w.write_all(b"EVT1")?;
     w.write_all(&(header.len() as u32).to_le_bytes())?;
     w.write_all(&header)?;
     prune(&cfg.dir, &cfg.role, cfg.keep, &path);
-    Ok((w, 8 + header.len() as u64, strings.len()))
+    Ok((w, 8 + header.len() as u64, n_strings))
 }
 
 /// Write the strings interned since `cursor` (before the record about to be
@@ -501,13 +535,16 @@ fn writer(rx: Receiver<Rec>, cfg: Cfg) {
         if last_meta.elapsed() >= Duration::from_secs(1) {
             last_meta = Instant::now();
             let mut m = Rec { kind: META.id, n: META.fields.len() as u16, v: [f64::NAN; MAX_FIELDS] };
-            m.v[..6].copy_from_slice(&[
+            let (dropped_b, ring_bytes) = super::evtrace_ring::stats();
+            m.v[..8].copy_from_slice(&[
                 monotonic_raw_ns() as f64,
                 realtime_ns() as f64,
                 WRITTEN.load(Relaxed) as f64,
                 DROPPED.load(Relaxed) as f64,
                 (n_file + 1) as f64,
                 QUEUE_CAP as f64,
+                dropped_b as f64,
+                ring_bytes as f64,
             ]);
             if let Err(e) = write_rec(&mut w, &m).and_then(|b| {
                 bytes += b;
