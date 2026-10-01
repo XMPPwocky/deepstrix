@@ -769,6 +769,21 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// `MtpState::ring_write_rows` (the kept rows of a verify block, one
+    /// upload and one sync) for consecutive positions from `pos0`.
+    pub fn dspark_ring_write_rows(
+        &self,
+        mtp_state: &mut super::mtp::MtpState,
+        w: &super::weights::MtpWeights,
+        pos0: u32,
+        hidden: &[f32],
+    ) -> color_eyre::eyre::Result<()> {
+        self.set_current_cached(self.igpu.device)?;
+        mtp_state.ring_write_rows(&self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos0, hidden)?;
+        self.igpu.compute.synchronize()?;
+        Ok(())
+    }
+
     pub fn dspark_draft(
         &self,
         mtp_state: &mut super::mtp::MtpState,

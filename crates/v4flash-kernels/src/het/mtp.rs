@@ -64,6 +64,12 @@ pub const MTP_MARKOV_RANK: usize = 256;
 /// Rotating host-staging slots for the drafter's index uploads. See
 /// `MtpState::stage_slots`.
 const STAGE_N: usize = 64;
+/// Most ring rows one `ring_write_rows` call writes (a verify block keeps at
+/// most `ARENA_ROWS_PER_STREAM` = 8).
+pub const RING_ROWS_MAX: usize = 8;
+/// Entries per staged index vector: the main row + the block's, or a batch of
+/// ring rows.
+const STAGE_W: usize = if MTP_BLOCK + 1 > RING_ROWS_MAX { MTP_BLOCK + 1 } else { RING_ROWS_MAX };
 
 /// `dspark_noise_token_id`.
 pub const MTP_NOISE_TOKEN: i32 = 128799;
@@ -539,6 +545,17 @@ pub struct MtpState {
     main_xq: DeviceBuffer<i8>,
     main_xscale: DeviceBuffer<f32>,
     main_kv_raw: DeviceBuffer<f32>,
+    /// `ring_write_rows` scratch, `RING_ROWS_MAX` rows: the residuals, their
+    /// Q8 staging, the `main_proj` output and its norm, the norm's Q8 staging,
+    /// and the per-layer `attn_kv` rows.
+    rows_in: DeviceBuffer<f32>,
+    rows_in_xq: DeviceBuffer<i8>,
+    rows_in_xscale: DeviceBuffer<f32>,
+    rows_proj: DeviceBuffer<f32>,
+    rows_x: DeviceBuffer<f32>,
+    rows_xq: DeviceBuffer<i8>,
+    rows_xscale: DeviceBuffer<f32>,
+    rows_kv_raw: DeviceBuffer<f32>,
     qr: DeviceBuffer<f32>,
     qr_normed: DeviceBuffer<f32>,
     qr_xq: DeviceBuffer<i8>,
@@ -650,6 +667,14 @@ impl MtpState {
             main_xq: DeviceBuffer::new(device_id, ne)?,
             main_xscale: DeviceBuffer::new(device_id, ne.div_ceil(32))?,
             main_kv_raw: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            rows_in: DeviceBuffer::new(device_id, RING_ROWS_MAX * k)?,
+            rows_in_xq: DeviceBuffer::new(device_id, RING_ROWS_MAX * k)?,
+            rows_in_xscale: DeviceBuffer::new(device_id, RING_ROWS_MAX * k.div_ceil(32))?,
+            rows_proj: DeviceBuffer::new(device_id, RING_ROWS_MAX * ne)?,
+            rows_x: DeviceBuffer::new(device_id, RING_ROWS_MAX * ne)?,
+            rows_xq: DeviceBuffer::new(device_id, RING_ROWS_MAX * ne)?,
+            rows_xscale: DeviceBuffer::new(device_id, RING_ROWS_MAX * ne.div_ceil(32))?,
+            rows_kv_raw: DeviceBuffer::new(device_id, RING_ROWS_MAX * N_HEAD_DIM as usize)?,
             qr: DeviceBuffer::new(device_id, b * N_LORA_Q as usize)?,
             qr_normed: DeviceBuffer::new(device_id, b * N_LORA_Q as usize)?,
             qr_xq: DeviceBuffer::new(device_id, b * N_LORA_Q as usize)?,
@@ -657,12 +682,12 @@ impl MtpState {
             q: DeviceBuffer::new(device_id, b * Q_FLAT as usize)?,
             kv_raw: DeviceBuffer::new(device_id, b * N_HEAD_DIM as usize)?,
             kv_normed: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
-            stage_slots: (0..STAGE_N).map(|_| vec![0u32; b + 1]).collect(),
-            stage_poss: (0..STAGE_N).map(|_| vec![0u32; b + 1]).collect(),
+            stage_slots: (0..STAGE_N).map(|_| vec![0u32; STAGE_W]).collect(),
+            stage_poss: (0..STAGE_N).map(|_| vec![0u32; STAGE_W]).collect(),
             stage_dpos: (0..STAGE_N).map(|_| vec![0i32; b]).collect(),
             stage_idx: 0,
-            slot_dev: DeviceBuffer::new(device_id, b + 1)?,
-            pos_dev: DeviceBuffer::new(device_id, b + 1)?,
+            slot_dev: DeviceBuffer::new(device_id, STAGE_W)?,
+            pos_dev: DeviceBuffer::new(device_id, STAGE_W)?,
             pos_per_b: DeviceBuffer::new(device_id, b)?,
             scores: DeviceBuffer::new(device_id, SCORES_ELEMS)?,
             heads: DeviceBuffer::new(device_id, b * Q_FLAT as usize)?,
@@ -1168,6 +1193,74 @@ impl MtpState {
         }
         // Same bookkeeping a full forward does — the ring advanced by one row.
         self.ring_writes += 1;
+        Ok(())
+    }
+
+    /// `ring_write_only` for `hidden.len() / (3 * N_EMBD)` consecutive positions
+    /// from `pos0` (the rows a verify step kept): ONE upload of their residuals,
+    /// one read of `main_proj` and of each layer's `attn_kv` for all of them
+    /// (`matvec_bpack`, bit-identical per row to the `q8.matvec` the single-row
+    /// path runs; the batched quantize and the batched-fast RMS are the
+    /// single-row kernels with more blocks), then each row's own kv_post into
+    /// the ring in position order. The ring ends up exactly as after that many
+    /// `ring_write_only` calls (`tests/dspark_parity.rs`, PARITY_SEED_ROWS) at
+    /// a fraction of the launches, and the caller syncs once.
+    pub fn ring_write_rows(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        w: &MtpWeights,
+        rope: &crate::RopeParams,
+        pos0: u32,
+        hidden: &[f32],
+    ) -> eyre::Result<()> {
+        let k = MTP_SRC_LAYERS.len() * N_EMBD as usize;
+        let ne = N_EMBD as usize;
+        let r = hidden.len() / k;
+        if r == 0 || r > RING_ROWS_MAX || hidden.len() != r * k {
+            return Err(eyre!("ring_write_rows: {} floats is not 1..={RING_ROWS_MAX} rows of {k}", hidden.len()));
+        }
+        let q8 = v4flash_core::gguf::GgufType::Q8_0;
+        if w.main_proj.dtype != q8 || w.layers.iter().any(|l| l.attn_kv.dtype != q8) {
+            for j in 0..r {
+                self.inject_main_hidden(&hidden[j * k..(j + 1) * k])?;
+                self.ring_write_only(e, s, w, rope, pos0 + j as u32)?;
+            }
+            return Ok(());
+        }
+        let _t = e.events.stage("mtp.ring_write_rows", s)?;
+        // Slots and positions of the r rows, as r single writes would take them.
+        let si = self.stage_idx % STAGE_N;
+        self.stage_idx = self.stage_idx.wrapping_add(1);
+        for j in 0..r {
+            self.stage_slots[si][j] = ((self.ring_writes + j) % MTP_WINDOW) as u32;
+            self.stage_poss[si][j] = pos0 + j as u32;
+        }
+        self.slot_dev.copy_from_host_async(&self.stage_slots[si], s)?;
+        self.pos_dev.copy_from_host_async(&self.stage_poss[si], s)?;
+        self.rows_in.slice_view_mut(0, r * k).copy_from_host(hidden)?;
+        // entry, B-packed
+        let xin = self.rows_in.slice_view(0, r * k);
+        e.q8.quantize_input_batched(s, &mut self.rows_in_xq, &mut self.rows_in_xscale, &xin, k as u32, r as u32)?;
+        e.q8.matvec_bpack(
+            s, &mut self.rows_proj, &w.main_proj.buffer, &self.rows_in_xq, &self.rows_in_xscale, N_EMBD, k as u32, r as u32,
+        )?;
+        e.rms_w.launch_weighted_batched(s, &mut self.rows_x, &self.rows_proj, &w.main_norm, N_EMBD, RMS_EPS, r as u32)?;
+        e.q8.quantize_input_batched(s, &mut self.rows_xq, &mut self.rows_xscale, &self.rows_x, N_EMBD, r as u32)?;
+        for (li, lw) in w.layers.iter().enumerate() {
+            e.q8.matvec_bpack(
+                s, &mut self.rows_kv_raw, &lw.attn_kv.buffer, &self.rows_xq, &self.rows_xscale, N_HEAD_DIM, N_EMBD, r as u32,
+            )?;
+            for j in 0..r {
+                let row = self.rows_kv_raw.slice_view(j * N_HEAD_DIM as usize, N_HEAD_DIM as usize);
+                kv_post_row(
+                    e, s, &mut self.kv_normed, &mut self.rings[li], &row, &lw.kv_a_norm,
+                    &self.pos_dev.slice_view(j, 1), &self.slot_dev.slice_view(j, 1), rope,
+                )?;
+            }
+        }
+        let _ = ne;
+        self.ring_writes += r;
         Ok(())
     }
 

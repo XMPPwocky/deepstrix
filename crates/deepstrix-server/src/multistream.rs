@@ -1556,13 +1556,11 @@ impl Sched {
                     continue;
                 }
                 let pos_end = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
-                for j in 0..keeps[i] as usize {
-                    let pos = pos_end - keeps[i] + j as u32;
-                    if let Err(e) = dsp.keep_row(&state.engine, m, s.slot, pos, caps[row0[i] + j].clone(), write) {
-                        tracing::warn!(slot = s.slot, pos, error = %e, "ms dspark: ring write failed; the stream's ring restarts");
-                        let _ = dsp.reset(s.slot);
-                        break;
-                    }
+                let pos0 = pos_end - keeps[i];
+                let rows: Vec<Vec<f32>> = (0..keeps[i] as usize).map(|j| caps[row0[i] + j].clone()).collect();
+                if let Err(e) = dsp.keep_rows(&state.engine, m, s.slot, pos0, rows, write) {
+                    tracing::warn!(slot = s.slot, pos0, error = %e, "ms dspark: ring write failed; the stream's ring restarts");
+                    let _ = dsp.reset(s.slot);
                 }
             }
             if let Some((k, accepted, emitted)) = spec_out {

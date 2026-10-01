@@ -182,9 +182,24 @@ fn drafter_matches_reference() {
 
     if seeded {
         let win = MTP_WINDOW as usize;
-        for p in seed.saturating_sub(win)..seed {
-            st.inject_main_hidden(&mh[p * row..(p + 1) * row]).expect("inject");
-            st.ring_write_only(&e, &e.compute, &w, &rope, p as u32).expect("ring write");
+        // PARITY_SEED_ROWS=n (1..=8): seed through the batched writer
+        // (`ring_write_rows`, n rows per call, as the arena writes a verify
+        // block's kept rows); the drafts must be identical to the per-row seed.
+        let batch = std::env::var("PARITY_SEED_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let lo = seed.saturating_sub(win);
+        if batch > 0 {
+            let mut p = lo;
+            while p < seed {
+                let q = (p + batch).min(seed);
+                st.ring_write_rows(&e, &e.compute, &w, &rope, p as u32, &mh[p * row..q * row]).expect("ring rows");
+                p = q;
+            }
+            println!("seeded {} ring rows through ring_write_rows, {batch} per call", seed - lo);
+        } else {
+            for p in lo..seed {
+                st.inject_main_hidden(&mh[p * row..(p + 1) * row]).expect("inject");
+                st.ring_write_only(&e, &e.compute, &w, &rope, p as u32).expect("ring write");
+            }
         }
         e.compute.synchronize().expect("sync");
     }

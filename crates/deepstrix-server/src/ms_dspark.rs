@@ -28,7 +28,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::DeviceBuffer;
 use v4flash_kernels::config::N_EMBD;
 use v4flash_kernels::het::batch_scratch::{BatchDgpuScratch, MTP_CAP_ROWS};
-use v4flash_kernels::het::mtp::{MTP_BLOCK, MTP_SRC_LAYERS, MTP_WINDOW};
+use v4flash_kernels::het::mtp::{MTP_BLOCK, MTP_SRC_LAYERS, MTP_WINDOW, RING_ROWS_MAX};
 use v4flash_kernels::het::{HetModelWeights, HeterogeneousEngine};
 
 use crate::engine_worker::MtpCtx;
@@ -190,6 +190,46 @@ impl MsDspark {
         Ok(())
     }
 
+    /// `keep_row` for the consecutive rows `pos0..pos0 + rows.len()` a step
+    /// kept: rows not yet in the ring go in with ONE batched write per
+    /// `RING_ROWS_MAX` (`MtpState::ring_write_rows`: one upload, one read of
+    /// each projection, one sync), and the last row's residual feeds the next
+    /// draft.
+    pub fn keep_rows(
+        &mut self,
+        engine: &HeterogeneousEngine,
+        mtp: &mut MtpCtx,
+        slot: u32,
+        pos0: u32,
+        mut rows: Vec<Vec<f32>>,
+        write_ring: bool,
+    ) -> eyre::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if rows.iter().any(|h| h.len() != HIDDEN) {
+            return Err(eyre!("ms dspark: a kept row's residual is not {HIDDEN} floats"));
+        }
+        let last = pos0 + rows.len() as u32 - 1;
+        if write_ring {
+            let skip = match self.slot(slot)?.last_ring_pos {
+                Some(p) if p >= pos0 => ((p - pos0) as usize + 1).min(rows.len()),
+                _ => 0,
+            };
+            for (c, chunk) in rows[skip..].chunks(RING_ROWS_MAX).enumerate() {
+                let p = pos0 + (skip + c * RING_ROWS_MAX) as u32;
+                let flat: Vec<f32> = chunk.concat();
+                self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows(&mut m.state, &m.w, p, &flat))?;
+            }
+            if skip < rows.len() {
+                self.slot(slot)?.last_ring_pos = Some(last);
+            }
+        }
+        let h = rows.pop().expect("non-empty");
+        self.slot(slot)?.hidden = Some((last, h));
+        Ok(())
+    }
+
     /// Seed `slot`'s ring from a prefill's captured residuals (absolute
     /// position -> row), `last` = the prompt's last position: the contiguous
     /// run ending at `last`, at most a window, every row including the last
@@ -210,12 +250,9 @@ impl MsDspark {
         if !rows.contains_key(&last) {
             return Ok(0);
         }
-        let mut n = 0;
-        for p in first..=last {
-            let h = rows.remove(&p).expect("contiguous run");
-            self.keep_row(engine, mtp, slot, p, h, true)?;
-            n += 1;
-        }
+        let run: Vec<Vec<f32>> = (first..=last).map(|p| rows.remove(&p).expect("contiguous run")).collect();
+        let n = run.len();
+        self.keep_rows(engine, mtp, slot, first, run, true)?;
         Ok(n)
     }
 
