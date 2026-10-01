@@ -1452,9 +1452,16 @@ struct PfJob {
     /// A request needs it now (a parked request's own pick), as opposed to a
     /// guess (look-ahead) or a background admission (box-2 miss substitution).
     certain: bool,
-    /// A PREFILL-shaped request's own pick (its early page / park): lands in
-    /// the staging band, and reads by `knobs::prefill_route_split`.
+    /// A PREFILL-shaped request's own pick (its early page / park) that lands in
+    /// the staging band (cleared when staging is off: see `own_prefill`).
     stage: bool,
+    /// A PREFILL-shaped request's own pick, staged or not: reads by
+    /// `knobs::prefill_route_split` (striped across both drives, like its
+    /// demand reads). Separate from `stage` because staging off (production,
+    /// mode-aware eviction) clears `stage` -- and keying the route on it sent
+    /// every early-page read mirror-only (60-80% of prefill reads on the SN5000
+    /// at 13.8 ms p50 while the E100 idled; MEASURED 2026-10-01).
+    own_prefill: bool,
     /// Lands PREFILL-class (evicted first) even outside the staging band: a hub
     /// word carried by a prefill-shaped request (layer-major group prefetch).
     prefill: bool,
@@ -1916,6 +1923,12 @@ pub mod knobs {
     static MIRROR_OK: AtomicBool = AtomicBool::new(false);
     /// `V41_B2_FAST_CHAIN` (default on; `0` = the old chain): see `fast_chain`.
     static FAST_CHAIN: AtomicBool = AtomicBool::new(true);
+    /// `V41_B2_PREFILL_BUDGET` / key `prefill_budget`: see `prefill_budget`.
+    static PREFILL_BUDGET: AtomicU64 = AtomicU64::new(PREFILL_BUDGET_DEFAULT);
+    /// `V41_B2_ENCODER_VICTIMS_FIRST` / key `encoder_victims_first`: see
+    /// `encoder_victims_first`.
+    static ENCODER_VICTIMS_FIRST: AtomicBool = AtomicBool::new(true);
+    const PREFILL_BUDGET_DEFAULT: u64 = 3500;
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     fn init() {
         INIT.get_or_init(|| {
@@ -1935,6 +1948,11 @@ pub mod knobs {
             PARK.store(std::env::var("V41_B2_PARK").as_deref() == Ok("1"), Relaxed);
             ROUTE_URGENCY.store(std::env::var("V41_B2_ROUTE").as_deref() == Ok("urgency"), Relaxed);
             PREFILL_ROUTE_SPLIT.store(std::env::var("V41_B2_PREFILL_ROUTE").as_deref() != Ok("mirror"), Relaxed);
+            PREFILL_BUDGET.store(
+                std::env::var("V41_B2_PREFILL_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFILL_BUDGET_DEFAULT),
+                Relaxed,
+            );
+            ENCODER_VICTIMS_FIRST.store(std::env::var("V41_B2_ENCODER_VICTIMS_FIRST").as_deref() != Ok("0"), Relaxed);
             FAST_CHAIN.store(std::env::var("V41_B2_FAST_CHAIN").as_deref() != Ok("0"), Relaxed);
         });
     }
@@ -1997,6 +2015,28 @@ pub mod knobs {
     /// itself from the SN5000 and the late copy is discarded on landing.
     /// Needs a usable mirror on EVERY shard (`set_mirror_ok`); otherwise it
     /// is `split` (a mirror-only read would silently fall back to the primary).
+    /// Decode victims one prefill phase may take before it evicts its own
+    /// oldest pages (mode-aware eviction, `V41_B2_MODE_EVICT`); read at the
+    /// start of each prefill phase. Env `V41_B2_PREFILL_BUDGET`, file key
+    /// `prefill_budget`, default 3500 (was 2048 until 2026-10-01). 2048 held one
+    /// layer-major WINDOW (0 re-reads within a window) but not a job longer than
+    /// one: from a 113K-row job's 4th window on, 96-100% of each window's reads
+    /// were experts the same job had read and then evicted itself (40.5K reads
+    /// for 3,398 distinct experts, MEASURED 2026-10-01); ~3500 covers a job's
+    /// box-2 union (~170 per layer x 20 encoder layers). Its cost -- decode
+    /// experts displaced per prefill phase -- is not priced yet.
+    pub fn prefill_budget() -> u64 { init(); PREFILL_BUDGET.load(Relaxed) }
+    /// When a prefill phase takes DECODE-class victims (mode-aware tiers 2 and
+    /// 4), take those of ENCODER layers (< `CED_DECODER_START`) before any
+    /// decoder layer's, least recently used within each. A CED prefill's chunks
+    /// run only the encoder layers, but its replay (the last 128 rows through
+    /// the decoder layers, right after) needs the decoder layers' experts --
+    /// exactly the decode pages a global-LRU victim choice had just evicted:
+    /// 640-750 box-2 reads per replay, 2.3-2.9 s, 90% of it waiting on box 2
+    /// (MEASURED 2026-10-01). Decode after the prefill loses as many pages
+    /// either way, only from other layers. Env `V41_B2_ENCODER_VICTIMS_FIRST`
+    /// (`0` = off), file key `encoder_victims_first`, default on.
+    pub fn encoder_victims_first() -> bool { init(); ENCODER_VICTIMS_FIRST.load(Relaxed) }
     pub fn route_urgency() -> bool {
         init();
         ROUTE_URGENCY.load(Relaxed) && MIRROR_OK.load(Relaxed)
@@ -2033,13 +2073,15 @@ pub mod knobs {
                 ("prefill_route", v) => eprintln!("expertd: knobs: unknown prefill_route={v:?} (want split|mirror); unchanged"),
                 ("mirror_frac", v) => { if let Ok(f) = v.parse::<f32>() { v4flash_core::hf_v41::set_expert_mirror_frac(f) } }
                 ("fast_chain", v) => FAST_CHAIN.store(v != "0", Relaxed),
+                ("prefill_budget", v) => { if let Ok(n) = v.parse() { PREFILL_BUDGET.store(n, Relaxed) } }
+                ("encoder_victims_first", v) => ENCODER_VICTIMS_FIRST.store(v != "0", Relaxed),
                 _ => {}
             }
         }
-        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={}", park(),
+        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={}", park(),
             merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac(),
             if route_urgency() { "urgency" } else { "split" }, if prefill_route_split() { "split" } else { "mirror" },
-            u8::from(fast_chain()))
+            u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()))
     }
 }
 
@@ -2058,10 +2100,10 @@ pub fn install_knobs_toggle() -> String {
     // it while passing `V41_B2_MISS_PAR=4` on the command line runs at 4 and looks
     // like it is running at 1 (found by the 2026-09-22 audit, B4).
     let _ = knobs::reload();
-    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} (SIGUSR2 reloads {})",
+    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={} (SIGUSR2 reloads {})",
         knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::coalesce(),
         v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" },
-        if knobs::prefill_route_split() { "split" } else { "mirror" }, u8::from(knobs::fast_chain()), knobs::path());
+        if knobs::prefill_route_split() { "split" } else { "mirror" }, u8::from(knobs::fast_chain()), knobs::prefill_budget(), u8::from(knobs::encoder_victims_first()), knobs::path());
     unsafe { signal(SIGUSR2, knobs_signal); }
     init
 }
@@ -2251,6 +2293,16 @@ struct ShardPool {
 // first). Requires the global pool (tiers across the whole band).
 // ---------------------------------------------------------------------------
 
+/// Within the DECODE tiers (2 and 4) of a prefill-mode search: 1 for a
+/// decoder layer's page, 0 for an encoder layer's (`knobs::encoder_victims_first`),
+/// so encoder layers' decode pages go first. 0 everywhere else.
+fn decoder_layer_rank(enc_first: bool, tier: u8, owner: Option<(u32, u32)>) -> u8 {
+    match owner {
+        Some((l, _)) if enc_first && (tier == 2 || tier == 4) => u8::from(l as usize >= crate::config::CED_DECODER_START),
+        _ => 0,
+    }
+}
+
 /// Per-phase counters of mode-aware eviction (logged at each phase switch).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ModeEvictCounters {
@@ -2274,6 +2326,9 @@ struct ModeEvict {
     /// Decode victims one prefill phase may take before preferring its own.
     budget: u64,
     budget_left: u64,
+    /// `budget` follows `knobs::prefill_budget` (re-read at each prefill phase
+    /// start); off in tests, which pin a budget.
+    budget_live: bool,
     /// The current phase is prefill (else decode).
     prefill_phase: bool,
     /// Prefill phases begun (1-based once the first begins).
@@ -2333,14 +2388,9 @@ pub fn b2_mode_evict() -> bool {
     *B
 }
 
-/// `V41_B2_PREFILL_BUDGET` (default 2048): decode victims one prefill phase may
-/// take before it evicts its own oldest pages. ~ today's measured displacement
-/// per prefill phase (2,136 decode experts median, 2026-09-27).
+/// The prefill budget now (`knobs::prefill_budget`: env, knobs file, live).
 pub fn b2_prefill_budget() -> u64 {
-    static B: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_B2_PREFILL_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
-    });
-    *B
+    knobs::prefill_budget()
 }
 
 impl ModeEvict {
@@ -2884,6 +2934,13 @@ impl ShardPool {
         self.me = ModeEvict::enabled(self.owner_of.len(), budget);
     }
 
+    /// `enable_mode_evict` with the budget following the live knob
+    /// (`knobs::prefill_budget`, re-read at each prefill phase start).
+    fn enable_mode_evict_live(&mut self) {
+        self.enable_mode_evict(b2_prefill_budget());
+        self.me.budget_live = true;
+    }
+
     /// Note the HUB's phase of the request about to be served (`prefill` =
     /// no `REQ_FLAG_DECODE`), before it claims or lands anything. A prefill
     /// request starts a prefill phase at once; a prefill phase ends after
@@ -2929,6 +2986,9 @@ impl ShardPool {
         if prefill {
             self.me.phase += 1;
             self.me.phase_start = self.tick;
+            if self.me.budget_live {
+                self.me.budget = b2_prefill_budget();
+            }
             self.me.budget_left = self.me.budget;
         } else if self.me.restore_on {
             self.me_build_restore();
@@ -3072,9 +3132,10 @@ impl ShardPool {
         let n = self.owner_of.len() as u32;
         let range = range.start.min(n)..range.end.min(n);
         // Mode-aware eviction: a prefill-mode search in a prefill phase ranks by
-        // (tier, recency).
+        // (tier, encoder-layer-first within the decode tiers, recency).
         let tiered = self.me_tiered(prefill_mode);
-        let mut best: Option<((u8, u64), u32)> = None;
+        let enc_first = tiered && knobs::encoder_victims_first();
+        let mut best: Option<((u8, u8, u64), u32)> = None;
         for sl in range {
             let ok = match self.owner_of[sl as usize] {
                 Some((ol, oe)) => {
@@ -3094,7 +3155,12 @@ impl ShardPool {
                 continue;
             }
             let t = self.last_use[sl as usize];
-            let key = if tiered { (self.me.tier(sl, t, self.owner_of[sl as usize].is_none()), t) } else { (0, t) };
+            let key = if tiered {
+                let tier = self.me.tier(sl, t, self.owner_of[sl as usize].is_none());
+                (tier, decoder_layer_rank(enc_first, tier, self.owner_of[sl as usize]), t)
+            } else {
+                (0, 0, t)
+            };
             if best.is_none_or(|(bk, _)| key < bk) {
                 best = Some((key, sl));
             }
@@ -4029,6 +4095,7 @@ impl ExpertShard {
         // land PREFILL-class even with staging off (they used to land
         // decode-class and search the global minimum = prefill's own pages).
         let me_on = self.pool.as_ref().is_some_and(|p| p.me.on);
+        let own_prefill = stage;
         let prefill = prefill || (me_on && stage && self.stage_slots() == 0);
         let stage = stage && self.stage_slots() > 0;
         if self.prefetch.is_none() {
@@ -4061,7 +4128,7 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let urgency = knobs::route_urgency();
-                    let Some(PfJob { layer, e, set, certain, stage, prefill, restore, t_hint }) = queue_r.pop_mode(urgency) else { break };
+                    let Some(PfJob { layer, e, set, certain, stage, own_prefill, prefill, restore, t_hint }) = queue_r.pop_mode(urgency) else { break };
                     let ev_on = super::evtrace::enabled();
                     let ev_t_pop = if ev_on { super::evtrace::now() } else { f64::NAN };
                     let mut ev_yield_ns = 0u64;
@@ -4103,9 +4170,10 @@ impl ExpertShard {
                     // yields to urgent reads (io_throttle); certain ones do not.
                     // Under urgency routing: certain -> the mirror, speculative
                     // -> the primary, and neither is throttled; a PREFILL
-                    // chunk's own reads (`stage`) are striped across both
-                    // drives like its demand reads (`knobs::prefill_route_split`).
-                    let route = match (urgency, done.certain, stage && knobs::prefill_route_split()) {
+                    // chunk's own reads (`own_prefill`, staged or not) are
+                    // striped across both drives like its demand reads
+                    // (`knobs::prefill_route_split`).
+                    let route = match (urgency, done.certain, own_prefill && knobs::prefill_route_split()) {
                         (false, _, _) | (true, _, true) => v4flash_core::hf_v41::ExpertRoute::split(),
                         (true, true, false) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
                         (true, false, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
@@ -4176,7 +4244,7 @@ impl ExpertShard {
             };
             pf.pending.insert(key);
             pf.hinted += 1;
-            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, prefill, restore, t_hint: std::time::Instant::now() });
+            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, own_prefill, prefill, restore, t_hint: std::time::Instant::now() });
         }
         dropped_words
     }
@@ -4568,7 +4636,7 @@ impl ExpertShard {
         let stage = pool.set_stage(b2_prefill_stage());
         if b2_mode_evict() {
             if stage == 0 && b2_scan_class() && b2_global_pool() {
-                pool.enable_mode_evict(b2_prefill_budget());
+                pool.enable_mode_evict_live();
                 pool.me.restore_on = b2_restore();
                 eprintln!("expertd: mode-aware eviction ON (prefill budget {} decode victims per phase; delta restore {})",
                     b2_prefill_budget(), if pool.me.restore_on { "ON" } else { "off" });
@@ -8627,7 +8695,7 @@ mod tests {
     fn prefetch_queue_priority_and_reservation() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, prefill: false, restore: 0, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, false));
         q.push(job(2, false));
@@ -8701,7 +8769,7 @@ mod tests {
     fn prefetch_finish_releases_spec_key() {
         use std::time::Instant;
         let q = PfQueue::with_readers(2, 3);
-        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, prefill: false, restore: 0, t_hint: Instant::now() });
+        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() });
         let j = q.pop_mode(true).unwrap();
         assert!(q.spec_keys_snapshot().contains(&(6, 1)));
         assert!(!q.promote(6, 1), "a running speculative key must not be promoted/urgent");
@@ -8715,7 +8783,7 @@ mod tests {
         // Urgency cap: max_spec 2 but 3 readers -> 2 may run; with 2 readers -> 1.
         let q2 = PfQueue::with_readers(2, 2);
         for e in 0..3 {
-            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, prefill: false, restore: 0, t_hint: Instant::now() });
+            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() });
         }
         let _a = q2.pop_mode(true).unwrap();
         let g = q2.inner.lock().unwrap();
@@ -8731,7 +8799,7 @@ mod tests {
     fn prefetch_queue_urgency_routing() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, prefill: false, restore: 0, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, true));
         q.push(job(2, false));
@@ -9096,6 +9164,33 @@ mod tests {
     /// -- that would reset the budget and turn the ongoing prefill's pages
     /// stale. A full streak ends it; outside a prefill phase nothing is tiered.
     #[test]
+    fn pool_mode_evict_takes_encoder_layers_decode_pages_first() {
+        // Decoder layer 25's decode pages are OLDER than encoder layer 3's, yet
+        // a prefill claim in the decode tier takes layer 3's first (the replay
+        // right after the prefill needs the decoder layers), LRU within each
+        // (`knobs::encoder_victims_first`, default on).
+        let ids: Vec<u32> = (0..2).collect();
+        let mut pool = ShardPool::seeded(4, &[(25, 0, &ids), (3, 2, &ids)], 0.0);
+        pool.enable_mode_evict(8);
+        for e in 0..2 {
+            assert!(pool.touch_hit(25, e, false));
+        }
+        for e in 0..2 {
+            assert!(pool.touch_hit(3, e, false));
+        }
+        pool.me_note_request(true);
+        let want: Vec<u32> = (10..14).collect();
+        let mut order = Vec::new();
+        for e in 10..14 {
+            let (slot, ev) = pool.claim_miss(7, e, &want, &[], (0, 4), true, true, true).unwrap();
+            order.push(ev.unwrap());
+            pool.commit(7, e, slot);
+        }
+        assert_eq!(order, vec![(3, 0), (3, 1), (25, 0), (25, 1)]);
+        assert_eq!(pool.me.c.took_decode, 4);
+    }
+
+    #[test]
     fn pool_mode_evict_phase_does_not_flap() {
         let ids: Vec<u32> = (0..4).collect();
         let mut pool = ShardPool::seeded(8, &[(1, 0, &ids), (2, 4, &ids)], 0.0);
@@ -9164,7 +9259,7 @@ mod tests {
                     // Oracle: eligible = free, or not one of `want` on `layer`;
                     // rank (tier, last_use) in a tiered search, else last_use.
                     let tiered = pool.me.on && pool.me.prefill_phase && prefill_mode;
-                    let rank = |sl: usize| -> (u8, u64) {
+                    let rank = |sl: usize| -> (u8, u8, u64) {
                         let lu = pool.last_use[sl];
                         let t = match pool.owner_of[sl] {
                             _ if !tiered => 0,
@@ -9174,7 +9269,12 @@ mod tests {
                             Some(_) if pool.me.budget_left > 0 => 2,
                             Some(_) => 4,
                         };
-                        (t, lu)
+                        // Encoder layers' decode pages first (knob default on).
+                        let dl = match pool.owner_of[sl] {
+                            Some((l, _)) if tiered && (t == 2 || t == 4) => u8::from(l as usize >= crate::config::CED_DECODER_START),
+                            _ => 0,
+                        };
+                        (t, dl, lu)
                     };
                     let expect = (0..n)
                         .filter(|&sl| !matches!(pool.owner_of[sl], Some((ol, oe)) if ol == layer && want.contains(&oe)))

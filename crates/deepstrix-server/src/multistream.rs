@@ -149,6 +149,69 @@ struct Prefill {
     /// prompt + marker is a key the prefix walk (EOS/Assistant/User
     /// boundaries) can never match, and it took one of the lineage's slots.
     save_at_finish: bool,
+    /// Engram rows gathered AHEAD of the chunks that need them
+    /// (`engram_lookahead`), contiguous blocks in token order.
+    engram_ahead: EngramAhead,
+}
+
+/// A prefill job's Engram rows gathered ahead (2026-10-01): a long prefill
+/// spent 9-20% of its wall gathering each sub-chunk's Engram rows on the
+/// scheduler thread before the sub-chunk could start (0.15-0.25 s cached,
+/// 0.4-1.1 s from box-1 NVMe), while box-1 disk sat otherwise idle. Now each
+/// prefill tick with room gathers the next block on a scoped thread while its
+/// unit runs on the GPUs, up to one layer-major window ahead
+/// (`PrefillJob::input_lookahead_rows`): the 16 non-input units of a window
+/// (groups 1..) gather the next window's sub-chunks, so its group-0 units find
+/// their rows ready. Positions are absolute (`p0 + index`), so a block serves
+/// any later chunk cut.
+#[derive(Default)]
+struct EngramAhead {
+    /// `(start, end, rows per Engram table [(end - start) * ENGRAM_IN])`.
+    blocks: VecDeque<(usize, usize, Vec<Vec<f32>>)>,
+    /// First job token index whose rows are neither consumed nor cached.
+    next: usize,
+}
+
+impl EngramAhead {
+    fn cached_rows(&self) -> usize {
+        self.blocks.iter().map(|b| b.1 - b.0).sum()
+    }
+
+    /// The rows of `[a, z)` if the cache covers them (consumed: blocks
+    /// wholly before `z` are dropped). `None` = not cached (gather now).
+    fn take(&mut self, a: usize, z: usize, n_tables: usize) -> Option<Vec<Vec<f32>>> {
+        let ein = ENGRAM_IN as usize;
+        while self.blocks.front().is_some_and(|b| b.1 <= a) {
+            self.blocks.pop_front();
+        }
+        let covered = self.blocks.front().is_some_and(|b| b.0 <= a) && {
+            let mut end = self.blocks.front().map_or(a, |b| b.0);
+            for b in &self.blocks {
+                if b.0 != end {
+                    break;
+                }
+                end = b.1;
+            }
+            end >= z
+        };
+        if !covered {
+            return None;
+        }
+        let mut out = vec![vec![0f32; (z - a) * ein]; n_tables];
+        for (s, e, rows) in &self.blocks {
+            let (lo, hi) = (a.max(*s), z.min(*e));
+            if lo >= hi {
+                continue;
+            }
+            for (t, r) in rows.iter().enumerate() {
+                out[t][(lo - a) * ein..(hi - a) * ein].copy_from_slice(&r[(lo - s) * ein..(hi - s) * ein]);
+            }
+        }
+        while self.blocks.front().is_some_and(|b| b.1 <= z) {
+            self.blocks.pop_front();
+        }
+        Some(out)
+    }
 }
 
 /// `Prefill` after its scratch state has been recycled.
@@ -208,6 +271,8 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         }
     };
     tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 120_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), head_cands = ?head_cands_mode(), "multistream scheduler ON");
+    // Logs its UNTESTED-fidelity warning when on: at every start, not only on first use.
+    let _ = v4flash_kernels::het::forward_prefill::prefill_f16_replies();
     // Event trace (`V41_EVTRACE_DIR`): every V41_* knob goes in the header.
     {
         let knobs: serde_json::Map<String, serde_json::Value> = std::env::vars()
@@ -1030,7 +1095,7 @@ impl Sched {
             Ok(v) => v,
             Err(e) => return Err((p, kv, e)),
         };
-        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, save_at_finish: !marker_in_prefill };
+        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, save_at_finish: !marker_in_prefill, engram_ahead: EngramAhead::default() };
         if marker_in_prefill {
             pf.p.trailing_marker = None; // consumed
             pf.prefix.push(suffix[0]);
@@ -1126,8 +1191,33 @@ impl Sched {
             }
             if let Err(e) = chunk_inputs(&mut pf, state) { return Err((Some(pf.kv), e)); }
             let inputs_ms = t.elapsed().as_millis() as u64;
-            let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
-            let rows = match engine.prefill_job_chunk(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, &mut pf.kv, weights, pager.as_mut()) {
+            let ahead = engram_lookahead(&pf, state.pager.is_some() && state.engram.is_some());
+            let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, engram, .. } = state;
+            // The next block of Engram rows gathers BESIDE this unit (`EngramAhead`).
+            let p0 = pf.job.pos0() as usize;
+            let Prefill { job, kv, compressed, .. } = &mut pf;
+            let (chunk, gathered) = std::thread::scope(|sc| {
+                let g = match (ahead, engram.as_ref()) {
+                    (Some((a, z)), Some(ec)) => {
+                        let compressed = &*compressed;
+                        Some((a, z, sc.spawn(move || gather_prefill_engram(ec, compressed, p0, a, z))))
+                    }
+                    _ => None,
+                };
+                let chunk = engine.prefill_job_chunk(job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut());
+                let gathered = g.map(|(a, z, h)| (a, z, h.join().unwrap_or_else(|_| Err(eyre!("engram look-ahead gather panicked")))));
+                (chunk, gathered)
+            });
+            match gathered {
+                // A failed look-ahead only costs the overlap: the chunk gathers it.
+                Some((a, z, Ok(rows))) => {
+                    pf.engram_ahead.blocks.push_back((a, z, rows));
+                    pf.engram_ahead.next = z;
+                }
+                Some((a, z, Err(e))) => tracing::warn!(a, z, error = %e, "multistream: Engram look-ahead gather failed; the chunk gathers it"),
+                None => {}
+            }
+            let rows = match chunk {
                 Ok(r) => r,
                 Err(e) => return Err((Some(pf.kv), e)),
             };
@@ -1232,7 +1322,7 @@ impl Sched {
         }
         if let Err(e) = self.arena.fill_reserved(slot, &pf.kv, pos, &state.engine.dgpu.compute) { return Err((Some(pf.kv), e)); }
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
-        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, save_at_finish: _ } = pf;
+        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, save_at_finish: _, engram_ahead: _ } = pf;
         self.spare_states.push(kv_done);
         let pf = PrefillDone { p: pp, job, prefix, compressed, started };
         self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
@@ -2075,28 +2165,56 @@ fn chunk_inputs(pf: &mut Prefill, state: &mut WorkerState) -> eyre::Result<()> {
         hcs.push(v);
     }
     let engram = match (state.pager.as_ref(), state.engram.as_ref()) {
-        (Some(pg), Some(ec)) => {
-            const GATHER_THREADS: usize = 32;
-            let ein = ENGRAM_IN as usize;
-            let n = z - a;
-            let mut rows = vec![vec![0f32; n * ein]; ec.tables.len()];
-            let mut k = 0usize;
-            while k < n {
-                if pf.compressed[p0 + a + k] == v4flash_core::engram_hash::DEAD { k += 1; continue; }
-                let start = k;
-                while k < n && pf.compressed[p0 + a + k] != v4flash_core::engram_hash::DEAD { k += 1; }
-                let hashes: Vec<_> = (start..k).map(|q| ec.hasher.hash_ids(&pf.compressed, p0 + a + q)).collect();
-                for (li, tbl) in ec.tables.iter().enumerate() {
-                    let flat: Vec<i64> = hashes.iter().flat_map(|h| h[li]).collect();
-                    tbl.gather(pg.raw(), &flat, &mut rows[li][start * ein..k * ein], GATHER_THREADS)?;
-                }
+        (Some(_), Some(ec)) => Some(match pf.engram_ahead.take(a, z, ec.tables.len()) {
+            Some(rows) => rows,
+            None => {
+                let rows = gather_prefill_engram(ec, &pf.compressed, p0, a, z)?;
+                pf.engram_ahead.blocks.clear();
+                pf.engram_ahead.next = pf.engram_ahead.next.max(z);
+                rows
             }
-            Some(rows)
-        }
+        }),
         _ => None,
     };
     pf.job.set_chunk_inputs(hcs, engram);
     Ok(())
+}
+
+/// Engram rows of job tokens `[a, z)` (absolute positions `p0 + index`):
+/// batched gathers over runs of live positions, as `EngramCtx::rows_for_chunk`.
+/// Reads through the Engram context's OWN checkpoint handle (`EngramCtx::st`),
+/// so it can run beside a forward that holds the pager (`engram_lookahead`).
+fn gather_prefill_engram(ec: &crate::engine_worker::EngramCtx, compressed: &[i32], p0: usize, a: usize, z: usize) -> eyre::Result<Vec<Vec<f32>>> {
+    const GATHER_THREADS: usize = 32;
+    let ein = ENGRAM_IN as usize;
+    let n = z - a;
+    let mut rows = vec![vec![0f32; n * ein]; ec.tables.len()];
+    let mut k = 0usize;
+    while k < n {
+        if compressed[p0 + a + k] == v4flash_core::engram_hash::DEAD { k += 1; continue; }
+        let start = k;
+        while k < n && compressed[p0 + a + k] != v4flash_core::engram_hash::DEAD { k += 1; }
+        let hashes: Vec<_> = (start..k).map(|q| ec.hasher.hash_ids(compressed, p0 + a + q)).collect();
+        for (li, tbl) in ec.tables.iter().enumerate() {
+            let flat: Vec<i64> = hashes.iter().flat_map(|h| h[li]).collect();
+            tbl.gather(&ec.st, &flat, &mut rows[li][start * ein..k * ein], GATHER_THREADS)?;
+        }
+    }
+    Ok(rows)
+}
+
+/// The next block of Engram rows worth gathering ahead for `pf` (block comment
+/// at `EngramAhead`): from the first row neither consumed nor cached, one chunk
+/// long, while the cache holds less than the job's look-ahead span. `None` when
+/// Engram is off, the job is done, or the cache is full.
+fn engram_lookahead(pf: &Prefill, engram_on: bool) -> Option<(usize, usize)> {
+    if !engram_on || !pf.job.lazy_inputs() || pf.job.chunks_done() {
+        return None;
+    }
+    let ahead = &pf.engram_ahead;
+    let start = ahead.next.max(pf.job.done_rows());
+    let end = (start + pf.job.chunk_rows()).min(pf.job.total());
+    (start < end && ahead.cached_rows() < pf.job.input_lookahead_rows()).then_some((start, end))
 }
 
 fn finish(state: &mut WorkerState, arena: &mut KvArena, s: Stream, f: FinishReason) -> eyre::Result<()> {

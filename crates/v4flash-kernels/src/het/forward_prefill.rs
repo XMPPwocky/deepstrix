@@ -570,6 +570,112 @@ struct ReplayRow {
 // and `checkpoint_ok` is false while one is open.
 // ---------------------------------------------------------------------------
 
+/// `V41_PREFILL_F16_REPLIES` (default ON since 2026-10-01; `0` = f32): box 2
+/// returns a PREFILL request's MoE partial as f16 -- half the bytes on the box-2
+/// link (10.49 -> 5.24 MB per 512-row request; the link was ~46 ms of a ~70 ms
+/// no-paging round trip on 2.5 GbE, estimated ~-15% on long prefills) -- and the
+/// hub widens it to f32 (`widen_f16`) before the unchanged f32 add. Decode
+/// (arena rows) stays f32.
+///
+/// UNTESTED FIDELITY. No KLD / golden gate has been run on f16 partials (owner's
+/// call 2026-10-01: ship now, warn until gated). Box 2's cast rounds to nearest
+/// and turns |x| > 65504 into inf (`widen_partial` logs that loudly). This logs
+/// a WARNING the first time it is read (the scheduler reads it at startup) so it
+/// cannot be forgotten: run the fidelity gate, then delete the warning.
+pub fn prefill_f16_replies() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let on = std::env::var("V41_PREFILL_F16_REPLIES").as_deref() != Ok("0");
+        if on {
+            tracing::warn!(
+                "UNTESTED FIDELITY: prefill box-2 MoE partials travel as f16 (V41_PREFILL_F16_REPLIES, default on since \
+                 2026-10-01). No KLD/golden fidelity gate has been run on this; box 2 turns |partial| > 65504 into inf. \
+                 Set V41_PREFILL_F16_REPLIES=0 for f32 replies. TODO: run the fidelity gate, then remove this warning."
+            );
+        }
+        on
+    })
+}
+
+thread_local! {
+    /// `widen_partial`'s output buffer, handed back after the upload (no 10 MB
+    /// allocation per request).
+    static WIDEN_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Box 2's f16 partial for `layer` widened to f32 (`prefill_f16_replies`). An
+/// inf / NaN in it (box 2's cast saturates |x| > 65504 to inf) is logged as an
+/// ERROR, rate-limited: it means the f16 path is corrupting this prefill.
+fn widen_partial(src: &[u16], layer: i32) -> Vec<f32> {
+    let mut out = WIDEN_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    widen_f16(src, &mut out);
+    if src.iter().any(|&h| h & 0x7c00 == 0x7c00) {
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10)) {
+            *last = Some(std::time::Instant::now());
+            let n = src.iter().filter(|&&h| h & 0x7c00 == 0x7c00).count();
+            tracing::error!(layer, n, "f16 prefill partial from box 2 holds inf/NaN (|x| > 65504?): this prefill is corrupted -- set V41_PREFILL_F16_REPLIES=0");
+        }
+    }
+    out
+}
+
+/// IEEE half bits -> f32, into `out` (resized): F16C when the CPU has it.
+pub fn widen_f16(src: &[u16], out: &mut Vec<f32>) {
+    out.clear();
+    out.resize(src.len(), 0.0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        static F16C: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::arch::is_x86_feature_detected!("f16c") && std::arch::is_x86_feature_detected!("avx"));
+        if *F16C {
+            // SAFETY: the features were detected above.
+            unsafe { widen_f16_f16c(src, out) };
+            return;
+        }
+    }
+    for (o, &h) in out.iter_mut().zip(src) {
+        *o = f16_bits_to_f32(h);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+unsafe fn widen_f16_f16c(src: &[u16], out: &mut [f32]) {
+    use std::arch::x86_64::{__m128i, _mm256_cvtph_ps, _mm256_storeu_ps, _mm_loadu_si128};
+    let n8 = src.len() / 8 * 8;
+    let mut i = 0;
+    while i < n8 {
+        // SAFETY: i + 8 <= len of both slices (out was resized to src.len()).
+        let h = unsafe { _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i) };
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_cvtph_ps(h)) };
+        i += 8;
+    }
+    for j in n8..src.len() {
+        out[j] = f16_bits_to_f32(src[j]);
+    }
+}
+
+/// One IEEE half (bits) as f32, exactly (subnormals, inf, NaN included).
+pub fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h >> 15) << 31;
+    let exp = u32::from((h >> 10) & 0x1f);
+    let man = u32::from(h & 0x3ff);
+    let bits = match (exp, man) {
+        (0, 0) => sign,
+        (0, _) => {
+            // Subnormal: value = man * 2^-24; normalize into an f32 normal.
+            let shift = man.leading_zeros() - 21; // man's top bit to bit 10
+            let m = (man << shift) & 0x3ff;
+            sign | ((127 - 15 + 1 - shift) << 23) | (m << 13)
+        }
+        (0x1f, _) => sign | 0x7f80_0000 | (man << 13),
+        _ => sign | ((exp + 127 - 15) << 23) | (man << 13),
+    };
+    f32::from_bits(bits)
+}
+
 /// `V41_LM_PREFILL=1`: layer-major CED prefill (see the block comment above).
 pub fn lm_prefill_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -819,6 +925,11 @@ impl PrefillJob {
         })
     }
     pub fn total(&self) -> usize { self.tokens.len() }
+    /// Rows of inputs worth preparing ahead of the chunks (the multistream
+    /// Engram look-ahead): one layer-major window, else one chunk.
+    pub fn input_lookahead_rows(&self) -> usize { if self.lm_rows > 0 { self.lm_rows } else { self.chunk_rows } }
+    /// Rows of one chunk (a layer-major window's sub-chunks are at most this).
+    pub fn chunk_rows(&self) -> usize { self.chunk_rows }
     /// Make `state` safe to CHECKPOINT mid-job. Under CED the chunks never run
     /// the decoder layers, so their rings still hold whatever the job started
     /// from (the restored snapshot's rows at `pos0`, or nothing) -- stale by
@@ -9001,15 +9112,13 @@ impl HeterogeneousEngine {
                             // be true whenever we get here, so it worked by coincidence and
                             // would have panicked the moment the two diverged. Now explicit.
                             //
-                            // f32 is LOAD-BEARING: the consumer below calls
-                            // `RemotePartial::f32()`, which asserts `is_f32`. It is not a
-                            // free choice, and asking for f16 panics with "partial is f16"
-                            // (measured 2026-09-14) until an f16 remote-add path exists.
-                            //
-                            // Worth building: at B=512 an f32 partial is 512*5120*4 =
-                            // 10.49 MB/request, 3760 requests = 39.4 GB over a 724 MB/s
-                            // link = ~54 s of a 160 s prefill. f16 halves it. See
-                            // docs/v41/PREFILL_100K_PROFILE.md.
+                            // PREFILL rows ask for f16 (`prefill_f16_replies`, UNTESTED
+                            // fidelity -- see there): the consumer widens it on the host
+                            // (`widen_f16`). Decode (arena rows) keeps f32. At B=512 an
+                            // f32 partial is 512*5120*4 = 10.49 MB/request; on the 2.5 GbE
+                            // box-2 link (293 MB/s, MEASURED 2026-10-01) that is ~46 ms of
+                            // a ~70 ms no-paging round trip, and the round trip is on a
+                            // long prefill's critical path in every window.
                             // MASKED vs UNMASKED. `submit` filters the picks down to what
                             // box 2 ADVERTISED it owns, leaving the rest for box 1. Under
                             // the small-B offload box 1 computes nothing, so a masked
@@ -9036,7 +9145,7 @@ impl HeterogeneousEngine {
                                         .collect();
                                     &ew_for_remote
                                 },
-                                true,
+                                !(prefill_f16_replies() && !decode_rows),
                                 // Another request for this SAME layer follows
                                 // immediately (the other lane, routed next by the
                                 // pipelined driver), so the daemon may hold for it
@@ -10638,7 +10747,11 @@ impl HeterogeneousEngine {
             }
             if remote_add_partial() {
                 let rows = (b as usize) * N_EMBD as usize;
-                let src = partial.f32();
+                let widened = (!partial.is_f32).then(|| widen_partial(partial.f16(), layer));
+                let src: &[f32] = match widened.as_ref() {
+                    Some(w) => w,
+                    None => partial.f32(),
+                };
                 // Hash box 2's HOST-SIDE response before it is copied anywhere.
                 // The combine-dbg print reads the DEVICE buffer after syncing
                 // de.compute, so a repeated value there could be a readback
@@ -10672,6 +10785,9 @@ impl HeterogeneousEngine {
                     .slice_view_mut(0, rows)
                     .copy_from_host(src)?;
                 bd.remote_ffn_moe_valid = true;
+                if let Some(w) = widened {
+                    WIDEN_BUF.with(|c| *c.borrow_mut() = w);
+                }
             }
             remote
                 .lock()
@@ -11357,6 +11473,24 @@ mod remote_sel_tests {
 #[cfg(all(test, feature = "v41"))]
 mod lm_tests {
     use super::*;
+
+    #[test]
+    fn f16_widening_is_exact_for_every_bit_pattern() {
+        // Known values, then the SIMD path (when present) against the scalar
+        // reference on all 65536 halves (NaN payloads compared as bits).
+        for (h, want) in [(0x3c00u16, 1.0f32), (0xc000, -2.0), (0x7bff, 65504.0), (0x0001, 5.960_464_5e-8), (0x0400, 6.103_515_6e-5), (0x8000, -0.0)] {
+            assert_eq!(f16_bits_to_f32(h).to_bits(), want.to_bits(), "{h:#06x}");
+        }
+        assert_eq!(f16_bits_to_f32(0x7c00), f32::INFINITY);
+        assert!(f16_bits_to_f32(0x7e00).is_nan());
+        let all: Vec<u16> = (0..=u16::MAX).collect();
+        let mut out = Vec::new();
+        widen_f16(&all, &mut out);
+        for (&h, &f) in all.iter().zip(&out) {
+            let r = f16_bits_to_f32(h);
+            assert!(f.to_bits() == r.to_bits() || (f.is_nan() && r.is_nan()), "{h:#06x}: {f} vs {r}");
+        }
+    }
 
     #[test]
     fn lm_groups_follow_the_source_layers() {
