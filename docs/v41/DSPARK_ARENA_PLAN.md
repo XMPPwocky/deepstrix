@@ -540,6 +540,32 @@ confidence head, calibrated ONLINE at the production temperature (bucket conf ->
 observed acceptance, EWMA; the 09-17 temp-0 calibration was [4,inf) 0.97,
 [0,1) 0.46). Every input obeys the rule of 2.4.
 
+**The confidence head is the K policy, from the first accept-mode milestone
+(owner 2026-10-01: "we should make sure to use the confidence head").** Replay
+over the reference's recorded per-block confidences and T=1 rejection-sampling
+acceptances (`scripts/v41_oracle/dspark_conf_policy.py`; step costs = the
+09-30..10-01 p50 ladder; K chosen per block to maximize predicted tokens/time
+with `P(accept through k) = prod sigmoid(conf_j)`, uncalibrated), tok/s on the
+55/45 code/reasoning blend of production output:
+
+| streams, drafter | plain | best fixed K | confidence-gated | oracle (true per-block acceptance) |
+|---|---|---|---|---|
+| 1, hidden | 16.7 | 23.7 (1.42x) | 25.6 (1.53x) | 27.8 (1.67x) |
+| 1, 20 ms | 16.7 | 19.7 (1.18x) | 22.6 (1.35x) | 24.4 (1.46x) |
+| 2, hidden | 24.7 | 32.6 (1.32x) | 34.9 (1.42x) | 37.6 (1.52x) |
+| 4, hidden | 37.4 | 39.4 (1.06x) | 43.2 (1.15x) | 46.1 (1.23x) |
+| 4, 20 ms | 37.4 | 35.6 (0.95x) | 41.0 (1.10x) | 43.6 (1.17x) |
+
+The head ranks blocks well: realized E at K=5 by predicted tercile is 2.19 /
+4.59 / 5.56 on code (predicted 2.75 / 4.93 / 5.98) and 1.28 / 1.66 / 2.51 on
+prose (predicted 1.40 / 1.90 / 2.57): slightly optimistic, monotone, which online
+calibration fixes. It is what turns "speculation loses at 4 streams" (fixed K,
+20 ms drafter, 0.95x) into a small win (1.10x). Caveats: one 89-step transcript
+per content type; streams simulated in lockstep on the same transcript.
+Plumbing it needs: `conf` per draft position exported with the drafts (4.3; the
+exit computes it today, `MtpExit::conf`), the online calibration table, and
+per-stream K in the row build (5.2).
+
 Two stages, because `t_draft` is paid before conf exists:
 1. **Draft or not**, per stream, from its recent realized acceptance and the
    current load (a stream whose recent blocks accept little is not drafted, and
@@ -832,11 +858,16 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
   per position (review N5). The per-position `X_k` estimator is kept only for
   confidence calibration. Also measures the drafter's wall cost and iGPU contention.
   Go/no-go for M5.
-* **M5: accept mode, simple K**: point-mass drafts; K=5 for a lone stream and a
-  fixed row budget otherwise; A/B against off per `feedback_e2e_tokps_noise_floor`
-  (suites at production temperature, the distribution of E, never one prompt).
-* **M6: adaptive K and sampled drafts**: the section-6 policy, online confidence
-  calibration, `tau_d` from M0/M4, stream-aligned lane balancing, the 8-row lane
+* **M5: accept mode with confidence-gated K**: point-mass drafts (so a global
+  search over K is exact, 2.4) and K per stream per block chosen from the
+  confidence head against the live step-cost curve (section 6), starting from the
+  head's own sigmoid calibration; A/B against off per
+  `feedback_e2e_tokps_noise_floor` (suites at production temperature, the
+  distribution of E, never one prompt), and against fixed K to confirm the
+  head's gain on real traffic.
+* **M6: sampled drafts and the full policy**: online confidence calibration at the
+  production temperature, the stopping rule for sampled drafts, `tau_d` from
+  M0/M4, the draft-or-not stage, stream-aligned lane balancing, the 8-row lane
   cap.
 * **M7: cost levers** (section 7): drafter attention kernel for gfx1151, drafter
   quantization, drafter under the other lane, early Engram for draft rows, the
