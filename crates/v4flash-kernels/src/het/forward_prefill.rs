@@ -855,6 +855,19 @@ impl PrefillJob {
     /// its early groups then hold more rows than its late ones, so no prefix
     /// length describes the state. (`done_rows` is the last CLOSED window.)
     pub fn checkpoint_ok(&self) -> bool { self.lm.is_none() }
+    /// Is the open layer-major window part-way through a group with MoE layers
+    /// (some of the group's sub-chunks run, some left)? The next unit then needs
+    /// the box-2 experts the group's earlier units just paged, which a decode
+    /// burst in between would evict (decode claims, the delta restore and the
+    /// hub's pin restore all take the prefill class first) -- so the scheduler
+    /// finishes the group before it lets decode in (`V41_MS_FINISH_GROUP`). At a
+    /// group or window boundary the next group's experts were last used a window
+    /// ago: nothing worth keeping. The LAST group (the KV-source-only layer, no
+    /// MoE) is excluded: holding it saves no reads, and the unit that finishes it
+    /// closes the window (a checkpoint may follow), so a hold never closes one.
+    pub fn lm_mid_group(&self) -> bool {
+        self.lm.as_ref().is_some_and(|w| w.sub > 0 && w.group + 1 < lm_groups(crate::config::CED_DECODER_START).len())
+    }
     /// Layer-major windows completed so far (0 = the job ran chunked).
     pub fn lm_windows_run(&self) -> usize { self.lm_windows }
     pub fn chunks_done(&self) -> bool { self.chunk_start >= self.tokens.len() }
@@ -11372,6 +11385,29 @@ mod lm_tests {
         for w in groups.windows(2) {
             assert_eq!(w[0].end, w[1].start);
         }
+    }
+
+    #[test]
+    fn lm_mid_group_only_between_a_groups_sub_chunks() {
+        let mut job = PrefillJob::new(vec![1; 5000], Vec::new(), None, None, 0, 1024).unwrap();
+        assert!(!job.lm_mid_group(), "no window");
+        let subs = lm_plan_window(0, 0, 5000, 1024, (512, 512), &[], 4096).unwrap().unwrap();
+        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default() });
+        assert!(!job.lm_mid_group(), "window open, group not begun");
+        for sub in 1..4 {
+            job.lm.as_mut().unwrap().sub = sub;
+            assert!(job.lm_mid_group(), "group 0 after {sub} of 4 sub-chunks");
+        }
+        let w = job.lm.as_mut().unwrap();
+        (w.group, w.sub) = (1, 0);
+        assert!(!job.lm_mid_group(), "next group not begun");
+        let last = lm_groups(crate::config::CED_DECODER_START).len() - 1;
+        let w = job.lm.as_mut().unwrap();
+        (w.group, w.sub) = (last - 1, 2);
+        assert!(job.lm_mid_group(), "the last MoE group, mid-way");
+        let w = job.lm.as_mut().unwrap();
+        (w.group, w.sub) = (last, 2);
+        assert!(!job.lm_mid_group(), "the KV-source-only group never holds");
     }
 
     #[test]

@@ -250,7 +250,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         (true, None) => { tracing::error!("multistream: V41_MS_DSPARK set but no drafter loaded; DSpark off"); None }
         _ => None,
     };
-    let mut sched = Sched { dsp, profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { dsp, profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -396,6 +396,17 @@ fn spec_lanes_on() -> bool {
     }
     *g = Some((Instant::now(), on));
     on
+}
+
+/// `V41_MS_FINISH_GROUP` (default on; `0` off): a prefill burst whose budget
+/// runs out in the middle of a layer-major group keeps the prefill until the
+/// group's remaining sub-chunks have run (`PrefillJob::lm_mid_group`). Cutting
+/// there let the decode burst evict the group's box-2 pages (decode claims, the
+/// box-2 delta restore and the hub's pin restore all take the prefill class
+/// first) and the next unit page them all again (SF-B, owner's call 10-01).
+fn finish_group() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_FINISH_GROUP").as_deref() != Ok("0"));
+    *B
 }
 
 /// Run-time override of layer-major prefill for NEW jobs: the contents of
@@ -581,6 +592,10 @@ struct Sched {
     bounce_u8: v4flash_hip::DeviceBuffer<u8>,
     phase: Phase,
     phase_since: Instant,
+    /// This prefill burst ran past its budget to finish a layer-major group
+    /// (`finish_group`): since when, and units held. Logged (`hold_ms`,
+    /// `hold_units`) on the `ms.phase` line that ends the burst.
+    group_hold: Option<(Instant, u32)>,
     arena: KvArena,
     dev: RowTablesDev,
     streams: Vec<Stream>,
@@ -857,7 +872,21 @@ impl Sched {
                 if starved {
                     Phase::Prefill
                 } else if self.phase_since.elapsed() >= budget(self.phase) {
-                    match self.phase { Phase::Prefill => Phase::Decode, Phase::Decode => Phase::Prefill }
+                    match self.phase {
+                        // Not in the middle of a layer-major group: its next
+                        // unit needs the box-2 experts the group's earlier units
+                        // just paged (`PrefillJob::lm_mid_group`). At most the
+                        // rest of one group's sub-chunks (under one window's
+                        // rows through <= 6 layers; the sticky job selection in
+                        // `prefill_tick` runs exactly that job's next unit).
+                        Phase::Prefill if finish_group() && self.prefills.iter().any(|p| p.job.lm_mid_group()) => {
+                            let h = self.group_hold.get_or_insert((Instant::now(), 0));
+                            h.1 += 1;
+                            Phase::Prefill
+                        }
+                        Phase::Prefill => Phase::Decode,
+                        Phase::Decode => Phase::Prefill,
+                    }
                 } else {
                     self.phase
                 }
@@ -877,7 +906,8 @@ impl Sched {
             };
             tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(),
                 burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, starved,
-                pin_released, pin_restore, "ms.phase");
+                pin_released, pin_restore, hold_units = self.group_hold.map_or(0, |h| h.1),
+                hold_ms = self.group_hold.map_or(0, |h| h.0.elapsed().as_millis() as u64), "ms.phase");
             let code = |p: &Phase| match p { Phase::Decode => 0.0, Phase::Prefill => 1.0 };
             v4flash_kernels::het::evtrace::emit(&v4flash_kernels::het::evtrace_kinds::HUB_PHASE, &[
                 v4flash_kernels::het::evtrace::now(), code(&self.phase), code(&next), self.streams.len() as f64,
@@ -886,6 +916,7 @@ impl Sched {
             ]);
             self.phase = next;
             self.phase_since = Instant::now();
+            self.group_hold = None;
         }
         match self.phase {
             Phase::Prefill => {
