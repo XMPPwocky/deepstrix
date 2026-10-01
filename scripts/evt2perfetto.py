@@ -278,9 +278,12 @@ def cmd_trace(a):
         rows, live, lanes = int(s['rows']), int(s['live']), s.get('lanes', NAN)
         kind = f'DSpark block K={rows - 1}' if live == 1 and rows > 1 else f'step {rows} rows'
         lanes_s = '' if math.isnan(lanes) else f' {int(lanes)}L'
+        # + the step's device busy time by stage (`d_*` dGPU, `i_*` iGPU; ms
+        # summed over the step, V41_MS_PROFILE): what, not when.
+        stages = {k: s[k] for k in s if k[:2] in ('d_', 'i_') and not math.isnan(s[k]) and s[k] > 0}
         tr.slice(1, 'decode steps', f'{kind}{lanes_s}', s['t_start'], s['t_end'],
-                 fin(s, 'step', 'rows', 'live', 'lanes', 'step_ms', 'fwd_ms', 'remote_wait_ms', 'b2_page_ms', 'b2_misses',
-                     'b1_misses', 'b1_read_ms', 'rf_chain_waits', 'dgpu_busy_ms', 'igpu_busy_ms', 'pos_max'))
+                 {**fin(s, 'step', 'rows', 'live', 'lanes', 'step_ms', 'fwd_ms', 'remote_wait_ms', 'b2_page_ms', 'b2_misses',
+                        'b1_misses', 'b1_read_ms', 'rf_chain_waits', 'dgpu_busy_ms', 'igpu_busy_ms', 'pos_max'), **stages})
         for c in ('remote_wait_ms', 'b2_page_ms', 'b2_misses', 'b1_misses', 'b1_read_ms', 'step_ms'):
             tr.counter(1, c, s['t_start'], s.get(c, NAN))
     for p in hub.get('hub_phase', []):
