@@ -320,6 +320,12 @@ impl Knob {
         if let Some(v) = env(self.name) {
             cands.push((Source::Env, v));
         }
+        // First resolution: an empty source has no current value to keep -- the
+        // next source down decides (a hub starting while a legacy file is empty
+        // must take its env, not the default; review round 18).
+        if self.state.load(Ordering::Acquire) == 0 && !matches!(self.kind, Kind::Text) {
+            cands.retain(|(_, v)| !v.trim().is_empty());
+        }
         match cands.into_iter().next() {
             None => (self.kind.default_bits(), Source::Default, None),
             // Empty (a truncating write in progress, `V41_X=`): keep the
@@ -422,6 +428,15 @@ pub fn pass(knobs: &[&'static Knob], file: &BTreeMap<String, String>, env: &dyn 
             if warned.insert(w.clone()) {
                 out.warnings.push(w);
             }
+        }
+        // `NAME=` in the knob file is more likely a mistake than a truncating
+        // write (an empty FILE is handled whole, `step`): say so, once.
+        let file_val = file.get(k.name).or_else(|| k.alias.and_then(|a| file.get(a)));
+        if k.live && file_val.is_some_and(|v| v.trim().is_empty()) && warned.insert(format!("empty:{}", k.name)) {
+            // (Not `k.show()`: on a first resolution that would resolve -- and
+            // take `RESOLVE`, which the watcher's pass holds.)
+            let now = if k.state.load(Ordering::Acquire) != 0 { k.kind.show(k.bits.load(Ordering::Relaxed)) } else { "its env/default".to_string() };
+            out.warnings.push(format!("{}: empty value in the knob file; keeping {now}", k.name));
         }
         let first = k.state.load(Ordering::Acquire) == 0;
         if !first && !k.live {
@@ -748,8 +763,15 @@ mod tests {
         assert_eq!((K.get(), K.source()), (4, Source::Env));
         pass(&knobs, &BTreeMap::new(), &env_of(&[]), &read, &mut warned);
         assert_eq!((K.get(), K.source()), (6, Source::Default));
-        // an empty value (a truncating write) keeps the current one, silently
+        // an empty value keeps the current one; in the knob file that is
+        // probably a mistake, so it warns (once)
         let p = pass(&knobs, &parse_file("T_MIN_ROWS=\n"), &env_of(&[]), &read, &mut warned);
+        assert_eq!((K.get(), p.warnings.len(), p.changed.len()), (6, 1, 0));
+        assert!(pass(&knobs, &parse_file("T_MIN_ROWS=\n"), &env_of(&[]), &read, &mut warned).warnings.is_empty());
+        // ... and an empty LEGACY file (a truncating `echo 4 > f`) keeps it silently
+        let env_l = env_of(&[("T_MIN_ROWS_FILE", "/empty")]);
+        let read_e = |p: &str| if p == "/empty" { Some(String::new()) } else { None };
+        let p = pass(&knobs, &BTreeMap::new(), &env_l, &read_e, &mut warned);
         assert_eq!((K.get(), p.warnings.len(), p.changed.len()), (6, 0, 0));
         // a bad value that was fixed (the passes above resolved valid) and
         // comes back is reported again, once
@@ -789,6 +811,19 @@ mod tests {
         assert_eq!(p.hooks.len(), 1);
         // no change, no hook
         assert!(pass(&knobs, &parse_file("T_B2_MISS_PAR=8\n"), &env_of(&[]), &read, &mut warned).hooks.is_empty());
+    }
+
+    #[test]
+    fn a_first_resolution_skips_an_empty_source() {
+        // The hub starts while /dev/shm/lm_prefill.txt is empty (created, or
+        // mid-truncating-write): the env decides, not the default.
+        static L: Knob = Knob::flag("T_LM_PREFILL", false).legacy("T_LM_FILE");
+        let knobs: [&'static Knob; 1] = [&L];
+        let env = env_of(&[("T_LM_PREFILL", "1"), ("T_LM_FILE", "/shm/lm")]);
+        let read = |p: &str| if p == "/shm/lm" { Some(" \n".to_string()) } else { None };
+        let p = pass(&knobs, &BTreeMap::new(), &env, &read, &mut HashSet::new());
+        assert_eq!((L.on(), L.source()), (true, Source::Env));
+        assert!(p.warnings.is_empty());
     }
 
     #[test]

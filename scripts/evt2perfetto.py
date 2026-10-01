@@ -2,10 +2,11 @@
 """evtrace (*.evt) -> a perfetto timeline (Chrome JSON; open in ui.perfetto.dev).
 Both boxes on the hub's clock, host time (no per-kernel device slices).
 
-  evt2perfetto.py window HUB.evt --last S [--lone] hub + box-2 RAW windows of the last S s (JSON);
-                                                   --lone: inside the latest run of lone-stream
-                                                   (DSpark) steps lasting >= S (else the longest)
-  evt2perfetto.py cut FILE... --from T --to T -o OUT.evt   records in [T, T] (one file; run on box 2)
+  evt2perfetto.py window HUB.evt --last S [--lone]   hub + box-2 RAW windows of the last S s (JSON);
+                                                     --lone: inside the latest run of lone-stream
+                                                     (DSpark) steps lasting >= S (else the longest)
+  evt2perfetto.py cut FILE... --from T --to T -o PREFIX   one PREFIX.<i>.evt per file holding records
+                                                     in [T, T] (run on box 2; prints the paths)
   evt2perfetto.py trace HUB.evt [B2.evt ...] --from T --to T -o OUT.json[.gz]
 
 Tracks: hub = decode steps (rows / lanes / live; a lone stream with rows > 1 is a
@@ -14,9 +15,14 @@ and the hub's exposed waits, counters per step (box-2 wait / page ms, box-1
 pager misses / read ms, b2 misses); box 2 = requests (frame -> ready), run_path,
 ensure (paging), SSD reads by class (demand / certain / speculative; args: the
 drive route), reply writes. Box-2 stamps are moved onto the hub's
-CLOCK_MONOTONIC_RAW by the hub's measured offset (`offset_fn`).
-Overlapping slices of one kind go on numbered sub-tracks. The evt headers'
-env / knob tables are args of the `knobs` instants. Stdlib only.
+CLOCK_MONOTONIC_RAW by the hub's measured offset (`Offsets`). Overlapping
+slices of one kind go on numbered sub-tracks. The evt headers' env / knob
+tables are args of the `knobs` instants. Stdlib only.
+
+These run next to production: files are STREAMED (64 MB chunks, dropped from
+the page cache once parsed) and only per-bucket clock samples plus the
+window's own records are kept (a hub file holds millions of requests; the hub
+can have ~3 GB free). A record whose first time field is NaN is skipped.
 """
 import argparse
 import gzip
@@ -29,79 +35,37 @@ import sys
 from collections import defaultdict
 
 NAN = float('nan')
-
-
-def offset_fn(reqs, bucket_ns=2e9):
-    """Box-2-minus-hub clock offset as a function of hub time, from the hub's
-    per-request estimates: per 2 s bucket the sample with the smallest link
-    delay, then only the buckets whose best delay is near the link's floor
-    (<= 1.5 x the window's minimum + 20 us). A bucket inside a link-saturating
-    burst (10-01: delays of 14 ms, the offset skewed by ~4 ms) would bend the
-    interpolation by hundreds of us (`evtrace.smoothed_offset` keeps it).
-    Linear between the kept points, extrapolated along the end segments (the
-    RAW clocks drift ~100 ppm apart)."""
-    best = {}
-    for h in reqs:
-        o, d, t = h['clock_offset_ns'], h['clock_delay_ns'], h['t1']
-        if math.isnan(o) or math.isnan(d) or math.isnan(t):
-            continue
-        k = int(t // bucket_ns)
-        if k not in best or d < best[k][1]:
-            best[k] = (t, d, o)
-    if not best:
-        return lambda t: NAN
-    floor = min(d for _, d, _ in best.values())
-    pts = sorted((t, o) for t, d, o in best.values() if d <= 1.5 * floor + 20e3)
-
-    def at(t):
-        if math.isnan(t):
-            return NAN
-        if len(pts) == 1:
-            return pts[0][1]
-        if t <= pts[0][0]:
-            lo, hi = 0, 1
-        elif t >= pts[-1][0]:
-            lo, hi = len(pts) - 2, len(pts) - 1
-        else:
-            lo, hi = 0, len(pts) - 1
-            while hi - lo > 1:
-                mid = (lo + hi) // 2
-                if pts[mid][0] <= t:
-                    lo = mid
-                else:
-                    hi = mid
-        (t0, o0), (t1, o1) = pts[lo], pts[hi]
-        return o0 if t1 == t0 else o0 + (o1 - o0) * (t - t0) / (t1 - t0)
-    return at
 TFIELD = re.compile(r'^t(_|\d|$)')
-
-
-def header_of(data):
-    if data[:4] != b'EVT1':
-        raise ValueError('not an EVT1 file')
-    hlen = struct.unpack_from('<I', data, 4)[0]
-    return hlen, json.loads(data[8:8 + hlen])
-
-
 CHUNK = 64 << 20
+BUCKET = 2e9
+# Records are written close to time order: a file is abandoned this far past
+# the window's end (box-2 background reads are recorded when LANDED, seconds
+# after their read).
+STOP_MARGIN = 30e9
 
 
-def records(path, lo=-math.inf, hi=math.inf, raw=False):
-    """Yield (header, kind name, fields, values[, raw bytes]) of the records
-    whose first finite t-field is in [lo, hi]. Streams the file in 64 MB
-    chunks and drops each from the page cache once parsed (POSIX_FADV_DONTNEED):
-    these files run to 1 GB on boxes whose page cache holds the decode's hot
-    data (Engram rows), and whose free memory can be ~3 GB."""
+def header_of(path):
+    with open(path, 'rb') as f:
+        head = f.read(1 << 22)
+    if head[:4] != b'EVT1':
+        raise ValueError(f'{path}: not an EVT1 file')
+    hlen = struct.unpack_from('<I', head, 4)[0]
+    return hlen, json.loads(head[8:8 + hlen])
+
+
+def records(path, lo=-math.inf, hi=math.inf, raw=False, stop=math.inf):
+    """Yield (t, kind name, fields, values[, raw bytes]) of the records whose
+    first finite t-field `t` is in [lo, hi]; stop at the first record past
+    `stop`. Streams the file (64 MB chunks, POSIX_FADV_DONTNEED after each)."""
+    hlen, header = header_of(path)
+    kinds = {k['id']: (k['name'], k['fields']) for k in header['kinds']}
+    tidx = {kid: [i for i, n in enumerate(fs) if TFIELD.match(n)] for kid, (_, fs) in kinds.items()}
     fd = os.open(path, os.O_RDONLY)
     try:
-        head = os.pread(fd, 1 << 22, 0)
-        hlen, header = header_of(head)
-        kinds = {k['id']: (k['name'], k['fields']) for k in header['kinds']}
-        tidx = {kid: [i for i, n in enumerate(fs) if TFIELD.match(n)] for kid, (_, fs) in kinds.items()}
         cache, pos, buf = {}, 8 + hlen, b''
         while True:
             chunk = os.pread(fd, CHUNK, pos)
-            if hasattr(os, 'posix_fadvise'):
+            if hasattr(os, 'posix_fadvise') and chunk:
                 os.posix_fadvise(fd, pos, len(chunk), os.POSIX_FADV_DONTNEED)
             pos += len(chunk)
             data = buf + chunk
@@ -109,69 +73,100 @@ def records(path, lo=-math.inf, hi=math.inf, raw=False):
             while off + 4 <= n_data:
                 kid, n = struct.unpack_from('<HH', data, off)
                 if off + 4 + 8 * n > n_data:
-                    break  # continues in the next chunk (or the tail of a file being written)
+                    break  # continues in the next chunk (or a file still being written)
                 s = cache.get(n) or cache.setdefault(n, struct.Struct(f'<{n}d'))
                 vals = s.unpack_from(data, off + 4)
                 t = next((vals[i] for i in tidx.get(kid, []) if i < n and not math.isnan(vals[i])), NAN)
+                if t > stop:
+                    return
                 if lo <= t <= hi:
                     name, fields = kinds.get(kid, (f'kind{kid}', [f'f{i}' for i in range(n)]))
                     if raw:
-                        yield header, name, fields, vals, data[off:off + 4 + 8 * n]
+                        yield t, name, fields, vals, data[off:off + 4 + 8 * n]
                     else:
-                        yield header, name, fields, vals
+                        yield t, name, fields, vals
                 off += 4 + 8 * n
             buf = data[off:]
             if not chunk:
-                break
+                return
     finally:
         os.close(fd)
 
 
-def cmd_cut(a):
-    out, head = None, None
-    for p in a.files:
-        for h, _, _, _, rawb in records(p, a.t_from, a.t_to, raw=True):
-            if out is None:
-                with open(p, 'rb') as f:
-                    hlen = struct.unpack_from('<I', f.read(8), 4)[0]
-                with open(p, 'rb') as f:
-                    head = f.read(8 + hlen)
-                out = open(a.o, 'wb')
-                out.write(head)
-            out.write(rawb)
-    if out is None:
-        sys.exit('cut: no records in the window')
-    out.close()
-    print(a.o, os.path.getsize(a.o))
+class Offsets:
+    """Box-2-minus-hub clock offset vs hub time, from the hub's per-request
+    estimates (`hub_req` clock_offset_ns / clock_delay_ns / t1): per 2 s bucket
+    the sample with the smallest link delay. `fn` keeps the buckets whose best
+    delay is near the link's floor -- the 5th percentile of the bucket minima
+    (robust to one bogus sample); keep <= 1.5 x floor + 20 us -- because a
+    bucket inside a link-saturating burst (10-01: delays of 14 ms, the offset
+    skewed ~4 ms by asymmetric queueing) would bend the interpolation by
+    hundreds of us. Linear between kept points; the end segments extrapolate
+    with the slope clamped to +-200 ppm (the RAW clocks drift ~100 ppm)."""
 
+    def __init__(self):
+        self.best = {}
 
-def as_dicts(path, lo, hi):
-    hdr, out = None, defaultdict(list)
-    for h, name, fields, vals in records(path, lo, hi):
-        hdr = h
-        out[name].append(dict(zip(fields, vals)))
-    if hdr is None:
-        with open(path, 'rb') as f:
-            hdr = header_of(f.read(1 << 22))[1]
-    return hdr, out
+    def add(self, r):
+        o, d, t = r['clock_offset_ns'], r['clock_delay_ns'], r['t1']
+        if math.isnan(o) or math.isnan(d) or math.isnan(t) or d <= 0:
+            return
+        k = int(t // BUCKET)
+        if k not in self.best or d < self.best[k][1]:
+            self.best[k] = (t, d, o)
+
+    def fn(self, lo=-math.inf, hi=math.inf):
+        pts = [v for v in self.best.values() if lo <= v[0] <= hi]
+        if not pts:
+            print('offsets: no clock samples; box 2 left unaligned', file=sys.stderr)
+            return lambda t: NAN
+        ds = sorted(d for _, d, _ in pts)
+        floor = ds[int(0.05 * (len(ds) - 1))]
+        kept = sorted((t, o) for t, d, o in pts if d <= 1.5 * floor + 20e3)
+        print(f'offsets: link-delay floor {floor / 1e3:.0f} us, {len(kept)}/{len(pts)} buckets kept', file=sys.stderr)
+        if floor > 1e6:
+            print('offsets: WARNING the link was saturated across the whole range: box 2 may be shifted by '
+                  'up to ~half the floor', file=sys.stderr)
+        clamp = 200e-6
+
+        def at(t):
+            if math.isnan(t):
+                return NAN
+            if len(kept) == 1:
+                return kept[0][1]
+            if t <= kept[0][0] or t >= kept[-1][0]:
+                (t0, o0), (t1, o1) = (kept[0], kept[1]) if t <= kept[0][0] else (kept[-2], kept[-1])
+                slope = 0.0 if t1 == t0 else max(-clamp, min(clamp, (o1 - o0) / (t1 - t0)))
+                anchor = (t0, o0) if t <= kept[0][0] else (t1, o1)
+                return anchor[1] + slope * (t - anchor[0])
+            lo_i, hi_i = 0, len(kept) - 1
+            while hi_i - lo_i > 1:
+                mid = (lo_i + hi_i) // 2
+                if kept[mid][0] <= t:
+                    lo_i = mid
+                else:
+                    hi_i = mid
+            (t0, o0), (t1, o1) = kept[lo_i], kept[hi_i]
+            return o0 if t1 == t0 else o0 + (o1 - o0) * (t - t0) / (t1 - t0)
+        return at
 
 
 def cmd_window(a):
-    """The last `--last` s of the hub file (by its last step), and the matching
-    box-2 RAW window (offset at the window's end, +-2 s for drift)."""
-    last, reqs, runs, run = -math.inf, [], [], None
+    """The last `--last` s of the hub file (by its last step; `--lone`: inside a
+    lone-stream run), and the matching box-2 RAW window (+-2 s for drift).
+    One streaming pass; keeps only clock samples and lone-run bounds."""
+    last, offs, runs, run = -math.inf, Offsets(), [], None
     for _, name, fields, vals in records(a.hub):
         if name == 'hub_step':
             r = dict(zip(fields, vals))
             last = max(last, r['t_end'])
-            # runs of consecutive lone-stream steps (DSpark decodes only these)
             if r['live'] == 1:
                 run = [r['t_start'], r['t_end']] if run is None else [run[0], r['t_end']]
             elif run is not None:
                 runs.append(run)
                 run = None
         elif name == 'hub_req':
-            reqs.append(dict(zip(fields, vals)))
+            offs.add(dict(zip(fields, vals)))
     if run is not None:
         runs.append(run)
     if not math.isfinite(last):
@@ -184,13 +179,166 @@ def cmd_window(a):
         last = pick[1]
         print(f'lone-stream run {(pick[1] - pick[0]) / 1e9:.1f} s ({len(runs)} runs in the file)', file=sys.stderr)
     lo = last - a.last * 1e9
-    off = offset_fn([r for r in reqs if lo - 60e9 <= r['t1'] <= last + 60e9])(last)
-    print(json.dumps({'hub_from': lo, 'hub_to': last, 'offset': off,
-                      'b2_from': lo + off - 2e9, 'b2_to': last + off + 2e9}))
+    off = offs.fn(lo - 300e9, last + 300e9)(last)
+    print(json.dumps({'hub_from': lo, 'hub_to': last, 'offset': off, 'b2_from': lo + off - 2e9, 'b2_to': last + off + 2e9}))
+
+
+def first_t(path):
+    """The first record's time (a 1 MB read): where a rotated file starts. (The
+    header's `t_mono_raw_at_open` is the PROCESS's open, shared by its files.)"""
+    hlen, header = header_of(path)
+    kinds = {k['id']: [i for i, n in enumerate(k['fields']) if TFIELD.match(n)] for k in header['kinds']}
+    with open(path, 'rb') as f:
+        f.seek(8 + hlen)
+        data = f.read(1 << 20)
+    off = 0
+    while off + 4 <= len(data):
+        kid, n = struct.unpack_from('<HH', data, off)
+        if off + 4 + 8 * n > len(data):
+            break
+        vals = struct.unpack_from(f'<{n}d', data, off + 4)
+        t = next((vals[i] for i in kinds.get(kid, []) if i < n and not math.isnan(vals[i])), NAN)
+        if not math.isnan(t):
+            return t
+        off += 4 + 8 * n
+    return math.inf
+
+
+def boot_of(path):
+    """The box's boot (realtime at RAW zero, s): RAW times of files from
+    different boots do not compare."""
+    h = header_of(path)[1]
+    return (h['t_realtime_at_open'] - h['t_mono_raw_at_open']) / 1e9
+
+
+def cmd_cut(a):
+    """One cut per input file whose time span can hold the window (a file spans
+    from its first record to the next file's), each with ITS OWN header: a
+    window across a daemon restart may span two binaries' kind tables. Files of
+    an earlier boot are skipped (their RAW clock restarted)."""
+    boots = {p: boot_of(p) for p in a.files}
+    newest = max(a.files, key=lambda p: header_of(p)[1]['t_realtime_at_open'])
+    same_boot = [p for p in a.files if abs(boots[p] - boots[newest]) < 60]
+    opened = sorted((first_t(p), p) for p in same_boot)
+    written = []
+    for i, (t_open, p) in enumerate(opened):
+        t_next = opened[i + 1][0] if i + 1 < len(opened) else math.inf
+        if t_open > a.t_to or t_next < a.t_from:
+            continue
+        out = None
+        for _, _, _, _, rawb in records(p, a.t_from, a.t_to, raw=True, stop=a.t_to + STOP_MARGIN):
+            if out is None:
+                hlen, _ = header_of(p)
+                with open(p, 'rb') as f:
+                    head = f.read(8 + hlen)
+                path = f'{a.o}.{i}.evt'
+                out = open(path, 'wb')
+                out.write(head)
+                written.append(path)
+            out.write(rawb)
+        if out is not None:
+            out.close()
+    if not written:
+        sys.exit('cut: no records in the window')
+    print(' '.join(written))
+
+
+def cmd_trace(a):
+    hub_hdr = header_of(a.files[0])[1]
+    offs, hub = Offsets(), defaultdict(list)
+    keep_lo, keep_hi = a.t_from - 5e9, a.t_to + 5e9
+    for t, name, fields, vals in records(a.files[0], a.t_from - 300e9, a.t_to + 300e9, stop=a.t_to + 300e9 + STOP_MARGIN):
+        if name == 'hub_req':
+            r = dict(zip(fields, vals))
+            offs.add(r)
+            if keep_lo <= t <= keep_hi:
+                hub[name].append(r)
+        elif keep_lo <= t <= keep_hi:
+            hub[name].append(dict(zip(fields, vals)))
+    b2_hdr, b2 = None, defaultdict(list)
+    for p in a.files[1:]:
+        b2_hdr = header_of(p)[1]
+        for _, name, fields, vals in records(p):
+            b2[name].append(dict(zip(fields, vals)))
+    # Slices are assigned to sub-tracks in START order (records are written at
+    # completion, lanes interleaved, replies out of order).
+    for d, key in ((hub, {'hub_step': 't_start', 'hub_req': 't_submit', 'hub_phase': 't'}),
+                   (b2, {'b2_req': 't_frame', 'b2_ensure': 't_start', 'b2_read': 't_read_start', 'b2_write': 't3'})):
+        for k, f in key.items():
+            d[k].sort(key=lambda r: r[f] if not math.isnan(r[f]) else math.inf)
+    tr = Tracks(a.t_from)
+    tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 1, 'args': {'name': 'hub (box 1)'}})
+    tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 2, 'args': {'name': 'box 2 (expertd), on hub clock'}})
+    inside = lambda t: a.t_from <= t <= a.t_to
+    ex = hub_hdr.get('extras', {})
+    tr.instant(1, 'knobs', 'knobs (hub)', a.t_from, {**ex.get('env', {}), **{f'knob {k}': v for k, v in ex.get('knobs', {}).items()}})
+    for s in hub.get('hub_step', []):
+        if not inside(s['t_start']):
+            continue
+        rows, live, lanes = int(s['rows']), int(s['live']), s.get('lanes', NAN)
+        kind = f'DSpark block K={rows - 1}' if live == 1 and rows > 1 else f'step {rows} rows'
+        lanes_s = '' if math.isnan(lanes) else f' {int(lanes)}L'
+        tr.slice(1, 'decode steps', f'{kind}{lanes_s}', s['t_start'], s['t_end'],
+                 fin(s, 'step', 'rows', 'live', 'lanes', 'step_ms', 'fwd_ms', 'remote_wait_ms', 'b2_page_ms', 'b2_misses',
+                     'b1_misses', 'b1_read_ms', 'rf_chain_waits', 'dgpu_busy_ms', 'igpu_busy_ms', 'pos_max'))
+        for c in ('remote_wait_ms', 'b2_page_ms', 'b2_misses', 'b1_misses', 'b1_read_ms', 'step_ms'):
+            tr.counter(1, c, s['t_start'], s.get(c, NAN))
+    for p in hub.get('hub_phase', []):
+        if inside(p['t']):
+            tr.instant(1, 'phases', 'prefill' if p['to'] == 1 else 'decode', p['t'], fin(p, 'live', 'prefills', 'queued', 'burst_ms', 'starved'))
+    for r in hub.get('hub_req', []):
+        if not inside(r['t_submit']):
+            continue
+        lane = 'AB'[int(r['lane'])] if not math.isnan(r['lane']) and r['lane'] < 2 else '?'
+        name = f"L{int(r['layer'])} b={int(r['b'])}" if not math.isnan(r['layer']) else 'req'
+        args = fin(r, 'step', 'seq', 'rtt_us', 'srv_us', 'page_us', 'compute_us', 'n_miss', 'n_distinct', 'blocked', 'n_surprise')
+        tr.slice(1, f'lane {lane}: box-2 request', name, r['t_submit'], r['t4'], args)
+        if r['t_wait_exit'] > r['t_wait_enter']:
+            tr.slice(1, f'lane {lane}: hub waits', f'wait {name}', r['t_wait_enter'], r['t_wait_exit'], args)
+    if b2:
+        off = offs.fn(a.t_from - 300e9, a.t_to + 300e9)
+        to_hub = lambda t: t - off(t - off(a.t_to)) if not math.isnan(t) else NAN
+        b2ex = (b2_hdr or {}).get('extras', {})
+        tr.instant(2, 'knobs', 'knobs (box 2)', a.t_from, {**b2ex.get('env', {}), **{f'knob {k}': v for k, v in b2ex.get('knobs', {}).items()}})
+        for r in b2.get('b2_req', []):
+            t = to_hub(r['t_frame'])
+            if not inside(t):
+                continue
+            name = f"L{int(r['layer'])} b={int(r['b'])}"
+            args = fin(r, 'seq', 'n_miss', 'page_us', 'compute_us', 'server_us', 'merged', 'served_under', 'n_paged', 'depth_on_take')
+            tr.slice(2, 'requests (frame -> ready)', name, t, to_hub(r['t_ready']), args)
+            tr.slice(2, 'run_path (paging + kernels)', name, to_hub(r['t_run_start']), to_hub(r['t_run_end']), args)
+        for e in b2.get('b2_ensure', []):
+            t = to_hub(e['t_start'])
+            if inside(t) and e['n_miss'] > 0:
+                tr.slice(2, 'ensure (paging)', f"L{int(e['layer'])} miss={int(e['n_miss'])}", t, to_hub(e['t_end']),
+                         fin(e, 'seq', 'n_want', 'n_hits', 'n_miss', 'admit_wait_ns', 'victim_scan_ns', 'k_par'))
+        cls = {0: 'SSD demand reads', 1: 'SSD certain reads', 2: 'SSD certain reads', 3: 'SSD speculative reads'}
+        route = {0: 'split', 1: 'mirror (SN5000)', 2: 'primary (E100)'}
+        for r in b2.get('b2_read', []):
+            t = to_hub(r['t_read_start'])
+            if not inside(t):
+                continue
+            args = fin(r, 'seq', 'layer', 'expert', 'wanted', 'blocked_on', 'yield_ns', 'pause_ns')
+            if not math.isnan(r.get('route', NAN)):
+                args['route'] = route.get(int(r['route']), '?')
+            tr.slice(2, cls.get(int(r['src']), 'SSD reads'), f"L{int(r['layer'])} E{int(r['expert'])}", t, to_hub(r['t_read_end']), args)
+        for w in b2.get('b2_write', []):
+            t = to_hub(w['t3'])
+            if inside(t):
+                tr.slice(2, 'reply writes', f"seq {int(w['seq'])}", t, to_hub(w['t_written']), fin(w, 'bytes'))
+    out = {'traceEvents': tr.ev, 'displayTimeUnit': 'ms',
+           'otherData': {'t0_hub_mono_raw_ns': a.t_from, 'window_s': (a.t_to - a.t_from) / 1e9,
+                         'hub_realtime_at_open': hub_hdr.get('t_realtime_at_open'), 'hub_mono_raw_at_open': hub_hdr.get('t_mono_raw_at_open')}}
+    opener = gzip.open if a.o.endswith('.gz') else open
+    with opener(a.o, 'wt') as f:
+        json.dump(out, f)
+    print(a.o, len(tr.ev), 'events')
 
 
 class Tracks:
-    """Chrome JSON events; overlapping slices of a kind go on numbered sub-tracks."""
+    """Chrome JSON events; overlapping slices of a kind go on numbered
+    sub-tracks (greedy, so feed each kind in start order)."""
 
     def __init__(self, t0):
         self.t0, self.ev, self.lanes, self.tids = t0, [], defaultdict(list), {}
@@ -238,89 +386,6 @@ def fin(r, *keys):
     return {k: r[k] for k in keys if k in r and not math.isnan(r[k])}
 
 
-def cmd_trace(a):
-    hub_hdr, hub = as_dicts(a.files[0], a.t_from - 60e9, a.t_to + 60e9)
-    b2_hdr, b2 = None, defaultdict(list)
-    for p in a.files[1:]:
-        h, recs = as_dicts(p, -math.inf, math.inf)
-        b2_hdr = h
-        for k, v in recs.items():
-            b2[k].extend(v)
-    tr = Tracks(a.t_from)
-    tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 1, 'args': {'name': 'hub (box 1)'}})
-    tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 2, 'args': {'name': 'box 2 (expertd), on hub clock'}})
-    inside = lambda t: a.t_from <= t <= a.t_to
-    # knobs: the headers' env / knob tables
-    ex = hub_hdr.get('extras', {})
-    tr.instant(1, 'knobs', 'knobs (hub)', a.t_from, {**ex.get('env', {}), **{f'knob {k}': v for k, v in ex.get('knobs', {}).items()}})
-    # steps
-    for s in hub.get('hub_step', []):
-        if not inside(s['t_start']):
-            continue
-        rows, live, lanes = int(s['rows']), int(s['live']), s.get('lanes', NAN)
-        kind = f'DSpark block K={rows - 1}' if live == 1 and rows > 1 else f'step {rows} rows'
-        lanes_s = '' if math.isnan(lanes) else f' {int(lanes)}L'
-        tr.slice(1, 'decode steps', f'{kind}{lanes_s}', s['t_start'], s['t_end'],
-                 fin(s, 'step', 'rows', 'live', 'lanes', 'step_ms', 'fwd_ms', 'remote_wait_ms', 'b2_page_ms', 'b2_misses',
-                     'b1_misses', 'b1_read_ms', 'rf_chain_waits', 'dgpu_busy_ms', 'igpu_busy_ms', 'pos_max'))
-        for c in ('remote_wait_ms', 'b2_page_ms', 'b2_misses', 'b1_misses', 'b1_read_ms', 'step_ms'):
-            tr.counter(1, c, s['t_start'], s.get(c, NAN))
-    for p in hub.get('hub_phase', []):
-        if inside(p['t']):
-            tr.instant(1, 'phases', 'prefill' if p['to'] == 1 else 'decode', p['t'], fin(p, 'live', 'prefills', 'queued', 'burst_ms', 'starved'))
-    # box-2 requests as the hub saw them
-    reqs = hub.get('hub_req', [])
-    for r in reqs:
-        if not inside(r['t_submit']):
-            continue
-        lane = 'AB'[int(r['lane'])] if not math.isnan(r['lane']) and r['lane'] < 2 else '?'
-        name = f"L{int(r['layer'])} b={int(r['b'])}" if not math.isnan(r['layer']) else 'req'
-        args = fin(r, 'step', 'seq', 'rtt_us', 'srv_us', 'page_us', 'compute_us', 'n_miss', 'n_distinct', 'blocked', 'n_surprise')
-        tr.slice(1, f'lane {lane}: box-2 request', name, r['t_submit'], r['t4'], args)
-        if r['t_wait_exit'] > r['t_wait_enter']:
-            tr.slice(1, f'lane {lane}: hub waits', f'wait {name}', r['t_wait_enter'], r['t_wait_exit'], args)
-    # box 2, moved onto the hub clock
-    if b2:
-        off = offset_fn(reqs)
-        to_hub = lambda t: t - off(t - off(a.t_to)) if not math.isnan(t) else NAN
-        b2ex = (b2_hdr or {}).get('extras', {})
-        tr.instant(2, 'knobs', 'knobs (box 2)', a.t_from, {**b2ex.get('env', {}), **{f'knob {k}': v for k, v in b2ex.get('knobs', {}).items()}})
-        for r in b2.get('b2_req', []):
-            t = to_hub(r['t_frame'])
-            if not inside(t):
-                continue
-            name = f"L{int(r['layer'])} b={int(r['b'])}"
-            args = fin(r, 'seq', 'n_miss', 'page_us', 'compute_us', 'server_us', 'merged', 'served_under', 'n_paged', 'depth_on_take')
-            tr.slice(2, 'requests (frame -> ready)', name, t, to_hub(r['t_ready']), args)
-            tr.slice(2, 'run_path (paging + kernels)', name, to_hub(r['t_run_start']), to_hub(r['t_run_end']), args)
-        for e in b2.get('b2_ensure', []):
-            t = to_hub(e['t_start'])
-            if inside(t) and e['n_miss'] > 0:
-                tr.slice(2, 'ensure (paging)', f"L{int(e['layer'])} miss={int(e['n_miss'])}", t, to_hub(e['t_end']),
-                         fin(e, 'seq', 'n_want', 'n_hits', 'n_miss', 'admit_wait_ns', 'victim_scan_ns', 'k_par'))
-        cls = {0: 'SSD demand reads', 1: 'SSD certain reads', 2: 'SSD certain reads', 3: 'SSD speculative reads'}
-        route = {0: 'split', 1: 'mirror (SN5000)', 2: 'primary (E100)'}
-        for r in b2.get('b2_read', []):
-            t = to_hub(r['t_read_start'])
-            if not inside(t):
-                continue
-            args = fin(r, 'seq', 'layer', 'expert', 'wanted', 'blocked_on', 'yield_ns', 'pause_ns')
-            if not math.isnan(r.get('route', NAN)):
-                args['route'] = route.get(int(r['route']), '?')
-            tr.slice(2, cls.get(int(r['src']), 'SSD reads'), f"L{int(r['layer'])} E{int(r['expert'])}", t, to_hub(r['t_read_end']), args)
-        for w in b2.get('b2_write', []):
-            t = to_hub(w['t3'])
-            if inside(t):
-                tr.slice(2, 'reply writes', f"seq {int(w['seq'])}", t, to_hub(w['t_written']), fin(w, 'bytes'))
-    out = {'traceEvents': tr.ev, 'displayTimeUnit': 'ms',
-           'otherData': {'t0_hub_mono_raw_ns': a.t_from, 'window_s': (a.t_to - a.t_from) / 1e9,
-                         'hub_realtime_at_open': hub_hdr.get('t_realtime_at_open'), 'hub_mono_raw_at_open': hub_hdr.get('t_mono_raw_at_open')}}
-    opener = gzip.open if a.o.endswith('.gz') else open
-    with opener(a.o, 'wt') as f:
-        json.dump(out, f)
-    print(a.o, len(tr.ev), 'events')
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -332,9 +397,9 @@ def main():
     c.add_argument('files', nargs='+')
     c.add_argument('--from', dest='t_from', type=float, required=True)
     c.add_argument('--to', dest='t_to', type=float, required=True)
-    c.add_argument('-o', required=True)
+    c.add_argument('-o', required=True, help='output prefix: writes PREFIX.<i>.evt per contributing file')
     t = sub.add_parser('trace')
-    t.add_argument('files', nargs='+', help='the hub file first, then box-2 files (cut)')
+    t.add_argument('files', nargs='+', help='the hub file first, then box-2 files (cuts)')
     t.add_argument('--from', dest='t_from', type=float, required=True)
     t.add_argument('--to', dest='t_to', type=float, required=True)
     t.add_argument('-o', required=True)
