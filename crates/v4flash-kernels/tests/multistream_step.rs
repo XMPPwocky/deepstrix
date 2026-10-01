@@ -951,12 +951,12 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         for t in 0..n_steps {
             let dl = max_abs_diff(&logits_spec[s][t], &logits_spec_true[s][t]);
             let da = max_abs_diff(&logits_spec[s][t], &logits_alone[s][t]);
-            let k = kld(&logits_dec[s][t], &logits_spec[s][t]);
+            let k = kld(&logits_alone[s][t], &logits_spec[s][t]);
             g5f_leak += usize::from(dl != 0.0);
             g5f_alone += usize::from(da != 0.0);
             kls_spec.push(k);
             if dl != 0.0 || da != 0.0 {
-                eprintln!("   G5f row s={s} t={t}: |spec-spec_true| {dl:.3e}  |spec-alone| {da:.3e}  KL(dec||spec) {k:.5}  argmax spec/alone {}/{}",
+                eprintln!("   G5f row s={s} t={t}: |spec-spec_true| {dl:.3e}  |spec-alone| {da:.3e}  KL(alone||spec) {k:.5}  argmax spec/alone {}/{}",
                     argmax(&logits_spec[s][t]), argmax(&logits_alone[s][t]));
             }
         }
@@ -964,7 +964,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mean_f = kls_spec.iter().sum::<f64>() / kls_spec.len() as f64;
     let max_f = kls_spec.iter().cloned().fold(0.0, f64::max);
     eprintln!(
-        "G5f: {g5f_leak} of {} kept rows differ between a rejected tail and a correct one (want 0); {g5f_alone} differ from alone; KL(dec||spec) mean {mean_f:.5} max {max_f:.5}",
+        "G5f: {g5f_leak} of {} kept rows differ between a rejected tail and a correct one (want 0); {g5f_alone} differ from alone; KL(alone||spec) mean {mean_f:.5} max {max_f:.5}",
         kls_spec.len()
     );
     // Inexact mode (two-box split: the tail's routing changes the kept rows'
@@ -979,7 +979,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         return Err(eyre!("G5f failed: {g5f_alone} speculative rows differ from one-row steps (MS_ALLOW_INEXACT=1 to report only)"));
     }
     if mean_f > kld_mean_bar || max_f > kld_max_bar {
-        return Err(eyre!("G5f failed: speculative KL mean {mean_f:.5} / max {max_f:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
+        return Err(eyre!("G5f failed: speculative KL(alone||spec) mean {mean_f:.5} / max {max_f:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
     }
     if g5a_fail > 0 && !allow_inexact {
         return Err(eyre!("G5a failed: {g5a_fail} rows not batch-invariant (MS_ALLOW_INEXACT=1 to report only)"));
