@@ -209,7 +209,9 @@ impl MsDspark {
         }
         let n = self.drafting_blocks;
         self.drafting_blocks += 1;
-        let ke = explore(k, cap, n);
+        // The fit an explored block (k + 2 rows) would feed.
+        let target = if two_from.is_some_and(|m| k + 2 >= m) { &self.cost2 } else { &self.cost };
+        let ke = explore(k, cap, n, target.young());
         self.stats.explored += u64::from(ke != k);
         ke
     }
@@ -653,22 +655,37 @@ fn level_prior(n: f64) -> f64 {
 /// A step sample counts at most as this multiple of the CURRENT estimate: one
 /// stall (box-2 paging, a warm-up) moves the fit a bounded step, while a real,
 /// lasting slowdown is still followed (the bound rises with the estimate).
-const STALL_CLAMP: f64 = 1.5;
+/// Tight (1.5x) only while the fit is YOUNG (`young`: what went wrong on 10-01
+/// was a young fit's first samples); a mature fit keeps 3x, so the routine
+/// paging tail -- which grows with rows -- still counts toward its mean and
+/// slope instead of being trimmed into an under-estimate (over-drafting).
+fn stall_clamp(n: f64) -> f64 {
+    if young(n) { 1.5 } else { 3.0 }
+}
+
+/// A fit with fewer than `PRIOR_LEVEL_HALF` (decayed) samples.
+fn young(n: f64) -> bool {
+    n < PRIOR_LEVEL_HALF
+}
 
 /// Every `EXPLORE_EVERY`-th drafting block verifies one draft MORE than the
 /// policy chose (`explore`): the fits only learn from rows the policy picks,
 /// so without it a few bad samples at a row count (one regime) could make the
 /// policy avoid it -- and never sample it again -- for good. ~6% of blocks,
-/// one extra row each (~15 ms, partly repaid by its acceptance).
+/// one extra row each (~15 ms, partly repaid by its acceptance). Every
+/// `EXPLORE_EVERY_YOUNG`-th while the fit those rows would feed is young (after
+/// a restart, or a regime that has not run yet): it matures in ~16 samples.
 const EXPLORE_EVERY: u64 = 16;
+const EXPLORE_EVERY_YOUNG: u64 = 4;
 
 /// `k` for the `n`-th drafting block (0-based): one more on every
-/// `EXPLORE_EVERY`-th, when the policy drafts at all and `cap` allows.
-/// Exactness of the stopping rule is kept: whether draft `k` is verified then
-/// depends on `conf[..=k]` (already read to stop at `k`) and the block count,
-/// never on draft `k` itself.
-pub fn explore(k: usize, cap: usize, n: u64) -> usize {
-    if k >= 1 && k < cap && n % EXPLORE_EVERY == EXPLORE_EVERY - 1 { k + 1 } else { k }
+/// `EXPLORE_EVERY`-th (`EXPLORE_EVERY_YOUNG`-th when `young`), when the policy
+/// drafts at all and `cap` allows. Exactness of the stopping rule is kept:
+/// whether draft `k` is verified then depends on `conf[..=k]` (already read to
+/// stop at `k`), the block count and the fits' past samples, never on draft `k`.
+pub fn explore(k: usize, cap: usize, n: u64, young: bool) -> usize {
+    let every = if young { EXPLORE_EVERY_YOUNG } else { EXPLORE_EVERY };
+    if k >= 1 && k < cap && n % every == every - 1 { k + 1 } else { k }
 }
 
 /// What a lone stream's step and draft cost (ms), for the K policy and the
@@ -798,8 +815,8 @@ impl StepCost {
             return;
         }
         // A stall (box-2 hiccup, seconds of paging, a warm-up) counts, but at
-        // most as `STALL_CLAMP` x the estimate: one sample must not drag the fit.
-        let (x, y) = (rows as f64, ms.min(STALL_CLAMP * self.cost(rows)));
+        // most as `stall_clamp` x the estimate: one sample must not drag the fit.
+        let (x, y) = (rows as f64, ms.min(stall_clamp(self.data[0]) * self.cost(rows)));
         for (s, v) in self.data.iter_mut().zip([1.0, x, x * x, y, x * y]) {
             *s = self.decay * *s + v;
         }
@@ -807,7 +824,13 @@ impl StepCost {
         self.refit();
     }
 
-    /// A draft took `ms`.
+    /// Fewer than `PRIOR_LEVEL_HALF` (decayed) step samples so far.
+    pub fn young(&self) -> bool {
+        young(self.data[0])
+    }
+
+    /// A draft took `ms`. (A plain 3x clamp: drafts are device-bound and
+    /// low-variance, and the EWMA sees every draft, so it cannot freeze.)
     pub fn observe_draft(&mut self, ms: f64) {
         if self.live && ms.is_finite() && ms > 0.0 {
             self.draft = 0.95 * self.draft + 0.05 * ms.min(3.0 * self.draft);
@@ -1142,15 +1165,31 @@ mod tests {
     }
 
     #[test]
-    fn exploration_adds_one_draft_every_sixteenth_drafting_block() {
-        let ks: Vec<usize> = (0..32).map(|n| explore(2, MTP_BLOCK, n)).collect();
+    fn exploration_adds_one_draft_every_sixteenth_drafting_block_fourth_while_young() {
+        let ks: Vec<usize> = (0..32).map(|n| explore(2, MTP_BLOCK, n, false)).collect();
         assert_eq!(ks.iter().filter(|&&k| k == 3).count(), 2);
         assert_eq!((ks[15], ks[31]), (3, 3));
         assert!(ks.iter().enumerate().all(|(n, &k)| k == if n % 16 == 15 { 3 } else { 2 }));
+        // A young target fit: every 4th.
+        assert_eq!((0..32).filter(|&n| explore(2, MTP_BLOCK, n, true) == 3).count(), 8);
         // Never past the cap, never drafts when the policy does not.
-        assert_eq!(explore(MTP_BLOCK, MTP_BLOCK, 15), MTP_BLOCK);
-        assert_eq!(explore(3, 3, 15), 3);
-        assert_eq!(explore(0, MTP_BLOCK, 15), 0);
+        assert_eq!(explore(MTP_BLOCK, MTP_BLOCK, 15, true), MTP_BLOCK);
+        assert_eq!(explore(3, 3, 15, false), 3);
+        assert_eq!(explore(0, MTP_BLOCK, 15, true), 0);
+    }
+
+    #[test]
+    fn a_mature_fit_keeps_the_paging_tail() {
+        // Steps of 100 ms with every 10th a 250 ms paging stall (mean 115):
+        // the mature fit must land near the mean, not near a tail trimmed at
+        // 1.5x (~107.5); a young one may trim.
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
+        assert!(c.young());
+        for i in 0..3000 {
+            c.observe_step(4, if i % 10 == 9 { 250.0 } else { 100.0 });
+        }
+        assert!(!c.young());
+        assert!((c.cost(4) - 115.0).abs() < 4.0, "cost(4) {}", c.cost(4));
     }
 
     #[test]
