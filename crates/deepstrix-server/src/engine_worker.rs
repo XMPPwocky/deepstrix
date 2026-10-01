@@ -2948,6 +2948,11 @@ fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyr
         }
         lanes_used += 1;
     }
+    // Consumed: a capture seeds at most once. A later request whose prompt is
+    // restored in full runs no prefill (nothing re-zeroes the counts), and must
+    // start cold rather than seed these rows again.
+    state.bd_a.mtp_captured = 0;
+    state.bd_b.mtp_captured = 0;
     let Some(&last) = by_pos.keys().next_back() else {
         return Ok(());
     };
@@ -2990,9 +2995,10 @@ fn finish_decode(
     //
     // The prompt's positions are real context the drafter should already have.
     // The batched prefill captured the last `mtp_captured` main-model residuals
-    // (see `MTP_CAP_ROWS`), so replay the drafter over them here -- same
-    // `advance_ring` the accept path uses: full layer forward (ring + carry),
-    // skipping only the exit. `V41_DSPARK_SEED_RING=0` disables.
+    // of each lane (see `MTP_CAP_ROWS`); `seed_mtp_ring` merges both lanes by
+    // position and writes them into the drafter's KV ring with the cheap
+    // `ring_write_only` (a ring row depends only on the main residual at its
+    // position). `V41_DSPARK_SEED_RING=0` disables.
     #[cfg(feature = "v41")]
     if state.mtp.is_some()
         && std::env::var("V41_DSPARK_SEED_RING").as_deref() != Ok("0")
@@ -4201,6 +4207,13 @@ fn finish_decode(
             if cut < toks.len() {
                 state.bd_b.mtp_src.copy_to_host(&mut whole_b)?;
             }
+            // Consumed (the rows now live in `whole`/`whole_b`): clear the
+            // counts so nothing later treats them as a capture. Otherwise a
+            // later request whose prompt is restored in full runs no prefill,
+            // and `seed_mtp_ring` would seed the drafter ring with THIS verify's
+            // rows (they pass its "ends at or before start_pos" guard).
+            state.bd_a.mtp_captured = 0;
+            state.bd_b.mtp_captured = 0;
             let lane_row = |r: usize| -> (&Vec<f32>, usize) {
                 let (buf, lr) = if r < cut { (&whole, r) } else { (&whole_b, r - cut) };
                 // LANE-LOCAL row, never a global one: `mtp_src` holds at most
@@ -5204,7 +5217,7 @@ fn prefill_suffix(
     }
     // DSpark prefill ring seeding: have the batched path capture the last
     // MTP_CAP_ROWS main-model residuals of this prefill so `seed_mtp_ring` can
-    // replay the drafter over them. Costs one `hc_weighted` launch per MTP
+    // write them into the drafter's ring. Costs one `hc_weighted` launch per MTP
     // source layer per chunk and nothing when no drafter is loaded.
     #[cfg(feature = "v41")]
     {

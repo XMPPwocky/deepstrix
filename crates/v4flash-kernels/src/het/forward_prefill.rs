@@ -3647,9 +3647,9 @@ impl HeterogeneousEngine {
                         crate::config::N_HC,
                         n as u32,
                     )?;
-                    // Which absolute positions these rows are. Both lanes may
-                    // capture; the caller takes whichever ran LATER (higher
-                    // pos0), since that lane holds the most recent positions.
+                    // Which absolute positions these rows are. Both lanes
+                    // capture (a two-lane chunk splits its rows between them);
+                    // `seed_mtp_ring` merges the lanes by absolute position.
                     bd.mtp_captured = n;
                     bd.mtp_captured_pos0 = pos0 + skip as u32;
                 }

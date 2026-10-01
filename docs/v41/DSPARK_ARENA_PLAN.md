@@ -5,7 +5,7 @@ Status: PLAN. Review round 1: APPROVE WITH CHANGES (15 findings, addressed in
 rev 1; one pushed back: the production row mix, 1.3). Round 2: APPROVE WITH
 CHANGES (N1-N7, addressed in rev 2). Round 3: APPROVE WITH CHANGES (R3-1..R3-5,
 addressed in rev 3: paired gate + more reference positions, what 4.382 means,
-A4 CED seeding, test hardening, the drafter KV quantizer FIXED in a6baf76, CPU
+A4 CED seeding, test hardening, the drafter KV quantizer FIXED in 6ab2c43, CPU
 bisect first). **Round 4: APPROVE** (the new drafter KV chain verified step for
 step against the main model's V4.1 chain and the reference quantizer; minor
 R4-1..R4-4 folded in: one numeric pass rule, JSON check no longer silent, iGPU
@@ -385,7 +385,7 @@ logits on the dGPU, then a serial markov loop adds a bias from the previous draf
 and takes argmax (`mtp.rs` ~1628). Cost: device ~17 ms (attention 8.5, MoE 7.3,
 mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
 `WorkerState`) and loading it today turns multistream off for every request
-(`multistream.rs` ~347: `is_legacy = move |_p| mtp_on`).
+(`multistream.rs` ~401: `is_legacy = move |_p| mtp_on`).
 
 4.1 **Per-stream state is the ring.** Each drafter layer keeps a `[133 x 512]` f16
     ring (128 window + 5 transient block rows); `embed()` overwrites the hidden
@@ -400,11 +400,13 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
     draft forward itself writes the row for its own `pos` (`mtp.rs` ~1110) and
     bumps `ring_writes` (~935). So after a block with `keep` kept rows,
     `ring_write_only` writes rows 0..keep-2 and the next draft writes row keep-1;
-    a stream that will NOT draft next step writes all `keep` rows; seeding writes
-    every captured prefill row except the last (the legacy pairing,
-    `engine_worker.rs` ~2921); if the new stream does NOT draft at its first
-    decode step, that last prefill row is written by `ring_write_only` right
-    after admission (review N7). A ring write is not free: `entry()` runs
+    a stream that will NOT draft next step writes all `keep` rows. Seeding: in
+    the ARENA flow the first draft is at the last prefill row, so seeding writes
+    every captured row except the last, and if the new stream does NOT draft at
+    its first decode step that last row is written by `ring_write_only` right
+    after admission (review N7). (The legacy driver's first draft comes after a
+    bootstrap decode step at `start_pos`, so its `seed_mtp_ring` writes every
+    captured row INCLUDING the last; 06c90dd.) A ring write is not free: `entry()` runs
     `main_proj` (~83 MB of weights) per row, so batch ring writes across rows and
     streams with `matvec_bpack`.
     Layout: one `[n_slots x 133 x 512]` f16 buffer per drafter layer (~3.4 MB for
@@ -469,8 +471,11 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
 5.1 **Routing.** Delete `is_legacy = mtp_on`; DSpark becomes a per-stream property
     on the arena path (`V41_MS_DSPARK=off|shadow|accept`), so a DSpark server keeps
     multistream. Requests keep the legacy path only for what still needs it (none,
-    once M8 lands).
-5.2 **`decode_step` row build** (~822): per stream, rows `[next, d_0..d_{K_s-1}]`
+    once M8 lands). Also change main's legacy-state stub condition
+    (`engine_worker.rs` ~1098: `multistream::enabled() && mtp.is_none()`) and the
+    guard at `multistream.rs` ~431: otherwise a DSpark server on the arena keeps
+    ~1.07 GB of idle full-context legacy state on the dGPU (count it under R5).
+5.2 **`decode_step` row build** (~937): per stream, rows `[next, d_0..d_{K_s-1}]`
     contiguous and in ONE lane; Engram hashes for draft rows from `s.seq` + the
     drafts; tables with per-row positions; lane split balances ROWS not streams.
 5.3 **After the forward**: `head_rows` (already full logits) -> per-stream block
@@ -488,7 +493,10 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
     only the verify clears it, and the arena guard would then fail a step.
 5.7 **Clamp K before `tables()`**: `K_s <= max_new - completion - 1` and <= the
     stream's region headroom (raw and every store). `tables()` returns `Err` on a
-    full region, and a failed step aborts every stream (`multistream.rs` ~210).
+    full region, and a failed step aborts every stream (`multistream.rs` ~336).
+    Main's `KvArena::can_step` (`kv_arena.rs` ~542) assumes ONE position per step
+    (`pos + 1`), and `take_stalled` / `grow` size regions on that basis: both must
+    learn `1 + K_s` positions per stream before draft rows exist.
 5.8 **Failure domain**: a drafter error sets that stream's K to 0 (plain decode),
     never `abort_all`; a drafter that keeps failing is disabled with a log line.
 5.9 **Snapshots without residuals**: checkpoint snapshots taken under CED carry
@@ -590,7 +598,8 @@ the arena's per-stream KV headroom.
   equals `alone`, which proves rejected raw/comp rows, keys and stash are
   discarded. Cases: blocks starting at both ratio-2 parities (L2/8/14 fire every
   other row, L20 every row), rejections at both parities, `n_raw` below and at W,
-  a block crossing `KV_CACHE_ROWS` (compaction), positions crossing 512 comp rows
+  a block crossing the arena's raw region (`ARENA_RAW_ROWS` = 128 + 128 since
+  main's b6e5e10, compaction), positions crossing 512 comp rows
   (pos 512 at ratio 1, 1024 at ratio 2) so the indexer fires mid-stream, the CED
   decoder window, every index-source layer, mixed steps (A at K=3 beside B, C at
   K=0) equal to their alone runs, all three lane drivers with streams whole,
@@ -647,7 +656,7 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     on `main` (1,006 tokens, ~740 steps; its current `dspark_accept.json` predates
     the ffn_norm fix), `gen` and `gen_dspark` (needs ~13+ GB of RAM for the
     oracle's expert cache, so also a hub-down item unless the cache is trimmed).
-    **Fixed before the first run** (a6baf76): the drafter's ring and block KV
+    **Fixed before the first run** (6ab2c43): the drafter's ring and block KV
     used the V4-era `kv_post_fused` (E4M3, power-of-two scale per 64 over the first 448
     dims, RoPE tail unquantized), a DIFFERENT quantizer from the reference's
     `act_quant` (E4M3, ue8m0 scale per 32 over all 512 dims); now it is the main
@@ -667,7 +676,7 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     | base, legacy quantizer | 3.719 | 4.382 | [-0.99, -0.32] | 0.854 |
     | nomarkov | 1.831 | 2.382 | [-0.97, -0.20] | 0.573 |
 
-    **A1 PASSED after the shared-expert fix (dca8467; window 20:02-20:04, hub
+    **A1 PASSED after the shared-expert fix (761e46f; window 20:02-20:04, hub
     only, logs ~/logs/dspark_parity_20260927_fix):**
 
     | run | E ours | E ref | 90% paired interval | d1 draft == ref | agreement given identical earlier drafts, d1..d5 |
