@@ -25,6 +25,7 @@
 //! - [`Store`] (here): the scheduler-thread facade over all of them.
 
 pub mod format;
+pub mod index;
 pub mod keys;
 
 /// Positions per chunk (4.2). Equals the production prefill chunk
