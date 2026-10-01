@@ -432,6 +432,42 @@ pub mod hot_set {
         Some(OWN[layer as usize * NE + e as usize].load(Relaxed))
     }
     pub fn picks_seen() -> u64 { TOTAL.load(Relaxed) }
+
+    /// Decode-LRU slots of box 1's pool, published by `ExpertPager::new`
+    /// (0 = no pager yet: the size is not clamped).
+    static CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    pub fn set_capacity(decode_slots: usize) {
+        CAPACITY.store(decode_slots, Relaxed);
+    }
+
+    /// The hot set's size per layer that fits `decode_slots` of pool with
+    /// `slack` slots per layer to spare (newcomers land before the departed are
+    /// evicted).
+    pub fn fit_per_layer(want: usize, decode_slots: usize, slack: usize) -> usize {
+        if decode_slots == 0 {
+            return want;
+        }
+        want.min((decode_slots / NL).saturating_sub(slack).max(1))
+    }
+
+    /// Experts box 1 owns per layer: `V41_B1_HOT_PER_LAYER` (default 90)
+    /// CLAMPED to what the pool's decode LRU holds resident, less
+    /// `V41_B1_HOT_SLACK` (default 2) per layer. Owning an expert is a routing
+    /// promise (box 2 skips it), so an owned expert that does not fit is a
+    /// synchronous box-1 read on the critical path each time it is picked. The
+    /// size used to be a free knob that nothing re-derived when the pool
+    /// shrank: production owned 4,120 in 4,070 decode slots once the 384-slot
+    /// prefill band existed, a DSpark hub (7.93 GB drafter) 4,120 in 3,613.
+    pub fn per_layer() -> usize {
+        let want = env_u("V41_B1_HOT_PER_LAYER", 90).min(NE);
+        let cap = CAPACITY.load(Relaxed);
+        let fit = fit_per_layer(want, cap, env_u("V41_B1_HOT_SLACK", 2));
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if fit < want && !LOGGED.swap(true, Relaxed) {
+            tracing::warn!(want, fit, decode_slots = cap, "box-1 hot set CLAMPED to the pool's decode LRU (V41_B1_HOT_PER_LAYER does not fit)");
+        }
+        fit
+    }
     fn env_f(k: &str, d: f32) -> f32 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
     fn env_u(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
     /// Recompute the ownership from the counts and decay them. Returns
@@ -441,7 +477,7 @@ pub mod hot_set {
         if !enabled() || TOTAL.load(Relaxed) < env_u("V41_B1_HOT_MIN_PICKS", 20_000) as u64 {
             return None;
         }
-        let per_layer = env_u("V41_B1_HOT_PER_LAYER", 90).min(NE);
+        let per_layer = per_layer();
         let mass_cap = env_f("V41_B1_HOT_MASS", 0.9).clamp(0.0, 1.0);
         // HYSTERESIS (`V41_B1_HOT_HYST`, default 40 ranks): an incumbent keeps
         // its slot until it falls below rank per_layer + hyst; newcomers only
@@ -552,6 +588,20 @@ pub mod hot_set {
             assert!((0..3).all(|e| box1_owns(0, e) == Some(true)), "strongest incumbents kept");
             assert_eq!(box1_owns(0, 3), Some(false), "the weakest incumbent left");
             std::env::set_var("V41_B1_HOT_MAX_CHANGE", "0");
+        }
+
+        /// The size never exceeds what the decode LRU holds (less slack); an
+        /// unknown capacity leaves the knob alone.
+        #[test]
+        fn hot_set_fits_the_pool() {
+            // 2026-10-01 production: 4,070 decode slots, knob 103 -> 99.
+            assert_eq!(fit_per_layer(103, 4070, 2), 99);
+            // DSpark hub (drafter takes 7.93 GB): 3,613 slots -> 88.
+            assert_eq!(fit_per_layer(103, 3613, 2), 88);
+            // A knob that fits is kept; no pager = no clamp; never 0.
+            assert_eq!(fit_per_layer(80, 4070, 2), 80);
+            assert_eq!(fit_per_layer(103, 0, 2), 103);
+            assert_eq!(fit_per_layer(103, 40, 2), 1);
         }
     }
 }
@@ -1296,6 +1346,8 @@ impl ExpertPager {
         let ub = up_bpe * pager_read_batch();
         let db = down_bpe * pager_read_batch();
         let lru_lo = dense_windows.saturating_sub(1) * window_stride + N_EXPERT;
+        // The hot set must fit what this pool keeps resident for decode.
+        hot_set::set_capacity(n_slots.saturating_sub(lru_lo) as usize);
         eprintln!(
             "expert pager: {total_windows} windows of {N_EXPERT}; prefill dense = {dense_windows} \
              (pinned layers 0..{}, rest rotate; ced={ced}, ceiling {prefill_ceiling}, decode_frac {decode_frac:.2}), \

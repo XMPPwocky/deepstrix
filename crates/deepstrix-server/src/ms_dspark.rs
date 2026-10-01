@@ -100,6 +100,11 @@ struct Stats {
 
 pub struct MsDspark {
     slots: Vec<SlotDraft>,
+    /// EWMA of a plain one-row step's wall (ms), the stage-1 baseline: a
+    /// drafted block pays when it emits more per ms than a plain step NOW
+    /// (a cold pool slows both; the static ladder made cold blocks look like
+    /// losses and backed off 324 steps of a code stream, 2026-10-01).
+    plain_ms: f64,
     stats: Stats,
     since: Instant,
 }
@@ -112,7 +117,7 @@ impl MsDspark {
             let rings = mtp.state.rings.iter().map(|r| DeviceBuffer::<u16>::new(igpu_id, r.len())).collect::<eyre::Result<Vec<_>>>()?;
             slots.push(SlotDraft { rings, writes: 0, last_ring_pos: None, hidden: None, gain: GAIN0, skip_left: 0, backoff: 0, last_draft_ms: 0.0 });
         }
-        Ok(Self { slots, stats: Stats::default(), since: Instant::now() })
+        Ok(Self { slots, plain_ms: step_cost(1), stats: Stats::default(), since: Instant::now() })
     }
 
     fn slot(&mut self, slot: u32) -> eyre::Result<&mut SlotDraft> {
@@ -257,11 +262,19 @@ impl MsDspark {
         Ok(Some((ids, mtp.exit.conf)))
     }
 
+    /// A plain one-row decode step took `ms` (no drafts): the stage-1 baseline.
+    pub fn note_plain_step(&mut self, ms: f64) {
+        if ms.is_finite() && ms > 0.0 {
+            self.plain_ms = 0.9 * self.plain_ms + 0.1 * ms;
+        }
+    }
+
     /// Account one verified block of `slot` (stage-1 gain, stats) and log a
     /// rollup every 50 blocks.
     pub fn record(&mut self, slot: u32, k: usize, accepted: usize, emitted: usize, step_ms: f64) {
+        let plain_ms = self.plain_ms;
         if let Ok(sd) = self.slot(slot) {
-            let g = emitted as f64 * step_cost(1) / (step_ms + sd.last_draft_ms).max(1.0);
+            let g = emitted as f64 * plain_ms / (step_ms + sd.last_draft_ms).max(1.0);
             // A probe after a back-off moves the estimate half way at once.
             let a = if sd.backoff > 0 { 0.5 } else { 0.25 };
             sd.gain = (1.0 - a) * sd.gain + a * g;
@@ -292,6 +305,7 @@ impl MsDspark {
                 k_hist = ?s.k_hist,
                 no_hidden = s.no_hidden,
                 skipped_steps = s.skipped,
+                plain_ms = format!("{:.1}", self.plain_ms),
                 window_s = self.since.elapsed().as_secs(),
                 "ms dspark: blocks"
             );

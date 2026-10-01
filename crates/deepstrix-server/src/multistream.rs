@@ -1567,6 +1567,8 @@ impl Sched {
             }
             if let Some((k, accepted, emitted)) = spec_out {
                 dsp.record(self.streams[0].slot, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3);
+            } else if b == 1 {
+                dsp.note_plain_step(t0.elapsed().as_secs_f64() * 1e3);
             }
         }
         for (r, f) in done.into_iter().rev() {
