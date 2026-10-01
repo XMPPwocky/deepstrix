@@ -315,15 +315,29 @@ fn step_cost(rows: usize) -> f64 {
     c[n - 1] + (c[n - 1] - c[n - 2]) * (rows - n) as f64
 }
 
+/// `V41_MS_DSPARK_K`: verify exactly this many drafts (capped like the policy).
+fn fixed_k() -> Option<usize> {
+    static FIXED: LazyLock<Option<usize>> =
+        LazyLock::new(|| std::env::var("V41_MS_DSPARK_K").ok().and_then(|v| v.parse().ok()));
+    *FIXED
+}
+
+/// Most drafts a block may verify: `V41_MS_DSPARK_K` if set (0 = never draft,
+/// the plain-decode control on the same binary), else `V41_MS_DSPARK_KMAX`
+/// (default the block size).
+pub fn k_max() -> usize {
+    static KMAX: LazyLock<usize> =
+        LazyLock::new(|| std::env::var("V41_MS_DSPARK_KMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(MTP_BLOCK));
+    fixed_k().unwrap_or(*KMAX).min(MTP_BLOCK)
+}
+
 /// How many drafts to verify (plan section 6, point-mass tests: any K rule is
 /// exact, 2.4): maximize expected tokens per ms, `E(K) = 1 + sum_{k<=K}
 /// prod_{j<k} sigmoid(conf_j)` over `cost(1 + K) + draft`, the draft being
 /// paid either way. `V41_MS_DSPARK_K` fixes K (capped like the policy).
 pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize) -> usize {
     let cap = cap.min(MTP_BLOCK);
-    static FIXED: LazyLock<Option<usize>> =
-        LazyLock::new(|| std::env::var("V41_MS_DSPARK_K").ok().and_then(|v| v.parse().ok()));
-    if let Some(k) = *FIXED {
+    if let Some(k) = fixed_k() {
         return k.min(cap);
     }
     let draft = env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0);

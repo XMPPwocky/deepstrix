@@ -1082,7 +1082,7 @@ impl Sched {
                 let s = &self.streams[0];
                 let pos = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
                 let remaining = s.max_new.saturating_sub(s.completion_tokens as usize);
-                let mut cap = remaining.saturating_sub(1).min(v4flash_kernels::het::mtp::MTP_BLOCK);
+                let mut cap = remaining.saturating_sub(1).min(ms_dspark::k_max());
                 while cap > 0 && !self.arena.can_step_rows(s.slot, 1 + cap as u32) {
                     cap -= 1;
                 }
@@ -1277,7 +1277,8 @@ impl Sched {
         })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
         // The drafter's input for every row (lane-local captures, in row order).
-        let caps: Vec<Vec<f32>> = if self.dsp.is_some() {
+        // A failed readback costs the drafts (no ring rows, no next draft), never the step.
+        let caps: Option<Vec<Vec<f32>>> = if self.dsp.is_some() {
             let sizes: Vec<usize> = if lanes3 {
                 (0..3).map(|i| b / 3 + usize::from(i < b % 3)).collect()
             } else if stagger2 || pipelined {
@@ -1287,12 +1288,20 @@ impl Sched {
             };
             let lanes: [&v4flash_kernels::het::batch_scratch::BatchDgpuScratch; 3] = [&*bd_a, &*bd_b, &*bd_c];
             let mut v = Vec::with_capacity(b);
+            let mut r = Ok(());
             for (bd, n) in lanes.iter().zip(sizes) {
-                v.extend(ms_dspark::lane_captures(bd, n)?);
+                match ms_dspark::lane_captures(bd, n) {
+                    Ok(c) => v.extend(c),
+                    Err(e) => { r = Err(e); break; }
+                }
             }
-            v
+            match r {
+                Ok(()) if v.len() == b => Some(v),
+                Ok(()) => { tracing::warn!(rows = b, captured = v.len(), "ms dspark: captures do not cover the step"); None }
+                Err(e) => { tracing::warn!(error = %e, "ms dspark: capture readback failed"); None }
+            }
         } else {
-            Vec::new()
+            None
         };
         // Box-2 pinning (`V41_B2_PIN`), drained EVERY step so `hub_step`
         // carries them with or without the profile: `b2_surprises` must stay
@@ -1540,7 +1549,7 @@ impl Sched {
             self.arena.accept(s.slot, keep, &state.engine.dgpu.compute)?;
         }
         // Kept rows into the drafter rings; the last one feeds the next draft.
-        if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
+        if let (Some(dsp), Some(m), Some(caps)) = (self.dsp.as_mut(), state.mtp.as_mut(), caps.as_ref()) {
             let write = dsp.ring_all() || spec;
             for (i, s) in self.streams.iter().enumerate() {
                 if done.iter().any(|&(d, _)| d == i) {
