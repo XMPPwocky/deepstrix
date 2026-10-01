@@ -164,7 +164,10 @@ pub struct Track {
 /// the file alongside tracing-perfetto's host-time packets (same
 /// writer); the parser concatenates them transparently.
 pub struct DeviceTimingExporter {
-    writer: Mutex<File>,
+    /// BUFFERED: a 2-lane arena step emits thousands of slices, and one
+    /// `write` syscall each distorted the very timing being traced. Flushed
+    /// by `flush` (every exported step) and on drop.
+    writer: Mutex<std::io::BufWriter<File>>,
     seq_id: u32,
     pub dgpu_compute: Track,
     pub dgpu_xfer: Track,
@@ -239,7 +242,7 @@ impl DeviceTimingExporter {
             anchor: Anchor::new(igpu_xfer_stream, igpu)?,
         };
 
-        let writer = Mutex::new(file);
+        let writer = Mutex::new(std::io::BufWriter::with_capacity(1 << 20, file));
         let mut this = Self {
             writer,
             seq_id,
@@ -265,6 +268,13 @@ impl DeviceTimingExporter {
         this.declare_track(this.knobs_uuid, "knobs")?;
         this.emit_knobs(true)?;
         Ok(this)
+    }
+
+    /// Write out the buffered packets (a step boundary; the file is read while
+    /// the process runs, or after it is killed).
+    pub fn flush(&self) -> eyre::Result<()> {
+        self.writer.lock().unwrap().flush()?;
+        Ok(())
     }
 
     /// The `knobs` track: the whole table when `snapshot`, then the live

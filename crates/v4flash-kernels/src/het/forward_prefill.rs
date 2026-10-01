@@ -1010,21 +1010,11 @@ impl PrefillJob {
 }
 
 impl HeterogeneousEngine {
+    /// A prefill unit's pairs (it reset the pools when it began). By the
+    /// watermark (`flush_perfetto`): a later export -- the arena step's, the
+    /// drafter's -- must not write them again.
     fn emit_prefill_perfetto(&self) -> eyre::Result<()> {
-        if let Some(exp_lock) = &self.perfetto {
-            let mut exp = exp_lock.lock().unwrap();
-            self.dgpu.events.for_each_pair(|name, s, e| {
-                let track = if name.contains(".xfer") || name.contains(".peer_push") { &exp.dgpu_xfer } else { &exp.dgpu_compute };
-                exp.emit_slice(track, name, s, e)
-            })?;
-            self.igpu.events.for_each_pair(|name, s, e| {
-                let track = if name.contains(".xfer") || name.contains(".peer_push") { &exp.igpu_xfer } else { &exp.igpu_compute };
-                exp.emit_slice(track, name, s, e)
-            })?;
-            exp.re_anchor(self.dgpu.device, &self.dgpu.compute, &self.dgpu.xfer, self.igpu.device, &self.igpu.compute, &self.igpu.xfer)?;
-            self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(())
+        self.flush_perfetto()
     }
 
     /// Layer-major: is a window open (opening one if at least two chunks fit)?
@@ -9281,6 +9271,9 @@ impl HeterogeneousEngine {
                     eprintln!("[ensure-audit] L{layer} b={b} replay_offload={replay_offload} sparse_resid={sparse_resid} ids={} first={:?} owns_remote={} remote_split_on={remote_split_on}",
                         ids.len(), ids.first(), owns_remote_some);
                 }
+                // Box-1 paging on the arena / prefill path, as the serial path
+                // draws it (`expert pager (host)` track).
+                let t_ens_ns = self.perfetto.is_some().then(super::perfetto::now_ns);
                 if replay_offload {
                     ids.clear();
                 } else if sparse_resid {
@@ -9339,6 +9332,11 @@ impl HeterogeneousEngine {
                     pg.ensure_layer_dense(layer as i32)?;
                 } else {
                     pg.ensure_layer_union(layer as i32, &ids)?;
+                }
+                if let (Some(t0), Some(pf)) = (t_ens_ns, self.perfetto.as_ref()) {
+                    if let Ok(pf) = pf.lock() {
+                        let _ = pf.emit_host_slice(pf.pager_uuid, &format!("ensure L{layer} ids={} b={b}", ids.len()), t0, super::perfetto::now_ns());
+                    }
                 }
                 drop(_t_ensure);
                 if audit_v {

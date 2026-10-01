@@ -352,7 +352,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         _ => None,
     };
     let plain_lanes = PlainLanes::from_env(n_slots as usize, pipeline_min_rows());
-    let mut sched = Sched { dsp, plain_lanes, profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -656,6 +656,8 @@ struct Sched {
     dsp: Option<MsDspark>,
     /// The plain multi-stream steps' lane choice (`LaneRule::Learned`).
     plain_lanes: PlainLanes,
+    /// A live perfetto trace (`V41_PERFETTO_STEPS`).
+    trace: LiveTrace,
     profile_acc: ProfileAcc,
     legacy_wait_logged: Option<Instant>,
     /// Lane-B tables for the two-lane step (`V41_MS_PIPELINE`).
@@ -686,7 +688,84 @@ struct Sched {
     tick: u64,
 }
 
+/// A live perfetto trace of N decode steps (`knobs::PERFETTO_STEPS`):
+/// attached between steps, detached after the N-th.
+#[derive(Default)]
+struct LiveTrace {
+    /// The knob value last acted on (a new non-zero value starts a trace).
+    seen: u64,
+    /// Decode steps still to trace (0 = none of ours attached).
+    left: u64,
+    path: Option<std::path::PathBuf>,
+}
+
+/// `YYYYmmdd-HHMMSS` (UTC) of a unix time: trace file names (no date crate).
+fn utc_stamp(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
 impl Sched {
+    /// Start a live trace when `V41_PERFETTO_STEPS` changed to N > 0 (between
+    /// decode steps).
+    fn live_trace_begin(&mut self, engine: &mut v4flash_kernels::het::HeterogeneousEngine) {
+        let want = knobs::PERFETTO_STEPS.get();
+        if want == self.trace.seen {
+            return;
+        }
+        self.trace.seen = want;
+        if want == 0 {
+            return; // re-armed: the same N may be written again
+        }
+        if self.trace.left > 0 {
+            tracing::warn!(left = self.trace.left, "perfetto: a live trace is running; the new request is ignored");
+            return;
+        }
+        if engine.perfetto_attached() {
+            tracing::warn!("perfetto: a trace is already attached (V41_PERFETTO_OUT); the live request is ignored");
+            return;
+        }
+        let dir = knobs::PERFETTO_DIR.str().map(std::path::PathBuf::from).unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join("traces")
+        });
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let path = dir.join(format!("hub-{}-{want}steps.pftrace", utc_stamp(now)));
+        let kernels = knobs::PERFETTO_KERNELS.on();
+        match std::fs::create_dir_all(&dir).map_err(eyre::Report::from).and_then(|_| engine.attach_perfetto_with(&path, kernels)) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), steps = want, kernels, "perfetto: live trace started");
+                self.trace.left = want;
+                self.trace.path = Some(path);
+            }
+            Err(e) => tracing::warn!(path = %path.display(), error = %e, "perfetto: live trace not started"),
+        }
+    }
+
+    /// One traced decode step done; detach after the last.
+    fn live_trace_step(&mut self, engine: &mut v4flash_kernels::het::HeterogeneousEngine) {
+        if self.trace.left == 0 {
+            return;
+        }
+        self.trace.left -= 1;
+        if self.trace.left == 0 {
+            let path = self.trace.path.take().map(|p| p.display().to_string()).unwrap_or_default();
+            match engine.detach_perfetto() {
+                Ok(()) => tracing::info!(path, "perfetto: live trace written"),
+                Err(e) => tracing::warn!(path, error = %e, "perfetto: live trace detached with an error"),
+            }
+        }
+    }
+
     fn enqueue(&mut self, mut req: GenerateReq, tx: mpsc::Sender<WorkerEvent>, session_id: Option<String>, cancel: Arc<AtomicBool>) {
         let prompt_tokens = req.tokens.len() as u32;
         let trailing_marker = req.tokens.last().copied().filter(|&t| t == TOK_THINK_BEGIN || t == TOK_THINK_END);
@@ -1482,6 +1561,16 @@ impl Sched {
         // (The wait is what the step's host tail did not hide of the last write.)
         let ring_settle_ms = self.dsp.as_mut().map(|d| d.settle_writes()).unwrap_or(0.0);
         if let Some(pg) = state.pager.as_mut() { pg.drain_prefetched()?; }
+        // Perfetto (`V41_PERFETTO_STEPS` live, or `V41_PERFETTO_OUT`): the
+        // previous step's leftovers (the drafter's ring writes, recorded after
+        // its export) go out before this step's pool reset.
+        self.live_trace_begin(&mut state.engine);
+        let pf_on = state.engine.perfetto_attached();
+        if pf_on {
+            if let Err(e) = state.engine.export_pending_perfetto() {
+                tracing::warn!(error = %e, "perfetto: export failed");
+            }
+        }
         // DSpark (`V41_MS_DSPARK`): a LONE stream drafts from its last row in KV
         // and verifies K of the drafts in this step's rows, K from the drafter's
         // confidence (`ms_dspark::choose_k`). Several live streams step plainly.
@@ -1612,8 +1701,14 @@ impl Sched {
             let _ = v4flash_kernels::het::forward_prefill::take_layer_host_timing();
             engine.dgpu.events.set_enabled(true);
             engine.igpu.events.set_enabled(true);
+        }
+        // Under a perfetto trace too: the pools hold 16384 events and a full
+        // one fails the step (everything before this point is exported).
+        if profile || pf_on {
             engine.dgpu.events.reset();
             engine.igpu.events.reset();
+        }
+        if profile {
             v4flash_kernels::het::trace::phase::reset();
         }
         let t_fwd = Instant::now();
@@ -1730,6 +1825,13 @@ impl Sched {
         Ok::<_, eyre::Report>(targets)
         })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+        // This step's device stages (perfetto), then the live trace's count.
+        if pf_on {
+            if let Err(e) = engine.export_step_perfetto() {
+                tracing::warn!(error = %e, "perfetto: step export failed");
+            }
+            self.live_trace_step(engine);
+        }
         // Ordered two-lane verify: how often / how long the later lane waited
         // to enter a layer behind the earlier one (`Ph::Chain`).
         let (chain_waits, chain_wait_us) = v4flash_kernels::het::forward_prefill::take_chain_waits();
@@ -2329,6 +2431,20 @@ mod reservation_tests {
         }
         assert_eq!(reservation(170_000, 65536), 170_000 + 16384 + 2);
         assert_eq!(reservation(170_000, 500), 170_502);
+    }
+}
+
+#[cfg(test)]
+mod live_trace_tests {
+    use super::utc_stamp;
+
+    #[test]
+    fn utc_stamps() {
+        assert_eq!(utc_stamp(0), "19700101-000000");
+        assert_eq!(utc_stamp(951_782_400), "20000229-000000");
+        // The hub's 10-01 21:41:44 UTC restart (evt header realtime).
+        assert_eq!(utc_stamp(1_790_890_904), "20261001-214144");
+        assert_eq!(utc_stamp(1_790_899_199), "20261001-235959");
     }
 }
 

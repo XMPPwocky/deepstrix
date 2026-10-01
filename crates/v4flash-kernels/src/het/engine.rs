@@ -1565,6 +1565,7 @@ impl HeterogeneousEngine {
                 &self.igpu.compute,
                 &self.igpu.xfer,
             )?;
+            exp.flush()?;
             // re_anchor calls device.set_current() internally for each
             // of the 4 tracks (last is igpu.xfer → igpu), bypassing
             // set_current_cached and leaving the cache stale. Invalidate
@@ -1936,7 +1937,9 @@ impl HeterogeneousEngine {
     pub fn flush_perfetto(&self) -> eyre::Result<()> {
         if let Some(exp_lock) = &self.perfetto {
             let mut exp = exp_lock.lock().unwrap();
-            self.dgpu.events.for_each_pair(|name, s, e| {
+            // `_new` (the watermark): a pair already exported by another path
+            // is not written twice.
+            self.dgpu.events.for_each_pair_new(|name, s, e| {
                 let track = if name.contains(".xfer") || name.contains(".peer_push") {
                     &exp.dgpu_xfer
                 } else {
@@ -1944,7 +1947,7 @@ impl HeterogeneousEngine {
                 };
                 exp.emit_slice(track, name, s, e)
             })?;
-            self.igpu.events.for_each_pair(|name, s, e| {
+            self.igpu.events.for_each_pair_new(|name, s, e| {
                 let track = if name.contains(".xfer") || name.contains(".peer_push") {
                     &exp.igpu_xfer
                 } else {
@@ -1960,10 +1963,46 @@ impl HeterogeneousEngine {
                 &self.igpu.compute,
                 &self.igpu.xfer,
             )?;
+            exp.flush()?;
             self.current_device
                 .store(-1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// A perfetto trace is attached (`attach_perfetto*`).
+    pub fn perfetto_attached(&self) -> bool {
+        self.perfetto.is_some()
+    }
+
+    /// The arena scheduler's per-step export: this step's pairs (watermark),
+    /// a re-anchor (bounds the device clocks' drift; the streams are idle at
+    /// a step boundary) and a flush. The multistream path never exported
+    /// before 10-01: the arena steps recorded their stages and nothing wrote
+    /// them out.
+    pub fn export_step_perfetto(&self) -> eyre::Result<()> {
+        self.flush_perfetto()
+    }
+
+    /// `attach_perfetto` for a LIVE trace (multistream `V41_PERFETTO_STEPS`):
+    /// `k.*` kernel sub-stages only when `kernel_stages` -- the pools hold
+    /// 16384 events per device and a full pool FAILS the step, so a two-lane
+    /// arena step records parent stages unless asked.
+    pub fn attach_perfetto_with(&mut self, path: impl AsRef<std::path::Path>, kernel_stages: bool) -> eyre::Result<()> {
+        self.attach_perfetto(path)?;
+        self.dgpu.events.set_kernel_stages(kernel_stages);
+        self.igpu.events.set_kernel_stages(kernel_stages);
+        Ok(())
+    }
+
+    /// Write out what is pending, close the trace, and put the event pools
+    /// back to their construction-time flags.
+    pub fn detach_perfetto(&mut self) -> eyre::Result<()> {
+        let r = self.flush_perfetto();
+        self.perfetto = None;
+        self.dgpu.events.restore_defaults();
+        self.igpu.events.restore_defaults();
+        r
     }
 
     /// Open a perfetto device-time trace file. Subsequent

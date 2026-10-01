@@ -87,6 +87,22 @@ v4flash_kernels::knobs! {
     /// `V41_MS_ENGRAM_THREADS` (default 32, 1..=512): `multistream::engram_threads`.
     pub static MS_ENGRAM_THREADS = Knob::int("V41_MS_ENGRAM_THREADS", 32, 1, 512).legacy("V41_MS_ENGRAM_THREADS_FILE");
 
+    // ---- live perfetto traces (multistream `LiveTrace`)
+    /// `V41_PERFETTO_STEPS` (live, default 0): set it to N > 0 -- a new value,
+    /// or 0 then N again -- and the scheduler writes a perfetto trace of the
+    /// next N decode steps (and the prefill units between them) to
+    /// `V41_PERFETTO_DIR`, then detaches. Device stages of both GPUs, box-1
+    /// paging, the remote-expert round trips and box 2's paging as reported
+    /// over the wire, and every knob. Ignored while `V41_PERFETTO_OUT` holds a
+    /// trace open.
+    pub static PERFETTO_STEPS = Knob::int("V41_PERFETTO_STEPS", 0, 0, 1_000_000).live();
+    /// `V41_PERFETTO_KERNELS` (live, default off): also each kernel (`k.*`
+    /// sub-stages). Several x the events: a full pool (16384 per device)
+    /// fails the step, so keep N small with it.
+    pub static PERFETTO_KERNELS = Knob::flag("V41_PERFETTO_KERNELS", false).live();
+    /// `V41_PERFETTO_DIR` (default `~/traces`): where live traces go.
+    pub static PERFETTO_DIR = Knob::text("V41_PERFETTO_DIR");
+
     // ---- DSpark on the arena (static)
     /// `V41_MS_DSPARK` (`accept|1|on`): `ms_dspark::enabled`.
     pub static MS_DSPARK = Knob::choice("V41_MS_DSPARK", 0, &[&["0", "off"], &["accept", "1", "on"]]);
@@ -134,13 +150,19 @@ mod tests {
         for k in &all {
             assert!(k.name.starts_with("V41_"), "{}", k.name);
             assert!(names.insert(k.name), "{} declared twice", k.name);
-            assert_eq!(k.live, k.legacy.is_some(), "{}: live iff it had a 10-01 _FILE", k.name);
+            assert!(k.live || k.legacy.is_none(), "{}: a legacy _FILE knob is live", k.name);
             if let Some(f) = k.legacy {
                 assert!(f.ends_with("_FILE"), "{f}");
             }
             assert!(!(k.live && matches!(k.kind, Kind::Text)), "{}: text knobs are static", k.name);
         }
-        assert_eq!(all.iter().filter(|k| k.live).count(), 8);
+        // Live: the eight 10-01 `_FILE` knobs and the live-trace trigger.
+        let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
+        live.sort();
+        assert_eq!(live, [
+            "V41_B2_PIN_PREFILL_BAND", "V41_LM_PREFILL", "V41_MS_ENGRAM_THREADS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
+            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS", "V41_SUB_LAMBDA",
+        ]);
         // The parses these knobs had before.
         let p = |k: &Knob, s: &str| k.kind.parse(s);
         assert_eq!(p(&MS_DSPARK, "accept"), Some(1));

@@ -129,6 +129,13 @@ impl EventPool {
         self.enabled.get()
     }
 
+    /// Back to the construction-time recording flags (env profiles), e.g.
+    /// after a live perfetto trace detaches.
+    pub fn restore_defaults(&self) {
+        self.enabled.set(token_profile() || prefill_profile::enabled());
+        self.sub.set(kernel_stages());
+    }
+
     /// Reset for the next token. Drops all timing pairs.
     pub fn reset(&self) {
         let mut inner = self.inner.borrow_mut();
