@@ -75,10 +75,15 @@ const END_RESERVE: usize = 32;
 /// epochs are one decode step / one prefill unit: ~2 per second).
 const DROP_LOG_EVERY_S: u64 = 10;
 
+/// Call with no `EventPool` borrow held: the log line may reach a tracing
+/// layer that records pool stages.
 fn note_drop(label: &'static str, stage: &'static str, events: usize, dropped: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
+    // Seconds since the first drop, on a MONOTONIC base (a wall-clock step
+    // backwards must not silence the log); `LAST` = 0 means "never logged".
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = BASE.get_or_init(std::time::Instant::now).elapsed().as_secs() + DROP_LOG_EVERY_S;
     let last = LAST.load(Ordering::Relaxed);
     if now >= last + DROP_LOG_EVERY_S && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         tracing::warn!(pool = label, events, stage, dropped_this_epoch = dropped, "event pool full: stages dropped (timing gaps; logged at most every 10 s)");
@@ -204,7 +209,9 @@ impl EventPool {
                 // Reachable from a live perfetto trace (`V41_PERFETTO_KERNELS`).
                 // `END_RESERVE` slots stay free for the ends of open stages.
                 inner.dropped += 1;
-                note_drop(self.label, name, inner.events.len(), inner.dropped);
+                let (n, len) = (inner.dropped, inner.events.len());
+                drop(inner);
+                note_drop(self.label, name, len, n);
                 return Ok(StageScope { pool: self, stream, name, start_idx: usize::MAX, done: true });
             }
             inner.next += 1;
