@@ -38,6 +38,8 @@ pub const SESSION_ID_MAX: usize = 64;
 const CHECKSUM_LEN: usize = 16;
 /// Offset of the tail's `hits` (le32), excluded from the header checksum.
 pub const TAIL_HITS_OFFSET: u64 = 160;
+/// `hits` is clamped to this on read (log2(1 + 2^16) × 6 h ≈ 4 days of score).
+pub const MAX_HITS: u32 = 1 << 16;
 
 /// Row encodings recorded in [`StoreLayout`] (namespace ABI).
 pub const ENC_F16: u8 = 1;
@@ -290,7 +292,9 @@ impl StoreRows {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
-    Io(String),
+    /// An IO failure, with its kind: only some kinds say the FILE is bad
+    /// ([`FormatError::evicts`]).
+    Io(std::io::ErrorKind, String),
     /// Shorter than its header claims (torn or truncated write).
     Short { want: u64, got: u64 },
     /// Longer than its header claims.
@@ -300,16 +304,34 @@ pub enum FormatError {
     BadField(&'static str),
     HeaderChecksum,
     Namespace,
-    /// The key recomputed from the stored parent, ids and images differs.
+    /// The key recomputed from the stored parent, ids and images differs, or
+    /// the header names another key than the one asked for.
     Key,
     /// A payload section's blake3 differs ("payload", "E", "D").
     Checksum(&'static str),
+    /// Section D was asked for, but the file is an encoder tail.
+    NoSectionD,
+}
+
+impl FormatError {
+    /// Is this a verdict on the file's DATA (evict it, 6.2, 9.4), rather
+    /// than a transient failure of this read (EMFILE, ENOMEM, EIO, EACCES...)
+    /// that says nothing about the file? A file that is gone or shorter than
+    /// a read (UnexpectedEof) is data-attributable; any other IO error is not,
+    /// and evicting on it would turn an infrastructure fault into cold
+    /// re-prefills (risk 10).
+    pub fn evicts(&self) -> bool {
+        match self {
+            Self::Io(kind, _) => matches!(kind, std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::NotFound),
+            _ => true,
+        }
+    }
 }
 
 impl std::fmt::Display for FormatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "io: {e}"),
+            Self::Io(k, e) => write!(f, "io ({k:?}): {e}"),
             Self::Short { want, got } => write!(f, "short: want {want} B, file has {got}"),
             Self::Long { want, got } => write!(f, "long: want {want} B, file has {got}"),
             Self::BadMagic => f.write_str("bad magic"),
@@ -319,13 +341,16 @@ impl std::fmt::Display for FormatError {
             Self::Namespace => f.write_str("namespace mismatch"),
             Self::Key => f.write_str("key mismatch"),
             Self::Checksum(s) => write!(f, "section {s} checksum"),
+            Self::NoSectionD => f.write_str("section D asked of an encoder tail"),
         }
     }
 }
 
+impl std::error::Error for FormatError {}
+
 impl From<std::io::Error> for FormatError {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(e.to_string())
+        Self::Io(e.kind(), e.to_string())
     }
 }
 
@@ -626,7 +651,9 @@ impl TailHeader {
         let n_raw_dec = g.u32();
         g.skip(4);
         let drafter = g.bytes();
-        let hits = g.u32();
+        // `hits` is outside the checksum: a damaged value must not make a
+        // tail immortal (score = path_last_used + 6 h × log2(1 + hits)).
+        let hits = g.u32().min(MAX_HITS);
         let gen = GenPair { gen: g.u32(), knob: g.bytes() };
         let sha = g.bytes();
         let build = BuildId::from_parts(sha, g.u8());
@@ -767,6 +794,14 @@ fn read_exact_at(f: &File, len: u64, off: u64) -> Result<Vec<u8>, FormatError> {
     Ok(v)
 }
 
+/// Read `len` bytes at `off` into `buf` (reused: its capacity is kept).
+fn read_into(f: &File, buf: &mut Vec<u8>, len: u64, off: u64) -> Result<(), FormatError> {
+    buf.clear();
+    buf.resize(len as usize, 0);
+    f.read_exact_at(buf, off)?;
+    Ok(())
+}
+
 /// A verified chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkFile {
@@ -777,22 +812,48 @@ pub struct ChunkFile {
     pub payload: Vec<u8>,
 }
 
-/// Read and verify a whole chunk file (header, length, key, payload hash).
-/// M2's restore streams the payload into staging instead; it runs the same
-/// checks through [`verify_chunk_prefix`] and [`blake3`] on the staged bytes.
-pub fn read_chunk(path: &Path, ns: &Key) -> Result<ChunkFile, FormatError> {
+/// A chunk's verified header, ids and images (its payload went into the
+/// caller's buffer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkMeta {
+    pub header: ChunkHeader,
+    pub tokens: Vec<i32>,
+    pub images: Vec<ImageRecord>,
+}
+
+/// Read and verify a chunk into `payload` (a staging buffer the caller
+/// reuses): header checksum, the requested key, exact length, namespace, the
+/// key recomputed from parent + ids + images, and the payload blake3.
+pub fn read_chunk_into(path: &Path, ns: &Key, key: Option<&Key>, payload: &mut Vec<u8>) -> Result<ChunkMeta, FormatError> {
     let f = File::open(path)?;
     let size = f.metadata()?.len();
     let hb = read_exact_at(&f, (CHUNK_HEADER_LEN as u64).min(size), 0)?;
     let header = ChunkHeader::decode(&hb)?;
+    if key.is_some_and(|k| *k != header.key) {
+        return Err(FormatError::Key);
+    }
     check_len(header.file_len(), size)?;
     let prefix = read_exact_at(&f, header.data_offset() - CHUNK_HEADER_LEN as u64, CHUNK_HEADER_LEN as u64)?;
     let (tokens, images) = verify_chunk_prefix(&header, &prefix, ns)?;
-    let payload = read_exact_at(&f, header.payload_len, header.data_offset())?;
-    if blake3::hash(&payload).as_bytes() != &header.payload_hash {
-        return Err(FormatError::Checksum("payload"));
+    read_into(&f, payload, header.payload_len, header.data_offset())?;
+    verify_section(payload, &header.payload_hash, "payload")?;
+    Ok(ChunkMeta { header, tokens, images })
+}
+
+/// Read and verify a whole chunk file ([`read_chunk_into`] with a fresh
+/// buffer and no key expectation).
+pub fn read_chunk(path: &Path, ns: &Key) -> Result<ChunkFile, FormatError> {
+    let mut payload = Vec::new();
+    let m = read_chunk_into(path, ns, None, &mut payload)?;
+    Ok(ChunkFile { header: m.header, tokens: m.tokens, images: m.images, payload })
+}
+
+/// The blake3 check of one staged section (payload, E or D).
+pub fn verify_section(bytes: &[u8], want: &[u8; 32], which: &'static str) -> Result<(), FormatError> {
+    if blake3::hash(bytes).as_bytes() != want {
+        return Err(FormatError::Checksum(which));
     }
-    Ok(ChunkFile { header, tokens, images, payload })
+    Ok(())
 }
 
 /// Namespace + ids + images + key of a chunk whose header is already decoded.
@@ -823,20 +884,43 @@ pub struct TailFile {
     pub open: Vec<i32>,
     pub images: Vec<ImageRecord>,
     pub sec_e: Vec<u8>,
-    /// `None` for an encoder tail, or when the caller did not ask (t > 128:
-    /// section D is never read, 6.6).
+    /// `Some` exactly when section D was asked for (t ≤ 128 restores, 6.6).
     pub sec_d: Option<Vec<u8>>,
 }
 
-/// Read and verify a tail. `want_d` reads and checks section D too.
-pub fn read_tail(path: &Path, ns: &Key, want_d: bool) -> Result<TailFile, FormatError> {
+/// A tail's verified header, open ids and images (its sections went into
+/// the caller's buffers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailMeta {
+    pub header: TailHeader,
+    pub open: Vec<i32>,
+    pub images: Vec<ImageRecord>,
+}
+
+/// Read and verify a tail into `sec_e` (and `sec_d` when `want_d`). Asking
+/// for section D of an encoder tail is an error, never an empty D: a restore
+/// that keeps rings it never got is the KNOWN_BUGS #25 signature.
+pub fn read_tail_into(
+    path: &Path,
+    ns: &Key,
+    key: Option<&Key>,
+    want_d: bool,
+    sec_e: &mut Vec<u8>,
+    sec_d: &mut Vec<u8>,
+) -> Result<TailMeta, FormatError> {
     let f = File::open(path)?;
     let size = f.metadata()?.len();
     let hb = read_exact_at(&f, (TAIL_HEADER_LEN as u64).min(size), 0)?;
     let header = TailHeader::decode(&hb)?;
+    if key.is_some_and(|k| *k != header.key) {
+        return Err(FormatError::Key);
+    }
     check_len(header.file_len(), size)?;
     if &header.ns != ns {
         return Err(FormatError::Namespace);
+    }
+    if want_d && header.kind != TailKind::Full {
+        return Err(FormatError::NoSectionD);
     }
     let prefix = read_exact_at(&f, header.e_offset() - TAIL_HEADER_LEN as u64, TAIL_HEADER_LEN as u64)?;
     let a = header.t / C * C;
@@ -847,20 +931,22 @@ pub fn read_tail(path: &Path, ns: &Key, want_d: bool) -> Result<TailFile, Format
     if keys::tail_step(&header.base, a, &open, &images) != header.key {
         return Err(FormatError::Key);
     }
-    let sec_e = read_exact_at(&f, header.sec_e_len, header.e_offset())?;
-    if blake3::hash(&sec_e).as_bytes() != &header.sec_e_hash {
-        return Err(FormatError::Checksum("E"));
+    read_into(&f, sec_e, header.sec_e_len, header.e_offset())?;
+    verify_section(sec_e, &header.sec_e_hash, "E")?;
+    sec_d.clear();
+    if want_d {
+        read_into(&f, sec_d, header.sec_d_len, header.e_end())?;
+        verify_section(sec_d, &header.sec_d_hash, "D")?;
     }
-    let sec_d = if want_d && header.kind == TailKind::Full {
-        let d = read_exact_at(&f, header.sec_d_len, header.e_end())?;
-        if blake3::hash(&d).as_bytes() != &header.sec_d_hash {
-            return Err(FormatError::Checksum("D"));
-        }
-        Some(d)
-    } else {
-        None
-    };
-    Ok(TailFile { header, open, images, sec_e, sec_d })
+    Ok(TailMeta { header, open, images })
+}
+
+/// Read and verify a whole tail ([`read_tail_into`] with fresh buffers and
+/// no key expectation).
+pub fn read_tail(path: &Path, ns: &Key, want_d: bool) -> Result<TailFile, FormatError> {
+    let (mut e, mut d) = (Vec::new(), Vec::new());
+    let m = read_tail_into(path, ns, None, want_d, &mut e, &mut d)?;
+    Ok(TailFile { header: m.header, open: m.open, images: m.images, sec_e: e, sec_d: want_d.then_some(d) })
 }
 
 /// The ids and image records of a file (no payload), for the startup scan's
@@ -883,6 +969,20 @@ pub fn read_ids(path: &Path, is_tail: bool) -> Result<(u32, Vec<i32>, Vec<ImageR
     let prefix = read_exact_at(&f, data_off - hlen, hlen)?;
     let (ids, images) = parse_ids_and_images(&prefix, n_ids, n_images, a)?;
     Ok((a, ids, images))
+}
+
+/// Tests: recompute a mutated chunk header's checksum in place.
+#[cfg(test)]
+pub(crate) fn reseal_chunk(b: &mut [u8]) {
+    let sum = header_checksum(&b[..CHUNK_HEADER_LEN], None);
+    b[CHUNK_HEADER_LEN - CHECKSUM_LEN..CHUNK_HEADER_LEN].copy_from_slice(&sum);
+}
+
+/// Tests: recompute a mutated tail header's checksum in place.
+#[cfg(test)]
+pub(crate) fn reseal_tail(b: &mut [u8]) {
+    let sum = header_checksum(&b[..TAIL_HEADER_LEN], Some(TAIL_HITS_OFFSET as usize));
+    b[TAIL_HEADER_LEN - CHECKSUM_LEN..TAIL_HEADER_LEN].copy_from_slice(&sum);
 }
 
 #[cfg(test)]
@@ -999,5 +1099,160 @@ pub(crate) mod tests {
         assert_eq!(b.to_string(), "0123456789abcdef0123456789abcdef01234567");
         assert!(BuildId::parse("0123").is_none());
         assert_eq!(BuildId::V6.to_string(), "v6");
+    }
+
+    /// 9b: every header validator, reached. A random flip trips the checksum
+    /// first, so each case mutates ONE field and recomputes the checksum.
+    #[test]
+    fn header_validators_each_fire() {
+        let good = sample_chunk_header().encode();
+        let chunk_case = |at: usize, bytes: &[u8]| {
+            let mut b = good;
+            b[at..at + bytes.len()].copy_from_slice(bytes);
+            reseal_chunk(&mut b);
+            ChunkHeader::decode(&b)
+        };
+        assert_eq!(chunk_case(0, b"X"), Err(FormatError::BadMagic));
+        assert_eq!(chunk_case(5, &[2]), Err(FormatError::BadVersion(2)));
+        assert_eq!(chunk_case(6, &255u16.to_le_bytes()), Err(FormatError::BadField("header_len")));
+        assert_eq!(chunk_case(112, &[5]), Err(FormatError::BadField("n_stores")));
+        assert_eq!(chunk_case(113, &[9]), Err(FormatError::BadField("provenance")));
+        assert_eq!(chunk_case(200, &7u64.to_le_bytes()), Err(FormatError::BadField("payload_len")));
+        assert_eq!(chunk_case(108, &1000u16.to_le_bytes()), Err(FormatError::BadField("n_tokens")));
+        let mut b = good;
+        b[150] ^= 1; // inside the checksummed body, not resealed
+        assert_eq!(ChunkHeader::decode(&b), Err(FormatError::HeaderChecksum));
+
+        let good = sample_tail_header().encode();
+        let tail_case = |edits: &[(usize, &[u8])]| {
+            let mut b = good;
+            for (at, bytes) in edits {
+                b[*at..*at + bytes.len()].copy_from_slice(bytes);
+            }
+            reseal_tail(&mut b);
+            TailHeader::decode(&b)
+        };
+        assert_eq!(tail_case(&[(108, &[7])]), Err(FormatError::BadField("kind")));
+        assert_eq!(tail_case(&[(110, &[9])]), Err(FormatError::BadField("origin")));
+        assert_eq!(tail_case(&[(109, &[0x80])]), Err(FormatError::BadField("flags")));
+        assert_eq!(tail_case(&[(111, &[65])]), Err(FormatError::BadField("flags")));
+        assert_eq!(tail_case(&[(112, &78u16.to_le_bytes())]), Err(FormatError::BadField("n_open")));
+        assert_eq!(tail_case(&[(108, &[0])]), Err(FormatError::BadField("enc tail with section D")));
+        assert_eq!(tail_case(&[(109, &[TAIL_FLAG_ANCHOR | TAIL_FLAG_DEMOTED])]), Err(FormatError::BadField("demoted anchor")));
+        // hits is outside the checksum and clamped on read.
+        let h = tail_case(&[(160, &u32::MAX.to_le_bytes())]).unwrap();
+        assert_eq!(h.hits, MAX_HITS);
+    }
+
+    /// The file-level validators of the readers (ids, images, key, lengths,
+    /// namespace, section D), each reached with a self-consistent header.
+    #[test]
+    fn reader_validators_each_fire() {
+        let dir = crate::kvstore::io::tests::unique_dir("fmt-val");
+        let stores = v41_stores();
+        let ns = [1u8; 32];
+        let tokens: Vec<i32> = (0..C as i32).collect();
+        let write_chunk = |name: &str, k: u32, images: &[ImageRecord], key_images: &[ImageRecord]| -> std::path::PathBuf {
+            let payload = vec![3u8; chunk_payload_len(&stores) as usize];
+            let mut h = sample_chunk_header();
+            h.k = k;
+            h.n_images = images.len() as u16;
+            h.key = keys::chunk_step(&h.parent, k.wrapping_mul(C), &tokens, key_images);
+            h.payload_hash = *blake3::hash(&payload).as_bytes();
+            let mut b = Vec::new();
+            b.extend_from_slice(&h.encode());
+            for t in &tokens {
+                b.extend_from_slice(&t.to_le_bytes());
+            }
+            for r in images {
+                // Raw records (relative to k*C, wrapping): may be malformed on purpose.
+                let mut rec = [0u8; 40];
+                rec[0..4].copy_from_slice(&r.start.wrapping_sub(k.wrapping_mul(C)).to_le_bytes());
+                rec[4..8].copy_from_slice(&r.len.to_le_bytes());
+                rec[8..].copy_from_slice(&r.hash);
+                b.extend_from_slice(&rec);
+            }
+            b.extend_from_slice(&payload);
+            let p = dir.join(name);
+            std::fs::write(&p, &b).unwrap();
+            p
+        };
+        let img = |start: u32| ImageRecord { start, len: 5, hash: [4; 32] };
+        // Baseline: valid.
+        let ok_imgs = [img(7 * C + 10), img(7 * C + 20)];
+        let p = write_chunk("ok.kvc", 7, &ok_imgs, &ok_imgs);
+        let f = read_chunk(&p, &ns).unwrap();
+        assert_eq!(f.images, ok_imgs);
+        assert_eq!(read_chunk(&p, &[2; 32]), Err(FormatError::Namespace));
+        assert_eq!(read_chunk_into(&p, &ns, Some(&[9; 32]), &mut Vec::new()).map(|_| ()), Err(FormatError::Key));
+        // Out-of-order records, and one past the chunk.
+        let rev = [img(7 * C + 20), img(7 * C + 10)];
+        let p = write_chunk("order.kvc", 7, &rev, &[]);
+        assert_eq!(read_chunk(&p, &ns), Err(FormatError::BadField("image order")));
+        let p = write_chunk("past.kvc", 7, &[img(8 * C + 1)], &[]);
+        assert_eq!(read_chunk(&p, &ns), Err(FormatError::BadField("image order")));
+        // A record whose absolute start overflows u32.
+        let k_big = u32::MAX / C;
+        let p = write_chunk("ovf.kvc", k_big, &[ImageRecord { start: k_big * C - 1, len: 1, hash: [0; 32] }], &[]);
+        assert_eq!(read_chunk(&p, &ns), Err(FormatError::BadField("image")));
+        // k * C overflows.
+        let p = write_chunk("k.kvc", u32::MAX / C + 1, &[], &[]);
+        assert_eq!(read_chunk(&p, &ns), Err(FormatError::BadField("k")));
+        // Ids changed after the key was taken.
+        let p = write_chunk("ids.kvc", 7, &[], &[]);
+        let mut b = std::fs::read(&p).unwrap();
+        b[CHUNK_HEADER_LEN + 4] ^= 1;
+        std::fs::write(&p, &b).unwrap();
+        assert_eq!(read_chunk(&p, &ns), Err(FormatError::Key));
+        // Long and short files.
+        let p = write_chunk("long.kvc", 7, &[], &[]);
+        let mut b = std::fs::read(&p).unwrap();
+        b.push(0);
+        std::fs::write(&p, &b).unwrap();
+        assert!(matches!(read_chunk(&p, &ns), Err(FormatError::Long { .. })));
+        b.truncate(b.len() - 100);
+        std::fs::write(&p, &b).unwrap();
+        assert!(matches!(read_chunk(&p, &ns), Err(FormatError::Short { .. })));
+
+        // Tails: an image record past t, section D asked of an encoder tail.
+        let write_tail = |name: &str, kind: TailKind, images: &[ImageRecord]| -> std::path::PathBuf {
+            let t = 3 * C + 50;
+            let open: Vec<i32> = (0..50).collect();
+            let sec_e = vec![1u8; 100];
+            let sec_d = if kind == TailKind::Full { vec![2u8; 60] } else { vec![] };
+            let mut h = sample_tail_header();
+            h.anchor = false;
+            h.kind = kind;
+            h.t = t;
+            h.n_open = 50;
+            h.n_images = images.len() as u16;
+            h.n_raw_dec = if kind == TailKind::Full { 128 } else { 0 };
+            h.key = keys::tail_step(&h.base, 3 * C, &open, &[]);
+            h.sec_e_len = sec_e.len() as u64;
+            h.sec_e_hash = *blake3::hash(&sec_e).as_bytes();
+            h.sec_d_len = sec_d.len() as u64;
+            h.sec_d_hash = if sec_d.is_empty() { [0; 32] } else { *blake3::hash(&sec_d).as_bytes() };
+            let mut b = encode_tail_prefix(&h, &open, images);
+            b.extend_from_slice(&sec_e);
+            b.extend_from_slice(&sec_d);
+            let p = dir.join(name);
+            std::fs::write(&p, &b).unwrap();
+            p
+        };
+        let p = write_tail("past.kvt", TailKind::Full, &[img(3 * C + 60)]);
+        assert_eq!(read_tail(&p, &ns, false), Err(FormatError::BadField("image past t")));
+        let p = write_tail("enc.kvt", TailKind::Enc, &[]);
+        assert!(read_tail(&p, &ns, false).is_ok());
+        assert_eq!(read_tail(&p, &ns, true), Err(FormatError::NoSectionD));
+        let p = write_tail("full.kvt", TailKind::Full, &[]);
+        let t = read_tail(&p, &ns, true).unwrap();
+        assert_eq!(t.sec_d.unwrap().len(), 60);
+        assert_eq!(read_tail_into(&p, &ns, Some(&[0; 32]), false, &mut Vec::new(), &mut Vec::new()).map(|_| ()), Err(FormatError::Key));
+        // Transient IO errors are not verdicts; data errors are.
+        assert!(!FormatError::Io(std::io::ErrorKind::PermissionDenied, String::new()).evicts());
+        assert!(!FormatError::Io(std::io::ErrorKind::Other, String::new()).evicts());
+        assert!(FormatError::Io(std::io::ErrorKind::UnexpectedEof, String::new()).evicts());
+        assert!(FormatError::Io(std::io::ErrorKind::NotFound, String::new()).evicts());
+        assert!(FormatError::Key.evicts());
     }
 }

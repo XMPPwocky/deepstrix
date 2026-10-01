@@ -20,7 +20,8 @@
 //! - [`index`]: trie, tails, refcounts, pins, demotion, thinning, eviction,
 //!   walk and selection, the invariant checker;
 //! - [`io`]: the one IO thread (writes, mutations, unlinks, trash);
-//! - [`scan`]: startup (namespace GC, header scan, crash repair, rebuild);
+//! - [`scan`]: startup (root lock, namespace GC, header scan, crash repair,
+//!   rebuild);
 //! - [`knobs`]: the knob classification and the knob hash;
 //! - [`Store`] (here): the scheduler-thread facade over all of them.
 
@@ -33,14 +34,18 @@ pub mod scan;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use format::{BuildId, ChunkHeader, FormatError, GenPair, Provenance, StoreLayout, StoreRows, TailHeader, TailKind, TailOrigin};
+use format::{
+    BuildId, ChunkHeader, ChunkMeta, FormatError, GenPair, Provenance, StoreLayout, StoreRows, TailHeader, TailKind, TailMeta,
+    TailOrigin,
+};
 use index::{Action, ChunkInsert, Index, JobId, PinId, Removal, Removed, TailInsert, Walk, WalkTail, Why};
 use io::{ChunkWrite, Completion, IoHandle, IoJob, IoStats, NsDirs, TailWrite, WaitBudget};
-use keys::{ChainCursor, ImageRecord, Key, KeyChain, NamespaceInputs};
+use keys::{ChainCursor, ImageRecord, Key, KeyChain, KeyMap, NamespaceInputs};
 pub use scan::{PurgeSpec, ScanReport};
 
 /// Positions per chunk (4.2). Equals the production prefill chunk
@@ -67,8 +72,14 @@ pub const ENC_MIN_SUFFIX: u32 = 128;
 pub const MIN_RESTORE_T: u32 = 64;
 /// Eviction score weight of hits (8.3): score = path_last_used + 6 h × log2(1 + hits).
 pub const SCORE_HIT_S: u64 = 6 * 3600;
-/// How often the invariant checker runs in debug builds and in shadow (9.5).
+/// How often the invariant checker runs in debug builds and in shadow (9.5),
+/// and how often the namespace byte total is persisted.
 pub const INVARIANT_CHECK_EVERY_S: u64 = 3600;
+/// Recent removals, demotions and drops kept for the shadow reason codes
+/// (11.1: "the store's own record of that event"), like the frontier LRU.
+pub const RECENT_EVENTS: usize = 10_000;
+/// Write buffers kept for reuse (a chunk payload is 2.83 MB; 8 ≈ 23 MB).
+pub const BUFFER_POOL: usize = 8;
 
 const _: () = assert!(K % C == 0);
 const _: () = assert!(ENC_MIN_SUFFIX == v4flash_kernels::config::SWA_WINDOW);
@@ -120,6 +131,9 @@ pub struct StoreConfig {
     /// `V41_KV_STORE_PURGE_BUILD`, applied at open.
     pub purge: Vec<PurgeSpec>,
     pub build: BuildId,
+    /// The knob hash of the launch env. Knobs re-read at run time (a job's
+    /// resolved `V41_MS_LM_FILE` values, box 2's own knobs) are not in it:
+    /// writes may carry their own (`ChunkWriteReq::knob_hash`), see `knobs`.
     pub knob_hash: [u8; 16],
     /// Run the invariant checker hourly (debug builds and shadow, 9.5).
     pub check_invariants: bool,
@@ -165,6 +179,9 @@ pub enum StoreError {
     Invalid(String),
     /// A stored file failed validation; it was evicted (6.2).
     Corrupt { key: Key, error: FormatError },
+    /// A read failed for a reason that says nothing about the file (EIO,
+    /// EMFILE, ENOMEM, EACCES...): nothing was evicted (`kv.suspect`).
+    Io { key: Key, error: FormatError },
     /// The file is not indexed (evicted meanwhile).
     Missing,
 }
@@ -174,10 +191,13 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Invalid(s) => write!(f, "invalid store request: {s}"),
             Self::Corrupt { key, error } => write!(f, "corrupt file {}: {error}", keys::hex(&key[..8])),
+            Self::Io { key, error } => write!(f, "transient read failure on {}: {error}", keys::hex(&key[..8])),
             Self::Missing => f.write_str("not in the store"),
         }
     }
 }
+
+impl std::error::Error for StoreError {}
 
 /// What happened to a write request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,8 +205,8 @@ pub enum WriteOutcome {
     Queued,
     /// Already indexed (the first writer wins, E5).
     Stored,
-    /// Another job's write of the same key is in flight: subscribe to its
-    /// completion (9.4).
+    /// Another write of the same key (at least this kind) is in flight:
+    /// subscribe to its completion (9.4).
     Pending,
     /// The queue stayed full past the tick's wait budget (`kv.write_dropped`).
     Dropped,
@@ -203,19 +223,41 @@ pub enum StoreEvent {
     TailDropped { key: Key, why: &'static str },
 }
 
+/// The store's own record of what happened to a key recently (11.1 reason
+/// codes: `dropped`, `evicted`, `thinned`, `demoted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecentEvent {
+    Removed(Why),
+    Demoted,
+    Dropped,
+}
+
+/// A chunk or a tail, for [`Store::evict_corrupt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Chunk,
+    Tail,
+}
+
 /// A chunk to write: chunk `k` of `tokens` (the REQUEST's ids, never a
 /// reconstructed prefix: bug (a), 1.1).
 pub struct ChunkWriteReq<'a> {
     pub tokens: &'a [i32],
     pub images: &'a [ImageRecord],
     pub k: u32,
-    /// Store by store, rows then keys (4.1).
+    /// Store by store, rows then keys (4.1). Take it from [`Store::buffer`]:
+    /// it comes back to the pool when the write completes.
     pub payload: Vec<u8>,
     pub provenance: Provenance,
     pub job: Option<JobId>,
+    /// The knob hash of the values this job actually ran with, when they
+    /// differ from the launch env's (knobs re-read at run time); `None` = the
+    /// store's.
+    pub knob_hash: Option<[u8; 16]>,
 }
 
-/// A tail to write at `t` of `tokens` (the request's ids).
+/// A tail to write at `t` of `tokens` (the request's ids). Its ancestors on
+/// the path (for demotion, thinning, touches) are computed by the store.
 pub struct TailWriteReq<'a> {
     pub tokens: &'a [i32],
     pub images: &'a [ImageRecord],
@@ -229,14 +271,23 @@ pub struct TailWriteReq<'a> {
     pub sec_e: Vec<u8>,
     /// Empty for an encoder tail.
     pub sec_d: Vec<u8>,
-    /// The walk's matched tails below `t` plus the job's own earlier tails.
-    pub ancestors: Vec<Key>,
     pub job: Option<JobId>,
+    pub knob_hash: Option<[u8; 16]>,
 }
 
+#[derive(Debug, Clone)]
 enum PendingWrite {
     Chunk(ChunkInsert),
     Tail(TailInsert),
+}
+
+impl PendingWrite {
+    fn job(&self) -> Option<JobId> {
+        match self {
+            Self::Chunk(c) => c.job,
+            Self::Tail(t) => t.job,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -251,6 +302,7 @@ pub struct StoreStats {
     pub pending_writes: u64,
     pub writes_dropped: u64,
     pub evicted_bytes: u64,
+    pub needs_rescan: bool,
     pub gens: Vec<(GenPair, index::GenStat)>,
     pub io: IoStats,
 }
@@ -261,7 +313,7 @@ impl StoreStats {
         let gens: Vec<String> = self.gens.iter().map(|(g, s)| format!("{g}:{}", s.files)).collect();
         format!(
             "kv.store chunks={} tails={} orphans={} chunk_mb={} tail_mb={} inactive_mb={} cap_mb={} pending={} \
-             dropped={} evicted_mb={} written_mb={} trash_bytes={} trash_dirs={} gens={}",
+             dropped={} evicted_mb={} written_mb={} trash_bytes={} trash_dirs={} trash_errors={} rescan={} gens={}",
             self.chunks,
             self.tails,
             self.orphans,
@@ -275,8 +327,30 @@ impl StoreStats {
             self.io.written_bytes >> 20,
             self.io.delete_backlog_bytes,
             self.io.trash_dirs,
+            self.io.trash_errors,
+            self.needs_rescan as u8,
             gens.join(",")
         )
+    }
+}
+
+/// A bounded memory of recent events per key (oldest forgotten first).
+#[derive(Default)]
+struct RecentLog {
+    map: KeyMap<(RecentEvent, u64)>,
+    order: VecDeque<Key>,
+}
+
+impl RecentLog {
+    fn note(&mut self, key: Key, ev: RecentEvent, now: u64) {
+        if self.map.insert(key, (ev, now)).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > RECENT_EVENTS {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
     }
 }
 
@@ -289,21 +363,33 @@ pub struct Store {
     chunk_rows: Vec<StoreRows>,
     index: Index,
     io: IoHandle,
-    pending: HashMap<Key, PendingWrite>,
+    /// Writes in flight per key, oldest first. A key can have more than one:
+    /// an encoder tail and then the full tail at the same T (a waypoint at
+    /// L % K == 0, an anchor on a K multiple, two jobs). Completions arrive in
+    /// FIFO order, so each pops the front.
+    pending: KeyMap<VecDeque<PendingWrite>>,
+    /// Writes in flight per job: a finished job is forgotten when they drain.
+    job_writes: HashMap<JobId, u32>,
+    recent: RecentLog,
+    pool: Vec<Vec<u8>>,
     dropped: u64,
     evicted_bytes: u64,
     last_check: u64,
     scan: ScanReport,
+    /// The root lock (`kvstore-v1/.lock`), held for the store's lifetime.
+    _lock: File,
 }
 
 impl Store {
-    /// Open (or create) the namespace of `ns`: GC, scan, rebuild, start the IO
-    /// thread. Never waits on deletions.
+    /// Open (or create) the namespace of `ns`: lock the root, GC, scan,
+    /// rebuild, start the IO thread. Never waits on deletions. Fails (and the
+    /// caller runs with the store off, logging why) if another process holds
+    /// the root.
     pub fn open(cfg: StoreConfig, ns: &NamespaceInputs, now: u64) -> std::io::Result<Self> {
         let ns_key = ns.key();
         let chain = KeyChain::new(ns_key);
         let chunk_rows: Vec<StoreRows> = ns.stores.iter().map(StoreRows::chunk_of).collect();
-        let opened = scan::open_namespace(&cfg.root, &ns_key, cfg.cap_bytes, &chunk_rows, &cfg.purge, cfg.gen(), now)?;
+        let opened = scan::open_namespace(&cfg.root, &ns_key, cfg.cap_bytes, &chunk_rows, &cfg.purge, &cfg.build, cfg.gen(), now)?;
         let dirs = NsDirs::new(cfg.root.join(keys::ns16(&ns_key)));
         let io = IoHandle::spawn(dirs, cfg.root.join("trash"), cfg.write_queue_bytes)?;
         for j in opened.jobs {
@@ -322,8 +408,10 @@ impl Store {
             unreachable = r.unreachable,
             missing_ancestor = r.missing_ancestor,
             purged = r.purged,
+            purge_refused = r.purge_refused,
             repaired = r.repaired_demotions,
             truncated = r.truncated,
+            io_errors = r.io_errors,
             trashed_ns = r.trashed_namespaces,
             ms = r.elapsed_ms,
             "kv.scan"
@@ -337,16 +425,20 @@ impl Store {
             chunk_rows,
             index: opened.index,
             scan: opened.report,
+            _lock: opened.lock,
             cfg,
             chain,
             io,
-            pending: HashMap::new(),
+            pending: KeyMap::default(),
+            job_writes: HashMap::new(),
+            recent: RecentLog::default(),
+            pool: Vec::new(),
             dropped: 0,
             evicted_bytes: 0,
             last_check: now,
         };
         s.index.enforce_cap(now);
-        s.apply();
+        s.apply(now);
         Ok(s)
     }
 
@@ -366,17 +458,55 @@ impl Store {
     pub fn tick_budget(&self) -> WaitBudget {
         WaitBudget::new(self.cfg.write_wait)
     }
+    /// Counter drift was seen: rebuild from disk (restart) when convenient.
+    pub fn needs_rescan(&self) -> bool {
+        self.index.needs_rescan()
+    }
+    /// The store's record of a recent removal, demotion or dropped write of
+    /// `key` (shadow reason codes, 11.1).
+    pub fn recent_event(&self, key: &Key) -> Option<(RecentEvent, u64)> {
+        self.recent.map.get(key).copied()
+    }
+    /// The stored payload blake3 of an indexed chunk (`kv.dedup_mismatch`).
+    pub fn chunk_payload_hash(&self, key: &Key) -> Option<[u8; 32]> {
+        self.index.chunk(key).map(|c| c.payload_hash)
+    }
+    /// A write buffer from the pool (cleared), or a new one.
+    pub fn buffer(&mut self) -> Vec<u8> {
+        let mut b = self.pool.pop().unwrap_or_default();
+        b.clear();
+        b
+    }
 
-    /// Top of every scheduler tick: completions, then the hourly checker.
+    fn recycle(&mut self, bufs: Vec<Vec<u8>>) {
+        for b in bufs {
+            if self.pool.len() < BUFFER_POOL && b.capacity() > 0 {
+                self.pool.push(b);
+            }
+        }
+    }
+
+    /// Top of every scheduler tick: completions, then the hourly checker and
+    /// the namespace byte total.
     pub fn tick(&mut self, now: u64) -> Vec<StoreEvent> {
         let ev = self.process_completions(now);
-        if self.cfg.check_invariants && now >= self.last_check + INVARIANT_CHECK_EVERY_S {
+        if now >= self.last_check + INVARIANT_CHECK_EVERY_S {
             self.last_check = now;
-            if let Err(e) = self.index.check_invariants() {
-                tracing::error!(error = %e, "kv.invariant violated");
+            self.persist_bytes();
+            if self.cfg.check_invariants {
+                if let Err(e) = self.check_invariants() {
+                    tracing::error!(error = %e, "kv.invariant violated");
+                }
             }
         }
         ev
+    }
+
+    fn persist_bytes(&self) {
+        let b = self.index.chunk_bytes() + self.index.tail_bytes();
+        if let Err(e) = scan::write_small(&self.dirs().base.join(scan::NS_BYTES), &format!("{b}\n")) {
+            tracing::warn!(error = %e, "kv.store could not persist the namespace byte total");
+        }
     }
 
     /// Apply the IO thread's completions to the index (9.4).
@@ -385,16 +515,57 @@ impl Store {
         self.complete(done, now)
     }
 
+    fn pop_pending(&mut self, key: &Key) -> Option<PendingWrite> {
+        let q = self.pending.get_mut(key)?;
+        let p = q.pop_front();
+        if q.is_empty() {
+            self.pending.remove(key);
+        }
+        p
+    }
+
+    /// One write of `job` is fully applied. Called AFTER its insert: a
+    /// finished job forgotten before its last write is indexed would make
+    /// that write pin for a job nobody releases.
+    fn job_write_done(&mut self, job: Option<JobId>) {
+        let Some(job) = job else { return };
+        let n = self.job_writes.entry(job).or_default();
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            self.job_writes.remove(&job);
+            if self.index.finished(job).is_some() {
+                self.index.forget_job(job);
+            }
+        }
+    }
+
+    /// The key has no write in flight and is not indexed: whatever file may
+    /// be left at its path is garbage (an unlink skipped while a write was
+    /// pending, 9.4) and goes.
+    fn delete_if_unindexed(&mut self, key: &Key, tail: bool) {
+        if self.pending.contains_key(key) {
+            return;
+        }
+        if tail && self.index.tail(key).is_none() {
+            self.io.delete(self.io.dirs().tail_path(key), 0);
+        } else if !tail && self.index.chunk(key).is_none() {
+            self.io.delete(self.io.dirs().chunk_path(key), 0);
+        }
+    }
+
     fn complete(&mut self, done: Vec<Completion>, now: u64) -> Vec<StoreEvent> {
         let mut ev = Vec::new();
         for c in done {
             match c {
-                Completion::Written { key, tail, result } => {
-                    let Some(p) = self.pending.remove(&key) else { continue };
+                Completion::Written { key, tail, result, payload_hash, bufs } => {
+                    self.recycle(bufs);
+                    let Some(p) = self.pop_pending(&key) else { continue };
+                    let job = p.job();
                     match (p, result) {
                         (PendingWrite::Chunk(mut ins), Ok(bytes)) => {
                             ins.bytes = bytes;
-                            self.index.insert_chunk(ins);
+                            ins.payload_hash = payload_hash.unwrap_or_default();
+                            self.index.insert_chunk(ins, now);
                             ev.push(StoreEvent::ChunkStored(key));
                         }
                         (PendingWrite::Tail(mut ins), Ok(bytes)) => {
@@ -403,38 +574,62 @@ impl Store {
                                 Ok(()) => ev.push(StoreEvent::TailStored(key)),
                                 Err(index::Refused::MissingAncestor) => {
                                     tracing::info!(key = %keys::hex(&key[..8]), "kv.write_dropped kind=tail why=broken_path");
-                                    self.io.delete(self.dirs().tail_path(&key), bytes);
+                                    self.delete_if_unindexed(&key, true);
                                     self.dropped += 1;
+                                    self.recent.note(key, RecentEvent::Dropped, now);
                                     ev.push(StoreEvent::TailDropped { key, why: "broken_path" });
                                 }
                             }
                         }
-                        (_, Err(e)) => {
-                            tracing::warn!(key = %keys::hex(&key[..8]), tail, error = %e, "kv.write_dropped why=io");
+                        (_, Err((kind, msg))) => {
+                            tracing::warn!(key = %keys::hex(&key[..8]), tail, ?kind, error = %msg, "kv.write_dropped why=io");
                             self.dropped += 1;
+                            self.recent.note(key, RecentEvent::Dropped, now);
+                            self.delete_if_unindexed(&key, tail);
                             ev.push(if tail { StoreEvent::TailDropped { key, why: "io" } } else { StoreEvent::ChunkDropped(key) });
                         }
                     }
+                    self.job_write_done(job);
                 }
-                Completion::Corrupt { key, error } => {
-                    tracing::warn!(key = %keys::hex(&key[..8]), error = %error, "kv.corrupt (demote)");
-                    self.index.remove_tail(&key, Why::Corrupt, now);
+                Completion::MutationFailed { key, error } => {
+                    if error.evicts() {
+                        tracing::warn!(key = %keys::hex(&key[..8]), error = %error, "kv.corrupt demotion found a bad file");
+                        self.index.remove_tail(&key, Why::Corrupt, now);
+                    } else {
+                        // The index already counts it as demoted; the file
+                        // keeps section D until the next scan sees it.
+                        tracing::warn!(key = %keys::hex(&key[..8]), error = %error, "kv.suspect demotion failed transiently");
+                    }
                 }
             }
         }
         self.index.enforce_cap(now);
-        self.apply();
+        self.apply(now);
         ev
     }
 
-    /// Hand the index's file work to the IO thread; log removals.
-    fn apply(&mut self) {
+    /// Hand the index's file work to the IO thread and record removals. An
+    /// unlink of a key with a write in flight is skipped: that write already
+    /// ran or will run, and the file at the path is (or will be) the new one;
+    /// if the write fails, `delete_if_unindexed` cleans up.
+    fn apply(&mut self, now: u64) {
         for a in self.index.take_actions() {
             match a {
-                Action::UnlinkChunk { key, bytes } => self.io.delete(self.io.dirs().chunk_path(&key), bytes),
-                Action::UnlinkTail { key, bytes } => self.io.delete(self.io.dirs().tail_path(&key), bytes),
+                Action::UnlinkChunk { key, bytes, why } => {
+                    self.recent.note(key, RecentEvent::Removed(why), now);
+                    if !self.pending.contains_key(&key) {
+                        self.io.delete(self.io.dirs().chunk_path(&key), bytes);
+                    }
+                }
+                Action::UnlinkTail { key, bytes, why } => {
+                    self.recent.note(key, RecentEvent::Removed(why), now);
+                    if !self.pending.contains_key(&key) {
+                        self.io.delete(self.io.dirs().tail_path(&key), bytes);
+                    }
+                }
                 Action::Demote { key, hits } => {
                     tracing::info!(key = %keys::hex(&key[..8]), "kv.demote");
+                    self.recent.note(key, RecentEvent::Demoted, now);
                     self.io.submit(IoJob::Demote { path: self.io.dirs().tail_path(&key), key: Some(key), hits: Some(hits) })
                 }
                 Action::Touch { key, hits, last_used } => self.io.submit(IoJob::Touch { key, hits, last_used }),
@@ -470,6 +665,17 @@ impl Store {
         }
     }
 
+    fn gen_for(&self, knob: Option<[u8; 16]>) -> GenPair {
+        GenPair { gen: KV_NUMERICS_GEN, knob: knob.unwrap_or(self.cfg.knob_hash) }
+    }
+
+    fn queue(&mut self, key: Key, p: PendingWrite) {
+        if let Some(job) = p.job() {
+            *self.job_writes.entry(job).or_default() += 1;
+        }
+        self.pending.entry(key).or_default().push_back(p);
+    }
+
     /// Queue chunk `k` of the request (w1). The key comes from the job's
     /// cursor over the request ids (the same `chunk_step` the walk uses).
     pub fn write_chunk(&mut self, cur: &mut ChainCursor, req: ChunkWriteReq<'_>, budget: &mut WaitBudget, now: u64) -> Result<WriteOutcome, StoreError> {
@@ -490,7 +696,8 @@ impl Store {
             return Ok(WriteOutcome::Pending);
         }
         let images: Vec<ImageRecord> = keys::images_in(req.images, a, a + C).to_vec();
-        let gen = self.cfg.gen();
+        let gen = self.gen_for(req.knob_hash);
+        let backfill = req.provenance == Provenance::BackfillV6;
         let header = ChunkHeader {
             ns: *self.chain.ns(),
             key,
@@ -500,27 +707,29 @@ impl Store {
             n_images: images.len() as u16,
             stores: self.chunk_rows.clone(),
             provenance: req.provenance,
-            gen: if req.provenance == Provenance::BackfillV6 { GenPair { gen: format::GEN_V6, ..gen } } else { gen },
-            build: if req.provenance == Provenance::BackfillV6 { BuildId::V6 } else { self.cfg.build },
+            gen: if backfill { GenPair { gen: format::GEN_V6, ..gen } } else { gen },
+            build: if backfill { BuildId::V6 } else { self.cfg.build },
             created: now,
             payload_len: want,
             payload_hash: [0; 32],
         };
         let bytes = header.data_offset() + want;
-        let ins = ChunkInsert { key, parent, k: req.k, bytes, created: now, gen: header.gen, job: req.job };
+        let ins = ChunkInsert { key, parent, k: req.k, bytes, created: now, gen: header.gen, payload_hash: [0; 32], job: req.job };
         let w = ChunkWrite { header, tokens: req.tokens[a as usize..(a + C) as usize].to_vec(), images, payload: req.payload };
         if self.io.submit_write(IoJob::Chunk(Box::new(w)), bytes, budget).is_err() {
             tracing::info!(k = req.k, "kv.write_dropped kind=chunk why=queue_full");
             self.dropped += 1;
+            self.recent.note(key, RecentEvent::Dropped, now);
             return Ok(WriteOutcome::Dropped);
         }
-        self.pending.insert(key, PendingWrite::Chunk(ins));
+        self.queue(key, PendingWrite::Chunk(ins));
         Ok(WriteOutcome::Queued)
     }
 
     /// Queue a tail at `t` (w2-w4). Skipped when the same key is stored or in
     /// flight with at least this kind; a full tail replaces an encoder tail at
-    /// the same key (5.1) and keeps its hits and anchor flag.
+    /// the same key (5.1) and keeps its hits and anchor flag. The ancestors
+    /// (8.2) are the indexed and in-flight tails on this request's path.
     pub fn write_tail(&mut self, cur: &mut ChainCursor, req: TailWriteReq<'_>, budget: &mut WaitBudget, now: u64) -> Result<WriteOutcome, StoreError> {
         let t = req.t;
         if t as usize > req.tokens.len() {
@@ -548,16 +757,17 @@ impl Store {
         if existing.is_some_and(|(k, _, _)| k >= req.kind) {
             return Ok(WriteOutcome::Stored);
         }
-        if let Some(PendingWrite::Tail(p)) = self.pending.get(&key) {
-            if p.kind >= req.kind {
-                return Ok(WriteOutcome::Pending);
-            }
+        let in_flight = self.pending.get(&key).is_some_and(|q| q.iter().any(|p| matches!(p, PendingWrite::Tail(p) if p.kind >= req.kind)));
+        if in_flight {
+            return Ok(WriteOutcome::Pending);
         }
+        let ancestors = self.ancestors(cur, req.tokens, req.images, t);
         let a = t / C * C;
         let images: Vec<ImageRecord> = keys::images_in(req.images, a, t).to_vec();
-        let anchor = req.origin == TailOrigin::Anchor || existing.is_some_and(|(_, an, _)| an);
+        let pending_anchor = self.pending.get(&key).is_some_and(|q| q.iter().any(|p| matches!(p, PendingWrite::Tail(p) if p.anchor)));
+        let anchor = req.origin == TailOrigin::Anchor || existing.is_some_and(|(_, an, _)| an) || pending_anchor;
         let hits = existing.map_or(0, |(_, _, h)| h);
-        let gen = self.cfg.gen();
+        let gen = self.gen_for(req.knob_hash);
         let header = TailHeader {
             ns: *self.chain.ns(),
             key,
@@ -596,91 +806,176 @@ impl Store {
             created: now,
             gen,
             hits,
-            ancestors: req.ancestors,
+            ancestors,
             job: req.job,
         };
         let w = TailWrite { header, open: req.tokens[a as usize..t as usize].to_vec(), images, sec_e: req.sec_e, sec_d: req.sec_d };
         if self.io.submit_write(IoJob::Tail(Box::new(w)), bytes, budget).is_err() {
             tracing::info!(t, kind = ?req.kind, "kv.write_dropped kind=tail why=queue_full");
             self.dropped += 1;
+            self.recent.note(key, RecentEvent::Dropped, now);
             return Ok(WriteOutcome::Dropped);
         }
-        self.pending.insert(key, PendingWrite::Tail(ins));
+        self.queue(key, PendingWrite::Tail(ins));
         Ok(WriteOutcome::Queued)
+    }
+
+    /// The tails on the path of a tail at `t` of this request: indexed ones
+    /// (the walk's matching over the cursor's chain keys, no chunk re-hashed)
+    /// and in-flight ones (a job's own waypoints land before its prompt end:
+    /// FIFO).
+    fn ancestors(&self, cur: &mut ChainCursor, tokens: &[i32], images: &[ImageRecord], t: u32) -> Vec<Key> {
+        let chain = cur.keys_to(tokens, images, t / C).to_vec();
+        let mut anc = self.index.ancestors_on_path(&chain, tokens, images, t);
+        for (pk, q) in &self.pending {
+            for p in q {
+                let PendingWrite::Tail(p) = p else { continue };
+                if p.t >= t || anc.contains(pk) {
+                    continue;
+                }
+                let b = (p.t / C) as usize;
+                let a = b as u32 * C;
+                if chain[b] == p.base && keys::tail_step(&chain[b], a, &tokens[a as usize..p.t as usize], keys::images_in(images, a, p.t)) == *pk {
+                    anc.push(*pk);
+                }
+            }
+        }
+        anc
     }
 
     /// A restore of `tail` (8.3): a hit, and its walk ancestors' paths young.
     pub fn touch(&mut self, tail: &Key, ancestors: &[Key], now: u64) {
         self.index.touch(tail, ancestors, now);
-        self.apply();
+        self.apply(now);
     }
 
-    /// Pin a restore plan's tail and chunk path until the restore completes.
-    pub fn pin_plan(&mut self, tail: &Key) -> Option<PinId> {
-        self.index.pin_plan(tail)
+    /// Pin a restore plan's tail and chunk path until the restore completes;
+    /// owned by `job`, it also goes when the job ends.
+    pub fn pin_plan(&mut self, tail: &Key, job: Option<JobId>) -> Option<PinId> {
+        self.index.pin_plan(tail, job)
     }
 
     pub fn unpin(&mut self, id: PinId, now: u64) {
         self.index.unpin(id, now);
-        self.apply();
+        self.apply(now);
     }
 
-    /// A job ended; `failed` = an error, not a cancel (9.4).
+    /// A job ended; `failed` = an error, not a cancel (9.4). It may be called
+    /// while writes of the job are in flight: they land unowned, and a failed
+    /// job's late chunks go at once if nothing references them.
     pub fn job_finished(&mut self, job: JobId, failed: bool, now: u64) {
         self.index.release_job(job, failed, now);
+        if !self.job_writes.contains_key(&job) {
+            self.index.forget_job(job);
+        }
         self.index.enforce_cap(now);
-        self.apply();
+        self.apply(now);
     }
 
-    /// Read and verify chunk `k` of a plan against the request's ids. A file
-    /// that fails is evicted with every tail beneath it (6.2) and reported.
-    pub fn read_chunk(&mut self, key: &Key, expect: &[i32], now: u64) -> Result<format::ChunkFile, StoreError> {
+    /// Evict a file for a data-attributable failure the caller found (shape,
+    /// ABI, a restore-side check), with everything beneath it (6.2).
+    pub fn evict_corrupt(&mut self, key: &Key, kind: EntryKind, now: u64) {
+        match kind {
+            EntryKind::Chunk => self.index.remove_chunk(key, Why::Corrupt, now),
+            EntryKind::Tail => {
+                self.index.remove_tail(key, Why::Corrupt, now);
+            }
+        }
+        self.apply(now);
+    }
+
+    fn read_failed(&mut self, key: &Key, kind: EntryKind, error: FormatError, now: u64) -> StoreError {
+        if error.evicts() {
+            tracing::warn!(key = %keys::hex(&key[..8]), ?kind, error = %error, "kv.corrupt");
+            self.evict_corrupt(key, kind, now);
+            StoreError::Corrupt { key: *key, error }
+        } else {
+            tracing::warn!(key = %keys::hex(&key[..8]), ?kind, error = %error, "kv.suspect read failed; file kept");
+            StoreError::Io { key: *key, error }
+        }
+    }
+
+    /// Read and verify an indexed chunk into `payload` (a reused staging
+    /// buffer) and check its ids against the request's. A file that fails a
+    /// data check is evicted with every tail beneath it (6.2); a transient IO
+    /// failure evicts nothing.
+    pub fn read_chunk_into(&mut self, key: &Key, expect: &[i32], payload: &mut Vec<u8>, now: u64) -> Result<ChunkMeta, StoreError> {
         if self.index.chunk(key).is_none() {
             return Err(StoreError::Missing);
         }
-        let r = format::read_chunk(&self.dirs().chunk_path(key), self.chain.ns()).and_then(|f| {
-            if f.header.stores != self.chunk_rows {
+        let r = format::read_chunk_into(&self.dirs().chunk_path(key), self.chain.ns(), Some(key), payload).and_then(|m| {
+            if m.header.stores != self.chunk_rows {
                 Err(FormatError::BadField("store shape"))
-            } else if f.tokens != expect {
+            } else if m.tokens != expect {
                 Err(FormatError::BadField("token ids differ from the request"))
             } else {
-                Ok(f)
+                Ok(m)
             }
         });
-        r.map_err(|error| {
-            tracing::warn!(key = %keys::hex(&key[..8]), error = %error, "kv.corrupt chunk");
-            self.index.remove_chunk(key, Why::Corrupt, now);
-            self.apply();
-            StoreError::Corrupt { key: *key, error }
-        })
+        r.map_err(|e| self.read_failed(key, EntryKind::Chunk, e, now))
     }
 
-    /// Read and verify a tail against the request's open ids; `want_d` reads
-    /// section D (only when t ≤ 128 will use it, 6.6).
-    pub fn read_tail(&mut self, key: &Key, expect_open: &[i32], want_d: bool, now: u64) -> Result<format::TailFile, StoreError> {
-        if self.index.tail(key).is_none() {
-            return Err(StoreError::Missing);
+    pub fn read_chunk(&mut self, key: &Key, expect: &[i32], now: u64) -> Result<format::ChunkFile, StoreError> {
+        let mut payload = Vec::new();
+        let m = self.read_chunk_into(key, expect, &mut payload, now)?;
+        Ok(format::ChunkFile { header: m.header, tokens: m.tokens, images: m.images, payload })
+    }
+
+    /// Read and verify an indexed tail against the request's open ids;
+    /// `want_d` reads section D (only a t ≤ 128 restore uses it, 6.6) and is
+    /// refused for a tail the index holds as encoder-only.
+    pub fn read_tail_into(
+        &mut self,
+        key: &Key,
+        expect_open: &[i32],
+        want_d: bool,
+        sec_e: &mut Vec<u8>,
+        sec_d: &mut Vec<u8>,
+        now: u64,
+    ) -> Result<TailMeta, StoreError> {
+        let Some(e) = self.index.tail(key) else { return Err(StoreError::Missing) };
+        if want_d && e.kind != TailKind::Full {
+            return Err(StoreError::Invalid("section D asked of an encoder tail".into()));
         }
-        let stores = self.stores.clone();
-        let r = format::read_tail(&self.dirs().tail_path(key), self.chain.ns(), want_d).and_then(|f| {
-            if f.header.sec_e_len != format::section_e_len(&stores, f.header.t, f.header.n_raw) {
+        let stores = &self.stores;
+        let r = format::read_tail_into(&self.io.dirs().tail_path(key), self.chain.ns(), Some(key), want_d, sec_e, sec_d).and_then(|m| {
+            let h = &m.header;
+            if h.n_raw != h.t.min(v4flash_kernels::config::SWA_WINDOW) || h.sec_e_len != format::section_e_len(stores, h.t, h.n_raw) {
                 Err(FormatError::BadField("section E shape"))
-            } else if f.open != expect_open {
+            } else if m.open != expect_open {
                 Err(FormatError::BadField("token ids differ from the request"))
             } else {
-                Ok(f)
+                Ok(m)
             }
         });
-        r.map_err(|error| {
-            tracing::warn!(key = %keys::hex(&key[..8]), error = %error, "kv.corrupt tail");
-            self.index.remove_tail(key, Why::Corrupt, now);
-            self.apply();
-            StoreError::Corrupt { key: *key, error }
-        })
+        r.map_err(|e| self.read_failed(key, EntryKind::Tail, e, now))
     }
 
+    pub fn read_tail(&mut self, key: &Key, expect_open: &[i32], want_d: bool, now: u64) -> Result<format::TailFile, StoreError> {
+        let (mut e, mut d) = (Vec::new(), Vec::new());
+        let m = self.read_tail_into(key, expect_open, want_d, &mut e, &mut d, now)?;
+        Ok(format::TailFile { header: m.header, open: m.open, images: m.images, sec_e: e, sec_d: want_d.then_some(d) })
+    }
+
+    /// The index invariants, plus the store's own: every pending entry and
+    /// every job write counter agree, and no finished job owns a pin.
     pub fn check_invariants(&self) -> Result<(), String> {
-        self.index.check_invariants()
+        self.index.check_invariants()?;
+        let mut per_job: HashMap<JobId, u32> = HashMap::new();
+        for q in self.pending.values() {
+            if q.is_empty() {
+                return Err("empty pending queue left in the map".into());
+            }
+            for p in q {
+                if let Some(j) = p.job() {
+                    *per_job.entry(j).or_default() += 1;
+                }
+            }
+        }
+        if per_job != self.job_writes {
+            return Err(format!("job write counters drifted: {:?} vs {:?}", self.job_writes, per_job));
+        }
+        Ok(())
     }
 
     pub fn stats(&self) -> StoreStats {
@@ -692,9 +987,10 @@ impl Store {
             tail_bytes: self.index.tail_bytes(),
             inactive_bytes: self.index.inactive_bytes(),
             cap_bytes: self.index.cap_bytes(),
-            pending_writes: self.pending.len() as u64,
+            pending_writes: self.pending.values().map(|q| q.len() as u64).sum(),
             writes_dropped: self.dropped,
             evicted_bytes: self.evicted_bytes,
+            needs_rescan: self.index.needs_rescan(),
             gens: self.index.gens().collect(),
             io: self.io.stats(),
         }
@@ -704,21 +1000,23 @@ impl Store {
     /// then apply the completions. For tests and shutdown.
     pub fn flush(&mut self, all: bool, now: u64) -> Vec<StoreEvent> {
         let done = if all { self.io.flush_all() } else { self.io.flush() };
-        let ev = self.complete(done, now);
+        let mut ev = self.complete(done, now);
         if all {
             // The completions may have queued more unlinks.
             let more = self.io.flush_all();
-            let mut ev = ev;
             ev.extend(self.complete(more, now));
-            return ev;
         }
         ev
     }
 
-    /// Drain the write queue (9.4) and stop the IO thread.
-    pub fn shutdown(self, delete_grace: Duration) {
-        let n = self.pending.len();
-        let _ = self.io.shutdown(delete_grace);
+    /// Drain the write queue (9.4), persist the byte total, stop the IO thread.
+    pub fn shutdown(mut self, delete_grace: Duration, now: u64) {
+        let n: usize = self.pending.values().map(|q| q.len()).sum();
+        let done = self.io.flush();
+        self.complete(done, now);
+        self.persist_bytes();
+        let Self { io, .. } = self;
+        let _ = io.shutdown(delete_grace);
         tracing::info!(drained = n, "kv.store shutdown");
     }
 

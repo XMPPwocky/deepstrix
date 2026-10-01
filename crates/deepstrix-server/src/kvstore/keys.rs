@@ -20,6 +20,33 @@ use super::C;
 /// A 32-byte blake3 output: a namespace, a chain key, or a tail key.
 pub type Key = [u8; 32];
 
+/// Keys are uniform blake3 outputs: their first 8 bytes are already a hash,
+/// so the maps keyed by them skip SipHash (38K chunks, ~10K tails, lookups on
+/// every walk step).
+#[derive(Default, Clone, Copy)]
+pub struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // `[u8; 32]` hashes as a length prefix (write_usize) then its bytes.
+        if bytes.len() >= 8 {
+            self.0 ^= u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        } else {
+            for b in bytes {
+                self.0 = self.0.rotate_left(8) ^ *b as u64;
+            }
+        }
+    }
+    fn write_usize(&mut self, _len: usize) {}
+}
+
+pub type KeyBuild = std::hash::BuildHasherDefault<KeyHasher>;
+pub type KeyMap<V> = std::collections::HashMap<Key, V, KeyBuild>;
+pub type KeySet = std::collections::HashSet<Key, KeyBuild>;
+
 /// `blake3::derive_key` contexts. Separate contexts keep the three kinds of
 /// hash apart: no chunk key can ever equal a tail key or a namespace.
 pub const CTX_NAMESPACE: &str = "deepstrix kvstore v1 namespace";
@@ -200,10 +227,23 @@ impl ChainCursor {
 
     /// Seed with keys already known for this request (the walk's matched
     /// chunks, chain_1..chain_m), so a job never re-hashes its restored prefix.
+    ///
+    /// Panics if the cursor already holds keys that disagree with `matched`:
+    /// it was created for a different request (a caller bug that would write
+    /// files under keys no walk can reach).
     pub fn seed(&mut self, matched: &[Key]) {
-        if self.keys.len() == 1 {
-            self.keys.extend_from_slice(matched);
+        for (i, k) in matched.iter().enumerate() {
+            match self.keys.get(i + 1) {
+                Some(have) => assert_eq!(have, k, "ChainCursor::seed: chain_{} differs; cursor of another request", i + 1),
+                None => self.keys.push(*k),
+            }
         }
+    }
+
+    /// chain_0..chain_b (extended over `tokens` as needed).
+    pub fn keys_to(&mut self, tokens: &[i32], images: &[ImageRecord], b: u32) -> &[Key] {
+        self.chain(tokens, images, b);
+        &self.keys[..=b as usize]
     }
 
     pub fn known(&self) -> u32 {
@@ -237,6 +277,11 @@ pub struct NamespaceInputs {
     pub index_k: bool,
     /// [`super::KV_EPOCH`] (4.4.1).
     pub kv_epoch: u32,
+    /// [`super::format::FORMAT_VERSION`]: a format bump starts a new namespace,
+    /// so neither the new binary's scan nor a rolled-back one unlinks the
+    /// other's files as "bad version"; the old namespace is kept as the
+    /// inactive one and evicted first.
+    pub format: u32,
 }
 
 impl NamespaceInputs {
@@ -269,6 +314,8 @@ impl NamespaceInputs {
         v.push(self.index_k as u8);
         v.extend_from_slice(b"epoch\0");
         v.extend_from_slice(&self.kv_epoch.to_le_bytes());
+        v.extend_from_slice(b"format\0");
+        v.extend_from_slice(&self.format.to_le_bytes());
         v
     }
 
@@ -291,6 +338,7 @@ impl NamespaceInputs {
             ced,
             index_k,
             kv_epoch: super::KV_EPOCH,
+            format: super::format::FORMAT_VERSION as u32,
         }
     }
 }
@@ -392,6 +440,7 @@ mod tests {
             ced: true,
             index_k: true,
             kv_epoch: 1,
+            format: 1,
         }
     }
 
@@ -429,11 +478,11 @@ mod tests {
 
         let got = [hex(&ns), hex(&c1), hex(&c2), hex(&t_key), hex(&w_key)];
         let want = [
-            "1bf2c54238fb4bd3aa2afeea29cd294b0e274dd1218e8043ffa6b3f219de8665",
-            "b4e3720753f00e80fce784fe68b19e8832c21a66086c010eef6b9c2dca2085f0",
-            "2ec67cd5000c200ad0d656319a842cc54de911e6c9dac4ad3f8913b0732ca9a0",
-            "0042bb83757d78fd07b7a3aae22c5efc72cbeabb9fecf87d736a814fcdbf44c9",
-            "bae1357b6c296562c00d98918c5cfa259e383183cc5aae1d9cfdd2e612ad1899",
+            "226dc4b3153eb9136e83333dacbb6fe87b1f8744cc05c33ea4a4d089095b060a",
+            "17e7943790d51b2d3676f14911b4461f6623d603debfaaf0e73d52fab2b4e05e",
+            "e26f8ec96344183d9008dcd73eacd5f7a70497ecd4ba35356e4c01fd8f46d793",
+            "1ee14fcc1563032e91f8bc87d48ff2d8747a8e010c1c77333cf0cfbd515aae7d",
+            "64f6c89dc36bc0bbb99190f82da650665d750a24e96d3861ec2218082916445a",
         ];
         assert!(got == want, "key derivation changed (ns, chain_1, chain_2, tail(2C+200), tail(2C)):\n{got:#?}");
     }
@@ -485,6 +534,9 @@ mod tests {
         n.kv_epoch = 2;
         assert_ne!(k0, n.key(), "KV_EPOCH is part of the namespace");
         n.kv_epoch = 1;
+        n.format = 2;
+        assert_ne!(k0, n.key(), "FORMAT_VERSION is part of the namespace");
+        n.format = 1;
         assert_eq!(k0, n.key());
         // The same input under the three contexts gives three keys.
         let x = [7u8; 32];
@@ -492,6 +544,38 @@ mod tests {
         let b = blake3::derive_key(CTX_CHUNK, &x);
         let c = blake3::derive_key(CTX_TAIL, &x);
         assert!(a != b && b != c && a != c);
+    }
+
+    #[test]
+    fn cursor_seed_extends_and_checks() {
+        let chain = KeyChain::new(golden_ns().key());
+        let tokens = toks(3 * C as usize, 9);
+        let mut full = chain.cursor();
+        let keys: Vec<Key> = full.keys_to(&tokens, &[], 3)[1..].to_vec();
+        let mut c = chain.cursor();
+        c.chain(&tokens, &[], 1);
+        c.seed(&keys); // overlaps chain_1, extends to chain_3
+        assert_eq!(c.known(), 3);
+        assert_eq!(c.chain(&tokens, &[], 3), keys[2]);
+        let other = toks(3 * C as usize, 10);
+        let mut d = chain.cursor();
+        d.chain(&other, &[], 1);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.seed(&keys)));
+        assert!(r.is_err(), "seeding a cursor of another request must not pass silently");
+    }
+
+    #[test]
+    fn key_hasher_spreads_keys() {
+        use std::hash::BuildHasher;
+        let b = KeyBuild::default();
+        let k1: Key = core::array::from_fn(|i| i as u8);
+        let mut k2 = k1;
+        k2[0] ^= 1;
+        assert_ne!(b.hash_one(k1), b.hash_one(k2));
+        let mut m: KeyMap<u32> = KeyMap::default();
+        m.insert(k1, 1);
+        m.insert(k2, 2);
+        assert_eq!((m[&k1], m[&k2]), (1, 2));
     }
 
     #[test]

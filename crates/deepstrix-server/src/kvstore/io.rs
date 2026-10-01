@@ -18,7 +18,7 @@
 //! per-tick budget (`V41_KV_WRITE_WAIT_MS`) for room, then the write is
 //! dropped and the caller logs `kv.write_dropped`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::format::{self, ChunkHeader, TailHeader, TAIL_HEADER_LEN, TAIL_HITS_OFFSET};
+use super::format::{self, ChunkHeader, TailHeader, TailKind, TAIL_HEADER_LEN, TAIL_HITS_OFFSET};
 use super::keys::{self, ImageRecord, Key};
 
 /// Create `dir` and its missing parents with mode 0700: the files contain
@@ -106,11 +106,36 @@ pub enum IoJob {
 #[derive(Debug, Clone)]
 pub enum Completion {
     /// A chunk or tail write finished: `Ok(file bytes)` or the error (the tmp
-    /// file is removed; nothing was renamed).
-    Written { key: Key, tail: bool, result: Result<u64, String> },
-    /// A mutation found the file unreadable: the index should evict it.
-    Corrupt { key: Key, error: String },
+    /// file is removed; nothing was renamed). The write's buffers come back
+    /// for reuse; `payload_hash` is the stored chunk payload's blake3.
+    Written {
+        key: Key,
+        tail: bool,
+        result: Result<u64, (io::ErrorKind, String)>,
+        payload_hash: Option<[u8; 32]>,
+        bufs: Vec<Vec<u8>>,
+    },
+    /// A demotion failed on this tail. `error.evicts()` says whether the file
+    /// itself is bad (evict it) or the failure was transient (`kv.suspect`).
+    MutationFailed { key: Key, error: format::FormatError },
 }
+
+/// The write FIFO stayed full past the tick's wait budget: the write was
+/// dropped (`kv.write_dropped`, 9.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueFull;
+
+impl std::fmt::Display for QueueFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("kvstore write queue full")
+    }
+}
+
+impl std::error::Error for QueueFull {}
+
+/// Attempts at removing a trash directory before it is left alone (a file in
+/// it cannot be unlinked); it is then counted in `IoStats::trash_errors`.
+const TRASH_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IoStats {
@@ -128,6 +153,8 @@ pub struct IoStats {
     pub unlinked_bytes: u64,
     pub unlink_errors: u64,
     pub trash_files_removed: u64,
+    /// Trash directories given up on (something in them cannot be removed).
+    pub trash_errors: u64,
 }
 
 struct Queues {
@@ -138,9 +165,16 @@ struct Queues {
     deletes: VecDeque<PathBuf>,
     delete_set: HashMap<PathBuf, u64>,
     trash: Vec<PathBuf>,
+    /// Failed removals per trash directory, and the ones given up on (their
+    /// parents skip them instead of pushing them again).
+    trash_attempts: HashMap<PathBuf, u32>,
+    trash_failed: HashSet<PathBuf>,
     barriers_all: Vec<mpsc::SyncSender<()>>,
     shutdown: Option<Instant>,
     stats: IoStats,
+    /// Test fault injection: per queued write, true = fail it.
+    #[cfg(test)]
+    faults: VecDeque<bool>,
 }
 
 struct Shared {
@@ -187,9 +221,13 @@ impl IoHandle {
                 deletes: VecDeque::new(),
                 delete_set: HashMap::new(),
                 trash: Vec::new(),
+                trash_attempts: HashMap::new(),
+                trash_failed: HashSet::new(),
                 barriers_all: Vec::new(),
                 shutdown: None,
                 stats: IoStats::default(),
+                #[cfg(test)]
+                faults: VecDeque::new(),
             }),
             work: Condvar::new(),
             room: Condvar::new(),
@@ -206,7 +244,7 @@ impl IoHandle {
 
     /// Queue a write. Waits for room up to `budget` (which it decrements),
     /// then gives up: `Err` means dropped (`kv.write_dropped`).
-    pub fn submit_write(&self, job: IoJob, bytes: u64, budget: &mut WaitBudget) -> Result<(), ()> {
+    pub fn submit_write(&self, job: IoJob, bytes: u64, budget: &mut WaitBudget) -> Result<(), QueueFull> {
         let start = Instant::now();
         let deadline = start + budget.remaining;
         let mut q = self.shared.lock();
@@ -215,7 +253,7 @@ impl IoHandle {
             let now = Instant::now();
             if now >= deadline {
                 budget.remaining = Duration::ZERO;
-                return Err(());
+                return Err(QueueFull);
             }
             q = self.shared.room.wait_timeout(q, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
         }
@@ -224,6 +262,13 @@ impl IoHandle {
         q.main.push_back((job, bytes));
         self.shared.work.notify_one();
         Ok(())
+    }
+
+    /// Test fault injection: the next writes the worker runs fail (true) or
+    /// succeed (false), in order.
+    #[cfg(test)]
+    pub fn inject_write_faults(&self, pattern: &[bool]) {
+        self.shared.lock().faults.extend(pattern.iter().copied());
     }
 
     /// Queue a mutation (never dropped: they are tiny).
@@ -369,13 +414,14 @@ impl Worker {
         match job {
             IoJob::Chunk(mut w) => {
                 let key = w.header.key;
-                let r = self.write_chunk(&mut w);
-                self.written(key, false, r);
+                let r = if self.injected_fault() { Err(io::Error::other("injected write fault")) } else { self.write_chunk(&mut w) };
+                let hash = r.is_ok().then_some(w.header.payload_hash);
+                self.written(key, false, r, hash, vec![std::mem::take(&mut w.payload)]);
             }
             IoJob::Tail(mut w) => {
                 let key = w.header.key;
-                let r = self.write_tail(&mut w);
-                self.written(key, true, r);
+                let r = if self.injected_fault() { Err(io::Error::other("injected write fault")) } else { self.write_tail(&mut w) };
+                self.written(key, true, r, None, vec![std::mem::take(&mut w.sec_e), std::mem::take(&mut w.sec_d)]);
             }
             IoJob::Touch { key, hits, last_used } => {
                 let path = self.dirs.tail_path(&key);
@@ -384,15 +430,21 @@ impl Worker {
                 }
             }
             IoJob::Demote { path, key, hits } => {
-                if let Err(e) = demote(&path, hits) {
-                    tracing::warn!(path = %path.display(), error = %e, "kv.io demote failed");
+                if let Err(error) = demote(&path, hits) {
+                    tracing::warn!(path = %path.display(), error = %error, "kv.io demote failed");
                     if let Some(key) = key {
-                        let _ = self.tx.send(Completion::Corrupt { key, error: e.to_string() });
+                        let _ = self.tx.send(Completion::MutationFailed { key, error });
                     }
                 }
             }
             IoJob::Truncate { path, len } => {
-                if let Err(e) = OpenOptions::new().write(true).open(&path).and_then(|f| f.set_len(len)) {
+                // Keep the mtime: it is the tail's persisted last_used (8.3).
+                let r = OpenOptions::new().write(true).open(&path).and_then(|f| {
+                    let mtime = f.metadata()?.modified()?;
+                    f.set_len(len)?;
+                    f.set_modified(mtime)
+                });
+                if let Err(e) = r {
                     tracing::warn!(path = %path.display(), error = %e, "kv.io truncate failed");
                 }
             }
@@ -427,7 +479,17 @@ impl Worker {
         Some(self.trash_root.join(format!("{name}-{}-{}", unix_now(), self.seq)))
     }
 
-    fn written(&mut self, key: Key, tail: bool, r: io::Result<u64>) {
+    #[cfg(test)]
+    fn injected_fault(&self) -> bool {
+        self.shared.lock().faults.pop_front().unwrap_or(false)
+    }
+
+    #[cfg(not(test))]
+    fn injected_fault(&self) -> bool {
+        false
+    }
+
+    fn written(&mut self, key: Key, tail: bool, r: io::Result<u64>, payload_hash: Option<[u8; 32]>, bufs: Vec<Vec<u8>>) {
         {
             let mut q = self.shared.lock();
             match &r {
@@ -438,7 +500,8 @@ impl Worker {
                 Err(_) => q.stats.write_errors += 1,
             }
         }
-        let _ = self.tx.send(Completion::Written { key, tail, result: r.map_err(|e| e.to_string()) });
+        let result = r.map_err(|e| (e.kind(), e.to_string()));
+        let _ = self.tx.send(Completion::Written { key, tail, result, payload_hash, bufs });
     }
 
     /// A write to `path` makes a queued unlink of the same path stale: the
@@ -506,9 +569,15 @@ impl Worker {
     }
 
     /// Remove up to [`DELETE_BATCH`] entries of the deepest trash directory,
-    /// then return to the queues.
+    /// then return to the queues. A directory that will not go (a file in it
+    /// cannot be unlinked) is retried [`TRASH_ATTEMPTS`] times, then left on
+    /// disk and counted, so the worker never spins and `flush_all` returns.
     fn trash_step(&mut self) {
-        let Some(dir) = self.shared.lock().trash.last().cloned() else { return };
+        let (dir, failed) = {
+            let q = self.shared.lock();
+            let Some(d) = q.trash.last().cloned() else { return };
+            (d, q.trash_failed.clone())
+        };
         let mut removed = 0u64;
         let mut subdirs = Vec::new();
         let mut more = false;
@@ -521,7 +590,9 @@ impl Worker {
                     }
                     let p = e.path();
                     if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        subdirs.push(p);
+                        if !failed.contains(&p) {
+                            subdirs.push(p);
+                        }
                     } else if fs::remove_file(&p).is_ok() {
                         removed += 1;
                     }
@@ -535,8 +606,23 @@ impl Worker {
         if !subdirs.is_empty() {
             q.trash.extend(subdirs);
         } else if !more {
-            let _ = fs::remove_dir(&dir);
-            q.trash.retain(|d| d != &dir);
+            match fs::remove_dir(&dir) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    let n = q.trash_attempts.entry(dir.clone()).or_default();
+                    *n += 1;
+                    if *n >= TRASH_ATTEMPTS {
+                        tracing::warn!(dir = %dir.display(), error = %e, "kv.io trash dir left in place");
+                        q.trash_attempts.remove(&dir);
+                        q.trash.retain(|d| d != &dir);
+                        q.trash_failed.insert(dir);
+                        q.stats.trash_errors += 1;
+                    }
+                }
+                _ => {
+                    q.trash_attempts.remove(&dir);
+                    q.trash.retain(|d| d != &dir);
+                }
+            }
         }
         q.stats.trash_dirs = q.trash.len() as u64;
     }
@@ -592,7 +678,15 @@ pub(crate) fn demote(path: &Path, hits: Option<u32>) -> Result<(), format::Forma
     if h.anchor {
         return Err(format::FormatError::BadField("demoting an anchor"));
     }
-    let mtime = f.metadata()?.modified().ok();
+    if h.kind != TailKind::Full {
+        return Err(format::FormatError::BadField("demoting a tail that is not full"));
+    }
+    let meta = f.metadata()?;
+    // set_len past the end would EXTEND a torn file with zeros.
+    if meta.len() < h.e_end() {
+        return Err(format::FormatError::Short { want: h.e_end(), got: meta.len() });
+    }
+    let mtime = meta.modified().ok();
     f.set_len(h.e_end())?;
     let d = h.demoted(hits.unwrap_or(h.hits));
     f.write_all_at(&d.encode(), 0)?;
@@ -768,15 +862,28 @@ pub(crate) mod tests {
         let path = io.dirs().tail_path(&key);
         io.submit(IoJob::Demote { path: path.clone(), key: Some(key), hits: Some(18) });
         assert!(io.flush().iter().all(|c| matches!(c, Completion::Written { result: Ok(_), .. })));
-        let t = read_tail(&path, &ns, true).unwrap();
+        let t = read_tail(&path, &ns, false).unwrap();
         assert_eq!((t.header.kind, t.header.demoted, t.header.hits), (TailKind::Enc, true, 18));
-        assert!(t.sec_d.is_none());
+        assert_eq!(read_tail(&path, &ns, true), Err(format::FormatError::NoSectionD));
         assert_eq!(fs::metadata(&path).unwrap().len(), t.header.e_end());
         assert_eq!(mtime_secs(&fs::metadata(&path).unwrap()), 1_800_000_000, "demotion keeps last_used");
         // Demoting a corrupt file reports it.
         fs::write(&path, b"garbage").unwrap();
         io.submit(IoJob::Demote { path, key: Some(key), hits: Some(1) });
-        assert!(matches!(io.flush().as_slice(), [Completion::Corrupt { .. }]));
+        match io.flush().as_slice() {
+            [Completion::MutationFailed { error, .. }] => assert!(error.evicts(), "{error}"),
+            other => panic!("{other:?}"),
+        }
+        // A file already demoted (or torn short of section E) is refused, not
+        // extended by set_len.
+        let tw = tail_write(C + 7, TailKind::Enc, 5);
+        let p2 = io.dirs().tail_path(&tw.header.key);
+        io.submit_write(IoJob::Tail(Box::new(tw)), 1, &mut b).unwrap();
+        io.submit(IoJob::Demote { path: p2.clone(), key: None, hits: None });
+        io.flush();
+        let len = fs::metadata(&p2).unwrap().len();
+        assert_eq!(read_tail(&p2, &ns, false).unwrap().header.kind, TailKind::Enc);
+        assert_eq!(fs::metadata(&p2).unwrap().len(), len);
     }
 
     #[test]
@@ -797,6 +904,70 @@ pub(crate) mod tests {
         assert_eq!(fs::read_dir(root.join("trash")).unwrap().count(), 0);
         let s = io.stats();
         assert_eq!((s.trash_files_removed, s.trash_dirs), (450, 0));
+    }
+
+    #[test]
+    fn a_stuck_trash_dir_is_given_up_not_spun_on() {
+        // A file that cannot be unlinked (its directory is read-only) keeps its
+        // directory, and so every parent, non-empty forever. The worker must
+        // give up after a few attempts so it idles and flush_all returns.
+        use std::os::unix::fs::PermissionsExt;
+        let root = unique_dir("io-stuck");
+        let io = spawn(&root, 1 << 30);
+        // Already inside trash/ (as startup leaves it), so it is not renamed
+        // and the test can restore the permissions afterwards.
+        let victim = root.join("trash").join("oldns");
+        let locked = victim.join("chunks").join("ab");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("x.kvc"), b"x").unwrap();
+        fs::write(victim.join("chunks").join("y.kvc"), b"y").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let undo = || fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        if fs::remove_file(locked.join("x.kvc")).is_ok() {
+            undo();
+            return; // running as root: permissions do not bind, nothing to test
+        }
+        io.submit(IoJob::Trash { from: victim.clone() });
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            io.flush_all();
+            let _ = tx.send(io.stats());
+            io
+        });
+        let r = rx.recv_timeout(Duration::from_secs(20));
+        undo();
+        let s = r.expect("flush_all hung: the worker spins on the stuck trash dir");
+        drop(waiter.join().unwrap());
+        assert!(s.trash_errors >= 1 && s.trash_dirs == 0, "{s:?}");
+        assert!(s.trash_files_removed >= 1, "the removable file went");
+    }
+
+    #[test]
+    fn injected_write_faults_fail_only_their_writes() {
+        let root = unique_dir("io-fault");
+        let io = spawn(&root, 1 << 30);
+        let mut b = WaitBudget::new(Duration::from_millis(200));
+        io.inject_write_faults(&[false, true]);
+        let w0 = chunk_write(0, 1);
+        let w1 = chunk_write(1, 2);
+        let (k0, k1) = (w0.header.key, w1.header.key);
+        io.submit_write(IoJob::Chunk(Box::new(w0)), 1, &mut b).unwrap();
+        io.submit_write(IoJob::Chunk(Box::new(w1)), 1, &mut b).unwrap();
+        let done = io.flush();
+        let ok: Vec<(Key, bool)> = done
+            .iter()
+            .map(|c| match c {
+                Completion::Written { key, result, payload_hash, bufs, .. } => {
+                    assert_eq!(bufs.len(), 1, "the payload buffer comes back");
+                    assert_eq!(payload_hash.is_some(), result.is_ok());
+                    (*key, result.is_ok())
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(ok, vec![(k0, true), (k1, false)]);
+        assert!(io.dirs().chunk_path(&k0).exists() && !io.dirs().chunk_path(&k1).exists());
+        assert_eq!(fs::read_dir(io.dirs().tmp()).unwrap().count(), 0);
     }
 
     #[test]

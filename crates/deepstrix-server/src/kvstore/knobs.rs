@@ -12,17 +12,38 @@
 //! `multistream.rs`). [`tests::knob_literals_are_classified`] fails on any
 //! literal not listed here and on any listed name that no longer occurs.
 //!
-//! Classifying a new knob: `N` if it can change the bits of anything the
+//! **The rule.** A knob is `N` iff it can change the bits of anything the
 //! prefill stores (compressed rows, index keys, accumulators, the encoder and
-//! decoder windows, the DSpark ring seeded at finish), including kernel arm
-//! choices, chunk / lane sizes (kernels pick arms by batch size, E3), the
-//! box-1/box-2 split, Engram and the vision tower. `P` for decode-only,
-//! scheduling, logging, paths and pure IO. When in doubt, `N`: over-inclusion
-//! only adds a generation pair to the headers, under-inclusion hides drift.
+//! decoder windows, the DSpark ring seeded at finish) by changing either
+//! - WHAT is computed: a kernel arm, precision, fusion, or the batch / lane /
+//!   chunk geometry a kernel picks its arm by (E3); Engram; the vision tower;
+//! - or WHICH device computes a prefill row: box-1 ownership and residency
+//!   (the hot set, box-1 pool geometry, catch-all, partition, box-1 prefetch
+//!   admission), because box-1 residency decides what goes to box 2.
 //!
-//! Known gap (M2): knobs read by the box-2 daemon (`V41_B2_MERGE`,
-//! `V41_B2_FAST_CHAIN`, ...) are hashed from the HUB's environment, which may
-//! not be box 2's. Box 2 would have to report its values (e.g. in HELLO).
+//! Box-2 residency, prefetch and IO pacing (`V41_B2_PIN_*`, `V41_LM_PREFETCH`,
+//! `V41_LOOKAHEAD_PREFETCH`, readahead, read threads) are `P`: box 2 computes
+//! whatever the hub's split assigns it, whatever is resident there, so they
+//! change only WHEN bytes arrive. Decode-only knobs, scheduling, logging,
+//! paths and pure IO are `P`. When in doubt, `N`: over-inclusion only adds a
+//! generation pair to the headers, under-inclusion hides drift.
+//!
+//! **The hash covers only knobs that are SET** (name, length, value, sorted
+//! by name), so adding a knob to this table changes nobody's hash until
+//! someone sets it.
+//!
+//! **Known gaps (M2).** The hash is taken from the launch env at open; two
+//! kinds of knobs escape it:
+//! - knobs re-read at run time: `V41_MS_LM_FILE` re-reads its file every 2 s
+//!   per job, and `V41_B2_KNOBS` is the PATH of box 2's runtime knob file
+//!   (merge, fast_chain, coalesce), hashed as a path, not as values;
+//! - knobs read by the box-2 daemon itself (`V41_B2_MERGE`,
+//!   `V41_B2_FAST_CHAIN`, ...), hashed from the hub's environment, which need
+//!   not be box 2's.
+//!
+//! M2 closes both: a job hashes the values it resolved (with
+//! [`knob_hash_with`]) and passes them per write (`ChunkWriteReq::knob_hash`,
+//! `TailWriteReq::knob_hash`), and box 2 reports its own (e.g. in HELLO).
 //!
 //! The initial classification (2026-10-01) read each literal's use sites; the
 //! reasons are one line each.
@@ -400,26 +421,23 @@ pub const KNOBS: &[(&str, Class, &str)] = &[
     ("VIT_PROFILE", P, "vision tower profiling"),
 ];
 
-/// The knob hash over `get(name)` for every numerics knob, in table order.
-/// An unset knob and a knob set to its default hash differently: that only
+/// The knob hash over the numerics knobs that `get` reports as set, in name
+/// order: le32(len) ‖ name ‖ le32(len) ‖ value each. Unset knobs contribute
+/// nothing, so a newly classified knob changes no hash until it is set. A
+/// knob set to its default and an unset knob hash differently: that only
 /// over-separates (a new pair, no cold start).
 pub fn knob_hash_with(get: impl Fn(&str) -> Option<String>) -> [u8; 16] {
     let mut h = blake3::Hasher::new_derive_key("deepstrix kvstore v1 knob hash");
+    // KNOBS is sorted by name (table_is_sorted_and_unique).
     for (name, class, _) in KNOBS {
         if *class != N {
             continue;
         }
+        let Some(v) = get(name) else { continue };
+        h.update(&(name.len() as u32).to_le_bytes());
         h.update(name.as_bytes());
-        match get(name) {
-            Some(v) => {
-                h.update(&[1]);
-                h.update(&(v.len() as u32).to_le_bytes());
-                h.update(v.as_bytes());
-            }
-            None => {
-                h.update(&[0]);
-            }
-        }
+        h.update(&(v.len() as u32).to_le_bytes());
+        h.update(v.as_bytes());
     }
     let mut out = [0u8; 16];
     out.copy_from_slice(&h.finalize().as_bytes()[..16]);
@@ -550,6 +568,20 @@ mod tests {
         assert_eq!(base, knob_hash_with(|k| (k == p_knob).then(|| "1".into())), "a plain knob is not hashed");
         // The empty string is a value, distinct from unset.
         assert_ne!(base, knob_hash_with(|k| (k == n_knob).then(String::new)));
+        // Unset knobs contribute nothing: the hash of an empty env is the
+        // empty hash, whatever the table holds.
+        let empty = blake3::Hasher::new_derive_key("deepstrix kvstore v1 knob hash").finalize();
+        assert_eq!(base[..], empty.as_bytes()[..16], "unset knobs must not enter the hash");
+        // Two set knobs: order-independent of the env, fixed by name.
+        let two = |a: &str, b: &str| {
+            let (a, b) = (a.to_string(), b.to_string());
+            knob_hash_with(move |k| match k {
+                "V41_PREFILL_F32_MATVEC" => Some(a.clone()),
+                "V41_MS_CHUNK_ROWS" => Some(b.clone()),
+                _ => None,
+            })
+        };
+        assert_ne!(two("1", "512"), two("512", "1"), "values are bound to their names");
         for name in ["V41_PREFILL_F32_MATVEC", "V41_MS_CHUNK_ROWS", "VIT_GEMM", "V41_T2_CATCHALL", "V41_MHC_GEMM_NARROW"] {
             assert_eq!(KNOBS.iter().find(|k| k.0 == name).map(|k| k.1), Some(N), "{name} must be numerics (4.4)");
         }

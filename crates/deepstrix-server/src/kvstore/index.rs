@@ -14,22 +14,32 @@
 //!   goes when that reaches 0, with the last tail beneath it ("the chunk bytes
 //!   go only with the last tail beneath them").
 //! - `pins` of a chunk = the number of pin records anchored at it OR BELOW it.
-//!   Pins are PATH pins (a refinement of 6.5/9.4, which pin "files"): a pinned
-//!   chunk keeps its ancestors too, otherwise an in-flight job's restored
-//!   prefix could be cascaded away under the chunks it is writing, and its
-//!   next tail would find a hole. Refs and pins are therefore both monotone up
-//!   a path, so a deletable chunk's whole subtree is deletable.
+//!   Pins are PATH pins (6.5, 9.4): a pinned chunk keeps its ancestors too,
+//!   otherwise an in-flight job's restored prefix could be cascaded away under
+//!   the chunks it is writing, and its next tail would find a hole. Refs and
+//!   pins are therefore both monotone up a path, so a deletable chunk's whole
+//!   subtree is deletable.
 //! - orphans = chunks with refs 0 and pins 0 that no tail removal deleted:
 //!   left by a killed or cancelled job (or found by the startup scan). They are
 //!   the first thing eviction takes (8.3 order 1).
+//!
+//! Completions are asynchronous: a job may end (`release_job`) while writes of
+//! its are still in flight. Such late completions are indexed as unowned
+//! (no pin), and a failed job's late chunks go at once if nothing references
+//! them (9.4); the index remembers finished jobs until the store forgets them.
+//!
+//! Counter drift (a refcount or byte total that would go negative) never
+//! panics the scheduler thread: it saturates, logs `kv.invariant`, and sets
+//! [`Index::needs_rescan`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::format::{GenPair, TailKind, TailOrigin};
-use super::keys::{self, images_in, ImageRecord, Key};
+use super::keys::{self, images_in, ImageRecord, Key, KeyMap, KeySet};
 use super::{C, DEMOTE_KEEP_FULL, ENC_MIN_SUFFIX, K, MIN_RESTORE_T, SCORE_HIT_S};
 
-/// A prefill job, as the owner of chunk pins (9.4).
+/// A prefill job, as the owner of chunk pins and plan pins (9.4, 6.5). Ids
+/// must not be reused while the store remembers the job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JobId(pub u64);
 
@@ -48,6 +58,9 @@ pub struct ChunkEntry {
     pub bytes: u64,
     pub created: u64,
     pub gen: GenId,
+    /// The stored payload's blake3 (`kv.dedup_mismatch` compares a recomputed
+    /// chunk against it, 7.1 E2).
+    pub payload_hash: [u8; 32],
     pub refs: u32,
     pub pins: u32,
 }
@@ -81,7 +94,7 @@ pub struct TailEntry {
     pub thin_by: Option<Key>,
 }
 
-/// Why something left the index (`kv.evict why=`).
+/// Why something left the index (`kv.evict why=`, shadow reason codes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Why {
     Cap,
@@ -124,8 +137,8 @@ impl Why {
 /// order, 4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    UnlinkChunk { key: Key, bytes: u64 },
-    UnlinkTail { key: Key, bytes: u64 },
+    UnlinkChunk { key: Key, bytes: u64, why: Why },
+    UnlinkTail { key: Key, bytes: u64, why: Why },
     /// `ftruncate` section D, then rewrite the header with `hits` (8.2, 4.5).
     Demote { key: Key, hits: u32 },
     /// pwrite `hits`, set the mtime to `last_used` (8.3).
@@ -164,6 +177,7 @@ pub struct ChunkInsert {
     pub bytes: u64,
     pub created: u64,
     pub gen: GenPair,
+    pub payload_hash: [u8; 32],
     /// Pinned for this job until the next tail on its path completes (9.4).
     pub job: Option<JobId>,
 }
@@ -180,12 +194,14 @@ pub struct TailInsert {
     pub demoted: bool,
     pub bytes: u64,
     pub sec_d_bytes: u64,
+    /// The insert time: the header's `created`, the file's mtime, and so this
+    /// tail's `last_used` (8.3: the mtime IS the persisted last_used).
     pub created: u64,
     pub gen: GenPair,
     pub hits: u32,
-    /// The tails on this tail's path that the job's walk matched, plus the
-    /// tails the job itself wrote before this one (8.2: "the job's walk
-    /// matched them"). Drives demotion, thinning and touch propagation.
+    /// The tails on this tail's path (8.2: "the job's walk matched them"),
+    /// computed by the store from the request ([`Index::ancestors_on_path`]).
+    /// Drives demotion, thinning and touch propagation.
     pub ancestors: Vec<Key>,
     pub job: Option<JobId>,
 }
@@ -203,6 +219,8 @@ struct PinRec {
     /// force-removed (the contribution was already taken off its ancestors).
     chunk: Option<Key>,
     tail: Option<Key>,
+    /// The job that owns the record (released by `release_job`).
+    job: Option<JobId>,
 }
 
 /// A tail the walk matched.
@@ -224,8 +242,7 @@ pub struct Walk {
 }
 
 impl Walk {
-    /// The matched tails strictly below `t`: the ancestors of a tail written
-    /// at `t` for this request (8.2).
+    /// The matched tails strictly below `t`.
     pub fn ancestors_below(&self, t: u32) -> Vec<Key> {
         self.tails.iter().filter(|w| w.t < t).map(|w| w.key).collect()
     }
@@ -264,19 +281,22 @@ pub struct GenStat {
 
 pub struct Index {
     root: Key,
-    chunks: HashMap<Key, ChunkEntry>,
+    chunks: KeyMap<ChunkEntry>,
     /// parent key (the root included) -> child chunk keys. A child may arrive
     /// before its parent (a dropped write re-enqueued behind it, 9.4): it is
     /// listed here, unreachable for walks until the parent lands.
-    children: HashMap<Key, Vec<Key>>,
-    tails: HashMap<Key, TailEntry>,
+    children: KeyMap<Vec<Key>>,
+    tails: KeyMap<TailEntry>,
     /// node (chain_b) -> the tails hanging off it.
-    tails_at: HashMap<Key, Vec<Key>>,
+    tails_at: KeyMap<Vec<Key>>,
     /// (created, k, key): oldest first, and a parent before its children.
     orphans: BTreeSet<(u64, u32, Key)>,
     by_score: BTreeSet<(u64, Key)>,
     pins: HashMap<PinId, PinRec>,
     job_pins: HashMap<JobId, Vec<PinId>>,
+    /// Jobs that ended, with `failed`, until the store forgets them (their
+    /// writes drained). Their late completions are indexed unowned.
+    finished: HashMap<JobId, bool>,
     next_pin: u64,
     gens: Vec<GenPair>,
     gen_stats: Vec<GenStat>,
@@ -285,22 +305,32 @@ pub struct Index {
     /// Kept inactive namespaces (4.4): (ns16, bytes), evicted first, whole.
     inactive: Vec<(String, u64)>,
     cap_bytes: u64,
+    /// A counter would have gone negative: the incremental state drifted.
+    drift: bool,
     actions: Vec<Action>,
     removals: Vec<Removal>,
+}
+
+/// `a -= b`, saturating; true on underflow.
+fn sub_sat(a: &mut u64, b: u64) -> bool {
+    let under = b > *a;
+    *a = a.saturating_sub(b);
+    under
 }
 
 impl Index {
     pub fn new(root: Key, cap_bytes: u64) -> Self {
         Self {
             root,
-            chunks: HashMap::new(),
-            children: HashMap::new(),
-            tails: HashMap::new(),
-            tails_at: HashMap::new(),
+            chunks: KeyMap::default(),
+            children: KeyMap::default(),
+            tails: KeyMap::default(),
+            tails_at: KeyMap::default(),
             orphans: BTreeSet::new(),
             by_score: BTreeSet::new(),
             pins: HashMap::new(),
             job_pins: HashMap::new(),
+            finished: HashMap::new(),
             next_pin: 1,
             gens: Vec::new(),
             gen_stats: Vec::new(),
@@ -308,6 +338,7 @@ impl Index {
             tail_bytes: 0,
             inactive: Vec::new(),
             cap_bytes,
+            drift: false,
             actions: Vec::new(),
             removals: Vec::new(),
         }
@@ -370,6 +401,19 @@ impl Index {
     pub fn gens(&self) -> impl Iterator<Item = (GenPair, GenStat)> + '_ {
         self.gens.iter().copied().zip(self.gen_stats.iter().copied()).filter(|(_, s)| s.files > 0)
     }
+    /// A counter drifted (saturated instead of going negative): the store
+    /// should rebuild from disk (a restart's scan) at a convenient time.
+    pub fn needs_rescan(&self) -> bool {
+        self.drift
+    }
+    /// The job ended and the store has not forgotten it yet; `Some(failed)`.
+    pub fn finished(&self, job: JobId) -> Option<bool> {
+        self.finished.get(&job).copied()
+    }
+    /// Pin records the job still owns.
+    pub fn job_pin_count(&self, job: JobId) -> usize {
+        self.job_pins.get(&job).map_or(0, |v| v.len())
+    }
 
     /// File work produced since the last call.
     pub fn take_actions(&mut self) -> Vec<Action> {
@@ -378,6 +422,13 @@ impl Index {
     /// Removals since the last call (telemetry).
     pub fn take_removals(&mut self) -> Vec<Removal> {
         std::mem::take(&mut self.removals)
+    }
+
+    fn flag_drift(&mut self, what: &'static str) {
+        if !self.drift {
+            tracing::error!(what, "kv.invariant counter drift; saturated, a rescan is due");
+        }
+        self.drift = true;
     }
 
     fn intern_gen(&mut self, g: GenPair) -> GenId {
@@ -392,11 +443,44 @@ impl Index {
 
     fn gen_add(&mut self, g: GenId, files: i64, bytes: i64) {
         let s = &mut self.gen_stats[g as usize];
-        s.files = (s.files as i64 + files) as u64;
-        s.bytes = (s.bytes as i64 + bytes) as u64;
+        let (f, b) = (s.files as i64 + files, s.bytes as i64 + bytes);
+        s.files = f.max(0) as u64;
+        s.bytes = b.max(0) as u64;
+        if f < 0 || b < 0 {
+            self.flag_drift("generation stats");
+        }
+    }
+
+    fn sub_chunk_bytes(&mut self, b: u64) {
+        if sub_sat(&mut self.chunk_bytes, b) {
+            self.flag_drift("chunk bytes");
+        }
+    }
+
+    fn sub_tail_bytes(&mut self, b: u64) {
+        if sub_sat(&mut self.tail_bytes, b) {
+            self.flag_drift("tail bytes");
+        }
+    }
+
+    /// A job that ended is no owner any more: its late writes go in unowned.
+    fn live_job(&self, job: Option<JobId>) -> Option<JobId> {
+        job.filter(|j| !self.finished.contains_key(j))
     }
 
     // ---- chunks -------------------------------------------------------
+
+    /// Is this chunk on a path from the root (not detached)?
+    pub fn reachable(&self, key: &Key) -> bool {
+        let mut node = *key;
+        while node != self.root {
+            match self.chunks.get(&node) {
+                Some(c) => node = c.parent,
+                None => return false,
+            }
+        }
+        true
+    }
 
     /// The chunk keys of a path ending at node `base` = chain_b, in order
     /// chain_1..chain_b. `None` if any chunk is missing or misnumbered.
@@ -420,13 +504,19 @@ impl Index {
     /// Add `d_refs` / `d_pins` to `from` and every existing ancestor.
     fn add_path(&mut self, from: &Key, d_refs: i64, d_pins: i64) {
         let mut node = *from;
+        let mut under = false;
         while node != self.root {
             let Some(c) = self.chunks.get_mut(&node) else { break };
-            c.refs = (c.refs as i64 + d_refs).try_into().expect("chunk refs underflow");
-            c.pins = (c.pins as i64 + d_pins).try_into().expect("chunk pins underflow");
+            let (r, p) = (c.refs as i64 + d_refs, c.pins as i64 + d_pins);
+            under |= r < 0 || p < 0;
+            c.refs = r.max(0) as u32;
+            c.pins = p.max(0) as u32;
             let parent = c.parent;
             self.orphan_sync(&node);
             node = parent;
+        }
+        if under {
+            self.flag_drift("chunk refs/pins");
         }
     }
 
@@ -442,16 +532,30 @@ impl Index {
 
     /// Index a chunk whose file is on disk. Returns false if it was already
     /// indexed (the caller's dedup failed; the first writer wins, E5).
-    pub fn insert_chunk(&mut self, c: ChunkInsert) -> bool {
+    ///
+    /// A chunk of a job that already ended is indexed unowned; if that job
+    /// FAILED and nothing references or pins the chunk, it goes at once (9.4).
+    pub fn insert_chunk(&mut self, c: ChunkInsert, now: u64) -> bool {
         if self.chunks.contains_key(&c.key) || c.key == self.root {
             return false;
         }
+        let late_failed = c.job.and_then(|j| self.finished.get(&j).copied()).unwrap_or(false);
+        let job = self.live_job(c.job);
         let gen = self.intern_gen(c.gen);
         // Detached children that arrived before this chunk (9.4) carry pins.
         let pins_below: u32 = self.children(&c.key).iter().filter_map(|k| self.chunks.get(k)).map(|e| e.pins).sum();
         self.chunks.insert(
             c.key,
-            ChunkEntry { parent: c.parent, k: c.k, bytes: c.bytes, created: c.created, gen, refs: 0, pins: pins_below },
+            ChunkEntry {
+                parent: c.parent,
+                k: c.k,
+                bytes: c.bytes,
+                created: c.created,
+                gen,
+                payload_hash: c.payload_hash,
+                refs: 0,
+                pins: pins_below,
+            },
         );
         self.children.entry(c.parent).or_default().push(c.key);
         self.chunk_bytes += c.bytes;
@@ -461,10 +565,12 @@ impl Index {
             self.add_path(&parent, 0, pins_below as i64);
         }
         self.orphan_sync(&c.key);
-        if let Some(job) = c.job {
-            let id = self.new_pin(PinRec { chunk: Some(c.key), tail: None });
+        if let Some(job) = job {
+            let id = self.new_pin(PinRec { chunk: Some(c.key), tail: None, job: Some(job) });
             self.add_path(&c.key, 0, 1);
             self.job_pins.entry(job).or_default().push(id);
+        } else if late_failed && self.chunks.get(&c.key).is_some_and(|e| e.refs == 0 && e.pins == 0) {
+            self.delete_subtree(&c.key, Why::Failed, now);
         }
         true
     }
@@ -492,17 +598,20 @@ impl Index {
     /// which then have refs 0 and pins 0 too). Returns the bytes freed.
     fn delete_subtree(&mut self, key: &Key, why: Why, now: u64) -> u64 {
         let Some(top) = self.chunks.get(key) else { return 0 };
-        debug_assert!(top.refs == 0 && top.pins == 0, "deleting a referenced or pinned chunk");
+        if top.refs != 0 || top.pins != 0 {
+            self.flag_drift("deleting a referenced or pinned chunk");
+            return 0;
+        }
         let (top_k, top_bytes, top_created, parent) = (top.k, top.bytes, top.created, top.parent);
         let mut freed = 0;
         for k in self.subtree(key) {
             let Some(c) = self.chunks.remove(&k) else { continue };
             self.orphans.remove(&(c.created, c.k, k));
             self.children.remove(&k);
-            self.chunk_bytes -= c.bytes;
+            self.sub_chunk_bytes(c.bytes);
             self.gen_add(c.gen, -1, -(c.bytes as i64));
             freed += c.bytes;
-            self.actions.push(Action::UnlinkChunk { key: k, bytes: c.bytes });
+            self.actions.push(Action::UnlinkChunk { key: k, bytes: c.bytes, why });
         }
         if let Some(sib) = self.children.get_mut(&parent) {
             sib.retain(|c| c != key);
@@ -539,7 +648,7 @@ impl Index {
         let (pins, parent) = (c.pins, c.parent);
         if pins > 0 {
             self.add_path(&parent, 0, -(pins as i64));
-            let set: HashSet<Key> = self.subtree(key).into_iter().collect();
+            let set: KeySet = self.subtree(key).into_iter().collect();
             for rec in self.pins.values_mut() {
                 if rec.chunk.is_some_and(|c| set.contains(&c)) {
                     rec.chunk = None;
@@ -551,11 +660,15 @@ impl Index {
                 }
             }
         }
+        let mut stray_refs = false;
         for k in self.subtree(key) {
             if let Some(c) = self.chunks.get_mut(&k) {
-                debug_assert_eq!(c.refs, 0, "a chunk beneath a removed chunk still has tails");
+                stray_refs |= c.refs != 0;
                 c.refs = 0;
             }
+        }
+        if stray_refs {
+            self.flag_drift("refs beneath a removed chunk");
         }
         self.delete_subtree(key, why, now);
     }
@@ -579,18 +692,25 @@ impl Index {
     }
 
     /// Index a tail whose file is on disk (and demote / thin its path).
+    ///
+    /// Refused when a chunk on its path is missing; the job's pins on the
+    /// path are released either way (the tail was its "next tail", 9.4).
     pub fn insert_tail(&mut self, ins: TailInsert, now: u64) -> Result<(), Refused> {
         let b = ins.t / C;
-        let path = self.chunk_path(&ins.base, b).ok_or(Refused::MissingAncestor)?;
-        self.place_tail(&ins, b, ins.created.max(now));
-        // The tail's completion releases the job's pins on its path (9.4).
-        if let Some(job) = ins.job {
-            let on_path: HashSet<Key> = path.iter().copied().collect();
-            self.release_job_pins(job, now, |rec| rec.chunk.is_some_and(|c| on_path.contains(&c)));
+        let job = self.live_job(ins.job);
+        let path = self.chunk_path(&ins.base, b);
+        // The tail's completion releases the job's chunk pins on its path:
+        // every chunk the job pinned below b is on it (a job writes one request).
+        if let Some(job) = job {
+            self.release_job_pins(job, now, |idx, rec| {
+                rec.tail.is_none() && rec.chunk.map_or(true, |c| idx.chunks.get(&c).map_or(true, |e| e.k < b))
+            });
         }
-        // Inserting touches the tail and every ancestor the walk matched.
+        let path = path.ok_or(Refused::MissingAncestor)?;
+        self.place_tail(&ins, b);
+        // Inserting touches the tail and every ancestor on its path (8.3).
         let anc = self.valid_ancestors(&ins, &path);
-        self.propagate(&ins.key, &anc, now);
+        self.propagate(&ins.key, &anc, ins.created);
         if ins.kind == TailKind::Full {
             self.demote_and_thin(&ins.key, &anc, now);
         }
@@ -599,14 +719,15 @@ impl Index {
 
     /// Insert or replace the entry, with path refs; no policy. The startup
     /// scan uses this directly (the disk state is the state).
-    fn place_tail(&mut self, ins: &TailInsert, b: u32, last_used: u64) {
+    fn place_tail(&mut self, ins: &TailInsert, b: u32) {
         let gen = self.intern_gen(ins.gen);
-        if self.tails.contains_key(&ins.key) {
+        let last_used = ins.created;
+        if let Some(old) = self.tails.get(&ins.key).cloned() {
             // Same key: a full tail replacing an encoder tail at the same T
             // (5.1). The file was renamed over; adopt the new one, keep hits,
             // pins and the anchor flag.
-            let old = self.tails.get(&ins.key).unwrap().clone();
-            self.tail_bytes = self.tail_bytes - old.bytes + ins.bytes;
+            self.sub_tail_bytes(old.bytes);
+            self.tail_bytes += ins.bytes;
             self.gen_add(old.gen, -1, -(old.bytes as i64));
             self.gen_add(gen, 1, ins.bytes as i64);
             self.rescore(&ins.key, |e| {
@@ -653,11 +774,12 @@ impl Index {
         }
     }
 
-    /// Startup scan: index a tail exactly as found on disk.
-    pub(crate) fn load_tail(&mut self, ins: TailInsert, last_used: u64) -> Result<(), Refused> {
+    /// Startup scan: index a tail exactly as found on disk; `created` carries
+    /// the file's mtime (its persisted last_used).
+    pub(crate) fn load_tail(&mut self, ins: TailInsert) -> Result<(), Refused> {
         let b = ins.t / C;
         self.chunk_path(&ins.base, b).ok_or(Refused::MissingAncestor)?;
-        self.place_tail(&ins, b, last_used);
+        self.place_tail(&ins, b);
         Ok(())
     }
 
@@ -669,7 +791,7 @@ impl Index {
     /// The caller's ancestor list, restricted to tails that still exist and
     /// structurally sit on this tail's path (their node is on it, t below).
     fn valid_ancestors(&self, ins: &TailInsert, path: &[Key]) -> Vec<Key> {
-        let nodes: HashSet<&Key> = path.iter().chain(std::iter::once(&self.root)).collect();
+        let nodes: KeySet = path.iter().copied().chain(std::iter::once(self.root)).collect();
         ins.ancestors
             .iter()
             .filter(|a| **a != ins.key)
@@ -678,13 +800,13 @@ impl Index {
             .collect()
     }
 
-    fn propagate(&mut self, key: &Key, ancestors: &[Key], now: u64) {
+    fn propagate(&mut self, key: &Key, ancestors: &[Key], when: u64) {
         self.rescore(key, |e| {
-            e.last_used = e.last_used.max(now);
-            e.path_last_used = e.path_last_used.max(now);
+            e.last_used = e.last_used.max(when);
+            e.path_last_used = e.path_last_used.max(when);
         });
         for a in ancestors {
-            self.rescore(a, |e| e.path_last_used = e.path_last_used.max(now));
+            self.rescore(a, |e| e.path_last_used = e.path_last_used.max(when));
         }
     }
 
@@ -734,13 +856,16 @@ impl Index {
             return;
         }
         let freed = e.sec_d_bytes;
+        let under = sub_sat(&mut e.bytes, freed);
         e.kind = TailKind::Enc;
         e.demoted = true;
-        e.bytes -= freed;
         e.sec_d_bytes = 0;
         e.deferred_demote = false;
         let (gen, hits) = (e.gen, e.hits);
-        self.tail_bytes -= freed;
+        if under {
+            self.flag_drift("tail bytes below section D");
+        }
+        self.sub_tail_bytes(freed);
         self.gen_add(gen, 0, -(freed as i64));
         self.actions.push(Action::Demote { key: *key, hits });
     }
@@ -765,7 +890,7 @@ impl Index {
                 self.tails_at.remove(&e.base);
             }
         }
-        self.tail_bytes -= e.bytes;
+        self.sub_tail_bytes(e.bytes);
         self.gen_add(e.gen, -1, -(e.bytes as i64));
         if e.pins > 0 {
             // Forced removal of a pinned tail (corrupt): its pin records keep
@@ -776,7 +901,7 @@ impl Index {
                 }
             }
         }
-        self.actions.push(Action::UnlinkTail { key: *key, bytes: e.bytes });
+        self.actions.push(Action::UnlinkTail { key: *key, bytes: e.bytes, why });
         let mut cascaded = 0;
         if e.t >= C {
             self.add_path(&e.base, -1, 0);
@@ -816,7 +941,7 @@ impl Index {
         if !self.tails.contains_key(key) {
             return;
         }
-        self.rescore(key, |e| e.hits = e.hits.saturating_add(1));
+        self.rescore(key, |e| e.hits = e.hits.saturating_add(1).min(super::format::MAX_HITS));
         self.propagate(key, ancestors, now);
         let e = &self.tails[key];
         self.actions.push(Action::Touch { key: *key, hits: e.hits, last_used: e.last_used });
@@ -825,8 +950,10 @@ impl Index {
     // ---- pins ---------------------------------------------------------
 
     /// Pin a restore plan: the tail and its chunk path, until the restore
-    /// completes (6.5). Pins block deletion, demotion and thinning.
-    pub fn pin_plan(&mut self, tail: &Key) -> Option<PinId> {
+    /// completes (6.5). Pins block deletion, demotion and thinning. A plan
+    /// owned by `job` is also released when the job ends.
+    pub fn pin_plan(&mut self, tail: &Key, job: Option<JobId>) -> Option<PinId> {
+        let job = self.live_job(job);
         let e = self.tails.get_mut(tail)?;
         e.pins += 1;
         let (base, t) = (e.base, e.t);
@@ -834,11 +961,23 @@ impl Index {
         if let Some(c) = chunk {
             self.add_path(&c, 0, 1);
         }
-        Some(self.new_pin(PinRec { chunk, tail: Some(*tail) }))
+        let id = self.new_pin(PinRec { chunk, tail: Some(*tail), job });
+        if let Some(j) = job {
+            self.job_pins.entry(j).or_default().push(id);
+        }
+        Some(id)
     }
 
     pub fn unpin(&mut self, id: PinId, now: u64) {
         let Some(rec) = self.pins.remove(&id) else { return };
+        if let Some(j) = rec.job {
+            if let Some(v) = self.job_pins.get_mut(&j) {
+                v.retain(|x| *x != id);
+                if v.is_empty() {
+                    self.job_pins.remove(&j);
+                }
+            }
+        }
         self.drop_pin(rec, now);
     }
 
@@ -848,6 +987,10 @@ impl Index {
         }
         let Some(t) = rec.tail else { return };
         let Some(e) = self.tails.get_mut(&t) else { return };
+        if e.pins == 0 {
+            self.flag_drift("tail pins");
+            return;
+        }
         e.pins -= 1;
         if e.pins > 0 {
             return;
@@ -864,19 +1007,18 @@ impl Index {
         }
     }
 
-    fn release_job_pins(&mut self, job: JobId, now: u64, mut pred: impl FnMut(&PinRec) -> bool) {
-        let Some(ids) = self.job_pins.get_mut(&job) else { return };
-        let mut drop = Vec::new();
-        ids.retain(|id| match self.pins.get(id) {
-            Some(rec) if pred(rec) => {
-                drop.push(*id);
-                false
+    fn release_job_pins(&mut self, job: JobId, now: u64, mut pred: impl FnMut(&Self, &PinRec) -> bool) {
+        let Some(ids) = self.job_pins.remove(&job) else { return };
+        let (mut keep, mut drop) = (Vec::new(), Vec::new());
+        for id in ids {
+            match self.pins.get(&id) {
+                Some(rec) if pred(self, rec) => drop.push(id),
+                Some(_) => keep.push(id),
+                None => {}
             }
-            Some(_) => true,
-            None => false,
-        });
-        if ids.is_empty() {
-            self.job_pins.remove(&job);
+        }
+        if !keep.is_empty() {
+            self.job_pins.insert(job, keep);
         }
         for id in drop {
             if let Some(rec) = self.pins.remove(&id) {
@@ -885,16 +1027,19 @@ impl Index {
         }
     }
 
-    /// A job ended. Its remaining chunk pins go; on a failure (an error, not a
+    /// A job ended. Every pin it owns goes; on a failure (an error, not a
     /// cancel) its chunks that no tail references are deleted at once (9.4).
     /// After a cancel or a normal end they stay, as orphans if unreferenced.
+    /// Writes of the job still in flight land unowned ([`Index::insert_chunk`])
+    /// until [`Index::forget_job`].
     pub fn release_job(&mut self, job: JobId, failed: bool, now: u64) {
         let chunks: Vec<Key> = self
             .job_pins
             .get(&job)
-            .map(|ids| ids.iter().filter_map(|id| self.pins.get(id).and_then(|r| r.chunk)).collect())
+            .map(|ids| ids.iter().filter_map(|id| self.pins.get(id)).filter(|r| r.tail.is_none()).filter_map(|r| r.chunk).collect())
             .unwrap_or_default();
-        self.release_job_pins(job, now, |_| true);
+        self.release_job_pins(job, now, |_, _| true);
+        self.finished.insert(job, failed);
         if failed {
             for k in chunks {
                 if self.chunks.get(&k).is_some_and(|c| c.refs == 0 && c.pins == 0) {
@@ -902,6 +1047,11 @@ impl Index {
                 }
             }
         }
+    }
+
+    /// The job's writes have all completed: stop remembering it.
+    pub fn forget_job(&mut self, job: JobId) {
+        self.finished.remove(&job);
     }
 
     // ---- eviction (8.3) ---------------------------------------------------
@@ -988,6 +1138,23 @@ impl Index {
 
     // ---- lookup (6.1) ---------------------------------------------------
 
+    /// The tails at `node` (= chain_j, a = jC) whose key matches `tokens`, with
+    /// t ≤ `max_t`, by increasing t.
+    fn match_tails_at(&self, node: &Key, a: usize, tokens: &[i32], images: &[ImageRecord], max_t: usize, out: &mut Vec<WalkTail>) {
+        let Some(ts) = self.tails_at.get(node) else { return };
+        let mut cands: Vec<u32> = ts.iter().map(|k| self.tails[k].t).filter(|&t| t as usize <= max_t).collect();
+        cands.sort_unstable();
+        cands.dedup();
+        for t in cands {
+            let key = keys::tail_step(node, a as u32, &tokens[a..t as usize], images_in(images, a as u32, t));
+            if let Some(e) = self.tails.get(&key) {
+                if e.base == *node {
+                    out.push(WalkTail { key, t, kind: e.kind, anchor: e.anchor });
+                }
+            }
+        }
+    }
+
     /// Walk a request: chain keys while they are indexed, testing the tails at
     /// every matched node (b = 0 included). Pending writes are not indexed, so
     /// they are never matched; removed entries leave the index at once.
@@ -997,19 +1164,7 @@ impl Index {
         let mut node = self.root;
         let mut a = 0usize;
         loop {
-            if let Some(ts) = self.tails_at.get(&node) {
-                let mut cands: Vec<u32> = ts.iter().map(|k| self.tails[k].t).filter(|&t| t as usize <= l).collect();
-                cands.sort_unstable();
-                cands.dedup();
-                for t in cands {
-                    let key = keys::tail_step(&node, a as u32, &tokens[a..t as usize], images_in(images, a as u32, t));
-                    if let Some(e) = self.tails.get(&key) {
-                        if e.base == node {
-                            w.tails.push(WalkTail { key, t, kind: e.kind, anchor: e.anchor });
-                        }
-                    }
-                }
-            }
+            self.match_tails_at(&node, a, tokens, images, l, &mut w.tails);
             let end = a + C as usize;
             if end > l {
                 break;
@@ -1025,27 +1180,66 @@ impl Index {
         w
     }
 
+    /// The indexed tails on the path of a tail at `t` of this request (t' <
+    /// t), given its chain keys chain_0..chain_⌊t/C⌋: the walk's matching
+    /// without re-hashing any chunk. Stops at the first chain key not indexed.
+    pub fn ancestors_on_path(&self, chain: &[Key], tokens: &[i32], images: &[ImageRecord], t: u32) -> Vec<Key> {
+        let mut out = Vec::new();
+        if t == 0 {
+            return Vec::new();
+        }
+        for (j, node) in chain.iter().enumerate() {
+            if j > 0 && !self.chunks.contains_key(node) {
+                break;
+            }
+            self.match_tails_at(node, j * C as usize, tokens, images, t as usize - 1, &mut out);
+        }
+        out.into_iter().map(|w| w.key).collect()
+    }
+
     // ---- invariant checker (9.5) ------------------------------------------
 
-    /// Rebuild refcounts, pins, the orphan and score sets, byte totals and the
-    /// maps from scratch and compare with the incremental state. Run in tests
-    /// after every operation, and hourly in debug builds and in shadow.
+    /// Rebuild refcounts and pins bottom-up over the trie (O(chunks + tails)),
+    /// the orphan and score sets, byte totals, generation stats and the maps,
+    /// and compare with the incremental state. Run in tests after every
+    /// operation, and hourly in debug builds and in shadow.
     pub fn check_invariants(&self) -> Result<(), String> {
-        let mut refs: HashMap<Key, u32> = HashMap::new();
+        let h = |k: &Key| keys::hex(&k[..4]);
+        // Reachable chunks, and the k numbering along every edge.
+        let mut reach: KeySet = KeySet::default();
+        let mut stack = vec![(self.root, u32::MAX)];
+        while let Some((n, kn)) = stack.pop() {
+            for c in self.children(&n) {
+                let e = self.chunks.get(c).ok_or("children map names a missing chunk")?;
+                if e.parent != n || e.k != kn.wrapping_add(1) {
+                    return Err(format!("chunk {} misplaced under its parent", h(c)));
+                }
+                reach.insert(*c);
+                stack.push((*c, e.k));
+            }
+        }
         let mut tail_bytes = 0u64;
+        let mut own_refs: KeyMap<u32> = KeyMap::default();
+        let mut tail_pins: KeyMap<u32> = KeyMap::default();
         for (k, e) in &self.tails {
             tail_bytes += e.bytes;
-            let path = self
-                .chunk_path(&e.base, e.t / C)
-                .ok_or_else(|| format!("tail {} at t={} has an incomplete chunk path", keys::hex(&k[..4]), e.t))?;
-            for c in path {
-                *refs.entry(c).or_default() += 1;
+            let b = e.t / C;
+            if b == 0 {
+                if e.base != self.root {
+                    return Err(format!("tail {} at t={} not on the root", h(k), e.t));
+                }
+            } else {
+                let ok = reach.contains(&e.base) && self.chunks.get(&e.base).is_some_and(|c| c.k + 1 == b);
+                if !ok {
+                    return Err(format!("tail {} at t={} has an incomplete chunk path", h(k), e.t));
+                }
+                *own_refs.entry(e.base).or_default() += 1;
             }
             if !self.tails_at.get(&e.base).is_some_and(|v| v.contains(k)) {
-                return Err(format!("tail {} missing from tails_at", keys::hex(&k[..4])));
+                return Err(format!("tail {} missing from tails_at", h(k)));
             }
             if !self.by_score.contains(&(Self::score_of(e), *k)) {
-                return Err(format!("tail {} missing from the score order", keys::hex(&k[..4])));
+                return Err(format!("tail {} missing from the score order", h(k)));
             }
             if e.kind == TailKind::Enc && e.sec_d_bytes != 0 {
                 return Err("encoder tail with section D bytes".into());
@@ -1057,76 +1251,71 @@ impl Index {
                 return Err("path_last_used below last_used".into());
             }
         }
-        if self.by_score.len() != self.tails.len() {
-            return Err(format!("score order has {} entries for {} tails", self.by_score.len(), self.tails.len()));
+        if self.by_score.len() != self.tails.len() || self.tails_at.values().map(|v| v.len()).sum::<usize>() != self.tails.len() {
+            return Err("score order / tails_at count differs from the tails".into());
         }
-        let n_at: usize = self.tails_at.values().map(|v| v.len()).sum();
-        if n_at != self.tails.len() {
-            return Err("tails_at count differs".into());
-        }
-        // Pins: every live record contributes to its anchor and all ancestors.
-        let mut pins: HashMap<Key, u32> = HashMap::new();
-        let mut tail_pins: HashMap<Key, u32> = HashMap::new();
+        let mut own_pins: KeyMap<u32> = KeyMap::default();
         for rec in self.pins.values() {
-            if let Some(mut node) = rec.chunk {
-                while let Some(c) = self.chunks.get(&node) {
-                    *pins.entry(node).or_default() += 1;
-                    node = c.parent;
+            if let Some(c) = rec.chunk {
+                if !self.chunks.contains_key(&c) {
+                    return Err("a pin record is anchored at a missing chunk".into());
                 }
+                *own_pins.entry(c).or_default() += 1;
             }
             if let Some(t) = rec.tail {
                 *tail_pins.entry(t).or_default() += 1;
             }
         }
-        for ids in self.job_pins.values() {
-            if ids.iter().any(|id| !self.pins.contains_key(id)) {
-                return Err("job pin list names a retired record".into());
+        for (j, ids) in &self.job_pins {
+            if self.finished.contains_key(j) {
+                return Err(format!("finished job {j:?} still owns {} pins", ids.len()));
+            }
+            if ids.iter().any(|id| self.pins.get(id).is_none_or(|r| r.job != Some(*j))) {
+                return Err("job pin list names a retired or foreign record".into());
             }
         }
+        if self.pins.values().any(|r| r.job.is_some_and(|j| !self.job_pins.get(&j).is_some_and(|v| v.iter().any(|id| self.pins[id].job == Some(j))))) {
+            return Err("a job-owned pin record is missing from its job's list".into());
+        }
+        // Bottom-up: children (k + 1) before parents; totals flow to existing
+        // parents only, exactly like add_path.
+        let mut order: Vec<(&Key, &ChunkEntry)> = self.chunks.iter().collect();
+        order.sort_unstable_by(|a, b| b.1.k.cmp(&a.1.k));
+        let mut refs: KeyMap<u32> = own_refs;
+        let mut pins: KeyMap<u32> = own_pins;
         let mut chunk_bytes = 0u64;
         let mut orphans = 0usize;
-        for (k, c) in &self.chunks {
+        for (k, c) in &order {
             chunk_bytes += c.bytes;
-            let want_refs = refs.get(k).copied().unwrap_or(0);
-            if c.refs != want_refs {
-                return Err(format!("chunk {} k={} refs {} != rebuilt {}", keys::hex(&k[..4]), c.k, c.refs, want_refs));
+            let (r, p) = (refs.get(*k).copied().unwrap_or(0), pins.get(*k).copied().unwrap_or(0));
+            if c.refs != r {
+                return Err(format!("chunk {} k={} refs {} != rebuilt {}", h(k), c.k, c.refs, r));
             }
-            let want_pins = pins.get(k).copied().unwrap_or(0);
-            if c.pins != want_pins {
-                return Err(format!("chunk {} k={} pins {} != rebuilt {}", keys::hex(&k[..4]), c.k, c.pins, want_pins));
+            if c.pins != p {
+                return Err(format!("chunk {} k={} pins {} != rebuilt {}", h(k), c.k, c.pins, p));
+            }
+            if self.chunks.contains_key(&c.parent) {
+                *refs.entry(c.parent).or_default() += r;
+                *pins.entry(c.parent).or_default() += p;
+            } else if c.parent == self.root && c.k != 0 {
+                return Err("a child of the root is not chunk 0".into());
             }
             let is_orphan = c.refs == 0 && c.pins == 0;
-            if is_orphan != self.orphans.contains(&(c.created, c.k, *k)) {
-                return Err(format!("chunk {} orphan set membership wrong", keys::hex(&k[..4])));
+            if is_orphan != self.orphans.contains(&(c.created, c.k, **k)) {
+                return Err(format!("chunk {} orphan set membership wrong", h(k)));
             }
             orphans += is_orphan as usize;
             if !self.children.get(&c.parent).is_some_and(|v| v.contains(k)) {
-                return Err(format!("chunk {} missing from its parent's children", keys::hex(&k[..4])));
-            }
-            if c.parent != self.root {
-                if let Some(p) = self.chunks.get(&c.parent) {
-                    if p.k + 1 != c.k {
-                        return Err("chunk numbering breaks along a path".into());
-                    }
-                }
-            } else if c.k != 0 {
-                return Err("a child of the root is not chunk 0".into());
+                return Err(format!("chunk {} missing from its parent's children", h(k)));
             }
         }
         if orphans != self.orphans.len() {
             return Err(format!("orphan set has {} entries, rebuilt {}", self.orphans.len(), orphans));
         }
-        for (p, v) in &self.children {
-            for c in v {
-                if !self.chunks.get(c).is_some_and(|e| e.parent == *p) {
-                    return Err("children map names a missing or foreign chunk".into());
-                }
-            }
-        }
         for (k, e) in &self.tails {
             let want = tail_pins.get(k).copied().unwrap_or(0);
             if e.pins != want {
-                return Err(format!("tail {} pins {} != rebuilt {}", keys::hex(&k[..4]), e.pins, want));
+                return Err(format!("tail {} pins {} != rebuilt {}", h(k), e.pins, want));
             }
         }
         if chunk_bytes != self.chunk_bytes || tail_bytes != self.tail_bytes {
@@ -1136,13 +1325,9 @@ impl Index {
             ));
         }
         let mut gen_bytes = vec![GenStat::default(); self.gens.len()];
-        for c in self.chunks.values() {
-            gen_bytes[c.gen as usize].files += 1;
-            gen_bytes[c.gen as usize].bytes += c.bytes;
-        }
-        for e in self.tails.values() {
-            gen_bytes[e.gen as usize].files += 1;
-            gen_bytes[e.gen as usize].bytes += e.bytes;
+        for (g, b) in self.chunks.values().map(|c| (c.gen, c.bytes)).chain(self.tails.values().map(|e| (e.gen, e.bytes))) {
+            gen_bytes[g as usize].files += 1;
+            gen_bytes[g as usize].bytes += b;
         }
         if gen_bytes != self.gen_stats {
             return Err("generation stats drifted".into());
@@ -1154,39 +1339,72 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kvstore::keys::KeyChain;
+    use crate::kvstore::keys::{ChainCursor, KeyChain};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use std::collections::VecDeque;
 
     const GEN: GenPair = GenPair { gen: 1, knob: [0; 16] };
     const CHUNK_B: u64 = 1000;
     const ENC_B: u64 = 300;
     const D_B: u64 = 200;
 
-    /// An in-memory store driver that mimics M2's job flow over the index:
-    /// walk, write the missing chunks (job-pinned), waypoints, the prompt-end
-    /// tail with the walk's ancestors, release the job.
+    enum Pend {
+        Chunk(ChunkInsert),
+        Tail(TailInsert),
+    }
+
+    impl Pend {
+        fn job(&self) -> Option<JobId> {
+            match self {
+                Pend::Chunk(c) => c.job,
+                Pend::Tail(t) => t.job,
+            }
+        }
+    }
+
+    /// An in-memory driver that mimics M2's job flow and the store's
+    /// completion handling over the index: writes go into an in-flight FIFO
+    /// (the IO thread completes in order) and land when drained, possibly
+    /// after the job has ended; a write may be dropped.
     struct Sim {
         chain: KeyChain,
         idx: Index,
         next_job: u64,
+        inflight: VecDeque<(Key, Pend, bool)>,
+        job_writes: HashMap<JobId, u32>,
+        refused: u32,
+    }
+
+    /// How one admission runs.
+    #[derive(Clone, Copy, Default)]
+    struct Opts {
+        /// The job fails (no prompt-end tail, release as failed).
+        fail: bool,
+        /// Leave the writes in flight when the job ends (drained later).
+        async_end: bool,
+        /// Drop every write with this probability (needs an rng).
+        drop_p: f64,
+        /// Also write an anchor at the deepest K multiple ≤ L.
+        anchor: bool,
     }
 
     impl Sim {
         fn new(cap: u64) -> Self {
             let chain = KeyChain::new([42; 32]);
             let idx = Index::new(*chain.root(), cap);
-            Self { chain, idx, next_job: 1 }
+            Self { chain, idx, next_job: 1, inflight: VecDeque::new(), job_writes: HashMap::new(), refused: 0 }
         }
 
-        fn chunk_ins(&self, cur: &mut keys::ChainCursor, tokens: &[i32], k: u32, job: Option<JobId>, now: u64) -> ChunkInsert {
-            let parent = cur.chain(tokens, &[], k);
-            let key = cur.chain(tokens, &[], k + 1);
-            ChunkInsert { key, parent, k, bytes: CHUNK_B, created: now, gen: GEN, job }
+        fn chunk_ins(&self, cur: &mut ChainCursor, tokens: &[i32], images: &[ImageRecord], k: u32, job: Option<JobId>, now: u64) -> ChunkInsert {
+            let parent = cur.chain(tokens, images, k);
+            let key = cur.chain(tokens, images, k + 1);
+            ChunkInsert { key, parent, k, bytes: CHUNK_B, created: now, gen: GEN, payload_hash: [k as u8; 32], job }
         }
 
-        fn tail_ins(&self, cur: &mut keys::ChainCursor, tokens: &[i32], t: u32, kind: TailKind, origin: TailOrigin, ancestors: Vec<Key>, job: Option<JobId>, now: u64) -> TailInsert {
-            let (base, key) = self.chain.tail_key(cur, tokens, &[], t);
+        #[allow(clippy::too_many_arguments)]
+        fn tail_ins(&self, cur: &mut ChainCursor, tokens: &[i32], images: &[ImageRecord], t: u32, kind: TailKind, origin: TailOrigin, ancestors: Vec<Key>, job: Option<JobId>, now: u64) -> TailInsert {
+            let (base, key) = self.chain.tail_key(cur, tokens, images, t);
             TailInsert {
                 key,
                 base,
@@ -1205,48 +1423,148 @@ mod tests {
             }
         }
 
+        /// The store's ancestor rule: indexed tails on the path, plus
+        /// in-flight tails whose key matches this request.
+        fn ancestors(&self, cur: &mut ChainCursor, tokens: &[i32], images: &[ImageRecord], t: u32) -> Vec<Key> {
+            let chain = cur.keys_to(tokens, images, t / C).to_vec();
+            let mut anc = self.idx.ancestors_on_path(&chain, tokens, images, t);
+            for (pk, p, _) in &self.inflight {
+                let Pend::Tail(p) = p else { continue };
+                let b = (p.t / C) as usize;
+                if p.t < t && chain[b] == p.base && !anc.contains(pk) {
+                    let a = b as u32 * C;
+                    if keys::tail_step(&chain[b], a, &tokens[a as usize..p.t as usize], images_in(images, a, p.t)) == *pk {
+                        anc.push(*pk);
+                    }
+                }
+            }
+            anc
+        }
+
+        fn in_flight_kind(&self, key: &Key) -> Option<TailKind> {
+            self.inflight.iter().filter(|(k, _, _)| k == key).filter_map(|(_, p, _)| match p {
+                Pend::Tail(t) => Some(t.kind),
+                Pend::Chunk(_) => None,
+            }).max()
+        }
+
+        fn push(&mut self, key: Key, p: Pend, dropped: bool) {
+            if let Some(j) = p.job() {
+                *self.job_writes.entry(j).or_default() += 1;
+            }
+            self.inflight.push_back((key, p, dropped));
+        }
+
+        /// Land up to `n` in-flight writes, in order, the way the store does.
+        fn drain(&mut self, n: usize, now: u64) {
+            for _ in 0..n {
+                let Some((_, p, dropped)) = self.inflight.pop_front() else { break };
+                let job = p.job();
+                if !dropped {
+                    match p {
+                        Pend::Chunk(c) => {
+                            self.idx.insert_chunk(c, now);
+                        }
+                        Pend::Tail(t) => {
+                            if self.idx.insert_tail(t, now).is_err() {
+                                self.refused += 1;
+                            }
+                        }
+                    }
+                }
+                // After the insert, like the store: forgetting the job first
+                // would let its last write pin for a job nobody releases.
+                if let Some(j) = job {
+                    let w = self.job_writes.get_mut(&j).unwrap();
+                    *w -= 1;
+                    if *w == 0 {
+                        self.job_writes.remove(&j);
+                        if self.idx.finished(j).is_some() {
+                            self.idx.forget_job(j);
+                        }
+                    }
+                }
+                self.idx.enforce_cap(now);
+            }
+        }
+
+        fn drain_all(&mut self, now: u64) {
+            let n = self.inflight.len();
+            self.drain(n, now);
+        }
+
+        fn queue_tail(&mut self, cur: &mut ChainCursor, tokens: &[i32], images: &[ImageRecord], t: u32, kind: TailKind, origin: TailOrigin, job: JobId, now: u64, drop: bool) -> Key {
+            let anc = self.ancestors(cur, tokens, images, t);
+            let ins = self.tail_ins(cur, tokens, images, t, kind, origin, anc, Some(job), now);
+            let key = ins.key;
+            let have = self.idx.tail(&key).map(|e| e.kind).max(self.in_flight_kind(&key));
+            if have.is_none_or(|k| k < kind) {
+                self.push(key, Pend::Tail(ins), drop);
+            }
+            key
+        }
+
         /// One admission of `tokens`: returns the restored t (0 = cold).
-        fn admit(&mut self, tokens: &[i32], now: u64, fail: bool, check: bool) -> u32 {
+        fn admit_with(&mut self, tokens: &[i32], images: &[ImageRecord], now: u64, o: Opts, rng: Option<&mut StdRng>) -> u32 {
+            let mut rng = rng;
+            let mut roll = |p: f64| rng.as_mut().is_some_and(|r| r.gen_bool(p));
             let l = tokens.len() as u32;
-            let walk = self.idx.walk(tokens, &[]);
+            let walk = self.idx.walk(tokens, images);
             let plan = select(&walk, l, false);
             let pos0 = plan.map_or(0, |p| p.t);
-            let pin = plan.and_then(|p| self.idx.pin_plan(&p.key));
+            let job = JobId(self.next_job);
+            self.next_job += 1;
+            let pin = plan.and_then(|p| self.idx.pin_plan(&p.key, Some(job)));
             if let Some(p) = plan {
                 self.idx.touch(&p.key, &walk.ancestors_below(p.t), now);
             }
             if let Some(id) = pin {
                 self.idx.unpin(id, now);
             }
-            let job = JobId(self.next_job);
-            self.next_job += 1;
             let mut cur = self.chain.cursor();
             cur.seed(&walk.chunks);
-            let mut ancestors = walk.ancestors_below(l);
             for k in pos0 / C..l / C {
-                let ins = self.chunk_ins(&mut cur, tokens, k, Some(job), now);
-                if self.idx.chunk(&ins.key).is_none() {
-                    self.idx.insert_chunk(ins);
+                let ins = self.chunk_ins(&mut cur, tokens, images, k, Some(job), now);
+                let key = ins.key;
+                let pending = self.inflight.iter().any(|(pk, _, _)| *pk == key);
+                if self.idx.chunk(&key).is_none() && !pending {
+                    let d = roll(o.drop_p);
+                    self.push(key, Pend::Chunk(ins), d);
                 }
                 let end = (k + 1) * C;
-                if end % K == 0 && end > pos0 && end < l {
-                    let w = self.tail_ins(&mut cur, tokens, end, TailKind::Enc, TailOrigin::Waypoint, ancestors.clone(), Some(job), now);
-                    let wk = w.key;
-                    if self.idx.tail(&wk).is_none() {
-                        self.idx.insert_tail(w, now).unwrap();
-                        ancestors.push(wk);
-                    }
-                }
-                if check {
-                    self.idx.check_invariants().unwrap();
+                // A waypoint at every K multiple crossed, L included when L is
+                // one: then the prompt-end full tail has the SAME key.
+                if end % K == 0 && end > pos0 && end <= l {
+                    let d = roll(o.drop_p);
+                    self.queue_tail(&mut cur, tokens, images, end, TailKind::Enc, TailOrigin::Waypoint, job, now, d);
                 }
             }
-            if !fail && l >= 64 {
-                let full = self.tail_ins(&mut cur, tokens, l, TailKind::Full, TailOrigin::PromptEnd, ancestors, Some(job), now);
-                self.idx.insert_tail(full, now).unwrap();
+            if o.anchor && l >= K {
+                let a = l / K * K;
+                let d = roll(o.drop_p);
+                self.queue_tail(&mut cur, tokens, images, a, TailKind::Full, TailOrigin::Anchor, job, now, d);
             }
-            self.idx.release_job(job, fail, now);
+            if !o.fail && l >= 64 {
+                let d = roll(o.drop_p);
+                self.queue_tail(&mut cur, tokens, images, l, TailKind::Full, TailOrigin::PromptEnd, job, now, d);
+            }
+            if !o.async_end {
+                self.drain_all(now);
+            }
+            // M2 ends the job in the tick that queues its last writes.
+            self.idx.release_job(job, o.fail, now);
+            if !self.job_writes.contains_key(&job) {
+                self.idx.forget_job(job);
+            }
             self.idx.enforce_cap(now);
+            pos0
+        }
+
+        fn admit(&mut self, tokens: &[i32], now: u64, fail: bool, check: bool) -> u32 {
+            let pos0 = self.admit_with(tokens, &[], now, Opts { fail, ..Opts::default() }, None);
+            if check {
+                self.idx.check_invariants().unwrap();
+            }
             pos0
         }
     }
@@ -1262,6 +1580,15 @@ mod tests {
     fn conv(seed: u64, len: usize) -> Vec<i32> {
         let mut r = StdRng::seed_from_u64(seed);
         (0..len).map(|_| r.gen_range(0..128_000)).collect()
+    }
+
+    /// Two images per conversation: one straddling the chunk 0/1 boundary,
+    /// one starting in the open part of the second chunk.
+    fn images_for(seed: u64) -> Vec<ImageRecord> {
+        vec![
+            ImageRecord { start: 1000, len: 100, hash: [seed as u8; 32] },
+            ImageRecord { start: 1500, len: 40, hash: [seed as u8 ^ 0x5a; 32] },
+        ]
     }
 
     #[test]
@@ -1294,32 +1621,47 @@ mod tests {
     #[test]
     fn walk_finds_every_written_tail_at_every_prefix_length() {
         // G5 "walk keys = write keys for every prefix length": a tail written
-        // at T through the writer's key path is found by a walk of any request
-        // that extends tokens[..T], and by no walk of a request that does not.
-        let mut s = Sim::new(u64::MAX);
-        let tokens = conv(1, 3 * C as usize + 50);
-        let mut cur = s.chain.cursor();
-        for k in 0..3 {
-            let ins = s.chunk_ins(&mut cur, &tokens, k, None, 0);
-            s.idx.insert_chunk(ins);
+        // at T through the writer's key path (ChainCursor / tail_key) is found
+        // by the walk (its own slicing of ids and images) of any request that
+        // extends tokens[..T], and by no walk of a request that does not. With
+        // and without images (one straddling the chunk 0/1 boundary, one in
+        // the open part of chunk 1).
+        for images in [vec![], images_for(7)] {
+            let mut s = Sim::new(u64::MAX);
+            let tokens = conv(1, 3 * C as usize + 50);
+            let mut cur = s.chain.cursor();
+            for k in 0..3 {
+                let ins = s.chunk_ins(&mut cur, &tokens, &images, k, None, 0);
+                s.idx.insert_chunk(ins, 0);
+            }
+            for t in 0..=tokens.len() as u32 {
+                let ins = s.tail_ins(&mut cur, &tokens, &images, t, TailKind::Enc, TailOrigin::Waypoint, vec![], None, 0);
+                let key = ins.key;
+                s.idx.insert_tail(ins, 0).unwrap();
+                let w = s.idx.walk(&tokens[..t as usize], &images);
+                assert_eq!(w.tails.last().map(|x| (x.t, x.key)), Some((t, key)), "t={t}");
+                assert_eq!(w.chunks.len() as u32, t / C);
+                if t % 97 == 0 {
+                    let anc = s.idx.ancestors_on_path(cur.keys_to(&tokens, &images, t / C), &tokens, &images, t);
+                    assert_eq!(anc.len() as u32, t, "every earlier tail is an ancestor (t={t})");
+                }
+            }
+            let w = s.idx.walk(&tokens, &images);
+            assert_eq!(w.tails.len(), tokens.len() + 1);
+            // A request that differs at position p sees only tails at t ≤ p.
+            let mut other = tokens.clone();
+            other[1500] ^= 1;
+            let w = s.idx.walk(&other, &images);
+            assert_eq!(w.tails.last().unwrap().t, 1500);
+            assert_eq!(w.chunks.len(), 1);
+            if !images.is_empty() {
+                // Different pixels: nothing past the first IMAGE_START matches.
+                let w = s.idx.walk(&tokens, &images_for(8));
+                assert_eq!(w.tails.last().unwrap().t, 1000);
+                assert_eq!(w.chunks.len(), 0);
+            }
+            s.idx.check_invariants().unwrap();
         }
-        for t in 0..=tokens.len() as u32 {
-            let ins = s.tail_ins(&mut cur, &tokens, t, TailKind::Enc, TailOrigin::Waypoint, vec![], None, 0);
-            let key = ins.key;
-            s.idx.insert_tail(ins, 0).unwrap();
-            let w = s.idx.walk(&tokens[..t as usize], &[]);
-            assert_eq!(w.tails.last().map(|x| (x.t, x.key)), Some((t, key)), "t={t}");
-            assert_eq!(w.chunks.len() as u32, t / C);
-        }
-        let w = s.idx.walk(&tokens, &[]);
-        assert_eq!(w.tails.len(), tokens.len() + 1);
-        // A request that differs at position p sees only tails at t ≤ p.
-        let mut other = tokens.clone();
-        other[1500] ^= 1;
-        let w = s.idx.walk(&other, &[]);
-        assert_eq!(w.tails.last().unwrap().t, 1500);
-        assert_eq!(w.chunks.len(), 1);
-        s.idx.check_invariants().unwrap();
     }
 
     #[test]
@@ -1346,10 +1688,10 @@ mod tests {
         let mut sim = Sim::new(u64::MAX);
         let mut cur = sim.chain.cursor();
         for k in 0..t / C {
-            let ins = sim.chunk_ins(&mut cur, &req, k, None, 0);
-            sim.idx.insert_chunk(ins);
+            let ins = sim.chunk_ins(&mut cur, &req, &[], k, None, 0);
+            sim.idx.insert_chunk(ins, 0);
         }
-        let ins = sim.tail_ins(&mut cur, &req, t, TailKind::Enc, TailOrigin::Cancel, vec![], None, 0);
+        let ins = sim.tail_ins(&mut cur, &req, &[], t, TailKind::Enc, TailOrigin::Cancel, vec![], None, 0);
         assert_eq!(ins.key, good);
         sim.idx.insert_tail(ins, 0).unwrap();
         let w = sim.idx.walk(&req, &[]);
@@ -1395,7 +1737,7 @@ mod tests {
         let mut cur = s.chain.cursor();
         let w = s.idx.walk(&base[..a as usize], &[]);
         cur.seed(&w.chunks);
-        let anc = s.tail_ins(&mut cur, &base, a, TailKind::Full, TailOrigin::Anchor, vec![], None, 20);
+        let anc = s.tail_ins(&mut cur, &base, &[], a, TailKind::Full, TailOrigin::Anchor, vec![], None, 20);
         let anchor_key = anc.key;
         s.idx.insert_tail(anc, 20).unwrap();
         for (i, l) in [6200usize, 6400, 6600, 7000, 7500].into_iter().enumerate() {
@@ -1420,7 +1762,7 @@ mod tests {
         s.admit(&base[..3000], 1, false, true);
         let w = s.idx.walk(&base[..3000], &[]);
         let first = w.tails.last().unwrap().key;
-        let pin = s.idx.pin_plan(&first).unwrap();
+        let pin = s.idx.pin_plan(&first, None).unwrap();
         s.admit(&base[..3500], 2, false, true);
         s.admit(&base[..4000], 3, false, true);
         // The third full tail would demote `first`; it is pinned: deferred.
@@ -1442,6 +1784,27 @@ mod tests {
     }
 
     #[test]
+    fn plan_pins_owned_by_a_job_go_with_it() {
+        // 12a: a restore plan pinned for a job is released when the job ends,
+        // even if the job never unpins it.
+        let mut s = Sim::new(u64::MAX);
+        let base = conv(13, 5000);
+        s.admit(&base[..3000], 1, false, true);
+        let k = s.idx.walk(&base[..3000], &[]).tails[0].key;
+        let job = JobId(500);
+        s.idx.pin_plan(&k, Some(job)).unwrap();
+        assert_eq!(s.idx.job_pin_count(job), 1);
+        s.idx.set_cap_bytes(1);
+        s.idx.enforce_cap(2);
+        assert!(s.idx.tail(&k).is_some(), "the plan's tail is pinned");
+        s.idx.release_job(job, false, 3);
+        s.idx.forget_job(job);
+        s.idx.enforce_cap(3);
+        assert_eq!(s.idx.n_tails(), 0);
+        s.idx.check_invariants().unwrap();
+    }
+
+    #[test]
     fn eviction_order_namespace_then_orphans_then_score() {
         let mut s = Sim::new(u64::MAX);
         let a = conv(6, 5000);
@@ -1455,8 +1818,8 @@ mod tests {
         let c = conv(9, 3000);
         let mut cur = s.chain.cursor();
         for k in 0..2 {
-            let ins = s.chunk_ins(&mut cur, &c, k, Some(job), 40);
-            s.idx.insert_chunk(ins);
+            let ins = s.chunk_ins(&mut cur, &c, &[], k, Some(job), 40);
+            s.idx.insert_chunk(ins, 40);
         }
         s.idx.release_job(job, false, 40);
         assert_eq!(s.idx.n_orphans(), 2);
@@ -1502,23 +1865,56 @@ mod tests {
         let tokens = conv(11, 3 * C as usize);
         let job = JobId(1);
         let mut cur = s.chain.cursor();
-        let c0 = s.chunk_ins(&mut cur, &tokens, 0, Some(job), 1);
-        let c1 = s.chunk_ins(&mut cur, &tokens, 1, Some(job), 1);
-        let c2 = s.chunk_ins(&mut cur, &tokens, 2, Some(job), 1);
-        s.idx.insert_chunk(c0);
-        s.idx.insert_chunk(c2.clone());
+        let c0 = s.chunk_ins(&mut cur, &tokens, &[], 0, Some(job), 1);
+        let c1 = s.chunk_ins(&mut cur, &tokens, &[], 1, Some(job), 1);
+        let c2 = s.chunk_ins(&mut cur, &tokens, &[], 2, Some(job), 1);
+        s.idx.insert_chunk(c0, 1);
+        s.idx.insert_chunk(c2.clone(), 1);
         s.idx.check_invariants().unwrap();
         assert_eq!(s.idx.walk(&tokens, &[]).chunks.len(), 1, "the walk stops at the hole");
-        // A tail above the hole is refused.
-        let t = s.tail_ins(&mut cur, &tokens, 3 * C, TailKind::Enc, TailOrigin::Cancel, vec![], Some(job), 1);
+        // A tail above the hole is refused, and releases the job's pins on its
+        // path (it was the job's "next tail", 9.4).
+        let t = s.tail_ins(&mut cur, &tokens, &[], 3 * C, TailKind::Enc, TailOrigin::Cancel, vec![], Some(job), 1);
         assert_eq!(s.idx.insert_tail(t.clone(), 1), Err(Refused::MissingAncestor));
-        s.idx.insert_chunk(c1);
+        assert_eq!(s.idx.job_pin_count(job), 0);
         s.idx.check_invariants().unwrap();
-        assert_eq!(s.idx.chunk(&c2.key).unwrap().pins, 1);
+        let c1 = ChunkInsert { job: None, ..c1 };
+        s.idx.insert_chunk(c1, 2);
+        s.idx.check_invariants().unwrap();
         assert_eq!(s.idx.walk(&tokens, &[]).chunks.len(), 3);
         s.idx.insert_tail(t, 2).unwrap();
-        assert!(s.idx.job_pins.is_empty(), "the tail released the job's pins on its path");
         s.idx.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn late_completions_after_the_job_ended() {
+        // 2.: M2 ends a job in the tick that queues its last writes. Its late
+        // chunks land unowned (no pin leaks); a FAILED job's late chunks go at
+        // once when nothing references them; a cancelled job's stay as orphans.
+        for (fail, drop_tail) in [(false, false), (true, false), (false, true)] {
+            let mut s = Sim::new(u64::MAX);
+            let tokens = conv(14, 5000);
+            let o = Opts { fail, async_end: true, ..Opts::default() };
+            s.admit_with(&tokens, &[], 1, o, None);
+            if drop_tail {
+                // The prompt-end tail is the last write: drop it.
+                if let Some(last) = s.inflight.back_mut() {
+                    last.2 = true;
+                }
+            }
+            assert!(!s.inflight.is_empty(), "the job ended with writes in flight");
+            assert!(s.idx.finished(JobId(1)).is_some());
+            s.idx.check_invariants().unwrap();
+            s.drain_all(2);
+            s.idx.check_invariants().unwrap();
+            assert!(s.idx.finished(JobId(1)).is_none(), "forgotten once its writes drained");
+            assert!(s.idx.pins.is_empty(), "no pin outlives the job");
+            match (fail, drop_tail) {
+                (true, _) => assert_eq!(s.idx.n_chunks(), 0, "a failed job's late chunks are deleted"),
+                (false, true) => assert_eq!(s.idx.n_orphans(), 4, "a cancelled job's late chunks are orphans"),
+                _ => assert_eq!((s.idx.n_tails(), s.idx.n_orphans()), (1, 0)),
+            }
+        }
     }
 
     #[test]
@@ -1531,7 +1927,7 @@ mod tests {
         s.admit(&branch, 2, false, true);
         assert_eq!(s.idx.n_tails(), 4, "a waypoint and a prompt end per branch");
         let w = s.idx.walk(&base[..9000], &[]);
-        let pin = s.idx.pin_plan(&w.tails.last().unwrap().key).unwrap();
+        let pin = s.idx.pin_plan(&w.tails.last().unwrap().key, None).unwrap();
         // Chunk 3 (positions 3072..4096) is shared by both branches.
         s.idx.remove_chunk(&w.chunks[3], Why::Corrupt, 3);
         s.idx.check_invariants().unwrap();
@@ -1545,67 +1941,100 @@ mod tests {
         s.idx.check_invariants().unwrap();
     }
 
+    #[test]
+    fn drift_saturates_and_flags_a_rescan() {
+        let mut s = Sim::new(u64::MAX);
+        let base = conv(15, 3000);
+        s.admit(&base, 1, false, true);
+        let c0 = s.idx.walk(&base, &[]).chunks[0];
+        // Simulate drift: a refcount decrement nobody incremented.
+        s.idx.add_path(&c0, -5, 0);
+        assert!(s.idx.needs_rescan());
+        assert_eq!(s.idx.chunk(&c0).unwrap().refs, 0, "saturated, not wrapped or panicked");
+        assert!(s.idx.check_invariants().is_err(), "the checker sees the drift");
+    }
+
     /// G5: refcounts, pins, orphans, scores and byte totals under random
-    /// admissions (cold, warm, branches, retries, failures, cancels), pins,
-    /// demotion, thinning, corrupt evictions and cap pressure, checked against
-    /// a full rebuild after every step. Plus the policy invariants: pinned
-    /// tails survive, anchors stay full, every indexed tail is reachable.
+    /// admissions with ASYNCHRONOUS completions (drained at random points,
+    /// after jobs ended), dropped writes, Enc / Full / Anchor writes of the same
+    /// key, images, pins, demotion, thinning, corrupt evictions and cap
+    /// pressure, checked against a full rebuild after every step. Plus the
+    /// policy invariants: pinned tails survive, anchors stay full and are never
+    /// thinned, no pin outlives its job, no drift.
     #[test]
     fn randomized_refcounts_against_rebuild() {
         for seed in 1..=12u64 {
             let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let cap = rng.gen_range(20..200) * CHUNK_B;
             let mut s = Sim::new(cap);
-            let roots: Vec<Vec<i32>> = (0..4).map(|i| conv(seed * 100 + i, 30_000)).collect();
-            let mut lineages: Vec<Vec<i32>> = Vec::new();
+            let roots: Vec<(Vec<i32>, Vec<ImageRecord>)> =
+                (0..4).map(|i| (conv(seed * 100 + i, 30_000), if i % 2 == 0 { images_for(seed * 10 + i) } else { vec![] })).collect();
+            let mut lineages: Vec<(usize, Vec<i32>)> = Vec::new();
             let mut held: Vec<(PinId, Key)> = Vec::new();
+            let mut anchors: KeySet = KeySet::default();
+            let mut anchors_seen = 0u32;
             let mut now = 1000u64;
-            let (mut restored, mut steps) = (0u32, 0u32);
+            let (mut restored, mut steps, mut late) = (0u32, 0u32, 0u32);
             for step in 0..300 {
                 now += rng.gen_range(1..4000);
                 let op = rng.gen_range(0..100);
                 if op < 55 || lineages.is_empty() {
                     // Extend an existing lineage, or start one from a shared root.
-                    let tokens = if !lineages.is_empty() && rng.gen_bool(0.7) {
+                    let (ri, tokens) = if !lineages.is_empty() && rng.gen_bool(0.7) {
                         let i = rng.gen_range(0..lineages.len());
-                        let mut t = lineages[i].clone();
+                        let (ri, mut t) = lineages[i].clone();
                         let grow = rng.gen_range(1..4000);
-                        let r = &roots[i % roots.len()];
+                        let r = &roots[ri].0;
                         let end = (t.len() + grow).min(r.len());
                         t.extend_from_slice(&r[t.len().min(end)..end]);
                         if rng.gen_bool(0.2) && t.len() > 2000 {
                             let p = rng.gen_range(1000..t.len());
                             t[p] ^= 1; // a branch
                         }
-                        lineages[i] = t.clone();
-                        t
+                        lineages[i] = (ri, t.clone());
+                        (ri, t)
                     } else {
-                        let r = &roots[rng.gen_range(0..roots.len())];
-                        let t = r[..rng.gen_range(10..12_000)].to_vec();
-                        lineages.push(t.clone());
-                        t
+                        let ri = rng.gen_range(0..roots.len());
+                        // Sometimes exactly a K multiple: waypoint and prompt
+                        // end share a key.
+                        let l = if rng.gen_bool(0.2) { K as usize * rng.gen_range(1..3) } else { rng.gen_range(10..12_000) };
+                        let t = roots[ri].0[..l].to_vec();
+                        lineages.push((ri, t.clone()));
+                        (ri, t)
                     };
-                    let fail = rng.gen_bool(0.05);
-                    restored += s.admit(&tokens, now, fail, false).min(1);
+                    let o = Opts {
+                        fail: rng.gen_bool(0.05),
+                        async_end: rng.gen_bool(0.5),
+                        drop_p: if rng.gen_bool(0.2) { 0.15 } else { 0.0 },
+                        anchor: rng.gen_bool(0.2),
+                    };
+                    let images = roots[ri].1.clone();
+                    restored += s.admit_with(&tokens, &images, now, o, Some(&mut rng)).min(1);
+                    late += o.async_end as u32;
                     steps += 1;
-                } else if op < 70 {
+                } else if op < 62 {
+                    // Land some of the in-flight writes.
+                    let n = rng.gen_range(0..=s.inflight.len());
+                    s.drain(n, now);
+                } else if op < 72 {
                     // Pin a random tail as a restore in flight.
                     if let Some(k) = pick(&mut rng, s.idx.tails.keys()) {
-                        let id = s.idx.pin_plan(&k).unwrap();
+                        let id = s.idx.pin_plan(&k, None).unwrap();
                         held.push((id, k));
                     }
-                } else if op < 85 {
+                } else if op < 84 {
                     if !held.is_empty() {
                         let (id, _) = held.swap_remove(rng.gen_range(0..held.len()));
                         s.idx.unpin(id, now);
                     }
-                } else if op < 92 {
-                    // Retry of a lineage's prompt (t = 1 restores need a marker).
+                } else if op < 90 {
+                    // Retry of a lineage's prompt.
                     if !lineages.is_empty() {
-                        let t = lineages[rng.gen_range(0..lineages.len())].clone();
-                        s.admit(&t, now, false, false);
+                        let (ri, t) = lineages[rng.gen_range(0..lineages.len())].clone();
+                        let images = roots[ri].1.clone();
+                        s.admit_with(&t, &images, now, Opts { async_end: rng.gen_bool(0.5), ..Opts::default() }, Some(&mut rng));
                     }
-                } else if op < 96 {
+                } else if op < 95 {
                     // A data-attributable read failure on a random chunk.
                     if let Some(k) = pick(&mut rng, s.idx.chunks.keys()) {
                         s.idx.remove_chunk(&k, Why::Corrupt, now);
@@ -1622,18 +2051,38 @@ mod tests {
                 }
                 s.idx.enforce_cap(now);
                 s.idx.take_actions();
+                // The first removal of a key seen as an anchor is that anchor's
+                // end: never thinning. (The key may come back as a plain tail.)
+                for r in s.idx.take_removals() {
+                    if anchors.remove(&r.key) {
+                        assert_ne!(r.why, Why::Thinned, "seed {seed} step {step}: an anchor was thinned");
+                    }
+                }
                 s.idx.check_invariants().unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+                assert!(!s.idx.needs_rescan(), "seed {seed} step {step}: counter drift");
                 for (_, k) in &held {
                     // Pinned tails are never evicted, demoted or thinned
                     // (only a corrupt chunk beneath them removes them).
                     let e = s.idx.tail(k).unwrap_or_else(|| panic!("seed {seed} step {step}: a pinned tail vanished"));
                     assert!(e.pins > 0);
                 }
-                for e in s.idx.tails.values() {
+                for (k, e) in &s.idx.tails {
                     assert!(!(e.anchor && e.demoted));
+                    if e.anchor {
+                        assert_eq!(e.kind, TailKind::Full, "seed {seed} step {step}: an anchor lost section D");
+                        anchors_seen += anchors.insert(*k) as u32;
+                    }
                 }
             }
-            assert!(steps > 100 && restored > 20, "seed {seed}: not exercised ({steps} admissions, {restored} warm)");
+            s.drain_all(now);
+            for (id, _) in held.drain(..) {
+                s.idx.unpin(id, now);
+            }
+            s.idx.check_invariants().unwrap_or_else(|e| panic!("seed {seed} end: {e}"));
+            assert!(s.idx.pins.is_empty() && s.idx.job_pins.is_empty(), "seed {seed}: pins leaked");
+            assert!(s.idx.finished.is_empty(), "seed {seed}: finished jobs not forgotten");
+            assert!(steps > 100 && restored > 20 && late > 30, "seed {seed}: not exercised ({steps}, {restored} warm, {late} async)");
+            assert!(anchors_seen > 0 && s.refused > 0, "seed {seed}: no anchors ({anchors_seen}) or no refused tails ({})", s.refused);
         }
     }
 }
