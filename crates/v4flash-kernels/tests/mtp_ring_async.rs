@@ -58,8 +58,14 @@ fn run(e: &DeviceEngine, w: &MtpWeights, dev: &Device, asynchronous: bool) -> ey
     let mut st = MtpState::alloc(dev.id)?;
     let mut slots: Vec<Slot> = (0..2)
         .map(|i| -> eyre::Result<Slot> {
+            // Zeroed: most of a ring's MTP_WINDOW slots are never written by
+            // the script, and fresh allocations differ there between arms.
+            let mut rings: Vec<DeviceBuffer<u16>> = st.rings.iter().map(|r| DeviceBuffer::<u16>::new(dev.id, r.len())).collect::<eyre::Result<_>>()?;
+            for r in &mut rings {
+                r.fill_zero()?;
+            }
             Ok(Slot {
-                rings: st.rings.iter().map(|r| DeviceBuffer::<u16>::new(dev.id, r.len())).collect::<eyre::Result<_>>()?,
+                rings,
                 writes: 0,
                 pos: 1000 + 37 * i as u32,
                 done: Event::new_no_timing()?,
