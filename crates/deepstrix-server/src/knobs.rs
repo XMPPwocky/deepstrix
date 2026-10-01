@@ -49,8 +49,9 @@ v4flash_kernels::knobs! {
     pub static MS_AGING_S = Knob::int("V41_MS_AGING_S", 60, 0, MAX);
     /// `V41_MS_STARVE_S` (default 600): queue starvation bound.
     pub static MS_STARVE_S = Knob::int("V41_MS_STARVE_S", 600, 0, MAX);
-    /// `V41_MS_CHECKPOINT_EVERY` (default 32768): prefill checkpoint stride.
-    pub static MS_CHECKPOINT_EVERY = Knob::int("V41_MS_CHECKPOINT_EVERY", 32768, 1, MAX);
+    /// `V41_MS_CHECKPOINT_EVERY` (default 32768; `0` = no periodic checkpoints):
+    /// prefill checkpoint stride.
+    pub static MS_CHECKPOINT_EVERY = Knob::int("V41_MS_CHECKPOINT_EVERY", 32768, 0, MAX);
     /// `V41_MS_CHECKPOINT_MIN_ROWS` (default 4096).
     pub static MS_CHECKPOINT_MIN_ROWS = Knob::int("V41_MS_CHECKPOINT_MIN_ROWS", 4096, 0, MAX);
     /// `V41_MS_FINISH_GROUP` (default on): `multistream::finish_group`.
@@ -150,5 +151,6 @@ mod tests {
         assert_eq!(p(&MS_PIPELINE_MIN_ROWS, "1"), Some(2), "never below 2");
         assert_eq!(p(&MS_ENGRAM_THREADS, "9999"), Some(512));
         assert_eq!(p(&MS_DSPARK_RING, "solo"), Some(1));
+        assert_eq!(p(&MS_CHECKPOINT_EVERY, "0"), Some(0), "0 = periodic checkpoints off");
     }
 }

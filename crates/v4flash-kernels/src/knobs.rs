@@ -227,8 +227,9 @@ impl Knob {
         Source::from_u8(self.state.load(Ordering::Acquire).saturating_sub(1))
     }
 
-    /// Set the value in-process (tests, A/B harnesses); a running watcher
-    /// overrides it on its next change of this knob's sources.
+    /// Set the value in-process (tests, A/B harnesses). A LIVE knob's value is
+    /// replaced by its sources' at the running watcher's next pass (`start`):
+    /// set live knobs only in processes without one.
     pub fn set(&self, s: &str) -> bool {
         match self.kind.parse(s) {
             Some(bits) => {
@@ -254,7 +255,13 @@ impl Knob {
 
     /// First use: every source once (no watcher needed for a static knob, and
     /// a live one read before `start` -- or without it -- still sees its files).
+    /// Under `RESOLVE`, like the watcher's pass: a first use cannot overwrite
+    /// a value the watcher stored meanwhile.
     fn resolve_first(&self) {
+        let _g = RESOLVE.lock().unwrap_or_else(|p| p.into_inner());
+        if self.state.load(Ordering::Acquire) != 0 {
+            return;
+        }
         let file = knob_file().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| parse_file(&t)).unwrap_or_default();
         let env = |k: &str| std::env::var(k).ok();
         let read = |p: &str| std::fs::read_to_string(p).ok();
@@ -262,11 +269,7 @@ impl Knob {
         if let Some(raw) = bad {
             tracing::warn!(knob = self.name, value = %raw, using = %self.kind.show(bits), "knobs: invalid value");
         }
-        // A racing first use resolves the same value; the watcher may already
-        // have stored one: keep it.
-        if self.state.load(Ordering::Acquire) == 0 {
-            self.store(bits, src);
-        }
+        self.store(bits, src);
     }
 
     /// The value this knob's sources give, highest first; an invalid value at
@@ -338,6 +341,12 @@ pub fn parse_file(text: &str) -> BTreeMap<String, String> {
     m
 }
 
+/// The non-empty, non-comment lines of a knob file that are not `NAME=value`
+/// (`parse_file` skips them; the watcher warns).
+pub fn bad_lines(text: &str) -> Vec<String> {
+    text.lines().map(|l| l.split('#').next().unwrap_or("").trim()).filter(|l| !l.is_empty() && !l.contains('=')).map(str::to_string).collect()
+}
+
 /// What one pass of the watcher found.
 #[derive(Debug, Default, PartialEq)]
 pub struct Pass {
@@ -366,6 +375,11 @@ pub fn pass(knobs: &[&'static Knob], file: &BTreeMap<String, String>, env: &dyn 
             continue;
         }
         let (bits, src, bad) = k.resolve(file, env, read);
+        if bad.is_none() {
+            // A later return of the same bad value is reported again.
+            let prefix = format!("{}=", k.name);
+            warned.retain(|w| !w.starts_with(&prefix));
+        }
         if first {
             // First resolution (`start`): no change to report.
             if let Some(raw) = bad {
@@ -412,6 +426,9 @@ pub fn effective(knobs: &[&'static Knob]) -> String {
 
 static REGISTERED: Mutex<Vec<&'static Knob>> = Mutex::new(Vec::new());
 
+/// Held by a first resolution and by the watcher's pass (never by a read).
+static RESOLVE: Mutex<()> = Mutex::new(());
+
 /// A logged change of a live knob (`changes_since`; the perfetto `knobs` track).
 #[derive(Clone, Debug)]
 pub struct Change {
@@ -440,8 +457,12 @@ pub fn changes_since(seq: u64) -> Vec<Change> {
 }
 
 /// Every registered knob now: `(name, value, source, live)` (traces, dumps).
+/// Without `start` (a tool, a bench), the kernels' own table (`ALL`).
 pub fn snapshot() -> Vec<(&'static str, String, Source, bool)> {
-    let knobs = REGISTERED.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let mut knobs = REGISTERED.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if knobs.is_empty() {
+        knobs = ALL.to_vec();
+    }
     knobs.iter().map(|k| (k.name, k.show(), k.source(), k.live)).collect()
 }
 
@@ -472,18 +493,30 @@ pub fn start(tables: &[&'static [&'static Knob]]) {
     let set: Vec<String> = knobs.iter().filter(|k| k.source() != Source::Default).map(|k| format!("{}={}({:?})", k.name, k.show(), k.source())).collect();
     tracing::info!(knobs = knobs.len(), live = knobs.iter().filter(|k| k.live).count(), file = ?knob_file(), set = set.join(" "), "knobs: resolved");
     if first {
-        let _ = std::thread::Builder::new().name("knobs".into()).spawn(move || loop {
+        let spawned = std::thread::Builder::new().name("knobs".into()).spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
             step(&mut warned);
         });
+        if let Err(e) = spawned {
+            tracing::error!(error = %e, "knobs: watcher not started; live knobs keep their startup values");
+        }
     }
 }
 
 /// One watcher pass over every registered knob.
 fn step(warned: &mut HashSet<String>) {
     let knobs = REGISTERED.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    let file = knob_file().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| parse_file(&t)).unwrap_or_default();
-    let p = pass(&knobs, &file, &|k| std::env::var(k).ok(), &|p| std::fs::read_to_string(p).ok(), warned);
+    let text = knob_file().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let file = parse_file(&text);
+    let mut p = {
+        let _g = RESOLVE.lock().unwrap_or_else(|p| p.into_inner());
+        pass(&knobs, &file, &|k| std::env::var(k).ok(), &|p| std::fs::read_to_string(p).ok(), warned)
+    };
+    for l in bad_lines(&text) {
+        if warned.insert(format!("line:{l}")) {
+            p.warnings.push(format!("{l:?}: not NAME=value; ignored"));
+        }
+    }
     for w in &p.warnings {
         tracing::warn!("knobs: {w}");
     }
@@ -594,6 +627,13 @@ mod tests {
         assert_eq!((K.get(), K.source()), (4, Source::Env));
         pass(&knobs, &BTreeMap::new(), &env_of(&[]), &read, &mut warned);
         assert_eq!((K.get(), K.source()), (6, Source::Default));
+        // a bad value that was fixed (the passes above resolved valid) and
+        // comes back is reported again, once
+        assert_eq!(pass(&knobs, &bad, &env, &read, &mut warned).warnings.len(), 1);
+        assert!(pass(&knobs, &bad, &env, &read, &mut warned).warnings.is_empty());
+        pass(&knobs, &BTreeMap::new(), &env_of(&[]), &read, &mut warned);
+        // lines that are not NAME=value
+        assert_eq!(bad_lines("# c\nT_MIN_ROWS 3\n\nT_SLOTS=2 # ok\n"), vec!["T_MIN_ROWS 3".to_string()]);
         // unknown keys warn once
         let p = pass(&knobs, &parse_file("T_NOPE=1\n"), &env_of(&[]), &read, &mut warned);
         assert_eq!(p.warnings, vec!["T_NOPE: no such knob in this process; ignored".to_string()]);
