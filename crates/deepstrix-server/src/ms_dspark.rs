@@ -528,6 +528,8 @@ impl MsDspark {
                 plain_ms = format!("{:.1}", self.plain_ms),
                 cost_ms = format!("{:.1}+{:.1}/row", self.cost.a, self.cost.b),
                 cost2_ms = format!("{:.1}+{:.1}/row", self.cost2.a, self.cost2.b),
+                cells = cells_str(&self.cost.cell_costs(), 1),
+                cells2 = cells_str(&self.cost2.cell_costs(), self.cost2.first_row),
                 two_lane_blocks = s.two_lane,
                 explored = s.explored,
                 explored_k0 = s.explored_k0,
@@ -582,6 +584,11 @@ pub fn prefill_captures(lanes: &[&BatchDgpuScratch]) -> eyre::Result<BTreeMap<u3
         }
     }
     Ok(m)
+}
+
+/// `a,b,c,...` (ms, rows `first..=6`) for the blocks log line.
+fn cells_str(c: &[f64; CELLS], first: usize) -> String {
+    c[first.clamp(1, CELLS) - 1..].iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>().join(",")
 }
 
 fn env_f64(k: &str, d: f64) -> f64 {
@@ -725,10 +732,45 @@ pub fn explore_k(rng: &mut impl Rng, cap: usize, p: f64) -> Option<usize> {
     (cap > 0 && p > 0.0 && rng.gen::<f64>() < p).then(|| rng.gen_range(0..=cap))
 }
 
+/// Rows the per-row cost CELLS cover (1 ..= MTP_BLOCK + 1: every block's rows).
+const CELLS: usize = MTP_BLOCK + 1;
+/// A cell starts at its ladder value, weighted as this many samples (it
+/// washes out with the first real ones; bounds a first warm-up stall).
+const CELL_START_W: f64 = 1.0;
+
+/// `V41_MS_DSPARK_COST_SHAPE`: `cells` (default since 2026-10-01) or `line`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CostShape {
+    /// One independent estimate per row count (`StepCost` doc).
+    Cells,
+    /// `a + b * rows` with the ladder line as prior (the 10-01 daytime model).
+    Line,
+}
+
+fn cost_shape() -> CostShape {
+    static S: LazyLock<CostShape> = LazyLock::new(|| match std::env::var("V41_MS_DSPARK_COST_SHAPE").as_deref() {
+        Ok("line") => CostShape::Line,
+        _ => CostShape::Cells,
+    });
+    *S
+}
+
 /// What a lone stream's step and draft cost (ms), for the K policy and the
 /// stage-1 baseline.
 ///
-/// LIVE (default): `cost(rows) = a + b * rows`, least squares over the lone
+/// CELLS (default since 2026-10-01 evening, `V41_MS_DSPARK_COST_SHAPE`): one
+/// independent estimate per row count 1..=6 -- a time-aged mean of that row
+/// count's own steps, starting at its ladder value (`CELL_START_W`) -- with no
+/// prior BETWEEN row counts (owner: "we only have 6 possible options here",
+/// and epsilon-exploration now samples every one). A line missed the measured
+/// concavity (each extra row costs less: one lane +15.7 ms at 1->2 rows, +10.6
+/// at 5->6; two lanes +11.7, +7.5 -- more rows share more experts) and so
+/// overpriced 6-row steps by ~5 ms, under-drafting the 5th draft. No coupling
+/// at all, monotonicity included (owner: the cost may legitimately fall with
+/// rows, e.g. where the second lane switches on): a noisy rare cell is fixed
+/// by its own next samples, which exploration keeps supplying.
+///
+/// LINE (`=line`): `cost(rows) = a + b * rows`, least squares over the lone
 /// stream's recent steps (exponential forgetting, `V41_MS_DSPARK_COST_MEMORY`
 /// samples, default 500 = ~75 s of steps) with the configured ladder
 /// (`V41_MS_DSPARK_COST`) as the prior (`PRIOR_SLOPE`, `PRIOR_LEVEL`); the
@@ -762,6 +804,12 @@ pub struct StepCost {
     b: f64,
     draft: f64,
     samples: u64,
+    shape: CostShape,
+    first_row: usize,
+    /// Per row count (index rows - 1): time-aged `(weight, weighted sum)`.
+    cells: [(f64, f64); CELLS],
+    /// `cells`' means (what `cost` returns).
+    cell_cost: [f64; CELLS],
 }
 
 impl StepCost {
@@ -778,6 +826,7 @@ impl StepCost {
         let xc = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
         let yc = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
         let prior_b = pts.iter().map(|&(x, y)| (x - xc) * (y - yc)).sum::<f64>() / pts.iter().map(|&(x, _)| (x - xc) * (x - xc)).sum::<f64>();
+        let cells = std::array::from_fn(|i| (CELL_START_W, CELL_START_W * ladder_cost(&ladder, i + 1)));
         let mut c = Self {
             live,
             ladder,
@@ -790,9 +839,29 @@ impl StepCost {
             b: 0.0,
             draft: draft_ms,
             samples: 0,
+            shape: cost_shape(),
+            first_row,
+            cells,
+            cell_cost: [0.0; CELLS],
         };
         c.refit();
         c
+    }
+
+    /// This fit with `shape` (tests; production reads `V41_MS_DSPARK_COST_SHAPE`).
+    pub fn with_shape(mut self, shape: CostShape) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    /// The per-row cells' costs (logging): rows 1..=6.
+    pub fn cell_costs(&self) -> [f64; CELLS] {
+        self.cell_cost
+    }
+
+    /// The line's `(a, b)` (logging).
+    pub fn line(&self) -> (f64, f64) {
+        (self.a, self.b)
     }
 
     /// From `V41_MS_DSPARK_COST`, `_DRAFT_MS`, `_COST_LIVE`, `_COST_MEMORY`.
@@ -838,7 +907,15 @@ impl StepCost {
         if !self.live {
             return ladder_cost(&self.ladder, rows);
         }
-        (self.a + self.b * rows as f64).max(1.0)
+        match self.shape {
+            CostShape::Line => (self.a + self.b * rows as f64).max(1.0),
+            CostShape::Cells if rows <= CELLS => self.cell_cost[rows - 1].max(1.0),
+            // Past the cells (never a block's rows): extend the last step.
+            CostShape::Cells => {
+                let (l, p) = (self.cell_cost[CELLS - 1], self.cell_cost[CELLS - 2]);
+                (l + (l - p).max(0.0) * (rows - CELLS) as f64).max(1.0)
+            }
+        }
     }
 
     /// Draft time (ms).
@@ -863,6 +940,10 @@ impl StepCost {
         for v in self.data.iter_mut() {
             *v *= self.decay;
         }
+        for c in self.cells.iter_mut() {
+            c.0 *= self.decay;
+            c.1 *= self.decay;
+        }
         self.refit();
     }
 
@@ -873,9 +954,17 @@ impl StepCost {
         }
         // A stall (box-2 hiccup, seconds of paging, a warm-up) counts, but at
         // most as `stall_clamp` x the estimate: one sample must not drag the fit.
-        let (x, y) = (rows as f64, ms.min(stall_clamp(self.data[0]) * self.cost(rows)));
+        let line = (self.a + self.b * rows as f64).max(1.0);
+        let (x, y) = (rows as f64, ms.min(stall_clamp(self.data[0]) * line));
         for (s, v) in self.data.iter_mut().zip([1.0, x, x * x, y, x * y]) {
             *s += v;
+        }
+        // Each cell clamps against ITS OWN estimate and youth.
+        if rows <= CELLS {
+            let c = &mut self.cells[rows - 1];
+            let y = ms.min(stall_clamp(c.0) * (c.1 / c.0.max(1e-9)));
+            c.0 += 1.0;
+            c.1 += y;
         }
         self.samples += 1;
         self.refit();
@@ -894,9 +983,13 @@ impl StepCost {
         }
     }
 
-    /// Minimize `sum_data w (y - a - b x)^2 + level_prior(n) (a + b xc - yc)^2 +
-    /// PRIOR_SLOPE (b - prior_b)^2` (2x2 normal equations).
+    /// The line: minimize `sum_data w (y - a - b x)^2 + level_prior(n) (a + b xc
+    /// - yc)^2 + PRIOR_SLOPE (b - prior_b)^2` (2x2 normal equations). The cells:
+    /// each its own mean.
     fn refit(&mut self) {
+        for (cost, c) in self.cell_cost.iter_mut().zip(&self.cells) {
+            *cost = c.1 / c.0.max(1e-9);
+        }
         let [n, sx, sxx, sy, sxy] = self.data;
         let (l, s, xc, yc) = (level_prior(n), PRIOR_SLOPE, self.prior_xc, self.prior_yc);
         let (m00, m01, m11) = (n + l, sx + l * xc, sxx + l * xc * xc + s);
@@ -1127,7 +1220,7 @@ mod tests {
         // The 10-01 production mix (rows 4 and 6 dominate; 1, 2, 3, 5 rare),
         // true cost 53.2 + 15.1 * rows with +-20 ms noise, prior = the
         // static ladder (4-row entry 8 ms low).
-        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 20.0, true, 500.0);
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 20.0, true, 500.0).with_shape(CostShape::Line);
         let mix = [(1usize, 2), (2, 12), (3, 3), (4, 52), (5, 6), (6, 25)];
         let mut st = 42u64;
         for _ in 0..40 {
@@ -1154,7 +1247,7 @@ mod tests {
     #[test]
     fn one_row_count_shifts_the_level_and_keeps_the_prior_slope() {
         // Every block verifies 5 drafts: the data pin cost(6), the prior the slope.
-        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0).with_shape(CostShape::Line);
         let prior_slope = c.b;
         for _ in 0..3000 {
             c.observe_step(6, 200.0);
@@ -1201,7 +1294,7 @@ mod tests {
         // 565, 738 ms (warm-up, a cold box 2) where ~110 is normal. They may
         // raise the estimate a bounded step, and a run of normal steps (which
         // exploration keeps supplying) must bring it back.
-        let mut c2 = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0);
+        let mut c2 = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0).with_shape(CostShape::Line);
         let prior4 = c2.cost(4);
         for (rows, ms) in [(4, 222.0), (4, 1709.0), (5, 565.0), (6, 738.0)] {
             c2.observe_step(rows, ms);
@@ -1216,7 +1309,7 @@ mod tests {
         assert!((c2.cost(4) - 110.0).abs() < 8.0, "after 80 normal steps: cost2(4) {}", c2.cost(4));
         // At half a sample of level prior and a 3x clamp the first stall alone
         // put the 4-row estimate at ~185 (what production logged).
-        let mut one = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0);
+        let mut one = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0).with_shape(CostShape::Line);
         one.observe_step(4, 222.0);
         assert!(one.cost(4) < 130.0, "one warm-up step: cost2(4) {}", one.cost(4));
     }
@@ -1249,7 +1342,7 @@ mod tests {
     fn an_unused_fit_forgets_by_time() {
         // The one-lane line learned a cold level, then every block ran two
         // lanes: aging alone (others' steps) must bring it back to its prior.
-        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0).with_shape(CostShape::Line);
         let prior3 = c.cost(3);
         for _ in 0..3000 {
             c.observe_step(3, 1.4 * prior3);
@@ -1275,6 +1368,77 @@ mod tests {
         }
         assert!(!c.young());
         assert!((c.cost(4) - 115.0).abs() < 4.0, "cost(4) {}", c.cost(4));
+    }
+
+    /// The 10-01 evening means (one lane, rows 1..6; MEASURED over 9,736 warm
+    /// lone steps), ~+-8 ms noise, at an epsilon-exploring policy's row mix
+    /// (rows 1 and 2 seen only through exploration).
+    const MEASURED_ONE_LANE: [f64; 6] = [63.1, 78.8, 93.6, 107.2, 119.6, 130.2];
+
+    #[test]
+    fn cells_recover_a_concave_curve_a_line_cannot() {
+        let mut st = 7u64;
+        let mix = [(1usize, 1), (2, 1), (3, 12), (4, 10), (5, 6), (6, 10)];
+        let mut cells = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0).with_shape(CostShape::Cells);
+        let mut line = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0).with_shape(CostShape::Line);
+        for _ in 0..200 {
+            for &(rows, n) in &mix {
+                for _ in 0..n {
+                    let ms = MEASURED_ONE_LANE[rows - 1] + 8.0 * lcg(&mut st);
+                    cells.observe_step(rows, ms);
+                    line.observe_step(rows, ms);
+                }
+            }
+        }
+        for rows in 1..=6 {
+            let want = MEASURED_ONE_LANE[rows - 1];
+            assert!((cells.cost(rows) - want).abs() < 3.0, "cells rows {rows}: {} vs {want}", cells.cost(rows));
+        }
+        // The line cannot bend to the concavity: it misses some row count
+        // (which one depends on where the row mix puts its weight).
+        let worst = (1..=6).map(|r| (line.cost(r) - MEASURED_ONE_LANE[r - 1]).abs()).fold(0.0, f64::max);
+        assert!(worst > 3.0, "line's worst row error {worst}");
+    }
+
+    #[test]
+    fn cells_are_independent_and_a_young_cell_bounds_a_stall() {
+        let mut c = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0).with_shape(CostShape::Cells);
+        // Neighbours do not pull a cell: a 5-row cell measured below the 4-row
+        // one stays below it (the cost may legitimately fall with rows).
+        for _ in 0..300 {
+            c.observe_step(4, 105.0);
+            c.observe_step(5, 100.0);
+            c.observe_step(6, 125.0);
+        }
+        assert!((c.cost(4) - 105.0).abs() < 0.5 && (c.cost(5) - 100.0).abs() < 0.5 && (c.cost(6) - 125.0).abs() < 0.5, "{:?}", c.cell_costs());
+        // One 1709 ms step in a young cell moves it a bounded step (1.5x clamp
+        // against the cell's own start value), and normal steps bring it back.
+        let mut y = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0).with_shape(CostShape::Cells);
+        let start = y.cost(4);
+        y.observe_step(4, 1709.0);
+        assert!(y.cost(4) <= 1.26 * start, "one stall: {} vs start {start}", y.cost(4));
+        for _ in 0..30 {
+            y.observe_step(4, 110.0);
+        }
+        assert!((y.cost(4) - 110.0).abs() < 5.0, "after 30 normal steps: {}", y.cost(4));
+    }
+
+    #[test]
+    fn an_idle_cell_keeps_its_mean_but_a_new_sample_dominates() {
+        // No prior between cells and no reversion: aging shrinks a cell's weight,
+        // not its value; the next sample then carries it (bounded by the young clamp).
+        let mut c = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0).with_shape(CostShape::Cells);
+        for _ in 0..1000 {
+            c.observe_step(2, 80.0);
+        }
+        for _ in 0..4000 {
+            c.age();
+        }
+        // (The ladder start's pseudo-sample is all but gone: ~0.1 of ~500.)
+        assert!((c.cost(2) - 80.0).abs() < 0.01, "{}", c.cost(2));
+        // ~0.17 samples of weight left (e^-8 of ~500): the new sample carries it.
+        c.observe_step(2, 100.0);
+        assert!(c.cost(2) > 96.0, "{}", c.cost(2));
     }
 
     #[test]
