@@ -2917,10 +2917,20 @@ fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyr
     let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
     let win = v4flash_kernels::het::mtp::MTP_WINDOW as u32;
 
+    // Consumed: a capture seeds at most once. A later request whose prompt is
+    // restored in full runs no prefill (nothing re-zeroes the counts), and must
+    // start cold rather than seed these rows again. Snapshot and clear BEFORE
+    // reading, so an error below (a failed copy) cannot leave them set.
+    let counts = [
+        (state.bd_a.mtp_captured, state.bd_a.mtp_captured_pos0),
+        (state.bd_b.mtp_captured, state.bd_b.mtp_captured_pos0),
+    ];
+    state.bd_a.mtp_captured = 0;
+    state.bd_b.mtp_captured = 0;
+
     let mut by_pos: std::collections::BTreeMap<u32, Vec<f32>> = std::collections::BTreeMap::new();
     let mut lanes_used = 0usize;
-    for (lane_name, lane) in [("a", &state.bd_a), ("b", &state.bd_b)] {
-        let (n, pos0) = (lane.mtp_captured, lane.mtp_captured_pos0);
+    for ((lane_name, lane), (n, pos0)) in [("a", &state.bd_a), ("b", &state.bd_b)].into_iter().zip(counts) {
         if n == 0 {
             continue;
         }
@@ -2948,11 +2958,6 @@ fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyr
         }
         lanes_used += 1;
     }
-    // Consumed: a capture seeds at most once. A later request whose prompt is
-    // restored in full runs no prefill (nothing re-zeroes the counts), and must
-    // start cold rather than seed these rows again.
-    state.bd_a.mtp_captured = 0;
-    state.bd_b.mtp_captured = 0;
     let Some(&last) = by_pos.keys().next_back() else {
         return Ok(());
     };
@@ -3924,6 +3929,11 @@ fn finish_decode(
                     );
                 }
             }
+            // Only the batched verify (`forward_prefill_pipelined`) captures this
+            // step's `mtp_src`; the `V41_VERIFY_DECODE_PATH` diagnostic does not
+            // (warned above), so the lane-capture asserts and the consume-once
+            // reset below apply to the batched verify alone.
+            let verify_captured = decode_path_logits.is_none();
             let logits = decode_path_logits.take().unwrap_or(logits_batched);
             let t_fwd = t_step.elapsed();
 
@@ -4189,14 +4199,14 @@ fn finish_decode(
             // is silently STALE -- the failure that looked like "the drafter is
             // degenerate" until it was root-caused to this mapping.
             assert!(
-                state.bd_a.mtp_captured >= cut.min(toks.len()),
+                !verify_captured || state.bd_a.mtp_captured >= cut.min(toks.len()),
                 "dspark accept: lane A captured {} mtp_src rows, but the recorded lane cut claims                  rows [0,{}) of this {}-row verify came from lane A",
                 state.bd_a.mtp_captured,
                 cut.min(toks.len()),
                 toks.len()
             );
             assert!(
-                cut >= toks.len() || state.bd_b.mtp_captured >= toks.len() - cut,
+                !verify_captured || cut >= toks.len() || state.bd_b.mtp_captured >= toks.len() - cut,
                 "dspark accept: lane B captured {} mtp_src rows, but the recorded lane cut claims                  rows [{cut},{}) of this verify came from lane B",
                 state.bd_b.mtp_captured,
                 toks.len()
@@ -4212,8 +4222,10 @@ fn finish_decode(
             // later request whose prompt is restored in full runs no prefill,
             // and `seed_mtp_ring` would seed the drafter ring with THIS verify's
             // rows (they pass its "ends at or before start_pos" guard).
-            state.bd_a.mtp_captured = 0;
-            state.bd_b.mtp_captured = 0;
+            if verify_captured {
+                state.bd_a.mtp_captured = 0;
+                state.bd_b.mtp_captured = 0;
+            }
             let lane_row = |r: usize| -> (&Vec<f32>, usize) {
                 let (buf, lr) = if r < cut { (&whole, r) } else { (&whole_b, r - cut) };
                 // LANE-LOCAL row, never a global one: `mtp_src` holds at most

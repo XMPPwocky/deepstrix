@@ -1467,55 +1467,13 @@ fn chunk_rows_idle() -> usize { env_usize("V41_MS_CHUNK_ROWS_IDLE", 1024) }
 fn chunk_rows_busy() -> usize { env_usize("V41_MS_CHUNK_ROWS", 1024) }
 
 /// Same rule as `HeterogeneousEngine::sample_next` / the DSpark host twin.
+///
+/// The distribution is `spec_sample::TargetDist`, the ONE definition of `p`
+/// that plain sampling and DSpark's rejection sampling share; this draws from
+/// it exactly as the pre-refactor code did (bit-identical tokens and RNG
+/// consumption, test `g_rs2_refactor_is_bit_identical_to_the_old_sampler`).
 fn sample_row(r: &[f32], mode: &SampleMode, rng: &mut SamplerRng) -> i32 {
-    match *mode {
-        SampleMode::Argmax => {
-            let mut best = 0usize;
-            for (i, &x) in r.iter().enumerate() { if x > r[best] { best = i; } }
-            best as i32
-        }
-        SampleMode::Multinomial { temperature, min_p_rel, top_p } => {
-            // Same chain as `top_p_min_p_threshold` (temperature, top-p over
-            // the tempered weights, then min-p), but without a 129K-entry f64
-            // exp + full sort per row (~3 ms/row, 10 ms/step at 4 rows). The
-            // weight is exp(logit/T - gmax) in (0, 1]; entries below FLOOR
-            // cannot move a top-p cutoff by more than N_VOCAB * FLOOR of the
-            // mass (< 1e-5 of the total, which is >= 1), so only the survivors
-            // are sorted -- typically a few hundred.
-            const FLOOR: f32 = 1e-10;
-            let inv_t = 1.0f32 / temperature;
-            let gmax = r.iter().copied().fold(f32::NEG_INFINITY, f32::max) * inv_t;
-            let lo = (min_p_rel.max(FLOOR)).ln(); // survivors: x*inv_t - gmax >= lo
-            let mut cand: Vec<(f32, u32)> = Vec::with_capacity(512);
-            for (i, &x) in r.iter().enumerate() {
-                let l = x * inv_t - gmax;
-                if l >= lo { cand.push((l.exp(), i as u32)); }
-            }
-            // top-p cutoff over the survivors (sorted descending).
-            let thr = if top_p >= 1.0 { 0.0f32 } else {
-                cand.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                let z: f32 = cand.iter().map(|c| c.0).sum();
-                let target = top_p * z;
-                let mut cum = 0.0f32;
-                let mut t = cand.last().map(|c| c.0).unwrap_or(0.0);
-                for c in &cand { cum += c.0; if cum >= target { t = c.0; break; } }
-                t
-            }.max(min_p_rel);
-            let z: f32 = cand.iter().filter(|c| c.0 >= thr).map(|c| c.0).sum();
-            let target = rng.next_f32() * z;
-            let mut acc = 0.0f32;
-            let mut pick = cand.first().map(|c| c.1).unwrap_or(0);
-            // Cumulative pick in VOCAB order (as before), over the survivors.
-            if top_p < 1.0 { cand.sort_unstable_by_key(|c| c.1); }
-            for c in &cand {
-                if c.0 < thr { continue; }
-                acc += c.0;
-                pick = c.1;
-                if acc >= target { break; }
-            }
-            pick as i32
-        }
-    }
+    crate::spec_sample::TargetDist::from_logits(r, mode).sample(rng)
 }
 
 /// Record `tok` as the stream's next input and emit it (unless suppressed).

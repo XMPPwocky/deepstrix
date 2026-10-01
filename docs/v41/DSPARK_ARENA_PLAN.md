@@ -77,6 +77,28 @@ drafter measured on production outputs (7.6).
 4. **Integrate, don't fork.** The legacy serial DSpark driver in
    `engine_worker.rs` (~1,500 lines) is retired at the end, not extended
    (owner decision 2026-09-24: "integrate cleanly, reuse the main path").
+5. **A verify block is multistream rows that share one stream's attention
+   context** (owner 2026-10-01: "dspark verify should basically be 'multistream
+   but the attention is shared'"; share code as much as possible without hurting
+   performance or making things convoluted). Concretely:
+   * **One step.** Draft rows ride the same `forward_step_arena*` drivers, row
+     tables, MoE/router/head and lane machinery as every decode row. DSpark adds
+     per-row offsets inside a stream (3.1) and the per-store stash (3.2); there is
+     no DSpark-specific forward.
+   * **Shared attention.** A stream's rows read that stream's KV (raw window,
+     compressed rows, index keys) with per-row counts. First implementation: the
+     existing per-row kernels (attention is ~3-8 ms of a 154 ms 6-row step).
+     Later, only if measured worthwhile: read the stream's KV once for all of its
+     rows, as prefill's batched attention already does for one sequence.
+   * **One sampler.** `spec_sample::TargetDist` is the single definition of `p`
+     for plain sampling and verification (M1, done).
+   * **One emit path.** Each emitted token goes through the stream's existing
+     emit / stop / snapshot / cancel handling, once per token.
+   * **DSpark-only code** is the drafter and its rings, the accept rule
+     (`spec_sample::verify_block`), and the K policy.
+   * **Performance guard:** with zero draft rows, the multi-row tables must equal
+     today's (unit test) and the step must cost what it does today (A/B at the
+     noise floor), so plain multistream pays nothing for the sharing.
 
 ## 1. What it is worth (priced on today's arena step)
 
@@ -173,9 +195,9 @@ request path accepts temperature (default 1.0), top_p (default 0.95) and seed;
 `min_p_rel` is hard-coded 0.0; no penalties, logit_bias or top_k exist. Three
 implementations of this distribution exist today (device kernel, legacy f64
 `row_sample`, arena f32 `sample_row`); the arena one is the reference. Refactor `sample_row` into
-`target_dist(row, mode) -> SparseDist {ids, probs}` (the survivors, normalized)
-plus `draw(&SparseDist, u)`, and make BOTH plain sampling and rejection sampling
-use `target_dist`. Gate: the refactored plain sampler emits bit-identical tokens
+`TargetDist::from_logits(row, mode)` (the survivors with their unnormalised
+weights) plus `TargetDist::draw(u)`, and make BOTH plain sampling and rejection
+sampling use it (done in M1, `spec_sample.rs`). Gate: the refactored plain sampler emits bit-identical tokens
 for the same RNG stream (G-RS2). One definition of `p`, or the output drifts
 silently.
 
@@ -216,9 +238,9 @@ consumption); the DISTRIBUTION is identical. Document it on the API.
 Implementation details that the exactness depends on:
 * **Zero-mass residual.** When `p ~= q`, `p/q` can round below 1, a reject can then
   meet `sum (p - q)+ ~= 0`; fall back to drawing from `p` (never normalize ~0).
-* **Bit-identity of the plain path.** `SparseDist` keeps `sample_row`'s
+* **Bit-identity of the plain path.** `TargetDist` keeps `sample_row`'s
   unnormalized f32 weights, its `z` summed in sorted order, and its vocab-order
-  cumulative walk (`multistream.rs` ~1262-1289), so `draw` reproduces today's
+  cumulative walk (now `spec_sample.rs`, `TargetDist`), so `draw` reproduces today's
   sampler exactly (G-RS2); f64 probabilities are derived only for the RS ratio
   and the residual.
 * **Device-side draft sampling is tested**: a chi-square that the exported
@@ -278,7 +300,7 @@ correct tables, raw KV, comp rows, index keys, the indexer and the reuse layers
 are exact for same-stream rows with NO kernel change. The one structural problem
 is the compressor accumulator.
 
-3.1 **Multi-row tables** (`KvArena::tables`, `kv_arena.rs` ~650; drop the
+3.1 **Multi-row tables** (`KvArena::tables`, `kv_arena.rs` ~959; drop the
     duplicate-slot refusal). A stream's rows are contiguous; for row j at
     `pos + j` with `f_j` = fires among its rows before j:
     `n_raw_per = n_raw + j`, `slot_per = region + raw_off + n_raw + j` (and the
@@ -323,7 +345,8 @@ is the compressor accumulator.
     3387): the caller runs `advance(slot)` `keep` times (already exact per
     position incl. the `n_comp`/`n_index_comp` lockstep), then the commit.
     `needs_compaction` checks `raw_off + n_raw + rows`, not +1; `RowTablesDev`
-    `rows_cap` becomes `n_slots * (1 + K_max)` (`multistream.rs` ~124); no
+    `rows_cap` becomes `n_slots * (1 + K_max)` (the `RowTablesDev::alloc` calls,
+    `multistream.rs` ~174-188); no
     `compact_*` between a step and its commit.
 
 3.4 **Rollback is truncation.** Nothing past the counters is ever read (the
@@ -341,7 +364,8 @@ is the compressor accumulator.
     the shared `sd.kv_cur` and `ready_first`'s missing per-layer ordering between
     lanes. Pass explicit stream-aligned cut points into all three drivers
     (pipelined `b.div_ceil(2)` ~2900; lanes/ready_first `offs` ~3087 / ~3238) and
-    back to the server's logits slicing (`multistream.rs` ~913-941), balancing rows.
+    back to the server's logits slicing (`multistream.rs`, the lane-cut / logits
+    slicing in `decode_step`), balancing rows.
     Choose the lane count from the number of STREAMS, not rows:
     `V41_MS_PIPELINE_MIN_ROWS` counts rows and would split a lone stream's block.
     Option, after M0(d) measures a single-lane 6-row step: if the gather reads the
@@ -372,7 +396,7 @@ is the compressor accumulator.
 3.8 **Cache prior.** `V41_SUB` substitution applies to arena rows, so verify rows
     route like decode rows, consistent with production decode, which is already
     residency-dependent. Fidelity runs keep it unset. Fix the stale comment at
-    `forward_prefill.rs` ~1085 ("DSpark verify is Contiguous").
+    `forward_prefill.rs` ~1114 ("DSpark verify is Contiguous").
 
 ## 4. Drafter in the arena
 
@@ -428,8 +452,8 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
     blocking syncs per draft today). Point-mass mode = `tau_d -> 0`, no q export.
 
 4.4 **Residual capture on arena rows.** The per-row `mtp_src` capture kernel
-    exists in `forward_layer_pre_moe_v2` (`forward_prefill.rs` ~3561-3625) but the
-    arena drivers refuse it (~2800, 2904, 3097, 3248, 3520). Capture into an
+    exists in `forward_layer_pre_moe_v2` (`forward_prefill.rs` ~3586-3654) but the
+    arena drivers refuse it (~2831, 2935, 3128, 3279, 3551). Capture into an
     ARENA-ROW-indexed buffer `[R x 3 x 5120]` f32 (~61 KB/row) so no lane mapping
     is needed (the legacy `mtp_lane_cut` knows only 2 lanes and was the source of
     two bugs, 271d751 / cb25715). After acceptance, the kept rows' captures feed
@@ -769,7 +793,19 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
   microbench; it also speeds plain multi-stream decode, so it is not DSpark-only.
 * **M1: rejection-sampling core** (host only): `target_dist` + `draw` refactor of
   `sample_row`, the block procedure of 2.3, G-RS1 (with its negative control),
-  G-RS2.
+  G-RS2. **DONE 2026-10-01:** `crates/deepstrix-server/src/spec_sample.rs`
+  (`TargetDist`, `DraftDist::{PointMass, Sampled}`, `verify_position`,
+  `verify_block`; `multistream::sample_row` now calls `TargetDist`). Tests
+  (`cargo test -p deepstrix-server --features v41 --release --lib spec_sample`,
+  host only): G-RS2 bit-identical tokens and RNG consumption vs the old sampler
+  over >10,000 row x mode cases; G-RS1 chi-square of the first 3 emitted tokens
+  of a speculative toy chain vs plain sampling, 120,000 runs each, all under the
+  p = 1e-4 critical value (point-mass K=1 28.8 / 54.2, K=4 26.6 / 54.2; sampled
+  K=3 18.3 / 54.2, K=4 28.2 / 54.2; q outside supp(p) 8.1 / 28.4; q == p K=4
+  140.3 / 215.9; random K 16.6 and 19.4 / 54.2); the negative control
+  (draft-value-dependent K) scores 38,483 vs 215.9; temperature 0 emits exactly
+  the greedy chain. G-RS3 (device-side draft sampling) waits for the drafter's
+  device sampler (M3).
 * **M2: arena multi-row streams, no drafter**: 3.1-3.6; G5f, the tables unit
   test, the golden gate with teacher-forced blocks (K>0 must equal K=0 KL).
 * **M2.5: prompt-lookup drafter in production** (7.6): point-mass, zero drafter

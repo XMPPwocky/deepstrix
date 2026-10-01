@@ -13,6 +13,7 @@ pub mod prompt;
 pub mod prompt_v41;
 mod prompt_v41_templates;
 pub mod snapshot;
+pub mod spec_sample;
 pub mod tokens;
 pub mod vision_prompt;
 #[cfg(feature = "v41")]
