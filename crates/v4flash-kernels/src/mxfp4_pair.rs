@@ -25,6 +25,14 @@ pub const MXFP4_PAIR_MAX_BLOCKS: u32 = 32;
 /// Upper bound on the prefill kwide kernel's `chunk_size` (`MXFP4_KW_MAX_CHUNK`
 /// in the kernel: sizes its LDS staging and per-lane accumulators).
 pub const MXFP4_KW_MAX_CHUNK: u32 = 32;
+/// Members one pass of the grouped drafter gate+up holds in registers
+/// (`MXFP4_GROUPED_MAX_MEMBERS` in the kernel). A group never has more members
+/// than tokens (a token's top-k picks are distinct), so `n_tok <= 8` is one pass.
+pub const MXFP4_GROUPED_MAX_MEMBERS: u32 = 8;
+/// Most picks (`n_tok * n_used`) the grouped drafter kernels take
+/// (`MXFP4_GROUPED_MAX_PICKS`, kernels/mxfp4_matvec.hip: the down kernel's
+/// per-lane `inner[pick]` registers).
+pub const MXFP4_GROUPED_MAX_PICKS: u32 = 16;
 
 pub struct Mxfp4PairMatvec {
     module: Module,
@@ -182,6 +190,78 @@ impl Mxfp4PairMatvec {
                 clamp,
                 n_rows,
                 n_blocks
+            ]
+        )
+    }
+
+    /// Drafter block gate+up GROUPED BY EXPERT
+    /// (`mxfp4_pair_matvec_fused_swiglu_grouped`, `V41_MTP_MOE_GROUPED`): all
+    /// `n_tok` tokens' `n_used` picks in ONE launch, each DISTINCT resident
+    /// expert read once and applied to every token that picked it. Picks are
+    /// token-major (`p = token * n_used + slot`, the drafter's `[B, TOPK]`
+    /// `d_selected` / `d_ew`); `mid` is `[n_picks, n_rows]` and `xq` is
+    /// `[n_tok, n_blocks * 292]`.
+    ///
+    /// BIT-IDENTICAL per (pick, row) to `n_tok` launches of
+    /// [`Self::launch_fused_swiglu_batch_hetsplit`] with mode 0 and
+    /// `dgpu_cap >= n_used` (the only het-split contract it implements: a pick
+    /// is ours iff `remap[sel] < 0`, at expert `-remap[sel] - 1`; others get
+    /// `mid = 0`). Graph-capturable: no host-side grouping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_grouped(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        selected: &DeviceBuffer<i32>,
+        remap: &DeviceBuffer<i32>,
+        gate_bpe: u32,
+        up_bpe: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_tok: u32,
+        n_used: u32,
+    ) -> eyre::Result<()> {
+        let n_picks = n_tok * n_used;
+        if n_tok == 0 || n_used == 0 || n_picks > MXFP4_GROUPED_MAX_PICKS {
+            return Err(eyre!("mxfp4 pair grouped: n_tok={n_tok} x n_used={n_used} outside 1..={MXFP4_GROUPED_MAX_PICKS} picks"));
+        }
+        Self::check(mid, n_picks, n_rows, n_blocks)?;
+        let xq_bytes = n_blocks as usize * crate::q8_k::BLOCK_Q8_K_BYTES;
+        if xq.len() < n_tok as usize * xq_bytes {
+            return Err(eyre!("mxfp4 pair grouped xq: {} bytes < n_tok * {xq_bytes}", xq.len()));
+        }
+        if (expert_w.len() as u32) < n_picks || (selected.len() as u32) < n_picks {
+            return Err(eyre!(
+                "mxfp4 pair grouped: expert_w {} / selected {} < n_picks {n_picks}",
+                expert_w.len(),
+                selected.len()
+            ));
+        }
+        // One LDS slot per member of a pass; n_tok slots = one pass per group.
+        let member_slots = n_tok.min(MXFP4_GROUPED_MAX_MEMBERS);
+        let lds = member_slots as usize * xq_bytes;
+        if lds > 64 * 1024 {
+            return Err(eyre!("mxfp4 pair grouped: {lds} B of LDS staging > 64 KiB"));
+        }
+        let function = self.module.get_function("mxfp4_pair_matvec_fused_swiglu_grouped")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_picks, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: lds as u32,
+        };
+        launch_kernel!(
+            function,
+            cfg,
+            stream,
+            [
+                mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(), expert_w.raw(),
+                selected.raw(), remap.raw(), gate_bpe, up_bpe, clamp, n_rows, n_blocks,
+                n_used, n_picks, member_slots
             ]
         )
     }

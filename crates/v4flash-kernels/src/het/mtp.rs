@@ -479,6 +479,28 @@ pub fn mtp_expert_stats() -> bool {
     *V.get_or_init(|| std::env::var("V41_MTP_EXPERT_STATS").as_deref() == Ok("1"))
 }
 
+/// `V41_MTP_MOE_GROUPED=1`: run each drafter layer's routed MoE GROUPED BY
+/// EXPERT -- one gate+up launch, one q8k, one down launch for the whole block
+/// -- instead of B per-row hetsplit chains. Per row the block reads 3 experts,
+/// 15 per layer, but its 5 rows pick only ~7.6 DISTINCT ones (MEASURED,
+/// `V41_MTP_EXPERT_STATS`, 600 production drafts: L0 9.1 / L1 7.6 / L2 6.2),
+/// and at ~18.8 MB per MXFP4 expert the routed reads are ~60% of the drafter's
+/// ~1.4 GB per draft on a DEVICE-bound forward (8.7 ms iGPU, 0.4 ms enqueue).
+/// Grouping reads each distinct expert once: ~846 -> ~430 MB per draft.
+/// BIT-IDENTICAL drafts by construction (kernels/mxfp4_pair_matvec.hip and
+/// mxfp4_matvec.hip, `*_grouped`); default off until `tests/mtp_moe_grouped.rs`
+/// and `tests/dspark_parity.rs` confirm it on the GPU.
+fn mtp_moe_grouped() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_MTP_MOE_GROUPED").as_deref() == Ok("1"))
+}
+// The block must fit the grouped kernels as compiled: the down kernel's per-lane
+// `inner[pick]` registers, one member pass per expert (a group never has more
+// members than tokens), and the gate/up's per-member LDS staging.
+const _: () = assert!(MTP_BLOCK * MTP_TOPK as usize <= crate::mxfp4_pair::MXFP4_GROUPED_MAX_PICKS as usize);
+const _: () = assert!(MTP_BLOCK <= crate::mxfp4_pair::MXFP4_GROUPED_MAX_MEMBERS as usize);
+const _: () = assert!(MTP_BLOCK * XQ_BYTES_PER_TOKEN <= 64 * 1024);
+
 #[derive(Default)]
 struct ExpertStats {
     drafts: u64,
@@ -1565,7 +1587,43 @@ impl MtpState {
         let tk = MTP_TOPK as usize;
         let ffe = N_FF_EXP as usize;
         let ne = N_EMBD as usize;
-        for j in 0..(if no_routed() { 0 } else { MTP_BLOCK }) {
+        // GROUPED (`V41_MTP_MOE_GROUPED`): the same three steps once for the
+        // whole block, each distinct expert read once. `mid`/`midq`/`ffn_out`
+        // keep the per-row layout (pick j * TOPK + slot, token j), and q8k is
+        // per 256-element block, so one launch over all 15 slots writes the
+        // bytes the 5 per-row launches would. The kernels derive the groups
+        // from `d_selected` on the device: no readback, graph-capturable.
+        let mxfp4 = v4flash_core::gguf::GgufType::MXFP4;
+        let grouped = mtp_moe_grouped()
+            && !no_routed()
+            && w.routed.gate.dtype == mxfp4
+            && w.routed.up.dtype == mxfp4
+            && w.routed.down.dtype == mxfp4;
+        if grouped {
+            let n_picks = B * MTP_TOPK;
+            {
+                let _t = HostUs::start_dev(&MTP_H_MGATEUP, s);
+                e.mxfp4pair.launch_fused_swiglu_grouped(
+                    s, &mut self.mid, &w.routed.gate.buffer, &w.routed.up.buffer, &self.ffn_xq,
+                    &self.d_ew, &self.d_selected, &self.remap,
+                    w.routed.gate_bytes_per_expert as u32, w.routed.up_bytes_per_expert as u32,
+                    SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, B, MTP_TOPK,
+                )?;
+            }
+            {
+                let _t = HostUs::start_dev(&MTP_H_MQ8K, s);
+                e.q8k.launch(s, &mut self.midq, &self.mid, BLOCKS_Q8K_DOWN_IN * n_picks)?;
+            }
+            {
+                let _t = HostUs::start_dev(&MTP_H_MDOWN, s);
+                e.mxfp4.launch_grouped(
+                    s, &mut self.ffn_out, &w.routed.down.buffer, &self.midq, &self.d_selected,
+                    &self.remap, w.routed.down_bytes_per_expert as u32,
+                    MIDQ_BYTES_PER_SLOT as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN, B, MTP_TOPK,
+                )?;
+            }
+        }
+        for j in 0..(if no_routed() || grouped { 0 } else { MTP_BLOCK }) {
             let xq_j = self.ffn_xq.slice_view(j * XQ_BYTES_PER_TOKEN, XQ_BYTES_PER_TOKEN);
             let ew_j = self.d_ew.slice_view(j * tk, tk);
             let sel_j = self.d_selected.slice_view(j * tk, tk);

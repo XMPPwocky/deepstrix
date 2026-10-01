@@ -530,3 +530,163 @@ extern "C" __global__ void mxfp4_matvec_par_by_expert_smallb(
     }
     }  // work-item loop
 }
+
+// =============================================================================
+// Drafter (DSpark) block down projection, GROUPED BY EXPERT
+// (`V41_MTP_MOE_GROUPED`; gate+up twin: mxfp4_pair_matvec_fused_swiglu_grouped).
+//
+// ONE launch for the whole drafter block (n_tok tokens x n_used picks, pick
+// p = token * n_used + slot, midq pick-major at p * xq_slot_stride) instead of
+// n_tok `mxfp4_matvec_par_batched_hetsplit` launches that each re-read their 3
+// experts: a work-group owns 8 rows (one warp per row, as the per-row kernel)
+// for EVERY token, walks the block's DISTINCT resident experts once, and each
+// lane decodes its share of an expert's row once and applies it to every pick
+// of that expert. ~7.6 distinct of 15 picks (MEASURED) = half the bytes.
+//
+// BIT-IDENTICAL per (token, row) to the per-row kernel (mode 0, cap >= n_used)
+// BY CONSTRUCTION. Its per-lane sum runs over slots, then this lane's
+// super-blocks, and only then crosses lanes (warp_sum) -- so a token's 3
+// experts are summed INSIDE each lane, in slot order, and a by-expert partials
+// + reduce (kwide2/smallb + q2_k_reduce_partials) would re-associate it. Here
+// the expert walk only fills `inner[p][it]` = `dot_super_quarter_mxfp4`'s
+// `acc` (same lane split, same t order), and the epilogue replays the per-row
+// chain verbatim: per token, slots in order, super-blocks in order,
+// `acc += yd * inner` (the inlined `acc += yd * acc_inner`), then the same
+// warp_sum. The walk order cannot leak into any sum.
+//
+// No LDS beyond the LUT, no host-built groups: each work-group derives the
+// distinct set from `selected` itself (<= 16 picks, uniform). Grid
+// (n_rows / 8) x 256. Refuses (returns without writing; the launcher checks)
+// n_picks > MXFP4_GROUPED_MAX_PICKS or n_blocks_in > 16 (two super-block
+// iterations per lane: 9 at N_FF_EXP = 2304).
+// =============================================================================
+#ifndef MXFP4_GROUPED_MAX_PICKS
+#define MXFP4_GROUPED_MAX_PICKS 16u
+#endif
+#define MXFP4_GROUPED_ITERS 2u
+
+extern "C" __global__ void mxfp4_matvec_par_grouped(
+        float          * __restrict__ out,           // [n_tok, n_rows]
+        const uint8_t  * __restrict__ w_base,
+        const uint8_t  * __restrict__ xq_base,       // [n_picks, xq_slot_stride]
+        const int      * __restrict__ selected,      // [n_picks]
+        const int      * __restrict__ remap,         // [n_expert]
+        unsigned int     dbpe,
+        unsigned int     xq_slot_stride,
+        unsigned int     n_used,
+        unsigned int     n_picks,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+    if (n_picks > MXFP4_GROUPED_MAX_PICKS || n_blocks_in > 8u * MXFP4_GROUPED_ITERS || n_used == 0u) return;
+    __shared__ int8_t s_lut[16];
+    MXFP4_STAGE_LUT(s_lut);
+
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 2u;
+    const unsigned int sub        = lane & 3u;
+
+    // inner[p][it]: this lane's `acc` for pick p, super-block block_lane + 8 * it.
+    float inner[MXFP4_GROUPED_MAX_PICKS][MXFP4_GROUPED_ITERS];
+    #pragma unroll
+    for (unsigned int p = 0; p < MXFP4_GROUPED_MAX_PICKS; p++) {
+        #pragma unroll
+        for (unsigned int it = 0; it < MXFP4_GROUPED_ITERS; it++) inner[p][it] = 0.0f;
+    }
+
+    // Walk the distinct resident experts (first pick of each), uniform.
+    for (unsigned int p0 = 0; p0 < n_picks; p0++) {
+        const int sel_e = selected[p0];
+        if (remap[sel_e] >= 0) continue;
+        bool first = true;
+        for (unsigned int q = 0; q < p0; q++) {
+            if (selected[q] == sel_e) { first = false; break; }
+        }
+        if (!first) continue;
+        const int e = -remap[sel_e] - 1;
+        const uint8_t* row_base = w_base + (uint64_t)e * (uint64_t)dbpe
+                                + (uint64_t)row * n_blocks_in * SUPER_MXFP4_BYTES;
+        #pragma unroll
+        for (unsigned int it = 0; it < MXFP4_GROUPED_ITERS; it++) {
+            const unsigned int b = block_lane + 8u * it;
+            if (b < n_blocks_in) {
+                // This lane's 2 mxfp4 blocks of the super-block, decoded ONCE.
+                const uint8_t* w_super = row_base + (uint64_t)b * SUPER_MXFP4_BYTES;
+                float scale[2];
+                int32_t w_lo[2][4], w_hi[2][4];
+                #pragma unroll
+                for (unsigned int t = 0; t < 2u; t++) {
+                    const unsigned int b32 = 2u * sub + t;
+                    scale[t] = e8m0_half_to_f32(MXFP4_SCALE(w_super, b32));
+                    uint32_t ws_[4];
+                    mxfp4_load16(MXFP4_NIB(w_super, b32), ws_);
+                    #pragma unroll
+                    for (unsigned int i = 0; i < 4u; i++) {
+                        union { int32_t d; int8_t b[4]; } lo, hi;
+                        #pragma unroll
+                        for (unsigned int j = 0; j < 4u; j++) {
+                            const uint8_t q = (uint8_t)((ws_[i] >> (8u * j)) & 0xFFu);
+                            lo.b[j] = s_lut[q & 0x0F];
+                            hi.b[j] = s_lut[q >> 4];
+                        }
+                        w_lo[t][i] = lo.d;
+                        w_hi[t][i] = hi.d;
+                    }
+                }
+                #pragma unroll
+                for (unsigned int p = 0; p < MXFP4_GROUPED_MAX_PICKS; p++) {
+                    if (p < n_picks && selected[p] == sel_e) {
+                        const int8_t* q8_base = (const int8_t*)(xq_base
+                            + (uint64_t)p * (uint64_t)xq_slot_stride
+                            + (uint64_t)b * BLOCK_Q8_K_BYTES + 4u);
+                        float acc = 0.0f;
+                        #pragma unroll
+                        for (unsigned int t = 0; t < 2u; t++) {
+                            const int8_t* q8 = q8_base + (2u * sub + t) * 32u;
+                            int32_t sumi = 0;
+                            #pragma unroll
+                            for (unsigned int i = 0; i < 4u; i++) {
+                                sumi = sudot4_par(w_lo[t][i], load_dword_i8_par(q8 + 4u * i), sumi);
+                                sumi = sudot4_par(w_hi[t][i], load_dword_i8_par(q8 + 16u + 4u * i), sumi);
+                            }
+                            acc += scale[t] * (float)sumi;
+                        }
+                        inner[p][it] = acc;
+                    }
+                }
+            }
+        }
+    }
+
+    // The per-row kernel's chain, per token.
+    float acc = 0.0f;
+    unsigned int s = 0;
+    unsigned int tok = 0;
+    #pragma unroll
+    for (unsigned int p = 0; p < MXFP4_GROUPED_MAX_PICKS; p++) {
+        if (p < n_picks) {
+            if (remap[selected[p]] < 0) {
+                #pragma unroll
+                for (unsigned int it = 0; it < MXFP4_GROUPED_ITERS; it++) {
+                    const unsigned int b = block_lane + 8u * it;
+                    if (b < n_blocks_in) {
+                        const float yd = *(const float*)(xq_base
+                            + (uint64_t)p * (uint64_t)xq_slot_stride
+                            + (uint64_t)b * BLOCK_Q8_K_BYTES);
+                        acc += yd * inner[p][it];
+                    }
+                }
+            }
+            if (++s == n_used) {
+                acc = warp_sum_f32_par(acc);
+                if (lane == 0) out[(uint64_t)tok * (uint64_t)n_rows + (uint64_t)row] = acc;
+                acc = 0.0f;
+                s = 0;
+                tok++;
+            }
+        }
+    }
+}

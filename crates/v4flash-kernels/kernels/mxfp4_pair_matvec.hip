@@ -562,3 +562,221 @@ extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_kwide(
         }
     }
 }
+
+// =============================================================================
+// Drafter (DSpark) block gate+up, GROUPED BY EXPERT (`V41_MTP_MOE_GROUPED`).
+//
+// The drafter drafts a block of n_tok = 5 tokens x n_used = 3 picks in one pass.
+// Row by row, `_batch_hetsplit` reads 15 experts' gate+up per layer, but the
+// block's rows pick only ~7.6 DISTINCT experts (MEASURED, V41_MTP_EXPERT_STATS,
+// 600 production drafts: L0 9.1 / L1 7.6 / L2 6.2 of 15), so half the bytes are
+// re-reads of an expert another row already streamed. Here one work-group
+// column (blockIdx.y) owns one DISTINCT resident expert and walks its members.
+//
+// BIT-IDENTICAL per (pick, row) to `mxfp4_pair_matvec_fused_swiglu_batch_hetsplit`
+// (mode 0, cap >= n_used) BY CONSTRUCTION, not by tolerance: one warp per row
+// and the same lane split (block_lane = lane>>1 strides super-blocks by 16,
+// half = lane&1 owns 4 mxfp4 blocks); per member the same sudot4 chain, the
+// same per-block `acc += scale * sumi` in t order, the same `g += yd * acc` in
+// super-block order, the same warp_sum tree and the same clamp/SwiGLU/weight
+// epilogue. What changes is only WHERE the weights come from: each lane decodes
+// its 2 x 4 blocks ONCE per super-block (one DRAM read, one LUT decode) and
+// feeds every member from registers, so members are an inner loop over
+// independent accumulators -- reordering members never reorders a sum.
+//
+// Picks: p = token * n_used + slot (the drafter's [B, TOPK] d_selected/d_ew).
+// A pick is ours iff remap[sel] < 0, weights at expert -(remap[sel]) - 1: the
+// hetsplit mode-0 rule when no pick can be dGPU-taken (cap >= n_used). Others
+// get mid = 0 (work-group column 0 writes them), as the per-row kernel does.
+// Grid (n_rows / 8, n_picks) x 256: columns past the distinct count exit at once.
+// Dynamic LDS = member_slots x n_blocks x 292 (each member's Q8_K row, staged
+// like `MXFP4_PAIR_STAGE`); a group with more members than member_slots takes
+// several passes (cannot happen when a token's picks are distinct and
+// member_slots >= n_tok, which the launcher arranges).
+// =============================================================================
+#ifndef MXFP4_GROUPED_MAX_MEMBERS
+#define MXFP4_GROUPED_MAX_MEMBERS 8u
+#endif
+
+// The y-th DISTINCT resident expert of picks [0, n_picks) in first-pick order:
+// its first pick, or -1 when there are <= y of them. Reads only kernel
+// arguments, so it is uniform per work-group and may precede a barrier.
+__device__ __forceinline__ int grouped_leader_pair(
+        const int* selected, const int* remap, unsigned int n_picks, unsigned int y) {
+    unsigned int rank = 0;
+    for (unsigned int p = 0; p < n_picks; p++) {
+        const int sp = selected[p];
+        if (remap[sp] >= 0) continue;
+        bool first = true;
+        for (unsigned int q = 0; q < p; q++) {
+            if (selected[q] == sp) { first = false; break; }
+        }
+        if (!first) continue;
+        if (rank == y) return (int)p;
+        rank++;
+    }
+    return -1;
+}
+
+extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_grouped(
+        float        * __restrict__ mid,           // [n_picks, n_rows]
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,           // [n_tok, n_blocks * 292]
+        const float  * __restrict__ expert_w,      // [n_picks]
+        const int    * __restrict__ selected,      // [n_picks]
+        const int    * __restrict__ remap,         // [n_expert]
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks,
+        unsigned int    n_used,
+        unsigned int    n_picks,
+        unsigned int    member_slots) {            // <= MXFP4_GROUPED_MAX_MEMBERS
+    // [member_slots][n_blocks * 292]; declared as dwords so the dword staging and
+    // the 4-byte q8 / yd reads are aligned by type (292 and 32 are multiples of 4).
+    extern __shared__ uint32_t s_xq_grp_dw[];
+    uint8_t* s_xq_grp = (uint8_t*)s_xq_grp_dw;
+    __shared__ int8_t s_lut[16];
+    const unsigned int tid  = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int row  = blockIdx.x * (blockDim.x >> 5u) + (tid >> 5u);
+    const bool row_valid = row < n_rows;
+
+    if (blockIdx.y == 0u && row_valid && lane == 0u) {
+        for (unsigned int p = 0; p < n_picks; p++) {
+            if (remap[selected[p]] >= 0) mid[(uint64_t)p * (uint64_t)n_rows + (uint64_t)row] = 0.0f;
+        }
+    }
+    const int leader = grouped_leader_pair(selected, remap, n_picks, blockIdx.y);
+    if (leader < 0) return;
+    const int sel_e = selected[leader];
+    const int e     = -remap[sel_e] - 1;
+    if (tid < 16u) s_lut[tid] = kvalues_mxfp4_pair[tid];
+
+    const unsigned int xq_bytes   = n_blocks * BLOCK_Q8_K_BYTES;
+    const unsigned int block_lane = lane >> 1u;
+    const unsigned int half       = lane & 1u;
+    const uint8_t* gate_row = gate_w_base + (uint64_t)e * (uint64_t)gate_bpe
+                            + (uint64_t)row * (uint64_t)n_blocks * SUPER_MXFP4_BYTES;
+    const uint8_t* up_row   = up_w_base   + (uint64_t)e * (uint64_t)up_bpe
+                            + (uint64_t)row * (uint64_t)n_blocks * SUPER_MXFP4_BYTES;
+
+    unsigned int q_next = (unsigned int)leader;
+    for (;;) {
+        // This pass's members (uniform): the next <= member_slots picks of sel_e.
+        int mp[MXFP4_GROUPED_MAX_MEMBERS];
+        #pragma unroll
+        for (unsigned int mi = 0; mi < MXFP4_GROUPED_MAX_MEMBERS; mi++) {
+            while (q_next < n_picks && selected[q_next] != sel_e) q_next++;
+            const bool take = (mi < member_slots) && (q_next < n_picks);
+            mp[mi] = take ? (int)q_next : -1;
+            if (take) q_next++;
+        }
+        if (mp[0] < 0) break;
+
+        // Stage each member's token row (dwords: 292 % 4 == 0).
+        #pragma unroll
+        for (unsigned int mi = 0; mi < MXFP4_GROUPED_MAX_MEMBERS; mi++) {
+            if (mp[mi] >= 0) {
+                const uint32_t* src = (const uint32_t*)(
+                    xq + (uint64_t)((unsigned int)mp[mi] / n_used) * (uint64_t)xq_bytes);
+                uint32_t* dst = s_xq_grp_dw + mi * (xq_bytes >> 2u);
+                for (unsigned int i = tid; i < (xq_bytes >> 2u); i += blockDim.x) dst[i] = src[i];
+            }
+        }
+        __syncthreads();
+
+        if (row_valid) {
+            float g_sum[MXFP4_GROUPED_MAX_MEMBERS];
+            float u_sum[MXFP4_GROUPED_MAX_MEMBERS];
+            #pragma unroll
+            for (unsigned int mi = 0; mi < MXFP4_GROUPED_MAX_MEMBERS; mi++) {
+                g_sum[mi] = 0.0f;
+                u_sum[mi] = 0.0f;
+            }
+            for (unsigned int b = block_lane; b < n_blocks; b += 16u) {
+                const uint8_t* gs = gate_row + (uint64_t)b * SUPER_MXFP4_BYTES;
+                const uint8_t* us = up_row   + (uint64_t)b * SUPER_MXFP4_BYTES;
+                // = `dot_super_half_mxfp4`'s `acc`, per member and matrix.
+                float g_acc[MXFP4_GROUPED_MAX_MEMBERS];
+                float u_acc[MXFP4_GROUPED_MAX_MEMBERS];
+                #pragma unroll
+                for (unsigned int mi = 0; mi < MXFP4_GROUPED_MAX_MEMBERS; mi++) {
+                    g_acc[mi] = 0.0f;
+                    u_acc[mi] = 0.0f;
+                }
+                #pragma unroll
+                for (unsigned int t = 0; t < 4u; t++) {
+                    const unsigned int b32 = 4u * half + t;          // 0..7
+                    const float g_scale = e8m0_half_to_f32_pair(MXFP4_SCALE(gs, b32));
+                    const float u_scale = e8m0_half_to_f32_pair(MXFP4_SCALE(us, b32));
+                    uint32_t gw_[4], uw_[4];
+                    mxfp4_load16(MXFP4_NIB(gs, b32), gw_);
+                    mxfp4_load16(MXFP4_NIB(us, b32), uw_);
+                    int32_t g_lo[4], g_hi[4], u_lo[4], u_hi[4];
+                    #pragma unroll
+                    for (unsigned int i = 0; i < 4u; i++) {
+                        union { int32_t d; int8_t b[4]; } glo, ghi, ulo, uhi;
+                        #pragma unroll
+                        for (unsigned int j = 0; j < 4u; j++) {
+                            const uint8_t gq = (uint8_t)((gw_[i] >> (8u * j)) & 0xFFu);
+                            const uint8_t uq = (uint8_t)((uw_[i] >> (8u * j)) & 0xFFu);
+                            glo.b[j] = s_lut[gq & 0x0F];
+                            ghi.b[j] = s_lut[gq >> 4];
+                            ulo.b[j] = s_lut[uq & 0x0F];
+                            uhi.b[j] = s_lut[uq >> 4];
+                        }
+                        g_lo[i] = glo.d; g_hi[i] = ghi.d;
+                        u_lo[i] = ulo.d; u_hi[i] = uhi.d;
+                    }
+                    #pragma unroll
+                    for (unsigned int mi = 0; mi < MXFP4_GROUPED_MAX_MEMBERS; mi++) {
+                        if (mp[mi] >= 0) {
+                            const int8_t* q8 = (const int8_t*)(s_xq_grp + mi * xq_bytes
+                                                 + b * BLOCK_Q8_K_BYTES + 4u) + b32 * 32u;
+                            int32_t g_sumi = 0;
+                            int32_t u_sumi = 0;
+                            #pragma unroll
+                            for (unsigned int i = 0; i < 4u; i++) {
+                                g_sumi = sudot4_pair(g_lo[i], load_dword_i8_pair(q8 + 4u * i), g_sumi);
+                                g_sumi = sudot4_pair(g_hi[i], load_dword_i8_pair(q8 + 16u + 4u * i), g_sumi);
+                                u_sumi = sudot4_pair(u_lo[i], load_dword_i8_pair(q8 + 4u * i), u_sumi);
+                                u_sumi = sudot4_pair(u_hi[i], load_dword_i8_pair(q8 + 16u + 4u * i), u_sumi);
+                            }
+                            g_acc[mi] += g_scale * (float)g_sumi;
+                            u_acc[mi] += u_scale * (float)u_sumi;
+                        }
+                    }
+                }
+                #pragma unroll
+                for (unsigned int mi = 0; mi < MXFP4_GROUPED_MAX_MEMBERS; mi++) {
+                    if (mp[mi] >= 0) {
+                        const float yd = *(const float*)(s_xq_grp + mi * xq_bytes + b * BLOCK_Q8_K_BYTES);
+                        g_sum[mi] += yd * g_acc[mi];
+                        u_sum[mi] += yd * u_acc[mi];
+                    }
+                }
+            }
+            #pragma unroll
+            for (unsigned int mi = 0; mi < MXFP4_GROUPED_MAX_MEMBERS; mi++) {
+                if (mp[mi] >= 0) {
+                    float g = warp_sum_f32_pair(g_sum[mi]);
+                    float u = warp_sum_f32_pair(u_sum[mi]);
+                    if (lane == 0) {
+                        if (clamp > 1.0e-6f) {
+                            if (g > clamp)  g = clamp;
+                            if (u > clamp)  u = clamp;
+                            if (u < -clamp) u = -clamp;
+                        }
+                        const float sig = 1.0f / (1.0f + expf(-g));
+                        mid[(uint64_t)mp[mi] * (uint64_t)n_rows + (uint64_t)row] =
+                            g * sig * u * expert_w[mp[mi]];
+                    }
+                }
+            }
+        }
+        __syncthreads();   // before the next pass restages s_xq_grp
+    }
+}

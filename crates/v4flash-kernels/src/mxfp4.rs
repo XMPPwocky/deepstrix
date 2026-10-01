@@ -216,6 +216,75 @@ impl Mxfp4Matvec {
         ])
     }
 
+    /// Drafter block down projection GROUPED BY EXPERT (`mxfp4_matvec_par_grouped`,
+    /// `V41_MTP_MOE_GROUPED`; gate+up twin
+    /// [`crate::mxfp4_pair::Mxfp4PairMatvec::launch_fused_swiglu_grouped`]): all
+    /// `n_tok` tokens in ONE launch, each DISTINCT resident expert's rows read
+    /// once. `xq_base` is pick-major midq (pick `p = token * n_used + slot` at
+    /// `p * xq_slot_stride`), `out` is `[n_tok, n_rows]`.
+    ///
+    /// BIT-IDENTICAL per (token, row) to `n_tok` launches of
+    /// [`Self::launch_batched_hetsplit`] with mode 0 and `dgpu_cap >= n_used`
+    /// (ours iff `remap[sel] < 0`): the kernel keeps each lane's per-pick dot
+    /// and replays the per-row kernel's in-lane slot-order sum before the warp
+    /// reduction, which a by-expert partials + reduce cannot. Graph-capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_grouped(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,
+        selected: &DeviceBuffer<i32>,
+        remap: &DeviceBuffer<i32>,
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+        n_tok: u32,
+        n_used: u32,
+    ) -> eyre::Result<()> {
+        let n_picks = n_tok * n_used;
+        let max_picks = crate::mxfp4_pair::MXFP4_GROUPED_MAX_PICKS;
+        if n_tok == 0 || n_used == 0 || n_picks > max_picks {
+            return Err(eyre!("mxfp4 grouped down: n_tok={n_tok} x n_used={n_used} outside 1..={max_picks} picks"));
+        }
+        // Two super-block iterations per lane (block_lane < 8), as compiled.
+        if n_blocks_in == 0 || n_blocks_in > 16 {
+            return Err(eyre!("mxfp4 grouped down: n_blocks_in={n_blocks_in} outside 1..=16"));
+        }
+        if n_rows % 8 != 0 {
+            return Err(eyre!("mxfp4 grouped down: n_rows={n_rows} not %8"));
+        }
+        if out.len() < (n_tok * n_rows) as usize {
+            return Err(eyre!("mxfp4 grouped down out: len {} < n_tok * n_rows", out.len()));
+        }
+        if (xq_slot_stride as usize) < n_blocks_in as usize * crate::q8_k::BLOCK_Q8_K_BYTES
+            || xq_base.len() < n_picks as usize * xq_slot_stride as usize
+        {
+            return Err(eyre!(
+                "mxfp4 grouped down xq: {} bytes, stride {xq_slot_stride}, for {n_picks} picks of {n_blocks_in} blocks",
+                xq_base.len()
+            ));
+        }
+        if (selected.len() as u32) < n_picks {
+            return Err(eyre!("mxfp4 grouped down: selected len {} < n_picks {n_picks}", selected.len()));
+        }
+        if remap.len() < 256 {
+            return Err(eyre!("mxfp4 grouped down: remap len {} < 256", remap.len()));
+        }
+        let function = self.module.get_function("mxfp4_matvec_par_grouped")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), w_base.raw(), xq_base.raw(), selected.raw(), remap.raw(),
+            dbpe, xq_slot_stride, n_used, n_picks, n_rows, n_blocks_in
+        ])
+    }
+
     /// Prefill by-expert kwide2 (production analog of
     /// `Q2KAccumulateMatvec::launch_by_expert_kwide2`): grid
     /// `(n_rows/16, n_work_items)`, 2 rows per warp, members in halves of
