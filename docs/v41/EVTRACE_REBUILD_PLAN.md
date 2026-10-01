@@ -53,7 +53,7 @@ thread serializes into the ring. A stall or a dump on Tier B cannot drop a
 
 **Ring.** Serialized records in sealed, record-aligned blocks (64 KB,
 `Arc<[u8]>` once full) in a deque bounded by bytes. Sizes are stated in
-seconds: hub 96 MB ≈ 40-60 s, box 2 64 MB ≈ 2 min (box 2's rate is ~0.5 MB/s,
+seconds: 128 MB on both boxes (owner, 10-01) ≈ 50-85 s on the hub, ~4 min on box 2 (box 2's rate is ~0.5 MB/s,
 estimate, measured in P1); knobs `V41_EVTRACE_RING_MB` (static), 0 = Tier B
 off.
 
@@ -334,7 +334,7 @@ deploy, as today).
 - **Critical path.** Net change on the scheduler thread: - the synchronous
   harvest (~0.4 ms) + coarse spans (<= 30 us) + fine spans (~40-50 us) + pool
   handoff (~us). Measured per step in P2/P3.
-- **Memory.** Hub ring 96 MB (+ up to one cloned ring while a dump writes) +
+- **Memory.** Hub ring 128 MB (+ up to one cloned ring while a dump writes) +
   6 buffers per device (events only) on ~3-5 GB free; box-2 dumps in tmpfs
   capped at 256 MB.
 - **Disk.** Tier A unchanged; hub dumps to its disk; box-2 dumps to tmpfs,
@@ -387,10 +387,9 @@ deploy, as today).
 
 ## 5. Owner decisions
 
-1. Ring sizes: hub 96 MB (~40-60 s), box 2 64 MB (~2 min).
-2. Tier B on in production (recommended: device data reuses the profile already
-   on, and the critical path gets cheaper) or opt-in.
-3. `tracing-subscriber` as a dependency of `deepstrix-expertd` (box 2's first
-   subscriber, `fmt` at `warn`).
-4. Box-2 device records default off (yes / no).
-5. P5 auto-dump wanted?
+1. Ring sizes: **128 MB on both boxes** (owner, 2026-10-01).
+2. `tracing-subscriber` as a dependency of `deepstrix-expertd`: **approved**
+   (owner, 2026-10-01).
+3. Open, defaults until decided: Tier B ON in production (device data reuses
+   the profile already on; the critical path gets cheaper); box-2 device records
+   OFF by default; P5 auto-dump after P4.
