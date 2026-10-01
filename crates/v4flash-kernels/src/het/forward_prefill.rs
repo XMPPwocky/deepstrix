@@ -214,11 +214,26 @@ fn prefill_hot_active(
 /// Kernels index by `b`, not by the allocation size, so an oversized
 /// batch would silently overrun the B-scaled buffers — refuse it up
 /// front.
-fn check_lane_cuts(who: &str, slots: &[u32], cuts: &[usize]) -> eyre::Result<()> {
-    // A stream's rows (DSpark: next token + drafts) stay in ONE lane: row `j`
-    // of a stream gets its tables from its offset in the lane's slot list
-    // (`KvArena::tables`), and the compressor state of a group written by one
-    // lane is not ordered before the other lane's pool (plan 3.5).
+/// Rows per lane of a step's contiguous split: the first `b % n` lanes take
+/// one extra row. The ONE definition -- the lane drivers, and the head sources
+/// and capture sizes in `multistream::decode_rows`, must agree on it: a head
+/// reading a different split reads a stale row, silently.
+pub fn lane_rows(b: usize, n: usize) -> Vec<usize> {
+    (0..n).map(|i| b / n + usize::from(i < b % n)).collect()
+}
+
+fn check_lane_cuts(who: &str, slots: &[u32], cuts: &[usize], ordered: bool) -> eyre::Result<()> {
+    // A stream's rows (DSpark: next token + drafts) stay in ONE lane unless the
+    // driver ORDERS the cut (`ordered`: `forward_step_arena_ready_first`, whose
+    // tables are one `KvArena::tables` call split by row range, and whose later
+    // lane enters each layer's chain -- every KV / compressor / index write of
+    // that layer, all on `de.compute` -- only after the earlier lane has).
+    // Otherwise row `j` would restart at the stream's pre-step position and the
+    // compressor state of a group written by one lane would not be ordered
+    // before the other lane's pool (plan 3.5).
+    if ordered {
+        return Ok(());
+    }
     for &c in cuts {
         if c > 0 && c < slots.len() && slots[c - 1] == slots[c] {
             return Err(eyre!("{who}: lane cut at row {c} splits slot {}'s rows", slots[c]));
@@ -2992,7 +3007,7 @@ impl HeterogeneousEngine {
         }
         let b_a = b.div_ceil(2);
         let b_b = b - b_a;
-        check_lane_cuts("forward_step_arena_pipelined", slots, &[b_a])?;
+        check_lane_cuts("forward_step_arena_pipelined", slots, &[b_a], false)?;
         check_scratch_rows("forward_step_arena_pipelined", b_a, bd_a, bi_a, sd, si)?;
         check_scratch_rows("forward_step_arena_pipelined", b_b, bd_b, bi_b, sd, si)?;
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
@@ -3172,10 +3187,10 @@ impl HeterogeneousEngine {
         let mut offs: Vec<usize> = Vec::with_capacity(n + 1);
         offs.push(0);
         for i in 0..n {
-            let sz = b / n + usize::from(i < b % n);
+            let sz = lane_rows(b, n)[i];
             offs.push(offs[i] + sz);
         }
-        check_lane_cuts("forward_step_arena_lanes", slots, &offs)?;
+        check_lane_cuts("forward_step_arena_lanes", slots, &offs, false)?;
         for (i, (bd, bi, _)) in lanes.iter().enumerate() {
             let bl = offs[i + 1] - offs[i];
             check_scratch_rows("forward_step_arena_lanes", bl, bd, bi, sd, si)?;
@@ -3314,10 +3329,10 @@ impl HeterogeneousEngine {
         let mut offs: Vec<usize> = Vec::with_capacity(n + 1);
         offs.push(0);
         for i in 0..n {
-            let sz = b / n + usize::from(i < b % n);
+            let sz = lane_rows(b, n)[i];
             offs.push(offs[i] + sz);
         }
-        check_lane_cuts("forward_step_arena_ready_first", slots, &offs)?;
+        check_lane_cuts("forward_step_arena_ready_first", slots, &offs, true)?;
         for (i, (bd, bi, _)) in lanes.iter().enumerate() {
             let bl = offs[i + 1] - offs[i];
             check_scratch_rows("forward_step_arena_ready_first", bl, bd, bi, sd, si)?;
@@ -3326,10 +3341,18 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         arena.state.restore_compressor_lending();
         arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
+        // ONE tables call for the step, split by row range: a lane that cuts
+        // through a stream (an ordered DSpark verify) continues its positions
+        // instead of restarting at the stream's pre-step state; for lanes that
+        // split no stream it equals a per-lane call (`RowTables::rows`).
+        let all_tables = arena.tables(slots)?;
+        // Lanes `i - 1` and `i` share a stream at the cut: lane `i` may enter a
+        // layer's chain only after lane `i - 1` has (see `Ph::Chain`).
+        let ordered_dep: Vec<bool> = (0..n).map(|i| i > 0 && slots[offs[i] - 1] == slots[offs[i]]).collect();
         let mut tables: Vec<RowTables> = Vec::with_capacity(n);
         for (i, (bd, _, dev)) in lanes.iter_mut().enumerate() {
             let (lo, hi) = (offs[i], offs[i + 1]);
-            let t = arena.tables(&slots[lo..hi])?;
+            let t = all_tables.rows(lo, hi);
             dev.upload(&t, &self.dgpu.compute)?;
             for (k, hc) in input_hcs[lo..hi].iter().enumerate() {
                 let mut slot = bd.residual.slice_view_mut(k * HC_DIM as usize, HC_DIM as usize);
@@ -3399,11 +3422,26 @@ impl HeterogeneousEngine {
                 std::mem::swap(&mut bd.residual, &mut bd.residual_next);
             }};
         }
+        // `Chain(l)`: posted layer `l - 1`, not yet entered layer `l`. Only the
+        // later lane of an ORDERED cut ever waits here: it may not enqueue layer
+        // `l`'s chain before the lane holding the earlier rows of its stream has,
+        // because that chain writes the KV / compressor state / index keys it
+        // reads, and both run on `de.compute`, so stream order is the
+        // dependency. A lane goes to `Route(l)` only once its chain is enqueued
+        // (`selected_ready` still holds the previous step's record until then).
         #[derive(Clone, Copy, PartialEq)]
-        enum Ph { Route(usize), Post(usize), Done }
+        enum Ph { Chain(usize), Route(usize), Post(usize), Done }
+        let unordered = READY_FIRST_TEST_UNORDERED.load(std::sync::atomic::Ordering::Relaxed);
+        let hold_lane0 = READY_FIRST_TEST_HOLD_LANE0.load(std::sync::atomic::Ordering::Relaxed) && n > 1;
+        // Layers whose chain lane `i` has enqueued / that it has posted.
+        let mut entered: Vec<usize> = vec![0; n];
+        let mut posted: Vec<usize> = vec![0; n];
+        let mut wait_since: Vec<Option<std::time::Instant>> = vec![None; n];
+        let may_enter = |entered: &[usize], i: usize, l: usize| !ordered_dep[i] || unordered || entered[i - 1] > l;
         let mut carry: Vec<Option<PreMoeCarry>> = Vec::with_capacity(n);
         for i in 0..n {
             carry.push(Some(chain!(i, 0)));
+            entered[i] = 1;
         }
         let mut ph: Vec<Ph> = vec![Ph::Route(0); n];
         let mut spins: u64 = 0;
@@ -3411,6 +3449,20 @@ impl HeterogeneousEngine {
             let mut progressed = false;
             for i in 0..n {
                 match ph[i] {
+                    Ph::Chain(l) => {
+                        if may_enter(&entered, i, l) {
+                            if let Some(t0) = wait_since[i].take() {
+                                READY_FIRST_CHAIN_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                READY_FIRST_CHAIN_WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            carry[i] = Some(chain!(i, l));
+                            entered[i] = l + 1;
+                            ph[i] = Ph::Route(l);
+                            progressed = true;
+                        } else if wait_since[i].is_none() {
+                            wait_since[i] = Some(std::time::Instant::now());
+                        }
+                    }
                     Ph::Route(l) => {
                         let ready = self.sync_events_lane(i).layers[l].selected_ready.query().unwrap_or(true);
                         if ready {
@@ -3431,11 +3483,20 @@ impl HeterogeneousEngine {
                                 }
                             },
                         };
+                        // TEST: hold lane 0 until lane 1 has posted this layer.
+                        let ready = ready && !(hold_lane0 && i == 0 && posted[1] <= l);
                         if ready {
                             post!(i, l);
+                            posted[i] = l + 1;
                             if l + 1 < n_layer {
-                                carry[i] = Some(chain!(i, l + 1));
-                                ph[i] = Ph::Route(l + 1);
+                                if may_enter(&entered, i, l + 1) {
+                                    carry[i] = Some(chain!(i, l + 1));
+                                    entered[i] = l + 2;
+                                    ph[i] = Ph::Route(l + 1);
+                                } else {
+                                    wait_since[i] = Some(std::time::Instant::now());
+                                    ph[i] = Ph::Chain(l + 1);
+                                }
                             } else {
                                 ph[i] = Ph::Done;
                             }
@@ -10174,6 +10235,27 @@ pub static LH_WORK_ITEMS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub static LH_SEL_D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Idle polls of the ready-first lane driver (nothing ready anywhere). Diagnostic only.
 pub static READY_FIRST_SPINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Ordered lane cut (`forward_step_arena_ready_first`): times a lane had to
+/// wait in `Chain(l)` for the lane before it to enter layer `l`, and the wait
+/// in us. Drained per step by the caller (`take_chain_waits`).
+pub static READY_FIRST_CHAIN_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static READY_FIRST_CHAIN_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// TEST ONLY (G5g): hold lane 0's `Post(l)` until lane 1 has posted `l`, so the
+/// later lane reaches layer `l + 1` first -- the overtaking the ordering exists
+/// for, made deterministic.
+#[doc(hidden)]
+pub static READY_FIRST_TEST_HOLD_LANE0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// TEST ONLY (G5g negative control): skip the ordering of an ordered cut.
+#[doc(hidden)]
+pub static READY_FIRST_TEST_UNORDERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `(waits, wait_us)` of the ordered-cut `Chain` phase since the last call.
+pub fn take_chain_waits() -> (u64, u64) {
+    (
+        READY_FIRST_CHAIN_WAITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        READY_FIRST_CHAIN_WAIT_US.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
 pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Box-2 miss substitution (`het::b2_mirror`): the weights readback, planning,
 /// and the picks/weights write-back, per lane-layer.

@@ -78,6 +78,8 @@ pub static HUB_STEP: Kind = Kind {
     fields: &[
         // identity + wall
         "t_start", "t_end", "step", "rows", "live", "lanes", "fwd_ms", "fwd_all_ms", "engram_ms", "sample_ms", "step_ms", "profiled",
+        // ordered two-lane verify (`forward_step_arena_ready_first` `Ph::Chain`)
+        "rf_chain_waits", "rf_chain_wait_us",
         // box-2 leg, summed over the step's requests (ms / counts)
         "remote_wait_ms", "remote_rtt_ms", "remote_srv_ms", "b2_page_ms", "b2_service_ms", "b2_misses", "b2_paged_replies",
         // hop split (remote_experts::take_hop_stats)

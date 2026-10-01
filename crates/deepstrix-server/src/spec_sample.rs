@@ -803,7 +803,7 @@ mod tests {
                     conf[j] = (mx - r.iter().sum::<f32>() / r.len() as f32) * 2.0 - 2.0;
                     before = d.token;
                 }
-                let kk = crate::ms_dspark::choose_k_stopping(&conf, 5, &STOPPING_COST);
+                let kk = crate::ms_dspark::choose_k_stopping(&conf, 5, &*STOPPING_COST);
                 drafts.truncate(kk);
             }
             let mut rows = vec![toy.p(prev)];

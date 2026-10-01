@@ -20,7 +20,7 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre};
 use tokio::sync::mpsc;
 use v4flash_kernels::config::{ENGRAM_IN, HC_DIM, N_VOCAB};
-use v4flash_kernels::het::forward_prefill::{LazyEngramRows, PrefillJob};
+use v4flash_kernels::het::forward_prefill::{lane_rows, LazyEngramRows, PrefillJob};
 use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev, ARENA_ROWS_PER_STREAM};
 use v4flash_kernels::het::scratch::{HEAD_BATCH_MAX, HEAD_CAND_BAND, HEAD_CAND_CAP, HEAD_CAND_STRIDE};
 use v4flash_kernels::het::SampleMode;
@@ -374,6 +374,37 @@ fn head_cands_mode() -> HeadCands {
     }
     *g = Some((Instant::now(), m));
     m
+}
+
+/// `V41_MS_SPEC_LANES` (default on; `0` off), overridden at run time by the
+/// contents of `V41_MS_SPEC_LANES_FILE` (re-read every 2 s), like
+/// `head_cands_mode`.
+fn spec_lanes_on() -> bool {
+    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_SPEC_LANES").as_deref() != Ok("0"));
+    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_MS_SPEC_LANES_FILE").ok());
+    static CACHE: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+    let Some(path) = FILE.as_ref() else { return *ENV };
+    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((t, on)) = *g {
+        if t.elapsed() < std::time::Duration::from_secs(2) {
+            return on;
+        }
+    }
+    let on = std::fs::read_to_string(path).map(|s| s.trim() != "0").unwrap_or(*ENV);
+    if g.is_some_and(|(_, old)| old != on) {
+        tracing::info!(on, "multistream: spec two-lane verify changed");
+    }
+    *g = Some((Instant::now(), on));
+    on
+}
+
+/// The row count from which a speculating lone stream's verify runs two
+/// lanes (an ordered cut, `forward_step_arena_ready_first`), or `None` when it
+/// cannot: spec lanes off, lanes off, or not the ready-first driver
+/// (`V41_MS_STAGGER=2`). Also what the K policy prices a block's rows by.
+pub(crate) fn spec_two_lane_from() -> Option<usize> {
+    let ready_first = std::env::var("V41_MS_STAGGER").as_deref() == Ok("2");
+    (ready_first && ms_pipeline() && spec_lanes_on()).then(|| env_usize("V41_MS_PIPELINE_MIN_ROWS", 6).max(2))
 }
 
 /// `logits_nucleus_cands` params of a row sampled under `mode`: `[inv_t, lo,
@@ -1278,6 +1309,10 @@ impl Sched {
         let mut draft_q: Vec<Option<Vec<Vec<(i32, f64)>>>> = vec![None; self.streams.len()];
         // The lone stream's confidence logits (calibration, `MsDspark::record`).
         let mut draft_conf = [0f32; v4flash_kernels::het::mtp::MTP_BLOCK];
+        // The lane regime, ONE snapshot per step (the run-time file can change
+        // between reads): the K decision prices blocks by it and the driver
+        // choice below uses it (docs/v41/DSPARK_SINGLE_STREAM_PERF.md section 2).
+        let two_from = spec_two_lane_from();
         if self.streams.len() == 1 {
             if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
                 let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
@@ -1296,7 +1331,7 @@ impl Sched {
                         Ok(Some(d)) => {
                             // Sampled drafts need the stopping rule; point-mass
                             // tests allow the global search (plan 2.4).
-                            let k = dsp.k_for(&d.conf, cap, d.q.is_some());
+                            let k = dsp.k_for(&d.conf, cap, d.q.is_some(), two_from);
                             draft_conf = d.conf;
                             drafts[0] = d.ids[..k].to_vec();
                             draft_q[0] = d.q.map(|mut q| { q.truncate(k); q });
@@ -1394,9 +1429,14 @@ impl Sched {
         // MEASURED 2026-09-22 with partitioned paging: at 2 rows the two-lane
         // step's doubled dGPU chain (+55 ms) exceeds the box-2 wait it hides
         // (~30 ms), at 4 it is a wash; default to lanes from 6 rows.
-        // A speculating stream's rows stay in ONE lane (plan 3.5; the drivers
-        // refuse a cut through them), and only a lone stream speculates.
-        let pipelined = !spec && b >= env_usize("V41_MS_PIPELINE_MIN_ROWS", 6) && ms_pipeline();
+        // A speculating stream (only a lone stream speculates) runs two lanes
+        // only as an ORDERED cut through its rows: the ready-first driver, whose
+        // later lane enters each layer after the earlier one (`spec_two_lane_from`,
+        // docs/v41/DSPARK_SINGLE_STREAM_PERF.md); the other drivers refuse it.
+        // One lane takes turns between the dGPU attention and the MoE legs; two
+        // overlap them (09-30: 2->3 rows +19.5 ms on one lane, 3->4 +5.7 on two).
+        let spec_lanes = spec && two_from.is_some_and(|m| b >= m);
+        let pipelined = (!spec && b >= env_usize("V41_MS_PIPELINE_MIN_ROWS", 6) && ms_pipeline()) || spec_lanes;
         // Three lanes (`V41_MS_LANES=3`, DEFAULT 2) from `V41_MS_LANES3_MIN_ROWS`
         // rows (default 6). MEASURED 2026-09-21 at 8 rows, box-1 hot set warm:
         // 2 lanes 272 ms/step (27.2 tok/s), 3 lanes 324 (23.3). The third lane
@@ -1406,7 +1446,7 @@ impl Sched {
         // box-2 compute 94 -> 135 ms, dGPU 91 -> 126, box-1 iGPU 72 -> 93 per
         // step, and box 2 -- the saturated resource -- ends up busier, not
         // idler. Lanes cost bytes; only worth it when the pole has slack.
-        let lanes3 = pipelined && env_usize("V41_MS_LANES", 2) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
+        let lanes3 = pipelined && !spec && env_usize("V41_MS_LANES", 2) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
         // STAGGERED two lanes (`V41_MS_STAGGER=1`, default OFF until A/B'd on real
         // traffic; gated bit-exact by `multistream_step` G5d). The lockstep driver
         // above fuses both lanes into ONE box-2 pass per layer, so box 1 and box 2
@@ -1459,7 +1499,7 @@ impl Sched {
                 engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             }
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
-            let sz = |i: usize| b / 3 + usize::from(i < b % 3);
+            let sz = |i: usize| lane_rows(b, 3)[i];
             head_targets(engine, dgpu_scratch, &[(&*bd_a, sz(0)), (&*bd_b, sz(1)), (&*bd_c, sz(2))], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         } else if stagger2 {
             {
@@ -1473,12 +1513,12 @@ impl Sched {
             }
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             // Same split as the lanes driver: the first lane takes the odd row.
-            let b_a = b.div_ceil(2);
+            let b_a = lane_rows(b, 2)[0];
             head_targets(engine, dgpu_scratch, &[(&*bd_a, b_a), (&*bd_b, b - b_a)], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         } else if pipelined {
             engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
-            let b_a = b.div_ceil(2);
+            let b_a = lane_rows(b, 2)[0];
             head_targets(engine, dgpu_scratch, &[(&*bd_a, b_a), (&*bd_b, b - b_a)], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         } else {
             engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
@@ -1488,13 +1528,16 @@ impl Sched {
         Ok::<_, eyre::Report>(targets)
         })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+        // Ordered two-lane verify: how often / how long the later lane waited
+        // to enter a layer behind the earlier one (`Ph::Chain`).
+        let (chain_waits, chain_wait_us) = v4flash_kernels::het::forward_prefill::take_chain_waits();
         // The drafter's input for every row (lane-local captures, in row order).
         // A failed readback costs the drafts (no ring rows, no next draft), never the step.
         let caps: Option<Vec<Vec<f32>>> = if self.dsp.is_some() {
             let sizes: Vec<usize> = if lanes3 {
-                (0..3).map(|i| b / 3 + usize::from(i < b % 3)).collect()
+                lane_rows(b, 3)
             } else if stagger2 || pipelined {
-                vec![b.div_ceil(2), b - b.div_ceil(2)]
+                lane_rows(b, 2)
             } else {
                 vec![b]
             };
@@ -1790,7 +1833,8 @@ impl Sched {
                 }
             }
             if let Some((k, accepted, emitted)) = spec_out {
-                dsp.record(self.streams[0].slot, &draft_conf, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3);
+                let lanes = if spec_lanes { 2 } else { 1 };
+                dsp.record(self.streams[0].slot, &draft_conf, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3, lanes);
             } else if b == 1 {
                 dsp.note_plain_step(t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -1801,12 +1845,13 @@ impl Sched {
         }
         tracing::info!(rows = b, spec = ?spec_out, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
-            head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff, "ms.step");
+            head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff,
+            chain_waits, chain_wait_us, "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),
                 ("fwd_ms", fwd_only_ms), ("fwd_all_ms", fwd_ms), ("engram_ms", engram_ms), ("sample_ms", sample_ms),
-                ("step_ms", t0.elapsed().as_secs_f64() * 1e3)] {
+                ("step_ms", t0.elapsed().as_secs_f64() * 1e3), ("rf_chain_waits", chain_waits as f64), ("rf_chain_wait_us", chain_wait_us as f64)] {
                 ev.insert(k.into(), v);
             }
             ev.entry("profiled".into()).or_insert(0.0);

@@ -303,7 +303,7 @@ impl CompStore {
 /// the kernel parameters. Every value is PRE-step: the row's stream has
 /// `n_raw` raw rows and `n_comp` comp rows before this row runs; the driver
 /// derives the causal counts (`min(n_raw + 1, SWA_WINDOW)`, `n_comp + fires`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RowTables {
     pub pos_per: Vec<i32>,
     /// Raw window per row BEFORE the append: rows valid and the window start in
@@ -321,7 +321,53 @@ pub struct RowTables {
     pub stores: Vec<StoreTables>,
 }
 
-#[derive(Clone, Debug, Default)]
+impl RowTables {
+    /// The tables of rows `[lo, hi)` as a lane's own: per-row vectors sliced,
+    /// each store's fires kept for the rows in range and re-based to `lo`.
+    /// `tables(slots)` then `rows(lo, hi)` equals `tables(&slots[lo..hi])`
+    /// when no stream has rows on both sides of a cut; when one does (an
+    /// ORDERED two-lane verify, `forward_step_arena_ready_first`), the later
+    /// range keeps the positions the earlier rows advanced it to, which a
+    /// per-lane `tables` call would restart at the stream's pre-step state.
+    pub fn rows(&self, lo: usize, hi: usize) -> RowTables {
+        let sl = |v: &Vec<i32>| v[lo..hi].to_vec();
+        RowTables {
+            pos_per: sl(&self.pos_per),
+            n_raw_per: sl(&self.n_raw_per),
+            n_raw_offset_per: sl(&self.n_raw_offset_per),
+            slot_per: sl(&self.slot_per),
+            n_raw_per_dec: sl(&self.n_raw_per_dec),
+            n_raw_offset_per_dec: sl(&self.n_raw_offset_per_dec),
+            slot_per_dec: sl(&self.slot_per_dec),
+            stores: self.stores.iter().map(|s| s.rows(lo, hi)).collect(),
+        }
+    }
+}
+
+impl StoreTables {
+    fn rows(&self, lo: usize, hi: usize) -> StoreTables {
+        let mut t = StoreTables {
+            n_comp_per: self.n_comp_per[lo..hi].to_vec(),
+            comp_base_per: self.comp_base_per[lo..hi].to_vec(),
+            keys_base_per: self.keys_base_per[lo..hi].to_vec(),
+            state_base_per: self.state_base_per[lo..hi].to_vec(),
+            state_idx_per: self.state_idx_per[lo..hi].to_vec(),
+            ..Default::default()
+        };
+        for (k, &r) in self.fire_rows.iter().enumerate() {
+            let r = r as usize;
+            if (lo..hi).contains(&r) {
+                t.fire_rows.push((r - lo) as i32);
+                t.fire_state_idx.push(self.fire_state_idx[k]);
+                t.fire_dst_row.push(self.fire_dst_row[k]);
+                t.fire_comp_pos.push(self.fire_comp_pos[k]);
+            }
+        }
+        t
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StoreTables {
     /// Comp rows written before this step (the row's own boundary, if it
     /// fires this step, is NOT counted).
@@ -1414,6 +1460,61 @@ mod tests {
     /// row at a time in the same steps (rows before and after the run) and
     /// must get the tables it gets alone.
     #[cfg(feature = "v41")]
+    #[test]
+    fn lane_ranges_of_one_tables_call() {
+        // Three streams at positions straddling ratio-2 parities and the raw
+        // window; slot lists of runs, cut anywhere.
+        let mut ar = host_arena(3, 100_000);
+        for (slot, pos) in [(0u32, 37u32), (1, 200), (2, 129)] {
+            let comp = ar.stores.iter().map(|st| CompRegion {
+                base: 100 + slot * 30_000,
+                cap: 30_000,
+                n_comp: pos / st.ratio,
+                n_index_comp: pos / st.ratio,
+            }).collect();
+            let n_raw = pos.min(SWA_WINDOW);
+            ar.streams[slot as usize] = Some(StreamKv { pos, raw_off: 0, n_raw, raw_off_dec: 0, n_raw_dec: n_raw, comp });
+        }
+        let lists: [&[u32]; 5] = [&[0, 1, 2], &[0, 0, 0, 0, 0, 0], &[1, 1, 1, 1, 1], &[0, 0, 1, 2, 2], &[2, 2, 2, 2, 0]];
+        for slots in lists {
+            let all = ar.tables(slots).unwrap();
+            for cut in 0..=slots.len() {
+                let (a, b) = (all.rows(0, cut), all.rows(cut, slots.len()));
+                // Reassembles exactly: rows in order, every fire in one lane.
+                let mut joined = a.clone();
+                for (k, v) in [
+                    (&mut joined.pos_per, &b.pos_per), (&mut joined.n_raw_per, &b.n_raw_per),
+                    (&mut joined.n_raw_offset_per, &b.n_raw_offset_per), (&mut joined.slot_per, &b.slot_per),
+                    (&mut joined.n_raw_per_dec, &b.n_raw_per_dec), (&mut joined.n_raw_offset_per_dec, &b.n_raw_offset_per_dec),
+                    (&mut joined.slot_per_dec, &b.slot_per_dec),
+                ] {
+                    k.extend_from_slice(v);
+                }
+                for (js, bs) in joined.stores.iter_mut().zip(&b.stores) {
+                    js.n_comp_per.extend_from_slice(&bs.n_comp_per);
+                    js.comp_base_per.extend_from_slice(&bs.comp_base_per);
+                    js.keys_base_per.extend_from_slice(&bs.keys_base_per);
+                    js.state_base_per.extend_from_slice(&bs.state_base_per);
+                    js.state_idx_per.extend_from_slice(&bs.state_idx_per);
+                    js.fire_rows.extend(bs.fire_rows.iter().map(|&r| r + cut as i32));
+                    js.fire_state_idx.extend_from_slice(&bs.fire_state_idx);
+                    js.fire_dst_row.extend_from_slice(&bs.fire_dst_row);
+                    js.fire_comp_pos.extend_from_slice(&bs.fire_comp_pos);
+                }
+                assert_eq!(joined, all, "slots {slots:?} cut {cut}");
+                // A cut between streams: each side equals its own tables call.
+                if cut > 0 && cut < slots.len() && slots[cut - 1] != slots[cut] {
+                    assert_eq!(a, ar.tables(&slots[..cut]).unwrap(), "slots {slots:?} cut {cut} (left)");
+                    assert_eq!(b, ar.tables(&slots[cut..]).unwrap(), "slots {slots:?} cut {cut} (right)");
+                }
+                // A cut through a stream: the right side continues its positions.
+                if cut > 0 && cut < slots.len() && slots[cut - 1] == slots[cut] {
+                    assert_eq!(b.pos_per[0], a.pos_per[cut - 1] + 1, "slots {slots:?} cut {cut}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn multi_row_tables_match_one_row_steps() {
         let mut ar = host_arena(3, 100_000);

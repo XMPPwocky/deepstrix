@@ -130,6 +130,8 @@ struct Stats {
     no_hidden: u64,
     /// Steps a stream sat out drafting (stage-1 back-off).
     skipped: u64,
+    /// Blocks verified as an ordered two-lane cut.
+    two_lane: u64,
 }
 
 pub struct MsDspark {
@@ -142,6 +144,11 @@ pub struct MsDspark {
     /// baseline (fitted from every lone step, not only the rare plain ones).
     plain_ms: f64,
     cost: StepCost,
+    /// The two-lane regime's fit (an ordered verify cut from
+    /// `V41_MS_PIPELINE_MIN_ROWS` rows): observed only from steps that ran
+    /// two lanes, so the step change where the second lane switches on cannot
+    /// bend either line.
+    cost2: StepCost,
     calib: Calib,
     stats: Stats,
     since: Instant,
@@ -156,17 +163,22 @@ impl MsDspark {
             slots.push(SlotDraft { rings, writes: 0, last_ring_pos: None, hidden: None, gain: GAIN0, skip_left: 0, backoff: 0, last_draft_ms: 0.0 });
         }
         let cost = StepCost::from_env();
-        Ok(Self { slots, plain_ms: cost.cost(1), cost, calib: Calib::default(), stats: Stats::default(), since: Instant::now() })
+        let two_from = std::env::var("V41_MS_PIPELINE_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize).max(2);
+        let cost2 = StepCost::from_env_two_lane(two_from);
+        Ok(Self { slots, plain_ms: cost.cost(1), cost, cost2, calib: Calib::default(), stats: Stats::default(), since: Instant::now() })
     }
 
     /// K for the lone stream's drafted block (plan section 6): the stopping
     /// rule for sampled drafts, the global search for point-mass ones (2.4),
-    /// both over the live step cost.
-    pub fn k_for(&self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool) -> usize {
+    /// both over the live step cost of the regime each candidate block would
+    /// run in (`two_from`: the row count from which the verify runs two lanes,
+    /// the same snapshot the step's lane choice uses).
+    pub fn k_for(&self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool, two_from: Option<usize>) -> usize {
+        let cost = Regimes { one: &self.cost, two: &self.cost2, two_from };
         if sampled {
-            choose_k_stopping(conf, cap, &self.cost)
+            choose_k_stopping(conf, cap, &cost)
         } else {
-            choose_k(conf, cap, &self.cost)
+            choose_k(conf, cap, &cost)
         }
     }
 
@@ -362,10 +374,17 @@ impl MsDspark {
 
     /// Account one verified block of `slot` (stage-1 gain, step cost,
     /// calibration, stats) and log a rollup every 50 blocks. `conf` = the
-    /// block's confidence logits.
-    pub fn record(&mut self, slot: u32, conf: &[f32; MTP_BLOCK], k: usize, accepted: usize, emitted: usize, step_ms: f64) {
+    /// block's confidence logits; `lanes` = how many lanes its verify ran on
+    /// (the cost fit it feeds).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(&mut self, slot: u32, conf: &[f32; MTP_BLOCK], k: usize, accepted: usize, emitted: usize, step_ms: f64, lanes: usize) {
         let plain_ms = if self.cost.live { self.cost.cost(1) } else { self.plain_ms };
-        self.cost.observe_step(1 + k, step_ms);
+        if lanes >= 2 {
+            self.cost2.observe_step(1 + k, step_ms);
+            self.stats.two_lane += 1;
+        } else {
+            self.cost.observe_step(1 + k, step_ms);
+        }
         self.calib.observe(conf, k, accepted);
         if self.calib.blocks % CALIB_EVERY == 0 {
             self.calib.log();
@@ -404,6 +423,8 @@ impl MsDspark {
                 skipped_steps = s.skipped,
                 plain_ms = format!("{:.1}", self.plain_ms),
                 cost_ms = format!("{:.1}+{:.1}/row", self.cost.a, self.cost.b),
+                cost2_ms = format!("{:.1}+{:.1}/row", self.cost2.a, self.cost2.b),
+                two_lane_blocks = s.two_lane,
                 draft_est_ms = format!("{:.1}", self.cost.draft_ms()),
                 cost_samples = self.cost.samples,
                 window_s = self.since.elapsed().as_secs(),
@@ -461,6 +482,48 @@ fn env_f64(k: &str, d: f64) -> f64 {
 /// The 2026-09-30..10-01 production p50 ladder (ms of 1, 2, ... rows): the
 /// default PRIOR of `StepCost`.
 const DEFAULT_LADDER: [f64; 8] = [60.0, 81.0, 101.0, 107.0, 125.0, 139.0, 156.0, 172.0];
+
+/// 2026-09-30 production step means by rows (27 h, 543K steps; rows 1-3 one
+/// lane, 4-8 two): the default two-lane prior (`StepCost::from_env_two_lane`
+/// reads rows `>= first_row` only).
+const DEFAULT_LADDER_TWO_LANE: [f64; 8] = [62.4, 83.9, 103.4, 109.1, 127.4, 141.4, 158.6, 176.7];
+
+/// What the K policy prices a block with.
+pub trait CostModel {
+    /// Step time (ms) of `rows` rows of one stream.
+    fn cost(&self, rows: usize) -> f64;
+    /// Draft time (ms).
+    fn draft_ms(&self) -> f64;
+}
+
+impl CostModel for StepCost {
+    fn cost(&self, rows: usize) -> f64 {
+        StepCost::cost(self, rows)
+    }
+    fn draft_ms(&self) -> f64 {
+        StepCost::draft_ms(self)
+    }
+}
+
+/// The one- and two-lane regimes: rows from `two_from` on run as an ordered
+/// two-lane cut and are priced by the two-lane fit.
+pub struct Regimes<'a> {
+    pub one: &'a StepCost,
+    pub two: &'a StepCost,
+    pub two_from: Option<usize>,
+}
+
+impl CostModel for Regimes<'_> {
+    fn cost(&self, rows: usize) -> f64 {
+        match self.two_from {
+            Some(m) if rows >= m => self.two.cost(rows),
+            _ => self.one.cost(rows),
+        }
+    }
+    fn draft_ms(&self) -> f64 {
+        self.one.draft_ms()
+    }
+}
 
 /// `ladder[rows - 1]`, extrapolated linearly past its end.
 fn ladder_cost(ladder: &[f64], rows: usize) -> f64 {
@@ -526,8 +589,15 @@ pub struct StepCost {
 
 impl StepCost {
     pub fn new(ladder: Vec<f64>, draft_ms: f64, live: bool, memory: f64) -> Self {
+        Self::with_first_row(ladder, 1, draft_ms, live, memory)
+    }
+
+    /// `new` with the prior line fitted over rows `first_row..=MTP_BLOCK+1`
+    /// of the ladder only: the two-lane regime never prices fewer rows.
+    pub fn with_first_row(ladder: Vec<f64>, first_row: usize, draft_ms: f64, live: bool, memory: f64) -> Self {
         let ladder = if ladder.len() >= 2 { ladder } else { DEFAULT_LADDER.to_vec() };
-        let pts: Vec<(f64, f64)> = (1..=MTP_BLOCK + 1).map(|r| (r as f64, ladder_cost(&ladder, r))).collect();
+        let first_row = first_row.clamp(1, MTP_BLOCK);
+        let pts: Vec<(f64, f64)> = (first_row..=MTP_BLOCK + 1).map(|r| (r as f64, ladder_cost(&ladder, r))).collect();
         let xc = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
         let yc = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
         let prior_b = pts.iter().map(|&(x, y)| (x - xc) * (y - yc)).sum::<f64>() / pts.iter().map(|&(x, _)| (x - xc) * (x - xc)).sum::<f64>();
@@ -557,6 +627,26 @@ impl StepCost {
             .unwrap_or_else(|| DEFAULT_LADDER.to_vec());
         Self::new(
             ladder,
+            env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0),
+            std::env::var("V41_MS_DSPARK_COST_LIVE").as_deref() != Ok("0"),
+            env_f64("V41_MS_DSPARK_COST_MEMORY", 500.0),
+        )
+    }
+
+    /// The TWO-lane regime (an ordered verify cut from `first_row` rows):
+    /// `V41_MS_DSPARK_COST2`, a ladder for rows 1, 2, ... of which only rows
+    /// `>= first_row` shape the prior (default: the 2026-09-30 production
+    /// step means, rows 4..8 on two lanes). Its own fit, so the step change in
+    /// cost where the second lane switches on cannot bend the one-lane line.
+    pub fn from_env_two_lane(first_row: usize) -> Self {
+        let ladder = std::env::var("V41_MS_DSPARK_COST2")
+            .ok()
+            .and_then(|v| v.split(',').map(|x| x.trim().parse().ok()).collect::<Option<Vec<f64>>>())
+            .filter(|v| v.len() >= 2)
+            .unwrap_or_else(|| DEFAULT_LADDER_TWO_LANE.to_vec());
+        Self::with_first_row(
+            ladder,
+            first_row,
             env_f64("V41_MS_DSPARK_DRAFT_MS", 20.0),
             std::env::var("V41_MS_DSPARK_COST_LIVE").as_deref() != Ok("0"),
             env_f64("V41_MS_DSPARK_COST_MEMORY", 500.0),
@@ -642,7 +732,7 @@ pub fn k_max() -> usize {
 /// sigmoid(conf_k). So no decision reads the value it would test. The global
 /// search of `choose_k` lets conf_{k+1}, which depends on d_k, decide whether
 /// d_k is verified: exact for point-mass tests only (review N1).
-pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize, cost: &StepCost) -> usize {
+pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize, cost: &dyn CostModel) -> usize {
     let cap = cap.min(MTP_BLOCK);
     if let Some(k) = fixed_k() {
         return k.min(cap);
@@ -672,7 +762,7 @@ pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize, cost: &StepCost) -
 /// exact, 2.4): maximize expected tokens per ms, `E(K) = 1 + sum_{k<=K}
 /// prod_{j<k} sigmoid(conf_j)` over `cost(1 + K) + draft`, the draft being
 /// paid either way. `V41_MS_DSPARK_K` fixes K (capped like the policy).
-pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize, cost: &StepCost) -> usize {
+pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize, cost: &dyn CostModel) -> usize {
     let cap = cap.min(MTP_BLOCK);
     if let Some(k) = fixed_k() {
         return k.min(cap);
@@ -868,6 +958,27 @@ mod tests {
         }
         assert!((c.cost(6) - 200.0).abs() < 3.0, "cost(6) {}", c.cost(6));
         assert!((c.b - prior_slope).abs() < 2.0, "slope {} vs prior {prior_slope}", c.b);
+    }
+
+    #[test]
+    fn two_lane_prior_starts_at_its_first_row_and_regimes_route_by_rows() {
+        // The two-lane ladder is indexed from row 1 like the one-lane one; only
+        // rows >= first_row shape its prior line (09-30: 109.1 / 127.4 / 141.4).
+        let c2 = StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0);
+        for (rows, want) in [(4, 109.1), (5, 127.4), (6, 141.4)] {
+            assert!((c2.cost(rows) - want).abs() < 3.0, "cost2({rows}) = {} vs {want}", c2.cost(rows));
+        }
+        let c1 = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0);
+        let on = Regimes { one: &c1, two: &c2, two_from: Some(4) };
+        assert_eq!(on.cost(3), c1.cost(3));
+        assert_eq!(on.cost(4), c2.cost(4));
+        assert_eq!(on.draft_ms(), c1.draft_ms());
+        // Snapshot off: the one-lane fit only.
+        let off = Regimes { one: &c1, two: &c2, two_from: None };
+        assert_eq!(off.cost(5), c1.cost(5));
+        // Cheaper deep blocks on two lanes push K deeper for the same confidences.
+        let conf = [2.0f32, 1.0, 0.5, 0.2, 0.0];
+        assert!(choose_k_stopping(&conf, MTP_BLOCK, &on) >= choose_k_stopping(&conf, MTP_BLOCK, &off));
     }
 
     #[test]
