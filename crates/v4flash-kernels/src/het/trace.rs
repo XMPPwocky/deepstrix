@@ -21,12 +21,177 @@
 //! side and only fires once per token, so overlap on the device is
 //! preserved.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 
 use color_eyre::eyre;
 use v4flash_hip::{Event, Stream};
 
-/// Per-device ring of HIP events for kernel-scope timing.
+// ---- stage context (docs/v41/EVTRACE_REBUILD_PLAN.md 2.4 "Attribution") ----
+
+/// Which decode step / prefill unit / layer / lane a stage belongs to,
+/// captured into its pair at `stage()`. `NO` / `NO_IDX` = absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageCtx {
+    pub step: u64,
+    pub unit: u64,
+    pub layer: u32,
+    pub lane: u32,
+}
+
+impl StageCtx {
+    pub const NO: u64 = u64::MAX;
+    pub const NO_IDX: u32 = u32::MAX;
+    pub const NONE: StageCtx = StageCtx { step: Self::NO, unit: Self::NO, layer: Self::NO_IDX, lane: Self::NO_IDX };
+}
+
+thread_local! {
+    static CTX: Cell<StageCtx> = const { Cell::new(StageCtx::NONE) };
+}
+
+/// Restores the previous context when dropped (guards nest).
+#[must_use = "the context lasts as long as the guard"]
+pub struct CtxGuard {
+    prev: StageCtx,
+}
+
+impl Drop for CtxGuard {
+    fn drop(&mut self) {
+        CTX.with(|c| c.set(self.prev));
+    }
+}
+
+fn set_ctx(f: impl FnOnce(StageCtx) -> StageCtx) -> CtxGuard {
+    CTX.with(|c| {
+        let prev = c.get();
+        c.set(f(prev));
+        CtxGuard { prev }
+    })
+}
+
+/// A decode step: `(step, -, -, -)` until the guard drops, so the head,
+/// compact, upload and drafter stages carry the step and no layer.
+pub fn ctx_step(step: u64) -> CtxGuard {
+    set_ctx(|_| StageCtx { step, ..StageCtx::NONE })
+}
+
+/// A prefill unit (`next_unit`): `(-, unit, -, -)`.
+pub fn ctx_unit(unit: u64) -> CtxGuard {
+    set_ctx(|_| StageCtx { unit, ..StageCtx::NONE })
+}
+
+/// One lane's layer inside the current step / unit.
+pub fn ctx_layer(layer: usize, lane: usize) -> CtxGuard {
+    set_ctx(|c| StageCtx { layer: layer as u32, lane: lane as u32, ..c })
+}
+
+/// This thread's context now.
+pub fn ctx() -> StageCtx {
+    CTX.with(|c| c.get())
+}
+
+/// A process-wide prefill unit id.
+pub fn next_unit() -> u64 {
+    static U: AtomicU64 = AtomicU64::new(0);
+    U.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---- stream names (device tracks) ----
+
+static STREAM_NAMES: std::sync::Mutex<Vec<(usize, &'static str)>> = std::sync::Mutex::new(Vec::new());
+
+/// Name `s` for traces (an unnamed stream shows as `s<n>`).
+pub fn name_stream(s: &Stream, name: &'static str) {
+    let raw = s.raw() as usize;
+    let mut v = STREAM_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+    v.retain(|e| e.0 != raw);
+    v.push((raw, name));
+}
+
+pub(crate) fn stream_name(raw: usize) -> Option<&'static str> {
+    STREAM_NAMES.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|e| e.0 == raw).map(|e| e.1)
+}
+
+// ---- buffers ----
+
+/// One timed stage of a buffer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TimingPair {
+    pub(crate) name: &'static str,
+    pub(crate) start_idx: usize,
+    pub(crate) end_idx: usize,
+    pub(crate) ctx: StageCtx,
+    /// The stream's raw handle (`name_stream`).
+    pub(crate) stream: usize,
+    /// CLOCK_MONOTONIC_RAW ns just BEFORE the start event's record (plan N2);
+    /// NaN when the buffer is not handed to Tier B.
+    pub(crate) t_host: f64,
+}
+
+/// `EventPool::note_sync`: the first `n_pairs` pairs on `stream` had all
+/// ended (on the device) by RAW `t`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SyncMark {
+    pub(crate) stream: usize,
+    pub(crate) t: f64,
+    pub(crate) n_pairs: usize,
+}
+
+/// The events and pairs of one epoch (one decode step / prefill unit). ONE
+/// owner at a time: the pool, the handoff channel, the Tier B thread, the
+/// return channel (`evtrace_dev`).
+pub(crate) struct Buf<E = Event> {
+    pub(crate) events: Vec<E>,
+    pub(crate) next: usize,
+    pub(crate) pairs: Vec<TimingPair>,
+    /// How many `pairs` the perfetto exporter has emitted (work recorded
+    /// after the per-token export still goes out exactly once).
+    pub(crate) exported: usize,
+    /// Stages dropped this epoch because the buffer was full.
+    pub(crate) dropped: usize,
+    pub(crate) syncs: Vec<SyncMark>,
+    /// Set by Tier B before it returns the buffer: per stage name, the decode
+    /// pairs' device ms and calls, and the decode steps they cover.
+    pub(crate) sums: Vec<(&'static str, f64, u32)>,
+    pub(crate) sum_steps: u64,
+}
+
+// SAFETY: a `hipEvent_t` is a process-wide handle: HIP lets any thread
+// query, time or destroy it, and `Event`'s Drop enters the event's own device.
+// A `Buf` is never shared, only moved between its single owners (above).
+unsafe impl Send for Buf<Event> {}
+
+impl<E> Buf<E> {
+    pub(crate) fn with_events(events: Vec<E>) -> Self {
+        let n = events.len();
+        Self { events, next: 0, pairs: Vec::with_capacity(n / 2), exported: 0, dropped: 0, syncs: Vec::new(), sums: Vec::new(), sum_steps: 0 }
+    }
+
+    fn clear(&mut self) {
+        self.next = 0;
+        self.pairs.clear();
+        self.exported = 0;
+        self.dropped = 0;
+        self.syncs.clear();
+        self.sums.clear();
+        self.sum_steps = 0;
+    }
+}
+
+impl Buf<Event> {
+    /// `capacity` events on the CURRENT device.
+    pub(crate) fn new(capacity: usize) -> eyre::Result<Self> {
+        let mut events = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            events.push(Event::new()?);
+        }
+        Ok(Self::with_events(events))
+    }
+}
+
+/// Per-device HIP events for kernel-scope timing.
 ///
 /// `enabled` defaults to `false`: in that state, `stage()` returns a
 /// no-op guard and recording is skipped entirely. Each suppressed
@@ -38,32 +203,58 @@ use v4flash_hip::{Event, Stream};
 /// Enable by calling [`EventPool::set_enabled`]. The orchestrator's
 /// `attach_perfetto` flips both pools on automatically; tests that
 /// need the per-kernel INFO summary should also opt in.
+///
+/// With evtrace's Tier B on (`evtrace_dev::offload_on`), `reset()` HANDS the
+/// epoch's buffer to the Tier B thread, which times every pair off this
+/// thread, and takes a free one (docs/v41/EVTRACE_REBUILD_PLAN.md 2.4); with no
+/// free buffer the epoch records nothing (counted, `take_skipped`), never waits.
 pub struct EventPool {
     inner: RefCell<EventPoolInner>,
     label: &'static str,
-    enabled: std::cell::Cell<bool>,
+    enabled: Cell<bool>,
     /// While a stage is being captured into a HIP graph, `stage()` is a no-op:
     /// event records inside a capture become graph nodes whose timings the
     /// pool could not harvest (the parent stage around the graph launch still
     /// times the whole replay).
-    capturing: std::cell::Cell<bool>,
+    capturing: Cell<bool>,
     /// `k.*` kernel sub-stages (one pair per launch inside a parent stage).
     /// The `ms.stage` rollup sums PARENT stages only, so these ~630 pairs per
     /// 8-row step bought nothing there while costing ~8 us of dGPU stream time
     /// each (bench_event_overhead, 2026-09-21). Off unless perfetto is attached
     /// or `V41_PROFILE_KERNEL_STAGES=1`.
-    sub: std::cell::Cell<bool>,
+    sub: Cell<bool>,
+    /// This epoch's buffer goes to Tier B at the next reset (set at every
+    /// reset): stages take host stamps, `note_sync` records.
+    offload: Cell<bool>,
+    device: i32,
+    id: u64,
 }
 
 struct EventPoolInner {
-    events: Vec<Event>,
-    next: usize,
-    pairs: Vec<TimingPair>,
-    /// How many `pairs` have already been handed to the perfetto exporter, so
-    /// work recorded after the per-token export still gets emitted exactly once.
-    exported: usize,
-    /// Stages dropped since the last reset because the pool was full.
-    dropped: usize,
+    /// This epoch's buffer; `None` = Tier B holds every buffer.
+    buf: Option<Box<Buf>>,
+    /// Buffers back from Tier B (sums folded).
+    free: Vec<Box<Buf>>,
+    /// Their return channel (made at the first handoff).
+    back: Option<(SyncSender<Box<Buf>>, Receiver<Box<Buf>>)>,
+    /// Bumped by every reset: a scope that ends in a later epoch drops its pair.
+    epoch: u64,
+    /// Resets that found no free buffer.
+    skipped: u64,
+    /// Returned buffers' decode sums, until `take_dev_sums`.
+    sums: HashMap<&'static str, (f64, u32)>,
+    sum_steps: u64,
+}
+
+impl EventPoolInner {
+    fn fold(&mut self, b: &mut Buf) {
+        for (name, ms, calls) in b.sums.drain(..) {
+            let e = self.sums.entry(name).or_insert((0.0, 0));
+            e.0 += ms;
+            e.1 += calls;
+        }
+        self.sum_steps += std::mem::take(&mut b.sum_steps);
+    }
 }
 
 /// Event slots a new stage leaves free: more than the deepest nesting of open
@@ -78,7 +269,6 @@ const DROP_LOG_EVERY_S: u64 = 10;
 /// Call with no `EventPool` borrow held: the log line may reach a tracing
 /// layer that records pool stages.
 fn note_drop(label: &'static str, stage: &'static str, events: usize, dropped: usize) {
-    use std::sync::atomic::{AtomicU64, Ordering};
     // Seconds since the first drop, on a MONOTONIC base (a wall-clock step
     // backwards must not silence the log); `LAST` = 0 means "never logged".
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -88,12 +278,6 @@ fn note_drop(label: &'static str, stage: &'static str, events: usize, dropped: u
     if now >= last + DROP_LOG_EVERY_S && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         tracing::warn!(pool = label, events, stage, dropped_this_epoch = dropped, "event pool full: stages dropped (timing gaps; logged at most every 10 s)");
     }
-}
-
-struct TimingPair {
-    name: &'static str,
-    start_idx: usize,
-    end_idx: usize,
 }
 
 /// One harvested per-kernel timing.
@@ -108,17 +292,18 @@ impl EventPool {
     /// `capacity / 2` start/end pairs per token). The caller must have
     /// the relevant device already current.
     pub fn new(label: &'static str, capacity: usize) -> eyre::Result<Self> {
-        let mut events = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            events.push(Event::new()?);
-        }
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let buf = Buf::new(capacity)?;
+        let device = buf.events.first().map(|e| e.device_id()).unwrap_or(-1);
         Ok(Self {
             inner: RefCell::new(EventPoolInner {
-                events,
-                next: 0,
-                pairs: Vec::with_capacity(capacity / 2),
-                exported: 0,
-                dropped: 0,
+                buf: Some(Box::new(buf)),
+                free: Vec::new(),
+                back: None,
+                epoch: 0,
+                skipped: 0,
+                sums: HashMap::new(),
+                sum_steps: 0,
             }),
             label,
             // DEEPSTRIX_TOKEN_PROFILE=1 turns per-kernel event timing on without
@@ -130,9 +315,12 @@ impl EventPool {
             // (~100 us/layer, M20), so it stays opt-in.
             // Either profile turns recording on: DEEPSTRIX_TOKEN_PROFILE for the
             // decode breakdown, DEEPSTRIX_PREFILL_PROFILE for the prefill aggregate.
-            enabled: std::cell::Cell::new(token_profile() || prefill_profile::enabled()),
-            capturing: std::cell::Cell::new(false),
-            sub: std::cell::Cell::new(kernel_stages()),
+            enabled: Cell::new(token_profile() || prefill_profile::enabled()),
+            capturing: Cell::new(false),
+            sub: Cell::new(kernel_stages()),
+            offload: Cell::new(false),
+            device,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -163,13 +351,80 @@ impl EventPool {
         self.sub.set(kernel_stages());
     }
 
-    /// Reset for the next token. Drops all timing pairs.
+    /// Start the next epoch (token / step / prefill unit). With Tier B on, a
+    /// buffer holding pairs goes to the Tier B thread and a free one is
+    /// taken (its sums folded for `take_dev_sums`); otherwise the pairs are
+    /// dropped. Never waits.
     pub fn reset(&self) {
+        let off = super::evtrace_dev::offload_on();
         let mut inner = self.inner.borrow_mut();
-        inner.next = 0;
-        inner.pairs.clear();
-        inner.exported = 0;
-        inner.dropped = 0;
+        inner.epoch += 1;
+        let mut back = Vec::new();
+        if let Some((_, rx)) = inner.back.as_ref() {
+            while let Ok(b) = rx.try_recv() {
+                back.push(b);
+            }
+        }
+        for mut b in back {
+            inner.fold(&mut b);
+            inner.free.push(b);
+        }
+        if off && inner.buf.as_ref().is_some_and(|b| !b.pairs.is_empty()) {
+            let b = inner.buf.take().expect("checked");
+            let ret = inner.back.get_or_insert_with(|| std::sync::mpsc::sync_channel(super::evtrace_dev::bufs_per_pool())).0.clone();
+            if let Err(b) = super::evtrace_dev::hand_off(self.id, self.device, self.label, b, ret) {
+                inner.buf = Some(b); // Tier B behind or gone: this epoch's pairs are lost
+            }
+        }
+        if inner.buf.is_none() {
+            inner.buf = inner.free.pop();
+            if inner.buf.is_none() {
+                inner.skipped += 1;
+            }
+        }
+        if let Some(b) = inner.buf.as_mut() {
+            b.clear();
+        }
+        drop(inner);
+        self.offload.set(off);
+    }
+
+    /// Is this epoch's buffer going to Tier B (its sums come back through
+    /// `take_dev_sums`; `harvest` would block on it for nothing)?
+    pub fn offloading(&self) -> bool {
+        self.offload.get()
+    }
+
+    /// The device sums of the decode pairs (step set, no prefill unit) of the
+    /// buffers Tier B returned since the last call, by stage name, and the
+    /// decode steps they cover (parent stages present).
+    pub fn take_dev_sums(&self) -> (Vec<(&'static str, f32, u32)>, u64) {
+        let mut inner = self.inner.borrow_mut();
+        let v = inner.sums.drain().map(|(n, (ms, c))| (n, ms as f32, c)).collect();
+        (v, std::mem::take(&mut inner.sum_steps))
+    }
+
+    /// Resets since the last call that found no free buffer (their epochs
+    /// recorded nothing).
+    pub fn take_skipped(&self) -> u64 {
+        std::mem::take(&mut self.inner.borrow_mut().skipped)
+    }
+
+    /// The calling thread just returned from a synchronization of `stream`
+    /// (`synchronize()`, a blocking readback): every stage recorded on it
+    /// so far has ended. Tier B checks that against the device clock (plan 2.4
+    /// rules (b) / (c)). Returns the RAW stamp, NaN when not offloading.
+    pub fn note_sync(&self, stream: &Stream) -> f64 {
+        if !self.offload.get() {
+            return f64::NAN;
+        }
+        let t = super::evtrace::now();
+        let mut inner = self.inner.borrow_mut();
+        if let Some(b) = inner.buf.as_mut() {
+            let n_pairs = b.pairs.len();
+            b.syncs.push(SyncMark { stream: stream.raw() as usize, t, n_pairs });
+        }
+        t
     }
 
     /// Treat every pair recorded so far as exported: a perfetto exporter
@@ -177,7 +432,9 @@ impl EventPool {
     /// anchor with garbage durations).
     pub fn mark_exported(&self) {
         let mut inner = self.inner.borrow_mut();
-        inner.exported = inner.pairs.len();
+        if let Some(b) = inner.buf.as_mut() {
+            b.exported = b.pairs.len();
+        }
     }
 
     /// Open a timing scope on `stream` named `name`. Records a start event
@@ -191,40 +448,32 @@ impl EventPool {
         name: &'static str,
         stream: &'a Stream,
     ) -> eyre::Result<StageScope<'a>> {
+        let noop = StageScope { pool: self, stream, name, start_idx: usize::MAX, epoch: 0, ctx: StageCtx::NONE, t_host: f64::NAN, done: true };
         if !self.enabled.get() || self.capturing.get() || (!self.sub.get() && name.starts_with("k.")) {
-            return Ok(StageScope {
-                pool: self,
-                stream,
-                name,
-                start_idx: usize::MAX,
-                done: true,           // skip record_end
-            });
+            return Ok(noop);
         }
-        let start_idx = {
-            let mut inner = self.inner.borrow_mut();
-            let idx = inner.next;
-            if idx + END_RESERVE >= inner.events.len() {
-                // FULL: drop the stage (a timing gap) rather than fail the
-                // caller -- a decode step (every live stream) or a prefill job.
-                // Reachable from a live perfetto trace (`V41_PERFETTO_KERNELS`).
-                // `END_RESERVE` slots stay free for the ends of open stages.
-                inner.dropped += 1;
-                let (n, len) = (inner.dropped, inner.events.len());
-                drop(inner);
-                note_drop(self.label, name, len, n);
-                return Ok(StageScope { pool: self, stream, name, start_idx: usize::MAX, done: true });
-            }
-            inner.next += 1;
-            inner.events[idx].record(stream)?;
-            idx
-        };
-        Ok(StageScope {
-            pool: self,
-            stream,
-            name,
-            start_idx,
-            done: false,
-        })
+        let mut inner = self.inner.borrow_mut();
+        let epoch = inner.epoch;
+        // No free buffer this epoch (counted at the reset).
+        let Some(buf) = inner.buf.as_mut() else { return Ok(noop) };
+        let idx = buf.next;
+        if idx + END_RESERVE >= buf.events.len() {
+            // FULL: drop the stage (a timing gap) rather than fail the
+            // caller -- a decode step (every live stream) or a prefill job.
+            // Reachable from a live perfetto trace (`V41_PERFETTO_KERNELS`).
+            // `END_RESERVE` slots stay free for the ends of open stages.
+            buf.dropped += 1;
+            let (n, len) = (buf.dropped, buf.events.len());
+            drop(inner);
+            note_drop(self.label, name, len, n);
+            return Ok(noop);
+        }
+        buf.next += 1;
+        // Causality rule (a): stamped BEFORE the record (plan N2).
+        let t_host = if self.offload.get() { super::evtrace::now() } else { f64::NAN };
+        buf.events[idx].record(stream)?;
+        drop(inner);
+        Ok(StageScope { pool: self, stream, name, start_idx: idx, epoch, ctx: ctx(), t_host, done: false })
     }
 
     /// Synchronize on the last event in the ring then walk the pairs
@@ -232,14 +481,12 @@ impl EventPool {
     /// recording order.
     pub fn harvest(&self) -> eyre::Result<Vec<KernelTiming>> {
         let inner = self.inner.borrow();
-        if inner.pairs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let last_end_idx = inner.pairs.last().unwrap().end_idx;
-        inner.events[last_end_idx].synchronize()?;
-        let mut out = Vec::with_capacity(inner.pairs.len());
-        for p in &inner.pairs {
-            let ms = Event::elapsed_ms(&inner.events[p.start_idx], &inner.events[p.end_idx])?;
+        let Some(b) = inner.buf.as_ref() else { return Ok(Vec::new()) };
+        let Some(last) = b.pairs.last() else { return Ok(Vec::new()) };
+        b.events[last.end_idx].synchronize()?;
+        let mut out = Vec::with_capacity(b.pairs.len());
+        for p in &b.pairs {
+            let ms = Event::elapsed_ms(&b.events[p.start_idx], &b.events[p.end_idx])?;
             out.push(KernelTiming { name: p.name, ms });
         }
         Ok(out)
@@ -259,11 +506,12 @@ impl EventPool {
         F: FnMut(&'static str, &Event, &Event) -> eyre::Result<()>,
     {
         let inner = self.inner.borrow();
-        if let Some(last) = inner.pairs.last() {
-            inner.events[last.end_idx].synchronize()?;
+        let Some(b) = inner.buf.as_ref() else { return Ok(()) };
+        if let Some(last) = b.pairs.last() {
+            b.events[last.end_idx].synchronize()?;
         }
-        for p in &inner.pairs {
-            f(p.name, &inner.events[p.start_idx], &inner.events[p.end_idx])?;
+        for p in &b.pairs {
+            f(p.name, &b.events[p.start_idx], &b.events[p.end_idx])?;
         }
         Ok(())
     }
@@ -282,18 +530,19 @@ impl EventPool {
         F: FnMut(&'static str, &Event, &Event) -> eyre::Result<()>,
     {
         let mut inner = self.inner.borrow_mut();
-        let from = inner.exported.min(inner.pairs.len());
-        if from >= inner.pairs.len() {
+        let Some(b) = inner.buf.as_mut() else { return Ok(()) };
+        let from = b.exported.min(b.pairs.len());
+        if from >= b.pairs.len() {
             return Ok(());
         }
-        if let Some(last) = inner.pairs.last() {
-            inner.events[last.end_idx].synchronize()?;
+        if let Some(last) = b.pairs.last() {
+            b.events[last.end_idx].synchronize()?;
         }
-        for i in from..inner.pairs.len() {
-            let p = &inner.pairs[i];
-            f(p.name, &inner.events[p.start_idx], &inner.events[p.end_idx])?;
+        for i in from..b.pairs.len() {
+            let p = &b.pairs[i];
+            f(p.name, &b.events[p.start_idx], &b.events[p.end_idx])?;
         }
-        inner.exported = inner.pairs.len();
+        b.exported = b.pairs.len();
         Ok(())
     }
 }
@@ -304,6 +553,9 @@ pub struct StageScope<'a> {
     stream: &'a Stream,
     name: &'static str,
     start_idx: usize,
+    epoch: u64,
+    ctx: StageCtx,
+    t_host: f64,
     done: bool,
 }
 
@@ -317,26 +569,36 @@ impl<'a> StageScope<'a> {
         if self.done {
             return Ok(());
         }
+        self.done = true;
         let mut inner = self.pool.inner.borrow_mut();
-        let end_idx = inner.next;
-        if end_idx >= inner.events.len() {
-            // Backstop (`END_RESERVE` should make this unreachable): no pair,
-            // a timing gap, never an error for the caller.
-            inner.dropped += 1;
-            let (n, len) = (inner.dropped, inner.events.len());
+        // Open across a reset (resets are top-level, so not today): the start
+        // event is in a buffer Tier B now holds. Drop the pair.
+        if inner.epoch != self.epoch {
             drop(inner);
-            note_drop(self.pool.label, self.name, len, n);
-            self.done = true;
+            note_drop(self.pool.label, self.name, 0, 0);
             return Ok(());
         }
-        inner.next += 1;
-        inner.events[end_idx].record(self.stream)?;
-        inner.pairs.push(TimingPair {
+        let Some(buf) = inner.buf.as_mut() else { return Ok(()) };
+        let end_idx = buf.next;
+        if end_idx >= buf.events.len() {
+            // Backstop (`END_RESERVE` should make this unreachable): no pair,
+            // a timing gap, never an error for the caller.
+            buf.dropped += 1;
+            let (n, len) = (buf.dropped, buf.events.len());
+            drop(inner);
+            note_drop(self.pool.label, self.name, len, n);
+            return Ok(());
+        }
+        buf.next += 1;
+        buf.events[end_idx].record(self.stream)?;
+        buf.pairs.push(TimingPair {
             name: self.name,
             start_idx: self.start_idx,
             end_idx,
+            ctx: self.ctx,
+            stream: self.stream.raw() as usize,
+            t_host: self.t_host,
         });
-        self.done = true;
         Ok(())
     }
 }

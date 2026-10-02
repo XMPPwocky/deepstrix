@@ -97,9 +97,31 @@ pub static SITE: Kind = Kind {
 /// ids), source (0 default, 1 env, 2 legacy file, 3 knob file, 4 set).
 pub static KNOB: Kind = Kind { id: 5, name: "knob", fields: &["t", "name", "value", "source"] };
 
+/// TIER B: one device stage interval (`evtrace_dev`): RAW start / end on the
+/// host clock (calibrated, +-`q_us`), the stage, device and stream names
+/// (string ids), its context (`step` / `unit` / `layer` / `lane`, NaN =
+/// absent) and the host's RAW stamp just before it recorded the start.
+pub static DEV: Kind = Kind {
+    id: 6,
+    name: "dev",
+    fields: &["t_start", "t_end", "name", "device", "stream", "step", "unit", "layer", "lane", "t_host", "q_us"],
+};
+
+/// One device-clock calibration anchor (`evtrace_dev`, ~5/s per device):
+/// `ok` 0 = discarded (the marker did not complete within 2 ms: a busy
+/// hardware queue), `spin_us` record-to-observed, `q_us` the anchor's bound,
+/// `resid_us` / `tol_us` the chain self-check (NaN on a segment's first
+/// anchor), `slope_ppm` / `slope_q_ppm` the fitted device-to-host rate and
+/// its bound, `link_ms` the elapsed time from the previous anchor.
+pub static CAL: Kind = Kind {
+    id: 7,
+    name: "cal",
+    fields: &["t", "device", "ok", "spin_us", "q_us", "resid_us", "tol_us", "slope_ppm", "slope_q_ppm", "link_ms", "anchors"],
+};
+
 /// Every kind this binary can emit, in the header of every file.
 pub(crate) fn kinds() -> Vec<&'static Kind> {
-    let mut v: Vec<&'static Kind> = vec![&META, &SYS, &STR, &SITE, &KNOB];
+    let mut v: Vec<&'static Kind> = vec![&META, &SYS, &STR, &SITE, &KNOB, &DEV, &CAL];
     v.extend(super::evtrace_kinds::ALL.iter().copied());
     v
 }

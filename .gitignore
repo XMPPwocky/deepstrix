@@ -38,3 +38,4 @@ external/ds4-dump/quants-selftest
 /logs/
 /traces/
 scripts/v41_oracle/__pycache__/
+__pycache__/

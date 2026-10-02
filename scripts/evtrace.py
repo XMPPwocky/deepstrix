@@ -69,12 +69,59 @@ def read_file(path):
             continue
         rec = dict(zip(fields, vals))
         rec['_role'] = header.get('role', '?')
+        rec['_pid'] = header.get('pid')
         out[name].append(rec)
     header['_strings'] = strings
-    for r in out.get('knob', []):
-        r['name_s'] = strings.get(int(r['name']), '?')
-        r['value_s'] = strings.get(int(r['value']), '?')
+    # String-id fields -> `<field>_s` (format_rev 2).
+    for kind, keys in (('knob', ('name', 'value')), ('dev', ('name', 'device', 'stream')),
+                       ('step_dev', ('device',)), ('cal', ('device',))):
+        for r in out.get(kind, []):
+            for k in keys:
+                v = r.get(k, NAN)
+                r[k + '_s'] = strings.get(int(v), '?') if v == v else '?'
     return header, out
+
+
+# `step_dev` counters folded into `hub_step` as `dev_<name>` (sum, or max).
+STEP_DEV_SUM = ('pairs', 'deferred', 'dropped', 'viol_a', 'viol_b', 'checked_b', 'tierb_us')
+STEP_DEV_MAX = ('q_us_max', 'lag_ms')
+STEP_DEV_IDENT = ('t_start', 'step', 'device')
+
+
+def merge_step_dev(recs):
+    """Tier B (`evtrace_dev`) sends a step's device fields in `step_dev`
+    records, possibly several per step (per device; a step's drafter rides
+    the previous step's buffer): SUM them per (pid, step) into the step's
+    `hub_step` under the same field names, where the step has no value of its
+    own (the synchronous path fills them in `hub_step`). Counters go in as
+    `dev_<name>`. Every reader of `hub_step` then sees one record per step."""
+    parts = defaultdict(dict)
+    for r in recs.get('step_dev', []):
+        s = r.get('step', NAN)
+        if s != s:
+            continue
+        acc = parts[(r.get('_pid'), int(s))]
+        for k, v in r.items():
+            if k.startswith('_') or k in STEP_DEV_IDENT or k.endswith('_s') or v != v:
+                continue
+            if k in STEP_DEV_MAX:
+                acc[k] = max(acc.get(k, v), v)
+            else:
+                acc[k] = acc.get(k, 0.0) + v
+    if not parts:
+        return
+    for h in recs.get('hub_step', []):
+        s = h.get('step', NAN)
+        if s != s:
+            continue
+        acc = parts.get((h.get('_pid'), int(s)))
+        if not acc:
+            continue
+        for k, v in acc.items():
+            if k in STEP_DEV_SUM or k in STEP_DEV_MAX:
+                h['dev_' + k] = v
+            elif h.get(k, NAN) != h.get(k, NAN):
+                h[k] = v
 
 
 def expand(paths):
@@ -95,6 +142,7 @@ def load(paths):
         headers.append(h)
         for k, v in r.items():
             recs[k].extend(v)
+    merge_step_dev(recs)
     return headers, recs
 
 

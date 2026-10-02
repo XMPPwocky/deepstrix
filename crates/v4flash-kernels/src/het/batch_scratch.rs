@@ -1255,7 +1255,11 @@ impl BatchDgpuScratch {
             prior_pin: v4flash_hip::PinnedBuffer::new(crate::config::N_LAYER as usize * N_EXPERT as usize)?,
             d_orig_sel: mk_i32(N_EXPERT_USED)?,
             d_range: mk_f32(1)?,
-            rb_stream: v4flash_hip::Stream::new_non_blocking(id)?,
+            rb_stream: {
+                let s = v4flash_hip::Stream::new_non_blocking(id)?;
+                super::trace::name_stream(&s, "rb");
+                s
+            },
             rb_i32: v4flash_hip::PinnedBuffer::new(
                 b * (4 * N_EXPERT_USED + crate::router_topk::ROUTER_MAX_ALT as usize),
             )?,

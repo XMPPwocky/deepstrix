@@ -1169,6 +1169,7 @@ impl HeterogeneousEngine {
         }
         self.dgpu.events.reset();
         self.igpu.events.reset();
+        let _unit = super::trace::ctx_unit(super::trace::next_unit());
         // Group prefetch (`V41_LM_PREFETCH`): every unit queues the NEXT group's
         // box-2 experts the mirror says box 2 does not hold, capped per request
         // so the queue drains at box 2's staging rate; the guard drops whatever
@@ -1342,6 +1343,7 @@ impl HeterogeneousEngine {
         }
         self.dgpu.events.reset();
         self.igpu.events.reset();
+        let _unit = super::trace::ctx_unit(super::trace::next_unit());
         let chunk_engram: Option<Vec<Vec<f32>>> = match lazy_hcs.is_some() {
             true => lazy_engram,
             false => job.engram_rows.as_ref().map(|rs| {
@@ -1455,6 +1457,7 @@ impl HeterogeneousEngine {
         let t0 = std::time::Instant::now();
         self.dgpu.events.reset();
         self.igpu.events.reset();
+        let _unit = super::trace::ctx_unit(super::trace::next_unit());
         let b_a = self.forward_prompt_batch_v2_pipelined_range(
             bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, &seg_hcs, &seg_tokens, seg_pos0,
             None, None, pager.as_deref_mut(), None, split..N_LAYER as usize, CedMode::Replay, Some(&seg_carry),
@@ -2657,6 +2660,7 @@ impl HeterogeneousEngine {
             }
             self.dgpu.events.reset();
             self.igpu.events.reset();
+            let _unit = super::trace::ctx_unit(super::trace::next_unit());
 
             self.forward_prompt_batch_v2(
                 bd,
@@ -2952,6 +2956,8 @@ impl HeterogeneousEngine {
         )?;
         head_scratch.head_cands.slice_view(0, b * HEAD_CAND_STRIDE).copy_to_pinned_async(out, 0, &de.compute)?;
         de.compute.synchronize()?;
+        // Every head stage ended before this returned (causality rule (c)).
+        de.events.note_sync(&de.compute);
         Ok(true)
     }
 
@@ -3149,6 +3155,7 @@ impl HeterogeneousEngine {
             }
             self.dgpu.events.reset();
             self.igpu.events.reset();
+            let _unit = super::trace::ctx_unit(super::trace::next_unit());
 
             let chunk_engram: Option<Vec<Vec<f32>>> = engram_rows.map(|rs| {
                 let ein = ENGRAM_IN as usize;
@@ -3342,6 +3349,7 @@ impl HeterogeneousEngine {
             }
             self.dgpu.events.reset();
             self.igpu.events.reset();
+            let _unit = super::trace::ctx_unit(super::trace::next_unit());
             let b_a = self.forward_prompt_batch_v2_pipelined_range(
                 bd_a,
                 bi_a,
@@ -3591,6 +3599,14 @@ impl HeterogeneousEngine {
     /// `bd.hc_pre_carry` the carries: `head_rows(ds, bd, b, weights)` turns
     /// them into `[b * N_VOCAB]` logits.
     #[allow(clippy::too_many_arguments)]
+    /// After an arena driver's final `dgpu.compute.synchronize()`: every
+    /// stage it queued there has ended (Tier B's causality rule (b)); the
+    /// stamp goes into `hub_step.t_fwd_sync` (`take_fwd_sync`).
+    fn note_fwd_sync(&self) {
+        let t = self.dgpu.events.note_sync(&self.dgpu.compute);
+        FWD_SYNC_T.store(t.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn forward_step_arena(
         &self,
         bd: &mut BatchDgpuScratch,
@@ -3646,6 +3662,7 @@ impl HeterogeneousEngine {
         }
         let ein = ENGRAM_IN as usize;
         for layer in 0..N_LAYER as usize {
+            let _ctx = super::trace::ctx_layer(layer, 0);
             if weights.dgpu_layers[layer].engram.is_some() {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
                 let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
@@ -3670,6 +3687,7 @@ impl HeterogeneousEngine {
             std::mem::swap(&mut bd.residual, &mut bd.residual_next);
         }
         self.dgpu.compute.synchronize()?;
+        self.note_fwd_sync();
         Ok(tables)
     }
 
@@ -3793,6 +3811,8 @@ impl HeterogeneousEngine {
         macro_rules! chain {
             ($bd:expr, $bi:expr, $tables:expr, $dev:expr, $toks:expr, $sev:expr, $off:expr, $n:expr, $l:expr) => {{
                 let l: usize = $l;
+                // Lane B starts at a nonzero row.
+                let _ctx = super::trace::ctx_layer(l, ($off != 0) as usize);
                 stage(self, $bd, l, $off, $n)?;
                 arena.state.with_kv_source(l, |ls| {
                     let rl = rl!($tables, $dev, l);
@@ -3821,13 +3841,19 @@ impl HeterogeneousEngine {
                 cb.partner_follows = false;
                 // Both routes first: each waits on its own router EVENT, and both
                 // submits are out before any pager work.
-                { let rl = rl!(tables_a, dev_a, l); self.pre_moe_route(ca, bd_a, sd, sev_a, pager.as_deref_mut(), &rl)?; }
-                { let rl = rl!(tables_b, dev_b, l); self.pre_moe_route(cb, bd_b, sd, sev_b, pager.as_deref_mut(), &rl)?; }
+                { let _ctx = super::trace::ctx_layer(l, 0); let rl = rl!(tables_a, dev_a, l); self.pre_moe_route(ca, bd_a, sd, sev_a, pager.as_deref_mut(), &rl)?; }
+                { let _ctx = super::trace::ctx_layer(l, 1); let rl = rl!(tables_b, dev_b, l); self.pre_moe_route(cb, bd_b, sd, sev_b, pager.as_deref_mut(), &rl)?; }
                 // Then each lane's prep+launch as ONE unit (see the note above).
-                self.pre_moe_prep(ca, bd_a, bi_a, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_a, pager.as_deref_mut())?;
-                self.pre_moe_launch(ca, bd_a, bi_a, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_a, pager.as_deref_mut())?;
-                self.pre_moe_prep(cb, bd_b, bi_b, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_b, pager.as_deref_mut())?;
-                self.pre_moe_launch(cb, bd_b, bi_b, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_b, pager.as_deref_mut())?;
+                {
+                    let _ctx = super::trace::ctx_layer(l, 0);
+                    self.pre_moe_prep(ca, bd_a, bi_a, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_a, pager.as_deref_mut())?;
+                    self.pre_moe_launch(ca, bd_a, bi_a, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_a, pager.as_deref_mut())?;
+                }
+                {
+                    let _ctx = super::trace::ctx_layer(l, 1);
+                    self.pre_moe_prep(cb, bd_b, bi_b, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_b, pager.as_deref_mut())?;
+                    self.pre_moe_launch(cb, bd_b, bi_b, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_b, pager.as_deref_mut())?;
+                }
                 self.route_probe_after_layer(bd_a, weights, l, b_a, 0)?;
                 self.route_probe_after_layer(bd_b, weights, l, b_b, 1)?;
             }};
@@ -3837,23 +3863,24 @@ impl HeterogeneousEngine {
         rest_layer!(0, &mut ca, &mut cb);
         for layer in 0..n_layer - 1 {
             let hot_a = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_a, sd);
-            self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[layer], hot_a)?;
+            { let _ctx = super::trace::ctx_layer(layer, 0); self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[layer], hot_a)?; }
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
             let mut ca = chain!(bd_a, bi_a, tables_a, dev_a, tokens_a, self.sync_events, 0, b_a, layer + 1);
             let hot_b = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_b, sd);
-            self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[layer], hot_b)?;
+            { let _ctx = super::trace::ctx_layer(layer, 1); self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[layer], hot_b)?; }
             std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
             let mut cb = chain!(bd_b, bi_b, tables_b, dev_b, tokens_b, self.sync_events_t1, b_a, b_b, layer + 1);
             rest_layer!(layer + 1, &mut ca, &mut cb);
         }
         let last = n_layer - 1;
         let hot_a = prefill_hot_active(&weights.dgpu_layers[last], &weights.igpu_layers[last], bd_a, sd);
-        self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_a)?;
+        { let _ctx = super::trace::ctx_layer(last, 0); self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_a)?; }
         std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
         let hot_b = prefill_hot_active(&weights.dgpu_layers[last], &weights.igpu_layers[last], bd_b, sd);
-        self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_b)?;
+        { let _ctx = super::trace::ctx_layer(last, 1); self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_b)?; }
         std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
         self.dgpu.compute.synchronize()?;
+        self.note_fwd_sync();
         Ok((tables_a, tables_b))
     }
 
@@ -3942,6 +3969,7 @@ impl HeterogeneousEngine {
             ($i:expr, $layer:expr) => {{
                 let i: usize = $i;
                 let layer: usize = $layer;
+                let _ctx = super::trace::ctx_layer(layer, i);
                 let (lo, hi) = (offs[i], offs[i + 1]);
                 let (bd, bi, dev) = &mut lanes[i];
                 stage(self, bd, layer, lo, hi - lo)?;
@@ -3959,6 +3987,7 @@ impl HeterogeneousEngine {
             ($i:expr, $layer:expr) => {{
                 let i: usize = $i;
                 let layer: usize = $layer;
+                let _ctx = super::trace::ctx_layer(layer, i);
                 let bl = (offs[i + 1] - offs[i]) as u32;
                 let (bd, _, _) = &mut lanes[i];
                 let hot = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd, sd);
@@ -3980,6 +4009,7 @@ impl HeterogeneousEngine {
             post!(i, last);
         }
         self.dgpu.compute.synchronize()?;
+        self.note_fwd_sync();
         Ok(tables)
     }
 
@@ -4089,6 +4119,7 @@ impl HeterogeneousEngine {
         macro_rules! chain {
             ($i:expr, $l:expr) => {{
                 let (i, l): (usize, usize) = ($i, $l);
+                let _ctx = super::trace::ctx_layer(l, i);
                 let (lo, hi) = (offs[i], offs[i + 1]);
                 let (bd, bi, dev) = &mut lanes[i];
                 stage(self, bd, l, lo, hi - lo)?;
@@ -4112,6 +4143,7 @@ impl HeterogeneousEngine {
         macro_rules! rest {
             ($i:expr, $l:expr, $c:expr) => {{
                 let (i, l): (usize, usize) = ($i, $l);
+                let _ctx = super::trace::ctx_layer(l, i);
                 let c: &mut PreMoeCarry = $c;
                 let (lo, hi) = (offs[i], offs[i + 1]);
                 let (bd, bi, dev) = &mut lanes[i];
@@ -4126,6 +4158,7 @@ impl HeterogeneousEngine {
         macro_rules! post {
             ($i:expr, $l:expr) => {{
                 let (i, l): (usize, usize) = ($i, $l);
+                let _ctx = super::trace::ctx_layer(l, i);
                 let bl = (offs[i + 1] - offs[i]) as u32;
                 let (bd, _, _) = &mut lanes[i];
                 let hot = prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], bd, sd);
@@ -4224,6 +4257,7 @@ impl HeterogeneousEngine {
         }
         READY_FIRST_SPINS.fetch_add(spins, std::sync::atomic::Ordering::Relaxed);
         self.dgpu.compute.synchronize()?;
+        self.note_fwd_sync();
         Ok(tables)
     }
 
@@ -10979,6 +11013,16 @@ pub fn take_chain_waits() -> (u64, u64) {
         READY_FIRST_CHAIN_WAITS.swap(0, std::sync::atomic::Ordering::Relaxed),
         READY_FIRST_CHAIN_WAIT_US.swap(0, std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+const NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+/// The last arena forward's final dGPU sync, RAW ns as f64 bits (NaN when
+/// not offloading: `EventPool::note_sync`).
+static FWD_SYNC_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NAN_BITS);
+
+/// `hub_step.t_fwd_sync` of the forward that just ran (NaN once taken).
+pub fn take_fwd_sync() -> f64 {
+    f64::from_bits(FWD_SYNC_T.swap(NAN_BITS, std::sync::atomic::Ordering::Relaxed))
 }
 pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Box-2 miss substitution (`het::b2_mirror`): the weights readback, planning,

@@ -7,7 +7,7 @@ use super::evtrace::Kind;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Every hub/box-2 kind (added to `evtrace`'s header list).
-pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE];
+pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE];
 
 // ---- hub: step context for per-request records ----
 
@@ -67,15 +67,46 @@ pub static HUB_REQ: Kind = Kind {
     ],
 };
 
+/// The per-step DEVICE fields, shared by `hub_step` and `step_dev` (the
+/// readers sum a step's `step_dev` records into its `hub_step` BY NAME).
+/// Named BY the stage: `dgpu.a.b` -> `d_a_b`, `igpu.a` -> `i_a`; parent stages
+/// (`dgpu.*` / `igpu.*`) only make up `*_busy_ms`; `d_mtp` / `i_mtp` = the
+/// DSpark drafter and its ring writes (`mtp.*`, not in busy).
+macro_rules! with_dev_fields {
+    ($($pre:literal,)* ; $($post:literal,)*) => {
+        &[
+            $($pre,)*
+            // device busy (event time, parent stages)
+            "dgpu_busy_ms", "igpu_busy_ms",
+            // named dGPU stages (ms)
+            "d_output_proj", "d_attn_compute", "d_q_chain", "d_shared_expert", "d_mhc_pre_attn", "d_mhc_pre_ffn", "d_mhc_mix_ffn_late",
+            "d_router", "d_prefill_indexer", "d_prefill_indexer_reuse", "d_peer_push_ffn_input_norm", "d_kv_chain", "d_rb_pack",
+            "d_head_batch", "d_engram", "d_ffn_combine_local", "d_ffn_combine_remote", "d_kv_append_compressor_serial", "d_mhc_post_attn",
+            // named iGPU stages (ms)
+            "i_pair_kwide", "i_q2k_down", "i_moe_group_builder", "i_moe_work_items", "i_q8k_quantize_pre_iq2", "i_q8k_quantize_post_iq2",
+            "i_peer_push_ffn_moe",
+            // parent stages not named above (busy minus the named ones; the names
+            // are logged once as `evtrace: hub_step stages not named`)
+            "d_other", "i_other",
+            // the drafter (`mtp.*`)
+            "d_mtp", "i_mtp",
+            $($post,)*
+        ]
+    };
+}
+
 /// One decode step (multistream `step`), all per-step values -- the numbers
 /// `ms.stage` folds into 20-step means. `NaN` where profiling is off. The
 /// emitter fills fields BY NAME: `lh.x` -> `lh_x`, `dgpu.a.b` -> `d_a_b`,
 /// `igpu.a` -> `i_a`, so a stage added or renamed upstream reads NaN here
-/// rather than shifting columns.
+/// rather than shifting columns. With Tier B on (`evtrace_dev`), the device
+/// fields are NaN here and come in `step_dev` records (the readers merge
+/// them); `dev_skipped` = this step found no free event buffer (no device
+/// data), `t_fwd_sync` = the forward's final dGPU sync returned (RAW).
 pub static HUB_STEP: Kind = Kind {
     id: 11,
     name: "hub_step",
-    fields: &[
+    fields: with_dev_fields!(
         // identity + wall
         "t_start", "t_end", "step", "rows", "live", "lanes", "fwd_ms", "fwd_all_ms", "engram_ms", "sample_ms", "step_ms", "profiled",
         // ordered two-lane verify (`forward_step_arena_ready_first` `Ph::Chain`)
@@ -102,21 +133,33 @@ pub static HUB_STEP: Kind = Kind {
         "lh_excl", "lh_audit", "lh_remap_h2d", "lh_work_items_sync", "lh_remote_wait", "lh_pager_sync_igpu", "lh_engram_join",
         "lh_work_items_count", "lh_sel_d2h", "lh_sub", "lh_wic_busy_x1e3", "lh_wic_idle_x1e3", "lh_seld2h_busy_x1e3",
         "lh_seld2h_idle_x1e3", "lh_remote_sync",
-        // device busy (event time, parent stages)
-        "dgpu_busy_ms", "igpu_busy_ms",
-        // named dGPU stages (ms)
-        "d_output_proj", "d_attn_compute", "d_q_chain", "d_shared_expert", "d_mhc_pre_attn", "d_mhc_pre_ffn", "d_mhc_mix_ffn_late",
-        "d_router", "d_prefill_indexer", "d_prefill_indexer_reuse", "d_peer_push_ffn_input_norm", "d_kv_chain", "d_rb_pack",
-        "d_head_batch", "d_engram", "d_ffn_combine_local", "d_ffn_combine_remote", "d_kv_append_compressor_serial", "d_mhc_post_attn",
-        // named iGPU stages (ms)
-        "i_pair_kwide", "i_q2k_down", "i_moe_group_builder", "i_moe_work_items", "i_q8k_quantize_pre_iq2", "i_q8k_quantize_post_iq2",
-        "i_peer_push_ffn_moe",
-        // parent stages not named above (busy minus the named ones; the names
-        // are logged once as `evtrace: hub_step stages not named`)
-        "d_other", "i_other",
+        ;
         // context
         "pos_min", "pos_max",
-    ],
+        // Tier B (see above)
+        "dev_skipped", "t_fwd_sync",
+    ),
+};
+
+/// One decode step's device time on one device, from the Tier B thread
+/// (`evtrace_dev`) once the step's events completed: the device fields of
+/// `hub_step` (same names), summed BY EACH PAIR'S STEP, so a step can come
+/// in several partial records (its drafter rides the previous step's
+/// buffer): the readers SUM them per `(pid, step)`. `t_start` = the step's
+/// first stage start on this device (RAW). `pairs` / `deferred` (not
+/// complete at Tier B's first look) / `dropped` (never completed, or not
+/// convertible); causality (plan 2.4): `viol_a` = a stage started before the
+/// host recorded it, `viol_b` = a stage ended after a sync of its stream
+/// returned, of `checked_b`; `q_us_max` = the worst conversion bound;
+/// `lag_ms` / `tierb_us` = the buffer's handoff-to-done wall and Tier B's own
+/// time on it (on the record of the buffer's largest step only).
+pub static STEP_DEV: Kind = Kind {
+    id: 13,
+    name: "step_dev",
+    fields: with_dev_fields!(
+        "t_start", "step", "device", "pairs", "deferred", "dropped", "viol_a", "viol_b", "checked_b", "q_us_max", "lag_ms", "tierb_us",
+        ;
+    ),
 };
 
 /// Scheduler phase change (multistream `ms.phase`). Phases: 0 Decode,

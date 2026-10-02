@@ -393,3 +393,32 @@ deploy, as today).
 3. Open, defaults until decided: Tier B ON in production (device data reuses
    the profile already on; the critical path gets cheaper); box-2 device records
    OFF by default; P5 auto-dump after P4.
+
+## 7. P3 as built (2026-10-02)
+
+Code: `het/trace.rs` (stage context, buffers, the handoff in `reset()`),
+`het/evtrace_dev.rs` (calibrator, conversion, `step_dev` / `dev` / `cal`),
+`scripts/evtrace.py` / `evt2perfetto.py` (merge, device tracks, causality).
+Where it differs from sections 2.4 / 6:
+
+- **Conversion bias.** CLR 7.2 `hipEventElapsedTime` subtracts END timestamps of
+  both events and `hipEventRecord` always enqueues a NEW marker, so chain links
+  and conversions carry no start/end bias; the anchor bound is half its bracket
+  + 2 us.
+- **Rules (b) / (c) are one mechanism.** `EventPool::note_sync(stream)` after a
+  sync returns stores (stream, RAW, pairs so far): every pair already ENDED on
+  that stream must end on the device by then. Called after the four arena
+  drivers' final dGPU sync (also `hub_step.t_fwd_sync`) and after the head's
+  readback sync. Tier B counts per step (`step_dev.viol_a` / `viol_b` /
+  `checked_b`); the converter re-checks (a) and (b) from the records.
+- **`step_dev.t_start`** = the step's first stage START on that device
+  (converted), not the host's step start.
+- **Spare buffers** are created on the Tier B thread at a pool's first handoff
+  (its first epoch with pairs is skipped: counted); default 6 per pool
+  (`V41_EVTRACE_DEV_BUFS`); returned buffers are drained at every reset, so
+  their sums reach `ms.stage` at the next step.
+- **`hub_step.dev_skipped`** = resets since the previous step (prefill units
+  included) that found no free buffer.
+- **Kill switch**: `V41_EVTRACE_DEV=0` (live) = the synchronous harvest again.
+- **Box-2 `dev` records**: not yet (a later P3 step, behind a knob, default off).
+- GPU smoke test: `tests/evtrace_dev_gpu.rs` (`--ignored`, server down, ~10 s).

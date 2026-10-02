@@ -418,6 +418,9 @@ struct ProfileAcc {
     last_misses: u64,
     last_read_ns: u64,
     steps: u64,
+    /// Decode steps the device rows cover, dGPU / iGPU: with Tier B on
+    /// (`evtrace_dev`) their sums come back 1-2 steps late (plan N3).
+    steps_dev: [u64; 2],
     rows: u64,
     wall_ms: f64,
     stages: std::collections::HashMap<(&'static str, &'static str), (f64, u64)>,
@@ -1550,6 +1553,12 @@ impl Sched {
 
     /// The batched step over `self.streams` (all of them can step).
     fn decode_rows(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
+        // This step's id FIRST: the drafter below records device stages with
+        // it, and Tier B sums every pair by its own step (`hub_step.step`;
+        // docs/v41/EVTRACE_REBUILD_PLAN.md section 6 S1).
+        static EV_STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let step_id = EV_STEP.fetch_add(1, Ordering::Relaxed);
+        let _step_ctx = v4flash_kernels::het::trace::ctx_step(step_id);
         // Hot-set ownership refresh (see expert_pager::hot_set); `tick` is
         // advanced once per scheduler tick.
         if self.tick % knobs::B1_HOT_REFRESH.get() == 0 {
@@ -1653,9 +1662,7 @@ impl Sched {
         let ev_on = v4flash_kernels::het::evtrace::enabled();
         let mut ev: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         if ev_on {
-            use std::sync::atomic::AtomicU64;
-            static EV_STEP: AtomicU64 = AtomicU64::new(0);
-            let step = EV_STEP.fetch_add(1, Ordering::Relaxed);
+            let step = step_id;
             v4flash_kernels::het::evtrace_kinds::set_step(step, b as u64);
             ev.insert("t_start".into(), v4flash_kernels::het::evtrace::now());
             ev.insert("step".into(), step as f64);
@@ -1714,6 +1721,12 @@ impl Sched {
         if profile || pf_on {
             engine.dgpu.events.reset();
             engine.igpu.events.reset();
+        }
+        // Tier B held every buffer at a reset since the last step: those
+        // epochs (this step's included) recorded no device stages (plan N4).
+        let dev_skipped = engine.dgpu.events.take_skipped() + engine.igpu.events.take_skipped();
+        if ev_on && engine.dgpu.events.offloading() {
+            ev.insert("dev_skipped".into(), dev_skipped as f64);
         }
         if profile {
             v4flash_kernels::het::trace::phase::reset();
@@ -1832,6 +1845,11 @@ impl Sched {
         Ok::<_, eyre::Report>(targets)
         })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+        // The forward's final dGPU sync returned (causality rule (b), N1).
+        let t_fwd_sync = v4flash_kernels::het::forward_prefill::take_fwd_sync();
+        if ev_on && t_fwd_sync.is_finite() {
+            ev.insert("t_fwd_sync".into(), t_fwd_sync);
+        }
         // This step's device stages (perfetto), then the live trace's count.
         if pf_on {
             if let Err(e) = engine.export_step_perfetto() {
@@ -1879,9 +1897,16 @@ impl Sched {
             }
         }
         if profile {
-            use v4flash_kernels::het::trace::{phase as counters, rollup_by_name};
-            let dg = rollup_by_name(&engine.dgpu.events.harvest()?);
-            let ig = rollup_by_name(&engine.igpu.events.harvest()?);
+            use v4flash_kernels::het::trace::{phase as counters, rollup_by_name, EventPool};
+            // Tier B on (`evtrace_dev`): the step's buffers are timed off this
+            // thread; their sums come back 1-2 steps late with the decode
+            // steps they cover, and this step's `hub_step` device fields come
+            // in `step_dev` records instead. Otherwise the synchronous harvest.
+            let take = |p: &EventPool| -> eyre::Result<(Vec<(&'static str, f32, u32)>, u64, bool)> {
+                Ok(if p.offloading() { let (s, n) = p.take_dev_sums(); (s, n, true) } else { (rollup_by_name(&p.harvest()?), 1, false) })
+            };
+            let (dg, n_dg, off_dg) = take(&engine.dgpu.events)?;
+            let (ig, n_ig, off_ig) = take(&engine.igpu.events)?;
             // Box-2 leg, all per step, all sums over both lanes x 40 layers.
             // (`host.sel_sync/ensure/engram_stage` were the LEGACY path's
             // counters and read 0.00 here for a week; the live ones are `lh.*`.)
@@ -1909,6 +1934,8 @@ impl Sched {
             ];
             let acc = &mut self.profile_acc;
             acc.steps += 1;
+            acc.steps_dev[0] += n_dg;
+            acc.steps_dev[1] += n_ig;
             acc.rows += b as u64;
             acc.wall_ms += fwd_only_ms;
             for (dev, r) in [("dgpu", &dg), ("igpu", &ig)] {
@@ -1935,7 +1962,10 @@ impl Sched {
                 let mut busy = (0.0f64, 0.0f64);
                 let mut other = (0.0f64, 0.0f64);
                 let named = &v4flash_kernels::het::evtrace_kinds::HUB_STEP.fields;
-                for (pre, short, r) in [("dgpu.", "d_", &dg), ("igpu.", "i_", &ig)] {
+                for (pre, short, r, off) in [("dgpu.", "d_", &dg, off_dg), ("igpu.", "i_", &ig, off_ig)] {
+                    if off {
+                        continue; // `step_dev` carries them (other steps' sums are in `r`)
+                    }
                     for &(name, ms, _) in r.iter() {
                         if let Some(rest) = name.strip_prefix(pre) {
                             let key = format!("{short}{}", rest.replace('.', "_"));
@@ -1957,10 +1987,14 @@ impl Sched {
                         }
                     }
                 }
-                ev.insert("dgpu_busy_ms".into(), busy.0);
-                ev.insert("igpu_busy_ms".into(), busy.1);
-                ev.insert("d_other".into(), other.0);
-                ev.insert("i_other".into(), other.1);
+                if !off_dg {
+                    ev.insert("dgpu_busy_ms".into(), busy.0);
+                    ev.insert("d_other".into(), other.0);
+                }
+                if !off_ig {
+                    ev.insert("igpu_busy_ms".into(), busy.1);
+                    ev.insert("i_other".into(), other.1);
+                }
             }
             // Per-wait phase split (remote_experts::take_hop_stats): of the
             // box-2 waits this step, how many found the reply already in the
@@ -2058,13 +2092,20 @@ impl Sched {
             }
             let every = knobs::MS_PROFILE_EVERY.get();
             if acc.steps >= every {
-                let mut v: Vec<_> = acc.stages.iter().map(|(&(d, n), &(ms, c))| (d, n, ms / acc.steps as f64, c)).collect();
+                // Device rows per step THEY cover (`steps_dev`, plan N3).
+                let per = |d: &str| match d {
+                    "dgpu" => acc.steps_dev[0],
+                    "igpu" => acc.steps_dev[1],
+                    _ => acc.steps,
+                }
+                .max(1) as f64;
+                let mut v: Vec<_> = acc.stages.iter().map(|(&(d, n), &(ms, c))| (d, n, ms / per(d), c)).collect();
                 v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
                 // Parent stages only ("dgpu.*" / "igpu.*"): the "k.*" kernel
                 // sub-stages nest inside them and would double count.
                 let dgpu_busy: f64 = v.iter().filter(|e| e.0 == "dgpu" && e.1.starts_with("dgpu.")).map(|e| e.2).sum();
                 let igpu_busy: f64 = v.iter().filter(|e| e.0 == "igpu" && e.1.starts_with("igpu.")).map(|e| e.2).sum();
-                tracing::info!(steps = acc.steps, rows_avg = format!("{:.1}", acc.rows as f64 / acc.steps as f64),
+                tracing::info!(steps = acc.steps, steps_dev = format!("{}/{}", acc.steps_dev[0], acc.steps_dev[1]), rows_avg = format!("{:.1}", acc.rows as f64 / acc.steps as f64),
                     wall_ms = format!("{:.1}", acc.wall_ms / acc.steps as f64), dgpu_busy_ms = format!("{dgpu_busy:.1}"),
                     igpu_busy_ms = format!("{igpu_busy:.1}"), "ms.stage.total (per step)");
                 // Zero rows are counters this path never feeds; drop them.
@@ -2073,6 +2114,7 @@ impl Sched {
                 }
                 acc.stages.clear();
                 acc.steps = 0;
+                acc.steps_dev = [0; 2];
                 acc.rows = 0;
                 acc.wall_ms = 0.0;
             }

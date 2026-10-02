@@ -39,6 +39,11 @@ impl Event {
         self.raw
     }
 
+    /// The device this event was created on (and can be recorded on).
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
     pub fn record(&self, stream: &Stream) -> eyre::Result<()> {
         check_eyre(
             unsafe { sys::hipEventRecord(self.raw, stream.raw()) },

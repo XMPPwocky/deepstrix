@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """evtrace (*.evt) -> a perfetto timeline (Chrome JSON; open in ui.perfetto.dev).
-Both boxes on the hub's clock, host time (no per-kernel device slices).
+Both boxes on the hub's clock; the hub's device stage intervals (calibrated to
+host time by Tier B, `evtrace_dev`) when a hub Tier B dump is given.
 
   evt2perfetto.py window HUB.evt --last S [--lone]   hub + box-2 RAW windows of the last S s (JSON);
                                                      --lone: inside the latest run of lone-stream
                                                      (DSpark) steps lasting >= S (else the longest)
   evt2perfetto.py cut FILE... --from T --to T -o PREFIX   one PREFIX.<i>.evt per file holding records
                                                      in [T, T] (run on box 2; prints the paths)
-  evt2perfetto.py trace HUB.evt [B2.evt ...] --from T --to T -o OUT.json[.gz]
+  evt2perfetto.py trace FILE... --from T --to T -o OUT.json[.gz]
+                                                     FILEs by header role: the hub's Tier A file,
+                                                     its Tier B dumps (device intervals), box-2 cuts
 
 Tracks: hub = decode steps (rows / lanes / live; a lone stream with rows > 1 is a
 DSpark block), scheduler phases, per lane the box-2 requests (submit -> reply)
 and the hub's exposed waits, counters per step (box-2 wait / page ms, box-1
 pager misses / read ms, b2 misses); box 2 = requests (frame -> ready), run_path,
 ensure (paging), SSD reads by class (demand / certain / speculative; args: the
-drive route), reply writes. Box-2 stamps are moved onto the hub's
+drive route), reply writes; hub devices = one track per device and stream
+(`dgpu compute`, `igpu xfer`, ...) with each stage's step / layer / lane and
+`queued_us` (start - the host's record), calibration counters. The causality
+of the device intervals is checked (stderr): (a) none starts before the host
+recorded it, (b) none on the dGPU compute stream ends after its step's forward
+sync returned (`hub_step.t_fwd_sync`). Box-2 stamps are moved onto the hub's
 CLOCK_MONOTONIC_RAW by the hub's measured offset (`Offsets`). Overlapping
 slices of one kind go on numbered sub-tracks. The evt headers' env / knob
 tables are args of the `knobs` instants. Stdlib only.
@@ -284,29 +292,74 @@ def cmd_cut(a):
     print(' '.join(written))
 
 
+# String-id fields of a record, decoded as `<field>_s` (format_rev 2).
+STR_FIELDS = {'knob': ('name', 'value'), 'dev': ('name', 'device', 'stream'), 'step_dev': ('device',), 'cal': ('device',)}
+# `step_dev` -> `hub_step` (as evtrace.py's `merge_step_dev`).
+STEP_DEV_SUM = ('pairs', 'deferred', 'dropped', 'viol_a', 'viol_b', 'checked_b', 'tierb_us')
+STEP_DEV_MAX = ('q_us_max', 'lag_ms')
+STEP_DEV_IDENT = ('t_start', 'step', 'device')
+
+
+def merge_step_dev(steps, parts):
+    """SUM a step's `step_dev` records (per device; its drafter rides the
+    previous step's buffer) into its `hub_step` by field name where the step
+    has no value of its own; counters as `dev_<name>`."""
+    acc = defaultdict(dict)
+    for r in parts:
+        if r.get('step', NAN) != r.get('step', NAN):
+            continue
+        d = acc[(r.get('_pid'), int(r['step']))]
+        for k, v in r.items():
+            if k.startswith('_') or k in STEP_DEV_IDENT or k.endswith('_s') or v != v:
+                continue
+            d[k] = max(d.get(k, v), v) if k in STEP_DEV_MAX else d.get(k, 0.0) + v
+    for s in steps:
+        if s.get('step', NAN) != s.get('step', NAN):
+            continue
+        for k, v in acc.get((s.get('_pid'), int(s['step'])), {}).items():
+            if k in STEP_DEV_SUM or k in STEP_DEV_MAX:
+                s['dev_' + k] = v
+            elif s.get(k, NAN) != s.get(k, NAN):
+                s[k] = v
+
+
 def cmd_trace(a):
-    hub_hdr = header_of(a.files[0])[1]
+    hub_files, b2_files = [], []
+    for p in a.files:
+        (b2_files if header_of(p)[1].get('role') == 'b2' else hub_files).append(p)
+    if not hub_files:
+        sys.exit('trace: no hub file')
+    # The Tier A file first (its header is the run's; Tier B dumps add intervals).
+    hub_files.sort(key=lambda p: header_of(p)[1].get('tier') == 'B')
+    hub_hdr = header_of(hub_files[0])[1]
     offs, hub = Offsets(), defaultdict(list)
     keep_lo, keep_hi = a.t_from - 5e9, a.t_to + 5e9
     # String ids are PER PROCESS: decode each file's against its own table
     # (a box-2 window can span a daemon restart: two interners).
-    hub_str = dict(enumerate(hub_hdr.get('strings', [])))
-    for t, name, fields, vals in records(a.files[0], a.t_from - 300e9, a.t_to + 300e9, stop=a.t_to + 300e9 + STOP_MARGIN, strings=hub_str):
-        if name == 'hub_req':
+    for p in hub_files:
+        h = header_of(p)[1]
+        f_str = dict(enumerate(h.get('strings', [])))
+        # A Tier B dump is in batch order: never stop early in one.
+        stop = math.inf if h.get('tier') == 'B' else a.t_to + 300e9 + STOP_MARGIN
+        for t, name, fields, vals in records(p, a.t_from - 300e9, a.t_to + 300e9, stop=stop, strings=f_str):
             r = dict(zip(fields, vals))
-            offs.add(r)
-            if keep_lo <= t <= keep_hi:
-                hub[name].append(r)
-        elif keep_lo <= t <= keep_hi:
-            hub[name].append(dict(zip(fields, vals)))
+            if name == 'hub_req':
+                offs.add(r)
+            if not keep_lo <= t <= keep_hi:
+                continue
+            for k in STR_FIELDS.get(name, ()):
+                r[k + '_s'] = f_str.get(int(r[k]), '?') if r[k] == r[k] else '?'
+            r['_pid'] = h.get('pid')
+            hub[name].append(r)
+    merge_step_dev(hub.get('hub_step', []), hub.get('step_dev', []))
     b2_hdr, b2 = None, defaultdict(list)
-    for p in a.files[1:]:
+    for p in b2_files:
         b2_hdr = header_of(p)[1]
         f_str = dict(enumerate(b2_hdr.get('strings', [])))
         for _, name, fields, vals in records(p, strings=f_str):
             r = dict(zip(fields, vals))
-            if name == 'knob':
-                r['name_s'], r['value_s'] = f_str.get(int(r['name']), '?'), f_str.get(int(r['value']), '?')
+            for k in STR_FIELDS.get(name, ()):
+                r[k + '_s'] = f_str.get(int(r[k]), '?') if r[k] == r[k] else '?'
             b2[name].append(r)
     tr = Tracks(a.t_from)
     tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 1, 'args': {'name': 'hub (box 1)'}})
@@ -325,7 +378,8 @@ def cmd_trace(a):
         stages = {k: s[k] for k in s if k[:2] in ('d_', 'i_') and not math.isnan(s[k]) and s[k] > 0}
         tr.slice(1, 'decode steps', f'{kind}{lanes_s}', s['t_start'], s['t_end'],
                  {**fin(s, 'step', 'rows', 'live', 'lanes', 'step_ms', 'fwd_ms', 'remote_wait_ms', 'b2_page_ms', 'b2_misses',
-                        'b1_misses', 'b1_read_ms', 'rf_chain_waits', 'dgpu_busy_ms', 'igpu_busy_ms', 'pos_max'), **stages})
+                        'b1_misses', 'b1_read_ms', 'rf_chain_waits', 'dgpu_busy_ms', 'igpu_busy_ms', 'pos_max',
+                        'dev_pairs', 'dev_dropped', 'dev_skipped', 'dev_lag_ms'), **stages})
         for c in ('remote_wait_ms', 'b2_page_ms', 'b2_misses', 'b1_misses', 'b1_read_ms', 'step_ms'):
             tr.counter(1, c, s['t_start'], s.get(c, NAN))
     # Live knob changes (format_rev 2 `knob` records).
@@ -334,7 +388,7 @@ def cmd_trace(a):
     # of one window hold each change twice -- drawn once per (box, t, name).
     knobs_drawn = set()
     for k in hub.get('knob', []):  # (box 2's: below, on the hub clock)
-        nm, val = hub_str.get(int(k['name']), '?'), hub_str.get(int(k['value']), '?')
+        nm, val = k['name_s'], k['value_s']
         if inside(k['t']) and (1, k['t'], nm) not in knobs_drawn:
             knobs_drawn.add((1, k['t'], nm))
             tr.instant(1, 'knobs', f'knob {nm}={val}', k['t'], {'source': src_name.get(int(k['source']), '?')})
@@ -350,6 +404,7 @@ def cmd_trace(a):
         tr.slice(1, f'lane {lane}: box-2 request', name, r['t_submit'], r['t4'], args)
         if r['t_wait_exit'] > r['t_wait_enter']:
             tr.slice(1, f'lane {lane}: hub waits', f'wait {name}', r['t_wait_enter'], r['t_wait_exit'], args)
+    draw_devices(tr, hub, inside)
     if b2:
         off = offs.fn(a.t_from - 300e9, a.t_to + 300e9)
         to_hub = lambda t: t - off(t - off(a.t_to)) if not math.isnan(t) else NAN
@@ -396,6 +451,43 @@ def cmd_trace(a):
     with opener(a.o, 'wt') as f:
         json.dump(out, f)
     print(a.o, len(tr.ev), 'events')
+
+
+def draw_devices(tr, hub, inside):
+    """Tier B device intervals (pid 3), calibration counters, and the
+    causality check of the intervals against the host."""
+    devs = hub.get('dev', [])
+    if not devs:
+        return
+    tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 3, 'args': {'name': 'hub devices (calibrated to host time)'}})
+    fwd_sync = {(s.get('_pid'), int(s['step'])): s['t_fwd_sync'] for s in hub.get('hub_step', [])
+                if s.get('t_fwd_sync', NAN) == s.get('t_fwd_sync', NAN) and s['step'] == s['step']}
+    n = viol_a = viol_b = checked_b = 0
+    for d in devs:
+        if not (inside(d['t_start']) or inside(d['t_end'])):
+            continue
+        n += 1
+        q = d['q_us'] * 1e3
+        args = fin(d, 'step', 'unit', 'layer', 'lane', 'q_us')
+        if d['t_host'] == d['t_host']:
+            args['queued_us'] = round((d['t_start'] - d['t_host']) / 1e3, 1)
+            viol_a += d['t_start'] < d['t_host'] - q
+        tr.slice(3, f"{d['device_s']} {d['stream_s']}", d['name_s'], d['t_start'], d['t_end'], args)
+        if d['device_s'] == 'dgpu' and d['stream_s'] == 'compute' and d['step'] == d['step']:
+            ts = fwd_sync.get((d.get('_pid'), int(d['step'])))
+            if ts is not None and d['t_host'] < ts:
+                checked_b += 1
+                viol_b += d['t_end'] > ts + q
+    for c in hub.get('cal', []):
+        if not inside(c['t']):
+            continue
+        if c['ok'] == 1:
+            tr.counter(3, f"cal {c['device_s']} resid_us", c['t'], c['resid_us'])
+            tr.counter(3, f"cal {c['device_s']} q_us", c['t'], c['q_us'])
+        else:
+            tr.instant(3, f"cal {c['device_s']}", 'anchor discarded', c['t'], fin(c, 'spin_us'))
+    print(f'device intervals: {n}; causality (a) start before the host recorded it: {viol_a}; '
+          f'(b) after the forward sync: {viol_b} of {checked_b}', file=sys.stderr)
 
 
 class Tracks:
@@ -470,7 +562,7 @@ def main():
     c.add_argument('--to', dest='t_to', type=float, required=True)
     c.add_argument('-o', required=True, help='output prefix: writes PREFIX.<i>.evt per contributing file')
     t = sub.add_parser('trace')
-    t.add_argument('files', nargs='+', help='the hub file first, then box-2 files (cuts)')
+    t.add_argument('files', nargs='+', help='the hub Tier A file, hub Tier B dumps, box-2 files (cuts); by header role')
     t.add_argument('--from', dest='t_from', type=float, required=True)
     t.add_argument('--to', dest='t_to', type=float, required=True)
     t.add_argument('-o', required=True)

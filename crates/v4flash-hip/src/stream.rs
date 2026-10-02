@@ -51,6 +51,18 @@ impl Stream {
         Ok(Stream { raw, device_id })
     }
 
+    /// Non-blocking (`hipStreamNonBlocking`, see `new_non_blocking`) at
+    /// `priority` (smaller = higher, `Device::stream_priority_range`).
+    pub fn new_non_blocking_with_priority(device_id: i32, priority: i32) -> eyre::Result<Self> {
+        let mut raw: sys::hipStream_t = ptr::null_mut();
+        let _guard = crate::device::Device::scoped(device_id)?;
+        check_eyre(
+            unsafe { sys::hipStreamCreateWithPriority(&mut raw, sys::HIP_STREAM_NON_BLOCKING, priority) },
+            "hipStreamCreateWithPriority(NON_BLOCKING)",
+        )?;
+        Ok(Stream { raw, device_id })
+    }
+
     pub fn raw(&self) -> sys::hipStream_t {
         self.raw
     }

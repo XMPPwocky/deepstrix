@@ -281,10 +281,9 @@ pub(crate) fn init(role: &str, tier_a_dir: &Path) {
     }
     let keep_bytes = std::env::var("V41_EVTRACE_RING_KEEP_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(256) << 20;
     let cfg = DumpCfg { dir: dir.clone(), role: role.to_string(), keep_bytes };
-    let drain = std::thread::Builder::new().name("evtrace-tierb".into()).spawn(|| loop {
-        std::thread::sleep(Duration::from_millis(100));
-        drain_all();
-    });
+    // The Tier B thread also times the device buffers (`evtrace_dev`).
+    let rx = super::evtrace_dev::channel();
+    let drain = std::thread::Builder::new().name("evtrace-tierb".into()).spawn(move || super::evtrace_dev::tier_b_loop(rx, drain_all));
     let dump = std::thread::Builder::new().name("evtrace-dump".into()).spawn(move || dump_loop(cfg));
     if drain.is_err() || dump.is_err() {
         tracing::warn!("evtrace ring: thread failed to start; Tier B off");

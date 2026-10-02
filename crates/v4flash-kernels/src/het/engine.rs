@@ -217,6 +217,9 @@ impl DeviceEngine {
         let compute = Stream::new(device.id)?;
         let xfer = Stream::new(device.id)?;
         let hc = Stream::new(device.id)?;
+        super::trace::name_stream(&compute, "compute");
+        super::trace::name_stream(&xfer, "xfer");
+        super::trace::name_stream(&hc, "hc");
         let is_igpu = device.properties()?.integrated;
         let label: &'static str = if is_igpu { "igpu" } else { "dgpu" };
         let events = EventPool::new(label, EVENT_POOL_CAPACITY)?;
