@@ -429,9 +429,12 @@ Where it differs from sections 2.4 / 6:
   10 s is not anchored (an idle hub, box 2 with its records off); the next
   handoff anchors at once; an anchor more than 2 s after the previous one
   starts a new chain (the slope is kept, its bound widens until 1 s of span).
-- **Spare buffers are sized by use**: 8x the first epoch's events, at least
-  4096, at most the pool's own (the hub keeps 16384; box 2's tiny epochs do
-  not get 5 x 16384 events per executor).
+- **Spare buffers** have the pool's capacity unless it asks otherwise
+  (`EventPool::set_spare_capacity`: box 2's executors 4096; the hub keeps
+  16384).
+- **Sync marks only while recording** (review 29): `note_sync` is a no-op
+  unless the pool is enabled AND offloading (a disabled pool is never reset:
+  box 2's knob off would pile one mark per request up forever).
 - **Box-2 `dev` records** (`V41_B2_EVTRACE_DEV`, by that full name, live,
   default off; recorded only when its Tier B takes the buffers): each
   request's GPU span `b2.run` through the executor's engine pool

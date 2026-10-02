@@ -226,6 +226,8 @@ pub struct EventPool {
     /// This epoch's buffer goes to Tier B at the next reset (set at every
     /// reset): stages take host stamps, `note_sync` records.
     offload: Cell<bool>,
+    /// `set_spare_capacity`.
+    spare_cap: Cell<usize>,
     device: i32,
     id: u64,
 }
@@ -292,10 +294,15 @@ impl EventPool {
     /// `capacity / 2` start/end pairs per token). The caller must have
     /// the relevant device already current.
     pub fn new(label: &'static str, capacity: usize) -> eyre::Result<Self> {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let buf = Buf::new(capacity)?;
         let device = buf.events.first().map(|e| e.device_id()).unwrap_or(-1);
-        Ok(Self {
+        Ok(Self::with_buf(label, buf, device))
+    }
+
+    fn with_buf(label: &'static str, buf: Buf, device: i32) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let capacity = buf.events.len();
+        Self {
             inner: RefCell::new(EventPoolInner {
                 buf: Some(Box::new(buf)),
                 free: Vec::new(),
@@ -319,9 +326,16 @@ impl EventPool {
             capturing: Cell::new(false),
             sub: Cell::new(kernel_stages()),
             offload: Cell::new(false),
+            spare_cap: Cell::new(capacity),
             device,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        })
+        }
+    }
+
+    /// Events in each spare buffer Tier B makes for this pool (default: the
+    /// pool's own capacity). Box 2's executors: a few events an epoch.
+    pub fn set_spare_capacity(&self, n: usize) {
+        self.spare_cap.set(n);
     }
 
     /// Record `k.*` kernel sub-stages too (perfetto wants them; the rollup does not).
@@ -378,7 +392,7 @@ impl EventPool {
         if off && inner.buf.as_ref().is_some_and(|b| !b.pairs.is_empty()) {
             let b = inner.buf.take().expect("checked");
             let ret = inner.back.get_or_insert_with(|| std::sync::mpsc::sync_channel(super::evtrace_dev::bufs_per_pool())).0.clone();
-            if let Err(b) = super::evtrace_dev::hand_off(self.id, self.device, self.label, b, ret) {
+            if let Err(b) = super::evtrace_dev::hand_off(self.id, self.device, self.label, self.spare_cap.get(), b, ret) {
                 inner.buf = Some(b); // Tier B behind or gone: this epoch's pairs are lost
             }
         }
@@ -419,16 +433,21 @@ impl EventPool {
     /// The calling thread just returned from a synchronization of `stream`
     /// (`synchronize()`, a blocking readback): every stage recorded on it
     /// so far has ended. Tier B checks that against the device clock (plan 2.4
-    /// rules (b) / (c)). Returns the RAW stamp, NaN when not offloading.
+    /// rules (b) / (c)). Returns the RAW stamp, NaN when not recording for
+    /// Tier B -- a DISABLED pool is never reset, so its marks would pile up.
     pub fn note_sync(&self, stream: &Stream) -> f64 {
-        if !self.offload.get() {
+        self.note_sync_raw(stream.raw() as usize)
+    }
+
+    fn note_sync_raw(&self, stream: usize) -> f64 {
+        if !(self.enabled.get() && self.offload.get()) {
             return f64::NAN;
         }
         let t = super::evtrace::now();
         let mut inner = self.inner.borrow_mut();
         if let Some(b) = inner.buf.as_mut() {
             let n_pairs = b.pairs.len();
-            b.syncs.push(SyncMark { stream: stream.raw() as usize, t, n_pairs });
+            b.syncs.push(SyncMark { stream, t, n_pairs });
         }
         t
     }
@@ -901,4 +920,46 @@ pub fn rollup_by_name(timings: &[KernelTiming]) -> Vec<(&'static str, f32, u32)>
     let mut out: Vec<_> = by.into_iter().map(|(k, (s, c))| (k, s, c)).collect();
     out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pool with no HIP events (stages are FULL no-ops; marks need none).
+    fn pool() -> EventPool {
+        EventPool::with_buf("dgpu", Buf::with_events(Vec::new()), -1)
+    }
+
+    fn marks(p: &EventPool) -> usize {
+        p.inner.borrow().buf.as_ref().map_or(0, |b| b.syncs.len())
+    }
+
+    /// Review 29 (blocker): box 2 turns its pool off without a further reset;
+    /// sync marks must stop then, or one per request piles up forever.
+    #[test]
+    fn sync_marks_only_while_recording_for_tier_b() {
+        let p = pool();
+        p.set_enabled(true);
+        p.offload.set(true); // as `reset()` leaves it with Tier B on
+        assert!(p.note_sync_raw(7).is_finite());
+        assert_eq!(marks(&p), 1);
+        p.set_enabled(false); // the knob off: no reset follows
+        for _ in 0..10_000 {
+            assert!(p.note_sync_raw(7).is_nan());
+        }
+        assert_eq!(marks(&p), 1);
+        p.set_enabled(true);
+        p.offload.set(false); // Tier B off
+        assert!(p.note_sync_raw(7).is_nan());
+        assert_eq!(marks(&p), 1);
+    }
+
+    #[test]
+    fn spare_capacity_defaults_to_the_pools() {
+        let p = pool();
+        assert_eq!(p.spare_cap.get(), 0);
+        p.set_spare_capacity(4096);
+        assert_eq!(p.spare_cap.get(), 4096);
+    }
 }

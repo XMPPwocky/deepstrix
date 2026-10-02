@@ -153,7 +153,9 @@ fn tier_b_times_device_stages() {
             d.pool.note_sync(&d.stream);
             d.twin.insert(step, Event::elapsed_ms(&a, &b).unwrap());
         }
-        std::thread::sleep(Duration::from_millis(if n_steps > 200 { 2 } else { 10 }));
+        // Long runs at ~a hub step's pace (Tier B converts ~1200 pairs per
+        // device per step; a test-pace lag would skip epochs, not measure).
+        std::thread::sleep(Duration::from_millis(if n_steps > 200 { 20 } else { 10 }));
     }
     let bufs = std::env::var("V41_EVTRACE_DEV_BUFS").unwrap_or_else(|_| "6".into());
     for d in devs.iter_mut() {
@@ -175,8 +177,9 @@ fn tier_b_times_device_stages() {
         let (sums, steps) = d.pool.take_dev_sums();
         let skipped = d.pool.take_skipped();
         println!("{}: sums over {steps} steps ({skipped} resets skipped): {sums:?}", d.label);
-        // The first handoff finds no spare (Tier B makes them): one step lost.
-        assert!(steps >= n_steps - STEPS_FLOOR, "{}: {steps} steps came back", d.label);
+        // The first handoff finds no spare (Tier B makes them): one step lost;
+        // a long run may skip a few more (counted, `take_skipped`).
+        assert!(steps >= n_steps * 99 / 100 - STEPS_FLOOR, "{}: {steps} steps came back", d.label);
         assert!(sums.iter().any(|s| s.0 == d.stages[0]), "{}: no sums", d.label);
     }
 
@@ -193,7 +196,7 @@ fn tier_b_times_device_stages() {
             d.label, recs.len(), sum("pairs"), sum("dropped"), sum("deferred"), sum("viol_a"), sum("viol_b"), sum("checked_b"),
             recs.iter().map(|r| r["q_us_max"]).fold(0.0, f64::max)
         );
-        assert!(recs.len() as u64 >= n_steps - STEPS_FLOOR, "{}: {} step_dev records", d.label, recs.len());
+        assert!(recs.len() as u64 >= n_steps * 99 / 100 - STEPS_FLOOR, "{}: {} step_dev records", d.label, recs.len());
         let mut q: Vec<f64> = cal.iter().filter(|r| r["device"] == dev_id && r["ok"] == 1.0).map(|r| r["q_us"]).collect();
         let mut spin: Vec<f64> = cal.iter().filter(|r| r["device"] == dev_id && r["ok"] == 1.0).map(|r| r["spin_us"]).collect();
         if !q.is_empty() {

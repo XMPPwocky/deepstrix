@@ -80,6 +80,8 @@ pub(crate) struct Handoff {
     pool: u64,
     device: i32,
     label: &'static str,
+    /// Events per spare buffer (`EventPool::set_spare_capacity`).
+    spare_cap: usize,
     buf: Box<Buf>,
     ret: SyncSender<Box<Buf>>,
 }
@@ -99,9 +101,9 @@ pub(crate) fn bufs_per_pool() -> usize {
 
 /// Queue `buf` for the Tier B thread; `Err` gives it back (Tier B behind or
 /// gone, counted).
-pub(crate) fn hand_off(pool: u64, device: i32, label: &'static str, buf: Box<Buf>, ret: SyncSender<Box<Buf>>) -> Result<(), Box<Buf>> {
+pub(crate) fn hand_off(pool: u64, device: i32, label: &'static str, spare_cap: usize, buf: Box<Buf>, ret: SyncSender<Box<Buf>>) -> Result<(), Box<Buf>> {
     let Some(tx) = TX.get() else { return Err(buf) };
-    match tx.try_send(Handoff { pool, device, label, buf, ret }) {
+    match tx.try_send(Handoff { pool, device, label, spare_cap, buf, ret }) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(h)) | Err(TrySendError::Disconnected(h)) => {
             STATS.handoff_full.fetch_add(1, Relaxed);
@@ -670,11 +672,9 @@ impl TierB {
         let t0 = Instant::now();
         if self.pools.insert(h.pool) {
             // The pool's spare buffers, made here (never on the scheduler
-            // thread), sized by this first epoch's use (8x, at least 4096
-            // events, at most the pool's own): the hub keeps its full pools,
-            // box 2's ~2-event epochs do not get 5 x 16384 events per executor.
-            // An epoch that outgrows a spare drops stages (counted, FULL).
-            let cap = h.buf.events.len().min((8 * h.buf.next).next_power_of_two().max(4096));
+            // thread), at the pool's spare capacity (its own by default; box
+            // 2's executors ask for 4096: a few events an epoch).
+            let cap = h.spare_cap.max(64);
             let made = (|| -> color_eyre::eyre::Result<Vec<Box<Buf>>> {
                 let _g = Device::new(h.device).scoped_current()?;
                 (1..bufs_per_pool()).map(|_| Buf::new(cap).map(Box::new)).collect()

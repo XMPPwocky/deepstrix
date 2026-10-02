@@ -5677,6 +5677,8 @@ impl MoeExecutor {
         igpu.set_current()?;
         let arch = igpu.properties()?.gcn_arch_name;
         let engine = DeviceEngine::for_arch(igpu, &arch)?;
+        // `dev_epoch`'s epochs hold ~2 events a request: small spares.
+        engine.events.set_spare_capacity(4096);
         let id = igpu.id;
         let nu = N_EXPERT_USED;
         let wi_len = N_EXPERT as usize + rows * nu;
