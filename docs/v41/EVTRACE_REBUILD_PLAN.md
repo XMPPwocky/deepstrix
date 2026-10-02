@@ -425,13 +425,24 @@ Where it differs from sections 2.4 / 6:
   each stream's LAST end event of a buffer and converts the stream whole once
   that one completed: at most one such marker per still-running stream per
   buffer, from the Tier B thread.
-- **Box-2 `dev` records** (`V41_B2_EVTRACE_DEV` / `evtrace_dev`, live, default
-  off): each request's GPU span `b2.run` through the executor's engine pool
-  (`EventPool::open` / `close`, a guard-free token), `dev.unit` = the request's
-  seq; the pool is handed to Tier B every 100 ms between requests
-  (`MoeExecutor::dev_epoch`; the parking executor `exec2` too). Drawn per
-  stream on box 2's process (`trace_now.sh B2DUMP=1`).
+- **Calibration follows traffic (review 28).** A device with no handoff for
+  10 s is not anchored (an idle hub, box 2 with its records off); the next
+  handoff anchors at once; an anchor more than 2 s after the previous one
+  starts a new chain (the slope is kept, its bound widens until 1 s of span).
+- **Spare buffers are sized by use**: 8x the first epoch's events, at least
+  4096, at most the pool's own (the hub keeps 16384; box 2's tiny epochs do
+  not get 5 x 16384 events per executor).
+- **Box-2 `dev` records** (`V41_B2_EVTRACE_DEV`, by that full name, live,
+  default off; recorded only when its Tier B takes the buffers): each
+  request's GPU span `b2.run` through the executor's engine pool
+  (`EventPool::open` / `close`: a guard-free token that knows its pool and
+  stream), `dev.unit` = the request's seq, rule (b) after `ev_done`; the pool is
+  handed to Tier B every 100 ms after the replies, on idle ticks, and at an off
+  flip (`MoeExecutor::dev_epoch`; the parking executor `exec2` too, its streams
+  named `park.*`). Drawn per stream on box 2's process (`trace_now.sh
+  B2DUMP=1`).
 - GPU smoke test: `tests/evtrace_dev_gpu.rs` (`--ignored`, server down, ~10 s;
-  `EVTRACE_GPU_STEPS=3000` long): conversion vs `elapsed` twins, causality,
-  anchors, the stage calls' latency early vs late (6 live buffers per pool),
-  the anchors' bracket bound.
+  `EVTRACE_GPU_STEPS=3000` long, `EVTRACE_GPU_PAIRS` empty stages a step,
+  default 600 ~ the hub's): conversion vs `elapsed` twins, causality, anchors,
+  every record call's latency early vs late -- run with
+  `V41_EVTRACE_DEV_BUFS=2` and `=6` to compare -- and the anchors' bracket bound.

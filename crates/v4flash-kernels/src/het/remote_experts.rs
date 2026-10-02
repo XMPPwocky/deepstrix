@@ -1936,11 +1936,12 @@ pub mod knobs {
         pub static PREFILL_ROUTE = Knob::choice("V41_B2_PREFILL_ROUTE", 0, &[&["split"], &["mirror"]]).alias("prefill_route");
         /// `V41_B2_FAST_CHAIN` (default on), key `fast_chain`.
         pub static FAST_CHAIN = Knob::flag("V41_B2_FAST_CHAIN", true).alias("fast_chain");
-        /// `V41_B2_EVTRACE_DEV` / `evtrace_dev` (default off): each request's
-        /// GPU span (`b2.run`, `dev.unit` = its seq) goes to evtrace's Tier B
-        /// as a `dev` record (`ExpertExec::dev_epoch`; ~0.2-0.4% of box 2's
-        /// iGPU time, the bottleneck, so off unless wanted).
-        pub static EVTRACE_DEV = Knob::flag("V41_B2_EVTRACE_DEV", false).alias("evtrace_dev");
+        /// `V41_B2_EVTRACE_DEV` (default off; live, by that full name -- not the
+        /// hub's `V41_EVTRACE_DEV`): each request's GPU span (`b2.run`,
+        /// `dev.unit` = its seq) goes to evtrace's Tier B as a `dev` record
+        /// (`MoeExecutor::dev_epoch`; ~0.2-0.4% of box 2's iGPU time, the
+        /// bottleneck, so off unless wanted).
+        pub static EVTRACE_DEV = Knob::flag("V41_B2_EVTRACE_DEV", false).live();
         /// `V41_B2_PREFILL_BUDGET` (default 3500), key `prefill_budget`.
         pub static PREFILL_BUDGET = Knob::int("V41_B2_PREFILL_BUDGET", 3500, 0, MAX).alias("prefill_budget");
         /// `V41_B2_ENCODER_VICTIMS_FIRST` (default on), key `encoder_victims_first`.
@@ -5785,9 +5786,12 @@ impl MoeExecutor {
     /// handed to evtrace's Tier B every 100 ms. Call between requests (the
     /// last one's GPU work has completed).
     pub fn dev_epoch(&mut self) {
-        let on = knobs::EVTRACE_DEV.on();
+        let on = knobs::EVTRACE_DEV.on() && super::evtrace_dev::offload_on();
         let ev = &self.engine.events;
         if on != ev.is_enabled() {
+            if !on {
+                ev.reset(); // the last buffer goes to Tier B now, not at the next on
+            }
             ev.set_enabled(on);
         }
         if on && self.dev_epoch_t.elapsed() >= std::time::Duration::from_millis(100) {
@@ -6140,6 +6144,8 @@ impl MoeExecutor {
             overlap(shard, false)?;
             std::thread::sleep(std::time::Duration::from_micros(20));
         }
+        // `compute` drained: Tier B's causality rule (b) for `b2.run`.
+        self.engine.events.note_sync(&self.engine.compute);
         self.in_flight = false;
         if fast && self.reply_f16 {
             // The fast reduce wrote the f16 rows into `out16_pin`; the event
@@ -6820,7 +6826,14 @@ pub fn serve_connection(
                             got = Some(m);
                             break;
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => exec.keep_warm()?,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            exec.keep_warm()?;
+                            // Idle: the device-interval buffers still go out.
+                            exec.dev_epoch();
+                            if let Some(e2) = exec2.as_mut() {
+                                e2.dev_epoch();
+                            }
+                        }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
@@ -7129,7 +7142,12 @@ pub fn serve_connection(
                     loop {
                         while pending_ref.front().is_some_and(|m| servable(m)) {
                             if exec2_ref.is_none() {
-                                *exec2_ref = Some(MoeExecutor::new(exec_device, rows2, exec_decode_max_b)?);
+                                let e2 = MoeExecutor::new(exec_device, rows2, exec_decode_max_b)?;
+                                // Its own device tracks (served inside a parked request, concurrently).
+                                super::trace::name_stream(&e2.engine.compute, "park.compute");
+                                super::trace::name_stream(&e2.engine.xfer, "park.xfer");
+                                super::trace::name_stream(&e2.engine.hc, "park.hc");
+                                *exec2_ref = Some(e2);
                                 eprintln!("expertd: park executor ready ({rows2} rows)");
                             }
                             if !counted {
@@ -7152,7 +7170,6 @@ pub fn serve_connection(
                             // the parked request's is restored for its pass.
                             let parked_mode = shard.req_prefill;
                             let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
-                            ex2.dev_epoch();
                             shard.req_prefill = parked_mode;
                             let _ = tx_req_recycle_ref.send(buf);
                             *serve_acc += t_serve.elapsed().as_nanos() as u64;
@@ -7165,6 +7182,8 @@ pub fn serve_connection(
                                     }
                                     *n_done_ref += 1;
                                     *park_served_ref += 1;
+                                    // A long park: its buffer goes out every 100 ms too.
+                                    ex2.dev_epoch();
                                 }
                                 Err(e) => {
                                     let msg = format!("{e:#}");
@@ -7224,7 +7243,6 @@ pub fn serve_connection(
                     exec.run_path(shard, req.layer, b + bb, xq_run, sel_run, ew_run, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?
                 };
                 let ev_t_run1 = if ev_on { super::evtrace::now() } else { nan };
-                exec.dev_epoch();
                 drop(overlap);
                 w_park_wait_ns += this_park_wait_ns;
                 w_park_serve_ns += this_park_serve_ns;
@@ -7509,6 +7527,12 @@ pub fn serve_connection(
                         *n_total = n_done as u64;
                         w_n += 1;
                         w_merged += 1;
+                    }
+                    // Device intervals (`knobs::EVTRACE_DEV`): after the
+                    // replies, both executors (the GPU work has completed).
+                    exec.dev_epoch();
+                    if let Some(e2) = exec2.as_mut() {
+                        e2.dev_epoch();
                     }
                     // Catch-all tier: box 2 now owns ALL the paging, so its miss
                     // rate is the number that matters and the hub cannot see it.

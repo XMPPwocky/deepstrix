@@ -487,12 +487,19 @@ impl EventPool {
         let t_host = if self.offload.get() { super::evtrace::now() } else { f64::NAN };
         buf.events[idx].record(stream)?;
         drop(inner);
-        Ok(Some(OpenStage { name, start_idx: idx, epoch, ctx: ctx(), t_host }))
+        Ok(Some(OpenStage { name, start_idx: idx, epoch, ctx: ctx(), t_host, pool: self.id, stream: stream.raw() as usize }))
     }
 
     /// Record the end of an `open` stage on `stream` (its start's stream).
     pub fn close(&self, open: Option<OpenStage>, stream: &Stream) -> eyre::Result<()> {
         let Some(o) = open else { return Ok(()) };
+        // Another pool's token, or another stream's (its start would not be
+        // covered by this stream's completion): no pair.
+        debug_assert!(o.pool == self.id && o.stream == stream.raw() as usize, "stage {} closed on another pool / stream", o.name);
+        if o.pool != self.id || o.stream != stream.raw() as usize {
+            note_drop(self.label, o.name, 0, 0);
+            return Ok(());
+        }
         let mut inner = self.inner.borrow_mut();
         // Open across a reset (resets are top-level, so not today): the start
         // event is in a buffer Tier B now holds. Drop the pair.
@@ -598,6 +605,9 @@ pub struct OpenStage {
     epoch: u64,
     ctx: StageCtx,
     t_host: f64,
+    /// The pool (`EventPool::id`) and stream it must be closed on.
+    pool: u64,
+    stream: usize,
 }
 
 /// RAII guard that records its end event on drop.

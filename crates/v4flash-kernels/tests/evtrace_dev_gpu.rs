@@ -8,9 +8,12 @@
 //! calibrated duration matches a plain `elapsed` twin inside it.
 //!
 //! Also printed (the review's two runtime questions): the stage record
-//! calls' host latency early vs late in the run (6 buffers per pool keep ~6x
-//! the recorded events alive: does `hipEventRecord` slow down?), and the
-//! anchors' bracket bound per device. `EVTRACE_GPU_STEPS=3000` runs long.
+//! calls' host latency early vs late in the run, and the anchors' bracket
+//! bound per device. Each step also records `EVTRACE_GPU_PAIRS` (default 600)
+//! empty stages per device, so the buffers in flight hold about what the hub's
+//! do (~1000 pairs a step): run with `V41_EVTRACE_DEV_BUFS=2` and `=6` and
+//! compare the record calls (6 buffers keep ~3x the recorded events alive:
+//! does `hipEventRecord` slow down?). `EVTRACE_GPU_STEPS=3000` runs long.
 //!
 //! GPU, ~10 s: run with the server DOWN.
 //!   cargo test --release -p v4flash-kernels --features v41 --test evtrace_dev_gpu -- --ignored --nocapture
@@ -24,6 +27,10 @@ use v4flash_kernels::het::{evtrace, evtrace_dev, evtrace_ring};
 
 fn steps() -> u64 {
     std::env::var("EVTRACE_GPU_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(40)
+}
+
+fn tiny_pairs() -> usize {
+    std::env::var("EVTRACE_GPU_PAIRS").ok().and_then(|v| v.parse().ok()).unwrap_or(600)
 }
 
 /// p50 / p99 / max of `v` (us).
@@ -76,8 +83,9 @@ struct Dev {
     small: DeviceBuffer<u8>,
     /// Per step: the plain `elapsed` of the big memset (ms).
     twin: HashMap<u64, f32>,
-    /// Per step: host us of the stage calls (both opens and closes).
-    rec_us: Vec<f64>,
+    /// Host us of every stage open / close in the first and the last 10% of steps.
+    early_us: Vec<f64>,
+    late_us: Vec<f64>,
 }
 
 #[test]
@@ -101,47 +109,61 @@ fn tier_b_times_device_stages() {
         let (label, stages) = if igpu { ("igpu", ["igpu.pair_kwide", "igpu.q2k_down"]) } else { ("dgpu", ["dgpu.q_chain", "dgpu.router"]) };
         let pool = EventPool::new(label, 4096).unwrap();
         pool.set_enabled(true);
-        devs.push(Dev { label, stages, stream: Stream::new(id).unwrap(), pool, big: DeviceBuffer::new(id, 256 << 20).unwrap(), small: DeviceBuffer::new(id, 32 << 20).unwrap(), twin: HashMap::new(), rec_us: Vec::new() });
+        devs.push(Dev { label, stages, stream: Stream::new(id).unwrap(), pool, big: DeviceBuffer::new(id, 256 << 20).unwrap(), small: DeviceBuffer::new(id, 32 << 20).unwrap(), twin: HashMap::new(), early_us: Vec::new(), late_us: Vec::new() });
     }
     const STEPS_FLOOR: u64 = 2;
     let n_steps = steps();
-    let (a, b) = (Event::new().unwrap(), Event::new().unwrap());
+    let n_tiny = tiny_pairs();
+    let k = (n_steps / 10).max(1);
+    let tiny_name = |d: &Dev| if d.label == "dgpu" { "dgpu.tiny" } else { "igpu.tiny" };
     for step in 0..n_steps {
         for d in devs.iter_mut() {
             d.pool.reset();
             let _ctx = ctx_step(step);
             let _g = Device::new(d.stream.device_id()).scoped_current().unwrap();
             let (a, b) = (Event::new().unwrap(), Event::new().unwrap());
-            let t = std::time::Instant::now();
-            let o = d.pool.open(d.stages[0], &d.stream).unwrap();
-            let mut us = t.elapsed().as_secs_f64() * 1e6;
+            let mut calls: Vec<f64> = Vec::with_capacity(2 * n_tiny + 4);
+            let mut timed = |f: &mut dyn FnMut()| {
+                let t = std::time::Instant::now();
+                f();
+                calls.push(t.elapsed().as_secs_f64() * 1e6);
+            };
+            let mut o = None;
+            timed(&mut || o = d.pool.open(d.stages[0], &d.stream).unwrap());
             a.record(&d.stream).unwrap();
             d.big.fill_zero_async(&d.stream).unwrap();
             b.record(&d.stream).unwrap();
-            let t = std::time::Instant::now();
-            d.pool.close(o, &d.stream).unwrap();
-            us += t.elapsed().as_secs_f64() * 1e6;
-            {
-                let t = std::time::Instant::now();
-                let _t = d.pool.stage(d.stages[1], &d.stream).unwrap();
-                us += t.elapsed().as_secs_f64() * 1e6;
-                d.small.fill_zero_async(&d.stream).unwrap();
+            timed(&mut || d.pool.close(o, &d.stream).unwrap());
+            let mut o = None;
+            timed(&mut || o = d.pool.open(d.stages[1], &d.stream).unwrap());
+            d.small.fill_zero_async(&d.stream).unwrap();
+            timed(&mut || d.pool.close(o, &d.stream).unwrap());
+            let name = tiny_name(d);
+            for _ in 0..n_tiny {
+                let mut o = None;
+                timed(&mut || o = d.pool.open(name, &d.stream).unwrap());
+                timed(&mut || d.pool.close(o, &d.stream).unwrap());
             }
-            d.rec_us.push(us);
+            if step < k {
+                d.early_us.extend(&calls);
+            } else if step >= n_steps - k {
+                d.late_us.extend(&calls);
+            }
             d.stream.synchronize().unwrap();
             d.pool.note_sync(&d.stream);
             d.twin.insert(step, Event::elapsed_ms(&a, &b).unwrap());
         }
         std::thread::sleep(Duration::from_millis(if n_steps > 200 { 2 } else { 10 }));
     }
-    drop((a, b));
+    let bufs = std::env::var("V41_EVTRACE_DEV_BUFS").unwrap_or_else(|_| "6".into());
     for d in devs.iter_mut() {
-        let n = d.rec_us.len();
-        let k = (n / 10).max(1);
-        let (e50, e99, emax) = pcts(&mut d.rec_us[..k].to_vec());
-        let (l50, l99, lmax) = pcts(&mut d.rec_us[n - k..].to_vec());
-        println!("{}: stage-call host us per step, first {k} steps p50 {e50:.1} p99 {e99:.1} max {emax:.1}; last {k} p50 {l50:.1} p99 {l99:.1} max {lmax:.1}", d.label);
-        assert!(l50 < 4.0 * e50.max(5.0), "{}: stage calls slowed down over the run ({e50:.1} -> {l50:.1} us p50)", d.label);
+        let (e50, e99, emax) = pcts(&mut d.early_us);
+        let (l50, l99, lmax) = pcts(&mut d.late_us);
+        println!(
+            "{}: record calls (bufs {bufs}, {n_tiny} + 2 stages a step) host us: first {k} steps p50 {e50:.2} p99 {e99:.1} max {emax:.0}; last {k} p50 {l50:.2} p99 {l99:.1} max {lmax:.0}",
+            d.label
+        );
+        assert!(l50 < 4.0 * e50.max(2.0), "{}: record calls slowed down over the run ({e50:.2} -> {l50:.2} us p50)", d.label);
     }
     // Hand the last buffers off, let Tier B finish and Tier A flush, fold the sums.
     for d in &devs {

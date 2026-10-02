@@ -355,9 +355,11 @@ def cmd_trace(a):
         if h.get('tier') == 'B':
             hub['_tier_b_files'].append(p)
     merge_step_dev(hub.get('hub_step', []), hub.get('step_dev', []))
-    b2_hdr, b2 = None, defaultdict(list)
+    b2_hdr, b2, b2_tier_b = None, defaultdict(list), False
     for p in b2_files:
         b2_hdr = header_of(p)[1]
+        b2_tier_b |= b2_hdr.get('tier') == 'B'
+
         f_str = dict(enumerate(b2_hdr.get('strings', [])))
         for _, name, fields, vals in records(p, strings=f_str):
             r = dict(zip(fields, vals))
@@ -448,7 +450,10 @@ def cmd_trace(a):
                 tr.slice(2, 'reply writes', f"seq {int(w['seq'])}", t, to_hub(w['t_written']), fin(w, 'bytes'))
         # Box-2 device intervals (`V41_B2_EVTRACE_DEV`, its Tier B dumps):
         # each request's GPU span, `unit` = its seq; one track per stream (a
-        # parked request's and the requests served inside it: two executors).
+        # parked request's `compute` and the requests served inside it on the
+        # parking executor's `park.compute`).
+        if b2_tier_b and not any(inside(to_hub(d['t_start'])) for d in b2.get('dev', [])):
+            print('box-2 device intervals: none in the window (a box-2 Tier B dump was given: older than its ring, or V41_B2_EVTRACE_DEV off)', file=sys.stderr)
         for d in b2.get('dev', []):
             t = to_hub(d['t_start'])
             if not inside(t):

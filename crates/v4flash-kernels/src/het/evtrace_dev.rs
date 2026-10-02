@@ -62,6 +62,12 @@ const JUMP_NS: f64 = 100e3;
 const POLL: Duration = Duration::from_micros(500);
 /// A buffer is returned after this long even with pairs left (dropped).
 const TIMEOUT: Duration = Duration::from_secs(2);
+/// A device with no handoff for this long is not calibrated (an idle hub,
+/// box 2 with its device records off); the next handoff anchors at once.
+const CAL_IDLE: Duration = Duration::from_secs(10);
+/// An anchor this long after the previous one starts a new chain (f32 ms of
+/// a long link is too coarse; the slope is kept).
+const CHAIN_GAP: Duration = Duration::from_secs(2);
 /// The ring's drain and the stats line.
 const DRAIN_EVERY: Duration = Duration::from_millis(100);
 const LOG_EVERY: Duration = Duration::from_secs(60);
@@ -554,10 +560,13 @@ struct HipCal {
     label: &'static str,
     stream: Stream,
     ev: [Event; 3],
-    /// The newest valid anchor's slot.
+    /// The newest valid anchor's slot, and when it was taken.
     valid: Option<usize>,
+    valid_t: Instant,
     flip: bool,
     math: CalMath,
+    /// The last handoff from this device (`CAL_IDLE`).
+    last_use: Instant,
 }
 
 impl HipCal {
@@ -569,7 +578,7 @@ impl HipCal {
         let prio = d.stream_priority_range().map(|(_, greatest)| greatest).unwrap_or(0);
         let stream = Stream::new_non_blocking_with_priority(device, prio)?;
         let ev = [Event::new()?, Event::new()?, Event::new()?];
-        Ok(Self { label, stream, ev, valid: None, flip: false, math: CalMath::new() })
+        Ok(Self { label, stream, ev, valid: None, valid_t: Instant::now(), flip: false, math: CalMath::new(), last_use: Instant::now() })
     }
 
     /// Take one anchor (bounded spin), chain it, emit its `cal` record.
@@ -610,9 +619,10 @@ impl HipCal {
         STATS.anchors_ok.fetch_add(1, Relaxed);
         let raw = (lo + hi) / 2.0;
         let q = (hi - lo) / 2.0 + BIAS_NS;
-        let link = self.valid.and_then(|v| Event::elapsed_ms(&self.ev[v], &self.ev[slot]).ok());
+        let link = self.valid.filter(|_| self.valid_t.elapsed() < CHAIN_GAP).and_then(|v| Event::elapsed_ms(&self.ev[v], &self.ev[slot]).ok());
         let chk = self.math.add(raw, q, link);
         self.valid = Some(slot);
+        self.valid_t = Instant::now();
         if chk.is_some_and(|(r, t)| r.abs() > t) {
             STATS.resid_bad.fetch_add(1, Relaxed);
         }
@@ -659,8 +669,12 @@ impl TierB {
     fn accept(&mut self, h: Handoff) {
         let t0 = Instant::now();
         if self.pools.insert(h.pool) {
-            // The pool's spare buffers, made here (never on the scheduler thread).
-            let cap = h.buf.events.len();
+            // The pool's spare buffers, made here (never on the scheduler
+            // thread), sized by this first epoch's use (8x, at least 4096
+            // events, at most the pool's own): the hub keeps its full pools,
+            // box 2's ~2-event epochs do not get 5 x 16384 events per executor.
+            // An epoch that outgrows a spare drops stages (counted, FULL).
+            let cap = h.buf.events.len().min((8 * h.buf.next).next_power_of_two().max(4096));
             let made = (|| -> color_eyre::eyre::Result<Vec<Box<Buf>>> {
                 let _g = Device::new(h.device).scoped_current()?;
                 (1..bufs_per_pool()).map(|_| Buf::new(cap).map(Box::new)).collect()
@@ -674,7 +688,13 @@ impl TierB {
                 Err(e) => tracing::warn!(device = h.device, error = %e, "evtrace dev: spare event buffers not made (one buffer: most epochs skip)"),
             }
         }
-        if !self.cals.contains_key(&h.device) && !self.no_cal.contains(&h.device) {
+        if let Some(c) = self.cals.get_mut(&h.device) {
+            // Back from idle: anchor now (the old anchor is seconds away).
+            if c.last_use.elapsed() >= CAL_IDLE {
+                c.anchor();
+            }
+            c.last_use = Instant::now();
+        } else if !self.no_cal.contains(&h.device) {
             match HipCal::new(h.device, h.label) {
                 Ok(mut c) => {
                     c.anchor();
@@ -693,7 +713,9 @@ impl TierB {
 
     fn calibrate(&mut self) {
         for c in self.cals.values_mut() {
-            c.anchor();
+            if c.last_use.elapsed() < CAL_IDLE {
+                c.anchor();
+            }
         }
     }
 

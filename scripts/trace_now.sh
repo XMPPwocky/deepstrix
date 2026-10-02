@@ -53,7 +53,10 @@ fi
 scp -q -l "$LINK_KBIT" "$HERE/evt2perfetto.py" "$HERE/evt_dump_now.sh" "$B2:$RDIR/"
 # shellcheck disable=SC2029
 B2_FILES='~/logs/evtrace/b2-*.evt'
-if [ "${B2DUMP:-0}" = 1 ]; then
+B2AGE=$(ssh "$B2" "python3 -c 'import sys,time; print(int((time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) - float(sys.argv[1])) / 1e9))' $BF")
+if [ "${B2DUMP:-0}" = 1 ] && [ "$B2AGE" -gt "${DUMP_MAX_S:-150}" ]; then
+  echo "window starts ${B2AGE} s ago on box 2, older than its ring holds: no box-2 device intervals" >&2
+elif [ "${B2DUMP:-0}" = 1 ]; then
   # Box 2's ring back to the window's start (its RAW clock) + 2 s; its
   # dumps are in tmpfs and cut like the rest.
   # shellcheck disable=SC2029
