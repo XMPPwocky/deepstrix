@@ -92,7 +92,7 @@ def main():
     _, recs = evtrace.load([hub, dump])
     s3 = next(s for s in recs['hub_step'] if s['step'] == 3)
     assert (s3['dgpu_busy_ms'], s3['d_q_chain'], s3['d_mtp'], s3['igpu_busy_ms']) == (2.0, 2.0, 4.0, 5.0), s3
-    assert (s3['dev_pairs'], s3['dev_lag_ms']) == (4.0, 2.5), s3
+    assert (s3['dev_pairs'], s3['dev_lag_ms'], s3['dev_t_start']) == (4.0, 2.5, t0 + 300e6), s3
     s4 = next(s for s in recs['hub_step'] if s['step'] == 4)
     assert s4['dgpu_busy_ms'] != s4['dgpu_busy_ms'], 'a step without step_dev stays NaN'
     dv = recs['dev'][0]

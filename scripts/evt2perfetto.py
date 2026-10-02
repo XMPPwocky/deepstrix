@@ -297,7 +297,8 @@ STR_FIELDS = {'knob': ('name', 'value'), 'dev': ('name', 'device', 'stream'), 's
 # `step_dev` -> `hub_step` (as evtrace.py's `merge_step_dev`).
 STEP_DEV_SUM = ('pairs', 'deferred', 'dropped', 'viol_a', 'viol_b', 'checked_b', 'tierb_us')
 STEP_DEV_MAX = ('q_us_max', 'lag_ms')
-STEP_DEV_IDENT = ('t_start', 'step', 'device')
+STEP_DEV_MIN = ('t_start',)  # the step's first device stage start
+STEP_DEV_IDENT = ('step', 'device')
 
 
 def merge_step_dev(steps, parts):
@@ -312,12 +313,12 @@ def merge_step_dev(steps, parts):
         for k, v in r.items():
             if k.startswith('_') or k in STEP_DEV_IDENT or k.endswith('_s') or v != v:
                 continue
-            d[k] = max(d.get(k, v), v) if k in STEP_DEV_MAX else d.get(k, 0.0) + v
+            d[k] = max(d.get(k, v), v) if k in STEP_DEV_MAX else min(d.get(k, v), v) if k in STEP_DEV_MIN else d.get(k, 0.0) + v
     for s in steps:
         if s.get('step', NAN) != s.get('step', NAN):
             continue
         for k, v in acc.get((s.get('_pid'), int(s['step'])), {}).items():
-            if k in STEP_DEV_SUM or k in STEP_DEV_MAX:
+            if k in STEP_DEV_SUM or k in STEP_DEV_MAX or k in STEP_DEV_MIN:
                 s['dev_' + k] = v
             elif s.get(k, NAN) != s.get(k, NAN):
                 s[k] = v
@@ -351,6 +352,8 @@ def cmd_trace(a):
                 r[k + '_s'] = f_str.get(int(r[k]), '?') if r[k] == r[k] else '?'
             r['_pid'] = h.get('pid')
             hub[name].append(r)
+        if h.get('tier') == 'B':
+            hub['_tier_b_files'].append(p)
     merge_step_dev(hub.get('hub_step', []), hub.get('step_dev', []))
     b2_hdr, b2 = None, defaultdict(list)
     for p in b2_files:
@@ -443,6 +446,19 @@ def cmd_trace(a):
             t = to_hub(w['t3'])
             if inside(t):
                 tr.slice(2, 'reply writes', f"seq {int(w['seq'])}", t, to_hub(w['t_written']), fin(w, 'bytes'))
+        # Box-2 device intervals (`V41_B2_EVTRACE_DEV`, its Tier B dumps):
+        # each request's GPU span, `unit` = its seq; one track per stream (a
+        # parked request's and the requests served inside it: two executors).
+        for d in b2.get('dev', []):
+            t = to_hub(d['t_start'])
+            if not inside(t):
+                continue
+            args = fin(d, 'q_us')
+            if d['unit'] == d['unit']:
+                args['seq'] = int(d['unit'])
+            if d['t_host'] == d['t_host']:
+                args['queued_us'] = round((d['t_start'] - d['t_host']) / 1e3, 1)
+            tr.slice(2, f"device {d['device_s']} {d['stream_s']}", d['name_s'], t, to_hub(d['t_end']), args)
     tr.finish()
     out = {'traceEvents': tr.ev, 'displayTimeUnit': 'ms',
            'otherData': {'t0_hub_mono_raw_ns': a.t_from, 'window_s': (a.t_to - a.t_from) / 1e9,
@@ -458,6 +474,8 @@ def draw_devices(tr, hub, inside):
     causality check of the intervals against the host."""
     devs = hub.get('dev', [])
     if not devs:
+        if hub.get('_tier_b_files'):
+            print('device intervals: none in the window (a hub Tier B dump was given: the window may be older than the ring holds)', file=sys.stderr)
         return
     tr.ev.append({'ph': 'M', 'name': 'process_name', 'pid': 3, 'args': {'name': 'hub devices (calibrated to host time)'}})
     fwd_sync = {(s.get('_pid'), int(s['step'])): s['t_fwd_sync'] for s in hub.get('hub_step', [])

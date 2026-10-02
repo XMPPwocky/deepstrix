@@ -308,7 +308,13 @@ impl<E: DevEvent> Job<E> {
         }
     }
 
-    /// Convert every pair whose end completed; `true` once none is left.
+    /// Convert the pairs of every stream whose LAST end completed (a stream
+    /// completes in order: then all of its pairs have); `true` once none is
+    /// left. Only that one event per stream is ever queried: CLR's
+    /// `hipEventQuery` on an incomplete event enqueues a notify marker on its
+    /// queue (once per event) -- from this thread, onto the scheduler's
+    /// streams -- so a stream still running costs one marker per buffer, not
+    /// one per pending pair.
     pub(crate) fn poll(&mut self, cv: &mut impl ToRaw<E>) -> bool {
         let first = self.polls == 0;
         self.polls += 1;
@@ -317,35 +323,32 @@ impl<E: DevEvent> Job<E> {
             if g.next == g.idx.len() {
                 continue;
             }
-            // A stream completes in order: its last end done => all are.
             let last = g.idx[g.idx.len() - 1] as usize;
-            let all = buf.events[buf.pairs[last].end_idx].done() == Some(true);
-            while g.next < g.idx.len() {
-                let i = g.idx[g.next] as usize;
-                let p = &buf.pairs[i];
-                if !all {
-                    match buf.events[p.end_idx].done() {
-                        Some(true) => {}
-                        Some(false) => break,
-                        // An error: the pair stays unconverted (dropped).
-                        None => {
-                            g.next += 1;
-                            *left -= 1;
-                            continue;
+            match buf.events[buf.pairs[last].end_idx].done() {
+                Some(true) => {}
+                Some(false) => {
+                    if first {
+                        for &i in &g.idx {
+                            deferred[i as usize] = true;
                         }
                     }
+                    continue;
                 }
+                // An error: the stream's pairs stay unconverted (dropped).
+                None => {
+                    *left -= g.idx.len() - g.next;
+                    g.next = g.idx.len();
+                    continue;
+                }
+            }
+            for &i in &g.idx[g.next..] {
+                let p = &buf.pairs[i as usize];
                 if let (Some(s), Some(e)) = (cv.to_raw(&buf.events[p.start_idx]), cv.to_raw(&buf.events[p.end_idx])) {
-                    conv[i] = [s.0, e.0, s.1.max(e.1)];
-                }
-                g.next += 1;
-                *left -= 1;
-            }
-            if first {
-                for &i in &g.idx[g.next..] {
-                    deferred[i as usize] = true;
+                    conv[i as usize] = [s.0, e.0, s.1.max(e.1)];
                 }
             }
+            *left -= g.idx.len() - g.next;
+            g.next = g.idx.len();
         }
         *left == 0
     }
@@ -909,8 +912,8 @@ mod tests {
         assert_eq!(pre[0], RAW0 + 10.0 * ms);
     }
 
-    /// A stream whose last end is pending: the completed pairs convert, the
-    /// rest are deferred and convert at a later poll.
+    /// A stream whose last end is pending waits whole (only that event is
+    /// queried); the other stream converts; all convert at a later poll.
     #[test]
     fn pending_pairs_are_deferred_then_converted() {
         let b = buf(&[
@@ -921,12 +924,12 @@ mod tests {
         b.events[3].0.set(None); // router's end not complete
         let mut j = Job::new(0, "dgpu", b);
         assert!(!j.poll(&mut Conv));
-        assert!(!j.conv[0][0].is_nan() && j.conv[1][0].is_nan() && !j.conv[2][0].is_nan());
+        assert!(j.conv[0][0].is_nan() && j.conv[1][0].is_nan() && !j.conv[2][0].is_nan());
         j.buf.events[3].0.set(Some(2e6));
         assert!(j.poll(&mut Conv));
         let d = finish(&j, &mut Names::default(), 0.0, 0.0);
-        assert_eq!((d.deferred, d.dropped), (1, 0));
-        assert_eq!(field(&d.step_dev[0], "deferred"), 1.0);
+        assert_eq!((d.deferred, d.dropped), (2, 0));
+        assert_eq!(field(&d.step_dev[0], "deferred"), 2.0);
         // Never completed: dropped, counted, no dev record.
         let b = buf(&[("dgpu.q_chain", 1, 9, NO, 0.0, 1e6)]);
         b.events[1].0.set(None);

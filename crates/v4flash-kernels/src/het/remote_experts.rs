@@ -1936,6 +1936,11 @@ pub mod knobs {
         pub static PREFILL_ROUTE = Knob::choice("V41_B2_PREFILL_ROUTE", 0, &[&["split"], &["mirror"]]).alias("prefill_route");
         /// `V41_B2_FAST_CHAIN` (default on), key `fast_chain`.
         pub static FAST_CHAIN = Knob::flag("V41_B2_FAST_CHAIN", true).alias("fast_chain");
+        /// `V41_B2_EVTRACE_DEV` / `evtrace_dev` (default off): each request's
+        /// GPU span (`b2.run`, `dev.unit` = its seq) goes to evtrace's Tier B
+        /// as a `dev` record (`ExpertExec::dev_epoch`; ~0.2-0.4% of box 2's
+        /// iGPU time, the bottleneck, so off unless wanted).
+        pub static EVTRACE_DEV = Knob::flag("V41_B2_EVTRACE_DEV", false).alias("evtrace_dev");
         /// `V41_B2_PREFILL_BUDGET` (default 3500), key `prefill_budget`.
         pub static PREFILL_BUDGET = Knob::int("V41_B2_PREFILL_BUDGET", 3500, 0, MAX).alias("prefill_budget");
         /// `V41_B2_ENCODER_VICTIMS_FIRST` (default on), key `encoder_victims_first`.
@@ -5625,6 +5630,8 @@ pub struct MoeExecutor {
     /// paging caught only 40% of non-resident experts because the next frame
     /// had usually not arrived at the single poll point).
     ev_done: v4flash_hip::Event,
+    /// The last handoff of the engine's event pool to Tier B (`dev_epoch`).
+    dev_epoch_t: Instant,
     // --- The short batched chain (`knobs::fast_chain`) ---------------------
     fast_k: crate::b2_fast_chain::B2FastChain,
     /// Rows the fast chain can take on this executor (`FAST_CHAIN_MAX_B` or
@@ -5708,6 +5715,7 @@ impl MoeExecutor {
             warm_out: DeviceBuffer::new(id, BLOCK_Q8_K_BYTES)?,
             ev: None,
             ev_done: v4flash_hip::Event::new_no_timing()?,
+            dev_epoch_t: Instant::now(),
             fast_k: crate::b2_fast_chain::B2FastChain::for_arch(&arch)?,
             fast_rows,
             fin_dev: DeviceBuffer::new(id, fin_bytes)?,
@@ -5770,6 +5778,22 @@ impl MoeExecutor {
         self.device.set_current()?;
         self.ev = Some((v4flash_hip::Event::new()?, v4flash_hip::Event::new()?));
         Ok(())
+    }
+
+    /// Box-2 device intervals (`knobs::EVTRACE_DEV`, live): the engine's
+    /// pool records each request's GPU span (`run_path`'s `b2.run`) and is
+    /// handed to evtrace's Tier B every 100 ms. Call between requests (the
+    /// last one's GPU work has completed).
+    pub fn dev_epoch(&mut self) {
+        let on = knobs::EVTRACE_DEV.on();
+        let ev = &self.engine.events;
+        if on != ev.is_enabled() {
+            ev.set_enabled(on);
+        }
+        if on && self.dev_epoch_t.elapsed() >= std::time::Duration::from_millis(100) {
+            ev.reset();
+            self.dev_epoch_t = Instant::now();
+        }
     }
 
     /// The last request's GPU event bracket (both completed after `run`).
@@ -5960,6 +5984,8 @@ impl MoeExecutor {
         if let Some((a, _)) = self.ev.as_ref() {
             a.record(&self.engine.compute)?;
         }
+        // Tier B's view of the same span (`dev_epoch`; a no-op unless on).
+        let dev_tok = self.engine.events.open("b2.run", &self.engine.compute)?;
         // Size the batched group buffers BEFORE borrowing the engine. The
         // group-id space is the POOL SLOT space (box 2's remap encodes absolute
         // pool slots); passing N_EXPERT silently dropped every pick above slot
@@ -6101,6 +6127,7 @@ impl MoeExecutor {
         if let Some((_, ev_b)) = self.ev.as_ref() {
             ev_b.record(&self.engine.compute)?;
         }
+        self.engine.events.close(dev_tok, &self.engine.compute)?;
         // A queued request's own misses can start reading now, under this
         // request's GPU tail + D2H + reply + the hub's turnaround (see the
         // compute loop). Cheap (decode + a few hash lookups); never waits.
@@ -7125,6 +7152,7 @@ pub fn serve_connection(
                             // the parked request's is restored for its pass.
                             let parked_mode = shard.req_prefill;
                             let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
+                            ex2.dev_epoch();
                             shard.req_prefill = parked_mode;
                             let _ = tx_req_recycle_ref.send(buf);
                             *serve_acc += t_serve.elapsed().as_nanos() as u64;
@@ -7190,8 +7218,13 @@ pub fn serve_connection(
                 let ev_t_run0 = if ev_on { super::evtrace::now() } else { nan };
                 // A merged partner has the same reply format (`mergeable`).
                 exec.set_reply_f16(req.flags & proto::REQ_FLAG_RESP_F32 == 0);
-                let timing = exec.run_path(shard, req.layer, b + bb, xq_run, sel_run, ew_run, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?;
+                let timing = {
+                    // `dev.unit` = the (carrier) request's seq.
+                    let _unit = super::trace::ctx_unit(u64::from(hdr.seq));
+                    exec.run_path(shard, req.layer, b + bb, xq_run, sel_run, ew_run, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?
+                };
                 let ev_t_run1 = if ev_on { super::evtrace::now() } else { nan };
+                exec.dev_epoch();
                 drop(overlap);
                 w_park_wait_ns += this_park_wait_ns;
                 w_park_serve_ns += this_park_serve_ns;
@@ -7631,7 +7664,10 @@ fn serve_interleaved(
     let ev_t_run0 = if ev_on { super::evtrace::now() } else { f64::NAN };
     let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
     exec.set_reply_f16(req.flags & proto::REQ_FLAG_RESP_F32 == 0);
-    let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut |_, _| Ok(()))?;
+    let timing = {
+        let _unit = super::trace::ctx_unit(u64::from(hdr.seq));
+        exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut |_, _| Ok(()))?
+    };
     let ev_t_run1 = if ev_on { super::evtrace::now() } else { f64::NAN };
     let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
     let t_page_us = (page_ns1.saturating_sub(page_ns0) / 1000).min(u32::MAX as u64) as u32;

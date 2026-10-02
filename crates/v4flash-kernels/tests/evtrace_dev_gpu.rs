@@ -7,6 +7,11 @@
 //! stream returned), the anchors succeed on idle GPUs, and each stage's
 //! calibrated duration matches a plain `elapsed` twin inside it.
 //!
+//! Also printed (the review's two runtime questions): the stage record
+//! calls' host latency early vs late in the run (6 buffers per pool keep ~6x
+//! the recorded events alive: does `hipEventRecord` slow down?), and the
+//! anchors' bracket bound per device. `EVTRACE_GPU_STEPS=3000` runs long.
+//!
 //! GPU, ~10 s: run with the server DOWN.
 //!   cargo test --release -p v4flash-kernels --features v41 --test evtrace_dev_gpu -- --ignored --nocapture
 
@@ -17,7 +22,16 @@ use v4flash_hip::{Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::het::trace::{ctx_step, EventPool};
 use v4flash_kernels::het::{evtrace, evtrace_dev, evtrace_ring};
 
-const STEPS: u64 = 40;
+fn steps() -> u64 {
+    std::env::var("EVTRACE_GPU_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(40)
+}
+
+/// p50 / p99 / max of `v` (us).
+fn pcts(v: &mut [f64]) -> (f64, f64, f64) {
+    v.sort_by(|a, b| a.total_cmp(b));
+    let at = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+    (at(0.5), at(0.99), v[v.len() - 1])
+}
 
 /// Every record of `kind` in the `.evt` files under `dir` whose names start
 /// with `prefix`, as field maps.
@@ -62,6 +76,8 @@ struct Dev {
     small: DeviceBuffer<u8>,
     /// Per step: the plain `elapsed` of the big memset (ms).
     twin: HashMap<u64, f32>,
+    /// Per step: host us of the stage calls (both opens and closes).
+    rec_us: Vec<f64>,
 }
 
 #[test]
@@ -85,28 +101,47 @@ fn tier_b_times_device_stages() {
         let (label, stages) = if igpu { ("igpu", ["igpu.pair_kwide", "igpu.q2k_down"]) } else { ("dgpu", ["dgpu.q_chain", "dgpu.router"]) };
         let pool = EventPool::new(label, 4096).unwrap();
         pool.set_enabled(true);
-        devs.push(Dev { label, stages, stream: Stream::new(id).unwrap(), pool, big: DeviceBuffer::new(id, 256 << 20).unwrap(), small: DeviceBuffer::new(id, 32 << 20).unwrap(), twin: HashMap::new() });
+        devs.push(Dev { label, stages, stream: Stream::new(id).unwrap(), pool, big: DeviceBuffer::new(id, 256 << 20).unwrap(), small: DeviceBuffer::new(id, 32 << 20).unwrap(), twin: HashMap::new(), rec_us: Vec::new() });
     }
-    for step in 0..STEPS {
+    const STEPS_FLOOR: u64 = 2;
+    let n_steps = steps();
+    let (a, b) = (Event::new().unwrap(), Event::new().unwrap());
+    for step in 0..n_steps {
         for d in devs.iter_mut() {
             d.pool.reset();
             let _ctx = ctx_step(step);
+            let _g = Device::new(d.stream.device_id()).scoped_current().unwrap();
             let (a, b) = (Event::new().unwrap(), Event::new().unwrap());
+            let t = std::time::Instant::now();
+            let o = d.pool.open(d.stages[0], &d.stream).unwrap();
+            let mut us = t.elapsed().as_secs_f64() * 1e6;
+            a.record(&d.stream).unwrap();
+            d.big.fill_zero_async(&d.stream).unwrap();
+            b.record(&d.stream).unwrap();
+            let t = std::time::Instant::now();
+            d.pool.close(o, &d.stream).unwrap();
+            us += t.elapsed().as_secs_f64() * 1e6;
             {
-                let _t = d.pool.stage(d.stages[0], &d.stream).unwrap();
-                a.record(&d.stream).unwrap();
-                d.big.fill_zero_async(&d.stream).unwrap();
-                b.record(&d.stream).unwrap();
-            }
-            {
+                let t = std::time::Instant::now();
                 let _t = d.pool.stage(d.stages[1], &d.stream).unwrap();
+                us += t.elapsed().as_secs_f64() * 1e6;
                 d.small.fill_zero_async(&d.stream).unwrap();
             }
+            d.rec_us.push(us);
             d.stream.synchronize().unwrap();
             d.pool.note_sync(&d.stream);
             d.twin.insert(step, Event::elapsed_ms(&a, &b).unwrap());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(if n_steps > 200 { 2 } else { 10 }));
+    }
+    drop((a, b));
+    for d in devs.iter_mut() {
+        let n = d.rec_us.len();
+        let k = (n / 10).max(1);
+        let (e50, e99, emax) = pcts(&mut d.rec_us[..k].to_vec());
+        let (l50, l99, lmax) = pcts(&mut d.rec_us[n - k..].to_vec());
+        println!("{}: stage-call host us per step, first {k} steps p50 {e50:.1} p99 {e99:.1} max {emax:.1}; last {k} p50 {l50:.1} p99 {l99:.1} max {lmax:.1}", d.label);
+        assert!(l50 < 4.0 * e50.max(5.0), "{}: stage calls slowed down over the run ({e50:.1} -> {l50:.1} us p50)", d.label);
     }
     // Hand the last buffers off, let Tier B finish and Tier A flush, fold the sums.
     for d in &devs {
@@ -119,7 +154,7 @@ fn tier_b_times_device_stages() {
         let skipped = d.pool.take_skipped();
         println!("{}: sums over {steps} steps ({skipped} resets skipped): {sums:?}", d.label);
         // The first handoff finds no spare (Tier B makes them): one step lost.
-        assert!(steps >= STEPS - 2, "{}: {steps} steps came back", d.label);
+        assert!(steps >= n_steps - STEPS_FLOOR, "{}: {steps} steps came back", d.label);
         assert!(sums.iter().any(|s| s.0 == d.stages[0]), "{}: no sums", d.label);
     }
 
@@ -136,7 +171,14 @@ fn tier_b_times_device_stages() {
             d.label, recs.len(), sum("pairs"), sum("dropped"), sum("deferred"), sum("viol_a"), sum("viol_b"), sum("checked_b"),
             recs.iter().map(|r| r["q_us_max"]).fold(0.0, f64::max)
         );
-        assert!(recs.len() as u64 >= STEPS - 2, "{}: {} step_dev records", d.label, recs.len());
+        assert!(recs.len() as u64 >= n_steps - STEPS_FLOOR, "{}: {} step_dev records", d.label, recs.len());
+        let mut q: Vec<f64> = cal.iter().filter(|r| r["device"] == dev_id && r["ok"] == 1.0).map(|r| r["q_us"]).collect();
+        let mut spin: Vec<f64> = cal.iter().filter(|r| r["device"] == dev_id && r["ok"] == 1.0).map(|r| r["spin_us"]).collect();
+        if !q.is_empty() {
+            let (q50, q99, qmax) = pcts(&mut q);
+            let (s50, s99, smax) = pcts(&mut spin);
+            println!("{}: anchor bound q_us p50 {q50:.1} p99 {q99:.1} max {qmax:.1}; record-to-seen us p50 {s50:.1} p99 {s99:.1} max {smax:.1}", d.label);
+        }
         assert_eq!(sum("dropped"), 0.0, "{}: dropped pairs", d.label);
         assert_eq!(sum("viol_a"), 0.0, "{}: a stage started before the host recorded it", d.label);
         assert_eq!(sum("viol_b"), 0.0, "{}: a stage ended after its stream's sync returned", d.label);
@@ -170,7 +212,8 @@ fn tier_b_times_device_stages() {
         }
     }
     println!("dump: {} dev records", dev.len());
-    assert!(dev.len() as u64 >= (STEPS - 2) * 2 * devs.len() as u64, "{} dev records", dev.len());
+    // (A long run's early records may have left the 16 MB ring.)
+    assert!(dev.len() as u64 >= (n_steps.min(1000) - STEPS_FLOOR) * 2 * devs.len() as u64, "{} dev records", dev.len());
     assert!(dev.iter().all(|r| r["t_end"] >= r["t_start"] && r["t_start"] >= r["t_host"] - r["q_us"] * 1e3));
     let _ = std::fs::remove_dir_all(&base);
 }

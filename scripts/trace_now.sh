@@ -5,7 +5,10 @@
 #   LONE=1: a window inside the latest run of lone-stream (DSpark) steps
 #   HUB=<hub .evt>: that file instead of the newest
 #   DUMP=0: no hub Tier B dump (default: one covering the window, for the
-#   device intervals; RING=<ring dir>, default ~/logs/evtrace-ring)
+#   device intervals; RING=<ring dir>, default ~/logs/evtrace-ring); a window
+#   older than DUMP_MAX_S (default 150: ~the 128 MB ring) gets none
+#   B2DUMP=1: also box 2's Tier B ring (its device intervals, with
+#   `V41_B2_EVTRACE_DEV` on; /dev/shm/evtrace-ring there)
 # Open OUT in https://ui.perfetto.dev (drag and drop).
 # Gentle on production: Python parses at tens of MB/s, box 2's cut reads only
 # the files that can hold the window and stops just past it, runs off
@@ -40,29 +43,24 @@ HF=$(get hub_from); HT=$(get hub_to); BF=$(get b2_from); BT=$(get b2_to)
 # start (+2 s) and wait for the dump (written by the hub, paced).
 RING=${RING:-$HOME/logs/evtrace-ring}
 HUB_B=()
-if [ "${DUMP:-1}" = 1 ] && [ -d "$RING" ]; then
-  SECS=$(python3 -c "import sys,time; print(int((time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) - float(sys.argv[1])) / 1e9) + 2)" "$HF")
-  BEFORE=$(ls "$RING"/hub-dump-*.evt 2>/dev/null | wc -l)
-  echo "$SECS" > "$RING/.dump-request.tmp" && mv "$RING/.dump-request.tmp" "$RING/dump-request"
-  for _ in $(seq 1 120); do
-    if [ ! -e "$RING/dump-request" ] && [ "$(ls "$RING"/hub-dump-*.evt 2>/dev/null | wc -l)" -gt "$BEFORE" ]; then
-      break
-    fi
-    sleep 0.25
-  done
-  # The newest dump, once its size settles (the writer streams it).
-  D=$(ls -t "$RING"/hub-dump-*.evt 2>/dev/null | head -1 || true)
-  if [ -n "$D" ]; then
-    S0=-1
-    while [ "$(stat -c %s "$D")" != "$S0" ]; do S0=$(stat -c %s "$D"); sleep 0.5; done
-    HUB_B=("$D")
-  else
-    echo "no hub Tier B dump (device intervals left out)" >&2
-  fi
+AGE=$(python3 -c "import sys,time; print(int((time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) - float(sys.argv[1])) / 1e9))" "$HF")
+if [ "${DUMP:-1}" = 1 ] && [ "$AGE" -gt "${DUMP_MAX_S:-150}" ]; then
+  echo "window starts ${AGE} s ago, older than the hub ring holds (DUMP_MAX_S=${DUMP_MAX_S:-150}): no device intervals" >&2
+elif [ "${DUMP:-1}" = 1 ]; then
+  D=$(bash "$HERE/evt_dump_now.sh" "$RING" hub "$HF")
+  if [ -n "$D" ]; then HUB_B=("$D"); else echo "no hub Tier B dump (device intervals left out)" >&2; fi
 fi
-scp -q -l "$LINK_KBIT" "$HERE/evt2perfetto.py" "$B2:$RDIR/evt2perfetto.py"
+scp -q -l "$LINK_KBIT" "$HERE/evt2perfetto.py" "$HERE/evt_dump_now.sh" "$B2:$RDIR/"
 # shellcheck disable=SC2029
-CUTS=$(ssh "$B2" "taskset -c $B2_CPUS ionice -c3 nice -n 19 python3 $RDIR/evt2perfetto.py cut ~/logs/evtrace/b2-*.evt --from $BF --to $BT -o $RDIR/b2cut >/dev/null && taskset -c $B2_CPUS nice -n 19 gzip -1 -f $RDIR/b2cut.*.evt && ls $RDIR/b2cut.*.evt.gz")
+B2_FILES='~/logs/evtrace/b2-*.evt'
+if [ "${B2DUMP:-0}" = 1 ]; then
+  # Box 2's ring back to the window's start (its RAW clock) + 2 s; its
+  # dumps are in tmpfs and cut like the rest.
+  # shellcheck disable=SC2029
+  D2=$(ssh "$B2" "bash $RDIR/evt_dump_now.sh /dev/shm/evtrace-ring b2 $BF")
+  [ -n "$D2" ] && B2_FILES="$B2_FILES $D2" || echo "no box-2 Tier B dump" >&2
+fi
+CUTS=$(ssh "$B2" "taskset -c $B2_CPUS ionice -c3 nice -n 19 python3 $RDIR/evt2perfetto.py cut $B2_FILES --from $BF --to $BT -o $RDIR/b2cut >/dev/null && taskset -c $B2_CPUS nice -n 19 gzip -1 -f $RDIR/b2cut.*.evt && ls $RDIR/b2cut.*.evt.gz")
 LOCAL=()
 for c in $CUTS; do
   scp -q -l "$LINK_KBIT" "$B2:$c" "$TMP/"

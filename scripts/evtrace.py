@@ -85,7 +85,8 @@ def read_file(path):
 # `step_dev` counters folded into `hub_step` as `dev_<name>` (sum, or max).
 STEP_DEV_SUM = ('pairs', 'deferred', 'dropped', 'viol_a', 'viol_b', 'checked_b', 'tierb_us')
 STEP_DEV_MAX = ('q_us_max', 'lag_ms')
-STEP_DEV_IDENT = ('t_start', 'step', 'device')
+STEP_DEV_MIN = ('t_start',)  # the step's first device stage start
+STEP_DEV_IDENT = ('step', 'device')
 
 
 def merge_step_dev(recs):
@@ -106,6 +107,8 @@ def merge_step_dev(recs):
                 continue
             if k in STEP_DEV_MAX:
                 acc[k] = max(acc.get(k, v), v)
+            elif k in STEP_DEV_MIN:
+                acc[k] = min(acc.get(k, v), v)
             else:
                 acc[k] = acc.get(k, 0.0) + v
     if not parts:
@@ -118,7 +121,7 @@ def merge_step_dev(recs):
         if not acc:
             continue
         for k, v in acc.items():
-            if k in STEP_DEV_SUM or k in STEP_DEV_MAX:
+            if k in STEP_DEV_SUM or k in STEP_DEV_MAX or k in STEP_DEV_MIN:
                 h['dev_' + k] = v
             elif h.get(k, NAN) != h.get(k, NAN):
                 h[k] = v

@@ -369,6 +369,12 @@ impl EventPool {
             inner.fold(&mut b);
             inner.free.push(b);
         }
+        // `V41_EVTRACE_DEV` flipped (live): sums folded across the change
+        // belong to no `ms.stage` window.
+        if off != self.offload.get() {
+            inner.sums.clear();
+            inner.sum_steps = 0;
+        }
         if off && inner.buf.as_ref().is_some_and(|b| !b.pairs.is_empty()) {
             let b = inner.buf.take().expect("checked");
             let ret = inner.back.get_or_insert_with(|| std::sync::mpsc::sync_channel(super::evtrace_dev::bufs_per_pool())).0.clone();
@@ -448,14 +454,22 @@ impl EventPool {
         name: &'static str,
         stream: &'a Stream,
     ) -> eyre::Result<StageScope<'a>> {
-        let noop = StageScope { pool: self, stream, name, start_idx: usize::MAX, epoch: 0, ctx: StageCtx::NONE, t_host: f64::NAN, done: true };
+        let open = self.open(name, stream)?;
+        Ok(StageScope { pool: self, stream, open })
+    }
+
+    /// `stage` without the guard: the start is recorded now, the end by
+    /// `close` on the same stream (for code that holds the pool's owner
+    /// mutably in between). `None` = not recorded (disabled, capturing, no
+    /// buffer, full); a token never closed leaves a gap, nothing else.
+    pub fn open(&self, name: &'static str, stream: &Stream) -> eyre::Result<Option<OpenStage>> {
         if !self.enabled.get() || self.capturing.get() || (!self.sub.get() && name.starts_with("k.")) {
-            return Ok(noop);
+            return Ok(None);
         }
         let mut inner = self.inner.borrow_mut();
         let epoch = inner.epoch;
         // No free buffer this epoch (counted at the reset).
-        let Some(buf) = inner.buf.as_mut() else { return Ok(noop) };
+        let Some(buf) = inner.buf.as_mut() else { return Ok(None) };
         let idx = buf.next;
         if idx + END_RESERVE >= buf.events.len() {
             // FULL: drop the stage (a timing gap) rather than fail the
@@ -466,14 +480,42 @@ impl EventPool {
             let (n, len) = (buf.dropped, buf.events.len());
             drop(inner);
             note_drop(self.label, name, len, n);
-            return Ok(noop);
+            return Ok(None);
         }
         buf.next += 1;
         // Causality rule (a): stamped BEFORE the record (plan N2).
         let t_host = if self.offload.get() { super::evtrace::now() } else { f64::NAN };
         buf.events[idx].record(stream)?;
         drop(inner);
-        Ok(StageScope { pool: self, stream, name, start_idx: idx, epoch, ctx: ctx(), t_host, done: false })
+        Ok(Some(OpenStage { name, start_idx: idx, epoch, ctx: ctx(), t_host }))
+    }
+
+    /// Record the end of an `open` stage on `stream` (its start's stream).
+    pub fn close(&self, open: Option<OpenStage>, stream: &Stream) -> eyre::Result<()> {
+        let Some(o) = open else { return Ok(()) };
+        let mut inner = self.inner.borrow_mut();
+        // Open across a reset (resets are top-level, so not today): the start
+        // event is in a buffer Tier B now holds. Drop the pair.
+        if inner.epoch != o.epoch {
+            drop(inner);
+            note_drop(self.label, o.name, 0, 0);
+            return Ok(());
+        }
+        let Some(buf) = inner.buf.as_mut() else { return Ok(()) };
+        let end_idx = buf.next;
+        if end_idx >= buf.events.len() {
+            // Backstop (`END_RESERVE` should make this unreachable): no pair,
+            // a timing gap, never an error for the caller.
+            buf.dropped += 1;
+            let (n, len) = (buf.dropped, buf.events.len());
+            drop(inner);
+            note_drop(self.label, o.name, len, n);
+            return Ok(());
+        }
+        buf.next += 1;
+        buf.events[end_idx].record(stream)?;
+        buf.pairs.push(TimingPair { name: o.name, start_idx: o.start_idx, end_idx, ctx: o.ctx, stream: stream.raw() as usize, t_host: o.t_host });
+        Ok(())
     }
 
     /// Synchronize on the last event in the ring then walk the pairs
@@ -547,59 +589,28 @@ impl EventPool {
     }
 }
 
+/// A stage `EventPool::open` recorded the start of (`close` ends it).
+#[derive(Clone, Copy, Debug)]
+pub struct OpenStage {
+    name: &'static str,
+    start_idx: usize,
+    /// The pool's epoch at the start: a later close drops the pair.
+    epoch: u64,
+    ctx: StageCtx,
+    t_host: f64,
+}
+
 /// RAII guard that records its end event on drop.
 pub struct StageScope<'a> {
     pool: &'a EventPool,
     stream: &'a Stream,
-    name: &'static str,
-    start_idx: usize,
-    epoch: u64,
-    ctx: StageCtx,
-    t_host: f64,
-    done: bool,
+    open: Option<OpenStage>,
 }
 
 impl<'a> StageScope<'a> {
     /// Explicit end (for early termination before the natural drop point).
     pub fn end(mut self) -> eyre::Result<()> {
-        self.record_end()
-    }
-
-    fn record_end(&mut self) -> eyre::Result<()> {
-        if self.done {
-            return Ok(());
-        }
-        self.done = true;
-        let mut inner = self.pool.inner.borrow_mut();
-        // Open across a reset (resets are top-level, so not today): the start
-        // event is in a buffer Tier B now holds. Drop the pair.
-        if inner.epoch != self.epoch {
-            drop(inner);
-            note_drop(self.pool.label, self.name, 0, 0);
-            return Ok(());
-        }
-        let Some(buf) = inner.buf.as_mut() else { return Ok(()) };
-        let end_idx = buf.next;
-        if end_idx >= buf.events.len() {
-            // Backstop (`END_RESERVE` should make this unreachable): no pair,
-            // a timing gap, never an error for the caller.
-            buf.dropped += 1;
-            let (n, len) = (buf.dropped, buf.events.len());
-            drop(inner);
-            note_drop(self.pool.label, self.name, len, n);
-            return Ok(());
-        }
-        buf.next += 1;
-        buf.events[end_idx].record(self.stream)?;
-        buf.pairs.push(TimingPair {
-            name: self.name,
-            start_idx: self.start_idx,
-            end_idx,
-            ctx: self.ctx,
-            stream: self.stream.raw() as usize,
-            t_host: self.t_host,
-        });
-        Ok(())
+        self.pool.close(self.open.take(), self.stream)
     }
 }
 
@@ -607,8 +618,9 @@ impl<'a> Drop for StageScope<'a> {
     fn drop(&mut self) {
         // Drop-time errors are reported via tracing and swallowed; the
         // alternative (panic) is worse for orchestrator code.
-        if let Err(e) = self.record_end() {
-            tracing::warn!(stage = self.name, label = self.pool.label(), error = %e, "EventPool stage end failed");
+        let name = self.open.map(|o| o.name).unwrap_or("?");
+        if let Err(e) = self.pool.close(self.open.take(), self.stream) {
+            tracing::warn!(stage = name, label = self.pool.label(), error = %e, "EventPool stage end failed");
         }
     }
 }

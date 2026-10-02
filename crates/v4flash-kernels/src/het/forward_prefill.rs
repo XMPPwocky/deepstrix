@@ -3583,6 +3583,14 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// After an arena driver's final `dgpu.compute.synchronize()`: every
+    /// stage it queued there has ended (Tier B's causality rule (b)); the
+    /// stamp goes into `hub_step.t_fwd_sync` (`take_fwd_sync`).
+    fn note_fwd_sync(&self) {
+        let t = self.dgpu.events.note_sync(&self.dgpu.compute);
+        FWD_SYNC_T.store(t.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// One multi-stream decode step, K=1 (docs/v41/MULTISTREAM_DECODE_PLAN.md
     /// 3.7, M1a step 3): row `i` is `tokens[i]` at the next position of the
     /// stream in `slots[i]`, all `b` rows through the batched layer driver with
@@ -3599,14 +3607,6 @@ impl HeterogeneousEngine {
     /// `bd.hc_pre_carry` the carries: `head_rows(ds, bd, b, weights)` turns
     /// them into `[b * N_VOCAB]` logits.
     #[allow(clippy::too_many_arguments)]
-    /// After an arena driver's final `dgpu.compute.synchronize()`: every
-    /// stage it queued there has ended (Tier B's causality rule (b)); the
-    /// stamp goes into `hub_step.t_fwd_sync` (`take_fwd_sync`).
-    fn note_fwd_sync(&self) {
-        let t = self.dgpu.events.note_sync(&self.dgpu.compute);
-        FWD_SYNC_T.store(t.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub fn forward_step_arena(
         &self,
         bd: &mut BatchDgpuScratch,

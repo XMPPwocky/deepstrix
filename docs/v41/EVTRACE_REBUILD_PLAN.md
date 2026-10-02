@@ -420,5 +420,18 @@ Where it differs from sections 2.4 / 6:
 - **`hub_step.dev_skipped`** = resets since the previous step (prefill units
   included) that found no free buffer.
 - **Kill switch**: `V41_EVTRACE_DEV=0` (live) = the synchronous harvest again.
-- **Box-2 `dev` records**: not yet (a later P3 step, behind a knob, default off).
-- GPU smoke test: `tests/evtrace_dev_gpu.rs` (`--ignored`, server down, ~10 s).
+- **Polling (review 27).** CLR's `hipEventQuery` on an incomplete event
+  enqueues a notify marker on its queue (once per event). Tier B queries only
+  each stream's LAST end event of a buffer and converts the stream whole once
+  that one completed: at most one such marker per still-running stream per
+  buffer, from the Tier B thread.
+- **Box-2 `dev` records** (`V41_B2_EVTRACE_DEV` / `evtrace_dev`, live, default
+  off): each request's GPU span `b2.run` through the executor's engine pool
+  (`EventPool::open` / `close`, a guard-free token), `dev.unit` = the request's
+  seq; the pool is handed to Tier B every 100 ms between requests
+  (`MoeExecutor::dev_epoch`; the parking executor `exec2` too). Drawn per
+  stream on box 2's process (`trace_now.sh B2DUMP=1`).
+- GPU smoke test: `tests/evtrace_dev_gpu.rs` (`--ignored`, server down, ~10 s;
+  `EVTRACE_GPU_STEPS=3000` long): conversion vs `elapsed` twins, causality,
+  anchors, the stage calls' latency early vs late (6 live buffers per pool),
+  the anchors' bracket bound.
