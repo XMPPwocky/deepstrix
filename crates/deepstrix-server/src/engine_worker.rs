@@ -4088,10 +4088,22 @@ fn finish_decode(
             // rewinds the COMPRESSED store to what the accepted prefix earns —
             // without it the rejected drafts' compressor boundaries stayed in
             // the store permanently and decode attended to them.
-            let partial = mark.advanced_by(keep, pos);
+            //
+            // It restores the PRE-verify segment accumulators, which are right
+            // only where no kept row's slot is still open: with `pos + keep` odd
+            // the ratio-2 slot 0 held a token of the previous, already-fired
+            // group, and the next fire pooled it into a permanent comp row (about
+            // half of all accepts). So commit the exact prefix and re-forward the
+            // rest (at most the last kept row on V4.1) through decode, which
+            // writes its raw KV, comp rows and accumulator slots exactly.
+            let exact = mark.exact_accumulator_rows(keep, pos);
+            let partial = mark.advanced_by(exact, pos);
             state.state.rollback_kv(&partial).map_err(|e| {
                 eyre!("dspark accept: partial rollback ({keep} of {k}) refused: {e}")
             })?;
+            for j in exact as usize..keep as usize {
+                forward_one!(state, hcs[j], pos + j as u32, toks[j])?;
+            }
 
             // `main_hidden` for the next draft is the row that became the head.
             let row = n; // row n is the last position kept: `next` + n drafts
