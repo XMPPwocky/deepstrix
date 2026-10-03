@@ -125,19 +125,46 @@ fn remote_exclude() -> bool {
 /// added both: those experts counted twice (KNOWN_BUGS #29, the class of #0).
 /// `verify_routing_exactly_once` checks `owns_eff`, not what box 2 computes,
 /// so it could not see it. Dry (`!remote_exclude`) keeps the old debug paths.
-fn remote_sel_override(partition: bool, dry: bool, extra_remote: &[bool], owns_eff: &[bool], sel: &[i32]) -> Vec<i32> {
-    if dry || !(partition || extra_remote.iter().any(|&x| x)) {
-        return Vec::new();
+///
+/// Replay offload (`V41_REPLAY_OFFLOAD`) is the same class without the
+/// partition: box 1 excludes EVERY pick on the layer (`owns_eff` all true),
+/// so an empty override had box 2 compute only its HELLO range and the rest
+/// were computed by nobody. It always overrides, dry or not, because box 1's
+/// exclusion under it ignores `dry` too.
+///
+/// `owns`: box 2's HELLO set, i.e. what an empty override has it compute. When
+/// the override IS empty and the split is live, every pick must agree between
+/// `owns_eff` and `owns`, or `Err`. Today the caller builds `owns_eff` from
+/// `owns` in exactly that case, so this only guards a future change to
+/// `owns_eff` that forgets the override.
+fn remote_sel_override(
+    partition: bool,
+    replay_offload: bool,
+    dry: bool,
+    extra_remote: &[bool],
+    owns: &[bool],
+    owns_eff: &[bool],
+    sel: &[i32],
+) -> eyre::Result<Vec<i32>> {
+    let live = |e: i32| (0..N_EXPERT as i32).contains(&e);
+    if replay_offload || (!dry && (partition || extra_remote.iter().any(|&x| x))) {
+        return Ok(sel
+            .iter()
+            .map(|&e| if live(e) && owns_eff[e as usize] { e } else { super::remote_experts::NO_PICK })
+            .collect());
     }
-    sel.iter()
-        .map(|&e| {
-            if (0..N_EXPERT as i32).contains(&e) && owns_eff[e as usize] {
-                e
-            } else {
-                super::remote_experts::NO_PICK
-            }
-        })
-        .collect()
+    if !dry {
+        if let Some(&e) = sel.iter().find(|&&e| live(e) && owns_eff[e as usize] != owns[e as usize]) {
+            return Err(eyre!(
+                "remote split: expert {e} is {} by box 1's owns_eff but box 2's HELLO set {} it, \
+                 and the submit is HELLO-masked: computed by {} devices",
+                if owns_eff[e as usize] { "excluded" } else { "kept" },
+                if owns[e as usize] { "holds" } else { "lacks" },
+                if owns_eff[e as usize] { 0 } else { 2 },
+            ));
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// Add the remote partial at the combine? Mode 1 only.
@@ -325,6 +352,22 @@ enum RangeSeed<'a> {
 /// path). `V41_CED=0` restores the exact all-40-layer prefill.
 pub fn ced_enabled() -> bool {
     cfg!(feature = "v41") && std::env::var("V41_CED").map(|v| v != "0").unwrap_or(true)
+}
+
+/// A CED continuation (`pos0 > 0`, suffix within the replay, so its decoder
+/// rings are KEPT) whose decoder rings (layers `split..`) hold nothing: the
+/// state is a mid-prefill checkpoint
+/// (`PrefillJob::clear_decoder_rings_for_checkpoint`), and the replay and the
+/// first ~SWA_WINDOW decoded tokens would attend a window of only the suffix
+/// rows (KNOWN_BUGS #25). Restores refuse such a resume (the server's
+/// `snapshot::resume_ok`); this is the backstop.
+fn continuation_rings_empty(state: &HetModelState, split: usize) -> bool {
+    split < state.layers.len() && state.layers[split..].iter().all(|l| l.n_raw == 0)
+}
+
+fn empty_rings_error(pos0: u32, t: usize) -> eyre::Report {
+    eyre!("CED replay: a {t}-row continuation at pos0 {pos0} would replay onto EMPTY decoder rings \
+           (a mid-prefill checkpoint resumed with <= SWA_WINDOW rows, KNOWN_BUGS #25); refused")
 }
 
 /// `V41_ENGRAM_GEMV=1` puts the Engram `wkv` prefill projection back on the
@@ -937,9 +980,14 @@ impl PrefillJob {
     /// from (the restored snapshot's rows at `pos0`, or nothing) -- stale by
     /// `done_rows()` positions. A snapshot saved like that would hand a resume
     /// with <= SWA_WINDOW rows left non-adjacent rows as its window. Empty them
-    /// instead: a resume then replays onto empty rings, like a fresh prompt.
-    /// Harmless for this job: `prefill_job_finish` empties them anyway when
-    /// the suffix exceeds the replay, which any checkpointable job does.
+    /// instead. That is NOT a fresh prompt to every resume: one whose suffix
+    /// fits the replay (<= SWA_WINDOW rows) is a continuation, whose rings
+    /// `prefill_job_finish` KEEPS (KNOWN_BUGS #25), and it would replay onto
+    /// empty rings. Restores refuse that (`snapshot::resume_ok`, which sees the
+    /// empty rings in the meta) and `prefill_job_finish` errors out rather than
+    /// run it. Harmless for this job whenever its suffix exceeds the replay
+    /// (the finish empties the rings anyway), which the default checkpoint
+    /// knobs guarantee; otherwise its finish refuses the same way.
     pub fn clear_decoder_rings_for_checkpoint(&self, state: &mut HetModelState) {
         if !self.ced {
             return;
@@ -1445,6 +1493,8 @@ impl HeterogeneousEngine {
                 state.layers[l].n_raw = 0;
                 state.layers[l].raw_off = 0;
             }
+        } else if continuation_rings_empty(state, split) {
+            return Err(empty_rings_error(job.pos0, t));
         }
         let mut seg_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
         let mut seg_carry: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
@@ -3324,6 +3374,8 @@ impl HeterogeneousEngine {
                     state.layers[l].n_raw = 0;
                     state.layers[l].raw_off = 0;
                 }
+            } else if continuation_rings_empty(state, split) {
+                return Err(empty_rings_error(pos0, t));
             }
             let mut seg_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
             let mut seg_carry: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
@@ -7166,23 +7218,40 @@ impl HeterogeneousEngine {
             // Recomputes rather than replaces so this is one self-contained block,
             // testable with `V41_DSPARK_XCHECK` before anyone pays to delete the
             // superseded work.
+            //
+            // Each row reads what the batched pair above reads for it, as decode's
+            // views: raw keys `[n_raw_offset_after[j], +n_raw)` sliced out of the
+            // cache (decode's `kv_win`; the wsum kernel has no offset argument, so
+            // a `raw_off` to score alone would not do), and with the indexer fired
+            // the row's own gathered top-K at `j * INDEXER_TOP_K`, `n_comp` clamped
+            // to it as the sparse re-upload above does. Reading `[0, n_raw)` and
+            // row 0's selection for every row made this instrument measure a
+            // different attention than either path (and the "attention refuted"
+            // A/B taken with it is void).
             if verify_decode_attn() && arena.is_some() {
                 return Err(eyre!("L{layer}: V41_VERIFY_DECODE_ATTN replays one sequence at raw_off 0; not for arena rows"));
             }
             if verify_decode_attn() && (b as usize) <= 16 {
                 const K_SPLIT: u32 = 16;
                 let qf = crate::config::Q_FLAT as usize;
+                let hd = N_HEAD_DIM as usize;
                 let _t_va = de.events.stage("dgpu.verify_decode_attn", &de.compute)?;
                 for j in 0..b as usize {
                     let nr = n_raw_after[j];
-                    let nc = n_comp_after[j];
+                    let nc = if indexer_fired { n_comp_after[j].min(INDEXER_TOP_K) } else { n_comp_after[j] };
+                    let kv_j = ls.kv_cache.slice_view(n_raw_offset_after[j] as usize * hd, nr as usize * hd);
+                    let topk = INDEXER_TOP_K as usize * hd;
+                    let comp_j = eff_comp_kv_buf
+                        .filter(|_| indexer_fired)
+                        .map(|c| c.slice_view(j * topk, topk));
+                    let comp_kv_j = if indexer_fired { comp_j.as_ref() } else { eff_comp_kv_buf };
                     let q_j = sd.q_normed.slice_view(j * qf, qf);
                     de.attn_mixed.launch_score_b1_htiled_wmma(
                         &de.compute,
                         &mut sd.verify_scores,
                         &q_j,
-                        &ls.kv_cache,
-                        eff_comp_kv_buf,
+                        &kv_j,
+                        comp_kv_j,
                         nr,
                         /*raw_off=*/ 0,
                         nc,
@@ -7203,8 +7272,8 @@ impl HeterogeneousEngine {
                         &de.compute,
                         &mut sd.verify_partials,
                         &sd.verify_scores,
-                        &ls.kv_cache,
-                        eff_comp_kv_buf,
+                        &kv_j,
+                        comp_kv_j,
                         N_HEAD,
                         N_HEAD_DIM,
                         nr,
@@ -7833,18 +7902,6 @@ impl HeterogeneousEngine {
                     range_out: if sub3 { Some(&mut bd.d_range) } else { None },
                 },
             )?;
-        if let Some(nl) = look_next {
-            let _t = de.events.stage("k.router.lookahead", &de.compute)?;
-            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
-            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel, &mut sd.look_ew, &sd.router_logits, nl.router_bias_dev.as_ref(),
-                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
-        }
-        if let Some(nl) = look_next2 {
-            let _t = de.events.stage("k.router.lookahead2", &de.compute)?;
-            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
-            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel2, &mut sd.look_ew2, &sd.router_logits, nl.router_bias_dev.as_ref(),
-                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
-        }
             // KNOWN_BUGS #0b: layer 0's MoE half is where verify diverges from
             // decode while attention is clean. Expert SELECTION is the first
             // thing to rule in or out -- different experts fully explain the
@@ -7954,6 +8011,25 @@ impl HeterogeneousEngine {
                 EXPERT_WEIGHT_SCALE,
                 ROUTER_WEIGHT_EPS,
             )?;
+        }
+        // The look-ahead routers reuse `sd.router_logits`, so they run only
+        // AFTER its last reader for this layer: the image-row `bias_vl` re-top-k
+        // and the fidelity pin above both read THIS layer's logits (they ran
+        // before them and picked image rows' experts / pinned weights from
+        // layer L+1's or L+2's). Same stream, still ahead of the readback pack.
+        // Outside the hash-router branch too: a hash layer whose next layer is
+        // not hashed has a `look_next`, and the pack shipped stale `look_sel`.
+        if let Some(nl) = look_next {
+            let _t = de.events.stage("k.router.lookahead", &de.compute)?;
+            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
+            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel, &mut sd.look_ew, &sd.router_logits, nl.router_bias_dev.as_ref(),
+                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
+        }
+        if let Some(nl) = look_next2 {
+            let _t = de.events.stage("k.router.lookahead2", &de.compute)?;
+            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
+            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel2, &mut sd.look_ew2, &sd.router_logits, nl.router_bias_dev.as_ref(),
+                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
         }
         drop(_t_router);
         let remote_owns_layer = self
@@ -9015,16 +9091,21 @@ impl HeterogeneousEngine {
                         owns_eff = (0..N_EXPERT as usize)
                             .map(|e| replay_offload || extra_remote[e] || (!dry && owns[e]))
                             .collect();
-                        // The hub's own split whenever it reassigned something or
-                        // the T2 partition decides ownership (`remote_sel_override`:
-                        // under the partition an empty override double-counted).
+                        // The hub's own split whenever it reassigned something, the
+                        // T2 partition decides ownership or replay offload hands box 2
+                        // the whole layer (`remote_sel_override`: under the partition
+                        // an empty override double-counted, under replay offload it
+                        // dropped every pick outside box 2's HELLO range).
                         sel_for_remote = remote_sel_override(
                             super::expert_pager::t2_partition(),
+                            replay_offload,
                             dry,
                             &extra_remote,
+                            &owns,
                             &owns_eff,
                             &sel_host_remote,
-                        );
+                        )
+                        .map_err(|e| eyre!("L{layer}: {e}"))?;
                 }
                 // SUBMIT BEFORE PAGING. Box 2 needs only the router's picks and the
                 // activations, both ready above; it does NOT need box 1 to have
@@ -9353,7 +9434,9 @@ impl HeterogeneousEngine {
                     // where its misses may land only if asked to.
                     if !speculative_append() {
                         pg.set_count_as_prefill(true);
-                        let scan = prefill_scan_slots();
+                        // Never narrower than this layer's set: `claim`
+                        // refuses to evict a slot the same call already uses.
+                        let scan = prefill_scan_slots().max(ids.len());
                         if scan < pg.slots() as usize {
                             let n = pg.slots() as usize;
                             pg.set_scan_window(Some((n - scan, n)));
@@ -11488,7 +11571,7 @@ mod remote_sel_tests {
     fn partition_with_nothing_for_box2_sends_nothing() {
         let sel = [3, 250, 17, 300, 5, 383];
         let none = mask(&[]);
-        let o = remote_sel_override(true, false, &none, &none, &sel);
+        let o = remote_sel_override(true, false, false, &none, &none, &none, &sel).unwrap();
         assert_eq!(o, vec![NO_PICK; 6]);
     }
 
@@ -11496,7 +11579,7 @@ mod remote_sel_tests {
     fn partition_masks_by_owns_eff() {
         let sel = [3, 250, 17, 300, 5, -1];
         let own = mask(&[17, 250]);
-        let o = remote_sel_override(true, false, &own, &own, &sel);
+        let o = remote_sel_override(true, false, false, &own, &mask(&[]), &own, &sel).unwrap();
         assert_eq!(o, vec![NO_PICK, 250, 17, NO_PICK, NO_PICK, NO_PICK]);
     }
 
@@ -11506,12 +11589,40 @@ mod remote_sel_tests {
     fn no_partition_keeps_the_hello_path() {
         let sel = [3, 250];
         let hello = mask(&[250]);
-        assert!(remote_sel_override(false, false, &mask(&[]), &hello, &sel).is_empty());
+        assert!(remote_sel_override(false, false, false, &mask(&[]), &hello, &hello, &sel).unwrap().is_empty());
         let extra = mask(&[3]);
         let eff = mask(&[3, 250]);
-        assert_eq!(remote_sel_override(false, false, &extra, &eff, &sel), vec![3, 250]);
+        assert_eq!(remote_sel_override(false, false, false, &extra, &hello, &eff, &sel).unwrap(), vec![3, 250]);
         // Dry (debug split modes): the old path, partition or not.
-        assert!(remote_sel_override(true, true, &extra, &eff, &sel).is_empty());
+        assert!(remote_sel_override(true, false, true, &extra, &hello, &eff, &sel).unwrap().is_empty());
+    }
+
+    /// Replay offload without the partition: box 1 excludes the whole layer, so
+    /// box 2 is sent every pick (by `owns_eff`, all true), not just its HELLO
+    /// range -- dry or not, as box 1's exclusion ignores `dry` there.
+    #[test]
+    fn replay_offload_without_partition_sends_every_pick() {
+        let sel = [3, 250, 17, 300, 5, -1];
+        let hello = mask(&[250, 300]);
+        let all = vec![true; N_EXPERT as usize];
+        for dry in [false, true] {
+            let o = remote_sel_override(false, true, dry, &mask(&[]), &hello, &all, &sel).unwrap();
+            assert_eq!(o, vec![3, 250, 17, 300, 5, NO_PICK]);
+        }
+    }
+
+    /// An empty override (HELLO-masked submit) whose `owns_eff` disagrees with
+    /// the HELLO set on a pick is refused: that pick is computed by 0 or 2
+    /// devices. Agreement off the picks, or a dry run, passes.
+    #[test]
+    fn empty_override_must_match_hello() {
+        let sel = [3, 250];
+        let hello = mask(&[250]);
+        let none = mask(&[]);
+        assert!(remote_sel_override(false, false, false, &none, &hello, &mask(&[3, 250]), &sel).is_err());
+        assert!(remote_sel_override(false, false, false, &none, &hello, &none, &sel).is_err());
+        assert!(remote_sel_override(false, false, false, &none, &hello, &mask(&[250, 7]), &sel).unwrap().is_empty());
+        assert!(remote_sel_override(false, false, true, &none, &hello, &none, &sel).unwrap().is_empty());
     }
 }
 

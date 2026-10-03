@@ -10,6 +10,195 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+Entries 30-49: review of 2026-10-03 (11 auditors, one adversarial verifier per
+finding, read-only), all FIXED 2026-10-03 on branch `claude/sharp-feynman-j1ry6t`,
+NOT deployed. GPU paths were compile-checked only (no ROCm in the review
+sandbox); host regression tests named per entry. **Deploying it deletes every
+snapshot** (`KV_EPOCH` 1, #39) and changes token ids for non-ASCII text (#35).
+
+### 30. FIXED 2026-10-03 — a whole-prompt snapshot hit streamed the chain of thought as answer content
+
+`start_prefill` (multistream.rs) forwards the stripped trailing `<think>` when the
+restored snapshot covers the whole prompt, but `admit_stream` set `in_think` only
+from a marker still pending, so the stream started with `in_think = false`:
+every reasoning token went out as `content`, `</think>` was swallowed, and DSML-like
+text in the reasoning reached the tool-call scanner. Fires on an exact re-send
+(client retry, regenerate, duplicate agent call). The legacy path
+(`save_and_forward_marker` -> `initial_in_think`) was right. Fix: `plan_suffix`
+records the forwarded marker, `admit_stream` uses `initial_in_think`. Regression:
+`prefill_plan_tests::whole_prompt_snapshot_hit_still_starts_in_think`.
+
+### 31. FIXED 2026-10-03 — a tool call cut off by the token cap was "repaired" and returned as complete
+
+`DsmlScanner::finish` repaired every stream that ended inside an open DSML frame,
+including a `FinishReason::Length` cut (`max_tokens`, or the context-cap clamp late
+in a session), and both handlers let `saw_tool` win: the client got
+`finish_reason="tool_calls"` with a truncated `Write` body / bash command and ran it.
+Fix: `finish(length_cut)` drops the cut call (calls closed before the cut stand),
+`cut_by_length()` makes both paths report `"length"`; the EOS repair is unchanged.
+Regression: `dsml` `length_cut_*` tests.
+
+### 32. FIXED 2026-10-03 — tools with no system message rendered no tool schemas
+
+`prompt_v41::merge` attached `tools` to message 0 whatever its role and only the
+System arm rendered them, so `{messages:[user], tools:[...]}` produced a prompt with
+no `## Tools` block (V4-Flash's renderer always emitted it). Fix: a synthetic
+System carrier with no content. Regression: `tools_without_system_message_*`.
+
+### 33. FIXED 2026-10-03 — V4.1 history replay put four newlines before every replayed tool-call block
+
+The scanner returns the structural `\n\n` before `<｜DSML｜` as content; the V4.1
+renderer replayed it and then added its own `\n\n`. The V4-Flash renderer already
+trimmed. Every past tool call in an agent history was off-distribution and the
+prefix diverged from the live KV at the first one. Regression:
+`replayed_tool_call_content_is_trimmed_before_calls`.
+
+### 34. FIXED 2026-10-03 — non-streaming responses dropped `reasoning_content`
+
+`accumulate()` skipped reasoning chunks and the handler hard-coded `None`, so a
+`stream:false` agent with tools replayed every tool turn as `<think></think>`.
+Regression: `accumulate_tests::reasoning_is_returned_not_dropped`.
+
+### 35. FIXED 2026-10-03 — the joyai pre-tokenizer treated every non-ASCII codepoint as a letter
+
+Inherited from ds4.c: bytes >= 0x80 were letters and the digit / punctuation
+branches were ASCII-only, so CJK punctuation, typographic quotes, full-width and
+non-ASCII digits, non-ASCII whitespace and combining marks split differently from
+the reference `tokenizer.json` (three `Isolated` Split regexes) -- e.g. `你好。\n`
+missed the merged `。\n` token. Fix: the exact split with generated Unicode tables
+(`tokenizer/joyai_ucd.rs`, `scripts/gen_joyai_ucd.py`); ~253k random strings match
+HF `tokenizers` piece for piece. Regression: `tests/joyai_pretok_goldens.rs`.
+Token ids change for such text (pure ASCII is unchanged).
+
+### 36. FIXED 2026-10-03 — the pager's `ensure` left claimed-but-unloaded experts as permanent hits after an error
+
+`ensure` registered every miss in `slot_of` (and touched it) before reading; a
+read / O_DIRECT / reader-panic / HIP repack error returned early with the rest still
+"resident" on slots holding another expert's weights, and the scheduler survives
+the error with the same pager. Fix: claims are logged and `release_unlanded` rolls
+back the unlanded ones on any error. Regression:
+`residency_tests::release_unlanded_rolls_back_only_the_unloaded`.
+
+### 37. FIXED 2026-10-03 — a request served inside a box-2 park cleared `parked_pins`
+
+`serve_interleaved` re-entered `run_path`'s park block, which cleared the parked
+request's pins on entry and exit; its in-flight pass-A picks became LRU victims
+and could be repacked mid-read (`verify_routing_exactly_once` cannot see it).
+Production knobs (park=1), rare. Fix: `parked_pins` is a stack
+(`push_parked_pins` + truncate). Regression:
+`nested_park_keeps_the_parked_requests_pins`.
+
+### 38. FIXED 2026-10-03 — OpenAI `stop`, `min_p`, penalties, `logit_bias`, `top_k` and `n` were silently ignored
+
+Serde dropped them. Now: `stop` is honoured (visible content only, never inside a
+tool frame, held back across chunk boundaries; a match cancels the generation
+through the disconnect path; up to 64 strings), `min_p` is wired to `min_p_rel`,
+and `n != 1` is a 400. `top_k > 0`, non-zero penalties, `repetition_penalty != 1`
+and a non-empty `logit_bias` are still not implemented (each would have to change
+the serial sampler, the arena `TargetDist`, the head prefilter band and the DSpark
+verify together): served without them and named in a warning, a 400 with
+`V41_API_STRICT=1` (client presets send them on every request).
+Regression: `openai::stop::tests`, `accumulate_tests`, `handler::tests`.
+
+### 39. FIXED 2026-10-03 — snapshots carried no KV epoch: KV written by a buggy build outlived the fix
+
+Nothing identified the code generation that produced a snapshot's KV, and `save`
+copies a restored prefix's comp rows forward, so a KV-changing fix (#20, #22, #23,
+#28 class) never reached conversations started before it. Fix:
+`SnapshotMeta.kv_epoch` (`KV_EPOCH`, now 1: **bump it with every fix that changes
+the KV a forward writes**); `load` deletes older epochs, restore refuses a mismatch.
+Regression: `old_kv_epoch_meta_is_refused`.
+
+### 40. FIXED 2026-10-03 — `ensure_batched` gave every no-free-slot miss of a call the SAME LRU victim
+
+Phase 1 claimed a slot without touching it, so `lru_victim` returned the same slot
+for each later miss; phase 3 uploaded them all into it and left `slot_of` entries
+for all but the last as permanent hits on whatever the slot held. Not on the
+documented production launch (`V41_B1_PREFETCH` passes only resident experts);
+the default for a bare launch and the serial path. Fix: one `Residency::claim`
+for both paths, touched at claim, never evicting a slot claimed earlier in the
+same call. Regression: `residency_tests::misses_in_one_call_get_distinct_victims`.
+
+### 41. FIXED 2026-10-03 — serial decode: an error after an odd number of layers inverted residual buffer parity for good
+
+The `residual`/`residual_next` swap runs after each successful layer; graphs
+replay captured pointers while direct launches follow the fields, so one failed
+token (a box-2 `wait()` error, survived since 11a6c82) left every later serial
+token reading stale buffers. Fix: `DgpuScratch::restore_residual_parity` at every
+token start (warns when it swaps). Regression:
+`scratch::tests::residual_parity_restored_after_an_odd_layer_error`.
+
+### 42. FIXED 2026-10-03 — mid-prefill checkpoints were keyed with the suffix twice, and would have resumed onto empty decoder rings
+
+Both checkpoint sites keyed `pf.prefix` (already the whole prompt) + the done
+rows, so no checkpoint was ever restorable (KV_PREFIX_STORE_DESIGN 1.1(a): 15.2 GB
+unrestorable) and the cancel path's session hint pointed at one. Checkpoints save
+emptied decoder rings, and `prefill_job_finish` keeps the rings for a suffix of
+<= 128 rows, so fixing only the key would have reintroduced #25. Fix:
+`checkpoint_tokens` = `req.tokens[..pos0 + done]`; a ring-empty snapshot resumes
+only under CED with a suffix > 128 rows (`snapshot::resume_ok`), and the replay
+errors rather than run a continuation onto empty rings (a checkpoint the suffix
+cannot resume is refused from its meta.json before the restore reads anything,
+and the session hint that pointed at it is dropped); restore cross-checks
+`token_count` against `n_comp` / `n_raw`. Regression:
+`checkpoint_key_is_the_requests_own_prefix`, `checkpoint_rings_resume_only_past_the_replay`,
+`counts_must_match_the_token_count`. Still open: periodic checkpoints have no
+session hint, so after a restart only the boundary walk can find them.
+
+### 43. FIXED 2026-10-03 — legacy DSpark partial accept restored a stale ratio-2 compressor accumulator
+
+`KvMark::advanced_by` advanced `n_comp` but cloned the PRE-verify `state_kv` /
+`state_score`; with `pos + keep` odd the open segment's slot held the previous
+group's kv and the next fire pooled the wrong token into a comp row for the rest
+of the sequence (~half of accepts). Not "approximate", as the comment said. The
+arena path was exact. Fix: commit only the rows whose accumulators restore exactly
+(`KvMark::exact_accumulator_rows`) and re-forward the rest (at most one row on
+V4.1). Regression: `state::tests::ratio_two_*` (host);
+`tests/kv_rollback_compressor.rs::partial_rollback_commits_only_exact_accumulators` (GPU, not run).
+
+### 44. FIXED 2026-10-03 — legacy restore covering the whole request sampled the first token from another request's logits
+
+With no trailing marker and a full-coverage match nothing was forwarded and
+`sample_next` read `dgpu_scratch.logits` from whatever ran last. Multistream had
+the guard; the legacy path now does too.
+
+### 45. FIXED 2026-10-03 — `V41_VERIFY_DECODE_PATH` (the "serial oracle") let earlier rows see later draft tokens
+
+The layer-major loop appended every row's compressor / index rows on the source
+layers before the reuse layers ran for row 0, never reset the S2 gather cache per
+row, and shared one candidate pool. Its "numerically IDENTICAL" comment was wrong.
+**Results measured with it before this fix are suspect** (MULTISTREAM_DECODE_PLAN,
+VERIFY_DISAGREES_WITH_DECODE, and the `V41_VERIFY_DECODE_PATH=1` lines under #0b
+above). Fix: token-major through decode's own `forward_one!`; `V41_VDP_TRACE` removed.
+
+### 46. FIXED 2026-10-03 — `V41_REPLAY_OFFLOAD` without the T2 partition dropped replay experts (#29 class)
+
+Box 1 excluded every replay pick, the override came back empty, and box 2
+computed only its HELLO range: the rest (~60% of picks on decoder layers with
+production box 2) were computed by nobody. Fix: the override is always built under
+replay offload; an empty override is cross-checked against box 2's HELLO set.
+Regression: `remote_sel_tests::replay_offload_without_partition_sends_every_pick`,
+`empty_override_must_match_hello`.
+
+### 47. FIXED 2026-10-03 — a short or missing `comp_state.bin` reset the accumulators instead of refusing the snapshot
+
+And `save` wrote in place, so a failed re-save left a mixed directory still
+indexed. Fix: refused (cache miss); saves go through a tmp dir committed by rename.
+Regression: `commit_dir_replaces_atomically_and_restores_on_failure`.
+
+### 48. FIXED 2026-10-03 — `V41_VERIFY_DECODE_ATTN` replay attended the wrong window: the "prefill attention refuted" row is INVALID
+
+Every row used `raw_off = 0` (not its `n_raw_offset_after[j]` window), row 0's
+top-k comp rows, and an unclamped `nc`. DSPARK_VERIFY_FIDELITY "Prefill attention
+kernels differ: small (0.771 vs 0.710)" was measured with it: re-measure before
+ruling attention out of the B >= 3 verify-vs-decode gap. GPU path, no host test.
+
+### 49. FIXED 2026-10-03 — look-ahead routers overwrote `sd.router_logits` before the image-row `bias_vl` re-top-k and the fidelity pin read them
+
+With `V41_LOOKAHEAD_PREFETCH=1` image rows picked experts from the next layer's
+logits. The look-ahead now runs after both readers (it also runs on hash-routed
+layers now, which shipped a stale `look_sel` before). GPU path, no host test.
+
 ### 29. FIXED 2026-09-30 (NOT deployed) — under the T2 partition, a lane-layer with no box-2 pick was sent to box 2 masked by its static HELLO set while box 1 computed every pick: experts in box 2's `--experts` range were added TWICE
 
 `pre_moe_route` built the hub's own box-2 pick list (`sel_for_remote`, masked by

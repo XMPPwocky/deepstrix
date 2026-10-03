@@ -485,6 +485,10 @@ pub struct DsmlScanner {
     /// strips the tags and returns the prose as plain content — this
     /// buffer is what lets us do the same.
     halluc_buf: Vec<u8>,
+    /// True once `finish(true)` dropped a tool call the token cap cut
+    /// off mid-markup instead of repairing it. The handler reports
+    /// finish_reason=length for the turn rather than tool_calls.
+    cut_by_length: bool,
 }
 
 impl DsmlScanner {
@@ -493,6 +497,14 @@ impl DsmlScanner {
     /// scanner — caller queries at end-of-turn.
     pub fn saw_malformed(&self) -> bool {
         self.malformed
+    }
+
+    /// True if `finish(true)` dropped an in-flight tool call cut off by
+    /// the token cap. Calls closed before the cut were emitted and
+    /// stand; the turn's finish_reason must be "length", not
+    /// "tool_calls", so the client knows the call block is incomplete.
+    pub fn cut_by_length(&self) -> bool {
+        self.cut_by_length
     }
 }
 
@@ -509,6 +521,7 @@ impl DsmlScanner {
             tool_calls_emitted: 0,
             saw_orphan_close: false,
             halluc_buf: Vec::new(),
+            cut_by_length: false,
         }
     }
 
@@ -526,7 +539,10 @@ impl DsmlScanner {
         events
     }
 
-    pub fn finish(&mut self) -> Vec<DsmlEvent> {
+    /// `length_cut`: the stream ended because the token cap
+    /// (max_tokens / context) was hit, not because the model emitted
+    /// EOS. See case 2 below.
+    pub fn finish(&mut self, length_cut: bool) -> Vec<DsmlEvent> {
         let mut events = Vec::new();
         // End-of-stream cleanup. There are three cases:
         //
@@ -535,9 +551,9 @@ impl DsmlScanner {
         //
         // 2. Mid-stream EOS inside an open DSML frame (Mode::Text +
         //    frames non-empty, or Mode in {OpenHeader, CloseHeader,
-        //    ParameterBody}): the model hit length-cap or dropped the
-        //    closing tags during a long generation (its attention
-        //    degrades past ~2000 tokens of tool-call output). Port of
+        //    ParameterBody}): the model dropped the closing tags during
+        //    a long generation (its attention degrades past ~2000 tokens
+        //    of tool-call output). Port of
         //    upstream ds4's `try_repair_dsml` (0ffaabd, 596f49c,
         //    20df6c7, guards from 7bcc4e8): instead of failing the
         //    turn, finalize the in-flight parameter into the open
@@ -545,6 +561,11 @@ impl DsmlScanner {
         //    and close the tool_calls block. Upstream measured 100%
         //    repair success in production (0 finish=error across 156+
         //    requests).
+        //    NOT on a length cut: there the in-flight call stops at an
+        //    arbitrary byte (half a file body, half a shell command),
+        //    and repairing it would hand the client a truncated call
+        //    as complete. It is dropped and `cut_by_length` set; calls
+        //    closed before the cut were already emitted and stand.
         //
         // 3. Repair impossible (no recoverable invoke): fall back to
         //    the pre-repair behavior — flush whatever bytes we have as
@@ -597,7 +618,7 @@ impl DsmlScanner {
                 events.push(DsmlEvent::Text(drained));
             }
         } else if in_open_frame || mid_tag {
-            self.repair_truncated(&mut events);
+            self.repair_truncated(length_cut, &mut events);
         }
         self.mode = Mode::Done;
         events
@@ -607,8 +628,9 @@ impl DsmlScanner {
     /// (upstream semantics: append missing closing tags in reverse
     /// nesting order parameter → invoke → tool_calls, then verify the
     /// result parses); fall back to the malformed flush when no valid
-    /// invoke can be recovered.
-    fn repair_truncated(&mut self, events: &mut Vec<DsmlEvent>) {
+    /// invoke can be recovered. With `length_cut` an opened invoke is
+    /// dropped instead of repaired (see `finish()` case 2).
+    fn repair_truncated(&mut self, length_cut: bool, events: &mut Vec<DsmlEvent>) {
         // Snapshot the raw buffered bytes first — the fallback path
         // flushes them as text so letta gets a non-empty turn (the
         // pre-repair behavior).
@@ -694,6 +716,26 @@ impl DsmlScanner {
                     }
                 }
             }
+        }
+
+        if length_cut && any_invoke_opened {
+            // Token cap hit inside a tool call: drop the open frames and
+            // the partial body (markup / argument bytes, not content).
+            // No ToolCallsEnd: the block did not close.
+            let dropped = self
+                .frames
+                .iter()
+                .filter(|f| matches!(f, Frame::Invoke { .. }))
+                .count();
+            self.frames.clear();
+            self.cut_by_length = true;
+            tracing::warn!(
+                dropped,
+                kept = self.tool_calls_emitted,
+                "token cap cut a DSML tool call block; dropping the \
+                 truncated call instead of repairing it (finish_reason=length)"
+            );
+            return;
         }
 
         // Step 3: implicit `</invoke>` for every open invoke frame
@@ -1378,14 +1420,19 @@ mod tests {
     }
 
     /// Like `drive` but also returns the scanner so tests can inspect
-    /// `saw_malformed()`.
+    /// `saw_malformed()`. The stream ends with EOS.
     fn drive_sc(seq: &[(i32, &[u8])]) -> (Vec<DsmlEvent>, DsmlScanner) {
+        drive_sc_end(seq, false)
+    }
+
+    /// `drive_sc` with the stream ended by the token cap (finish=Length).
+    fn drive_sc_end(seq: &[(i32, &[u8])], length_cut: bool) -> (Vec<DsmlEvent>, DsmlScanner) {
         let mut sc = DsmlScanner::new(TOK_DSML_TEST);
         let mut out = Vec::new();
         for &(t, b) in seq {
             out.extend(sc.push_token(t, b));
         }
-        out.extend(sc.finish());
+        out.extend(sc.finish(length_cut));
         (out, sc)
     }
 
@@ -1637,9 +1684,11 @@ mod tests {
 
     #[test]
     fn repair_missing_parameter_close() {
-        // Upstream TEST 3: truncated mid parameter BODY — missing
-        // </parameter>, </invoke> and </tool_calls>. The in-flight
-        // parameter body is finalized into the invoke.
+        // Upstream TEST 3: the model emits EOS mid parameter BODY —
+        // missing </parameter>, </invoke> and </tool_calls>. The
+        // in-flight parameter body is finalized into the invoke. (A
+        // token-cap cut at the same point is NOT repaired:
+        // `length_cut_mid_parameter_drops_the_call`.)
         let (ev, sc) = drive_sc(&[
             (1, b"\n\n<"),
             (TOK_DSML_TEST, DSML_B),
@@ -1657,8 +1706,105 @@ mod tests {
         assert_eq!(v["command"], "echo hello");
         assert!(ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
         assert!(!sc.saw_malformed());
+        assert!(!sc.cut_by_length());
         // The recovered body must NOT also leak out as text.
         assert!(!contains_subseq(&all_text(&ev), b"echo hello"));
+    }
+
+    #[test]
+    fn length_cut_mid_parameter_drops_the_call() {
+        // Same stream as `repair_missing_parameter_close`, but ended by
+        // the token cap: `rm -rf /tmp/build` cut to `rm -rf /` must not
+        // reach the client as a complete call. Nothing is emitted for
+        // it (no ToolCall, no ToolCallsEnd, no body bytes as text), the
+        // turn is not malformed, and `cut_by_length` asks the handler
+        // for finish_reason=length.
+        let (ev, sc) = drive_sc_end(
+            &[
+                (1, b"Cleaning.\n\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"tool_calls>\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"invoke name=\"bash\">\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"parameter name=\"command\" string=\"true\">rm -rf /"),
+                // Token cap.
+            ],
+            true,
+        );
+        assert!(all_calls(&ev).is_empty());
+        assert!(!ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+        assert_eq!(all_text(&ev), b"Cleaning.\n\n".to_vec());
+        assert!(!sc.saw_malformed());
+        assert!(sc.cut_by_length());
+    }
+
+    #[test]
+    fn length_cut_keeps_calls_closed_before_the_cut() {
+        // Two parallel calls; the cap lands inside the second one's
+        // parameter list (path written, content not started). Repair
+        // would fabricate `write_file(path)` with no content. The first
+        // call closed properly and stands; the second is dropped.
+        let (ev, sc) = drive_sc_end(
+            &[
+                (1, b"<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"tool_calls>\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"invoke name=\"bash\">\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"parameter name=\"command\" string=\"true\">ls</"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"parameter>\n</"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"invoke>\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"invoke name=\"write_file\">\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"parameter name=\"path\" string=\"true\">/tmp/out.txt</"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"parameter>\n"),
+                // Token cap.
+            ],
+            true,
+        );
+        let calls = all_calls(&ev);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "bash");
+        assert!(!sc.saw_malformed());
+        assert!(sc.cut_by_length());
+    }
+
+    #[test]
+    fn length_cut_outside_dsml_is_not_a_cut_call() {
+        // A cap that lands in plain text, or right after a balanced
+        // block, cut no call: text flushes as usual, the closed call
+        // stands, `cut_by_length` stays false (finish_reason stays
+        // tool_calls / length as before).
+        let (ev, sc) = drive_sc_end(&[(1, b"partial answer <")], true);
+        assert_eq!(all_text(&ev), b"partial answer <".to_vec());
+        assert!(!sc.cut_by_length());
+        let (ev, sc) = drive_sc_end(
+            &[
+                (1, b"<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"tool_calls>\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"invoke name=\"bash\">\n<"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"parameter name=\"command\" string=\"true\">ls</"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"parameter>\n</"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"invoke>\n</"),
+                (TOK_DSML_TEST, DSML_B),
+                (1, b"tool_calls>"),
+            ],
+            true,
+        );
+        assert_eq!(all_calls(&ev).len(), 1);
+        assert!(!sc.cut_by_length());
+        assert!(!sc.saw_malformed());
     }
 
     #[test]
@@ -1931,7 +2077,7 @@ mod tests {
             ev.extend(sc.push_token(t, b));
         }
         let pre_finish = ev.len();
-        ev.extend(sc.finish());
+        ev.extend(sc.finish(false));
         assert_eq!(ev.len(), pre_finish, "finish() added events to a balanced turn");
         assert_eq!(all_calls(&ev).len(), 1);
         assert!(!sc.saw_malformed());

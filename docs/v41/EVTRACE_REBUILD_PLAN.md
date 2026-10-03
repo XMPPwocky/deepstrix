@@ -435,6 +435,19 @@ Where it differs from sections 2.4 / 6:
 - **Sync marks only while recording** (review 29): `note_sync` is a no-op
   unless the pool is enabled AND offloading (a disabled pool is never reset:
   box 2's knob off would pile one mark per request up forever).
+- **Used events renewed before a buffer goes back** (2026-10-03, hypothesis,
+  not yet measured). A recorded hipEvent keeps its marker, and through it an
+  HSA interrupt signal (one KFD event slot), until it is recorded again (ROCm
+  CLR/ROCr source). Knob off, a pool re-records one buffer from slot 0: ~one
+  epoch of events live. Knob on, it rotates through `V41_EVTRACE_DEV_BUFS`
+  buffers: ~6 epochs live, across both pools past the per-process ~4096 KFD
+  signal events at multi-lane steps, after which waits poll (decode / prefill
+  slower with more lanes). Tier B now destroys `events[..next]` of a finished
+  or timed-out buffer and creates fresh ones on its device before returning
+  it (`Buf::renew_used`; a failed create keeps the old event, counted as
+  `renew_failed` in the minute line). A/B: record-call latency in
+  `tests/evtrace_dev_gpu.rs` at `EVTRACE_GPU_PAIRS=3000`,
+  `V41_EVTRACE_DEV_BUFS=2` vs `6`, before and after.
 - **Box-2 `dev` records** (`V41_B2_EVTRACE_DEV`, by that full name, live,
   default off; recorded only when its Tier B takes the buffers): each
   request's GPU span `b2.run` through the executor's engine pool

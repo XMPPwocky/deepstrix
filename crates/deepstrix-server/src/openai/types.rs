@@ -450,6 +450,60 @@ pub struct ChatCompletionRequest {
     pub reasoning: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    // The fields below used to be dropped by serde (no field, no
+    // `deny_unknown_fields`), so a client's `stop` or `frequency_penalty`
+    // silently did nothing. Each is now honoured, or named in a warning (a
+    // 400 with `V41_API_STRICT=1`) by `handler::check_unsupported_params`.
+    /// Stop sequences (a string or an array of up to
+    /// `stop::MAX_STOP_SEQUENCES`), matched on the visible content only
+    /// (`openai::stop`).
+    #[serde(default)]
+    pub stop: Option<StopSpec>,
+    /// Choices per request. Only 1 is served (absent/1 OK, anything else 400).
+    #[serde(default)]
+    pub n: Option<i64>,
+    /// vLLM / llama.cpp extension: min-p relative to the top token after
+    /// temperature. Honoured (`GenerateReq::min_p_rel`, both samplers).
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// Not implemented: ignored with a warning unless at an "off" value
+    /// (absent, 0, -1); a 400 under `V41_API_STRICT`.
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    /// Not implemented: ignored with a warning unless 0 / absent (400 under
+    /// `V41_API_STRICT`).
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    /// Not implemented: ignored with a warning unless 0 / absent (400 under
+    /// `V41_API_STRICT`).
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// vLLM extension. Not implemented: ignored with a warning unless 1 /
+    /// absent (400 under `V41_API_STRICT`).
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    /// Not implemented: ignored with a warning unless empty / absent (400
+    /// under `V41_API_STRICT`). Values are kept as raw
+    /// JSON so an int bias (OpenAI's own examples) is not a 422.
+    #[serde(default)]
+    pub logit_bias: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// OpenAI `stop`: one string or an array of strings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum StopSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopSpec {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            StopSpec::One(s) => vec![s.clone()],
+            StopSpec::Many(v) => v.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

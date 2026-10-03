@@ -2359,7 +2359,31 @@ pub(crate) fn handle_generate_stream(
             disk_hit
         };
         if let Some((snap_req_tokens, snap_hash, snap_dir)) = disk_hit {
-            if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS {
+            // Keep >= 1 suffix token to prefill (or a marker to forward), as
+            // multistream's `usable`: see the post-restore check below. A
+            // mid-prefill checkpoint this suffix cannot resume is refused from
+            // its meta.json, before the reset and the restore's blob reads,
+            // and the session hint stops pointing at it.
+            let usable = snap_req_tokens >= DISK_RESTORE_MIN_TOKENS
+                && (snap_req_tokens < req.tokens.len() || trailing_marker.is_some());
+            let resumable = usable
+                && snapshot::resume_ok_from_meta(
+                    &snap_dir,
+                    req.tokens.len().saturating_sub(snap_req_tokens),
+                    v4flash_kernels::het::forward_prefill::ced_enabled(),
+                );
+            if usable && !resumable {
+                tracing::warn!(
+                    covered = snap_req_tokens,
+                    req_len = req.tokens.len(),
+                    snap_hash = %short_hex(&snap_hash[..4]),
+                    "snapshot is a mid-prefill checkpoint the suffix cannot resume; not restored"
+                );
+                if let Some(sid) = session_id.as_deref() {
+                    state.snapshot_index.drop_session_hint(sid, &snap_hash);
+                }
+            }
+            if resumable {
                 // The window between picking a request up and its `prefill` line
                 // measured 12.2% of all engine-busy time (p50 0.31 s, MEAN 8.70 s,
                 // max 302 s, scaling with context: 15.05 s above 50k tokens vs
@@ -2424,6 +2448,7 @@ pub(crate) fn handle_generate_stream(
                 if let Some(crate::snapshot::RestoredSnapshot {
                     tokens: loaded,
                     image_spans: loaded_spans,
+                    decoder_rings_empty,
                 }) = restored
                 {
                     let loaded_len = loaded.len() as u32;
@@ -2440,14 +2465,42 @@ pub(crate) fn handle_generate_stream(
                         state.vocab.as_ref(),
                         &state.byte_decoder,
                     );
-                    if verify.live_tokens != loaded.len() {
+                    // A prefix that cannot be resumed is a miss too: with no
+                    // suffix and no marker nothing would be forwarded, and the
+                    // first token would be sampled from `dgpu_scratch.logits`,
+                    // which `restore_vl` never writes (whatever ran last, often
+                    // another conversation); a mid-prefill checkpoint (decoder
+                    // rings empty) resumes only a long suffix
+                    // (`snapshot::resume_ok`).
+                    let is_prefix = verify.live_tokens == loaded.len();
+                    let rest = req.tokens.len().saturating_sub(verify.req_tokens);
+                    let resumable = (rest > 0 || trailing_marker.is_some())
+                        && snapshot::resume_ok(
+                            decoder_rings_empty,
+                            rest,
+                            v4flash_kernels::het::forward_prefill::ced_enabled(),
+                        );
+                    if !is_prefix || !resumable {
                         tracing::warn!(
                             loaded_len = loaded.len(),
                             verify_live = verify.live_tokens,
                             verify_req = verify.req_tokens,
+                            req_len = req.tokens.len(),
+                            marker = trailing_marker.is_some(),
+                            decoder_rings_empty,
                             snap_hash = %short_hex(&snap_hash[..4]),
-                            "restored snapshot bytes are NOT a prefix of the request; falling back"
+                            "{}",
+                            if is_prefix {
+                                "restored snapshot leaves nothing to forward or is a checkpoint the suffix cannot resume; falling back"
+                            } else {
+                                "restored snapshot bytes are NOT a prefix of the request; falling back"
+                            }
                         );
+                        if is_prefix && decoder_rings_empty {
+                            if let Some(sid) = session_id.as_deref() {
+                                state.snapshot_index.drop_session_hint(sid, &snap_hash);
+                            }
+                        }
                         state.state.reset_in_place(state.dgpu, state.igpu)?;
                         // The drafter's KV ring is process-lifetime state and is NOT part of
                         // `HetModelState`, so resetting the main KV leaves it holding the
@@ -3754,135 +3807,38 @@ fn finish_decode(
             }
             let spc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
             let mut decode_path_logits: Option<Vec<f32>> = None;
-            // `V41_VERIFY_DECODE_PATH=1`: run the verify through DECODE's own
-            // per-layer function, layer-major over the B rows, instead of the
-            // batched prefill driver.
+            // `V41_VERIFY_DECODE_PATH=1`: run the verify through DECODE itself,
+            // one row at a time (`forward_one!`, the very call the decode loop
+            // makes), instead of the batched prefill driver.
             //
             // WHY. The batched driver computes a different function than decode
             // — different kernel families throughout (measured: argmax
             // agreement 0.49-0.61, cos 0.75-0.79) — and swapping components one
             // at a time does NOT converge, because each swapped component still
-            // consumes diverged inputs from the ones ahead of it. Decode's
-            // `forward_layer_standalone_graphs_paged` is public and complete, so
-            // the faithful verify needs no change to the prefill path at all.
+            // consumes diverged inputs from the ones ahead of it.
             //
-            // Layer-major over rows is numerically IDENTICAL to running the
-            // tokens sequentially: each layer sees the same token order, and
-            // each row's layer-L input is its own layer-(L-1) output, which is
-            // computed first. Only the order of independent work changes.
+            // TOKEN-major on purpose: this is the serial oracle. The earlier
+            // LAYER-major form (each layer over all rows, then the next layer)
+            // was NOT equivalent, because the per-layer state is shared across
+            // rows: the KV-source layers appended every row's compressor and
+            // index-key rows before any reuse layer ran for row 0, so row 0
+            // attended to the drafts' latents; the cached S2 top-k gather and the
+            // candidate pool carried the LAST row's values into the earlier rows.
+            // Its verify logits were conditioned on the drafts themselves, and
+            // anything concluded from it as an oracle is suspect.
             //
-            // This is the correctness step. It costs B x decode's per-layer work
-            // because each row still does its own remote submit — batching those
-            // per layer is the follow-up, and it is where speculation's win is.
+            // Costs B decode tokens; it is a correctness tool, not a fast path.
             if verify_decode_path() {
-                use v4flash_kernels::config::{ENGRAM_LAYERS, HC_DIM, N_LAYER, N_VOCAB};
-                let bsz = toks.len();
-                let mut resid: Vec<Vec<f32>> = hcs.clone();
-                let hcm = state.dgpu_scratch.hc_pre_carry.len();
-                let mut carry: Vec<Vec<f32>> = vec![vec![0.0f32; hcm]; bsz];
-                // Engram rows per row, gathered up front: hashes are token-only.
-                let mut erows: Vec<Option<Vec<Vec<f32>>>> = Vec::with_capacity(bsz);
+                let nv = v4flash_kernels::config::N_VOCAB as usize;
+                let mut out = vec![0.0f32; toks.len() * nv];
                 for (j, &t) in toks.iter().enumerate() {
-                    erows.push(match (state.pager.as_ref(), state.engram.as_mut()) {
-                        (Some(pg), Some(ec)) => {
-                            Some(ec.rows_for(pg.raw(), t, pos + j as u32)?)
-                        }
-                        _ => None,
-                    });
-                }
-                for layer in 0..N_LAYER as usize {
-                    let eidx = ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                    for j in 0..bsz {
-                        state.dgpu_scratch.residual.copy_from_host(&resid[j])?;
-                        if layer > 0 {
-                            state.dgpu_scratch.hc_pre_carry.copy_from_host(&carry[j])?;
-                        }
-                        if let (Some(ei), Some(er)) = (eidx, erows[j].as_ref()) {
-                            state.engine.stage_engram_rows(&mut state.dgpu_scratch, &er[ei])?;
-                        }
-                        {
-                            // Layer-major breaks the lockstep the token-major
-                            // path assumes, so publish rope pos + KV slot from
-                            // THIS layer's counters, per row.
-                            let slot = state.state.layers[layer].raw_off
-                                + state.state.layers[layer].n_raw;
-                            state.engine.publish_pos_slot(
-                                &mut state.dgpu_scratch,
-                                pos + j as u32,
-                                slot,
-                            )?;
-                        }
-                        {
-                            // V4.1 reuse layers borrow another layer's
-                            // compressor store; `with_kv_source` lends it for
-                            // the call and gives it back. Without it the layer
-                            // errors with "reuse layer without its source's
-                            // store".
-                            let pg = state.pager.as_mut().expect("pager");
-                            let eng = &state.engine;
-                            let dgs = &mut state.dgpu_scratch;
-                            let igs = &mut state.igpu_scratch;
-                            let dlw = &state.weights.dgpu_layers[layer];
-                            let ilw = &state.weights.igpu_layers[layer];
-                            let (p, t) = (pos + j as u32, toks[j]);
-                            state.state.with_kv_source(layer, |ls| {
-                                eng.forward_layer_standalone_graphs_paged(
-                                    dgs, igs, ls, dlw, ilw, p, t, pg,
-                                )
-                            })?;
-                        }
-                        // A layer READS `residual` and WRITES `residual_next`
-                        // (`forward_layer.rs:245`); decode's loop then swaps them
-                        // (`engine.rs:1189`). This path never swapped and read back
-                        // `residual` -- the layer's own INPUT -- so roughly every
-                        // other layer came back bit-unchanged and the verify was
-                        // running on a residual that had skipped half the model.
-                        // Read the OUTPUT buffer instead; the swap that keeps the
-                        // per-layer buffer PARITY in step with decode is done once
-                        // per layer, after the row loop, not per row: HIP graphs
-                        // capture POINTERS, so layer L must see the same physical
-                        // buffer here that it sees in decode (A for even L, B for
-                        // odd), and every row of layer L must see the same one.
-                        state.dgpu_scratch.residual_next.copy_to_host(&mut resid[j])?;
-                        state.dgpu_scratch.hc_pre_carry.copy_to_host(&mut carry[j])?;
-                        // V41_VDP_TRACE=1: row-0 residual norm per layer. A blow-up
-                        // or NaN localises the first bad layer without needing a
-                        // baseline run to diff against.
-                        if j == 0 && std::env::var("V41_VDP_TRACE").as_deref() == Ok("1") {
-                            let r = &resid[0];
-                            let n2: f64 = r.iter().map(|&v| (v as f64) * (v as f64)).sum();
-                            let nan = r.iter().filter(|v| !v.is_finite()).count();
-                            let c = &carry[0];
-                            let cn: f64 = c.iter().map(|&v| (v as f64) * (v as f64)).sum();
-                            eprintln!(
-                                "VDP L{layer:02} pos={} |resid|={:.4e} nonfinite={} |carry|={:.4e}",
-                                pos, n2.sqrt(), nan, cn.sqrt()
-                            );
-                        }
-                    }
-                    // One swap per LAYER (not per row), mirroring decode's
-                    // `engine.rs:1189`, so layer L+1's rows read the physical
-                    // buffer its captured graphs were built against.
-                    std::mem::swap(
-                        &mut state.dgpu_scratch.residual,
-                        &mut state.dgpu_scratch.residual_next,
-                    );
-                }
-                // Head per row, into the same [B * N_VOCAB] layout the batched
-                // path returns.
-                let nv = N_VOCAB as usize;
-                let mut out = vec![0.0f32; bsz * nv];
-                for j in 0..bsz {
-                    state.dgpu_scratch.residual.copy_from_host(&resid[j])?;
-                    state.dgpu_scratch.hc_pre_carry.copy_from_host(&carry[j])?;
-                    state.engine.forward_head(&mut state.dgpu_scratch, &state.weights.global)?;
+                    forward_one!(state, hcs[j], pos + j as u32, t)?;
                     state
                         .dgpu_scratch
                         .logits
                         .slice_view(0, nv)
                         .copy_to_host(&mut out[j * nv..(j + 1) * nv])?;
                 }
-                let _ = HC_DIM;
                 decode_path_logits = Some(out);
             }
             // Capture on BOTH lanes, and over the WHOLE verify batch.
@@ -4185,10 +4141,22 @@ fn finish_decode(
             // rewinds the COMPRESSED store to what the accepted prefix earns —
             // without it the rejected drafts' compressor boundaries stayed in
             // the store permanently and decode attended to them.
-            let partial = mark.advanced_by(keep, pos);
+            //
+            // It restores the PRE-verify segment accumulators, which are right
+            // only where no kept row's slot is still open: with `pos + keep` odd
+            // the ratio-2 slot 0 held a token of the previous, already-fired
+            // group, and the next fire pooled it into a permanent comp row (about
+            // half of all accepts). So commit the exact prefix and re-forward the
+            // rest (at most the last kept row on V4.1) through decode, which
+            // writes its raw KV, comp rows and accumulator slots exactly.
+            let exact = mark.exact_accumulator_rows(keep, pos);
+            let partial = mark.advanced_by(exact, pos);
             state.state.rollback_kv(&partial).map_err(|e| {
                 eyre!("dspark accept: partial rollback ({keep} of {k}) refused: {e}")
             })?;
+            for j in exact as usize..keep as usize {
+                forward_one!(state, hcs[j], pos + j as u32, toks[j])?;
+            }
 
             // `main_hidden` for the next draft is the row that became the head.
             let row = n; // row n is the last position kept: `next` + n drafts
@@ -5364,12 +5332,21 @@ fn prefill_suffix(
 
 #[derive(Debug, Clone)]
 pub struct GenerateResult {
-    /// Plain text content (post-DSML-scanner, UTF-8-clean).
+    /// Plain text content (post-DSML-scanner, UTF-8-clean), cut before the
+    /// first stop string when one matched.
     pub text: String,
+    /// The reasoning trace (`reasoning: true` chunks), UTF-8-clean; `None`
+    /// when the turn had none. Returned as `message.reasoning_content`, so a
+    /// stream:false client can echo it back: with tools the V4.1 template
+    /// replays reasoning on every historical turn, and dropping it here made
+    /// each replayed tool-call turn render as an empty think block.
+    pub reasoning: Option<String>,
     /// Tool calls parsed out of the DSML markup.
     pub tool_calls: Vec<crate::openai::types::ToolCall>,
     /// True if the scanner saw any tool call or the tool_calls block
-    /// closed (used to set finish_reason="tool_calls").
+    /// closed (used to set finish_reason="tool_calls"). False when the
+    /// token cap cut a call off (`DsmlScanner::cut_by_length`): the turn
+    /// then reports "length", with the calls closed before the cut.
     pub saw_tool: bool,
     /// True if the scanner hit an unknown DSML tag and fell back to
     /// Text mode — the model emitted broken markup (e.g.
@@ -5391,24 +5368,36 @@ pub struct GenerateResult {
 /// `tok_dsml` is the vocab's `｜DSML｜` token id — pass `None` to
 /// disable DSML scanning (treat all content as plain text).
 ///
-/// The text field gets only NON-reasoning, post-DSML-scanner content.
-/// Reasoning tokens are dropped (OpenAI's non-streaming response
-/// doesn't have a reasoning_content field). A UTF-8 buffer holds
-/// trailing 0–3 bytes of any incomplete multi-byte character across
-/// scanner Text events.
+/// The text field gets only NON-reasoning, post-DSML-scanner content;
+/// reasoning chunks go to `reasoning`. Each channel has its own UTF-8
+/// buffer for the trailing 0–3 bytes of an incomplete multi-byte
+/// character (a token can end mid-character).
+///
+/// `stop`: the request's stop strings (`openai::stop`), matched on the
+/// text only. On a match the text is cut before it and this returns at
+/// once with `FinishReason::Stop`; dropping `rx` (and the caller's cancel
+/// guard) ends the generation through the cancel path. No `Done` arrives
+/// then: `completion_tokens` is the number of tokens received and
+/// `prompt_tokens` is 0 (the handler counts the prompt itself).
 pub async fn accumulate(
     mut rx: mpsc::Receiver<WorkerEvent>,
     tok_dsml: Option<i32>,
+    stop: Vec<String>,
 ) -> eyre::Result<GenerateResult> {
     use crate::dsml::{DsmlEvent, DsmlScanner};
+    use crate::openai::stop::StopMatcher;
     use crate::openai::types::{ToolCall, ToolCallFunction};
 
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut saw_tool = false;
     let mut pending: Vec<u8> = Vec::new();
+    let mut reasoning_pending: Vec<u8> = Vec::new();
     let mut last: Option<(u32, u32, FinishReason)> = None;
     let mut scanner = DsmlScanner::new(tok_dsml.unwrap_or(-1));
+    let mut sm = StopMatcher::new(stop);
+    let mut n_chunks: u32 = 0;
 
     fn drain_valid_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
         pending.extend_from_slice(chunk);
@@ -5423,27 +5412,34 @@ pub async fn accumulate(
         String::from_utf8(drained).unwrap()
     }
 
-    while let Some(ev) = rx.recv().await {
+    'recv: while let Some(ev) = rx.recv().await {
         match ev {
             WorkerEvent::Chunk {
                 token_id,
                 bytes,
-                reasoning,
+                reasoning: is_reasoning,
             } => {
-                if reasoning {
+                n_chunks += 1;
+                if is_reasoning {
+                    reasoning.push_str(&drain_valid_utf8(&mut reasoning_pending, &bytes));
                     continue;
                 }
                 for de in scanner.push_token(token_id, &bytes) {
                     match de {
                         DsmlEvent::Text(b) => {
                             let s = drain_valid_utf8(&mut pending, &b);
-                            if !s.is_empty() {
-                                text.push_str(&s);
+                            text.push_str(&sm.push(&s));
+                            if sm.hit() {
+                                tracing::info!(completion_tokens = n_chunks, "non-streaming: stop sequence matched; cancelling the generation");
+                                break 'recv;
                             }
                         }
                         DsmlEvent::ToolCall {
                             id, name, arguments, ..
                         } => {
+                            // Text on the far side of a tool frame is not
+                            // contiguous with the held-back tail.
+                            text.push_str(&sm.flush());
                             saw_tool = true;
                             tool_calls.push(ToolCall {
                                 id,
@@ -5468,35 +5464,57 @@ pub async fn accumulate(
     // Drain scanner state. Since the DSML-repair port, finish() can
     // also emit ToolCall / ToolCallsEnd events (truncated tool-call
     // blocks recovered by appending the missing closing tags) — they
-    // must be collected exactly like live-stream ones.
-    for de in scanner.finish() {
-        match de {
-            DsmlEvent::Text(b) => {
-                let s = drain_valid_utf8(&mut pending, &b);
-                if !s.is_empty() {
-                    text.push_str(&s);
+    // must be collected exactly like live-stream ones. A call the token
+    // cap cut off is dropped, not repaired (see `DsmlScanner::finish`).
+    // Skipped after a stop match: whatever the scanner still holds comes
+    // after it.
+    if !sm.hit() {
+        let length_cut = matches!(last, Some((_, _, FinishReason::Length)));
+        for de in scanner.finish(length_cut) {
+            match de {
+                DsmlEvent::Text(b) => {
+                    let s = drain_valid_utf8(&mut pending, &b);
+                    text.push_str(&sm.push(&s));
+                    if sm.hit() {
+                        break;
+                    }
                 }
+                DsmlEvent::ToolCall {
+                    id, name, arguments, ..
+                } => {
+                    text.push_str(&sm.flush());
+                    saw_tool = true;
+                    tool_calls.push(ToolCall {
+                        id,
+                        kind: "function".into(),
+                        function: ToolCallFunction { name, arguments },
+                    });
+                }
+                DsmlEvent::ToolCallsEnd => saw_tool = true,
             }
-            DsmlEvent::ToolCall {
-                id, name, arguments, ..
-            } => {
-                saw_tool = true;
-                tool_calls.push(ToolCall {
-                    id,
-                    kind: "function".into(),
-                    function: ToolCallFunction { name, arguments },
-                });
-            }
-            DsmlEvent::ToolCallsEnd => saw_tool = true,
         }
     }
-    if !pending.is_empty() {
-        text.push_str(&String::from_utf8_lossy(&pending));
+    if !sm.hit() && !pending.is_empty() {
+        text.push_str(&sm.push(&String::from_utf8_lossy(&pending)));
+    }
+    text.push_str(&sm.flush());
+    if sm.hit() {
+        // A match after `Done` (in the scanner's leftovers) keeps the
+        // worker's counts; one before it has only the tokens seen so far.
+        last = Some(match last {
+            Some((p, c, _)) => (p, c, FinishReason::Stop),
+            None => (0, n_chunks, FinishReason::Stop),
+        });
+    }
+    if !reasoning_pending.is_empty() {
+        reasoning.push_str(&String::from_utf8_lossy(&reasoning_pending));
     }
     let (p, c, f) = last.ok_or_else(|| eyre!("worker closed without Done"))?;
     let saw_malformed = scanner.saw_malformed();
+    let saw_tool = saw_tool && !scanner.cut_by_length();
     Ok(GenerateResult {
         text,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
         tool_calls,
         saw_tool,
         saw_malformed,
@@ -5504,6 +5522,124 @@ pub async fn accumulate(
         completion_tokens: c,
         finish_reason: f,
     })
+}
+
+#[cfg(test)]
+mod accumulate_tests {
+    use super::*;
+
+    const DSML: i32 = 128825;
+    const D: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
+
+    fn chunk(token_id: i32, bytes: &[u8], reasoning: bool) -> WorkerEvent {
+        WorkerEvent::Chunk { token_id, bytes: bytes.to_vec(), reasoning }
+    }
+
+    fn done(completion_tokens: u32) -> WorkerEvent {
+        WorkerEvent::Done { prompt_tokens: 7, completion_tokens, finish: FinishReason::Stop }
+    }
+
+    /// Run `accumulate` over `evs`, the sender dropped after them.
+    async fn run(evs: Vec<WorkerEvent>, stop: &[&str]) -> GenerateResult {
+        let (tx, rx) = mpsc::channel(evs.len() + 1);
+        for e in evs {
+            tx.send(e).await.unwrap();
+        }
+        drop(tx);
+        accumulate(rx, Some(DSML), stop.iter().map(|s| s.to_string()).collect()).await.unwrap()
+    }
+
+    /// A V4.1 tool-call block whose prose, tag names and parameter value
+    /// all hold candidate stop strings.
+    fn tool_turn() -> Vec<WorkerEvent> {
+        vec![
+            chunk(1, b"Reading.\n\n<", false),
+            chunk(DSML, D, false),
+            chunk(1, b" calls>\n<", false),
+            chunk(DSML, D, false),
+            chunk(1, b" invoke name=\"read_file\">\n<", false),
+            chunk(DSML, D, false),
+            chunk(1, b" parameter name=\"path\" string=\"true\">a\nObservation: b</", false),
+            chunk(DSML, D, false),
+            chunk(1, b" parameter>\n</", false),
+            chunk(DSML, D, false),
+            chunk(1, b" invoke>\n</", false),
+            chunk(DSML, D, false),
+            chunk(1, b" calls>", false),
+            done(13),
+        ]
+    }
+
+    #[tokio::test]
+    async fn reasoning_is_returned_not_dropped() {
+        // "─" (E2 94 80) split across two reasoning tokens, and a content
+        // token in between that must not disturb the reasoning buffer.
+        let r = run(
+            vec![
+                chunk(1, b"plan \xe2\x94", true),
+                chunk(1, b"\x80 done", true),
+                chunk(1, b"answer", false),
+                done(3),
+            ],
+            &[],
+        )
+        .await;
+        assert_eq!(r.reasoning.as_deref(), Some("plan ─ done"));
+        assert_eq!(r.text, "answer");
+        let r = run(vec![chunk(1, b"answer", false), done(1)], &[]).await;
+        assert_eq!(r.reasoning, None, "no reasoning -> field omitted");
+    }
+
+    #[tokio::test]
+    async fn stop_split_across_tokens_truncates_and_cancels() {
+        let (tx, rx) = mpsc::channel(16);
+        for (b, r) in [(&b"think\nObservation: x"[..], true), (b"Action: ls\nObs", false), (b"erv", false), (b"ation: hallucinated", false)] {
+            tx.send(chunk(1, b, r)).await.unwrap();
+        }
+        // The sender stays open and no `Done` comes: accumulate must return
+        // on the match by itself, and its dropped receiver is what tells
+        // the worker to stop (the cancel path).
+        let r = accumulate(rx, Some(DSML), vec!["\nObservation:".into()]).await.unwrap();
+        assert!(tx.is_closed());
+        assert_eq!(r.text, "Action: ls");
+        assert_eq!(r.reasoning.as_deref(), Some("think\nObservation: x"), "stop does not apply to reasoning");
+        assert!(matches!(r.finish_reason, FinishReason::Stop));
+        assert_eq!(r.completion_tokens, 4, "tokens seen before the match");
+    }
+
+    #[tokio::test]
+    async fn stop_never_matches_inside_a_tool_frame() {
+        let r = run(tool_turn(), &["\nObservation:", "calls", "path"]).await;
+        assert_eq!(r.tool_calls.len(), 1);
+        let args: serde_json::Value = serde_json::from_str(&r.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "a\nObservation: b");
+        assert_eq!(r.text, "Reading.\n\n");
+        assert_eq!(r.completion_tokens, 13, "no match: the worker's own counts");
+    }
+
+    #[tokio::test]
+    async fn held_back_partial_is_released_at_a_tool_frame() {
+        // "\n\n" is a prefix of the stop: held until the frame proves it
+        // cannot complete.
+        let r = run(tool_turn(), &["\n\nObservation"]).await;
+        assert_eq!(r.text, "Reading.\n\n");
+        assert_eq!(r.tool_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_in_prose_before_a_tool_call_ends_the_turn_there() {
+        let r = run(tool_turn(), &["ing."]).await;
+        assert_eq!(r.text, "Read");
+        assert!(r.tool_calls.is_empty() && !r.saw_tool);
+        assert!(matches!(r.finish_reason, FinishReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn trailing_partial_is_flushed_at_the_end() {
+        let r = run(vec![chunk(1, b"x END", false), chunk(1, b"\nE", false), done(2)], &["\nEND"]).await;
+        assert_eq!(r.text, "x END\nE");
+        assert!(matches!(r.finish_reason, FinishReason::Stop));
+    }
 }
 
 // Compile-time sanity check.

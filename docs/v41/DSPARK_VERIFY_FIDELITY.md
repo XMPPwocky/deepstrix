@@ -44,7 +44,7 @@ gap is real and unexplained; it is the remaining fidelity defect.
 | Hypothesis | Instrument | Result |
 |---|---|---|
 | Prefill MoE kernels differ from decode's | `V41_VERIFY_DECODE_MOE=1` | no change (0.673 vs 0.710 at B=6) |
-| Prefill attention kernels differ | `V41_VERIFY_DECODE_ATTN=1` | small (0.771 vs 0.710) |
+| Prefill attention kernels differ | `V41_VERIFY_DECODE_ATTN=1` | **INVALID** (2026-10-03, KNOWN_BUGS #48: the replay attended the wrong window); was "small (0.771 vs 0.710)" -- re-measure |
 | `n_comp_after` wrong on the own-compressor branch | `V41_COMP_POSITIONAL=2` | ZERO disagreements with the positional formula |
 | Two-lane split | `V41_SINGLE_LANE_AB=6` | 0.694 vs 0.679 — both arms broken, because the cliff is where a LANE first holds >1 row (lane_split = b/2 rounded up), not where a second lane appears |
 | Rows 1.. leak into row 0 | poison rows 1.. (tokens AND carries, so the mHC pre-mix is covered) | row 0 does not move |

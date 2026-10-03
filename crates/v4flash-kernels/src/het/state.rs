@@ -269,14 +269,9 @@ impl HetModelState {
     /// This is the reject half of speculative decoding: a verify step appends B
     /// tokens, the first rejected one and everything after it must go away.
     ///
-    /// # What this does NOT restore
-    /// **The compressor and indexer-compressor streaming state.** Those advance
-    /// with accepted AND rejected tokens and would need
-    /// `compressor_state_snapshot` to roll back properly. Deliberately out of
-    /// scope for now, so a rejected token leaves the compressor slightly ahead of
-    /// the raw KV. Fine while the compressed store is an approximation used for
-    /// scoring, NOT fine if bit-exact continuation is required — wire the
-    /// snapshot before claiming that.
+    /// The compressor stores are restored from [`KvMark::per_layer_comp`]
+    /// (counters and the running accumulators). For a PARTIAL rollback the
+    /// accumulators are exact only up to [`KvMark::exact_accumulator_rows`].
     ///
     /// # Errors
     /// If any layer's `raw_off` went BACKWARDS, the oversized cache wrapped since
@@ -503,13 +498,15 @@ impl KvMark {
     ///     row a boundary wrote inside the accepted prefix was computed from
     ///     real tokens, so those rows are valid and we keep exactly them.
     ///   - `state_kv` / `state_score` are restored to their pre-verify values.
-    ///     That is exact when the accepted prefix ends ON a segment boundary
-    ///     (the open segment is empty either way) and approximate otherwise, by
-    ///     at most the `ratio - 1` positions of one open segment — which affects
-    ///     only the NEXT compressed row. The alternative, keeping the batch's
-    ///     accumulator, is wrong by the REJECTED rows, which is strictly worse.
-    ///     Exactness here needs a per-row accumulator snapshot, which the
-    ///     batched compressor (one launch for the whole chunk) cannot provide.
+    ///     That is exact only when no kept row's accumulator slot is still read
+    ///     at `abs_pos + keep` (see [`Self::exact_accumulator_rows`]); otherwise
+    ///     it is WRONG, not approximate: the stale slot holds a token of an
+    ///     already-fired group and the next fire pools it into a compressed row
+    ///     that stays in the store for good. Keeping the batch's accumulator is
+    ///     no better (it holds the rejected rows), and the batched compressor
+    ///     (one launch for the whole chunk) keeps no per-row snapshot, so the
+    ///     accept path commits only `exact_accumulator_rows` rows here and
+    ///     re-forwards the rest through decode.
     pub fn advanced_by(&self, keep: u32, abs_pos: u32) -> Self {
         // SLIDING WINDOW, not a growing count. Decode keeps a monotonic append
         // region of size SWA_WINDOW + B_MAX: the append pointer is `off + nr`,
@@ -622,6 +619,52 @@ impl KvMark {
             .collect();
         Self { per_layer, per_layer_comp, slid: true }
     }
+}
+
+impl KvMark {
+    /// The longest accepted prefix `s <= keep` for which [`Self::advanced_by`]
+    /// restores the compressor accumulators EXACTLY: committing
+    /// `advanced_by(s, abs_pos)` and re-forwarding rows `s..keep` through decode
+    /// is then exact. `keep` itself when the mark carries no accumulators to
+    /// restore (`V41_COMP_ROLLBACK=0`, or a mark without them), since the
+    /// rollback then leaves the batch's store as it is and a re-forward would
+    /// ingest those rows into it twice.
+    pub fn exact_accumulator_rows(&self, keep: u32, abs_pos: u32) -> u32 {
+        if self.per_layer_comp.is_empty() || !comp_rollback_enabled() {
+            return keep;
+        }
+        let ratios = self
+            .per_layer_comp
+            .iter()
+            .enumerate()
+            .filter(|(_, cm)| cm.is_some())
+            .map(|(layer, _)| crate::config::COMPRESS_RATIOS[layer]);
+        exact_accumulator_prefix(ratios, keep, abs_pos)
+    }
+}
+
+/// Core of [`KvMark::exact_accumulator_rows`] over the ratios of the stores the
+/// mark restores. The pre-verify accumulators are right at `abs_pos + s` only
+/// when no row of `[abs_pos, abs_pos + s)` has a slot the next fire still reads:
+///   - ratio 0 / 1 keep no accumulator (ratio 1 pools each row on its own);
+///   - a non-overlapping ratio `r` (V4.1's 2, V4-Flash's 128) holds one slot per
+///     `pos % r`, never cleared after a fire and read only by the open segment's
+///     fire, so `(abs_pos + s) % r == 0` (open segment empty) is exact;
+///   - the overlapping ratio 4 (`coff` 2) also pools the previous group, which
+///     contains a kept row whenever `s > 0`, so only `s = 0` is exact.
+///
+/// V4.1 (ratios 1 and 2): `keep` when `abs_pos + keep` is even, else `keep - 1`,
+/// so the accept path re-forwards at most one row.
+fn exact_accumulator_prefix(
+    ratios: impl Iterator<Item = u32> + Clone,
+    keep: u32,
+    abs_pos: u32,
+) -> u32 {
+    let exact = |s: u32| {
+        s == 0
+            || ratios.clone().all(|r| r <= 1 || (r != 4 && (abs_pos + s) % r == 0))
+    };
+    (0..=keep).rev().find(|&s| exact(s)).unwrap_or(0)
 }
 
 impl CompStateMark {
@@ -784,5 +827,70 @@ impl HetModelState {
             layers,
             n_kv_max,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The legacy DSpark accept bug: a verify at pos=100 keeping one row left
+    /// the ratio-2 slot 0 holding kv98, so the fire at 101 pooled (kv98, kv101).
+    /// Only even end positions may restore the pre-verify accumulators.
+    #[test]
+    fn ratio_two_commits_only_up_to_an_even_end() {
+        let r = [0u32, 2, 2, 1];
+        let f = |keep, pos| exact_accumulator_prefix(r.iter().copied(), keep, pos);
+        assert_eq!(f(1, 100), 0, "pos 100 + 1 is odd: re-forward the kept row");
+        assert_eq!(f(2, 100), 2);
+        assert_eq!(f(5, 100), 4);
+        assert_eq!(f(1, 101), 1);
+        assert_eq!(f(4, 101), 3);
+        assert_eq!(f(0, 101), 0);
+        // Ratios 0 and 1 alone have no accumulator: everything commits.
+        assert_eq!(exact_accumulator_prefix([0u32, 1].into_iter(), 7, 3), 7);
+    }
+
+    #[test]
+    fn other_ratios() {
+        // Non-overlapping 128: only an end on the group boundary is exact.
+        assert_eq!(exact_accumulator_prefix([128u32].into_iter(), 8, 120), 8);
+        assert_eq!(exact_accumulator_prefix([128u32].into_iter(), 7, 120), 0);
+        assert_eq!(exact_accumulator_prefix([128u32].into_iter(), 3, 0), 0);
+        // Overlapping 4 pools the previous group too: never past row 0.
+        assert_eq!(exact_accumulator_prefix([4u32, 128].into_iter(), 8, 124), 0);
+        assert_eq!(exact_accumulator_prefix([4u32].into_iter(), 4, 0), 0);
+    }
+
+    /// The same through a real mark: every V4.1 store that owns an accumulator,
+    /// and the rows `advanced_by` then commits agree with it.
+    #[cfg(feature = "v41")]
+    #[test]
+    fn mark_uses_the_owning_layers_ratios() {
+        let n = crate::config::N_LAYER as usize;
+        let cm = || {
+            Some(CompMark {
+                main: Some(CompStateMark {
+                    n_comp: 50,
+                    n_index_comp: 0,
+                    state_kv: vec![0.0; 4],
+                    state_score: vec![0.0; 4],
+                }),
+                indexer: None,
+            })
+        };
+        let per_layer_comp = (0..n)
+            .map(|l| if crate::config::KV_SOURCE_LAYERS.contains(&(l as i32)) { cm() } else { None })
+            .collect();
+        let mark = KvMark { per_layer: vec![(10, 0); n], slid: false, per_layer_comp };
+        assert_eq!(mark.exact_accumulator_rows(1, 100), 0);
+        assert_eq!(mark.exact_accumulator_rows(3, 100), 2);
+        assert_eq!(mark.exact_accumulator_rows(3, 101), 3);
+        // Positional n_comp of the committed prefix: ratio 2 at L2, ratio 1 at L20.
+        let p = mark.advanced_by(2, 100);
+        assert_eq!(p.per_layer_comp[2].as_ref().unwrap().main.as_ref().unwrap().n_comp, 51);
+        // A mark with no accumulators commits everything.
+        let bare = KvMark { per_layer: vec![(10, 0); n], slid: false, per_layer_comp: Vec::new() };
+        assert_eq!(bare.exact_accumulator_rows(1, 100), 1);
     }
 }

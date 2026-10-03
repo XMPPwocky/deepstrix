@@ -25,7 +25,7 @@ use color_eyre::eyre::{self, eyre};
 use serde::{Deserialize, Serialize};
 use v4flash_core::tokenizer::BpeVocab;
 use v4flash_hip::Device;
-use v4flash_kernels::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
+use v4flash_kernels::config::{CED_DECODER_START, COMPRESS_RATIOS, N_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
 use v4flash_kernels::het::HetModelState;
 
 use v4flash_kernels::comp_kv_fp8::{FP8_KV_HEAD_ROWS, FP8_KV_ROW_BYTES};
@@ -68,6 +68,47 @@ use crate::vision_prompt::{span_hash_at, synthetic_token_bytes, ImageSpan};
 const FORMAT_VERSION: u32 = 6;
 /// Oldest format `restore` accepts.
 const MIN_FORMAT_VERSION: u32 = 6;
+
+/// Code generation of the KV a forward writes. BUMP IT WITH EVERY FIX THAT
+/// CHANGES THE KV A PREFILL OR DECODE WRITES (attention, compressor, Engram,
+/// MoE/expert selection, ring handling: the KNOWN_BUGS #20/#22/#23/#28 class).
+/// The format version and the model fingerprint say nothing about which code
+/// produced the rows, and `save` streams a restored prefix's rows into every
+/// longer snapshot while `touch` keeps active lineages alive: without a bump,
+/// KV from the buggy build outlives the fix for the rest of every conversation
+/// that started before it. Another epoch is a cache miss: `load` deletes an
+/// older one (skips a newer one, like a newer format), `restore` refuses it
+/// (callers evict). A meta.json without the field is epoch 0.
+// 0 -> 1 (2026-10-03): the quality-review fix round (mid-prefill checkpoint
+// key and rings among them) changed the KV several paths write; every
+// snapshot from before it is dropped once on deploy.
+pub const KV_EPOCH: u32 = 1;
+
+/// Name prefixes of in-flight `save` directories under the snapshot root
+/// (`.tmp-`: being written; `.old-`: a same-key snapshot being replaced). A
+/// crash leaves them behind; `load` deletes them unless their writer is alive
+/// ([`save_dir_is_stale`]).
+const SAVE_TMP_PREFIX: &str = ".tmp-";
+const SAVE_OLD_PREFIX: &str = ".old-";
+
+/// Is `name` (a directory under the snapshot root) a `save` leftover that
+/// `load` may delete? `save` names both its dirs `<prefix><key>-<pid>`. A dir
+/// whose pid is ANOTHER live process belongs to a writer still running (an
+/// overlapping restart): its `.tmp-` is the save in flight, its `.old-` the
+/// snapshot `commit_dir` renames back if the commit fails, so both are left
+/// alone. Our own pid is stale (`load` runs before this process saves; a
+/// container restart reuses the pid), and so is a name without a pid. Off
+/// Linux there is no `/proc` to ask: stale. `None`: not a save dir.
+fn save_dir_is_stale(name: &str) -> Option<bool> {
+    let rest = name.strip_prefix(SAVE_TMP_PREFIX).or_else(|| name.strip_prefix(SAVE_OLD_PREFIX))?;
+    let pid = rest.rsplit_once('-').and_then(|(_, pid)| pid.parse::<u32>().ok());
+    Some(match pid {
+        Some(pid) if pid != std::process::id() && cfg!(target_os = "linux") => {
+            !Path::new("/proc").join(pid.to_string()).exists()
+        }
+        _ => true,
+    })
+}
 
 /// On-disk encoding of one compressor's `comp_kv` rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -272,6 +313,9 @@ pub struct SnapshotMeta {
     /// Absent on pre-vision snapshots (which contain no image tokens).
     #[serde(default)]
     pub image_spans: Vec<ImageSpan>,
+    /// [`KV_EPOCH`] of the build that wrote the KV. Absent = 0.
+    #[serde(default)]
+    pub kv_epoch: u32,
 }
 
 /// In-memory record of one on-disk snapshot.
@@ -373,10 +417,26 @@ impl SnapshotIndex {
             return Ok(idx);
         }
         let mut skipped_fingerprint = 0usize;
+        let mut skipped_epoch = 0usize;
         for entry in fs::read_dir(&root)? {
             let entry = entry?;
             let path = entry.path();
             if !path.is_dir() {
+                continue;
+            }
+            // A save that never committed (crash, kill): half-written, and
+            // outside the cap's accounting. Within this process one worker
+            // owns the index; a dir of another live process (an overlapping
+            // restart's old server, still saving) is left to it.
+            if let Some(stale) = path.file_name().and_then(|n| n.to_str()).and_then(save_dir_is_stale) {
+                if !stale {
+                    tracing::info!(path = ?path, "snapshot save of another live process in flight; left alone");
+                    continue;
+                }
+                match fs::remove_dir_all(&path) {
+                    Ok(()) => tracing::warn!(path = ?path, "uncommitted snapshot save left behind; deleted"),
+                    Err(e) => tracing::warn!(path = ?path, error = %e, "failed to delete an uncommitted snapshot save"),
+                }
                 continue;
             }
             let meta_path = path.join("meta.json");
@@ -416,6 +476,20 @@ impl SnapshotIndex {
                 skipped_fingerprint += 1;
                 continue;
             }
+            // KV written by another code generation (`KV_EPOCH`): an older one
+            // is an invalid cache entry, deleted like an older format; a newer
+            // one belongs to a newer binary and is left alone.
+            if meta.kv_epoch < KV_EPOCH {
+                match fs::remove_dir_all(&path) {
+                    Ok(()) => skipped_epoch += 1,
+                    Err(e) => tracing::warn!(path = ?path, error = %e, "failed to delete an old-epoch snapshot"),
+                }
+                continue;
+            }
+            if meta.kv_epoch > KV_EPOCH {
+                tracing::warn!(path = ?path, saw = meta.kv_epoch, want = KV_EPOCH, "snapshot KV epoch newer than this binary; skipping");
+                continue;
+            }
             let Some(hash_hex) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
@@ -442,6 +516,8 @@ impl SnapshotIndex {
             total_bytes = idx.total_bytes,
             cap_bytes = idx.cap_bytes,
             skipped_fingerprint,
+            deleted_old_kv_epoch = skipped_epoch,
+            kv_epoch = KV_EPOCH,
             "snapshot index loaded"
         );
         Ok(idx)
@@ -463,7 +539,12 @@ impl SnapshotIndex {
             if let Ok(mut meta) = serde_json::from_slice::<SnapshotMeta>(&bytes) {
                 meta.last_used_unix = now;
                 if let Ok(out) = serde_json::to_vec_pretty(&meta) {
-                    let _ = fs::write(&meta_path, out);
+                    // Through a rename: a crash mid-write must not leave a
+                    // truncated meta.json (unparseable -> orphaned on disk).
+                    let tmp = entry.dir.join("meta.json.tmp");
+                    if fs::write(&tmp, out).and_then(|()| fs::rename(&tmp, &meta_path)).is_err() {
+                        let _ = fs::remove_file(&tmp);
+                    }
                 }
             }
         }
@@ -477,6 +558,16 @@ impl SnapshotIndex {
     /// restore, so the next matching request does not re-read it.
     pub fn evict(&mut self, hash: &[u8; 32], reason: &str) {
         self.remove_entry(hash, reason);
+    }
+
+    /// Forget `session_id`'s hint if it points at `hash`: a snapshot this
+    /// session's request refused ([`resume_ok_from_meta`]) but that stays
+    /// valid for others (a mid-prefill checkpoint resumes a longer suffix),
+    /// so its retries stop probing it first.
+    pub fn drop_session_hint(&mut self, session_id: &str, hash: &[u8; 32]) {
+        if self.session_to_hash.get(session_id) == Some(hash) {
+            self.session_to_hash.remove(session_id);
+        }
     }
 
     fn remove_entry(&mut self, hash: &[u8; 32], reason: &str) {
@@ -1022,8 +1113,73 @@ pub fn save(
     // differently but produce identical byte streams).
     let hash = blake3_decoded(tokens, image_spans, vocab, byte_decoder);
     let dir = root.join(hex::encode(hash));
-    fs::create_dir_all(&dir)?;
+    // Written into a private directory and renamed into place (the commit
+    // point). A same-key re-save used to overwrite the files in place, so a
+    // failure part-way (ENOSPC, a device error, a crash) left old and new
+    // blobs side by side under a key that was still indexed; a failed save
+    // now leaves the previous snapshot (if any) untouched and nothing else.
+    let tag = format!("{}-{}", hex::encode(hash), std::process::id());
+    let tmp = root.join(format!("{SAVE_TMP_PREFIX}{tag}"));
+    let _ = fs::remove_dir_all(&tmp);
+    let written = fs::create_dir_all(&tmp)
+        .map_err(eyre::Report::from)
+        .and_then(|()| save_files(state, tokens, image_spans, dgpu, igpu, fingerprint, &tmp, session_id));
+    let (disk_bytes, now) = match written {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+    };
+    commit_dir(&tmp, &dir, &root.join(format!("{SAVE_OLD_PREFIX}{tag}")))?;
+    Ok(IndexEntry {
+        hash,
+        token_count: tokens.len() as u32,
+        last_used_unix: now,
+        disk_bytes,
+        dir,
+        session_id: session_id.map(|s| s.to_string()),
+    })
+}
 
+/// Move the fully written save directory `tmp` to `dir`, replacing a previous
+/// snapshot of the same key (moved aside to `old` first: a directory rename
+/// cannot replace a non-empty directory). On failure the previous snapshot is
+/// put back and `tmp` removed.
+fn commit_dir(tmp: &Path, dir: &Path, old: &Path) -> eyre::Result<()> {
+    let replaced = dir.exists();
+    if replaced {
+        let _ = fs::remove_dir_all(old);
+        if let Err(e) = fs::rename(dir, old) {
+            let _ = fs::remove_dir_all(tmp);
+            return Err(eyre!("snapshot.save: move {dir:?} aside: {e}"));
+        }
+    }
+    if let Err(e) = fs::rename(tmp, dir) {
+        if replaced {
+            let _ = fs::rename(old, dir);
+        }
+        let _ = fs::remove_dir_all(tmp);
+        return Err(eyre!("snapshot.save: commit {dir:?}: {e}"));
+    }
+    if replaced {
+        let _ = fs::remove_dir_all(old);
+    }
+    Ok(())
+}
+
+/// The files of one snapshot, written into `dir` (meta.json last). Returns
+/// (disk bytes, creation time).
+fn save_files(
+    state: &HetModelState,
+    tokens: &[i32],
+    image_spans: &[ImageSpan],
+    dgpu: Device,
+    igpu: Device,
+    fingerprint: &ModelFingerprint,
+    dir: &Path,
+    session_id: Option<&str>,
+) -> eyre::Result<(u64, u64)> {
     // tokens.bin is still i32-LE token IDs — we DO want to restore the
     // actual sampled tokens into the KV cache (the K/V vectors were
     // built from those exact IDs). The hash key just makes lookup
@@ -1221,6 +1377,7 @@ pub fn save(
         disk_bytes: 0,
         session_id: session_id.map(|s| s.to_string()),
         image_spans: image_spans.to_vec(),
+        kv_epoch: KV_EPOCH,
     };
     let mut total_bytes: u64 = tokens_bytes.len() as u64 + kv_bytes;
     total_bytes += comp_kv_bytes;
@@ -1232,15 +1389,7 @@ pub fn save(
     meta.disk_bytes = total_bytes;
     let meta_final = serde_json::to_vec_pretty(&meta).map_err(|e| eyre!("meta encode: {e}"))?;
     fs::write(dir.join("meta.json"), &meta_final)?;
-
-    Ok(IndexEntry {
-        hash,
-        token_count: tokens.len() as u32,
-        last_used_unix: now,
-        disk_bytes: total_bytes,
-        dir,
-        session_id: session_id.map(|s| s.to_string()),
-    })
+    Ok((total_bytes, now))
 }
 
 /// Restore a snapshot into `state`. The caller must have already
@@ -1273,6 +1422,97 @@ pub struct RestoredSnapshot {
     pub tokens: Vec<i32>,
     /// Image spans recorded at save time (empty for pre-vision snapshots).
     pub image_spans: Vec<ImageSpan>,
+    /// The CED decoder rings were saved EMPTY (a mid-prefill checkpoint):
+    /// see [`resume_ok`] before prefilling a suffix onto it.
+    pub decoder_rings_empty: bool,
+}
+
+/// The checks on a snapshot's meta.json that need no device: format, model,
+/// KV epoch, layer count, and per-layer counts consistent with the token
+/// count (a compressor of ratio r holds exactly `token_count / r` rows, a raw
+/// ring never more rows than tokens). A mismatch is a cache miss.
+fn check_meta(meta: &SnapshotMeta, fingerprint: &ModelFingerprint) -> eyre::Result<()> {
+    if meta.format_version < MIN_FORMAT_VERSION || meta.format_version > FORMAT_VERSION {
+        return Err(eyre!(
+            "snapshot.restore: format_version mismatch (saw {}, want {}..={})",
+            meta.format_version,
+            MIN_FORMAT_VERSION,
+            FORMAT_VERSION
+        ));
+    }
+    if meta.fingerprint != *fingerprint {
+        return Err(eyre!(
+            "snapshot.restore: model fingerprint mismatch (snapshot is from a different model)"
+        ));
+    }
+    if meta.kv_epoch != KV_EPOCH {
+        return Err(eyre!(
+            "snapshot.restore: KV epoch {} (this build writes {KV_EPOCH}): KV from another code generation",
+            meta.kv_epoch
+        ));
+    }
+    if meta.layers.len() != N_LAYER as usize {
+        return Err(eyre!(
+            "snapshot.restore: layer count mismatch (saw {}, want {})",
+            meta.layers.len(),
+            N_LAYER
+        ));
+    }
+    for (li, m) in meta.layers.iter().enumerate() {
+        if m.n_raw > meta.token_count {
+            return Err(eyre!(
+                "snapshot.restore: layer {li} has {} raw rows for {} tokens",
+                m.n_raw, meta.token_count
+            ));
+        }
+        if m.has_compressor && m.ratio > 0 && m.n_comp != meta.token_count / m.ratio {
+            return Err(eyre!(
+                "snapshot.restore: layer {li} has {} compressed rows for {} tokens at ratio {}",
+                m.n_comp, meta.token_count, m.ratio
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Were the CED decoder rings (layers `CED_DECODER_START..`) saved empty at a
+/// non-empty position? Only a mid-prefill checkpoint
+/// (`PrefillJob::clear_decoder_rings_for_checkpoint`) does that: any state
+/// that ran the decoder over a row holds it in every decoder ring.
+fn decoder_rings_empty(meta: &SnapshotMeta) -> bool {
+    meta.token_count > 0
+        && CED_DECODER_START < meta.layers.len()
+        && meta.layers[CED_DECODER_START..].iter().all(|l| l.n_raw == 0)
+}
+
+/// May a restored snapshot be resumed by prefilling `suffix_rows` more prompt
+/// rows (the trailing think marker, forwarded after them, not counted; a
+/// marker forwarded IN the prefill because the suffix is empty counts as 0)?
+/// Always, unless its decoder rings are empty: then only under CED and only
+/// when the suffix is longer than the replay (`SWA_WINDOW` rows), which then
+/// starts past `pos0` and empties the rings anyway, exactly like a fresh
+/// prompt. A shorter suffix is a continuation: the rings are KEPT (KNOWN_BUGS
+/// #25), and the replay and the first ~SWA_WINDOW decoded tokens would attend
+/// a window of only the suffix rows. Without CED every suffix row runs the
+/// decoder layers on the empty rings.
+pub fn resume_ok(decoder_rings_empty: bool, suffix_rows: usize, ced: bool) -> bool {
+    !decoder_rings_empty || (ced && suffix_rows > SWA_WINDOW as usize)
+}
+
+/// [`resume_ok`] decided from `src`'s meta.json alone, BEFORE [`restore_vl`]
+/// reads the blobs (GBs at 100K tokens): a checkpoint the request cannot
+/// resume used to be read whole on every retry only to be refused.
+/// `suffix_rows` as [`resume_ok`], from the request tokens the index match
+/// covers. A meta.json that cannot be read or parsed answers true:
+/// `restore_vl` reports it (and the caller evicts).
+pub fn resume_ok_from_meta(src: &Path, suffix_rows: usize, ced: bool) -> bool {
+    let Some(meta) = fs::read(src.join("meta.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SnapshotMeta>(&b).ok())
+    else {
+        return true;
+    };
+    resume_ok(decoder_rings_empty(&meta), suffix_rows, ced)
 }
 
 /// [`restore`] that also returns the snapshot's image spans.
@@ -1288,26 +1528,7 @@ pub fn restore_vl(
         .map_err(|e| eyre!("snapshot.restore: read meta.json: {e}"))?;
     let meta: SnapshotMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| eyre!("snapshot.restore: parse meta.json: {e}"))?;
-    if meta.format_version < MIN_FORMAT_VERSION || meta.format_version > FORMAT_VERSION {
-        return Err(eyre!(
-            "snapshot.restore: format_version mismatch (saw {}, want {}..={})",
-            meta.format_version,
-            MIN_FORMAT_VERSION,
-            FORMAT_VERSION
-        ));
-    }
-    if meta.fingerprint != *fingerprint {
-        return Err(eyre!(
-            "snapshot.restore: model fingerprint mismatch (snapshot is from a different model)"
-        ));
-    }
-    if meta.layers.len() != N_LAYER as usize {
-        return Err(eyre!(
-            "snapshot.restore: layer count mismatch (saw {}, want {})",
-            meta.layers.len(),
-            N_LAYER
-        ));
-    }
+    check_meta(&meta, fingerprint)?;
     if state.layers.len() != N_LAYER as usize {
         return Err(eyre!("snapshot.restore: state has wrong layer count"));
     }
@@ -1333,6 +1554,12 @@ pub fn restore_vl(
     let mut tokens = Vec::with_capacity(token_count);
     for chunk in tokens_bytes.chunks_exact(4) {
         tokens.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    if token_count != meta.token_count as usize {
+        return Err(eyre!(
+            "snapshot.restore: tokens.bin holds {token_count} tokens, meta.json says {}",
+            meta.token_count
+        ));
     }
 
     // Blobs are streamed per layer (exact-size reads into reusable host
@@ -1432,14 +1659,17 @@ pub fn restore_vl(
             let block_bytes = n_state * 4;
             let block_total = 2 * block_bytes;
             igpu.set_current()?;
+            // A short or missing file is REFUSED like every other blob. It used
+            // to "fall back" to the alloc-time defaults, i.e. silently drop the
+            // partial block at the snapshot boundary: the next comp row pooled
+            // the wrong tokens and every later snapshot of the lineage kept it.
             if !comp_state_rd.has(block_total) {
-                // Fall back to alloc-time defaults if missing.
-                comp.state_kv.copy_from_host(&vec![0f32; n_state])?;
-                comp.state_score.copy_from_host(&vec![NEG_INF; n_state])?;
-            } else {
-                scratch.load_f32(&mut comp_state_rd, n_state, &mut comp.state_kv)?;
-                scratch.load_f32(&mut comp_state_rd, n_state, &mut comp.state_score)?;
+                return Err(eyre!(
+                    "snapshot.restore: comp_state.bin is short at layer {li}"
+                ));
             }
+            scratch.load_f32(&mut comp_state_rd, n_state, &mut comp.state_kv)?;
+            scratch.load_f32(&mut comp_state_rd, n_state, &mut comp.state_score)?;
 
             // v6: V4.1 sparse-indexer keys. Without these `n_index_comp` comes
             // back 0 and the decode gate (`n_index_comp > INDEXER_TOP_K`) can
@@ -1539,13 +1769,14 @@ pub fn restore_vl(
             let in_state = (m.index_state_rows as usize) * (m.index_width as usize);
             let in_block_bytes = in_state * 4;
             let in_block_total = 2 * in_block_bytes;
+            // Refused when short, as comp_state.bin above.
             if !index_comp_state_rd.has(in_block_total) {
-                icomp.state_kv.copy_from_host(&vec![0f32; in_state])?;
-                icomp.state_score.copy_from_host(&vec![NEG_INF; in_state])?;
-            } else {
-                scratch.load_f32(&mut index_comp_state_rd, in_state, &mut icomp.state_kv)?;
-                scratch.load_f32(&mut index_comp_state_rd, in_state, &mut icomp.state_score)?;
+                return Err(eyre!(
+                    "snapshot.restore: index_comp_state.bin is short at layer {li}"
+                ));
             }
+            scratch.load_f32(&mut index_comp_state_rd, in_state, &mut icomp.state_kv)?;
+            scratch.load_f32(&mut index_comp_state_rd, in_state, &mut icomp.state_score)?;
         } else if let Some(icomp) = layer.indexer_compressor.as_mut() {
             // State expects an indexer_compressor but snapshot doesn't —
             // re-init defaults.
@@ -1559,7 +1790,8 @@ pub fn restore_vl(
 
     // Leave dgpu current for the caller's subsequent prefill.
     dgpu.set_current()?;
-    Ok(RestoredSnapshot { tokens, image_spans: meta.image_spans })
+    let decoder_rings_empty = decoder_rings_empty(&meta);
+    Ok(RestoredSnapshot { tokens, image_spans: meta.image_spans, decoder_rings_empty })
 }
 
 /// hex encode/decode for the snapshot directory names. We avoid pulling
@@ -1733,6 +1965,7 @@ mod retention_tests {
             disk_bytes: 0,
             session_id: None,
             image_spans: spans.clone(),
+            kv_epoch: KV_EPOCH,
         };
         let j = serde_json::to_string(&meta).unwrap();
         let back: SnapshotMeta = serde_json::from_str(&j).unwrap();
@@ -1743,6 +1976,231 @@ mod retention_tests {
         o.remove("image_spans");
         let back2: SnapshotMeta = serde_json::from_value(serde_json::Value::Object(o)).unwrap();
         assert!(back2.image_spans.is_empty());
+    }
+
+    // ---- KV epoch, count cross-checks, checkpoint rings, atomic save ----
+
+    /// A meta of `token_count` tokens with every compressor at
+    /// `token_count / ratio` rows and every ring full (as a finished prefill).
+    fn meta_at(token_count: u32) -> SnapshotMeta {
+        let layers = (0..N_LAYER as usize)
+            .map(|li| {
+                let ratio = COMPRESS_RATIOS[li];
+                PerLayerMeta {
+                    n_raw: token_count.min(SWA_WINDOW),
+                    kv_rows: token_count.min(SWA_WINDOW),
+                    has_compressor: ratio > 0,
+                    n_comp: if ratio > 0 { token_count / ratio } else { 0 },
+                    ratio,
+                    coff: 1,
+                    width: 1,
+                    head_dim: 1,
+                    state_rows: ratio,
+                    has_indexer_compressor: false,
+                    n_index_comp: 0,
+                    index_coff: 0,
+                    index_width: 0,
+                    index_head_dim: 0,
+                    index_state_rows: 0,
+                    has_index_k: false,
+                    n_index_k: 0,
+                    comp_kv_format: CompKvFormat::F16,
+                    comp_kv_row_bytes: 0,
+                    index_comp_kv_format: CompKvFormat::F16,
+                    index_comp_kv_row_bytes: 0,
+                }
+            })
+            .collect();
+        SnapshotMeta {
+            format_version: FORMAT_VERSION,
+            fingerprint: fp(),
+            token_count,
+            n_kv_max: 1 << 20,
+            created_at_unix: 0,
+            last_used_unix: 0,
+            layers,
+            disk_bytes: 0,
+            session_id: None,
+            image_spans: Vec::new(),
+            kv_epoch: KV_EPOCH,
+        }
+    }
+
+    #[test]
+    fn old_kv_epoch_meta_is_refused() {
+        assert!(check_meta(&meta_at(1000), &fp()).is_ok());
+        let mut old = meta_at(1000);
+        old.kv_epoch = KV_EPOCH - 1;
+        let e = check_meta(&old, &fp()).unwrap_err();
+        assert!(format!("{e}").contains("KV epoch"), "{e}");
+        // A pre-epoch meta.json (no field) is epoch 0.
+        let mut v = serde_json::to_value(meta_at(1000)).unwrap();
+        v.as_object_mut().unwrap().remove("kv_epoch");
+        let pre: SnapshotMeta = serde_json::from_value(v).unwrap();
+        assert_eq!(pre.kv_epoch, 0);
+        assert!(check_meta(&pre, &fp()).is_err());
+    }
+
+    #[test]
+    fn load_deletes_old_epoch_and_uncommitted_saves() {
+        let root = unique_root();
+        let write = |tag: u8, epoch: u32| {
+            let dir = root.join(hex::encode(h(tag)));
+            fs::create_dir_all(&dir).unwrap();
+            let mut m = meta_at(100);
+            m.kv_epoch = epoch;
+            fs::write(dir.join("meta.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+            dir
+        };
+        let current = write(1, KV_EPOCH);
+        let old = write(2, 0);
+        let newer = write(3, KV_EPOCH + 1);
+        let tmp = root.join(format!("{SAVE_TMP_PREFIX}{}-{}", hex::encode(h(4)), u32::MAX));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("kv.bin"), b"half").unwrap();
+        let idx = SnapshotIndex::load(root.clone(), fp(), 1 << 40).unwrap();
+        assert_eq!(idx.len(), 1);
+        assert!(idx.by_hash.contains_key(&h(1)) && current.exists());
+        assert!(!old.exists(), "old-epoch snapshot deleted");
+        assert!(newer.exists() && !idx.by_hash.contains_key(&h(3)), "newer epoch skipped, kept");
+        assert!(!tmp.exists(), "uncommitted save deleted");
+    }
+
+    #[test]
+    fn load_leaves_a_live_writers_saves() {
+        let key = hex::encode(h(5));
+        let me = std::process::id();
+        // A live process other than us: our parent (the test harness).
+        let live = std::os::unix::process::parent_id();
+        let dead = u32::MAX; // above any pid_max
+        assert_eq!(save_dir_is_stale("0123abcd"), None, "not a save dir");
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{key}-{dead}")), Some(true));
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_OLD_PREFIX}{key}-{me}")), Some(true), "our pid: a previous incarnation's");
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{key}-x")), Some(true), "no pid");
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{key}")), Some(true), "no pid");
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{key}-{live}")), Some(!cfg!(target_os = "linux")));
+
+        let root = unique_root();
+        let mk = |name: String| {
+            let d = root.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("kv.bin"), b"half").unwrap();
+            d
+        };
+        let live_tmp = mk(format!("{SAVE_TMP_PREFIX}{key}-{live}"));
+        let live_old = mk(format!("{SAVE_OLD_PREFIX}{key}-{live}"));
+        let dead_tmp = mk(format!("{SAVE_TMP_PREFIX}{key}-{dead}"));
+        let own_old = mk(format!("{SAVE_OLD_PREFIX}{key}-{me}"));
+        let junk = mk(format!("{SAVE_TMP_PREFIX}junk"));
+        let idx = SnapshotIndex::load(root.clone(), fp(), 1 << 40).unwrap();
+        assert!(idx.is_empty());
+        if cfg!(target_os = "linux") {
+            assert!(live_tmp.exists() && live_old.exists(), "a live writer's save and swap dir kept");
+        }
+        assert!(!dead_tmp.exists() && !own_old.exists() && !junk.exists(), "stale saves deleted");
+    }
+
+    #[test]
+    fn checkpoint_refused_from_meta_and_hint_dropped() {
+        let root = unique_root();
+        let write = |tag: u8, m: &SnapshotMeta| {
+            let dir = root.join(hex::encode(h(tag)));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("meta.json"), serde_json::to_vec(m).unwrap()).unwrap();
+            dir
+        };
+        let full = write(1, &meta_at(5000));
+        let mut ckpt = meta_at(5000);
+        for l in &mut ckpt.layers[CED_DECODER_START..] {
+            l.n_raw = 0;
+            l.kv_rows = 0;
+        }
+        let ckpt_dir = write(2, &ckpt);
+        let w = SWA_WINDOW as usize;
+        // The same predicate as after the restore, from the meta alone.
+        for suffix in [0, 1, w, w + 1, 100_000] {
+            for ced in [false, true] {
+                assert_eq!(resume_ok_from_meta(&full, suffix, ced), resume_ok(false, suffix, ced));
+                assert_eq!(resume_ok_from_meta(&ckpt_dir, suffix, ced), resume_ok(decoder_rings_empty(&ckpt), suffix, ced));
+            }
+        }
+        if CED_DECODER_START < N_LAYER as usize {
+            assert!(!resume_ok_from_meta(&ckpt_dir, w, true), "a final chunk <= the replay: refused before the restore");
+            assert!(resume_ok_from_meta(&ckpt_dir, w + 1, true));
+        }
+        // No/unparseable meta: left to restore_vl (which reports and evicts).
+        assert!(resume_ok_from_meta(&root.join("missing"), 0, true));
+        let bad = root.join("bad");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("meta.json"), b"{").unwrap();
+        assert!(resume_ok_from_meta(&bad, 0, true));
+
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        idx.session_to_hash.insert("s".into(), h(2));
+        idx.drop_session_hint("s", &h(1));
+        assert_eq!(idx.session_to_hash.get("s"), Some(&h(2)), "a hint pointing elsewhere kept");
+        idx.drop_session_hint("s", &h(2));
+        assert!(idx.lookup_session("s", &[0; 6000]).is_none() && idx.session_to_hash.is_empty());
+    }
+
+    #[test]
+    fn counts_must_match_the_token_count() {
+        assert!(check_meta(&meta_at(5000), &fp()).is_ok());
+        // The KNOWN mid-prefill checkpoint bug: tokens P + done, KV pos0 + done.
+        let mut m = meta_at(5000);
+        m.token_count = 7000;
+        let e = check_meta(&m, &fp()).unwrap_err();
+        assert!(format!("{e}").contains("compressed rows"), "{e}");
+        let mut m = meta_at(100);
+        m.layers[0].n_raw = 101;
+        assert!(check_meta(&m, &fp()).is_err(), "more raw rows than tokens");
+    }
+
+    #[test]
+    fn checkpoint_rings_resume_only_past_the_replay() {
+        let full = meta_at(5000);
+        assert!(!decoder_rings_empty(&full));
+        let mut ckpt = meta_at(5000);
+        for l in &mut ckpt.layers[CED_DECODER_START..] {
+            l.n_raw = 0;
+            l.kv_rows = 0;
+        }
+        // V4-Flash has no decoder range: never "empty".
+        assert_eq!(decoder_rings_empty(&ckpt), CED_DECODER_START < N_LAYER as usize);
+        assert!(!decoder_rings_empty(&meta_at(0)), "an empty state is not a checkpoint");
+        let w = SWA_WINDOW as usize;
+        assert!(resume_ok(false, 0, true) && resume_ok(false, 1, false), "full rings: any suffix");
+        assert!(resume_ok(true, w + 1, true), "the replay empties the rings anyway");
+        assert!(!resume_ok(true, w, true), "a continuation would keep the empty rings (#25)");
+        assert!(!resume_ok(true, 0, true), "a marker-only resume");
+        assert!(!resume_ok(true, 100_000, false), "no CED: every suffix row runs the decoder");
+    }
+
+    #[test]
+    fn commit_dir_replaces_atomically_and_restores_on_failure() {
+        let root = unique_root();
+        let dir = root.join("snap");
+        let old = root.join(".old-snap");
+        let mk_tmp = |body: &[u8]| {
+            let tmp = root.join(".tmp-snap");
+            fs::create_dir_all(&tmp).unwrap();
+            fs::write(tmp.join("meta.json"), body).unwrap();
+            tmp
+        };
+        // Fresh key.
+        commit_dir(&mk_tmp(b"v1"), &dir, &old).unwrap();
+        assert_eq!(fs::read(dir.join("meta.json")).unwrap(), b"v1");
+        // Same key re-saved: replaced whole, nothing left aside.
+        let tmp = mk_tmp(b"v2");
+        commit_dir(&tmp, &dir, &old).unwrap();
+        assert_eq!(fs::read(dir.join("meta.json")).unwrap(), b"v2");
+        assert!(!tmp.exists() && !old.exists());
+        // A commit that fails (the written dir vanished) puts the previous
+        // snapshot back.
+        let gone = root.join(".tmp-missing");
+        assert!(commit_dir(&gone, &dir, &old).is_err());
+        assert_eq!(fs::read(dir.join("meta.json")).unwrap(), b"v2");
+        assert!(!old.exists());
     }
 
     /// `find_longest_prefix` keys every on-disk snapshot by the blake3 of the

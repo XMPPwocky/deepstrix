@@ -136,3 +136,65 @@ fn partial_rollback_keeps_accepted_boundaries_only() {
         "partial rollback kept more compressed rows than the accepted prefix earns"
     );
 }
+
+/// The accept path commits only `exact_accumulator_rows` of the kept rows and
+/// re-forwards the rest through decode. Committing all of them restored the
+/// PRE-verify accumulators at an odd end position, where the ratio-2 slot 0
+/// still held a token of the previous, already-fired group (verify at pos=100,
+/// keep=1: slots {kv98, kv99}, so the fire at 101 pooled kv98 with kv101). The
+/// committed prefix must end where the restored accumulators are exact, and
+/// they must come back exactly as they were at the mark.
+#[test]
+#[ignore = "needs a GPU"]
+fn partial_rollback_commits_only_exact_accumulators() {
+    install_panic_handler().ok();
+    let Some((dgpu, igpu)) = devices() else {
+        eprintln!("no suitable GPU; skipping");
+        return;
+    };
+    let mut state = HetModelState::alloc(dgpu, igpu, 4096).expect("alloc state");
+    let li = (0..state.layers.len())
+        .find(|&l| {
+            state.layers[l].compressor.is_some() && v4flash_kernels::config::COMPRESS_RATIOS[l] == 2
+        })
+        .expect("a ratio-2 KV-source layer");
+
+    // The open segment at the mark: slot 0 = "kv98", slot 1 = "kv99".
+    {
+        let cs = state.layers[li].compressor.as_mut().unwrap();
+        let half = cs.state_kv.len() / 2;
+        let mut kv = vec![98.0f32; cs.state_kv.len()];
+        kv[half..].fill(99.0);
+        cs.state_kv.copy_from_host(&kv).unwrap();
+        cs.state_score.copy_from_host(&kv).unwrap();
+        cs.n_comp = 50;
+    }
+    let mark = state.mark_kv();
+    let kv_at_mark = mark.per_layer_comp[li].as_ref().unwrap().main.as_ref().unwrap().state_kv.clone();
+
+    let pos = 100u32;
+    for keep in 1..=6u32 {
+        // A 6-row verify: boundaries fired at 101/103/105, slots left holding
+        // the batch's last rows, rejected or not.
+        {
+            let cs = state.layers[li].compressor.as_mut().unwrap();
+            cs.n_comp = 53;
+            let poisoned = vec![-7.0f32; cs.state_kv.len()];
+            cs.state_kv.copy_from_host(&poisoned).unwrap();
+            cs.state_score.copy_from_host(&poisoned).unwrap();
+        }
+        state.layers[li].n_raw = mark.per_layer[li].0 + 6;
+
+        let exact = mark.exact_accumulator_rows(keep, pos);
+        assert!(exact <= keep && keep - exact <= 1, "keep {keep}: re-forwards {} rows", keep - exact);
+        assert_eq!((pos + exact) % 2, 0, "keep {keep}: commit ends inside an open ratio-2 segment");
+        state.rollback_kv(&mark.advanced_by(exact, pos)).expect("partial rollback");
+
+        let cs = state.layers[li].compressor.as_ref().unwrap();
+        assert_eq!(cs.n_comp, (pos + exact) / 2, "keep {keep}: positional n_comp");
+        let mut kv = vec![0f32; cs.state_kv.len()];
+        cs.state_kv.copy_to_host(&mut kv).unwrap();
+        assert_eq!(kv, kv_at_mark, "keep {keep}: accumulators are not the mark's");
+        assert_eq!(state.layers[li].n_raw, mark.per_layer[li].0 + exact, "keep {keep}: raw rows");
+    }
+}

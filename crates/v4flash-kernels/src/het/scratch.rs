@@ -260,9 +260,36 @@ pub struct DgpuScratch {
     pub sampler_topp_mass: DeviceBuffer<f32>,
     pub sampler_topp_bracket: DeviceBuffer<f32>,
     pub sampler_topp_thr: DeviceBuffer<f32>,
+
+    /// `residual`'s device address as allocated: the parity every token must
+    /// start from (see [`Self::restore_residual_parity`]).
+    residual_home: usize,
+}
+
+/// Swap `a` and `b` when `a` is not the one at `home`. The pure core of
+/// [`DgpuScratch::restore_residual_parity`], generic so the host test can run it.
+fn restore_pair_parity<T>(a: &mut T, b: &mut T, home: usize, addr: impl Fn(&T) -> usize) -> bool {
+    if addr(a) == home {
+        return false;
+    }
+    std::mem::swap(a, b);
+    true
 }
 
 impl DgpuScratch {
+    /// Put `residual` back on the buffer it was allocated as. Decode swaps the
+    /// pair once per layer and restores the parity at the end of a token, but a
+    /// token that errors (or panics) after an odd number of layers leaves it
+    /// inverted, and the worker keeps this scratch across the error. HIP graphs
+    /// replay the POINTERS they captured while the direct launches follow these
+    /// fields, so from then on the two halves would read and write different
+    /// buffers for good. Call at every token start; true when it had to swap.
+    pub fn restore_residual_parity(&mut self) -> bool {
+        restore_pair_parity(&mut self.residual, &mut self.residual_next, self.residual_home, |b| {
+            b.raw() as usize
+        })
+    }
+
     pub fn alloc(dgpu_device: Device) -> eyre::Result<Self> {
         dgpu_device.set_current()?;
         let device_id = dgpu_device.id;
@@ -274,8 +301,11 @@ impl DgpuScratch {
         let d_selected = unsafe { sel_ew_pack.view_as::<i32>(0, N_EXPERT_USED) };
         let d_ew = unsafe { sel_ew_pack.view_as::<f32>(24, N_EXPERT_USED) };
         let eg = |n: u32| -> usize { if cfg!(feature = "v41") { n as usize } else { 32 } };
+        let residual = DeviceBuffer::new(device_id, HC_DIM as usize)?;
+        let residual_home = residual.raw() as usize;
         Ok(Self {
-            residual: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            residual,
+            residual_home,
             residual_next: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             flat: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             mix: DeviceBuffer::new(device_id, HC_MIX_DIM as usize)?,
@@ -496,5 +526,30 @@ impl IgpuScratch {
             d_selected,
             ffn_moe: DeviceBuffer::new(device_id, N_EMBD as usize)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_pair_parity;
+
+    /// A token that fails after an odd number of per-layer swaps leaves the pair
+    /// inverted; the next token start must put `residual` back on its home
+    /// buffer, and a token that ended with even parity must not be touched.
+    #[test]
+    fn residual_parity_restored_after_an_odd_layer_error() {
+        let addr = |b: &Box<u32>| &**b as *const u32 as usize;
+        let mut residual = Box::new(0u32);
+        let mut residual_next = Box::new(1u32);
+        let home = addr(&residual);
+        for layers_done in 0..6 {
+            for _ in 0..layers_done {
+                std::mem::swap(&mut residual, &mut residual_next);
+            }
+            let swapped = restore_pair_parity(&mut residual, &mut residual_next, home, addr);
+            assert_eq!(swapped, layers_done % 2 == 1, "after {layers_done} layers");
+            assert_eq!(addr(&residual), home, "after {layers_done} layers");
+            assert_eq!((*residual, *residual_next), (0, 1), "contents follow the buffers");
+        }
     }
 }

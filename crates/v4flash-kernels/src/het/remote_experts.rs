@@ -1747,6 +1747,25 @@ fn park_waits_for(
     pending.contains(&key) && !(urgency && (spec.contains(&key) || resident(&key)))
 }
 
+/// Push `layer`'s real picks in `sel` onto `pins` (a shard's `parked_pins`) and
+/// return the length to `truncate` back to when the park ends.
+///
+/// The park block RE-ENTERS: a request served inside a park runs `run_path`
+/// again, and with a miss it reaches the same block. That block used to
+/// `clear()` the list on entry and exit, which dropped the PARKED request's
+/// pins while its pass A was still reading those slots on `exec.compute`:
+/// `resident_mask` does not touch recency, so the nested pass's `ensure`, the
+/// parked loop's later `admit_landed` and every further nested request could
+/// pick them as victims and repack them mid-read. Appending and truncating to
+/// the mark keeps every enclosing request's pins until its own park ends.
+fn push_parked_pins(pins: &mut Vec<(u32, u32)>, layer: u32, sel: &[i32]) -> usize {
+    let mark = pins.len();
+    for &e in sel.iter().filter(|&&e| e != NO_PICK && (0..N_EXPERT as i32).contains(&e)) {
+        pins.push((layer, e as u32));
+    }
+    mark
+}
+
 /// Calls `PfQueue::finished` when a reader is done with a job, including by
 /// panic, so a failed read can never leave the gate counters raised (which
 /// would keep speculative reads off for good).
@@ -2131,8 +2150,10 @@ pub struct ExpertShard {
     /// picks around a queued request's early paging).
     pub pinned: Vec<(u32, u32)>,
     /// A PARKED request's picks (`knobs::park`): never victims while other
-    /// requests are served under its in-flight reads. Separate from `pinned`,
-    /// which the early-paging hook sets and clears around each hint.
+    /// requests are served under its in-flight reads. A stack: a request served
+    /// inside the park appends its own and truncates back (`push_parked_pins`).
+    /// Separate from `pinned`, which the early-paging hook sets and clears
+    /// around each hint.
     pub parked_pins: Vec<(u32, u32)>,
     /// The parked request's non-resident picks as `layer << 16 | expert`, for
     /// the park hook to hand to the prefetch readers.
@@ -3402,9 +3423,10 @@ pub fn b2_gpu_repack() -> bool {
     *B
 }
 
-/// Send `REQ_FLAG_BATCHED` on every multi-token remote submit, so a DSpark
-/// verify batch takes box 2's by-expert chain instead of its decode chain
-/// (`V41_REMOTE_BATCHED_MULTI=0` reverts). Default ON.
+/// Send `REQ_FLAG_BATCHED` on every remote submit, so a DSpark verify batch
+/// AND a plain B=1 decode token take box 2's by-expert chain instead of its
+/// decode chain (`V41_REMOTE_BATCHED_MULTI=0` reverts to neither;
+/// `V41_REMOTE_BATCHED_B1=0` keeps B=1 on the decode chain). Default ON.
 ///
 /// The flag has existed since the protocol was written — its own doc says it is
 /// there "to let the hub choose per request (DSpark verify batches)" — but the
@@ -3423,13 +3445,26 @@ pub fn b2_gpu_repack() -> bool {
 /// B>=5 already escapes onto the good path by accident; this makes B=2..4
 /// deliberate, which is what a shorter draft window needs.
 ///
-/// B=1 is deliberately left on the decode chain. Batched is marginally faster
-/// there too (383 vs 403 us with a realistic pool) but that is 0.8 ms of a 246 ms
-/// token, and the two chains sum per-expert partials in a different order, so
-/// switching B=1 would perturb today's decode numerics for ~0.3%. Not worth it.
+/// B=1 was left on the decode chain until 2026-10-03 because the two chains
+/// sum per-expert partials in a different order (~0.3% of decode tokens
+/// perturbed; batched is 383 vs 403 us there). The owner does not care about
+/// that numerics shift, and the batched chain is the only one with HITS-FIRST
+/// (`MoeExecutor::run_path`: the resident experts run while the misses read,
+/// and the request can PARK), which the decode chain -- page everything, then
+/// compute -- never gets. So B=1 goes batched too.
 pub fn remote_batched_multi() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("V41_REMOTE_BATCHED_MULTI").map(|v| v != "0").unwrap_or(true)
+    });
+    *B
+}
+
+/// `V41_REMOTE_BATCHED_B1=0`: a B=1 submit takes box 2's decode chain again
+/// (the pre-2026-10-03 numerics). Default on; no effect with
+/// `V41_REMOTE_BATCHED_MULTI=0`.
+pub fn remote_batched_b1() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_REMOTE_BATCHED_B1").map(|v| v != "0").unwrap_or(true)
     });
     *B
 }
@@ -5942,6 +5977,14 @@ impl MoeExecutor {
             // Pass A reads this layer's remap: a foreign eviction's pending
             // re-upload must land before anything reads it.
             shard.sync_remap(layer)?;
+            // The reply's miss bits (the hub's `hub_req.misses`): the picks
+            // pass B computes. The decode chain filled them from its
+            // `ensure`; now that B=1 takes this path too they must not read 0.
+            for (i, &sv) in sel.iter().take(proto::RESP_MISS_BITS).enumerate() {
+                if sv != NO_PICK && !self.resident_scratch[i] {
+                    miss_mask |= 1 << i;
+                }
+            }
         } else if b == 1 {
             self.missed_scratch.clear();
             shard.ensure_layer_reporting(layer, sel, &mut self.missed_scratch)?;
@@ -6085,12 +6128,10 @@ impl MoeExecutor {
                         shard.park_words.push((layer << 16) | e as u32);
                     }
                     shard.park_prefill = if shard.mode_evict_on() { shard.req_prefill } else { b > 16 };
-                    shard.parked_pins.clear();
-                    for &e in sel.iter().filter(|&&e| e != NO_PICK && (0..N_EXPERT as i32).contains(&e)) {
-                        shard.parked_pins.push((layer, e as u32));
-                    }
+                    // Append + truncate, never clear: see `push_parked_pins`.
+                    let mark = push_parked_pins(&mut shard.parked_pins, layer, sel);
                     let r = overlap(shard, true);
-                    shard.parked_pins.clear();
+                    shard.parked_pins.truncate(mark);
                     shard.park_words.clear();
                     r?;
                 }
@@ -6354,10 +6395,10 @@ impl MoeExecutor {
         // was missed once. Only the FIRST pass of a request zeroes: the second
         // pass writes the slots the first left at zero.
         //
-        // Only the BATCHED branch accumulates this way, and box 1 sets
-        // REQ_FLAG_BATCHED exactly when b > 1, which is why the corruption
-        // appeared only at b >= 2: a b=1 request takes the decode branch,
-        // which writes `ffn_moe` directly per token.
+        // Only the BATCHED branch accumulates this way, and until 2026-10-03
+        // box 1 set REQ_FLAG_BATCHED exactly when b > 1, which is why the
+        // corruption appeared only at b >= 2: a b=1 request took the decode
+        // branch, which writes `ffn_moe` directly per token.
         //
         // The FAST chain skips it: `run_path` guarantees rows [0, b*nu) are
         // zero on entry (`partials_make_clean`) and its reduce re-zeroes every
@@ -8310,10 +8351,11 @@ impl RemoteExpertClient {
         if b == 0 || b > self.info.max_batch as usize {
             return Err(eyre!("remote submit: b={b} outside 1..={}", self.info.max_batch));
         }
-        // A multi-token request is a DSpark verify batch; take the by-expert
-        // chain, which reads each expert's weights ONCE for the whole batch
-        // instead of once per token. See `remote_batched_multi`.
-        let flags = if b > 1 && remote_batched_multi() {
+        // The by-expert chain reads each expert's weights ONCE for the whole
+        // batch instead of once per token, and is the only chain with
+        // hits-first / park; a B=1 token takes it too unless
+        // `V41_REMOTE_BATCHED_B1=0`. See `remote_batched_multi`.
+        let flags = if remote_batched_multi() && (b > 1 || remote_batched_b1()) {
             flags | proto::REQ_FLAG_BATCHED
         } else {
             flags
@@ -8841,6 +8883,21 @@ mod tests {
         assert!(!park_waits_for((4, 3), &pending, &spec, resident, true));
         assert!(park_waits_for((4, 1), &pending, &spec, resident, true));
         assert!(!park_waits_for((4, 9), &pending, &spec, resident, true));
+    }
+
+    /// A request served inside a park re-enters the park block: its pins come
+    /// and go without dropping the parked request's (they used to be cleared).
+    #[test]
+    fn nested_park_keeps_the_parked_requests_pins() {
+        let mut pins: Vec<(u32, u32)> = Vec::new();
+        let outer = push_parked_pins(&mut pins, 7, &[3, NO_PICK, 9, 400]);
+        assert_eq!(pins, vec![(7, 3), (7, 9)], "NO_PICK and out-of-range ids are not pins");
+        let inner = push_parked_pins(&mut pins, 8, &[1, 2]);
+        assert_eq!(pins.len(), 4);
+        pins.truncate(inner); // the nested request's park ends
+        assert_eq!(pins, vec![(7, 3), (7, 9)], "the parked request is still protected");
+        pins.truncate(outer);
+        assert!(pins.is_empty());
     }
 
     /// `PfFinish` releases a recorded speculative key and the reader slot on
