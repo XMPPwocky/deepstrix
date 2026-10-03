@@ -37,6 +37,7 @@ use crate::openai::sse::{
     encode_chunk, reasoning_delta, role_delta, text_delta, tool_call_args_delta,
     tool_call_start_delta, ChunkDelta,
 };
+use crate::openai::stop::{stop_sequences, StopMatcher};
 use crate::openai::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Role, ToolCall,
     ToolCallFunction, Usage,
@@ -79,6 +80,50 @@ pub fn resolve_top_p(requested: Option<f32>, default_top_p: f32) -> f32 {
     v.clamp(MIN_TOP_P, 1.0)
 }
 
+/// Resolve the request's `min_p` (vLLM / llama.cpp extension) into
+/// `GenerateReq::min_p_rel`, clamped into [0, 1]; absent or NaN -> 0 (off).
+/// Both samplers already implement it (the device chain and
+/// `TargetDist`, which the DSpark verify and the head-candidate band use
+/// too), so this only plumbs the value through.
+pub fn resolve_min_p(requested: Option<f32>) -> f32 {
+    requested.filter(|v| !v.is_nan()).unwrap_or(DEFAULT_MIN_P_REL).clamp(0.0, 1.0)
+}
+
+/// Refuse (400, naming the parameter) the OpenAI request fields this server
+/// does not implement, unless they are at their "off" value. They used to be
+/// dropped by serde, so a client's constraint silently did nothing.
+///
+/// `top_k`, the penalties and `logit_bias` are not implemented because they
+/// would have to change the SAME distribution in every sampler: the serial
+/// path's device chain (`launch_multinomial_topp`), the arena's `TargetDist`,
+/// the device head prefilter (`launch_nucleus_cands` ships only candidates
+/// within `HEAD_CAND_BAND` of the max -- a bias or penalty can move a token
+/// across that band), and the DSpark verify, where a penalty on row j depends
+/// on the drafts accepted before it. Untestable here without a GPU; a wrong
+/// half-implementation would be worse than a clear 400.
+pub fn check_unsupported_params(req: &ChatCompletionRequest) -> Result<(), String> {
+    if let Some(n) = req.n.filter(|&n| n != 1) {
+        return Err(format!("n: only n=1 is supported, got {n}"));
+    }
+    // 0 is OpenAI-ish "off", -1 vLLM's.
+    if let Some(k) = req.top_k.filter(|&k| k != 0 && k != -1) {
+        return Err(format!("top_k: not supported (got {k}); omit it or send 0"));
+    }
+    for (name, v, off) in [
+        ("presence_penalty", req.presence_penalty, 0.0),
+        ("frequency_penalty", req.frequency_penalty, 0.0),
+        ("repetition_penalty", req.repetition_penalty, 1.0),
+    ] {
+        if let Some(v) = v.filter(|&v| v != off) {
+            return Err(format!("{name}: not supported (got {v}); omit it or send {off}"));
+        }
+    }
+    if req.logit_bias.as_ref().is_some_and(|m| !m.is_empty()) {
+        return Err("logit_bias: not supported; omit it or send {}".to_string());
+    }
+    Ok(())
+}
+
 /// Assemble the worker request's sampling parameters from an OpenAI
 /// request. Split out of `chat_completions` so the mapping (in particular
 /// `top_p`, which used to be accepted and silently dropped) is directly
@@ -100,7 +145,7 @@ pub fn build_generate_req(
             .unwrap_or(DEFAULT_MAX_NEW),
         max_new_defaulted: req.max_tokens.is_none(),
         temperature: req.temperature.unwrap_or(DEFAULT_TEMPERATURE),
-        min_p_rel: DEFAULT_MIN_P_REL,
+        min_p_rel: resolve_min_p(req.min_p),
         top_p: resolve_top_p(req.top_p, default_top_p),
         seed: req.seed.unwrap_or_else(default_seed),
     }
@@ -145,8 +190,12 @@ pub async fn chat_completions(
         n_messages = req.messages.len(),
         n_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
         stream = ?req.stream,
+        min_p = ?req.min_p,
+        n_stop = req.stop.as_ref().map(|s| s.to_vec().len()).unwrap_or(0),
         "chat request"
     );
+    check_unsupported_params(&req).map_err(ApiError::BadRequest)?;
+    let stop = stop_sequences(req.stop.as_ref()).map_err(ApiError::BadRequest)?;
     let stream = req.stream.unwrap_or(false);
 
     // V4-Flash 0731 reasoning effort. Both request fields map to one
@@ -321,6 +370,7 @@ pub async fn chat_completions(
             include_usage,
             prompt_tokens_count,
             tok_dsml,
+            stop,
         ));
         let stream = poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx));
         Ok(Sse::new(stream)
@@ -328,7 +378,8 @@ pub async fn chat_completions(
             .into_response())
     } else {
         let guard = CancelOnDrop(cancel);
-        let result = accumulate(rx, tok_dsml).await.map_err(ApiError::from)?;
+        let result = accumulate(rx, tok_dsml, stop).await.map_err(ApiError::from)?;
+        // Also how a stop-string match ends the generation (`openai::stop`).
         drop(guard);
         // Malformed DSML wins over everything else — the turn is
         // corrupted, don't pretend it succeeded as text/tool_calls.
@@ -374,10 +425,9 @@ pub async fn chat_completions(
                     tool_calls,
                     tool_call_id: None,
                     name: None,
-                    // The non-streaming accumulator still discards the
-                    // reasoning trace (engine_worker.rs:2375). `ChatMessage`
-                    // now has a field for it — wiring it up is a follow-up.
-                    reasoning_content: None,
+                    // Kept on the malformed-DSML branch too: it is the
+                    // model's own reasoning, not the corrupted markup.
+                    reasoning_content: result.reasoning,
                 },
                 finish_reason,
             }],
@@ -506,10 +556,11 @@ async fn drive_sse_stream(
     model: String,
     mut rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
     out: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-    _cancel_guard: CancelOnDrop,
+    cancel_guard: CancelOnDrop,
     include_usage: bool,
     prompt_tokens: u32,
     tok_dsml: Option<i32>,
+    stop: Vec<String>,
 ) {
     let created = unix_now();
     let send = |delta: ChunkDelta,
@@ -543,6 +594,11 @@ async fn drive_sse_stream(
     // raw byte stream including TOK_DSML's bytes, which it discards.
     let mut content_pending: Vec<u8> = Vec::new();
     let mut reasoning_pending: Vec<u8> = Vec::new();
+    // Stop strings (`openai::stop`): content passes through the matcher after
+    // its UTF-8 assembly, which holds back a tail that could still grow into
+    // a stop string so a match split across tokens is never sent.
+    let mut stop = StopMatcher::new(stop);
+    let mut n_chunks: u32 = 0;
 
     fn drain_valid_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
         pending.extend_from_slice(chunk);
@@ -582,6 +638,7 @@ async fn drive_sse_stream(
                 bytes,
                 reasoning,
             } => {
+                n_chunks += 1;
                 if reasoning {
                     let s = drain_valid_utf8(&mut reasoning_pending, &bytes);
                     if !s.is_empty()
@@ -597,11 +654,14 @@ async fn drive_sse_stream(
                 for de in scanner.push_token(token_id, &bytes) {
                     match de {
                         DsmlEvent::Text(t) => {
-                            let s = drain_valid_utf8(&mut content_pending, &t);
+                            let s = stop.push(&drain_valid_utf8(&mut content_pending, &t));
                             if !s.is_empty()
                                 && out.send(send(text_delta(s), None)).await.is_err()
                             {
                                 return;
+                            }
+                            if stop.hit() {
+                                break;
                             }
                         }
                         DsmlEvent::ToolCall {
@@ -610,6 +670,14 @@ async fn drive_sse_stream(
                             arguments,
                             ..
                         } => {
+                            // Text on the far side of a tool frame is not
+                            // contiguous with the held-back tail.
+                            let held = stop.flush();
+                            if !held.is_empty()
+                                && out.send(send(text_delta(held), None)).await.is_err()
+                            {
+                                return;
+                            }
                             saw_tool = true;
                             let tc = ToolCall {
                                 id: tid,
@@ -642,6 +710,16 @@ async fn drive_sse_stream(
                             saw_tool = true;
                         }
                     }
+                }
+                if stop.hit() {
+                    // End the generation through the cancel path (the
+                    // worker frees the slot as for a disconnect) and the
+                    // turn here; nothing after the stop string is sent.
+                    tracing::info!(completion_tokens = n_chunks, "stream: stop sequence matched; cancelling the generation");
+                    cancel_guard.0.store(true, Ordering::Relaxed);
+                    completion_tokens = n_chunks;
+                    finish_reason = if saw_tool { "tool_calls" } else { "stop" };
+                    break;
                 }
             }
             WorkerEvent::Done {
@@ -663,11 +741,14 @@ async fn drive_sse_stream(
                 )) {
                     match de {
                         DsmlEvent::Text(t) => {
-                            let s = drain_valid_utf8(&mut content_pending, &t);
+                            let s = stop.push(&drain_valid_utf8(&mut content_pending, &t));
                             if !s.is_empty()
                                 && out.send(send(text_delta(s), None)).await.is_err()
                             {
                                 return;
+                            }
+                            if stop.hit() {
+                                break;
                             }
                         }
                         DsmlEvent::ToolCall {
@@ -676,6 +757,12 @@ async fn drive_sse_stream(
                             arguments,
                             ..
                         } => {
+                            let held = stop.flush();
+                            if !held.is_empty()
+                                && out.send(send(text_delta(held), None)).await.is_err()
+                            {
+                                return;
+                            }
                             saw_tool = true;
                             let tc = ToolCall {
                                 id: tid,
@@ -709,15 +796,22 @@ async fn drive_sse_stream(
                         }
                     }
                 }
-                // Lossy-flush any trailing partial bytes.
-                if !content_pending.is_empty() {
-                    let s = String::from_utf8_lossy(&content_pending).into_owned();
+                // Lossy-flush any trailing partial bytes, then the stop
+                // matcher's held-back tail (no match can complete now).
+                if !content_pending.is_empty() && !stop.hit() {
+                    let s = stop.push(&String::from_utf8_lossy(&content_pending));
                     content_pending.clear();
                     if !s.is_empty()
                         && out.send(send(text_delta(s), None)).await.is_err()
                     {
                         return;
                     }
+                }
+                let held = stop.flush();
+                if !held.is_empty()
+                    && out.send(send(text_delta(held), None)).await.is_err()
+                {
+                    return;
                 }
                 if !reasoning_pending.is_empty() {
                     let s = String::from_utf8_lossy(&reasoning_pending).into_owned();
@@ -733,6 +827,11 @@ async fn drive_sse_stream(
                 } else {
                     finish.as_openai()
                 };
+                // A stop string in the scanner's leftovers: "stop" even
+                // when the worker hit its length cap.
+                if stop.hit() && !saw_tool {
+                    finish_reason = "stop";
+                }
             }
             WorkerEvent::Error(e) => {
                 tracing::error!(error=%e, "engine error during stream");
@@ -806,4 +905,162 @@ fn default_seed() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0xD5C0DE);
     nanos ^ 0xD5C0DE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine_worker::FinishReason;
+
+    fn chunk(bytes: &[u8], reasoning: bool) -> WorkerEvent {
+        WorkerEvent::Chunk { token_id: 1, bytes: bytes.to_vec(), reasoning }
+    }
+
+    /// What a client sees from `drive_sse_stream`.
+    #[derive(Debug, Default)]
+    struct Seen {
+        /// Every content delta, in order (to check no stop string ever went out).
+        deltas: Vec<String>,
+        reasoning: String,
+        finish: Option<String>,
+        completion_tokens: Option<u64>,
+    }
+
+    /// Run `drive_sse_stream` over `evs`. With `keep_open` the worker side
+    /// stays open with no `Done`, as a worker still decoding would: the
+    /// driver then only returns if a stop match ends the turn by itself.
+    async fn drive(evs: Vec<WorkerEvent>, stop: &[&str], keep_open: bool) -> Seen {
+        let (wtx, wrx) = tokio::sync::mpsc::channel(evs.len() + 1);
+        for e in evs {
+            wtx.send(e).await.unwrap();
+        }
+        let _hold = keep_open.then_some(wtx);
+        let (tx, mut sse_rx) = tokio::sync::mpsc::channel(1024);
+        let stop = stop.iter().map(|s| s.to_string()).collect();
+        let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+        drive_sse_stream("id".into(), "m".into(), wrx, tx, guard, true, 5, Some(128825), stop).await;
+        let sse = Sse::new(poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx)));
+        let body = axum::body::to_bytes(sse.into_response().into_body(), usize::MAX).await.unwrap();
+        let mut seen = Seen::default();
+        for line in std::str::from_utf8(&body).unwrap().lines() {
+            let Some(d) = line.strip_prefix("data: ") else { continue };
+            if d == "[DONE]" {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(d).unwrap();
+            if let Some(u) = v.get("usage") {
+                seen.completion_tokens = u["completion_tokens"].as_u64();
+                continue;
+            }
+            let c = &v["choices"][0];
+            if let Some(s) = c["delta"]["content"].as_str() {
+                seen.deltas.push(s.to_string());
+            }
+            if let Some(s) = c["delta"]["reasoning_content"].as_str() {
+                seen.reasoning.push_str(s);
+            }
+            if let Some(f) = c["finish_reason"].as_str() {
+                seen.finish = Some(f.to_string());
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn streaming_stop_split_across_tokens_is_never_sent() {
+        let s = drive(
+            vec![
+                chunk(b"plan: say\nObservation: x", true),
+                chunk(b"Action: ls\nObs", false),
+                chunk(b"ervati", false),
+                chunk(b"on: made up", false),
+                chunk(b"more", false),
+            ],
+            &["\nObservation:"],
+            true,
+        )
+        .await;
+        assert_eq!(s.deltas.concat(), "Action: ls");
+        assert!(s.deltas.iter().all(|d| !d.contains('\n')), "held-back partial leaked: {:?}", s.deltas);
+        assert_eq!(s.reasoning, "plan: say\nObservation: x", "reasoning is not stop-matched");
+        assert_eq!(s.finish.as_deref(), Some("stop"));
+        assert_eq!(s.completion_tokens, Some(4), "tokens seen up to the match");
+    }
+
+    #[tokio::test]
+    async fn streaming_partial_that_never_completes_is_flushed_at_done() {
+        let s = drive(
+            vec![
+                chunk(b"a\nObs", false),
+                chunk(b"erv", false),
+                WorkerEvent::Done { prompt_tokens: 5, completion_tokens: 2, finish: FinishReason::Length },
+            ],
+            &["\nObservation:"],
+            false,
+        )
+        .await;
+        assert_eq!(s.deltas.concat(), "a\nObserv");
+        assert_eq!(s.finish.as_deref(), Some("length"));
+        assert_eq!(s.completion_tokens, Some(2));
+    }
+
+    #[tokio::test]
+    async fn streaming_without_stop_is_unchanged() {
+        let s = drive(
+            vec![chunk(b"hello ", false), chunk(b"world", false), WorkerEvent::Done { prompt_tokens: 5, completion_tokens: 2, finish: FinishReason::Stop }],
+            &[],
+            false,
+        )
+        .await;
+        assert_eq!(s.deltas, vec!["hello ", "world"], "no holdback without stop strings");
+        assert_eq!(s.finish.as_deref(), Some("stop"));
+    }
+
+    fn req(extra: &str) -> ChatCompletionRequest {
+        serde_json::from_str(&format!(r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}]{extra}}}"#)).unwrap()
+    }
+
+    #[test]
+    fn unsupported_params_are_refused_unless_off() {
+        // The "off" values are accepted silently.
+        for ok in [
+            "",
+            r#","n":1"#,
+            r#","top_k":0"#,
+            r#","top_k":-1"#,
+            r#","presence_penalty":0"#,
+            r#","frequency_penalty":0.0"#,
+            r#","repetition_penalty":1.0"#,
+            r#","logit_bias":{}"#,
+            r#","n":null,"top_k":null,"logit_bias":null,"presence_penalty":null"#,
+        ] {
+            assert_eq!(check_unsupported_params(&req(ok)), Ok(()), "{ok}");
+        }
+        for (bad, param) in [
+            (r#","n":2"#, "n:"),
+            (r#","n":0"#, "n:"),
+            (r#","top_k":40"#, "top_k:"),
+            (r#","presence_penalty":0.5"#, "presence_penalty:"),
+            (r#","frequency_penalty":-1"#, "frequency_penalty:"),
+            (r#","repetition_penalty":1.1"#, "repetition_penalty:"),
+            (r#","logit_bias":{"50256":-100}"#, "logit_bias:"),
+        ] {
+            let e = check_unsupported_params(&req(bad)).unwrap_err();
+            assert!(e.starts_with(param), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn stop_and_min_p_parse_and_reach_the_request() {
+        use crate::openai::types::StopSpec;
+        assert_eq!(req(r#","stop":"\n""#).stop, Some(StopSpec::One("\n".into())));
+        assert_eq!(req(r#","stop":["a","b"]"#).stop, Some(StopSpec::Many(vec!["a".into(), "b".into()])));
+        assert_eq!(req(r#","stop":null"#).stop, None);
+        let g = build_generate_req(&req(r#","min_p":0.05"#), Vec::new(), Vec::new(), Vec::new(), DEFAULT_TOP_P);
+        assert_eq!(g.min_p_rel, 0.05);
+        assert_eq!(resolve_min_p(None), 0.0);
+        assert_eq!(resolve_min_p(Some(f32::NAN)), 0.0);
+        assert_eq!(resolve_min_p(Some(2.0)), 1.0);
+        assert_eq!(resolve_min_p(Some(-1.0)), 0.0);
+    }
 }
