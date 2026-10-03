@@ -10897,11 +10897,27 @@ impl HeterogeneousEngine {
                         src.len()
                     ));
                 }
-                bd.remote_ffn_moe
+                let _t_up = LayerHostTimer::start(&LH_REMOTE_UPLOAD);
+                let dst = bd
+                    .remote_ffn_moe
                     .as_mut()
-                    .ok_or_else(|| eyre!("remote partial pending but buffer unallocated"))?
-                    .slice_view_mut(0, rows)
-                    .copy_from_host(src)?;
+                    .ok_or_else(|| eyre!("remote partial pending but buffer unallocated"))?;
+                match (crate::knobs::REMOTE_PARTIAL_ASYNC.on(), bd.remote_ffn_moe_pin.as_mut(), bd.remote_upload_done.as_ref()) {
+                    // Pinned staging + async copy on the stream the add runs
+                    // on: the add sees the bytes by stream order, and the host
+                    // goes on to the other lane instead of waiting for
+                    // `de.compute` to drain (the blocking copy's null stream).
+                    (true, Some(pin), Some(done)) => {
+                        if bd.remote_upload_pending {
+                            done.synchronize()?;
+                        }
+                        pin.as_mut_slice()[..rows].copy_from_slice(src);
+                        dst.slice_view_mut(0, rows).copy_from_host_async(&pin.as_slice()[..rows], &de.compute)?;
+                        done.record(&de.compute)?;
+                        bd.remote_upload_pending = true;
+                    }
+                    _ => dst.slice_view_mut(0, rows).copy_from_host(src)?,
+                }
                 bd.remote_ffn_moe_valid = true;
                 if let Some(w) = widened {
                     WIDEN_BUF.with(|c| *c.borrow_mut() = w);
@@ -11108,6 +11124,9 @@ pub fn take_fwd_sync() -> f64 {
     f64::from_bits(FWD_SYNC_T.swap(NAN_BITS, std::sync::atomic::Ordering::Relaxed))
 }
 pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Post-MoE's upload of box 2's partial (`V41_REMOTE_PARTIAL_ASYNC`): the
+/// blocking copy's drain of `de.compute`, or the staging memcpy + enqueue.
+pub static LH_REMOTE_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Box-2 miss substitution (`het::b2_mirror`): the weights readback, planning,
 /// and the picks/weights write-back, per lane-layer.
 pub static LH_SUB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -11165,6 +11184,7 @@ pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
         ("lh.seld2h_busy_x1e3", LH_SEL_D2H_BUSY.swap(0, Relaxed)),
         ("lh.seld2h_idle_x1e3", LH_SEL_D2H_IDLE.swap(0, Relaxed)),
         ("lh.remote_sync", LH_REMOTE_SYNC.swap(0, Relaxed)),
+        ("lh.remote_upload", LH_REMOTE_UPLOAD.swap(0, Relaxed)),
     ]
 }
 

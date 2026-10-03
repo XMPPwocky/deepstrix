@@ -132,7 +132,7 @@ pub static HUB_STEP: Kind = Kind {
         "lh_pre_moe", "lh_post_moe", "lh_engram", "lh_pager_block", "lh_sel_sync", "lh_remote_submit", "lh_ensure", "lh_owns",
         "lh_excl", "lh_audit", "lh_remap_h2d", "lh_work_items_sync", "lh_remote_wait", "lh_pager_sync_igpu", "lh_engram_join",
         "lh_work_items_count", "lh_sel_d2h", "lh_sub", "lh_wic_busy_x1e3", "lh_wic_idle_x1e3", "lh_seld2h_busy_x1e3",
-        "lh_seld2h_idle_x1e3", "lh_remote_sync",
+        "lh_seld2h_idle_x1e3", "lh_remote_sync", "lh_remote_upload",
         ;
         // context
         "pos_min", "pos_max",

@@ -707,6 +707,12 @@ crate::knobs! {
     /// `V41_EVTRACE_DEV_BUFS` (default 6, 2..=16): event buffers per pool with
     /// Tier B on (the spares are made on the Tier B thread).
     pub static EVTRACE_DEV_BUFS = Knob::int("V41_EVTRACE_DEV_BUFS", 6, 2, 16);
+    /// `V41_REMOTE_PARTIAL_ASYNC` (default off; live): post-MoE uploads box 2's
+    /// partial from this lane's pinned staging with an async copy on
+    /// `de.compute`. Off = the blocking `hipMemcpy`, which runs on the null
+    /// stream and so holds the host until `de.compute` drains: this lane's
+    /// `moe_arrived` wait and the other lane's queued chain included.
+    pub static REMOTE_PARTIAL_ASYNC = Knob::flag("V41_REMOTE_PARTIAL_ASYNC", false).live();
 }
 
 #[cfg(test)]

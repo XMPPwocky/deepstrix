@@ -408,6 +408,15 @@ pub struct BatchDgpuScratch {
     /// is the question that distinguishes a dead write from a write that lands
     /// somewhere the final logits never read.
     pub remote_ffn_moe_layer: i32,
+    /// `V41_REMOTE_PARTIAL_ASYNC`: pinned host staging for box 2's partial
+    /// (`remote_ffn_moe`'s size), copied up ASYNC on `de.compute` so the host
+    /// does not wait for that stream to drain (a blocking `hipMemcpy` runs on
+    /// the null stream). `remote_upload_done` is recorded after each copy; the
+    /// next upload waits on it before rewriting the staging (in practice long
+    /// done: the lane's next route read back `remote_xq_lane` behind it).
+    pub remote_ffn_moe_pin: Option<v4flash_hip::PinnedBuffer<f32>>,
+    pub remote_upload_done: Option<v4flash_hip::Event>,
+    pub remote_upload_pending: bool,
     /// `V41_MS_MHC_SPLIT`: this lane's pre-FFN mixes were queued on `de.hc`
     /// this layer; the FFN combine must wait `hc_mixes_ffn` before `hc_post`
     /// reads `split`.
@@ -1303,6 +1312,17 @@ impl BatchDgpuScratch {
             },
             remote_ffn_moe_valid: false,
             remote_ffn_moe_layer: -1,
+            remote_ffn_moe_pin: if std::env::var("V41_REMOTE_ADDR").is_ok() {
+                Some(v4flash_hip::PinnedBuffer::new(b * N_EMBD as usize)?)
+            } else {
+                None
+            },
+            remote_upload_done: if std::env::var("V41_REMOTE_ADDR").is_ok() {
+                Some(v4flash_hip::Event::new_no_timing()?)
+            } else {
+                None
+            },
+            remote_upload_pending: false,
             mhc_ffn_split_pending: false,
             remote_ticket: None,
             ev_req: [f64::NAN; 9],
