@@ -1031,6 +1031,13 @@ impl HeterogeneousEngine {
         let pager_c0 = pager.as_deref().map(|p| p.counters()).unwrap_or_default();
 
         self.set_current_cached(self.dgpu.device)?;
+        // The per-layer swap below runs only after a layer succeeds, so a token
+        // that returned early after an odd number of layers left the pair
+        // inverted. Every graph below captured the pointers of the canonical
+        // parity, so restore it before anything (graphed or direct) touches them.
+        if dgpu_scratch.restore_residual_parity() {
+            tracing::warn!(pos, "decode: residual parity was inverted by an earlier failed token; restored");
+        }
         dgpu_scratch.residual.copy_from_host(input_hc_host)?;
         // Dump the layer-0 input (== embedded token vector) if
         // DEEPSTRIX_DUMP_RESIDUAL_DIR is set. Index 00 in the file
