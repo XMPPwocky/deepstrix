@@ -118,7 +118,8 @@ enum Block {
 #[derive(Clone, Debug)]
 struct Msg {
     role: R,
-    /// Plain content (system / assistant / user without blocks).
+    /// Plain content (system / assistant / user without blocks). `None` on a
+    /// system message only for the synthetic tools carrier (`build_v41`).
     content: Option<String>,
     /// User content blocks after `merge_tool_messages`.
     blocks: Option<Vec<Block>>,
@@ -127,7 +128,8 @@ struct Msg {
     tool_calls: Vec<ToolCall>,
     reasoning: Option<String>,
     /// Tools attached to this message (the reference attaches the request's
-    /// tools to message 0 and renders them only on a system message).
+    /// tools to message 0 and renders them only on a system message; see
+    /// `build_v41` for a conversation that does not start with one).
     tools: Option<Vec<ToolDef>>,
 }
 
@@ -179,10 +181,10 @@ fn tool_parts(m: &ChatMessage, next_img: &mut usize) -> Vec<Part> {
 
 /// `merge_tool_messages`: tool messages become `<tool_result>` blocks in the
 /// preceding user turn (or a new one); consecutive user turns merge.
-fn merge(messages: &[ChatMessage], tools: Option<&[ToolDef]>) -> eyre::Result<Vec<Msg>> {
+fn merge(messages: &[ChatMessage]) -> eyre::Result<Vec<Msg>> {
     let mut out: Vec<Msg> = Vec::new();
     let mut next_img = 0usize;
-    for (i, m) in messages.iter().enumerate() {
+    for m in messages {
         match m.role {
             Role::Tool => {
                 let block = Block::ToolResult(tool_parts(m, &mut next_img));
@@ -218,18 +220,24 @@ fn merge(messages: &[ChatMessage], tools: Option<&[ToolDef]>) -> eyre::Result<Ve
                         block_ids: vec![None; n],
                         tool_calls: vec![],
                         reasoning: None,
-                        tools: if i == 0 { tools.map(|t| t.to_vec()) } else { None },
+                        tools: None,
                     }),
                 }
             }
             Role::System | Role::Assistant => out.push(Msg {
                 role: if m.role == Role::System { R::System } else { R::Assistant },
-                content: text_of(m)?,
+                // A client system message always has content (null → ""):
+                // `None` marks the synthetic tools carrier.
+                content: if m.role == Role::System {
+                    Some(text_of(m)?.unwrap_or_default())
+                } else {
+                    text_of(m)?
+                },
                 blocks: None,
                 block_ids: vec![],
                 tool_calls: m.tool_calls.clone(),
                 reasoning: m.reasoning_content.clone(),
-                tools: if i == 0 { tools.map(|t| t.to_vec()) } else { None },
+                tools: None,
             }),
         }
     }
@@ -391,9 +399,16 @@ fn render_message(out: &mut Vec<Seg>, images: &mut Vec<usize>, index: usize, msg
             if index > 0 {
                 out.push(Seg::Ours(SYSTEM_TEXT.to_string()));
             }
-            out.push(Seg::Client(m.content.clone().unwrap_or_default()));
+            // The synthetic tools carrier has no content and so no
+            // content/tools separator either (as `prompt.rs` renders tools
+            // without a system message).
+            if let Some(c) = &m.content {
+                out.push(Seg::Client(c.clone()));
+            }
             if let Some(tools) = m.tools.as_ref().filter(|t| !t.is_empty()) {
-                out.push(Seg::Ours("\n\n".to_string()));
+                if m.content.is_some() {
+                    out.push(Seg::Ours("\n\n".to_string()));
+                }
                 tools_segs(tools, out);
             }
         }
@@ -438,7 +453,20 @@ fn render_message(out: &mut Vec<Seg>, images: &mut Vec<usize>, index: usize, msg
                 out.push(Seg::Client(m.reasoning.clone().unwrap_or_default()));
                 out.push(Seg::Ours(THINK_END_TEXT.to_string()));
             }
-            out.push(Seg::Client(m.content.clone().unwrap_or_default()));
+            // DELIBERATE deviation from the reference (as in `prompt.rs`):
+            // before a calls block, strip the content's trailing whitespace.
+            // The model's own output is `<text>\n\n<｜DSML｜ calls>` and the
+            // scanner hands the "\n\n" back in `content`, so replaying it
+            // verbatim grows four newlines where the live KV cache has two.
+            let content = m.content.as_deref().unwrap_or_default();
+            let content = if m.tool_calls.is_empty() {
+                content
+            } else {
+                content.trim_end_matches(['\n', '\r', '\t', ' '])
+            };
+            if !content.is_empty() {
+                out.push(Seg::Client(content.to_string()));
+            }
             if !m.tool_calls.is_empty() {
                 out.push(Seg::Ours(format!("\n\n<{DSML} calls>\n")));
                 for (i, tc) in m.tool_calls.iter().enumerate() {
@@ -495,14 +523,33 @@ fn build_v41(
         return Err(eyre!("V4.1 prompt: messages array is empty"));
     }
     let ctx_raw = context.unwrap_or(&[]);
-    let mut ctx = merge(ctx_raw, None)?;
-    // tools attach to message 0 of the whole conversation (the reference's load_cases).
-    let msgs_tools = if ctx.is_empty() { tools } else { None };
-    let mut msgs = merge(messages, msgs_tools)?;
-    if !ctx.is_empty() {
-        if let (Some(t), Some(first)) = (tools, ctx.first_mut()) {
-            first.tools = Some(t.to_vec());
+    let mut ctx = merge(ctx_raw)?;
+    let mut msgs = merge(messages)?;
+    // tools attach to message 0 of the whole conversation (the reference's
+    // load_cases), which renders them only if it is a system message. The
+    // reference's caller always supplies one; an OpenAI request need not, and
+    // then the model would see no tool schemas at all (while `any_tools` still
+    // keeps the reasoning). Prepend a content-less system message to carry
+    // them, which renders the block the way `prompt.rs` does without a system
+    // prompt. Into the context when there is one, so a context rendered
+    // earlier as `messages` had the same carrier at the same index.
+    if let Some(t) = tools.filter(|t| !t.is_empty()) {
+        let head = if ctx.is_empty() { &mut msgs } else { &mut ctx };
+        if !matches!(head.first(), Some(m) if m.role == R::System) {
+            head.insert(
+                0,
+                Msg {
+                    role: R::System,
+                    content: None,
+                    blocks: None,
+                    block_ids: vec![],
+                    tool_calls: vec![],
+                    reasoning: None,
+                    tools: None,
+                },
+            );
         }
+        head[0].tools = Some(t.to_vec());
     }
     let ctx_len = ctx.len();
     let mut full: Vec<Msg> = ctx.clone();
@@ -652,5 +699,91 @@ mod tests {
             {"role": "assistant", "content": [{"type": "text", "text": "a"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}
         ]));
         assert!(render_prompt_text_v41(&m, None, false, V41Effort::DEFAULT, None).is_err());
+    }
+
+    fn weather_tool() -> Vec<ToolDef> {
+        serde_json::from_value(serde_json::json!([{"type": "function", "function": {
+            "name": "get_weather", "description": "Weather for a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+        }}]))
+        .unwrap()
+    }
+
+    /// Tools with no system message: the reference renders tools only on a
+    /// system message 0, so the schemas used to vanish (while the reasoning
+    /// was still kept as for a tool conversation). A content-less system
+    /// message now carries them, with no content/tools separator.
+    #[test]
+    fn tools_without_system_message_still_render() {
+        let tools = weather_tool();
+        let block = tools_text(&tools);
+        let m = msgs(serde_json::json!([{"role": "user", "content": "Weather in Paris?"}]));
+        let s = render_prompt_text_v41(&m, Some(&tools), false, V41Effort::DEFAULT, None).unwrap();
+        assert_eq!(s, format!("{BOS_TEXT}{SYSTEM_TEXT}{block}{USER_TEXT}Weather in Paris?{ASSISTANT_TEXT}{THINK_END_TEXT}"));
+        let s = render_prompt_text_v41(&m, Some(&tools), true, V41Effort(75), None).unwrap();
+        assert_eq!(
+            s,
+            format!(
+                "{BOS_TEXT}{SYSTEM_TEXT}{REASONING_EFFORT_FMT_PREFIX}75{REASONING_EFFORT_FMT_SUFFIX}{block}\
+                 {USER_TEXT}Weather in Paris?{ASSISTANT_TEXT}{THINK_BEGIN_TEXT}"
+            )
+        );
+        // With a system message (even an empty one) nothing changes: content,
+        // "\n\n", tools, exactly as the reference.
+        let m = msgs(serde_json::json!([{"role": "system", "content": ""}, {"role": "user", "content": "q"}]));
+        let s = render_prompt_text_v41(&m, Some(&tools), false, V41Effort::DEFAULT, None).unwrap();
+        assert_eq!(s, format!("{BOS_TEXT}{SYSTEM_TEXT}\n\n{block}{USER_TEXT}q{ASSISTANT_TEXT}{THINK_END_TEXT}"));
+        // An empty tools list is no tools.
+        let m = msgs(serde_json::json!([{"role": "user", "content": "q"}]));
+        let s = render_prompt_text_v41(&m, Some(&[]), false, V41Effort::DEFAULT, None).unwrap();
+        assert_eq!(s, format!("{BOS_TEXT}{USER_TEXT}q{ASSISTANT_TEXT}{THINK_END_TEXT}"));
+    }
+
+    /// The carrier goes into the context when there is one, so the rendered
+    /// `messages` part continues the context's own rendering unchanged.
+    #[test]
+    fn tools_without_system_message_with_context() {
+        let tools = weather_tool();
+        let all = msgs(serde_json::json!([
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"}
+        ]));
+        let whole = render_prompt_text_v41(&all, Some(&tools), false, V41Effort::DEFAULT, None).unwrap();
+        let head = render_prompt_text_v41(&all[..2], Some(&tools), false, V41Effort::DEFAULT, None).unwrap();
+        let tail = render_prompt_text_v41(&all[2..], Some(&tools), false, V41Effort::DEFAULT, Some(&all[..2])).unwrap();
+        assert!(whole.contains(&tools_text(&tools)));
+        assert_eq!(format!("{head}{tail}"), whole);
+    }
+
+    /// The scanner returns the "\n\n" before `<｜DSML｜ calls>` in `content`;
+    /// replaying it must give the two newlines the model emitted (and the
+    /// reference renders), not four.
+    #[test]
+    fn replayed_tool_call_content_is_trimmed_before_calls() {
+        let tools = weather_tool();
+        let tc = serde_json::json!([{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]);
+        let calls = format!(
+            "<{DSML} calls>\n<{DSML} invoke name=\"get_weather\">\n<{DSML} parameter name=\"city\" string=\"true\">Paris</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} calls>"
+        );
+        for (content, want) in [("\n\n", ""), ("Checking.\n\n", "Checking."), ("Checking. \r\n", "Checking.")] {
+            let m = msgs(serde_json::json!([
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": content, "reasoning_content": "r", "tool_calls": tc},
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"}
+            ]));
+            let s = render_prompt_text_v41(&m, Some(&tools), true, V41Effort(75), None).unwrap();
+            let want = format!("{ASSISTANT_TEXT}{THINK_BEGIN_TEXT}r{THINK_END_TEXT}{want}\n\n{calls}{EOS_TEXT}");
+            assert!(s.contains(&want), "content {content:?}: {s}");
+        }
+        // Without tool calls the content is replayed verbatim.
+        let m = msgs(serde_json::json!([
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a\n\n"},
+            {"role": "user", "content": "q2"}
+        ]));
+        let s = render_prompt_text_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
+        assert!(s.contains(&format!("a\n\n{EOS_TEXT}")), "{s}");
     }
 }
