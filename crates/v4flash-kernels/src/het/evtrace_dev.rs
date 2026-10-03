@@ -21,7 +21,11 @@
 //!   (rule (a) a stage never starts before the host recorded it; rules (b)/(c)
 //!   a stage on a stream ends before a sync of that stream returned,
 //!   `EventPool::note_sync`) and Tier B's own lag / cost;
-//! * RETURNS the buffer with its decode sums (the `ms.stage` rollup).
+//! * RETURNS the buffer with its decode sums (the `ms.stage` rollup), its
+//!   used events swapped for fresh ones first (`Buf::renew_used`: a recorded
+//!   event pins an HSA interrupt signal until re-recorded, and the pool's
+//!   rotation through `V41_EVTRACE_DEV_BUFS` buffers would otherwise hold that
+//!   many epochs' signals, past the process's KFD event budget).
 //!
 //! Nothing here can fail a step: errors drop pairs (counted), a pool with no
 //! free buffer records nothing for an epoch (`EventPool::take_skipped`).
@@ -135,6 +139,8 @@ struct Stats {
     resid_bad: AtomicU64,
     handoff_full: AtomicU64,
     busy_ns: AtomicU64,
+    /// Used events a returned buffer could not swap for fresh ones.
+    renew_failed: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -150,6 +156,7 @@ static STATS: Stats = Stats {
     resid_bad: AtomicU64::new(0),
     handoff_full: AtomicU64::new(0),
     busy_ns: AtomicU64::new(0),
+    renew_failed: AtomicU64::new(0),
 };
 
 // ---- events and conversion, generic for the host tests ----
@@ -157,11 +164,24 @@ static STATS: Stats = Stats {
 pub(crate) trait DevEvent {
     /// `Some(true)` complete, `Some(false)` pending, `None` an error.
     fn done(&self) -> Option<bool>;
+    /// Become a fresh, never-recorded event on the CURRENT device (the old
+    /// one released); `false` = could not, the old one kept (`Buf::renew_used`).
+    fn renew(&mut self) -> bool;
 }
 
 impl DevEvent for Event {
     fn done(&self) -> Option<bool> {
         self.query().ok()
+    }
+    fn renew(&mut self) -> bool {
+        match Event::new() {
+            // The old event's Drop enters ITS device for `hipEventDestroy`.
+            Ok(e) => {
+                *self = e;
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -761,6 +781,15 @@ impl TierB {
         let mut buf = p.job.buf;
         buf.sums = d.sums;
         buf.sum_steps = d.sum_steps;
+        // Release this epoch's markers (and their KFD signal slots) now, not
+        // when the pool next records over them `bufs_per_pool` epochs later
+        // (`Buf::renew_used`). Here, off the scheduler thread; the new events
+        // land on the buffer's device, as the spare buffers in `accept` do.
+        let failed = match Device::new(p.job.device).scoped_current() {
+            Ok(_g) => buf.renew_used(),
+            Err(_) => buf.next.min(buf.events.len()),
+        };
+        STATS.renew_failed.fetch_add(failed as u64, Relaxed);
         STATS.busy_ns.fetch_add(((p.cost + w0.elapsed()).as_nanos()) as u64, Relaxed);
         // The pool is gone: the buffer (and its events) drop here.
         let _ = p.ret.try_send(buf);
@@ -768,10 +797,11 @@ impl TierB {
 }
 
 /// The minute line: deltas of the counters.
-fn log_stats(last: &mut [u64; 12]) {
+fn log_stats(last: &mut [u64; 13]) {
     let s = &STATS;
     let now = [
         &s.jobs, &s.pairs, &s.dropped, &s.deferred, &s.viol_a, &s.viol_b, &s.checked_b, &s.anchors_ok, &s.anchors_failed, &s.resid_bad, &s.handoff_full, &s.busy_ns,
+        &s.renew_failed,
     ]
     .map(|c| c.load(Relaxed));
     let d: Vec<u64> = now.iter().zip(last.iter()).map(|(a, b)| a.saturating_sub(*b)).collect();
@@ -782,6 +812,7 @@ fn log_stats(last: &mut [u64; 12]) {
     tracing::info!(
         buffers = d[0], pairs = d[1], dropped = d[2], deferred = d[3], viol_a = d[4], viol_b = d[5], checked_b = d[6],
         anchors_ok = d[7], anchors_failed = d[8], resid_bad = d[9], handoff_full = d[10], tierb_ms = d[11] / 1_000_000,
+        renew_failed = d[12],
         "evtrace dev (last minute)"
     );
 }
@@ -791,7 +822,7 @@ pub(crate) fn tier_b_loop(rx: Option<Receiver<Handoff>>, drain: fn()) {
     let mut st = TierB::default();
     let mut next_drain = Instant::now() + DRAIN_EVERY;
     let mut next_log = Instant::now() + LOG_EVERY;
-    let mut last = [0u64; 12];
+    let mut last = [0u64; 13];
     loop {
         let now = Instant::now();
         let mut wake = next_drain;
@@ -838,12 +869,20 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    /// A device event: its device time (ns) once complete.
-    struct Fake(Cell<Option<f64>>);
+    /// A device event: its device time (ns) once complete; renewed (by
+    /// `renew`); refuses to be renewed (event creation failing).
+    struct Fake(Cell<Option<f64>>, bool, bool);
 
     impl DevEvent for Fake {
         fn done(&self) -> Option<bool> {
             Some(self.0.get().is_some())
+        }
+        fn renew(&mut self) -> bool {
+            if self.2 {
+                return false;
+            }
+            *self = Fake(Cell::new(None), true, false);
+            true
         }
     }
 
@@ -868,8 +907,8 @@ mod tests {
         let mut ps = Vec::new();
         for &(name, stream, step, unit, s, e) in pairs {
             let i = events.len();
-            events.push(Fake(Cell::new(Some(s))));
-            events.push(Fake(Cell::new(Some(e))));
+            events.push(Fake(Cell::new(Some(s)), false, false));
+            events.push(Fake(Cell::new(Some(e)), false, false));
             let ctx = StageCtx { step, unit, ..StageCtx::NONE };
             ps.push(TimingPair { name, start_idx: i, end_idx: i + 1, ctx, stream, t_host: RAW0 + s - 10e3 });
         }
@@ -984,6 +1023,36 @@ mod tests {
         assert_eq!((d.checked_b, d.viol_b), (2, 1));
         assert_eq!(field(&d.step_dev[0], "viol_b"), 1.0);
         assert_eq!(field(&d.step_dev[0], "viol_a"), 1.0);
+    }
+
+    /// A finished buffer's recorded events -- exactly `events[..next]`, a
+    /// start whose stage never closed included -- are swapped for fresh ones
+    /// before it goes back; the unused tail is untouched; one that cannot be
+    /// renewed keeps its old event and is counted.
+    #[test]
+    fn renew_releases_exactly_the_recorded_events() {
+        let mut b = buf(&[("dgpu.q_chain", 1, 7, NO, 0.0, 1e6), ("dgpu.router", 1, 7, NO, 1e6, 2e6)]);
+        b.events.push(Fake(Cell::new(Some(3e6)), false, false)); // an open stage's start
+        for _ in 0..3 {
+            b.events.push(Fake(Cell::new(None), false, false)); // never recorded
+        }
+        b.next = 5;
+        b.events[2].2 = true;
+        let mut j = Job::new(0, "dgpu", b);
+        assert!(j.poll(&mut Conv));
+        let d = finish(&j, &mut Names::default(), 0.0, 0.0);
+        assert_eq!((d.pairs, d.dropped), (2, 0));
+        let mut buf = j.buf;
+        assert_eq!(buf.renew_used(), 1);
+        let renewed: Vec<bool> = buf.events.iter().map(|e| e.1).collect();
+        assert_eq!(renewed, [true, true, false, true, true, false, false, false]);
+        assert_eq!(buf.events[2].0.get(), Some(1e6), "the refused one is the old event");
+        assert_eq!(buf.events.len(), 8, "never shrinks");
+        // `next` past the end (cannot happen) renews what there is.
+        buf.next = 100;
+        buf.events[2].2 = false;
+        assert_eq!(buf.renew_used(), 0);
+        assert!(buf.events.iter().all(|e| e.1));
     }
 
     /// Deterministic noise in [-1, 1).

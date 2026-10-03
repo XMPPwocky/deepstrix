@@ -180,6 +180,25 @@ impl<E> Buf<E> {
     }
 }
 
+impl<E: super::evtrace_dev::DevEvent> Buf<E> {
+    /// Swap every event this epoch recorded (`events[..next]`) for a fresh,
+    /// unrecorded one; returns how many could not be (those keep the old
+    /// event: the buffer never shrinks). Tier B, before it returns a buffer,
+    /// with the buffer's device current.
+    ///
+    /// Why: a recorded hipEvent keeps its marker command -- and through it an
+    /// HSA interrupt signal, one KFD event slot -- alive until it is recorded
+    /// AGAIN. A pool re-recording one buffer from slot 0 every epoch holds
+    /// about one epoch's events; rotating through `V41_EVTRACE_DEV_BUFS`
+    /// buffers held that many epochs' worth, which at multi-lane step sizes
+    /// passes the process's ~4096 KFD signal events, after which new signals
+    /// get none and every wait polls (decode and prefill slowed with lanes).
+    pub(crate) fn renew_used(&mut self) -> usize {
+        let n = self.next.min(self.events.len());
+        self.events[..n].iter_mut().map(|e| usize::from(!e.renew())).sum()
+    }
+}
+
 impl Buf<Event> {
     /// `capacity` events on the CURRENT device.
     pub(crate) fn new(capacity: usize) -> eyre::Result<Self> {
