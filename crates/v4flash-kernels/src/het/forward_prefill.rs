@@ -134,7 +134,9 @@ fn remote_exclude() -> bool {
 ///
 /// `owns`: box 2's HELLO set, i.e. what an empty override has it compute. When
 /// the override IS empty and the split is live, every pick must agree between
-/// `owns_eff` and `owns` -- the one check that sees box 2's side -- or `Err`.
+/// `owns_eff` and `owns`, or `Err`. Today the caller builds `owns_eff` from
+/// `owns` in exactly that case, so this only guards a future change to
+/// `owns_eff` that forgets the override.
 fn remote_sel_override(
     partition: bool,
     replay_offload: bool,
@@ -9432,7 +9434,9 @@ impl HeterogeneousEngine {
                     // where its misses may land only if asked to.
                     if !speculative_append() {
                         pg.set_count_as_prefill(true);
-                        let scan = prefill_scan_slots();
+                        // Never narrower than this layer's set: `claim`
+                        // refuses to evict a slot the same call already uses.
+                        let scan = prefill_scan_slots().max(ids.len());
                         if scan < pg.slots() as usize {
                             let n = pg.slots() as usize;
                             pg.set_scan_window(Some((n - scan, n)));
