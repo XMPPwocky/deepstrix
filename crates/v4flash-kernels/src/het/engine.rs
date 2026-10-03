@@ -582,6 +582,15 @@ impl HeterogeneousEngine {
         c.set_busy_poll_us(if decode { *DECODE_US } else { *BATCH_US });
     }
 
+    /// The prefill job about to run is long (more than `V41_LONG_PREFILL_TOKENS`):
+    /// box 2 lets its phase keep the job's experts (`proto::REQ_FLAG_LONG_JOB`).
+    /// Set before each of a job's units, so a short job never inherits it.
+    pub fn remote_set_long_job(&self, long: bool) {
+        let Some(m) = self.remote.as_ref() else { return };
+        let Ok(mut c) = m.lock() else { return };
+        c.set_long_job(long);
+    }
+
     pub fn remote_drain_in_flight(&self) -> usize {
         self.remote
             .as_ref()

@@ -1299,6 +1299,9 @@ impl Sched {
     /// One chunk (or the finish + admit) of `pf`. On error returns the scratch
     /// state (if still owned) for recycling.
     fn prefill_job_tick(&mut self, state: &mut WorkerState, mut pf: Prefill, i: usize) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
+        // Every unit of the job (chunks, finish, replay) says whether it is long.
+        let long_min = crate::knobs::LONG_PREFILL_TOKENS.get() as usize;
+        state.engine.remote_set_long_job(long_min > 0 && pf.job.total() > long_min);
         if !pf.job.chunks_done() {
             let t = Instant::now();
             if let Some(pg) = state.pager.as_mut() {

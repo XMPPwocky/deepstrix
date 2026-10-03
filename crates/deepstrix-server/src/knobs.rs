@@ -120,6 +120,10 @@ v4flash_kernels::knobs! {
     pub static MS_DSPARK_DRAFTS = Knob::choice("V41_MS_DSPARK_DRAFTS", 0, &[&["sampled"], &["argmax"]]);
     /// `V41_MS_DSPARK_RING_ASYNC` (default on).
     pub static MS_DSPARK_RING_ASYNC = Knob::flag("V41_MS_DSPARK_RING_ASYNC", true);
+    /// `V41_LONG_PREFILL_TOKENS` (default 16384): a prefill job longer than this
+    /// flags its box-2 requests `REQ_FLAG_LONG_JOB` (box 2's phase keeps the
+    /// job's experts: `knobs::prefill_budget_long` there); 0 = never.
+    pub static LONG_PREFILL_TOKENS = Knob::int("V41_LONG_PREFILL_TOKENS", 16384, 0, u32::MAX as u64);
     /// `V41_MS_DSPARK_MIN_GAIN` (default 1.0): the stage-1 back-off bar.
     pub static MS_DSPARK_MIN_GAIN = Knob::real("V41_MS_DSPARK_MIN_GAIN", 1.0, 0.0, 1e9);
     /// `V41_MS_DSPARK_EXPLORE` (default 1/32): `ms_dspark::explore_p`.
