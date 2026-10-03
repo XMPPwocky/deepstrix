@@ -35,11 +35,11 @@ fn role_kr(which: &str) -> (u64, u64) {
     }
 }
 
-pub struct ExpertPager {
-    owner: V41HfWeights,
-    /// `n_slots` slots per role; slot `s`'s bytes live at `s * *_bytes_per_expert`.
-    pub routed: RoutedExpertWeights,
-    n_slots: u32,
+/// The pool's residency tables: which (layer, expert) each slot holds and how
+/// recently each slot was used. Plain host data, kept apart from the HIP
+/// buffers in `ExpertPager` so the claim / evict / roll-back rules are
+/// unit-testable without a GPU.
+struct Residency {
     /// (layer, global expert id) -> resident slot.
     slot_of: HashMap<(i32, u32), u32>,
     /// slot -> the key it currently holds (None = free).
@@ -56,6 +56,131 @@ pub struct ExpertPager {
     /// way (`ShardPool::last_use` + `tick`).
     last_use: Vec<u64>,
     tick: u64,
+}
+
+impl Residency {
+    fn new(n_slots: usize) -> Self {
+        Residency { slot_of: HashMap::new(), slot_key: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0 }
+    }
+
+    #[inline]
+    fn touch(&mut self, slot: u32) {
+        self.tick += 1;
+        if let Some(t) = self.last_use.get_mut(slot as usize) {
+            *t = self.tick;
+        }
+    }
+
+    /// Least-recently-used slot in `range`, or `None` if the range is empty.
+    /// O(range) and paid only on a MISS; the old deque paid O(pool) per HIT.
+    /// A never-used slot has stamp 0 and so is picked first, which is what the
+    /// deque did too (it only ever held slots that had been filled).
+    fn lru_victim(&self, range: std::ops::Range<usize>) -> Option<u32> {
+        let mut best: Option<(u64, u32)> = None;
+        for sl in range {
+            if sl >= self.last_use.len() {
+                break;
+            }
+            let t = self.last_use[sl];
+            if best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, sl as u32));
+            }
+        }
+        best.map(|(_, sl)| sl)
+    }
+
+    /// Give the MISS `key` a slot in `lo..hi` (the first free one, else the LRU
+    /// victim, whose key is evicted) and register it at once: `slot_of`,
+    /// `slot_key` AND a touch. The touch is what stops the next miss of the
+    /// same call from picking this slot again; `ensure_batched` used to claim
+    /// without it, so every no-free-slot miss of a layer got the SAME victim,
+    /// all of them were uploaded into it (last write wins) and all but one
+    /// became permanent hits on another expert's weights.
+    ///
+    /// `call_tick` is `tick` when the calling `ensure*` started. Every slot the
+    /// call has hit or claimed carries a newer stamp, so a victim newer than it
+    /// means the range cannot hold the call's set and evicting it would give one
+    /// slot to two experts the same dispatch reads: refuse instead.
+    ///
+    /// The bytes have NOT landed. A caller whose upload fails must `release` the
+    /// claim, or the key stays a hit on whatever the slot held before.
+    fn claim(&mut self, key: (i32, u32), lo: usize, hi: usize, call_tick: u64) -> eyre::Result<u32> {
+        let hi = hi.min(self.slot_key.len());
+        let free = (lo..hi).find(|&sl| self.slot_key[sl].is_none());
+        let slot = match free {
+            Some(sl) => sl as u32,
+            None => {
+                let victim = self
+                    .lru_victim(lo..hi)
+                    .ok_or_else(|| eyre!("expert pager: no slot to evict"))?;
+                if self.last_use[victim as usize] > call_tick {
+                    return Err(eyre!(
+                        "expert pager: L{} e{}: every slot in {lo}..{hi} is already used by this \
+                         call; the allocation range is smaller than the layer's expert set",
+                        key.0,
+                        key.1
+                    ));
+                }
+                if let Some(old) = self.slot_key[victim as usize].take() {
+                    self.slot_of.remove(&old);
+                }
+                victim
+            }
+        };
+        self.slot_of.insert(key, slot);
+        self.slot_key[slot as usize] = Some(key);
+        self.touch(slot);
+        Ok(slot)
+    }
+
+    /// Undo a `claim` whose bytes never landed: the key stops resolving and the
+    /// slot is free again (stamp 0, so it is reused first; its contents are
+    /// undefined, possibly half-written).
+    fn release(&mut self, key: (i32, u32), slot: u32) {
+        if self.slot_of.get(&key) == Some(&slot) {
+            self.slot_of.remove(&key);
+        }
+        if self.slot_key.get(slot as usize) == Some(&Some(key)) {
+            self.slot_key[slot as usize] = None;
+            self.last_use[slot as usize] = 0;
+        }
+    }
+
+    /// `release` every claim in `c` past its landed prefix.
+    fn release_unlanded(&mut self, layer: i32, c: &Claims) {
+        for &(id, slot) in &c.pending[c.landed.min(c.pending.len())..] {
+            self.release((layer, id), slot);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.slot_of.clear();
+        for k in self.slot_key.iter_mut() {
+            *k = None;
+        }
+        for t in self.last_use.iter_mut() {
+            *t = 0;
+        }
+        self.tick = 0;
+    }
+}
+
+/// The misses one `ensure*` call claimed, as `(id, slot)` in claim order, and
+/// how many of them have landed. Uploads land in claim order, so on an error
+/// exactly `pending[landed..]` must be released.
+#[derive(Default)]
+struct Claims {
+    pending: Vec<(u32, u32)>,
+    landed: usize,
+}
+
+pub struct ExpertPager {
+    owner: V41HfWeights,
+    /// `n_slots` slots per role; slot `s`'s bytes live at `s * *_bytes_per_expert`.
+    pub routed: RoutedExpertWeights,
+    n_slots: u32,
+    /// Which (layer, expert) each slot holds, and the slots' LRU stamps.
+    res: Residency,
     /// `V41_MISS_HIST=1`: misses counted per (layer, expert), so the SHAPE of the
     /// miss stream can be read instead of just its rate. The rate alone cannot
     /// tell apart three cases with opposite fixes — a working set that genuinely
@@ -1073,7 +1198,7 @@ impl ExpertPager {
     pub fn prefetch_hint(&mut self, layer: i32, id: u32) {
         let Some(pf) = self.prefetch.as_mut() else { return };
         let key = (layer, id);
-        if self.slot_of.contains_key(&key) || pf.pending.contains(&key) {
+        if self.res.slot_of.contains_key(&key) || pf.pending.contains(&key) {
             return;
         }
         let t = pf.touches.entry(key).or_insert(0);
@@ -1124,21 +1249,22 @@ impl ExpertPager {
             if let Some(pf) = self.prefetch.as_mut() {
                 pf.pending.remove(&key);
             }
-            if p.bufs[0].is_empty() || self.slot_of.contains_key(&key) {
+            if p.bufs[0].is_empty() || self.res.slot_of.contains_key(&key) {
                 continue; // read failed, or `ensure` paged it meanwhile
             }
             let lru_lo = {
                 let lo = self.dense_slots();
                 if lo >= self.n_slots as usize { 0 } else { lo }
             };
-            let slot = match self.slot_key.iter().enumerate().skip(lru_lo).find(|(_, k)| k.is_none()) {
+            let slot = match self.res.slot_key.iter().enumerate().skip(lru_lo).find(|(_, k)| k.is_none()) {
                 Some((free, _)) => free as u32,
                 None => {
                     let victim = self
+                        .res
                         .lru_victim(lru_lo..self.n_slots as usize)
                         .ok_or_else(|| eyre!("expert pager: prefetch has no slot to evict"))?;
-                    if let Some(old) = self.slot_key[victim as usize].take() {
-                        self.slot_of.remove(&old);
+                    if let Some(old) = self.res.slot_key[victim as usize].take() {
+                        self.res.slot_of.remove(&old);
                         push_hint(false, old.0, old.1);
                     }
                     victim
@@ -1166,9 +1292,9 @@ impl ExpertPager {
                 self.routed.down.buffer.slice_view_mut(slot as usize * dbpe, dbpe).copy_from_host(&p.bufs[2])?;
             }
             assert!(slot < self.n_slots, "expert pager: prefetch slot {slot} >= pool {}", self.n_slots);
-            self.slot_of.insert(key, slot);
-            self.slot_key[slot as usize] = Some(key);
-            self.touch(slot);
+            self.res.slot_of.insert(key, slot);
+            self.res.slot_key[slot as usize] = Some(key);
+            self.res.touch(slot);
             clear_box2_miss(p.layer, p.id);
             n += 1;
         }
@@ -1383,10 +1509,7 @@ impl ExpertPager {
             par_gate: vec![0u8; gb],
             par_up: vec![0u8; ub],
             par_down: vec![0u8; db],
-            slot_of: HashMap::new(),
-            slot_key: vec![None; n_slots as usize],
-            last_use: vec![0; n_slots as usize],
-            tick: 0,
+            res: Residency::new(n_slots as usize),
             miss_hist: (std::env::var("V41_MISS_HIST").as_deref() == Ok("1")).then(|| {
                 (0..(crate::config::N_LAYER as usize) * (N_EXPERT as usize))
                     .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -1576,32 +1699,6 @@ impl ExpertPager {
         &mut self.remap_dev[layer.clamp(0, crate::config::N_LAYER - 1) as usize]
     }
 
-    #[inline]
-    fn touch(&mut self, slot: u32) {
-        self.tick += 1;
-        if let Some(t) = self.last_use.get_mut(slot as usize) {
-            *t = self.tick;
-        }
-    }
-
-    /// Least-recently-used slot in `range`, or `None` if the range is empty.
-    /// O(range) and paid only on a MISS; the old deque paid O(pool) per HIT.
-    /// A never-used slot has stamp 0 and so is picked first, which is what the
-    /// deque did too (it only ever held slots that had been filled).
-    fn lru_victim(&self, range: std::ops::Range<usize>) -> Option<u32> {
-        let mut best: Option<(u64, u32)> = None;
-        for sl in range {
-            if sl >= self.last_use.len() {
-                break;
-            }
-            let t = self.last_use[sl];
-            if best.is_none_or(|(bt, _)| t < bt) {
-                best = Some((t, sl as u32));
-            }
-        }
-        best.map(|(_, sl)| sl)
-    }
-
     /// Page in every expert in `ids` for `layer` and return a `global id -> slot`
     /// remap (`-1` for ids not requested). The returned slice is valid until the
     /// next `ensure`. `ids` must have `len() <= n_slots`.
@@ -1655,8 +1752,8 @@ impl ExpertPager {
         // with a half-written mix of two layers' experts and never error.
         self.window_layer[w as usize] = None;
         for sl in base..base + N_EXPERT as usize {
-            if let Some(old) = self.slot_key[sl].take() {
-                self.slot_of.remove(&old);
+            if let Some(old) = self.res.slot_key[sl].take() {
+                self.res.slot_of.remove(&old);
             }
         }
         let names = [
@@ -1749,8 +1846,8 @@ impl ExpertPager {
             h2d_ns += t_h2d.elapsed().as_nanos() as u64;
             for i in 0..n {
                 let slot = (s0 + i) as u32;
-                self.slot_of.insert((layer, (e0 + i) as u32), slot);
-                self.slot_key[slot as usize] = Some((layer, (e0 + i) as u32));
+                self.res.slot_of.insert((layer, (e0 + i) as u32), slot);
+                self.res.slot_key[slot as usize] = Some((layer, (e0 + i) as u32));
             }
             self.prefill_misses += n as u64;
             e0 += n;
@@ -1779,6 +1876,17 @@ impl ExpertPager {
     ///
     /// `V41_PAGER_BATCH_MISS=0` restores the serial path.
     pub fn ensure_batched(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<&[i32]> {
+        let mut c = Claims::default();
+        match self.ensure_batched_inner(layer, ids, &mut c) {
+            Ok(()) => Ok(&self.remap),
+            Err(e) => {
+                self.res.release_unlanded(layer, &c);
+                Err(e)
+            }
+        }
+    }
+
+    fn ensure_batched_inner(&mut self, layer: i32, ids: &[u32], c: &mut Claims) -> eyre::Result<()> {
         self.cur_layer = layer;
         if ids.len() > self.n_slots as usize {
             return Err(eyre!(
@@ -1797,7 +1905,7 @@ impl ExpertPager {
             let lo = self.dense_slots();
             if lo >= self.n_slots as usize { 0 } else { lo }
         };
-        let mut misses: Vec<(u32, u32)> = Vec::with_capacity(ids.len()); // (id, slot)
+        let call_tick = self.res.tick;
         for &id in ids {
             if self.count_as_prefill {
                 self.prefill_requests += 1;
@@ -1805,8 +1913,8 @@ impl ExpertPager {
                 self.decode_requests += 1;
             }
             let key = (layer, id);
-            if let Some(&slot) = self.slot_of.get(&key) {
-                self.touch(slot);
+            if let Some(&slot) = self.res.slot_of.get(&key) {
+                self.res.touch(slot);
                 // ABSOLUTE pool slot, NOT a window-relative one (that is what
                 // `write_window_remap` writes into the same field). The group
                 // builder's arrays are sized to `sparse_group_bound() ==
@@ -1834,38 +1942,27 @@ impl ExpertPager {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            let slot = match self
-                .slot_key
-                .iter()
-                .enumerate()
-                .skip(lru_lo)
-                .find(|(_, k)| k.is_none())
-            {
-                Some((free, _)) => free as u32,
-                None => {
-                    let victim = self
-                        .lru_victim(lru_lo..self.n_slots as usize)
-                        .ok_or_else(|| eyre!("expert pager: no slot to evict"))?;
-                    if let Some(old) = self.slot_key[victim as usize].take() {
-                        self.slot_of.remove(&old);
-                    }
-                    victim
-                }
-            };
+            // Claimed AND touched now, so a later miss in this same call cannot
+            // pick it (see `Residency::claim`); rolled back by the caller if
+            // its bytes never land.
+            let slot = self.res.claim(key, lru_lo, self.n_slots as usize, call_tick)?;
             if (slot as usize) < self.dense_slots() {
                 if let Some(w) = self.window_of_slot(slot) {
                     if let Some(e) = self.window_layer.get_mut(w as usize) { *e = None; }
                     if let Some(d) = self.window_dense.get_mut(w as usize) { *d = false; }
                 }
             }
-            // Claim the slot NOW so a later miss in this same call cannot pick it.
-            self.slot_key[slot as usize] = Some(key);
-            misses.push((id, slot));
+            c.pending.push((id, slot));
         }
+        let misses = &c.pending;
         if misses.is_empty() {
             self.upload_remap()?;
-            return Ok(&self.remap);
+            return Ok(());
         }
+        debug_assert!(
+            misses.iter().enumerate().all(|(i, &(_, s))| misses[..i].iter().all(|&(_, t)| t != s)),
+            "expert pager: L{layer} two misses claimed one slot: {misses:?}"
+        );
 
         // --- phase 2: one parallel read for every miss in this layer ---
         let names = [
@@ -1995,8 +2092,14 @@ impl ExpertPager {
                     .slice_view_mut(slot as usize * dbpe, dbpe)
                     .copy_from_host(&self.par_down[i * dbpe..(i + 1) * dbpe])?;
             }
-            self.slot_of.insert((layer, id), slot);
-            self.touch(slot);
+            // Registered at claim time; nothing since may have taken the slot.
+            debug_assert!(
+                self.res.slot_key[slot as usize] == Some((layer, id))
+                    && self.res.slot_of.get(&(layer, id)) == Some(&slot),
+                "expert pager: L{layer} e{id} lost its claim on slot {slot} before landing"
+            );
+            c.landed += 1;
+            self.res.touch(slot);
             // ABSOLUTE pool slot; see the resident-hit branch above.
             assert!(
                 slot < self.n_slots,
@@ -2014,7 +2117,7 @@ impl ExpertPager {
             self.decode_repack_gpu_ns += gpu_ns;
         }
         self.upload_remap()?;
-        Ok(&self.remap)
+        Ok(())
     }
 
     /// Mark `is_remote` experts as NOT-OURS in the remap that [`Self::ensure`]
@@ -2082,7 +2185,7 @@ impl ExpertPager {
             self.remap[e as usize] = if is_remote(e) {
                 0
             } else {
-                match self.slot_of.get(&(layer, e)) {
+                match self.res.slot_of.get(&(layer, e)) {
                     Some(&sl) if (sl as usize) >= base && (sl as usize) < base + width => {
                         -((sl as usize - base) as i32) - 1
                     }
@@ -2105,10 +2208,10 @@ impl ExpertPager {
                 continue;
             }
             let sl = base + (-r - 1) as usize;
-            if self.slot_key.get(sl).copied().flatten() != Some((layer, e)) {
+            if self.res.slot_key.get(sl).copied().flatten() != Some((layer, e)) {
                 return Err(eyre!(
                     "expert pager: L{layer} remap[{e}]={r} -> slot {sl} holds {:?}, not (L{layer}, {e}).                      Window {w} base {base} width {width} stride {}.",
-                    self.slot_key.get(sl).copied().flatten(),
+                    self.res.slot_key.get(sl).copied().flatten(),
                     self.window_stride
                 ));
             }
@@ -2152,8 +2255,8 @@ impl ExpertPager {
             self.window_layer[w as usize] = None;
             self.window_dense[w as usize] = false;
             for sl in base..base + self.window_width(w) {
-                if let Some(old) = self.slot_key[sl].take() {
-                    self.slot_of.remove(&old);
+                if let Some(old) = self.res.slot_key[sl].take() {
+                    self.res.slot_of.remove(&old);
                 }
             }
             self.window_layer[w as usize] = Some(layer);
@@ -2216,14 +2319,14 @@ impl ExpertPager {
             }
             // Already resident IN THIS WINDOW? (a slot elsewhere is not reusable:
             // the dispatch only sees `[base, base+width)` through `routed_window`.)
-            if let Some(&sl) = self.slot_of.get(&(layer, e)) {
+            if let Some(&sl) = self.res.slot_of.get(&(layer, e)) {
                 let sl = sl as usize;
-                if sl >= base && sl < base + width && self.slot_key[sl] == Some((layer, e)) {
+                if sl >= base && sl < base + width && self.res.slot_key[sl] == Some((layer, e)) {
                     assign.push((e, sl));
                     continue;
                 }
             }
-            while next_free < width && self.slot_key[base + next_free].is_some() {
+            while next_free < width && self.res.slot_key[base + next_free].is_some() {
                 next_free += 1;
             }
             if next_free >= width {
@@ -2334,8 +2437,8 @@ impl ExpertPager {
                 self.routed.down.buffer
                     .slice_view_mut(slot * dbpe, dbpe)
                     .copy_from_host(&self.par_down[i * dbpe..(i + 1) * dbpe])?;
-                self.slot_of.insert((layer, e), slot as u32);
-                self.slot_key[slot] = Some((layer, e));
+                self.res.slot_of.insert((layer, e), slot as u32);
+                self.res.slot_key[slot] = Some((layer, e));
             }
             h2d_ns += t_h2d.elapsed().as_nanos() as u64;
             self.prefill_misses += n as u64;
@@ -2738,6 +2841,23 @@ impl ExpertPager {
     }
 
     pub fn ensure(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<&[i32]> {
+        // Misses are registered in `slot_of` BEFORE their bytes are read, so any
+        // error after that (a read / O_DIRECT error, a reader panic, a HIP repack
+        // failure) must release the ones that never landed: the scheduler fails
+        // only the affected request and keeps this pager, and an unreleased claim
+        // is a permanent, most-recently-used "hit" on the evicted expert's weights
+        // (or uninitialised memory) for every later request.
+        let mut c = Claims::default();
+        match self.ensure_inner(layer, ids, &mut c) {
+            Ok(()) => Ok(&self.remap),
+            Err(e) => {
+                self.res.release_unlanded(layer, &c);
+                Err(e)
+            }
+        }
+    }
+
+    fn ensure_inner(&mut self, layer: i32, ids: &[u32], c: &mut Claims) -> eyre::Result<()> {
         self.cur_layer = layer;
         if ids.len() > self.n_slots as usize {
             return Err(eyre!(
@@ -2758,7 +2878,7 @@ impl ExpertPager {
             format!("blk.{layer}.ffn_down_exps.weight"),
         ];
         let gpu_repack = self.repack.is_some();
-        let mut pending: Vec<(u32, u32)> = Vec::new();
+        let call_tick = self.res.tick;
         for &id in ids {
             if self.count_as_prefill {
                 self.prefill_requests += 1;
@@ -2766,8 +2886,8 @@ impl ExpertPager {
                 self.decode_requests += 1;
             }
             let key = (layer, id);
-            if let Some(&slot) = self.slot_of.get(&key) {
-                self.touch(slot);
+            if let Some(&slot) = self.res.slot_of.get(&key) {
+                self.res.touch(slot);
                 // ABSOLUTE pool slot, NOT a window-relative one (that is what
                 // `write_window_remap` writes into the same field). The group
                 // builder's arrays are sized to `sparse_group_bound() ==
@@ -2808,25 +2928,10 @@ impl ExpertPager {
             // where a MISS may land is restricted, which is what keeps a
             // prefill scan from evicting decode's warm set.
             let (lru_lo, lru_hi) = self.alloc_bounds();
-            let slot = match self
-                .slot_key
-                .iter()
-                .enumerate()
-                .take(lru_hi)
-                .skip(lru_lo)
-                .find(|(_, k)| k.is_none())
-            {
-                Some((free, _)) => free as u32,
-                None => {
-                    let victim = self
-                        .lru_victim(lru_lo..lru_hi)
-                        .ok_or_else(|| eyre!("expert pager: no slot to evict"))?;
-                    if let Some(old) = self.slot_key[victim as usize].take() {
-                        self.slot_of.remove(&old);
-                    }
-                    victim
-                }
-            };
+            // Slot claimed NOW (slot_of + slot_key + touch) so the next miss cannot
+            // pick it again; the remap entry is written once the bytes have landed,
+            // and `ensure` releases the claim if they never do.
+            let slot = self.res.claim(key, lru_lo, lru_hi, call_tick)?;
             // Safety net for the degenerate case above: if this slot does fall inside a
             // dense window, that window is no longer a faithful copy of its layer.
             if (slot as usize) < self.dense_slots() {
@@ -2835,21 +2940,13 @@ impl ExpertPager {
                     if let Some(d) = self.window_dense.get_mut(w as usize) { *d = false; }
                 }
             }
-            // Read the three role tensors for this expert into the stage buffers.
-            // Scope the source borrow so the device upload + bookkeeping below can
-            // take `&mut self` (owner and the stage/routed fields are disjoint, but
-            // `self.touch()` needs all of self).
-            // Slot claimed NOW so the next miss cannot pick it again; the remap
-            // entry is written once the bytes have landed.
-            self.slot_of.insert(key, slot);
-            self.slot_key[slot as usize] = Some(key);
-            self.touch(slot);
-            pending.push((id, slot));
+            c.pending.push((id, slot));
         }
         // Read the misses `stages.len()` at a time, concurrently, then upload /
-        // repack in order (see `pager_miss_par`).
+        // repack in order (see `pager_miss_par`). In CLAIM order: `c.landed`
+        // counts a prefix of `c.pending`.
         let k = self.stages.len().max(1);
-        let pending = std::mem::take(&mut pending);
+        let pending = &c.pending;
         for chunk in pending.chunks(k) {
             let t_read = std::time::Instant::now();
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
@@ -2934,6 +3031,7 @@ impl ExpertPager {
                     self.n_slots
                 );
                 self.remap[id as usize] = -(slot as i32) - 1;
+                c.landed += 1;
             }
         }
         // Split the blocking H2D out of the rest of `ensure`. With zero misses
@@ -2946,7 +3044,7 @@ impl ExpertPager {
             );
             self.upload_remap()?;
         }
-        Ok(&self.remap)
+        Ok(())
     }
 
     /// Is `(layer, e)` resident in the pool right now? Used by the T2-catch-all
@@ -2954,7 +3052,7 @@ impl ExpertPager {
     /// everything else to box 2, so a hub miss never blocks on the hub's
     /// (dm-crypt) disk. Pure lookup — does NOT page and does NOT touch the LRU.
     pub fn is_resident(&self, layer: i32, e: u32) -> bool {
-        self.slot_of.contains_key(&(layer, e))
+        self.res.slot_of.contains_key(&(layer, e))
     }
 
     /// Mark `(layer, e)` most-recently-used if resident; returns whether it was.
@@ -2963,9 +3061,9 @@ impl ExpertPager {
     /// other lane's `ensure` before this lane's, so without this the substitute
     /// can be the victim and the stall merely moves to box 1's disk.
     pub fn touch_resident(&mut self, layer: i32, e: u32) -> bool {
-        match self.slot_of.get(&(layer, e)).copied() {
+        match self.res.slot_of.get(&(layer, e)).copied() {
             Some(slot) => {
-                self.touch(slot);
+                self.res.touch(slot);
                 true
             }
             None => false,
@@ -2974,7 +3072,7 @@ impl ExpertPager {
 
     /// Pool slot of `(layer, e)` if resident (diagnostics).
     pub fn resident_slot(&self, layer: i32, e: u32) -> Option<u32> {
-        self.slot_of.get(&(layer, e)).copied()
+        self.res.slot_of.get(&(layer, e)).copied()
     }
 
     /// Unused slots in the decode LRU region.
@@ -2991,7 +3089,7 @@ impl ExpertPager {
             let l = self.dense_slots();
             if l >= self.n_slots as usize { 0 } else { l }
         };
-        self.slot_key[lo..].iter().filter(|k| k.is_none()).count()
+        self.res.slot_key[lo..].iter().filter(|k| k.is_none()).count()
     }
 
     /// `V41_T2_CATCHALL=1`: box 2 is a catch-all LRU tier, so the hub stops
@@ -3127,14 +3225,12 @@ impl ExpertPager {
 
     /// Reset residency (e.g. between independent sequences). Keeps the buffers.
     pub fn clear(&mut self) {
-        self.slot_of.clear();
-        for k in self.slot_key.iter_mut() {
-            *k = None;
-        }
-        for t in self.last_use.iter_mut() {
-            *t = 0;
-        }
-        self.tick = 0;
+        self.res.clear();
+        // The windows too: a window still flagged dense for its layer while
+        // `slot_of` is empty would let `ensure_layer_union` pack new experts
+        // over it and a later `ensure_layer_dense` trust it unchanged.
+        self.window_layer.iter_mut().for_each(|w| *w = None);
+        self.window_dense.iter_mut().for_each(|d| *d = false);
     }
 
     #[allow(dead_code)]
@@ -3213,5 +3309,99 @@ impl std::ops::Sub for PagerCounters {
             decode_n_direct: self.decode_n_direct - o.decode_n_direct,
             decode_n_raw: self.decode_n_raw - o.decode_n_raw,
         }
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::*;
+
+    /// Every `slot_of` entry is backed by `slot_key` and vice versa.
+    fn consistent(r: &Residency) {
+        for (k, &s) in &r.slot_of {
+            assert_eq!(r.slot_key[s as usize], Some(*k), "slot_of {k:?} -> {s} not backed by slot_key");
+        }
+        for (s, k) in r.slot_key.iter().enumerate() {
+            if let Some(k) = k {
+                assert_eq!(r.slot_of.get(k), Some(&(s as u32)), "slot_key[{s}] = {k:?} not in slot_of");
+            }
+        }
+    }
+
+    /// A full pool: every slot holds (0, slot), stamped in slot order.
+    fn full(n: usize) -> Residency {
+        let mut r = Residency::new(n);
+        for s in 0..n as u32 {
+            r.slot_of.insert((0, s), s);
+            r.slot_key[s as usize] = Some((0, s));
+            r.touch(s);
+        }
+        r
+    }
+
+    /// The `ensure_batched` bug: several no-free-slot misses in ONE call must get
+    /// DIFFERENT victims (the two least recent), not the same one.
+    #[test]
+    fn misses_in_one_call_get_distinct_victims() {
+        let mut r = full(4);
+        let t0 = r.tick;
+        let a = r.claim((1, 10), 0, 4, t0).unwrap();
+        let b = r.claim((1, 11), 0, 4, t0).unwrap();
+        assert_eq!((a, b), (0, 1), "the two least recent slots, one each");
+        assert!(!r.slot_of.contains_key(&(0, 0)) && !r.slot_of.contains_key(&(0, 1)));
+        assert_eq!(r.slot_of.get(&(1, 10)), Some(&0));
+        assert_eq!(r.slot_of.get(&(1, 11)), Some(&1));
+        consistent(&r);
+    }
+
+    /// A range smaller than the call's set refuses rather than evicting a slot the
+    /// same call already hit or claimed.
+    #[test]
+    fn claim_never_evicts_this_calls_slots() {
+        let mut r = full(2);
+        let t0 = r.tick;
+        r.touch(0); // a HIT in this call
+        assert_eq!(r.claim((1, 5), 0, 2, t0).unwrap(), 1);
+        assert!(r.claim((1, 6), 0, 2, t0).is_err(), "both slots belong to this call");
+        assert_eq!(r.slot_of.get(&(0, 0)), Some(&0), "the hit survives");
+        assert_eq!(r.slot_of.get(&(1, 5)), Some(&1), "the earlier claim survives");
+        consistent(&r);
+    }
+
+    /// The `ensure` bug: an error after the claims must leave no entry for the
+    /// experts whose bytes never landed, and their slots free.
+    #[test]
+    fn release_unlanded_rolls_back_only_the_unloaded() {
+        let mut r = full(4);
+        let t0 = r.tick;
+        let mut c = Claims::default();
+        for id in [20, 21, 22] {
+            let s = r.claim((3, id), 0, 4, t0).unwrap();
+            c.pending.push((id, s));
+        }
+        c.landed = 1; // e20 uploaded, then the read for e21 failed
+        r.release_unlanded(3, &c);
+        assert!(r.slot_of.contains_key(&(3, 20)));
+        assert!(!r.slot_of.contains_key(&(3, 21)) && !r.slot_of.contains_key(&(3, 22)));
+        for &(_, s) in &c.pending[1..] {
+            assert_eq!(r.slot_key[s as usize], None);
+            assert_eq!(r.last_use[s as usize], 0);
+        }
+        consistent(&r);
+        // The released slots are free and reused before any resident is evicted.
+        let s = r.claim((3, 21), 0, 4, r.tick).unwrap();
+        assert!(c.pending[1..].iter().any(|&(_, p)| p == s));
+        assert!(r.slot_of.contains_key(&(0, 3)), "the warm resident was not evicted");
+        consistent(&r);
+    }
+
+    /// `release` must not drop a key that has since moved to another slot.
+    #[test]
+    fn release_ignores_a_moved_key() {
+        let mut r = Residency::new(2);
+        let s0 = r.claim((0, 1), 0, 2, 0).unwrap();
+        r.release((0, 1), s0 + 1);
+        assert_eq!(r.slot_of.get(&(0, 1)), Some(&s0));
+        consistent(&r);
     }
 }
