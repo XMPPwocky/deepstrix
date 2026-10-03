@@ -230,6 +230,28 @@ accounting via `Stats::note_k0`, and for a POLICY K = 0 a gain sample with the
 draft charged, through the shared `gate_update`); `policy_k0` in the blocks line.
 Regression: `ms_dspark::tests::k0_steps_with_the_draft_charged_back_off`.
 
+### 52. FIXED 2026-10-03 — BPE merge was quadratic in the piece length: one 4,000-char symbol run cost ~2 s per encode
+
+`bpe_emit_piece` rescanned every adjacent pair after every merge, with a
+freshly allocated key per rank lookup: O(n^2) lookups per pre-tokenizer
+piece. Pieces are short in prose and code, but a run of one symbol is a
+single piece (`[\p{P}\p{S}]+`, a letter run, a CJK run): measured on the V4.1
+vocab, 4,000 x U+2500 1.88 s, 4,000 x 😀 2.5 s, 4,000 x "=" 0.22 s. Every turn
+re-tokenizes the whole conversation, so such runs anywhere in it (table
+borders, progress bars, box drawing in tool output) are paid again on every
+request. Suspected cause of the ~15 s per-turn stall between `chat request`
+and prefill on one long conversation since 10-03 (engine idle, one tokio
+worker at 100%; a synthetic 1.27 MB conversation without such runs renders and
+tokenizes in ~0.13 s); NOT yet confirmed by a profile of the live stall. The
+BPE code itself predates PR #2. Fix: a min-heap of candidate pairs over
+symbols kept as byte ranges, checked lazily (O(n log n), no allocation per
+lookup); the same merges in the same order. Now 4,000 x U+2500 1.97 ms;
+normal text unchanged (~0.12 s per 1.27 MB). Regression:
+`tokenizer::tests::bpe_heap_merge_matches_the_greedy_rescan` (5,000 strings vs
+the old loop, kept as `bpe_emit_piece_greedy`), `bpe_heap_merge_real_vocab`
+(ignored: the real vocab, piece by piece); benches
+`prompt_v41::tests::{prompt_cost_breakdown, bpe_long_piece_cost}` (ignored).
+
 ### 29. FIXED 2026-09-30 (NOT deployed) — under the T2 partition, a lane-layer with no box-2 pick was sent to box 2 masked by its static HELLO set while box 1 computed every pick: experts in box 2's `--experts` range were added TWICE
 
 `pre_moe_route` built the hub's own box-2 pick list (`sel_for_remote`, masked by

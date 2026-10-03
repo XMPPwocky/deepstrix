@@ -786,4 +786,109 @@ mod tests {
         let s = render_prompt_text_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
         assert!(s.contains(&format!("a\n\n{EOS_TEXT}")), "{s}");
     }
+
+    /// Synthetic agent conversation (system prompt, tool schemas, `rounds` of
+    /// reasoning + tool call + tool result with code/log/JSON output, a user
+    /// message every 10 rounds). Deterministic; no real traffic.
+    pub(crate) fn synth_agent_conversation(rounds: usize) -> (Vec<ChatMessage>, Vec<ToolDef>) {
+        let prose = "The agent reads the repository, runs the tests, and reports what changed. \
+                     Keep answers short; cite file:line; never invent output. ";
+        let code = "    fn step(&mut self, rows: usize) -> eyre::Result<()> {\n        let t = Instant::now();\n        \
+                    for (i, r) in self.rows.iter_mut().enumerate().take(rows) {\n            r.x += 0.5 * i as f32; // update\n        }\n        \
+                    self.ms += t.elapsed().as_secs_f64() * 1e3;\n        Ok(())\n    }\n";
+        let log = "2026-10-03T21:07:45.123456Z  INFO deepstrix_server::multistream: stream done slot=0 prompt_tokens=262026 \
+                   completion_tokens=347 tok_per_s=\"21.49\" finish=Stop sha=3f9a1c0b77de\n";
+        let json = "{\"files\": [{\"path\": \"crates/v4flash-kernels/src/het/mtp.rs\", \"lines\": 2251, \"changed\": true}, \
+                    {\"path\": \"docs/v41/KNOWN_BUGS.md\", \"lines\": 1460, \"changed\": false}], \"ok\": true}\n";
+        let tools: Vec<ToolDef> = (0..12)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({"type": "function", "function": {
+                    "name": format!("tool_{i}"),
+                    "description": prose.repeat(4),
+                    "parameters": {"type": "object", "properties": {
+                        "command": {"type": "string", "description": "The shell command to run."},
+                        "timeout": {"type": "integer", "description": "Seconds."},
+                        "path": {"type": "string", "description": "An absolute path."}
+                    }, "required": ["command"]}
+                }}))
+                .unwrap()
+            })
+            .collect();
+        let mut v = vec![serde_json::json!({"role": "system", "content": prose.repeat(60)})];
+        for r in 0..rounds {
+            if r % 10 == 0 {
+                v.push(serde_json::json!({"role": "user", "content": format!("round {r}: {}", prose.repeat(2))}));
+            }
+            let id = format!("call_{r}");
+            v.push(serde_json::json!({
+                "role": "assistant", "content": "",
+                "reasoning_content": format!("Round {r}. {}", prose.repeat(10)),
+                "tool_calls": [{"id": id, "type": "function", "function": {
+                    "name": format!("tool_{}", r % 12),
+                    "arguments": serde_json::json!({"command": format!("cargo test -p v4flash-kernels --release -- round_{r} 2>&1 | tail -40"), "timeout": 600}).to_string()
+                }}]
+            }));
+            v.push(serde_json::json!({"role": "tool", "tool_call_id": id,
+                "content": format!("{}{}{}", code.repeat(4), log.repeat(8), json.repeat(4))}));
+        }
+        (msgs(serde_json::Value::Array(v)), tools)
+    }
+
+    /// The BPE cost of ONE long pre-tokenizer piece (a symbol / whitespace /
+    /// letter run): the greedy merge loop rescans every pair after each merge.
+    ///   cargo test --release -p deepstrix-server --features v41 --lib -- --ignored --nocapture bpe_long_piece_cost
+    #[test]
+    #[ignore]
+    fn bpe_long_piece_cost() {
+        let tj = std::env::var("TOKENIZER_JSON").unwrap_or_else(|_| {
+            "/persist/hf_cache/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277/tokenizer.json".into()
+        });
+        let vocab = BpeVocab::from_tokenizer_json(&tj, Some("joyai-llm".to_string())).unwrap();
+        for unit in ["\u{2500}", "=", "-", " ", "\n", "\u{7684}", "a", "\u{2588}", "\u{1F600}"] {
+            let mut row = format!("{unit:?}:");
+            for n in [100usize, 1000, 4000] {
+                let s = unit.repeat(n);
+                let t = std::time::Instant::now();
+                let ids = vocab.encode(&s);
+                let longest = v4flash_core::tokenizer::joyai_pre_tokenize(s.as_bytes()).iter().map(|p| p.len()).max().unwrap_or(0);
+                row += &format!("  n={n}: {:.1} ms ({} ids, longest piece {} B)", t.elapsed().as_secs_f64() * 1e3, ids.len(), longest);
+            }
+            eprintln!("{row}");
+        }
+    }
+
+    /// Where the per-turn prompt time goes (PR #2 stall, 2026-10-03): build vs
+    /// encode on a synthetic ~1 MB agent conversation. Needs the V4.1
+    /// tokenizer.json (`TOKENIZER_JSON`, default the hub's model dir).
+    ///   cargo test --release -p deepstrix-server --features v41 --lib -- --ignored --nocapture prompt_cost_breakdown
+    #[test]
+    #[ignore]
+    fn prompt_cost_breakdown() {
+        let tj = std::env::var("TOKENIZER_JSON").unwrap_or_else(|_| {
+            "/persist/hf_cache/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277/tokenizer.json".into()
+        });
+        let vocab = BpeVocab::from_tokenizer_json(&tj, Some("joyai-llm".to_string())).unwrap();
+        let rounds: usize = std::env::var("SYNTH_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(250);
+        let (m, tools) = synth_agent_conversation(rounds);
+        let t = std::time::Instant::now();
+        let (segs, _) = build_v41(&m, Some(&tools), true, V41Effort::DEFAULT, None).unwrap();
+        let t_build = t.elapsed();
+        let text: String = segs.iter().map(Seg::text).collect();
+        let t = std::time::Instant::now();
+        let ids = crate::prompt::encode_segments(&vocab, &segs, None);
+        let t_enc = t.elapsed();
+        let t = std::time::Instant::now();
+        let pieces = v4flash_core::tokenizer::joyai_pre_tokenize(text.as_bytes());
+        let t_pre = t.elapsed();
+        let maxp = pieces.iter().map(|p| p.len()).max().unwrap_or(0);
+        let t = std::time::Instant::now();
+        let ids2 = vocab.encode(&text);
+        let t_plain = t.elapsed();
+        eprintln!(
+            "rounds {rounds}: {} messages, {} bytes, {} tokens | build {:.1} ms | encode_segments {:.1} ms | \
+             pre-tokenize {:.1} ms ({} pieces, longest {} bytes) | plain encode {:.1} ms ({} tokens)",
+            m.len(), text.len(), ids.len(), t_build.as_secs_f64() * 1e3, t_enc.as_secs_f64() * 1e3,
+            t_pre.as_secs_f64() * 1e3, pieces.len(), maxp, t_plain.as_secs_f64() * 1e3, ids2.len()
+        );
+    }
 }

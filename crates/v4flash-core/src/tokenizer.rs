@@ -278,9 +278,87 @@ impl BpeVocab {
 
     fn bpe_emit_piece(&self, raw_piece: &[u8], out: &mut Vec<i32>) {
         // Step 1: byte-encode raw bytes into printable UTF-8.
-        let encoded = byte_encode(raw_piece);
+        let enc = byte_encode(raw_piece);
+        let n = enc.len();
 
-        // Step 2: split encoded into UTF-8 char "symbols".
+        // Step 2: one symbol per UTF-8 char of `enc`. Merges only join
+        // neighbours, so a symbol is always a byte range of `enc`: kept as
+        // `end[start]` (NONE = `start` begins no symbol) and `prev[start]`.
+        const NONE: usize = usize::MAX;
+        let mut end = vec![NONE; n];
+        let mut prev = vec![NONE; n];
+        let mut off = 0;
+        let mut last = NONE;
+        while off < n {
+            let e = (off + utf8_len_from_first_byte(enc[off])).min(n);
+            end[off] = e;
+            prev[off] = last;
+            last = off;
+            off = e;
+        }
+
+        // Step 3: greedy BPE -- merge the lowest-rank adjacent pair, the
+        // leftmost on a tie, until none has a rank -- off a min-heap of
+        // candidate pairs `(rank, left, mid, right)`, each checked against
+        // the current symbols when popped (boundaries only ever disappear,
+        // so a pair whose two symbols still end where they did is the same
+        // pair). Same merges in the same order as rescanning every pair
+        // after every merge (`bpe_emit_piece_greedy`), but O(n log n): that
+        // rescan was O(n^2) rank lookups per piece, ~2 s for one 4,000-char
+        // run of a 3-byte symbol (a table border, a progress bar).
+        let mut key = Vec::new();
+        let mut heap = std::collections::BinaryHeap::new();
+        let mut push = |heap: &mut std::collections::BinaryHeap<_>, l: usize, m: usize, r: usize| {
+            if let Some(rank) = self.pair_rank_into(&mut key, &enc[l..m], &enc[m..r]) {
+                heap.push(std::cmp::Reverse((rank, l, m, r)));
+            }
+        };
+        let mut s = 0;
+        while s < n && end[s] < n {
+            let m = end[s];
+            push(&mut heap, s, m, end[m]);
+            s = m;
+        }
+        while let Some(std::cmp::Reverse((_, l, m, r))) = heap.pop() {
+            if end[l] != m || end[m] != r {
+                continue; // stale: one of the two symbols has merged since
+            }
+            end[l] = r;
+            end[m] = NONE;
+            if r < n {
+                prev[r] = l;
+                push(&mut heap, l, r, end[r]);
+            }
+            if prev[l] != NONE {
+                push(&mut heap, prev[l], l, r);
+            }
+        }
+
+        // Step 4: look up each final symbol; if not in vocab, fall back
+        // to byte-by-byte lookup (matches ds4 lines 14376-14388).
+        let mut s = 0;
+        while s < n {
+            let piece = &enc[s..end[s]];
+            s = end[s];
+            if let Some(&id) = self.token_to_id.get(piece) {
+                out.push(id);
+                continue;
+            }
+            for &b in piece {
+                if let Some(&id) = self.token_to_id.get(&[b][..]) {
+                    out.push(id);
+                }
+                // Note: if even single-byte lookup fails, ds4 drops the
+                // byte silently. We mirror that here — TODO: warn?
+            }
+        }
+    }
+
+    /// The pre-2026-10-03 merge loop (rescan every pair after every merge),
+    /// kept as the reference `bpe_emit_piece` must match id for id.
+    #[cfg(test)]
+    fn bpe_emit_piece_greedy(&self, raw_piece: &[u8], out: &mut Vec<i32>) {
+        let encoded = byte_encode(raw_piece);
         let mut sym: Vec<Vec<u8>> = Vec::new();
         let mut off = 0;
         while off < encoded.len() {
@@ -289,9 +367,6 @@ impl BpeVocab {
             sym.push(encoded[off..end].to_vec());
             off = end;
         }
-
-        // Step 3: greedy BPE merge loop. O(n²) per piece; pieces are
-        // short (joyai pre-tok keeps them small) so this is fine.
         loop {
             let mut best_i: Option<usize> = None;
             let mut best_rank = i32::MAX;
@@ -327,13 +402,20 @@ impl BpeVocab {
         }
     }
 
+    #[cfg(test)]
     fn pair_rank(&self, a: &[u8], b: &[u8]) -> Option<i32> {
+        self.pair_rank_into(&mut Vec::new(), a, b)
+    }
+
+    /// Rank of merging `a` + `b`, building the key in `key` (reused across
+    /// calls: no allocation per lookup).
+    fn pair_rank_into(&self, key: &mut Vec<u8>, a: &[u8], b: &[u8]) -> Option<i32> {
         // Key format: "<a><space><b>" (raw bytes, not escaped)
-        let mut key = Vec::with_capacity(a.len() + 1 + b.len());
+        key.clear();
         key.extend_from_slice(a);
         key.push(b' ');
         key.extend_from_slice(b);
-        self.merge_rank.get(&key).copied()
+        self.merge_rank.get(key.as_slice()).copied()
     }
 
     pub fn token_text(&self, id: i32) -> Option<&[u8]> {
@@ -947,5 +1029,74 @@ mod tests {
         let mut out = Vec::new();
         vocab.bpe_emit_piece(b"abc", &mut out);
         assert_eq!(out, vec![4]);
+    }
+
+    /// The heap merge (`bpe_emit_piece`) emits exactly what the rescan-every-
+    /// pair loop (`bpe_emit_piece_greedy`) does: overlapping candidates
+    /// ("a a" in "aaa"), merges that create lower-rank pairs on both sides,
+    /// a merge whose result is not in the vocab (byte fallback), and
+    /// multi-byte symbols (é byte-encodes to two chars).
+    #[test]
+    fn bpe_heap_merge_matches_the_greedy_rescan() {
+        let toks: [&[u8]; 14] = [b"a", b"b", b"c", b"aa", b"ab", b"ba", b"aaa", b"aab", b"abab", b"aaaa", b"bab", b"cab", "Ã".as_bytes(), "Ã©".as_bytes()];
+        let merges: [&[u8]; 11] = [b"a b", b"a a", b"b a", b"aa a", b"a aa", b"ab ab", b"aa b", b"aa aa", b"b ab", b"c ab", "Ã ©".as_bytes()];
+        let vocab = BpeVocab::from_sparse_parts(
+            32,
+            toks.iter().enumerate().map(|(i, t)| (i as i32, t.to_vec())).chain([(20, "©".as_bytes().to_vec())]),
+            merges.iter().map(|m| m.to_vec()).chain([b"c c".to_vec()]), // "cc" is not a token: byte fallback
+            None,
+        );
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet: [&str; 4] = ["a", "b", "c", "é"];
+        for i in 0..5000 {
+            let len = 1 + (next() % if i < 4000 { 24 } else { 300 }) as usize;
+            let s: String = (0..len).map(|_| alphabet[(next() % 4) as usize]).collect();
+            let (mut fast, mut slow) = (Vec::new(), Vec::new());
+            vocab.bpe_emit_piece(s.as_bytes(), &mut fast);
+            vocab.bpe_emit_piece_greedy(s.as_bytes(), &mut slow);
+            assert_eq!(fast, slow, "{s:?}");
+        }
+        for s in ["", "a", "aaaaaaaaa", "abababababab", "ccccc", "éééé", "aabaabaab"] {
+            let (mut fast, mut slow) = (Vec::new(), Vec::new());
+            vocab.bpe_emit_piece(s.as_bytes(), &mut fast);
+            vocab.bpe_emit_piece_greedy(s.as_bytes(), &mut slow);
+            assert_eq!(fast, slow, "{s:?}");
+        }
+    }
+
+    /// Same check on the real V4.1 vocab, piece by piece over long runs and
+    /// mixed text, plus the long-run cost. Needs the model's tokenizer.json
+    /// (`TOKENIZER_JSON`).
+    ///   TOKENIZER_JSON=.../tokenizer.json cargo test --release -p v4flash-core --lib -- --ignored --nocapture bpe_heap_merge_real_vocab
+    #[test]
+    #[ignore]
+    fn bpe_heap_merge_real_vocab() {
+        let tj = std::env::var("TOKENIZER_JSON").expect("TOKENIZER_JSON");
+        let vocab = BpeVocab::from_tokenizer_json(&tj, Some("joyai-llm".to_string())).unwrap();
+        let mut text = String::new();
+        for unit in ["\u{2500}", "=", " ", "\n", "\u{7684}", "a", "\u{2588}", "\u{1F600}", "-", "é"] {
+            for n in [1usize, 7, 64, 777, 4000] {
+                text += &unit.repeat(n);
+                text += " x ";
+            }
+        }
+        text += "fn main() {\n    println!(\"héllo — 世界 🎉 ２０２４\");\n}\n\t\t  ┌──┬──┐ │a│b│ └──┴──┘ ...!!!??? ¿qué? naïve café ";
+        let mut checked = 0usize;
+        for piece in joyai_pre_tokenize(text.as_bytes()) {
+            let (mut fast, mut slow) = (Vec::new(), Vec::new());
+            vocab.bpe_emit_piece(piece, &mut fast);
+            vocab.bpe_emit_piece_greedy(piece, &mut slow);
+            assert_eq!(fast, slow, "piece {:?}", String::from_utf8_lossy(piece));
+            checked += 1;
+        }
+        let t = std::time::Instant::now();
+        let ids = vocab.encode(&"\u{2500}".repeat(4000));
+        eprintln!("{checked} pieces identical; 4,000 x U+2500 now {:.2} ms ({} ids)", t.elapsed().as_secs_f64() * 1e3, ids.len());
     }
 }
