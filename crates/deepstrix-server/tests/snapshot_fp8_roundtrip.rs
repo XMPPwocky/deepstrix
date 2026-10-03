@@ -31,8 +31,10 @@ use v4flash_kernels::{CompKvAppend, CompKvFp8, F16Roundtrip, Fp8E4m3fnQuantize, 
 const DEFAULT_GGUF: &str = "/persist/lumi/models/dsv4f-exp-iq3-xxs/UD-IQ3_XXS/DeepSeek-V4-Flash-Vision-Exp-UD-IQ3_XXS-00001-of-00004.gguf";
 const N_KV_MAX: u32 = 4096;
 const N_COMP_R4: u32 = 700; // > FP8_KV_HEAD_ROWS so the shadow cut-off is exercised
-const N_COMP_R128: u32 = 20;
+const N_COMP_R128: u32 = 21; // = N_TOKENS / 128 (restore cross-checks n_comp against the token count)
 const N_ICOMP: u32 = 300;
+/// Every main compressor holds exactly `N_TOKENS / ratio` rows.
+const N_TOKENS: i32 = 700 * 4;
 
 struct Rng(u64);
 impl Rng {
@@ -270,7 +272,7 @@ fn snapshot_fp8_round_trip_and_conversions() -> eyre::Result<()> {
     let byte_decoder = build_gpt2_byte_decoder();
     let root = scratch_root();
     let fingerprint = fp();
-    let tokens: Vec<i32> = (0..300).map(|i| 1000 + (i * 7) % 5000).collect();
+    let tokens: Vec<i32> = (0..N_TOKENS).map(|i| 1000 + (i * 7) % 5000).collect();
 
     // 1. packed -> v5 -> packed.
     let mut src = HetModelState::alloc(dgpu, igpu, N_KV_MAX)?;

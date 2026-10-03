@@ -145,11 +145,13 @@ struct Prefill {
     /// Tower output for the request's images (empty when none): rows for
     /// the synthetic image ids, spliced into the chunk inputs.
     vl: EncodedImages,
-    /// Save the prompt snapshot at finish? False when the restored snapshot
-    /// already covers the whole prompt and only the think marker is prefilled:
-    /// prompt + marker is a key the prefix walk (EOS/Assistant/User
-    /// boundaries) can never match, and it took one of the lineage's slots.
-    save_at_finish: bool,
+    /// The trailing think marker when the restored snapshot already covers
+    /// the whole prompt and the marker itself is the prefill (`plan_suffix`;
+    /// `p.trailing_marker` is then None). No prompt snapshot is saved at
+    /// finish then: prompt + marker is a key the prefix walk
+    /// (EOS/Assistant/User boundaries) can never match, and it took one of
+    /// the lineage's slots.
+    prefilled_marker: Option<i32>,
     /// Engram rows gathered AHEAD of the chunks that need them
     /// (`engram_lookahead`), contiguous blocks in token order.
     engram_ahead: EngramAhead,
@@ -252,6 +254,7 @@ struct PrefillDone {
     prefix: Vec<i32>,
     compressed: Vec<i32>,
     started: Instant,
+    prefilled_marker: Option<i32>,
 }
 
 
@@ -1139,13 +1142,22 @@ impl Sched {
                             && tokens[..r.tokens.len()] == r.tokens[..]
                             && byte_aligned_lcp_vl(&r.tokens, &r.image_spans, tokens, &p.req.image_spans,
                                 state.vocab.as_ref(), &state.byte_decoder).live_tokens == r.tokens.len();
-                        if is_prefix {
+                        // A mid-prefill checkpoint (decoder rings saved empty)
+                        // resumes only a suffix longer than the CED replay.
+                        let resumable = snapshot::resume_ok(r.decoder_rings_empty, tokens.len().saturating_sub(r.tokens.len()),
+                            v4flash_kernels::het::forward_prefill::ced_enabled());
+                        if is_prefix && resumable {
                             let _ = state.snapshot_index.touch(&snap_hash);
                             prefix = r.tokens;
                             tracing::info!(restored = prefix.len(), total = tokens.len(), ms = t0.elapsed().as_millis() as u64, "multistream: snapshot restored");
                             break;
                         }
-                        tracing::warn!("multistream: restored snapshot is not a prefix of the request (tokens or image content); trying the next candidate");
+                        if is_prefix {
+                            tracing::warn!(restored = r.tokens.len(), total = tokens.len(),
+                                "multistream: snapshot is a mid-prefill checkpoint (decoder rings empty) and the suffix is too short to resume it; trying the next candidate");
+                        } else {
+                            tracing::warn!("multistream: restored snapshot is not a prefix of the request (tokens or image content); trying the next candidate");
+                        }
                         if let Err(e) = kv.reset_in_place(state.dgpu, state.igpu) { return Err((p, kv, e)); }
                     }
                     Err(e) => {
@@ -1157,17 +1169,9 @@ impl Sched {
             }
         }
         kv.restore_compressor_lending();
-        let mut suffix: Vec<i32> = tokens[prefix.len()..].to_vec();
-        let mut marker_in_prefill = false;
-        if suffix.is_empty() {
-            // The snapshot covers the whole prompt: forward the marker through
-            // the prefill instead (same computation as the legacy decode-side
-            // forward of it, modulo kernel family).
-            match p.trailing_marker {
-                Some(m) => { suffix.push(m); marker_in_prefill = true; }
-                None => return Err((p, kv, eyre!("multistream: snapshot covered the whole prompt with no marker (unreachable by construction)"))),
-            }
-        }
+        let Some((suffix, prefilled_marker)) = plan_suffix(tokens, prefix.len(), p.trailing_marker) else {
+            return Err((p, kv, eyre!("multistream: snapshot covered the whole prompt with no marker (unreachable by construction)")));
+        };
         let pos0 = prefix.len() as u32;
         // Engram: compress the whole sequence now (cheap); embeddings and
         // Engram rows are produced PER CHUNK in `prefill_job_tick` (lazy job
@@ -1195,13 +1199,11 @@ impl Sched {
             Ok(v) => v,
             Err(e) => return Err((p, kv, e)),
         };
-        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, save_at_finish: !marker_in_prefill, engram_ahead: EngramAhead::default() };
-        if marker_in_prefill {
-            pf.p.trailing_marker = None; // consumed
-            pf.prefix.push(suffix[0]);
-        } else {
-            pf.prefix.extend_from_slice(&suffix);
+        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, prefilled_marker, engram_ahead: EngramAhead::default() };
+        if prefilled_marker.is_some() {
+            pf.p.trailing_marker = None; // consumed (`admit_stream` reads `prefilled_marker`)
         }
+        pf.prefix.extend_from_slice(&suffix);
         Ok(pf)
     }
 
@@ -1231,20 +1233,22 @@ impl Sched {
             // without this the retry started from zero (2026-09-20: a 135K
             // prompt lost 115K prefilled tokens). The encoder state at a chunk
             // boundary is exactly what a resumed prefill restores, so the
-            // snapshot key is the prefix plus the suffix rows done so far. The
-            // DECODER rings are not: under CED the chunks never touch them, so
-            // they are saved EMPTY (a resume replays onto empty rings, like a
-            // fresh prompt) rather than stale by `done` positions.
+            // snapshot key is the request's first `pos0 + done` tokens
+            // (`checkpoint_tokens`). The DECODER rings are not: under CED the
+            // chunks never touch them, so they are saved EMPTY rather than
+            // stale by `done` positions, and a resume must replay past them
+            // (`snapshot::resume_ok`).
             let done = pf.job.done_rows();
             // Not mid layer-major window: its early groups hold more rows than
             // its late ones, so no prefix length describes the state (the work
             // since the last closed window is lost, <= V41_LM_ROWS rows).
-            if done >= checkpoint_min_rows() && !pf.job.chunks_done() && pf.job.checkpoint_ok() {
+            let key = (done >= checkpoint_min_rows() && !pf.job.chunks_done() && pf.job.checkpoint_ok())
+                .then(|| checkpoint_tokens(&pf.p.req.tokens, pf.job.pos0(), done))
+                .flatten();
+            if let Some(tokens_saved) = key {
                 let t = Instant::now();
                 pf.kv.restore_compressor_lending();
                 pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
-                let mut tokens_saved: Vec<i32> = pf.prefix.clone();
-                tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
                 match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
                     state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None)) {
                     Ok(entry) => {
@@ -1331,12 +1335,13 @@ impl Sched {
                 // empty (see the cancel checkpoint above).
                 let every = knobs::MS_CHECKPOINT_EVERY.usize();
                 let done = pf.job.done_rows();
-                if every > 0 && done >= every && (done - rows) / every != done / every && pf.job.checkpoint_ok() {
+                let key = (every > 0 && done >= every && (done - rows) / every != done / every && pf.job.checkpoint_ok())
+                    .then(|| checkpoint_tokens(&pf.p.req.tokens, pf.job.pos0(), done))
+                    .flatten();
+                if let Some(tokens_saved) = key {
                     let t = Instant::now();
                     pf.kv.restore_compressor_lending();
                     pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
-                    let mut tokens_saved: Vec<i32> = pf.prefix.clone();
-                    tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
                     match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
                         state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None)) {
                         Ok(entry) => {
@@ -1378,7 +1383,7 @@ impl Sched {
         kv.restore_compressor_lending();
         // Snapshot the prompt (the legacy path saves here too, before the marker).
         flush_expert_stats(state);
-        if pf.save_at_finish {
+        if pf.prefilled_marker.is_none() {
             let tokens_saved: Vec<i32> = pf.prefix.clone();
             match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
                 state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, pf.p.session_id.as_deref())) {
@@ -1422,9 +1427,9 @@ impl Sched {
         }
         if let Err(e) = self.arena.fill_reserved(slot, &pf.kv, pos, &state.engine.dgpu.compute) { return Err((Some(pf.kv), e)); }
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
-        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, save_at_finish: _, engram_ahead: _ } = pf;
+        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, prefilled_marker, engram_ahead: _ } = pf;
         self.spare_states.push(kv_done);
-        let pf = PrefillDone { p: pp, job, prefix, compressed, started };
+        let pf = PrefillDone { p: pp, job, prefix, compressed, started, prefilled_marker };
         self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
     }
 
@@ -1438,7 +1443,7 @@ impl Sched {
         let mut s = Stream {
             slot, tx: pf.p.tx.clone(), cancel: pf.p.cancel.clone(), next: 0, seq: pf.prefix.clone(), compressed: pf.compressed.clone(),
             prompt_tokens: pf.p.prompt_tokens, completion_tokens: 0, max_new: pf.p.req.max_new, sample_mode, rng, draft_rng,
-            in_think: false, send_failures: 0, started: pf.started, session_id: pf.p.session_id.clone(),
+            in_think: initial_in_think(pf.p.trailing_marker, pf.prefilled_marker), send_failures: 0, started: pf.started, session_id: pf.p.session_id.clone(),
             ctx_full: pf.prefix.len() as u32 + pf.p.req.max_new as u32 + 2, stalled_since: None,
         };
         // Ensure `compressed` covers `seq` (a marker forwarded in the prefill was hashed above).
@@ -1453,7 +1458,6 @@ impl Sched {
                 s.next = m;
                 s.seq.push(m);
                 if let Some(ec) = state.engram.as_ref() { s.compressed.push(ec.hasher.compress(m)); }
-                s.in_think = m == TOK_THINK_BEGIN;
             }
             None => {
                 let tok = sample_row(&logits, &s.sample_mode, &mut s.rng);
@@ -2234,6 +2238,41 @@ fn checkpoint_spans(spans: &[crate::vision_prompt::ImageSpan], n: usize) -> eyre
     crate::vision_prompt::spans_in_range(spans, 0, n).wrap_err("snapshot cut splits an image block; not saved")
 }
 
+/// The rows a prefill runs after a restored `prefix_len`-token prefix of the
+/// (marker-stripped) prompt `tokens`, and the trailing marker it consumes: the
+/// rest of the prompt (the marker is forwarded at admission), or, when the
+/// snapshot covers the whole prompt, the marker itself (same computation as
+/// the legacy decode-side forward of it, modulo kernel family). None: nothing
+/// to forward at all.
+fn plan_suffix(tokens: &[i32], prefix_len: usize, trailing_marker: Option<i32>) -> Option<(Vec<i32>, Option<i32>)> {
+    match (&tokens[prefix_len..], trailing_marker) {
+        ([], Some(m)) => Some((vec![m], Some(m))),
+        ([], None) => None,
+        (rest, _) => Some((rest.to_vec(), None)),
+    }
+}
+
+/// Does the stream start inside the reasoning block? Exactly when the prompt's
+/// trailing marker is `<think>`, whether it is still to be forwarded at
+/// admission (`pending`) or the prefill already consumed it (`prefilled`, a
+/// whole-prompt snapshot hit). `emit` flips the flag only on SAMPLED markers,
+/// so missing the prefilled case streamed the whole chain of thought as
+/// answer content (the legacy twin: `save_and_forward_marker`'s
+/// `initial_in_think`).
+fn initial_in_think(pending: Option<i32>, prefilled: Option<i32>) -> bool {
+    pending.or(prefilled) == Some(TOK_THINK_BEGIN)
+}
+
+/// Tokens a prefill's state holds when checkpointed after `done` of its rows
+/// (the job starting at `pos0`): the request's own first `pos0 + done`
+/// tokens. (`Prefill::prefix` already holds the whole prompt; appending the
+/// job's done rows to it once more made a key no request could ever match.)
+/// None past the marker-stripped prompt, i.e. into a marker forwarded in the
+/// prefill: requests are matched without their marker.
+fn checkpoint_tokens(req_tokens: &[i32], pos0: u32, done: usize) -> Option<Vec<i32>> {
+    req_tokens.get(..pos0 as usize + done).map(<[i32]>::to_vec)
+}
+
 /// Snapshot restore candidates in the order to try them: longest first, the
 /// session hint winning a tie, the same snapshot never twice. `start_prefill`
 /// falls through to the next one when a restore fails.
@@ -2262,6 +2301,43 @@ mod restore_candidate_tests {
         assert_eq!(order(None, Some((90, 2, "walk"))), vec!["walk"]);
         assert_eq!(order(Some((90, 1, "sess")), None), vec!["sess"]);
         assert!(order(None, None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prefill_plan_tests {
+    use super::{checkpoint_tokens, initial_in_think, plan_suffix};
+    use crate::tokens::{TOK_THINK_BEGIN, TOK_THINK_END};
+
+    #[test]
+    fn whole_prompt_snapshot_hit_still_starts_in_think() {
+        // Regression: an exact re-send of a thinking-mode prompt restores a
+        // snapshot covering the whole stripped prompt; the `<think>` marker is
+        // then the prefill, and the stream used to start with in_think=false.
+        let tokens = [1, 2, 3, 4];
+        let (suffix, prefilled) = plan_suffix(&tokens, 4, Some(TOK_THINK_BEGIN)).unwrap();
+        assert_eq!((suffix, prefilled), (vec![TOK_THINK_BEGIN], Some(TOK_THINK_BEGIN)));
+        assert!(initial_in_think(None, prefilled), "marker consumed by the prefill");
+        // Chat mode is answer content either way.
+        let (_, prefilled) = plan_suffix(&tokens, 4, Some(TOK_THINK_END)).unwrap();
+        assert!(!initial_in_think(None, prefilled));
+        // A partial hit forwards the marker at admission.
+        let (suffix, prefilled) = plan_suffix(&tokens, 2, Some(TOK_THINK_BEGIN)).unwrap();
+        assert_eq!((suffix, prefilled), (vec![3, 4], None));
+        assert!(initial_in_think(Some(TOK_THINK_BEGIN), prefilled));
+        assert!(!initial_in_think(None, None));
+        assert!(plan_suffix(&tokens, 4, None).is_none(), "nothing to forward");
+    }
+
+    #[test]
+    fn checkpoint_key_is_the_requests_own_prefix() {
+        // Restored 3 tokens, the job prefills the other 5; checkpoint after 4.
+        // The key used to be the whole prompt plus the 4 done rows again.
+        let req: Vec<i32> = (10..18).collect();
+        assert_eq!(checkpoint_tokens(&req, 3, 4).unwrap(), vec![10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(checkpoint_tokens(&req, 0, 8).unwrap(), req);
+        // Rows past the stripped prompt (a marker forwarded in the prefill).
+        assert!(checkpoint_tokens(&req, 8, 1).is_none());
     }
 }
 

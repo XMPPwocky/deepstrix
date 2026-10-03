@@ -352,6 +352,22 @@ pub fn ced_enabled() -> bool {
     cfg!(feature = "v41") && std::env::var("V41_CED").map(|v| v != "0").unwrap_or(true)
 }
 
+/// A CED continuation (`pos0 > 0`, suffix within the replay, so its decoder
+/// rings are KEPT) whose decoder rings (layers `split..`) hold nothing: the
+/// state is a mid-prefill checkpoint
+/// (`PrefillJob::clear_decoder_rings_for_checkpoint`), and the replay and the
+/// first ~SWA_WINDOW decoded tokens would attend a window of only the suffix
+/// rows (KNOWN_BUGS #25). Restores refuse such a resume (the server's
+/// `snapshot::resume_ok`); this is the backstop.
+fn continuation_rings_empty(state: &HetModelState, split: usize) -> bool {
+    split < state.layers.len() && state.layers[split..].iter().all(|l| l.n_raw == 0)
+}
+
+fn empty_rings_error(pos0: u32, t: usize) -> eyre::Report {
+    eyre!("CED replay: a {t}-row continuation at pos0 {pos0} would replay onto EMPTY decoder rings \
+           (a mid-prefill checkpoint resumed with <= SWA_WINDOW rows, KNOWN_BUGS #25); refused")
+}
+
 /// `V41_ENGRAM_GEMV=1` puts the Engram `wkv` prefill projection back on the
 /// `grid.z = batch` Q8 GEMV (see the call site for why it is 65x over
 /// roofline). Rollback knob only.
@@ -962,9 +978,14 @@ impl PrefillJob {
     /// from (the restored snapshot's rows at `pos0`, or nothing) -- stale by
     /// `done_rows()` positions. A snapshot saved like that would hand a resume
     /// with <= SWA_WINDOW rows left non-adjacent rows as its window. Empty them
-    /// instead: a resume then replays onto empty rings, like a fresh prompt.
-    /// Harmless for this job: `prefill_job_finish` empties them anyway when
-    /// the suffix exceeds the replay, which any checkpointable job does.
+    /// instead. That is NOT a fresh prompt to every resume: one whose suffix
+    /// fits the replay (<= SWA_WINDOW rows) is a continuation, whose rings
+    /// `prefill_job_finish` KEEPS (KNOWN_BUGS #25), and it would replay onto
+    /// empty rings. Restores refuse that (`snapshot::resume_ok`, which sees the
+    /// empty rings in the meta) and `prefill_job_finish` errors out rather than
+    /// run it. Harmless for this job whenever its suffix exceeds the replay
+    /// (the finish empties the rings anyway), which the default checkpoint
+    /// knobs guarantee; otherwise its finish refuses the same way.
     pub fn clear_decoder_rings_for_checkpoint(&self, state: &mut HetModelState) {
         if !self.ced {
             return;
@@ -1470,6 +1491,8 @@ impl HeterogeneousEngine {
                 state.layers[l].n_raw = 0;
                 state.layers[l].raw_off = 0;
             }
+        } else if continuation_rings_empty(state, split) {
+            return Err(empty_rings_error(job.pos0, t));
         }
         let mut seg_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
         let mut seg_carry: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
@@ -3349,6 +3372,8 @@ impl HeterogeneousEngine {
                     state.layers[l].n_raw = 0;
                     state.layers[l].raw_off = 0;
                 }
+            } else if continuation_rings_empty(state, split) {
+                return Err(empty_rings_error(pos0, t));
             }
             let mut seg_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
             let mut seg_carry: Vec<Vec<f32>> = Vec::with_capacity(b_seg);

@@ -2359,7 +2359,11 @@ pub(crate) fn handle_generate_stream(
             disk_hit
         };
         if let Some((snap_req_tokens, snap_hash, snap_dir)) = disk_hit {
-            if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS {
+            // Keep >= 1 suffix token to prefill (or a marker to forward), as
+            // multistream's `usable`: see the post-restore check below.
+            if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS
+                && (snap_req_tokens < req.tokens.len() || trailing_marker.is_some())
+            {
                 // The window between picking a request up and its `prefill` line
                 // measured 12.2% of all engine-busy time (p50 0.31 s, MEAN 8.70 s,
                 // max 302 s, scaling with context: 15.05 s above 50k tokens vs
@@ -2424,6 +2428,7 @@ pub(crate) fn handle_generate_stream(
                 if let Some(crate::snapshot::RestoredSnapshot {
                     tokens: loaded,
                     image_spans: loaded_spans,
+                    decoder_rings_empty,
                 }) = restored
                 {
                     let loaded_len = loaded.len() as u32;
@@ -2440,13 +2445,36 @@ pub(crate) fn handle_generate_stream(
                         state.vocab.as_ref(),
                         &state.byte_decoder,
                     );
-                    if verify.live_tokens != loaded.len() {
+                    // A prefix that cannot be resumed is a miss too: with no
+                    // suffix and no marker nothing would be forwarded, and the
+                    // first token would be sampled from `dgpu_scratch.logits`,
+                    // which `restore_vl` never writes (whatever ran last, often
+                    // another conversation); a mid-prefill checkpoint (decoder
+                    // rings empty) resumes only a long suffix
+                    // (`snapshot::resume_ok`).
+                    let is_prefix = verify.live_tokens == loaded.len();
+                    let rest = req.tokens.len().saturating_sub(verify.req_tokens);
+                    let resumable = (rest > 0 || trailing_marker.is_some())
+                        && snapshot::resume_ok(
+                            decoder_rings_empty,
+                            rest,
+                            v4flash_kernels::het::forward_prefill::ced_enabled(),
+                        );
+                    if !is_prefix || !resumable {
                         tracing::warn!(
                             loaded_len = loaded.len(),
                             verify_live = verify.live_tokens,
                             verify_req = verify.req_tokens,
+                            req_len = req.tokens.len(),
+                            marker = trailing_marker.is_some(),
+                            decoder_rings_empty,
                             snap_hash = %short_hex(&snap_hash[..4]),
-                            "restored snapshot bytes are NOT a prefix of the request; falling back"
+                            "{}",
+                            if is_prefix {
+                                "restored snapshot leaves nothing to forward or is a checkpoint the suffix cannot resume; falling back"
+                            } else {
+                                "restored snapshot bytes are NOT a prefix of the request; falling back"
+                            }
                         );
                         state.state.reset_in_place(state.dgpu, state.igpu)?;
                         // The drafter's KV ring is process-lifetime state and is NOT part of
