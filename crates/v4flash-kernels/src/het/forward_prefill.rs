@@ -7191,23 +7191,40 @@ impl HeterogeneousEngine {
             // Recomputes rather than replaces so this is one self-contained block,
             // testable with `V41_DSPARK_XCHECK` before anyone pays to delete the
             // superseded work.
+            //
+            // Each row reads what the batched pair above reads for it, as decode's
+            // views: raw keys `[n_raw_offset_after[j], +n_raw)` sliced out of the
+            // cache (decode's `kv_win`; the wsum kernel has no offset argument, so
+            // a `raw_off` to score alone would not do), and with the indexer fired
+            // the row's own gathered top-K at `j * INDEXER_TOP_K`, `n_comp` clamped
+            // to it as the sparse re-upload above does. Reading `[0, n_raw)` and
+            // row 0's selection for every row made this instrument measure a
+            // different attention than either path (and the "attention refuted"
+            // A/B taken with it is void).
             if verify_decode_attn() && arena.is_some() {
                 return Err(eyre!("L{layer}: V41_VERIFY_DECODE_ATTN replays one sequence at raw_off 0; not for arena rows"));
             }
             if verify_decode_attn() && (b as usize) <= 16 {
                 const K_SPLIT: u32 = 16;
                 let qf = crate::config::Q_FLAT as usize;
+                let hd = N_HEAD_DIM as usize;
                 let _t_va = de.events.stage("dgpu.verify_decode_attn", &de.compute)?;
                 for j in 0..b as usize {
                     let nr = n_raw_after[j];
-                    let nc = n_comp_after[j];
+                    let nc = if indexer_fired { n_comp_after[j].min(INDEXER_TOP_K) } else { n_comp_after[j] };
+                    let kv_j = ls.kv_cache.slice_view(n_raw_offset_after[j] as usize * hd, nr as usize * hd);
+                    let topk = INDEXER_TOP_K as usize * hd;
+                    let comp_j = eff_comp_kv_buf
+                        .filter(|_| indexer_fired)
+                        .map(|c| c.slice_view(j * topk, topk));
+                    let comp_kv_j = if indexer_fired { comp_j.as_ref() } else { eff_comp_kv_buf };
                     let q_j = sd.q_normed.slice_view(j * qf, qf);
                     de.attn_mixed.launch_score_b1_htiled_wmma(
                         &de.compute,
                         &mut sd.verify_scores,
                         &q_j,
-                        &ls.kv_cache,
-                        eff_comp_kv_buf,
+                        &kv_j,
+                        comp_kv_j,
                         nr,
                         /*raw_off=*/ 0,
                         nc,
@@ -7228,8 +7245,8 @@ impl HeterogeneousEngine {
                         &de.compute,
                         &mut sd.verify_partials,
                         &sd.verify_scores,
-                        &ls.kv_cache,
-                        eff_comp_kv_buf,
+                        &kv_j,
+                        comp_kv_j,
                         N_HEAD,
                         N_HEAD_DIM,
                         nr,
