@@ -2360,10 +2360,30 @@ pub(crate) fn handle_generate_stream(
         };
         if let Some((snap_req_tokens, snap_hash, snap_dir)) = disk_hit {
             // Keep >= 1 suffix token to prefill (or a marker to forward), as
-            // multistream's `usable`: see the post-restore check below.
-            if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS
-                && (snap_req_tokens < req.tokens.len() || trailing_marker.is_some())
-            {
+            // multistream's `usable`: see the post-restore check below. A
+            // mid-prefill checkpoint this suffix cannot resume is refused from
+            // its meta.json, before the reset and the restore's blob reads,
+            // and the session hint stops pointing at it.
+            let usable = snap_req_tokens >= DISK_RESTORE_MIN_TOKENS
+                && (snap_req_tokens < req.tokens.len() || trailing_marker.is_some());
+            let resumable = usable
+                && snapshot::resume_ok_from_meta(
+                    &snap_dir,
+                    req.tokens.len().saturating_sub(snap_req_tokens),
+                    v4flash_kernels::het::forward_prefill::ced_enabled(),
+                );
+            if usable && !resumable {
+                tracing::warn!(
+                    covered = snap_req_tokens,
+                    req_len = req.tokens.len(),
+                    snap_hash = %short_hex(&snap_hash[..4]),
+                    "snapshot is a mid-prefill checkpoint the suffix cannot resume; not restored"
+                );
+                if let Some(sid) = session_id.as_deref() {
+                    state.snapshot_index.drop_session_hint(sid, &snap_hash);
+                }
+            }
+            if resumable {
                 // The window between picking a request up and its `prefill` line
                 // measured 12.2% of all engine-busy time (p50 0.31 s, MEAN 8.70 s,
                 // max 302 s, scaling with context: 15.05 s above 50k tokens vs
@@ -2476,6 +2496,11 @@ pub(crate) fn handle_generate_stream(
                                 "restored snapshot bytes are NOT a prefix of the request; falling back"
                             }
                         );
+                        if is_prefix && decoder_rings_empty {
+                            if let Some(sid) = session_id.as_deref() {
+                                state.snapshot_index.drop_session_hint(sid, &snap_hash);
+                            }
+                        }
                         state.state.reset_in_place(state.dgpu, state.igpu)?;
                         // The drafter's KV ring is process-lifetime state and is NOT part of
                         // `HetModelState`, so resetting the main KV leaves it holding the

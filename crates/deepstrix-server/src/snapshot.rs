@@ -86,9 +86,29 @@ pub const KV_EPOCH: u32 = 1;
 
 /// Name prefixes of in-flight `save` directories under the snapshot root
 /// (`.tmp-`: being written; `.old-`: a same-key snapshot being replaced). A
-/// crash leaves them behind; `load` deletes them.
+/// crash leaves them behind; `load` deletes them unless their writer is alive
+/// ([`save_dir_is_stale`]).
 const SAVE_TMP_PREFIX: &str = ".tmp-";
 const SAVE_OLD_PREFIX: &str = ".old-";
+
+/// Is `name` (a directory under the snapshot root) a `save` leftover that
+/// `load` may delete? `save` names both its dirs `<prefix><key>-<pid>`. A dir
+/// whose pid is ANOTHER live process belongs to a writer still running (an
+/// overlapping restart): its `.tmp-` is the save in flight, its `.old-` the
+/// snapshot `commit_dir` renames back if the commit fails, so both are left
+/// alone. Our own pid is stale (`load` runs before this process saves; a
+/// container restart reuses the pid), and so is a name without a pid. Off
+/// Linux there is no `/proc` to ask: stale. `None`: not a save dir.
+fn save_dir_is_stale(name: &str) -> Option<bool> {
+    let rest = name.strip_prefix(SAVE_TMP_PREFIX).or_else(|| name.strip_prefix(SAVE_OLD_PREFIX))?;
+    let pid = rest.rsplit_once('-').and_then(|(_, pid)| pid.parse::<u32>().ok());
+    Some(match pid {
+        Some(pid) if pid != std::process::id() && cfg!(target_os = "linux") => {
+            !Path::new("/proc").join(pid.to_string()).exists()
+        }
+        _ => true,
+    })
+}
 
 /// On-disk encoding of one compressor's `comp_kv` rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -405,11 +425,14 @@ impl SnapshotIndex {
                 continue;
             }
             // A save that never committed (crash, kill): half-written, and
-            // outside the cap's accounting. Nothing else writes under the
-            // root (one worker owns the index).
-            if path.file_name().and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(SAVE_TMP_PREFIX) || n.starts_with(SAVE_OLD_PREFIX))
-            {
+            // outside the cap's accounting. Within this process one worker
+            // owns the index; a dir of another live process (an overlapping
+            // restart's old server, still saving) is left to it.
+            if let Some(stale) = path.file_name().and_then(|n| n.to_str()).and_then(save_dir_is_stale) {
+                if !stale {
+                    tracing::info!(path = ?path, "snapshot save of another live process in flight; left alone");
+                    continue;
+                }
                 match fs::remove_dir_all(&path) {
                     Ok(()) => tracing::warn!(path = ?path, "uncommitted snapshot save left behind; deleted"),
                     Err(e) => tracing::warn!(path = ?path, error = %e, "failed to delete an uncommitted snapshot save"),
@@ -535,6 +558,16 @@ impl SnapshotIndex {
     /// restore, so the next matching request does not re-read it.
     pub fn evict(&mut self, hash: &[u8; 32], reason: &str) {
         self.remove_entry(hash, reason);
+    }
+
+    /// Forget `session_id`'s hint if it points at `hash`: a snapshot this
+    /// session's request refused ([`resume_ok_from_meta`]) but that stays
+    /// valid for others (a mid-prefill checkpoint resumes a longer suffix),
+    /// so its retries stop probing it first.
+    pub fn drop_session_hint(&mut self, session_id: &str, hash: &[u8; 32]) {
+        if self.session_to_hash.get(session_id) == Some(hash) {
+            self.session_to_hash.remove(session_id);
+        }
     }
 
     fn remove_entry(&mut self, hash: &[u8; 32], reason: &str) {
@@ -1466,6 +1499,22 @@ pub fn resume_ok(decoder_rings_empty: bool, suffix_rows: usize, ced: bool) -> bo
     !decoder_rings_empty || (ced && suffix_rows > SWA_WINDOW as usize)
 }
 
+/// [`resume_ok`] decided from `src`'s meta.json alone, BEFORE [`restore_vl`]
+/// reads the blobs (GBs at 100K tokens): a checkpoint the request cannot
+/// resume used to be read whole on every retry only to be refused.
+/// `suffix_rows` as [`resume_ok`], from the request tokens the index match
+/// covers. A meta.json that cannot be read or parsed answers true:
+/// `restore_vl` reports it (and the caller evicts).
+pub fn resume_ok_from_meta(src: &Path, suffix_rows: usize, ced: bool) -> bool {
+    let Some(meta) = fs::read(src.join("meta.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SnapshotMeta>(&b).ok())
+    else {
+        return true;
+    };
+    resume_ok(decoder_rings_empty(&meta), suffix_rows, ced)
+}
+
 /// [`restore`] that also returns the snapshot's image spans.
 pub fn restore_vl(
     state: &mut HetModelState,
@@ -2006,7 +2055,7 @@ mod retention_tests {
         let current = write(1, KV_EPOCH);
         let old = write(2, 0);
         let newer = write(3, KV_EPOCH + 1);
-        let tmp = root.join(format!("{SAVE_TMP_PREFIX}{}-1", hex::encode(h(4))));
+        let tmp = root.join(format!("{SAVE_TMP_PREFIX}{}-{}", hex::encode(h(4)), u32::MAX));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(tmp.join("kv.bin"), b"half").unwrap();
         let idx = SnapshotIndex::load(root.clone(), fp(), 1 << 40).unwrap();
@@ -2015,6 +2064,83 @@ mod retention_tests {
         assert!(!old.exists(), "old-epoch snapshot deleted");
         assert!(newer.exists() && !idx.by_hash.contains_key(&h(3)), "newer epoch skipped, kept");
         assert!(!tmp.exists(), "uncommitted save deleted");
+    }
+
+    #[test]
+    fn load_leaves_a_live_writers_saves() {
+        let key = hex::encode(h(5));
+        let me = std::process::id();
+        // A live process other than us: our parent (the test harness).
+        let live = std::os::unix::process::parent_id();
+        let dead = u32::MAX; // above any pid_max
+        assert_eq!(save_dir_is_stale("0123abcd"), None, "not a save dir");
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{key}-{dead}")), Some(true));
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_OLD_PREFIX}{key}-{me}")), Some(true), "our pid: a previous incarnation's");
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{key}-x")), Some(true), "no pid");
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{key}")), Some(true), "no pid");
+        assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{key}-{live}")), Some(!cfg!(target_os = "linux")));
+
+        let root = unique_root();
+        let mk = |name: String| {
+            let d = root.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("kv.bin"), b"half").unwrap();
+            d
+        };
+        let live_tmp = mk(format!("{SAVE_TMP_PREFIX}{key}-{live}"));
+        let live_old = mk(format!("{SAVE_OLD_PREFIX}{key}-{live}"));
+        let dead_tmp = mk(format!("{SAVE_TMP_PREFIX}{key}-{dead}"));
+        let own_old = mk(format!("{SAVE_OLD_PREFIX}{key}-{me}"));
+        let junk = mk(format!("{SAVE_TMP_PREFIX}junk"));
+        let idx = SnapshotIndex::load(root.clone(), fp(), 1 << 40).unwrap();
+        assert!(idx.is_empty());
+        if cfg!(target_os = "linux") {
+            assert!(live_tmp.exists() && live_old.exists(), "a live writer's save and swap dir kept");
+        }
+        assert!(!dead_tmp.exists() && !own_old.exists() && !junk.exists(), "stale saves deleted");
+    }
+
+    #[test]
+    fn checkpoint_refused_from_meta_and_hint_dropped() {
+        let root = unique_root();
+        let write = |tag: u8, m: &SnapshotMeta| {
+            let dir = root.join(hex::encode(h(tag)));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("meta.json"), serde_json::to_vec(m).unwrap()).unwrap();
+            dir
+        };
+        let full = write(1, &meta_at(5000));
+        let mut ckpt = meta_at(5000);
+        for l in &mut ckpt.layers[CED_DECODER_START..] {
+            l.n_raw = 0;
+            l.kv_rows = 0;
+        }
+        let ckpt_dir = write(2, &ckpt);
+        let w = SWA_WINDOW as usize;
+        // The same predicate as after the restore, from the meta alone.
+        for suffix in [0, 1, w, w + 1, 100_000] {
+            for ced in [false, true] {
+                assert_eq!(resume_ok_from_meta(&full, suffix, ced), resume_ok(false, suffix, ced));
+                assert_eq!(resume_ok_from_meta(&ckpt_dir, suffix, ced), resume_ok(decoder_rings_empty(&ckpt), suffix, ced));
+            }
+        }
+        if CED_DECODER_START < N_LAYER as usize {
+            assert!(!resume_ok_from_meta(&ckpt_dir, w, true), "a final chunk <= the replay: refused before the restore");
+            assert!(resume_ok_from_meta(&ckpt_dir, w + 1, true));
+        }
+        // No/unparseable meta: left to restore_vl (which reports and evicts).
+        assert!(resume_ok_from_meta(&root.join("missing"), 0, true));
+        let bad = root.join("bad");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("meta.json"), b"{").unwrap();
+        assert!(resume_ok_from_meta(&bad, 0, true));
+
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        idx.session_to_hash.insert("s".into(), h(2));
+        idx.drop_session_hint("s", &h(1));
+        assert_eq!(idx.session_to_hash.get("s"), Some(&h(2)), "a hint pointing elsewhere kept");
+        idx.drop_session_hint("s", &h(2));
+        assert!(idx.lookup_session("s", &[0; 6000]).is_none() && idx.session_to_hash.is_empty());
     }
 
     #[test]

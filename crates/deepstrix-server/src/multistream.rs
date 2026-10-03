@@ -1130,6 +1130,16 @@ impl Sched {
                 if !usable {
                     continue;
                 }
+                // A mid-prefill checkpoint this suffix cannot resume is refused
+                // from its meta.json, before the restore reads its blobs; the
+                // session hint stops pointing at it (it stays for a longer one).
+                let ced = v4flash_kernels::het::forward_prefill::ced_enabled();
+                if !snapshot::resume_ok_from_meta(&snap_dir, tokens.len().saturating_sub(snap_req_tokens), ced) {
+                    tracing::warn!(covered = snap_req_tokens, total = tokens.len(),
+                        "multistream: snapshot is a mid-prefill checkpoint (decoder rings empty) and the suffix is too short to resume it; not restored, trying the next candidate");
+                    if let Some(sid) = p.session_id.as_deref() { state.snapshot_index.drop_session_hint(sid, &snap_hash); }
+                    continue;
+                }
                 match snapshot::restore_vl(&mut kv, &snap_dir, state.dgpu, state.igpu, &state.model_fingerprint,
                     snapshot::RestoreKernels { fp8: &state.engine.dgpu.comp_kv_fp8, stream: &state.engine.dgpu.compute }) {
                     Ok(r) => {
@@ -1143,9 +1153,9 @@ impl Sched {
                             && byte_aligned_lcp_vl(&r.tokens, &r.image_spans, tokens, &p.req.image_spans,
                                 state.vocab.as_ref(), &state.byte_decoder).live_tokens == r.tokens.len();
                         // A mid-prefill checkpoint (decoder rings saved empty)
-                        // resumes only a suffix longer than the CED replay.
-                        let resumable = snapshot::resume_ok(r.decoder_rings_empty, tokens.len().saturating_sub(r.tokens.len()),
-                            v4flash_kernels::het::forward_prefill::ced_enabled());
+                        // resumes only a suffix longer than the CED replay
+                        // (decided above from the meta; this is the backstop).
+                        let resumable = snapshot::resume_ok(r.decoder_rings_empty, tokens.len().saturating_sub(r.tokens.len()), ced);
                         if is_prefix && resumable {
                             let _ = state.snapshot_index.touch(&snap_hash);
                             prefix = r.tokens;
@@ -1155,6 +1165,7 @@ impl Sched {
                         if is_prefix {
                             tracing::warn!(restored = r.tokens.len(), total = tokens.len(),
                                 "multistream: snapshot is a mid-prefill checkpoint (decoder rings empty) and the suffix is too short to resume it; trying the next candidate");
+                            if let Some(sid) = p.session_id.as_deref() { state.snapshot_index.drop_session_hint(sid, &snap_hash); }
                         } else {
                             tracing::warn!("multistream: restored snapshot is not a prefix of the request (tokens or image content); trying the next candidate");
                         }
