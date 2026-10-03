@@ -92,10 +92,12 @@ Production knobs (park=1), rare. Fix: `parked_pins` is a stack
 
 Serde dropped them. Now: `stop` is honoured (visible content only, never inside a
 tool frame, held back across chunk boundaries; a match cancels the generation
-through the disconnect path), `min_p` is wired to `min_p_rel`, and `n != 1`,
-`top_k > 0`, non-zero penalties, `repetition_penalty != 1` and a non-empty
-`logit_bias` are a 400 (each would have to change the serial sampler, the arena
-`TargetDist`, the head prefilter band and the DSpark verify together).
+through the disconnect path; up to 64 strings), `min_p` is wired to `min_p_rel`,
+and `n != 1` is a 400. `top_k > 0`, non-zero penalties, `repetition_penalty != 1`
+and a non-empty `logit_bias` are still not implemented (each would have to change
+the serial sampler, the arena `TargetDist`, the head prefilter band and the DSpark
+verify together): served without them and named in a warning, a 400 with
+`V41_API_STRICT=1` (client presets send them on every request).
 Regression: `openai::stop::tests`, `accumulate_tests`, `handler::tests`.
 
 ### 39. FIXED 2026-10-03 — snapshots carried no KV epoch: KV written by a buggy build outlived the fix
@@ -135,7 +137,9 @@ emptied decoder rings, and `prefill_job_finish` keeps the rings for a suffix of
 <= 128 rows, so fixing only the key would have reintroduced #25. Fix:
 `checkpoint_tokens` = `req.tokens[..pos0 + done]`; a ring-empty snapshot resumes
 only under CED with a suffix > 128 rows (`snapshot::resume_ok`), and the replay
-errors rather than run a continuation onto empty rings; restore cross-checks
+errors rather than run a continuation onto empty rings (a checkpoint the suffix
+cannot resume is refused from its meta.json before the restore reads anything,
+and the session hint that pointed at it is dropped); restore cross-checks
 `token_count` against `n_comp` / `n_raw`. Regression:
 `checkpoint_key_is_the_requests_own_prefix`, `checkpoint_rings_resume_only_past_the_replay`,
 `counts_must_match_the_token_count`. Still open: periodic checkpoints have no
