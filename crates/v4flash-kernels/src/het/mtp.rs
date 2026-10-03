@@ -1785,25 +1785,31 @@ impl MtpState {
 pub const MTP_DRAFT_TOP_M: usize = 64;
 
 /// How the exit draws SAMPLED drafts (DSpark plan 2.2 / M6): at the request's
-/// temperature and top-p over the drafter's top-`m` biased logits, each
+/// temperature, min-p and top-p over the drafter's top-`m` biased logits, each
 /// position with its own uniform from the drafter's RNG (independent of the
 /// verifier's, plan 2.4).
 #[derive(Clone, Debug)]
 pub struct DraftSampling {
     pub temperature: f32,
     pub top_p: f32,
+    /// The request's `min_p` (relative to the top token), as the verifier's
+    /// `TargetDist` applies it: a draft the target's min-p removes has p = 0
+    /// and is always rejected, ending its block (KNOWN_BUGS #50).
+    pub min_p_rel: f32,
     pub m: usize,
     pub u: [f32; MTP_BLOCK],
 }
 
 /// The draft distribution of one position and its draw. `ids` / `logits` are
 /// the top-M candidates (any order) with their biased logits. q = softmax at
-/// `temperature` over them, cut to the smallest prefix (by logit, ties to the
-/// lower id) whose mass reaches `top_p`, renormalised; the draft is the first
+/// `temperature` over them, first cut by min-p (weight relative to the top
+/// candidate >= `min_p_rel`), then to the smallest prefix of those survivors
+/// (by logit, ties to the lower id) whose mass reaches `top_p` -- the order
+/// `TargetDist::from_logits` cuts in -- renormalised; the draft is the first
 /// candidate whose cumulative q reaches `u`. q is EXACTLY what the draft is
 /// drawn from, so `min(1, p/q)` in the verifier is exact (plan 2.2); tokens
 /// outside the top-M have q = 0.
-pub fn draft_dist(ids: &[i32], logits: &[f32], temperature: f32, top_p: f32, u: f32) -> eyre::Result<(Vec<(i32, f64)>, i32)> {
+pub fn draft_dist(ids: &[i32], logits: &[f32], temperature: f32, top_p: f32, min_p_rel: f32, u: f32) -> eyre::Result<(Vec<(i32, f64)>, i32)> {
     if ids.len() != logits.len() || !(temperature > 0.0) {
         return Err(eyre!("draft_dist: {} ids / {} logits at temperature {temperature}", ids.len(), logits.len()));
     }
@@ -1813,7 +1819,11 @@ pub fn draft_dist(ids: &[i32], logits: &[f32], temperature: f32, top_p: f32, u: 
     }
     c.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
     let mx = c[0].1 as f64;
-    let w: Vec<f64> = c.iter().map(|&(_, l)| ((l as f64 - mx) / temperature as f64).exp()).collect();
+    let mut w: Vec<f64> = c.iter().map(|&(_, l)| ((l as f64 - mx) / temperature as f64).exp()).collect();
+    // min-p: w is relative to the top candidate (w[0] = 1) and sorted, so the
+    // survivors are a prefix; the top one always survives (min_p_rel <= 1).
+    let min_p = (min_p_rel as f64).clamp(0.0, 1.0);
+    w.truncate(w.iter().position(|&wi| wi < min_p).unwrap_or(w.len()).max(1));
     let z: f64 = w.iter().sum();
     let top_p = (top_p as f64).clamp(0.0, 1.0);
     let mut keep = 0usize;
@@ -2123,7 +2133,7 @@ impl MtpExit {
                     let mut clg = vec![0f32; ds.m];
                     self.topk_sel.slice_view(0, ds.m).copy_to_host(&mut cid)?;
                     self.cand.slice_view(0, ds.m).copy_to_host(&mut clg)?;
-                    let (q, d) = draft_dist(&cid, &clg, ds.temperature, ds.top_p, ds.u[i])?;
+                    let (q, d) = draft_dist(&cid, &clg, ds.temperature, ds.top_p, ds.min_p_rel, ds.u[i])?;
                     self.q.push(q);
                     ids[i] = d;
                 }
@@ -2206,7 +2216,7 @@ mod draft_dist_tests {
     fn q_is_a_distribution_and_the_draw_follows_it() {
         let ids = [7, 3, 9, 1, 4];
         let lg = [2.0f32, 1.0, 1.0, -1.0, f32::NEG_INFINITY];
-        let (q, _) = draft_dist(&ids, &lg, 1.0, 1.0, 0.5).unwrap();
+        let (q, _) = draft_dist(&ids, &lg, 1.0, 1.0, 0.0, 0.5).unwrap();
         assert_eq!(q.iter().map(|x| x.0).collect::<Vec<_>>(), vec![7, 3, 9, 1], "sorted by logit, ties to the lower id, -inf dropped");
         assert!((q.iter().map(|x| x.1).sum::<f64>() - 1.0).abs() < 1e-12);
         // Draws over a fine grid of u reproduce q.
@@ -2214,7 +2224,7 @@ mod draft_dist_tests {
         let mut cnt = std::collections::HashMap::new();
         for k in 0..n {
             let u = (k as f32 + 0.5) / n as f32;
-            *cnt.entry(draft_dist(&ids, &lg, 1.0, 1.0, u).unwrap().1).or_insert(0usize) += 1;
+            *cnt.entry(draft_dist(&ids, &lg, 1.0, 1.0, 0.0, u).unwrap().1).or_insert(0usize) += 1;
         }
         for &(t, pr) in &q {
             let f = *cnt.get(&t).unwrap_or(&0) as f64 / n as f64;
@@ -2226,12 +2236,34 @@ mod draft_dist_tests {
     fn top_p_keeps_the_smallest_prefix_and_temperature_sharpens() {
         let ids = [0, 1, 2, 3];
         let lg = [3.0f32, 2.0, 1.0, 0.0];
-        let (q_all, _) = draft_dist(&ids, &lg, 1.0, 1.0, 0.0).unwrap();
-        let (q_p, _) = draft_dist(&ids, &lg, 1.0, 0.7, 0.0).unwrap();
+        let (q_all, _) = draft_dist(&ids, &lg, 1.0, 1.0, 0.0, 0.0).unwrap();
+        let (q_p, _) = draft_dist(&ids, &lg, 1.0, 0.7, 0.0, 0.0).unwrap();
         assert_eq!(q_all.len(), 4);
         assert!(q_p.len() < 4 && q_p[0].0 == 0, "top-p 0.7 keeps a prefix");
-        let (q_cold, _) = draft_dist(&ids, &lg, 0.25, 1.0, 0.0).unwrap();
+        let (q_cold, _) = draft_dist(&ids, &lg, 0.25, 1.0, 0.0, 0.0).unwrap();
         assert!(q_cold[0].1 > q_all[0].1, "lower temperature puts more mass on the top candidate");
-        assert!(draft_dist(&ids, &lg, 0.0, 1.0, 0.5).is_err(), "T = 0 is point-mass territory");
+        assert!(draft_dist(&ids, &lg, 0.0, 1.0, 0.0, 0.5).is_err(), "T = 0 is point-mass territory");
+    }
+
+    /// KNOWN_BUGS #50: min-p cuts q (relative to the top candidate) BEFORE
+    /// top-p, as the verifier's target does: a candidate it removes gets q = 0.
+    #[test]
+    fn min_p_prunes_q_before_top_p() {
+        let ids = [0, 1, 2];
+        // weights 1, e^-1 = 0.37, e^-5 = 0.0067 at T = 1
+        let lg = [0.0f32, -1.0, -5.0];
+        let (q_off, _) = draft_dist(&ids, &lg, 1.0, 1.0, 0.0, 0.0).unwrap();
+        let (q_on, _) = draft_dist(&ids, &lg, 1.0, 1.0, 0.05, 0.0).unwrap();
+        assert_eq!(q_off.len(), 3);
+        assert_eq!(q_on.iter().map(|x| x.0).collect::<Vec<_>>(), vec![0, 1], "e^-5 < 0.05 of the top: pruned");
+        assert!((q_on.iter().map(|x| x.1).sum::<f64>() - 1.0).abs() < 1e-12);
+        // Every draw stays inside the survivors.
+        for k in 0..1000 {
+            let u = (k as f32 + 0.5) / 1000.0;
+            assert_ne!(draft_dist(&ids, &lg, 1.0, 1.0, 0.05, u).unwrap().1, 2);
+        }
+        // min_p = 1 keeps only the top candidate; the top always survives.
+        let (q_one, d) = draft_dist(&ids, &lg, 1.0, 1.0, 1.0, 0.9).unwrap();
+        assert_eq!((q_one.len(), d), (1, 0));
     }
 }

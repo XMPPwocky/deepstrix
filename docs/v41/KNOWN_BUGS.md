@@ -199,6 +199,37 @@ With `V41_LOOKAHEAD_PREFETCH=1` image rows picked experts from the next layer's
 logits. The look-ahead now runs after both readers (it also runs on hash-routed
 layers now, which shipped a stale `look_sel` before). GPU path, no host test.
 
+Entries 50-51: GitHub issue #3 (DSpark acceptance review of 2026-10-03), fixed
+2026-10-03 on `worktree-lm-prefill-prod`, NOT deployed.
+
+### 50. FIXED 2026-10-03 — sampled drafts ignored the request's `min_p`; the verifier's target applied it
+
+`draft_sampling` (ms_dspark.rs) dropped `min_p_rel`, and `draft_dist` (mtp.rs)
+cut q by top-p only, while `TargetDist` cuts by min-p and then top-p over the
+survivors. A draft below the target's min-p line had q > 0 and p = 0: always
+rejected, ending its block. A regression from #38, which wired OpenAI `min_p`
+into `min_p_rel` (the q design assumed min-p was always 0). No production effect
+so far: every request since 10-03 18:52 logged `min_p=None`. Fix: `DraftSampling`
+carries `min_p_rel`; `draft_dist` keeps the candidates within it of the top one,
+then cuts top-p over those, the target's order. Exactness is unchanged (q is
+still exactly what the draft is drawn from). Regression:
+`ms_dspark::tests::sampled_draft_q_stays_inside_the_targets_min_p_support`,
+`mtp::draft_dist_tests::min_p_prunes_q_before_top_p`.
+
+### 51. FIXED 2026-10-03 — a drafted step whose K came out 0 paid the draft but reached neither the stage-1 gain nor any counter
+
+On a lone stream the draft (~12 ms) runs before `k_for`; a K of 0 (the policy's,
+or an exploration draw) then ran a plain step through `note_plain_step` only:
+`sd.gain` never saw the draft it cost, `k_hist[0]` was always 0, and the step's
+token and time were missing from `emitted` / `step_ms` while its draft was in
+`draft_ms` (so `tok_per_s` was biased by each arm's K = 0 rate). Measured
+10-03 20:38-20:54: 119 plain one-row steps = 112 back-offs + 6 exploration draws,
+so the policy's K = 0 was about 1 in 3,900 steps: an accounting gap more than a
+throughput one. Fix: `MsDspark::record_k0` (the plain-step sample, a block's
+accounting via `Stats::note_k0`, and for a POLICY K = 0 a gain sample with the
+draft charged, through the shared `gate_update`); `policy_k0` in the blocks line.
+Regression: `ms_dspark::tests::k0_steps_with_the_draft_charged_back_off`.
+
 ### 29. FIXED 2026-09-30 (NOT deployed) — under the T2 partition, a lane-layer with no box-2 pick was sent to box 2 masked by its static HELLO set while box 1 computed every pick: experts in box 2's `--experts` range were added TWICE
 
 `pre_moe_route` built the hub's own box-2 pick list (`sel_for_remote`, masked by

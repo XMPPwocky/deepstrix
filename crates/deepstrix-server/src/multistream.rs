@@ -1620,6 +1620,8 @@ impl Sched {
         let spec_rule = spec_lane_rule(min_rows, learned);
         // The drafted block's lane count (`MsDspark::k_for`).
         let mut spec_two = false;
+        // The lone stream drafted and `k_for` gave K = 0 (`MsDspark::record_k0`).
+        let mut drafted_k0 = false;
         if self.streams.len() == 1 {
             if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
                 let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
@@ -1640,6 +1642,7 @@ impl Sched {
                             // tests allow the global search (plan 2.4).
                             let (k, lanes) = dsp.k_for(&d.conf, cap, d.q.is_some(), spec_rule);
                             spec_two = lanes >= 2;
+                            drafted_k0 = k == 0;
                             draft_conf = d.conf;
                             drafts[0] = d.ids[..k].to_vec();
                             draft_q[0] = d.q.map(|mut q| { q.truncate(k); q });
@@ -2204,7 +2207,12 @@ impl Sched {
                 let lanes = if spec_lanes { 2 } else { 1 };
                 dsp.record(self.streams[0].slot, &draft_conf, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3, lanes);
             } else if b == 1 {
-                dsp.note_plain_step(t0.elapsed().as_secs_f64() * 1e3);
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                if drafted_k0 {
+                    dsp.record_k0(self.streams[0].slot, ms);
+                } else {
+                    dsp.note_plain_step(ms);
+                }
             }
         }
         // A plain multi-stream step feeds its lane tables (a three-lane step

@@ -66,8 +66,8 @@ fn sampled_drafts() -> bool {
 /// are the drafter RNG's uniforms for the block's positions.
 pub fn draft_sampling(mode: &SampleMode, u: [f32; MTP_BLOCK]) -> Option<DraftSampling> {
     match *mode {
-        SampleMode::Multinomial { temperature, top_p, .. } if temperature > 0.0 && sampled_drafts() => {
-            Some(DraftSampling { temperature, top_p, m: MTP_DRAFT_TOP_M, u })
+        SampleMode::Multinomial { temperature, top_p, min_p_rel } if temperature > 0.0 && sampled_drafts() => {
+            Some(DraftSampling { temperature, top_p, min_p_rel, m: MTP_DRAFT_TOP_M, u })
         }
         _ => None,
     }
@@ -145,14 +145,45 @@ struct Stats {
     ring_errors: u64,
     /// Blocks whose K (and lanes) was an exploration draw (`explore`), K >= 1.
     explored: u64,
-    /// Exploration draws of K = 0: plain steps, so not in `blocks` / `k_hist`.
+    /// Exploration draws of K = 0: drafted, then a plain step (`record_k0`:
+    /// in `blocks` and `k_hist[0]`).
     explored_k0: u64,
+    /// The POLICY's K = 0 (`choose_k*` priced no draft worth a row): drafted,
+    /// then a plain step, like `explored_k0`.
+    policy_k0: u64,
     /// Exploration draws by K (K = 0 included).
     explored_hist: [u64; MTP_BLOCK + 1],
     /// Exploration draws that verified on two lanes.
     explored_two: u64,
     /// Blocks by rows (index rows - 1): on one lane, on two.
     lanes_by_rows: [[u64; 2]; CELLS],
+}
+
+impl Stats {
+    /// A drafted step that verified nothing (K = 0) took `step_ms`: one token,
+    /// counted like a block (`k_hist[0]`), so `tokens_per_block`, `k_mean`
+    /// and `tok_per_s` see the draft it paid for (`draft_ms` already has it).
+    fn note_k0(&mut self, step_ms: f64) {
+        self.blocks += 1;
+        self.emitted += 1;
+        self.k_hist[0] += 1;
+        self.lanes_by_rows[0][0] += 1;
+        self.step_ms += step_ms;
+    }
+}
+
+/// Stage-1 gate (`SlotDraft::gain`): fold one drafted step's realized speed-up
+/// `g` into the EWMA and back off below `min_gain` (4 steps, doubling to 64).
+/// A probe after a back-off moves the estimate half way at once.
+fn gate_update(gain: &mut f64, backoff: &mut u32, skip_left: &mut u32, g: f64, min_gain: f64) {
+    let a = if *backoff > 0 { 0.5 } else { 0.25 };
+    *gain = (1.0 - a) * *gain + a * g;
+    if *gain < min_gain {
+        *backoff = (*backoff * 2).clamp(4, 64);
+        *skip_left = *backoff;
+    } else {
+        *backoff = 0;
+    }
 }
 
 pub struct MsDspark {
@@ -176,6 +207,9 @@ pub struct MsDspark {
     /// Exploration draws (`explore`); `V41_MS_DSPARK_EXPLORE_SEED` for a
     /// reproducible replay, else entropy.
     rng: StdRng,
+    /// The last `k_for` returning K = 0 was an exploration draw (`record_k0`
+    /// then feeds no gain sample).
+    k0_explored: bool,
 }
 
 impl MsDspark {
@@ -200,7 +234,7 @@ impl MsDspark {
         // which cells the steps feed.
         let m = crate::multistream::pipeline_min_rows();
         let lanes = LaneTables::new(StepCost::from_env(), StepCost::from_env_two_lane(m), m);
-        Ok(Self { slots, plain_ms: lanes.one.cost(1), lanes, switches: Switches::default(), calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng() })
+        Ok(Self { slots, plain_ms: lanes.one.cost(1), lanes, switches: Switches::default(), calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng(), k0_explored: false })
     }
 
     /// K and the lane count for the lone stream's drafted block (plan section
@@ -219,9 +253,10 @@ impl MsDspark {
             if let Some(i) = explore(&mut self.rng, cands.len(), explore_p(), |i| t.weight(cands[i].0 + 1, cands[i].1)) {
                 let (k, l) = cands[i];
                 self.stats.explored_hist[k] += 1;
-                // A K = 0 draw runs as a plain step (no `record`): counted apart.
+                // A K = 0 draw runs as a plain step (`record_k0`): counted apart.
                 if k == 0 {
                     self.stats.explored_k0 += 1;
+                    self.k0_explored = true;
                 } else {
                     self.stats.explored += 1;
                 }
@@ -233,6 +268,10 @@ impl MsDspark {
         }
         let cost = self.lanes.priced(rule);
         let k = if sampled { choose_k_stopping(conf, cap, &cost) } else { choose_k(conf, cap, &cost) };
+        if k == 0 {
+            self.stats.policy_k0 += 1;
+            self.k0_explored = false;
+        }
         let lanes = self.lanes.best(1 + k, rule).1;
         if k >= 1 && self.switches.note(1 + k, lanes) {
             self.lanes.log_switch("dspark", 1 + k, lanes);
@@ -511,15 +550,7 @@ impl MsDspark {
         }
         if let Ok(sd) = self.slot(slot) {
             let g = emitted as f64 * plain_ms / (step_ms + sd.last_draft_ms).max(1.0);
-            // A probe after a back-off moves the estimate half way at once.
-            let a = if sd.backoff > 0 { 0.5 } else { 0.25 };
-            sd.gain = (1.0 - a) * sd.gain + a * g;
-            if sd.gain < min_gain() {
-                sd.backoff = (sd.backoff * 2).clamp(4, 64);
-                sd.skip_left = sd.backoff;
-            } else {
-                sd.backoff = 0;
-            }
+            gate_update(&mut sd.gain, &mut sd.backoff, &mut sd.skip_left, g, min_gain());
         }
         let s = &mut self.stats;
         s.blocks += 1;
@@ -529,6 +560,33 @@ impl MsDspark {
         s.k_hist[k.min(MTP_BLOCK)] += 1;
         s.lanes_by_rows[k.min(MTP_BLOCK)][(lanes >= 2) as usize] += 1;
         s.step_ms += step_ms;
+        self.maybe_log();
+    }
+
+    /// A drafted step whose K came out 0 (`k_for`: the policy's, or an
+    /// exploration draw) ran as a plain one-row step but paid for its draft:
+    /// `note_plain_step`'s sample, a block's accounting (`Stats::note_k0`)
+    /// and -- a POLICY K = 0 only -- a stage-1 gain sample with that draft
+    /// charged, so a stream whose blocks keep coming out empty backs off
+    /// instead of paying the draft for every token (issue #3 finding 2;
+    /// before, these steps reached neither the gain nor any counter). An
+    /// exploration draw measures a choice the policy did not make: no gain.
+    pub fn record_k0(&mut self, slot: u32, step_ms: f64) {
+        let plain_ms = if self.lanes.one.live { self.lanes.one.cost(1) } else { self.plain_ms };
+        self.note_plain_step(step_ms);
+        if !self.k0_explored {
+            if let Ok(sd) = self.slot(slot) {
+                let g = plain_ms / (step_ms + sd.last_draft_ms).max(1.0);
+                gate_update(&mut sd.gain, &mut sd.backoff, &mut sd.skip_left, g, min_gain());
+            }
+        }
+        self.stats.note_k0(step_ms);
+        self.maybe_log();
+    }
+
+    /// The `ms dspark: blocks` rollup, every 50 drafted steps.
+    fn maybe_log(&mut self) {
+        let s = &self.stats;
         if s.blocks >= 50 {
             let n = s.blocks as f64;
             tracing::info!(
@@ -553,6 +611,7 @@ impl MsDspark {
                 two_lane_blocks = s.two_lane,
                 explored = s.explored,
                 explored_k0 = s.explored_k0,
+                policy_k0 = s.policy_k0,
                 explored_hist = ?s.explored_hist,
                 explored_two = s.explored_two,
                 lane_switches = self.switches.take(),
@@ -1960,5 +2019,50 @@ mod tests {
         assert_eq!(cal.depth_n, [2, 2, 1, 0, 0]);
         assert_eq!(cal.depth_acc, [2, 1, 1, 0, 0]);
         assert_eq!(cal.blocks, 2);
+    }
+
+    /// KNOWN_BUGS #50: with a request's min-p, every token a sampled draft can
+    /// propose has target p > 0 when the drafter's logits are the target's.
+    /// Before the fix q ignored min-p: here it kept ids 16-19, which the
+    /// target's min-p (0.05) then top-p (over the survivors) removes, so such
+    /// a draft was always rejected and ended its block.
+    #[test]
+    fn sampled_draft_q_stays_inside_the_targets_min_p_support() {
+        let mode = SampleMode::Multinomial { temperature: 1.0, min_p_rel: 0.05, top_p: 0.95 };
+        let ds = draft_sampling(&mode, [0.5; MTP_BLOCK]).expect("sampled drafts by default");
+        assert_eq!(ds.min_p_rel, 0.05);
+        let logits: Vec<f32> = (0..64).map(|i| -0.15 * i as f32).collect();
+        let ids: Vec<i32> = (0..64).collect();
+        let target = crate::spec_sample::TargetDist::from_logits(&logits, &mode);
+        let (q, _) = v4flash_kernels::het::mtp::draft_dist(&ids, &logits, ds.temperature, ds.top_p, ds.min_p_rel, 0.5).unwrap();
+        for &(t, _) in &q {
+            assert!(target.prob(t) > 0.0, "draft {t} has q > 0 but p = 0");
+        }
+        assert_eq!(q.len(), 16, "q's support is the target's: min-p keeps 0..=19, top-p 0..=15");
+    }
+
+    /// Issue #3 finding 2: drafted steps that keep coming out K = 0 pay the
+    /// draft for one token each; charged to the gain, the stream backs off.
+    #[test]
+    fn k0_steps_with_the_draft_charged_back_off() {
+        let (mut gain, mut backoff, mut skip) = (GAIN0, 0u32, 0u32);
+        // plain step 80 ms, draft 12 ms: one token for 92 ms
+        let g = 80.0 / (80.0 + 12.0);
+        let mut n = 0;
+        while backoff == 0 {
+            gate_update(&mut gain, &mut backoff, &mut skip, g, 1.0);
+            n += 1;
+            assert!(n < 20, "never backed off");
+        }
+        assert_eq!((n, backoff, skip), (6, 4, 4));
+        // The probe after the back-off moves half way: a good block clears it.
+        gate_update(&mut gain, &mut backoff, &mut skip, 2.5, 1.0);
+        assert_eq!(backoff, 0);
+        // The step counts like a block, with nothing verified.
+        let mut s = Stats::default();
+        s.note_k0(80.0);
+        assert_eq!((s.blocks, s.emitted, s.k_hist[0], s.drafts_verified, s.accepted), (1, 1, 1, 0, 0));
+        assert_eq!(s.lanes_by_rows[0], [1, 0]);
+        assert_eq!(s.step_ms, 80.0);
     }
 }
