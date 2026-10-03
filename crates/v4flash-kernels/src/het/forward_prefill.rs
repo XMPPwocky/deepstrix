@@ -7875,18 +7875,6 @@ impl HeterogeneousEngine {
                     range_out: if sub3 { Some(&mut bd.d_range) } else { None },
                 },
             )?;
-        if let Some(nl) = look_next {
-            let _t = de.events.stage("k.router.lookahead", &de.compute)?;
-            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
-            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel, &mut sd.look_ew, &sd.router_logits, nl.router_bias_dev.as_ref(),
-                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
-        }
-        if let Some(nl) = look_next2 {
-            let _t = de.events.stage("k.router.lookahead2", &de.compute)?;
-            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
-            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel2, &mut sd.look_ew2, &sd.router_logits, nl.router_bias_dev.as_ref(),
-                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
-        }
             // KNOWN_BUGS #0b: layer 0's MoE half is where verify diverges from
             // decode while attention is clean. Expert SELECTION is the first
             // thing to rule in or out -- different experts fully explain the
@@ -7996,6 +7984,25 @@ impl HeterogeneousEngine {
                 EXPERT_WEIGHT_SCALE,
                 ROUTER_WEIGHT_EPS,
             )?;
+        }
+        // The look-ahead routers reuse `sd.router_logits`, so they run only
+        // AFTER its last reader for this layer: the image-row `bias_vl` re-top-k
+        // and the fidelity pin above both read THIS layer's logits (they ran
+        // before them and picked image rows' experts / pinned weights from
+        // layer L+1's or L+2's). Same stream, still ahead of the readback pack.
+        // Outside the hash-router branch too: a hash layer whose next layer is
+        // not hashed has a `look_next`, and the pack shipped stale `look_sel`.
+        if let Some(nl) = look_next {
+            let _t = de.events.stage("k.router.lookahead", &de.compute)?;
+            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
+            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel, &mut sd.look_ew, &sd.router_logits, nl.router_bias_dev.as_ref(),
+                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
+        }
+        if let Some(nl) = look_next2 {
+            let _t = de.events.stage("k.router.lookahead2", &de.compute)?;
+            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
+            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel2, &mut sd.look_ew2, &sd.router_logits, nl.router_bias_dev.as_ref(),
+                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
         }
         drop(_t_router);
         let remote_owns_layer = self
