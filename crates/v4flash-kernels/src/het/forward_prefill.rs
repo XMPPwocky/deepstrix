@@ -125,19 +125,44 @@ fn remote_exclude() -> bool {
 /// added both: those experts counted twice (KNOWN_BUGS #29, the class of #0).
 /// `verify_routing_exactly_once` checks `owns_eff`, not what box 2 computes,
 /// so it could not see it. Dry (`!remote_exclude`) keeps the old debug paths.
-fn remote_sel_override(partition: bool, dry: bool, extra_remote: &[bool], owns_eff: &[bool], sel: &[i32]) -> Vec<i32> {
-    if dry || !(partition || extra_remote.iter().any(|&x| x)) {
-        return Vec::new();
+///
+/// Replay offload (`V41_REPLAY_OFFLOAD`) is the same class without the
+/// partition: box 1 excludes EVERY pick on the layer (`owns_eff` all true),
+/// so an empty override had box 2 compute only its HELLO range and the rest
+/// were computed by nobody. It always overrides, dry or not, because box 1's
+/// exclusion under it ignores `dry` too.
+///
+/// `owns`: box 2's HELLO set, i.e. what an empty override has it compute. When
+/// the override IS empty and the split is live, every pick must agree between
+/// `owns_eff` and `owns` -- the one check that sees box 2's side -- or `Err`.
+fn remote_sel_override(
+    partition: bool,
+    replay_offload: bool,
+    dry: bool,
+    extra_remote: &[bool],
+    owns: &[bool],
+    owns_eff: &[bool],
+    sel: &[i32],
+) -> eyre::Result<Vec<i32>> {
+    let live = |e: i32| (0..N_EXPERT as i32).contains(&e);
+    if replay_offload || (!dry && (partition || extra_remote.iter().any(|&x| x))) {
+        return Ok(sel
+            .iter()
+            .map(|&e| if live(e) && owns_eff[e as usize] { e } else { super::remote_experts::NO_PICK })
+            .collect());
     }
-    sel.iter()
-        .map(|&e| {
-            if (0..N_EXPERT as i32).contains(&e) && owns_eff[e as usize] {
-                e
-            } else {
-                super::remote_experts::NO_PICK
-            }
-        })
-        .collect()
+    if !dry {
+        if let Some(&e) = sel.iter().find(|&&e| live(e) && owns_eff[e as usize] != owns[e as usize]) {
+            return Err(eyre!(
+                "remote split: expert {e} is {} by box 1's owns_eff but box 2's HELLO set {} it, \
+                 and the submit is HELLO-masked: computed by {} devices",
+                if owns_eff[e as usize] { "excluded" } else { "kept" },
+                if owns[e as usize] { "holds" } else { "lacks" },
+                if owns_eff[e as usize] { 0 } else { 2 },
+            ));
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// Add the remote partial at the combine? Mode 1 only.
@@ -9015,16 +9040,21 @@ impl HeterogeneousEngine {
                         owns_eff = (0..N_EXPERT as usize)
                             .map(|e| replay_offload || extra_remote[e] || (!dry && owns[e]))
                             .collect();
-                        // The hub's own split whenever it reassigned something or
-                        // the T2 partition decides ownership (`remote_sel_override`:
-                        // under the partition an empty override double-counted).
+                        // The hub's own split whenever it reassigned something, the
+                        // T2 partition decides ownership or replay offload hands box 2
+                        // the whole layer (`remote_sel_override`: under the partition
+                        // an empty override double-counted, under replay offload it
+                        // dropped every pick outside box 2's HELLO range).
                         sel_for_remote = remote_sel_override(
                             super::expert_pager::t2_partition(),
+                            replay_offload,
                             dry,
                             &extra_remote,
+                            &owns,
                             &owns_eff,
                             &sel_host_remote,
-                        );
+                        )
+                        .map_err(|e| eyre!("L{layer}: {e}"))?;
                 }
                 // SUBMIT BEFORE PAGING. Box 2 needs only the router's picks and the
                 // activations, both ready above; it does NOT need box 1 to have
@@ -11488,7 +11518,7 @@ mod remote_sel_tests {
     fn partition_with_nothing_for_box2_sends_nothing() {
         let sel = [3, 250, 17, 300, 5, 383];
         let none = mask(&[]);
-        let o = remote_sel_override(true, false, &none, &none, &sel);
+        let o = remote_sel_override(true, false, false, &none, &none, &none, &sel).unwrap();
         assert_eq!(o, vec![NO_PICK; 6]);
     }
 
@@ -11496,7 +11526,7 @@ mod remote_sel_tests {
     fn partition_masks_by_owns_eff() {
         let sel = [3, 250, 17, 300, 5, -1];
         let own = mask(&[17, 250]);
-        let o = remote_sel_override(true, false, &own, &own, &sel);
+        let o = remote_sel_override(true, false, false, &own, &mask(&[]), &own, &sel).unwrap();
         assert_eq!(o, vec![NO_PICK, 250, 17, NO_PICK, NO_PICK, NO_PICK]);
     }
 
@@ -11506,12 +11536,40 @@ mod remote_sel_tests {
     fn no_partition_keeps_the_hello_path() {
         let sel = [3, 250];
         let hello = mask(&[250]);
-        assert!(remote_sel_override(false, false, &mask(&[]), &hello, &sel).is_empty());
+        assert!(remote_sel_override(false, false, false, &mask(&[]), &hello, &hello, &sel).unwrap().is_empty());
         let extra = mask(&[3]);
         let eff = mask(&[3, 250]);
-        assert_eq!(remote_sel_override(false, false, &extra, &eff, &sel), vec![3, 250]);
+        assert_eq!(remote_sel_override(false, false, false, &extra, &hello, &eff, &sel).unwrap(), vec![3, 250]);
         // Dry (debug split modes): the old path, partition or not.
-        assert!(remote_sel_override(true, true, &extra, &eff, &sel).is_empty());
+        assert!(remote_sel_override(true, false, true, &extra, &hello, &eff, &sel).unwrap().is_empty());
+    }
+
+    /// Replay offload without the partition: box 1 excludes the whole layer, so
+    /// box 2 is sent every pick (by `owns_eff`, all true), not just its HELLO
+    /// range -- dry or not, as box 1's exclusion ignores `dry` there.
+    #[test]
+    fn replay_offload_without_partition_sends_every_pick() {
+        let sel = [3, 250, 17, 300, 5, -1];
+        let hello = mask(&[250, 300]);
+        let all = vec![true; N_EXPERT as usize];
+        for dry in [false, true] {
+            let o = remote_sel_override(false, true, dry, &mask(&[]), &hello, &all, &sel).unwrap();
+            assert_eq!(o, vec![3, 250, 17, 300, 5, NO_PICK]);
+        }
+    }
+
+    /// An empty override (HELLO-masked submit) whose `owns_eff` disagrees with
+    /// the HELLO set on a pick is refused: that pick is computed by 0 or 2
+    /// devices. Agreement off the picks, or a dry run, passes.
+    #[test]
+    fn empty_override_must_match_hello() {
+        let sel = [3, 250];
+        let hello = mask(&[250]);
+        let none = mask(&[]);
+        assert!(remote_sel_override(false, false, false, &none, &hello, &mask(&[3, 250]), &sel).is_err());
+        assert!(remote_sel_override(false, false, false, &none, &hello, &none, &sel).is_err());
+        assert!(remote_sel_override(false, false, false, &none, &hello, &mask(&[250, 7]), &sel).unwrap().is_empty());
+        assert!(remote_sel_override(false, false, true, &none, &hello, &none, &sel).unwrap().is_empty());
     }
 }
 
