@@ -3754,135 +3754,38 @@ fn finish_decode(
             }
             let spc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
             let mut decode_path_logits: Option<Vec<f32>> = None;
-            // `V41_VERIFY_DECODE_PATH=1`: run the verify through DECODE's own
-            // per-layer function, layer-major over the B rows, instead of the
-            // batched prefill driver.
+            // `V41_VERIFY_DECODE_PATH=1`: run the verify through DECODE itself,
+            // one row at a time (`forward_one!`, the very call the decode loop
+            // makes), instead of the batched prefill driver.
             //
             // WHY. The batched driver computes a different function than decode
             // — different kernel families throughout (measured: argmax
             // agreement 0.49-0.61, cos 0.75-0.79) — and swapping components one
             // at a time does NOT converge, because each swapped component still
-            // consumes diverged inputs from the ones ahead of it. Decode's
-            // `forward_layer_standalone_graphs_paged` is public and complete, so
-            // the faithful verify needs no change to the prefill path at all.
+            // consumes diverged inputs from the ones ahead of it.
             //
-            // Layer-major over rows is numerically IDENTICAL to running the
-            // tokens sequentially: each layer sees the same token order, and
-            // each row's layer-L input is its own layer-(L-1) output, which is
-            // computed first. Only the order of independent work changes.
+            // TOKEN-major on purpose: this is the serial oracle. The earlier
+            // LAYER-major form (each layer over all rows, then the next layer)
+            // was NOT equivalent, because the per-layer state is shared across
+            // rows: the KV-source layers appended every row's compressor and
+            // index-key rows before any reuse layer ran for row 0, so row 0
+            // attended to the drafts' latents; the cached S2 top-k gather and the
+            // candidate pool carried the LAST row's values into the earlier rows.
+            // Its verify logits were conditioned on the drafts themselves, and
+            // anything concluded from it as an oracle is suspect.
             //
-            // This is the correctness step. It costs B x decode's per-layer work
-            // because each row still does its own remote submit — batching those
-            // per layer is the follow-up, and it is where speculation's win is.
+            // Costs B decode tokens; it is a correctness tool, not a fast path.
             if verify_decode_path() {
-                use v4flash_kernels::config::{ENGRAM_LAYERS, HC_DIM, N_LAYER, N_VOCAB};
-                let bsz = toks.len();
-                let mut resid: Vec<Vec<f32>> = hcs.clone();
-                let hcm = state.dgpu_scratch.hc_pre_carry.len();
-                let mut carry: Vec<Vec<f32>> = vec![vec![0.0f32; hcm]; bsz];
-                // Engram rows per row, gathered up front: hashes are token-only.
-                let mut erows: Vec<Option<Vec<Vec<f32>>>> = Vec::with_capacity(bsz);
+                let nv = v4flash_kernels::config::N_VOCAB as usize;
+                let mut out = vec![0.0f32; toks.len() * nv];
                 for (j, &t) in toks.iter().enumerate() {
-                    erows.push(match (state.pager.as_ref(), state.engram.as_mut()) {
-                        (Some(pg), Some(ec)) => {
-                            Some(ec.rows_for(pg.raw(), t, pos + j as u32)?)
-                        }
-                        _ => None,
-                    });
-                }
-                for layer in 0..N_LAYER as usize {
-                    let eidx = ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                    for j in 0..bsz {
-                        state.dgpu_scratch.residual.copy_from_host(&resid[j])?;
-                        if layer > 0 {
-                            state.dgpu_scratch.hc_pre_carry.copy_from_host(&carry[j])?;
-                        }
-                        if let (Some(ei), Some(er)) = (eidx, erows[j].as_ref()) {
-                            state.engine.stage_engram_rows(&mut state.dgpu_scratch, &er[ei])?;
-                        }
-                        {
-                            // Layer-major breaks the lockstep the token-major
-                            // path assumes, so publish rope pos + KV slot from
-                            // THIS layer's counters, per row.
-                            let slot = state.state.layers[layer].raw_off
-                                + state.state.layers[layer].n_raw;
-                            state.engine.publish_pos_slot(
-                                &mut state.dgpu_scratch,
-                                pos + j as u32,
-                                slot,
-                            )?;
-                        }
-                        {
-                            // V4.1 reuse layers borrow another layer's
-                            // compressor store; `with_kv_source` lends it for
-                            // the call and gives it back. Without it the layer
-                            // errors with "reuse layer without its source's
-                            // store".
-                            let pg = state.pager.as_mut().expect("pager");
-                            let eng = &state.engine;
-                            let dgs = &mut state.dgpu_scratch;
-                            let igs = &mut state.igpu_scratch;
-                            let dlw = &state.weights.dgpu_layers[layer];
-                            let ilw = &state.weights.igpu_layers[layer];
-                            let (p, t) = (pos + j as u32, toks[j]);
-                            state.state.with_kv_source(layer, |ls| {
-                                eng.forward_layer_standalone_graphs_paged(
-                                    dgs, igs, ls, dlw, ilw, p, t, pg,
-                                )
-                            })?;
-                        }
-                        // A layer READS `residual` and WRITES `residual_next`
-                        // (`forward_layer.rs:245`); decode's loop then swaps them
-                        // (`engine.rs:1189`). This path never swapped and read back
-                        // `residual` -- the layer's own INPUT -- so roughly every
-                        // other layer came back bit-unchanged and the verify was
-                        // running on a residual that had skipped half the model.
-                        // Read the OUTPUT buffer instead; the swap that keeps the
-                        // per-layer buffer PARITY in step with decode is done once
-                        // per layer, after the row loop, not per row: HIP graphs
-                        // capture POINTERS, so layer L must see the same physical
-                        // buffer here that it sees in decode (A for even L, B for
-                        // odd), and every row of layer L must see the same one.
-                        state.dgpu_scratch.residual_next.copy_to_host(&mut resid[j])?;
-                        state.dgpu_scratch.hc_pre_carry.copy_to_host(&mut carry[j])?;
-                        // V41_VDP_TRACE=1: row-0 residual norm per layer. A blow-up
-                        // or NaN localises the first bad layer without needing a
-                        // baseline run to diff against.
-                        if j == 0 && std::env::var("V41_VDP_TRACE").as_deref() == Ok("1") {
-                            let r = &resid[0];
-                            let n2: f64 = r.iter().map(|&v| (v as f64) * (v as f64)).sum();
-                            let nan = r.iter().filter(|v| !v.is_finite()).count();
-                            let c = &carry[0];
-                            let cn: f64 = c.iter().map(|&v| (v as f64) * (v as f64)).sum();
-                            eprintln!(
-                                "VDP L{layer:02} pos={} |resid|={:.4e} nonfinite={} |carry|={:.4e}",
-                                pos, n2.sqrt(), nan, cn.sqrt()
-                            );
-                        }
-                    }
-                    // One swap per LAYER (not per row), mirroring decode's
-                    // `engine.rs:1189`, so layer L+1's rows read the physical
-                    // buffer its captured graphs were built against.
-                    std::mem::swap(
-                        &mut state.dgpu_scratch.residual,
-                        &mut state.dgpu_scratch.residual_next,
-                    );
-                }
-                // Head per row, into the same [B * N_VOCAB] layout the batched
-                // path returns.
-                let nv = N_VOCAB as usize;
-                let mut out = vec![0.0f32; bsz * nv];
-                for j in 0..bsz {
-                    state.dgpu_scratch.residual.copy_from_host(&resid[j])?;
-                    state.dgpu_scratch.hc_pre_carry.copy_from_host(&carry[j])?;
-                    state.engine.forward_head(&mut state.dgpu_scratch, &state.weights.global)?;
+                    forward_one!(state, hcs[j], pos + j as u32, t)?;
                     state
                         .dgpu_scratch
                         .logits
                         .slice_view(0, nv)
                         .copy_to_host(&mut out[j * nv..(j + 1) * nv])?;
                 }
-                let _ = HC_DIM;
                 decode_path_logits = Some(out);
             }
             // Capture on BOTH lanes, and over the WHOLE verify batch.
