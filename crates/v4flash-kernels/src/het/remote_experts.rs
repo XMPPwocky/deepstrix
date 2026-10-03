@@ -1747,6 +1747,25 @@ fn park_waits_for(
     pending.contains(&key) && !(urgency && (spec.contains(&key) || resident(&key)))
 }
 
+/// Push `layer`'s real picks in `sel` onto `pins` (a shard's `parked_pins`) and
+/// return the length to `truncate` back to when the park ends.
+///
+/// The park block RE-ENTERS: a request served inside a park runs `run_path`
+/// again, and with a miss it reaches the same block. That block used to
+/// `clear()` the list on entry and exit, which dropped the PARKED request's
+/// pins while its pass A was still reading those slots on `exec.compute`:
+/// `resident_mask` does not touch recency, so the nested pass's `ensure`, the
+/// parked loop's later `admit_landed` and every further nested request could
+/// pick them as victims and repack them mid-read. Appending and truncating to
+/// the mark keeps every enclosing request's pins until its own park ends.
+fn push_parked_pins(pins: &mut Vec<(u32, u32)>, layer: u32, sel: &[i32]) -> usize {
+    let mark = pins.len();
+    for &e in sel.iter().filter(|&&e| e != NO_PICK && (0..N_EXPERT as i32).contains(&e)) {
+        pins.push((layer, e as u32));
+    }
+    mark
+}
+
 /// Calls `PfQueue::finished` when a reader is done with a job, including by
 /// panic, so a failed read can never leave the gate counters raised (which
 /// would keep speculative reads off for good).
@@ -2131,8 +2150,10 @@ pub struct ExpertShard {
     /// picks around a queued request's early paging).
     pub pinned: Vec<(u32, u32)>,
     /// A PARKED request's picks (`knobs::park`): never victims while other
-    /// requests are served under its in-flight reads. Separate from `pinned`,
-    /// which the early-paging hook sets and clears around each hint.
+    /// requests are served under its in-flight reads. A stack: a request served
+    /// inside the park appends its own and truncates back (`push_parked_pins`).
+    /// Separate from `pinned`, which the early-paging hook sets and clears
+    /// around each hint.
     pub parked_pins: Vec<(u32, u32)>,
     /// The parked request's non-resident picks as `layer << 16 | expert`, for
     /// the park hook to hand to the prefetch readers.
@@ -6085,12 +6106,10 @@ impl MoeExecutor {
                         shard.park_words.push((layer << 16) | e as u32);
                     }
                     shard.park_prefill = if shard.mode_evict_on() { shard.req_prefill } else { b > 16 };
-                    shard.parked_pins.clear();
-                    for &e in sel.iter().filter(|&&e| e != NO_PICK && (0..N_EXPERT as i32).contains(&e)) {
-                        shard.parked_pins.push((layer, e as u32));
-                    }
+                    // Append + truncate, never clear: see `push_parked_pins`.
+                    let mark = push_parked_pins(&mut shard.parked_pins, layer, sel);
                     let r = overlap(shard, true);
-                    shard.parked_pins.clear();
+                    shard.parked_pins.truncate(mark);
                     shard.park_words.clear();
                     r?;
                 }
@@ -8841,6 +8860,21 @@ mod tests {
         assert!(!park_waits_for((4, 3), &pending, &spec, resident, true));
         assert!(park_waits_for((4, 1), &pending, &spec, resident, true));
         assert!(!park_waits_for((4, 9), &pending, &spec, resident, true));
+    }
+
+    /// A request served inside a park re-enters the park block: its pins come
+    /// and go without dropping the parked request's (they used to be cleared).
+    #[test]
+    fn nested_park_keeps_the_parked_requests_pins() {
+        let mut pins: Vec<(u32, u32)> = Vec::new();
+        let outer = push_parked_pins(&mut pins, 7, &[3, NO_PICK, 9, 400]);
+        assert_eq!(pins, vec![(7, 3), (7, 9)], "NO_PICK and out-of-range ids are not pins");
+        let inner = push_parked_pins(&mut pins, 8, &[1, 2]);
+        assert_eq!(pins.len(), 4);
+        pins.truncate(inner); // the nested request's park ends
+        assert_eq!(pins, vec![(7, 3), (7, 9)], "the parked request is still protected");
+        pins.truncate(outer);
+        assert!(pins.is_empty());
     }
 
     /// `PfFinish` releases a recorded speculative key and the reader slot on
