@@ -89,9 +89,14 @@ pub fn resolve_min_p(requested: Option<f32>) -> f32 {
     requested.filter(|v| !v.is_nan()).unwrap_or(DEFAULT_MIN_P_REL).clamp(0.0, 1.0)
 }
 
-/// Refuse (400, naming the parameter) the OpenAI request fields this server
-/// does not implement, unless they are at their "off" value. They used to be
-/// dropped by serde, so a client's constraint silently did nothing.
+/// The OpenAI request fields this server does not implement that the request
+/// sets to something other than their "off" value. They used to be dropped by
+/// serde with no trace. `n != 1` is always a 400 (the response could not have
+/// the shape asked for); the sampling modifiers are returned by name for the
+/// caller to warn about, or, with `strict` (`V41_API_STRICT`), the first is a
+/// 400 naming it. Not a 400 by default: client presets send `top_k: 40` or
+/// `repetition_penalty: 1.1` on every request, and refusing those would fail
+/// whole clients over a nudge to the distribution.
 ///
 /// `top_k`, the penalties and `logit_bias` are not implemented because they
 /// would have to change the SAME distribution in every sampler: the serial
@@ -101,13 +106,14 @@ pub fn resolve_min_p(requested: Option<f32>) -> f32 {
 /// across that band), and the DSpark verify, where a penalty on row j depends
 /// on the drafts accepted before it. Untestable here without a GPU; a wrong
 /// half-implementation would be worse than a clear 400.
-pub fn check_unsupported_params(req: &ChatCompletionRequest) -> Result<(), String> {
+pub fn check_unsupported_params(req: &ChatCompletionRequest, strict: bool) -> Result<Vec<&'static str>, String> {
     if let Some(n) = req.n.filter(|&n| n != 1) {
         return Err(format!("n: only n=1 is supported, got {n}"));
     }
+    let mut set: Vec<(&'static str, String)> = Vec::new();
     // 0 is OpenAI-ish "off", -1 vLLM's.
     if let Some(k) = req.top_k.filter(|&k| k != 0 && k != -1) {
-        return Err(format!("top_k: not supported (got {k}); omit it or send 0"));
+        set.push(("top_k", format!("top_k: not supported (got {k}); omit it or send 0")));
     }
     for (name, v, off) in [
         ("presence_penalty", req.presence_penalty, 0.0),
@@ -115,13 +121,16 @@ pub fn check_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Strin
         ("repetition_penalty", req.repetition_penalty, 1.0),
     ] {
         if let Some(v) = v.filter(|&v| v != off) {
-            return Err(format!("{name}: not supported (got {v}); omit it or send {off}"));
+            set.push((name, format!("{name}: not supported (got {v}); omit it or send {off}")));
         }
     }
     if req.logit_bias.as_ref().is_some_and(|m| !m.is_empty()) {
-        return Err("logit_bias: not supported; omit it or send {}".to_string());
+        set.push(("logit_bias", "logit_bias: not supported; omit it or send {}".to_string()));
     }
-    Ok(())
+    match set.first() {
+        Some((_, msg)) if strict => Err(msg.clone()),
+        _ => Ok(set.into_iter().map(|(name, _)| name).collect()),
+    }
 }
 
 /// Assemble the worker request's sampling parameters from an OpenAI
@@ -194,7 +203,10 @@ pub async fn chat_completions(
         n_stop = req.stop.as_ref().map(|s| s.to_vec().len()).unwrap_or(0),
         "chat request"
     );
-    check_unsupported_params(&req).map_err(ApiError::BadRequest)?;
+    let ignored = check_unsupported_params(&req, crate::knobs::API_STRICT.on()).map_err(ApiError::BadRequest)?;
+    if !ignored.is_empty() {
+        tracing::warn!(params = ?ignored, "request sets sampling parameters this server does not implement; served without them (V41_API_STRICT=1 refuses them)");
+    }
     let stop = stop_sequences(req.stop.as_ref()).map_err(ApiError::BadRequest)?;
     let stream = req.stream.unwrap_or(false);
 
@@ -1021,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_params_are_refused_unless_off() {
+    fn unsupported_params_are_named_or_refused_unless_off() {
         // The "off" values are accepted silently.
         for ok in [
             "",
@@ -1034,7 +1046,7 @@ mod tests {
             r#","logit_bias":{}"#,
             r#","n":null,"top_k":null,"logit_bias":null,"presence_penalty":null"#,
         ] {
-            assert_eq!(check_unsupported_params(&req(ok)), Ok(()), "{ok}");
+            assert_eq!(check_unsupported_params(&req(ok), true), Ok(vec![]), "{ok}");
         }
         for (bad, param) in [
             (r#","n":2"#, "n:"),
@@ -1045,8 +1057,14 @@ mod tests {
             (r#","repetition_penalty":1.1"#, "repetition_penalty:"),
             (r#","logit_bias":{"50256":-100}"#, "logit_bias:"),
         ] {
-            let e = check_unsupported_params(&req(bad)).unwrap_err();
+            let e = check_unsupported_params(&req(bad), true).unwrap_err();
             assert!(e.starts_with(param), "{bad}: {e}");
+            // Not strict: served, the modifier named for the warning; n is
+            // always refused.
+            match check_unsupported_params(&req(bad), false) {
+                Ok(names) => assert_eq!(names, vec![param.trim_end_matches(':')], "{bad}"),
+                Err(e) => assert!(param == "n:" && e.starts_with("n:"), "{bad}: {e}"),
+            }
         }
     }
 

@@ -452,10 +452,11 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
     // The fields below used to be dropped by serde (no field, no
     // `deny_unknown_fields`), so a client's `stop` or `frequency_penalty`
-    // silently did nothing. Each is now either honoured or refused with a
-    // 400 by `handler::check_unsupported_params`; none is ignored.
-    /// Stop sequences (a string or up to 4 strings), matched on the visible
-    /// content only (`openai::stop`).
+    // silently did nothing. Each is now honoured, or named in a warning (a
+    // 400 with `V41_API_STRICT=1`) by `handler::check_unsupported_params`.
+    /// Stop sequences (a string or an array of up to
+    /// `stop::MAX_STOP_SEQUENCES`), matched on the visible content only
+    /// (`openai::stop`).
     #[serde(default)]
     pub stop: Option<StopSpec>,
     /// Choices per request. Only 1 is served (absent/1 OK, anything else 400).
@@ -465,19 +466,24 @@ pub struct ChatCompletionRequest {
     /// temperature. Honoured (`GenerateReq::min_p_rel`, both samplers).
     #[serde(default)]
     pub min_p: Option<f32>,
-    /// Not implemented: accepted only at the "off" values (absent, 0, -1).
+    /// Not implemented: ignored with a warning unless at an "off" value
+    /// (absent, 0, -1); a 400 under `V41_API_STRICT`.
     #[serde(default)]
     pub top_k: Option<i64>,
-    /// Not implemented: accepted only at 0 / absent.
+    /// Not implemented: ignored with a warning unless 0 / absent (400 under
+    /// `V41_API_STRICT`).
     #[serde(default)]
     pub presence_penalty: Option<f32>,
-    /// Not implemented: accepted only at 0 / absent.
+    /// Not implemented: ignored with a warning unless 0 / absent (400 under
+    /// `V41_API_STRICT`).
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
-    /// vLLM extension. Not implemented: accepted only at 1 / absent.
+    /// vLLM extension. Not implemented: ignored with a warning unless 1 /
+    /// absent (400 under `V41_API_STRICT`).
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
-    /// Not implemented: accepted only empty / absent. Values are kept as raw
+    /// Not implemented: ignored with a warning unless empty / absent (400
+    /// under `V41_API_STRICT`). Values are kept as raw
     /// JSON so an int bias (OpenAI's own examples) is not a 422.
     #[serde(default)]
     pub logit_bias: Option<serde_json::Map<String, serde_json::Value>>,

@@ -10,6 +10,12 @@ use v4flash_kernels::het::mtp::MTP_BLOCK;
 const MAX: u64 = u32::MAX as u64;
 
 v4flash_kernels::knobs! {
+    // ---- OpenAI API (static)
+    /// `V41_API_STRICT` (`1`): a request with a sampling parameter the server
+    /// does not implement (`top_k`, the penalties, `logit_bias`) is a 400.
+    /// Default off: it is served without them and a warning names them (client
+    /// presets send `top_k: 40` / `repetition_penalty: 1.1` on every request).
+    pub static API_STRICT = Knob::flag("V41_API_STRICT", false);
     // ---- multistream: scheduler and arena (static)
     /// `V41_MULTISTREAM` (`1|on`): the multistream scheduler.
     pub static MULTISTREAM = Knob::flag("V41_MULTISTREAM", false);

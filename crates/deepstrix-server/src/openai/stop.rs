@@ -23,8 +23,10 @@
 
 use crate::openai::types::StopSpec;
 
-/// OpenAI's limit on `stop` entries.
-pub const MAX_STOP_SEQUENCES: usize = 4;
+/// Most `stop` entries served. OpenAI's own limit is 4, but vLLM-style
+/// clients send more and the matcher handles any count; this only bounds
+/// its per-chunk work.
+pub const MAX_STOP_SEQUENCES: usize = 64;
 
 /// The request's stop strings, validated. More than [`MAX_STOP_SEQUENCES`] is
 /// a 400 (the message names the parameter). An empty string is dropped: it
@@ -208,7 +210,9 @@ mod tests {
         let four = StopSpec::Many(vec!["a".into(), "b".into(), "".into(), "d".into()]);
         assert_eq!(stop_sequences(Some(&four)), Ok(vec!["a".to_string(), "b".into(), "d".into()]), "empty strings dropped");
         let five = StopSpec::Many((0..5).map(|i| i.to_string()).collect());
-        let e = stop_sequences(Some(&five)).unwrap_err();
+        assert_eq!(stop_sequences(Some(&five)).map(|v| v.len()), Ok(5), "more than OpenAI's 4 are served");
+        let many = StopSpec::Many((0..=MAX_STOP_SEQUENCES).map(|i| i.to_string()).collect());
+        let e = stop_sequences(Some(&many)).unwrap_err();
         assert!(e.starts_with("stop:"), "{e}");
     }
 }
