@@ -5369,7 +5369,9 @@ pub struct GenerateResult {
     /// Tool calls parsed out of the DSML markup.
     pub tool_calls: Vec<crate::openai::types::ToolCall>,
     /// True if the scanner saw any tool call or the tool_calls block
-    /// closed (used to set finish_reason="tool_calls").
+    /// closed (used to set finish_reason="tool_calls"). False when the
+    /// token cap cut a call off (`DsmlScanner::cut_by_length`): the turn
+    /// then reports "length", with the calls closed before the cut.
     pub saw_tool: bool,
     /// True if the scanner hit an unknown DSML tag and fell back to
     /// Text mode — the model emitted broken markup (e.g.
@@ -5468,8 +5470,10 @@ pub async fn accumulate(
     // Drain scanner state. Since the DSML-repair port, finish() can
     // also emit ToolCall / ToolCallsEnd events (truncated tool-call
     // blocks recovered by appending the missing closing tags) — they
-    // must be collected exactly like live-stream ones.
-    for de in scanner.finish() {
+    // must be collected exactly like live-stream ones. A call the token
+    // cap cut off is dropped, not repaired (see `DsmlScanner::finish`).
+    let length_cut = matches!(last, Some((_, _, FinishReason::Length)));
+    for de in scanner.finish(length_cut) {
         match de {
             DsmlEvent::Text(b) => {
                 let s = drain_valid_utf8(&mut pending, &b);
@@ -5495,6 +5499,7 @@ pub async fn accumulate(
     }
     let (p, c, f) = last.ok_or_else(|| eyre!("worker closed without Done"))?;
     let saw_malformed = scanner.saw_malformed();
+    let saw_tool = saw_tool && !scanner.cut_by_length();
     Ok(GenerateResult {
         text,
         tool_calls,

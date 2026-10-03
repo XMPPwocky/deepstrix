@@ -654,8 +654,13 @@ async fn drive_sse_stream(
                 // the DSML-repair port, finish() can also emit
                 // ToolCall / ToolCallsEnd events (truncated tool-call
                 // blocks recovered by appending the missing closing
-                // tags) — stream them exactly like live ones.
-                for de in scanner.finish() {
+                // tags) — stream them exactly like live ones. A call the
+                // token cap cut off is dropped, not repaired, and the
+                // turn reports "length" below, not "tool_calls".
+                for de in scanner.finish(matches!(
+                    finish,
+                    crate::engine_worker::FinishReason::Length
+                )) {
                     match de {
                         DsmlEvent::Text(t) => {
                             let s = drain_valid_utf8(&mut content_pending, &t);
@@ -723,7 +728,7 @@ async fn drive_sse_stream(
                         return;
                     }
                 }
-                finish_reason = if saw_tool {
+                finish_reason = if saw_tool && !scanner.cut_by_length() {
                     "tool_calls"
                 } else {
                     finish.as_openai()
