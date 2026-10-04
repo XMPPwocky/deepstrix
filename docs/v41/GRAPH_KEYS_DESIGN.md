@@ -1,6 +1,7 @@
 # Arena stage graphs keyed by (stage, rows) only
 
-Status: DESIGN rev 2, 2026-10-04 (review round 1: NEEDS REWORK; dispositions in section 7).
+Status: DESIGN rev 3, 2026-10-04 (review round 1 NEEDS REWORK, round 2 APPROVE WITH CHANGES;
+dispositions in section 7).
 Branch `worktree-ms-dspark2` (on eb84ebb).
 
 ## 0. Problem
@@ -46,17 +47,28 @@ replay cost unchanged (about one launch per stage), numerics bit-identical.
 
 ### 2.0 Step 0: measure before building (GPU micro-benchmark, short window)
 
-Extend tests/bench_launch_overhead.rs (dGPU, hub down for a few minutes) and measure:
-1. Host enqueue time and the event-timed GPU gap between two dependent kernels on one stream,
-   with nothing / a `hipMemcpyAsync` H2D of 256 B from pinned memory / a 1-WG `ctx_store`
-   kernel taking a 256-B struct by value / `hipStreamWriteValue32` in between.
-2. 80 back-to-back `hipGraphLaunch` of ONE executable queued behind a long kernel (does ROCm block
-   the host or serialize an executable that is still in flight?), vs 80 distinct executables.
-3. An `_ind` vs direct twin of one gemv (`q8_0_gemv_bpack_tB{b}`) at b = 1, 4, 8: time and
-   bit-exactness.
-Go / no-go: the context write adds <= ~5 us GPU and <= the cost of one graph launch on the host,
-re-launching one executable 80x per step neither blocks nor serializes, and the `_ind` twin is
-bit-exact and within noise. Otherwise this design stops here and the doc is revised.
+A dGPU bench (tests/bench_graph_keys.rs; hub down for a few minutes). Repo evidence already
+favours the by-value write: 4eb4b69 measured tiny `hipMemcpyAsync` uploads at ~4.1 us of device
+timeline each (pinned memory no faster), and the by-value `attn_meta_fill` (attn_meta.rs:18-81)
+that replaced 3-5 of them saved 13-20 us per lane-layer (tests/bench_decode_latency_ab.rs).
+1. The context write, AMORTIZED: N x [kernel; write] vs N x [kernel] inside one event pair, the
+   queue pre-filled behind a long `slack_probe_spin` (events cost ~10 us themselves): none / H2D
+   from pinned / `ctx_store` by value / `hipStreamWriteValue32`; host enqueue time per write.
+2. 80 `hipGraphLaunch` of ONE executable vs 80 distinct executables, behind a ~50 ms spin.
+   BLOCKS = the host enqueue time of the 80 launches grows with the spin; SERIALIZES = GPU time per
+   launch > 10% above the distinct-executable case.
+3. COHERENCE: `ctx_store` then a graph whose first node reads the slot (scalar loads), alternating
+   entries, 10k rounds, every read checked.
+4. `_ind` twins vs direct: `q8_0_gemv_bpack_tB{b}` at b = 1, 4, 8 (tB8 = the VGPR worst case) and
+   `mhc_fast_batched` (13 pointer operands, short per-WG work: the prologue worst case), each
+   bit-exact and timed, with the canary log compiled in (null log pointer), VGPR/SGPR counts
+   compared.
+5. The mechanism: one captured `_ind` graph replayed after storing entry A, then B, reproduces the
+   direct kernel on A, then on B.
+Go / no-go: per step, the added GPU time plus the host critical-path time <= 1% of `ms.step` p50
+(~80-160 writes per step at <= ~5 us GPU each); neither BLOCKS nor SERIALIZES; coherence clean;
+each twin bit-exact and within max(2%, 0.3 us) of its direct kernel. Otherwise the design stops
+and is revised.
 
 ### 2.1 Operands: `Arg` and a pointer-only context
 
@@ -64,8 +76,12 @@ Wrappers take operands as `Arg::Dev(&buf)` (direct, today) or `Arg::Ctx(slot, &b
 pointer from context slot `slot` at run time). The real buffer is passed in both cases, so the
 wrappers' byte_len / len checks stay. The context is POINTER-ONLY: `struct ArenaCtx { const void*
 p[N_SLOTS]; u64 seq; }` (~24 slots + a sequence number for the canary, 2.8). The per-layer rope
-scalars live in a static device array `rope_dev[layer]` built at load; the context carries a
-POINTER to the layer's entry, so rope kernels read their 6 floats through one slot.
+values live in a static device array `rope_dev[layer]` built at load holding EXACTLY the kernel
+arguments the host derives today, `RopeTail::device_args(params, N_ROT)` (rope.rs:269-282:
+theta_scale, freq_scale, ext_factor, mscale_eff, corr_low, corr_high) -- never `RopeParams`' raw
+floats (recomputing powf / ln / corr_dims on the device is not bit-exact). One entry per layer
+suffices because all three rope kernels use n_rot 64 (asserted at load). The context carries a
+POINTER to the layer's entry.
 
 ### 2.2 The context write is tied to the capture (`ensure_ctx`)
 
@@ -73,22 +89,27 @@ In indirect mode `stage_cap_on` receives the lane-layer's entry (a host `ArenaCt
 lane-layer from `dlw`, `bd` and `rope_dev`, carried with the lane's chain state so `pre_moe_prep`
 has it too) and calls `ensure_ctx(entry)` BEFORE it replays or begins a capture: if the entry
 differs from a host shadow of the last enqueued entry (whole-entry compare, residual pointer
-included), it enqueues a write of the entry into the single device slot `ctx_dev` on the stage's
-stream and updates the shadow. Stream order makes the stage read that entry. This holds for every
-capture site and driver, including the presubmit shared expert, at ~1 write per lane-layer (2 with
-presubmit). The shadow resets at step start and on any error.
+included), it enqueues a write of the entry into the single device slot `ctx_dev` and, once the enqueue
+returned Ok, updates the shadow (compare the payload, not `seq`). Enforced, not described: the
+stream must be `de.compute` (asserted: two streams would race on one slot), no capture may be open
+on it (asserted; 2.5's node count would also catch a write captured as a node), and one host thread
+submits (debug-asserted thread id). Stream order makes the stage read that entry. This holds for
+every capture site and driver, including the presubmit shared expert, at ~1 write per lane-layer (2
+with presubmit). The shadow resets at step start and in `StageCap::drop` on an abnormal end.
 
-The write is a 1-WG `ctx_store` kernel taking the entry by value (256 B, well under the kernel
-argument limit): same HW queue as the stages, no pinned ring, nothing to keep alive. (Step 0 checks
-it against `hipStreamWriteValue32` + a static table and the H2D copy.)
+The write is a 1-WG `ctx_store` kernel taking the entry by value (264 B, well under the kernel
+argument limit) -- the production precedent is `attn_meta_fill` (attn_meta.rs:18-81, a 256-B
+`#[repr(C)]` struct by value, stream-ordered): same HW queue as the stages, nothing to keep alive.
 
 ### 2.3 Indirect kernel twins
 
 Each default-path kernel family with an L / P / R operand gets an `_ind` twin generated by a macro
-around its existing `__device__ __forceinline__` body: the twin takes `const ArenaCtx* __restrict__
-ctx`, the usual operand pointers, and a `uint32_t ind_mask`; its prologue resolves, before any
-store, `p_i = (ind_mask >> i) & 1 ? ctx->p[slot_i] : p_i` (thread-uniform, scalar loads) and calls
-the body. Direct kernels are untouched (prefill, single-token decode, uncaptured paths). Families:
+around its existing `__device__ __forceinline__` body: the twin takes the usual operand pointers and a
+`uint32_t ind_mask`; for an indirect operand the wrapper passes, in that operand's own pointer
+argument, the address of its context slot (`ctx_dev + 8 x slot`, process-static, safe to bake),
+and the prologue dereferences it, before any store: `p_i = (ind_mask >> i) & 1 ? *(T* const*)p_i :
+p_i` (thread-uniform, scalar loads). No slot table or slot ids in HIP. The canary's `seq` and log
+pointer (2.8) come the same way, read in the same prologue load sequence. Direct kernels are untouched (prefill, single-token decode, uncaptured paths). Families:
 `mhc_fast_batched`, `q8_0_gemv_bpack_tB{b}`, `q8_0_grouped_gemv_bpack[_tB{b}]`,
 `rms_quant_q8_1280_batched`, `rope_tail_batched_copy`, `kv_rms_rope_fp8`, `rope_inv_quant_q8`,
 `f16_matvec_batched_h20`, `shared_gateup_swiglu_q8_tB{b}_r1`, `q8_0_quantize_f32_wave`, and the b
@@ -105,36 +126,54 @@ entries may be dropped after a device sync (`GraphCache::retain`).
 
 ### 2.5 Taint guard: a stage that is not indirect-able cannot be cached as (stage, b)
 
-During an indirect capture a thread-local flag is set. A launch is VETTED only if it goes through
-a converted wrapper whose L / P / R operands are all `Arg::Ctx` (a `Dev` operand whose address is
-in the registered per-layer / per-lane buffer set -- every `dlw.*` tensor and every `bd.*`
-buffer, registered at load -- does not count). Any unvetted launch, and any `copy_*_async` on the
-captured stream, TAINTS the capture. At `StageCap::end` a tainted capture is instantiated and
-launched ONCE (its baked pointers are this lane-layer's, so this call is correct), NOT inserted,
-and `(stage, b, topo)` is marked legacy in a small map: later calls capture it under the legacy key
-(or run uncaptured under the memory reserve). A predicate drift therefore costs performance and a
-warning, never correctness.
+A WHITELIST, enforced at one choke point. During an indirect capture:
+- every `Arg::Dev` pointer a converted wrapper passes must lie INSIDE a registered process-static
+  range (`sd.*` and engine scratch -- the set 2.7 fingerprints; containment check, so interior
+  slices count); a `Dev` operand outside it taints the capture (a wrapper cannot know an operand's
+  role, and a blacklist of `dlw` / `bd` addresses would miss buffers allocated later and new
+  fields);
+- converted wrappers set a thread-local token consumed by `Function::launch_raw` (module.rs:105),
+  which counts VETTED launches;
+- after `end_capture`, the graph's node count (`Graph::nodes()`, graph.rs:60) must equal the
+  vetted count: an unconverted wrapper, a memcpy, a memset (`fill_zero_async`), a
+  `write_value32`, a peer copy -- any node not vetted -- taints, without listing APIs.
+A tainted capture is instantiated and launched ONCE (its `_ind` nodes read the entry written
+before `begin_capture`, its direct nodes baked this lane-layer's pointers: this call is correct),
+pushed onto a per-step RETIRE list (dropping a `GraphExec` destroys it at once, graph.rs:164-168,
+while its launch may still be queued; the list is dropped after the step's final synchronize), NOT
+inserted, and `(stage, b, topo)` is marked legacy: later calls capture it under the legacy key (or
+run uncaptured under the memory reserve). A predicate drift costs performance and a warning, never
+correctness.
 
 ### 2.6 Topology classes and the startup check
 
-At load, derive per layer, from the slot table, the topology-relevant facts of every operand a
-captured kernel reads: dtype, byte_len, the lengths of the scale / base / norm vectors, 16-B
-alignment. Layers with identical facts share a `topo` class id (expected: one class on V4.1); the
+At load, derive per layer the topology-relevant facts over the UNION of every captured stage's
+operands plus every `dlw` fact a host predicate reads inside a capture (predicates cross stages:
+`kv_chain` branches on `attn_q_a.dtype`, forward_prefill.rs:5225, and pairs its quantize skip
+with `q_chain`'s, 5010; today every such fact is an operand: 4995, 5010, 5026, 5225, 2824,
+2855-2857, 2902): dtype, byte_len, the lengths of the scale / base / norm vectors, 16-B alignment.
+Lane facts (alignment of the `bd` pointers) are not in the class: hipMalloc alignment plus 2.5's
+guard. Layers with identical facts share a `topo` class id (expected: one class on V4.1); the
 key carries the class id -- bounded, not a layer or address key -- so a mixed-dtype GGUF still
 gets indirect graphs per class instead of falling back wholesale.
 
 ### 2.7 Baked process-static operands
 
 `sd.*` and engine scratch stay direct (one per process, engine_worker.rs:1136). The first
-`stage_b` capture records a fingerprint of the `sd` buffer addresses; a later capture with a
-different fingerprint clears the `stage_b` entries first (never replays foreign pointers). One host
+capture records a fingerprint of the `sd` buffer addresses; `stage_cap_on` compares it BEFORE
+`graphs.get` (or once at step entry), and a mismatch clears both the `stage_b` and the legacy
+entries (legacy graphs bake `sd` too) after a device sync -- so no replay ever uses foreign
+pointers. One host
 thread submits to `ctx_dev` (documented invariant).
 
 ### 2.8 Device canary (tests and `V41_MS_CTX_CHECK=1`)
 
-`ensure_ctx` stamps each entry with an increasing `seq`; every `_ind` kernel (thread 0 of block 0)
-appends `ctx->seq` and its stage id to a per-step device log; after the step the host checks that
-every indirect launch read the seq the host enqueued for its lane-layer. (A readback of the slot
+`ensure_ctx` stamps each entry with an increasing `seq`; every `_ind` kernel reads `seq` in its
+prologue load sequence (the same path as its operands) and, when the log pointer is non-null (a
+uniform branch COMPILED INTO the production twins, so the canary tests the production binary),
+thread 0 of block 0 appends (seq, stage id) at an atomic cursor clamped at the log's end; the host
+knows each graph's `_ind` launch count (recorded at capture, the vetted counter of 2.5) and checks
+after the step that every indirect launch read the seq enqueued for its lane-layer. (A readback of the slot
 proves memory contents, not what the kernels read.)
 
 ### 2.9 Graph count, memory, cost
@@ -169,6 +208,11 @@ both. The eb84ebb reserve stays.
 - Presubmit: an arm with `V41_PREFILL_PRESUBMIT=1 V41_REMOTE_SPLIT=1` if it runs with box 2, else a
   unit test that interleaves `chain(B)` between `chain(A)` and `prep(A)`.
 - `V41_SLACK_PROBE` armed sets `cap_ok = false` (its alternating mode would be baked).
+- The taint path, exercised: `V41_MHC_FAST=0` sends `mhc_pre_attn` to the arm with the per-lane
+  memcpy (~4963): expect the warning, legacy marking, a bit-exact result and a non-empty retire
+  list.
+- The fingerprint mismatch: a second `sd` in one process clears the cache before any replay.
+- Rollout bar (section 4's A/B): `ms.step` p50 regression <= 1%, graphs ~64.
 
 ## 4. Rollout
 
@@ -196,3 +240,18 @@ routed-MoE graphs.
 10. Gate gaps: ACCEPTED (3).
 11. NITs: ACCEPTED (2.9 rows 9-16 fall back; 3 slack probe).
 12. Rollout default legacy: ACCEPTED (4).
+
+Review round 2 (reviewer: APPROVE WITH CHANGES):
+
+1. Taint guard fails open: ACCEPTED -- whitelist of process-static ranges, vetted count at
+   `launch_raw`, node count == vetted count (2.5).
+2. Tainted executable dropped while queued: ACCEPTED -- per-step retire list (2.5).
+3. Fingerprint only at capture: ACCEPTED -- checked before `graphs.get`, clears both caches (2.7).
+4. `rope_dev` contents: ACCEPTED -- `device_args` outputs, n_rot asserted (2.1).
+5. Shadow details: ACCEPTED (2.2).
+6. Slot ids: ACCEPTED -- operand pointer = slot address, mask = dereference (2.3).
+7. Topology over the union of stages: ACCEPTED (2.6).
+8. Canary details: ACCEPTED (2.8).
+9. Step 0 measurements / thresholds: ACCEPTED (2.0).
+10. Gates for the new paths: ACCEPTED (3).
+11. `attn_meta_fill` precedent: cited (2.2).
