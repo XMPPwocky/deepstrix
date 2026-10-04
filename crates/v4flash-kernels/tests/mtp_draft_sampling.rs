@@ -75,7 +75,7 @@ fn top_m_and_gather_match_a_host_sort() -> eyre::Result<()> {
         for k in 0..m {
             assert_eq!(got_lg[k].to_bits(), host[got_id[k] as usize].to_bits(), "case {case}: gathered logit {k}");
         }
-        let (q, d) = draft_dist(&got_id, &got_lg, 1.0, 0.95, 0.5)?;
+        let (q, d) = draft_dist(&got_id, &got_lg, 1.0, 0.95, 0.0, 0.5)?;
         assert!(q.iter().any(|&(t, _)| t == d) && (q.iter().map(|e| e.1).sum::<f64>() - 1.0).abs() < 1e-9);
     }
     // Timing: the per-position device cost the sampled exit adds.
