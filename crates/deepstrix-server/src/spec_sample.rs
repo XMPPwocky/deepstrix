@@ -747,13 +747,11 @@ mod tests {
         /// a synthetic confidence that depends on the drafts through the
         /// markov-prev channel, as the real head does: conf_k is a function
         /// of d_{k-1}.
-        #[cfg(feature = "v41")]
         Stopping,
     }
 
     /// The stopping rule's cost model, as configured (exactness must hold
     /// under any cost model).
-    #[cfg(feature = "v41")]
     static STOPPING_COST: std::sync::LazyLock<crate::ms_dspark::StepCost> =
         std::sync::LazyLock::new(crate::ms_dspark::StepCost::from_env);
 
@@ -766,7 +764,6 @@ mod tests {
                 KPolicy::Fixed(k) => k,
                 KPolicy::Random(k) => (rng.next_f32() * (k + 1) as f32) as usize,
                 KPolicy::PeekFirstDraft { .. } => 1,
-                #[cfg(feature = "v41")]
                 KPolicy::Stopping => 5,
             };
             let mut drafts = Vec::with_capacity(k_max);
@@ -791,7 +788,6 @@ mod tests {
                     drafts.clear(); // the forbidden, draft-value-dependent truncation
                 }
             }
-            #[cfg(feature = "v41")]
             if let KPolicy::Stopping = k {
                 // conf_j from the token BEFORE draft j (the stream's prev for
                 // j = 0): strongly varying, so K really depends on the drafts.
@@ -887,7 +883,6 @@ mod tests {
         SampleMode::Multinomial { temperature: 1.0, min_p_rel: 0.0, top_p }
     }
 
-    #[cfg(feature = "v41")]
     #[test]
     fn g_rs1_sampled_drafts_with_the_production_stopping_rule_are_exact() {
         let toy = Toy::new(sampled_mode(0.9));
@@ -901,7 +896,6 @@ mod tests {
     /// over synthetic confidences that depend on each stream's drafts through
     /// the markov-prev channel. `peek_a`: the negative control, stream 0's
     /// first draft verified only when its drawn value is `a`.
-    #[cfg(feature = "v41")]
     fn generate_two(toy: &Toy, starts: [i32; 2], len: usize, drafter: Drafter, peek_a: Option<i32>, rngs: &mut [SamplerRng; 2]) -> [Vec<i32>; 2] {
         use crate::ms_dspark::{choose_ks_stopping, BlockConf};
         let mut seqs: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
@@ -956,7 +950,6 @@ mod tests {
     /// prefixes against the product of the two exact plain-sampling chains
     /// (independent streams): catches a bias in either stream and any
     /// coupling between them. (statistic, critical value at p = 1e-4).
-    #[cfg(feature = "v41")]
     fn chi_square_two(toy: &Toy, starts: [i32; 2], len: usize, drafter: Drafter, peek_a: Option<i32>, n: usize, seed: u64) -> (f64, f64) {
         let mut rngs = [SamplerRng::new(seed), SamplerRng::new(seed ^ 0x5DEE_CE66_D1CE_4E5B)];
         let mut counts: HashMap<(Vec<i32>, Vec<i32>), usize> = HashMap::new();
@@ -1011,7 +1004,6 @@ mod tests {
         (stat, dof * (1.0 - h + 3.719 * h.sqrt()).powi(3))
     }
 
-    #[cfg(feature = "v41")]
     #[test]
     fn g_rs1_two_streams_with_the_joint_stopping_rule_are_exact() {
         let toy = Toy::new(sampled_mode(0.9));
@@ -1028,7 +1020,6 @@ mod tests {
 
     /// The two-stream harness has power: stream 0 verifying its first SAMPLED
     /// draft only when the draft's drawn value is `a` must be caught.
-    #[cfg(feature = "v41")]
     #[test]
     fn g_rs1_two_streams_negative_control_is_caught() {
         let toy = Toy::new(sampled_mode(1.0));

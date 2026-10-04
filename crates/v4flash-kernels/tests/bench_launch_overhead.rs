@@ -3,7 +3,6 @@
 //! floor the batched driver pays ~2000 times per step.
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release \
 //!   --features v41 -p v4flash-kernels --test bench_launch_overhead -- --ignored --nocapture
-#![cfg(feature = "v41")]
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer, Stream};
 use v4flash_kernels::het::engine::DeviceEngine;

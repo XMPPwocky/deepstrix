@@ -19,7 +19,6 @@
 //!
 //! Synthetic data, dGPU only, ~110 MB -- runs beside a live server:
 //!   cargo test -p v4flash-kernels --features v41 --release --test attention_vs_reference -- --ignored --nocapture
-#![cfg(feature = "v41")]
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer};

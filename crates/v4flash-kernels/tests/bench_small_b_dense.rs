@@ -4,7 +4,6 @@
 //! B = 1..8. Event-timed min of BENCH_ITERS. Tiny VRAM: runs next to a live server.
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release \
 //!   --features v41 -p v4flash-kernels --test bench_small_b_dense -- --ignored --nocapture
-#![cfg(feature = "v41")]
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::het::batch_scratch::f16_pitch;

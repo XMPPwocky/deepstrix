@@ -1231,12 +1231,12 @@ impl BatchDgpuScratch {
             residual_next: mk_f32(HC_DIM as usize)?,
             split: mk_f32(HC_MIX_DIM as usize)?,
             hc_pre_carry: mk_f32(HC_MIX_DIM as usize)?,
-            engram_rows: if cfg!(feature = "v41") { mk_f32(ENGRAM_IN as usize)? } else { DeviceBuffer::new(id, 32)? },
+            engram_rows: if true { mk_f32(ENGRAM_IN as usize)? } else { DeviceBuffer::new(id, 32)? },
             // Rows per Engram pass: ENGRAM_CHUNK, or 2x under `V41_ENGRAM_CHUNK128`
             // (forward_prefill::engram_chunk_rows; +6.6 MB here at 128 rows).
-            engram_xq: DeviceBuffer::new(id, if cfg!(feature = "v41") { (super::forward_prefill::engram_chunk_rows() * ENGRAM_IN) as usize } else { 32 })?,
-            engram_xscale: DeviceBuffer::new(id, if cfg!(feature = "v41") { (super::forward_prefill::engram_chunk_rows() * ENGRAM_IN / 32) as usize } else { 32 })?,
-            engram_kv: DeviceBuffer::new(id, if cfg!(feature = "v41") { (super::forward_prefill::engram_chunk_rows() * ENGRAM_OUT) as usize } else { 32 })?,
+            engram_xq: DeviceBuffer::new(id, if true { (super::forward_prefill::engram_chunk_rows() * ENGRAM_IN) as usize } else { 32 })?,
+            engram_xscale: DeviceBuffer::new(id, if true { (super::forward_prefill::engram_chunk_rows() * ENGRAM_IN / 32) as usize } else { 32 })?,
+            engram_kv: DeviceBuffer::new(id, if true { (super::forward_prefill::engram_chunk_rows() * ENGRAM_OUT) as usize } else { 32 })?,
             engram_rows_ready: false,
             mtp_src: DeviceBuffer::new(
                 id,

@@ -11,7 +11,6 @@
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels \
 //!   --release --features v41 --test head_cands -- --ignored --nocapture
 //! ```
-#![cfg(feature = "v41")]
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};

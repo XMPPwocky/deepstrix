@@ -18,9 +18,6 @@ const ROUTER_TOPK_PAR_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ROUTER_TOPK_P
 /// changes these, both have to move in lock-step.
 /// Padded expert count = kernel block size (power of two; ids in
 /// [n_expert, MAX) are -INF-padded). Must match `-DROUTER_MAX_EXPERTS` in build.rs.
-#[cfg(not(feature = "v41"))]
-pub const ROUTER_MAX_EXPERTS: u32 = 256;
-#[cfg(feature = "v41")]
 pub const ROUTER_MAX_EXPERTS: u32 = 512;
 pub const ROUTER_MAX_USED: u32 = 8;
 /// Max alternatives (ranks `n_used+1..=n_used+n_alt`) per token. Matches

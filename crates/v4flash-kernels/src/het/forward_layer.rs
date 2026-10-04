@@ -82,13 +82,8 @@ use super::sync::{peer_push_f32, peer_push_i32};
 /// Default OFF. Inert while on — nothing reads `HetCompressorState::index_k` until S1
 /// flips the sparse gate — so it is safe to enable for numerical validation.
 /// Mirror of `het::weights::is_index_source` (private there).
-#[cfg(feature = "v41")]
 pub(crate) fn is_index_source_layer(layer: i32) -> bool {
     crate::config::INDEX_SOURCE_LAYERS.contains(&layer)
-}
-#[cfg(not(feature = "v41"))]
-pub(crate) fn is_index_source_layer(_layer: i32) -> bool {
-    false
 }
 
 /// `V41_LOCAL_PICKS=N`: force box 1 to claim N of the 6 routed picks per layer
@@ -231,7 +226,7 @@ pub fn verify_routing_exactly_once(
 /// launch, which the shift also permits.
 fn mhc_split_enabled() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        cfg!(feature = "v41")
+        true
             && !std::env::var("MHC_FUSED").map(|v| v != "0").unwrap_or(false)
             && std::env::var("V41_MHC_SPLIT").map(|v| v != "0").unwrap_or(false)
             && std::env::var("RMS_NW_MW").map(|v| v == "fused").unwrap_or(true)
@@ -548,7 +543,7 @@ impl HeterogeneousEngine {
         // ============================================================
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
-        if cfg!(feature = "v41") && layer == 0 {
+        if true && layer == 0 {
             // Single-pass mHC: every token's layer-0 attention collapses with
             // the initial one-hot(copy 0) pre-mix (ARCH_SPEC §1.1).
             dgpu_scratch.hc_pre_carry.copy_from_host_async(&super::scratch::HC_PRE_ONEHOT, &de.compute)?;
@@ -707,7 +702,7 @@ impl HeterogeneousEngine {
                     }
                 }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
-                if cfg!(feature = "v41") {
+                if true {
                     // Single-pass mHC (ARCH_SPEC §1.1): collapse with the PREVIOUS
                     // sub-block's pre, then carry this sub-block's pre forward.
                     de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual, &dgpu_scratch.hc_pre_carry, N_EMBD, N_HC)?;
@@ -777,13 +772,13 @@ impl HeterogeneousEngine {
         // quantisation (E4M3 over the 448 non-RoPE dims, block 64); V4.1 quantises
         // the whole post-RoPE row at block 32 (ARCH_SPEC §1.2). Fusing that is an
         // M7 item (needs a device-slot kv_append for graph capture).
-        if *QKV_GRAPH && !standalone_graphs && !cfg!(feature = "v41") {
+        if *QKV_GRAPH && !standalone_graphs && !true {
             self.dgpu_graphs.run("qkv_chain", layer as u32, &de.compute, |s| {
                 de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
                 super::dispatch::dense_matvec(de, s, &mut dgpu_scratch.qr, &dlw.attn_q_a, &dgpu_scratch.attn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
                 de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
                 de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
-                if cfg!(feature = "v41") {
+                if true {
                     // V4.1 has no per-head q RMSNorm after wq_b (ARCH_SPEC §1.2: q = wq_b(qr); rope);
                     // keep the buffer flow, skip the norm.
                     dgpu_scratch.q_normed.copy_from_buffer_async(&dgpu_scratch.q, s)?;
@@ -824,7 +819,7 @@ impl HeterogeneousEngine {
                 // qr_normed is still written for the CSA indexer.
                 de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
                 de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
-                if cfg!(feature = "v41") {
+                if true {
                     // V4.1 has no per-head q RMSNorm after wq_b (ARCH_SPEC §1.2: q = wq_b(qr); rope);
                     // keep the buffer flow, skip the norm.
                     dgpu_scratch.q_normed.copy_from_buffer_async(&dgpu_scratch.q, s)?;
@@ -898,7 +893,7 @@ impl HeterogeneousEngine {
             }
             {
                 let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
-                if cfg!(feature = "v41") {
+                if true {
                     // V4.1 window KV: E4M3 × 2^e per 32 over the whole row, RoPE tail included.
                     de.fp4kv.launch_fp8_window(&de.compute, &mut dgpu_scratch.kv_normed, 1, N_HEAD_DIM)?;
                 } else {
@@ -1109,7 +1104,7 @@ impl HeterogeneousEngine {
                     )?;
                 }
                 let packed_store = cs.comp_kv.is_fp8();
-                if cfg!(feature = "v41") {
+                if true {
                     // V4.1: E2M1 values with one E4M3 scale per 16 over the
                     // whole post-RoPE row (ARCH_SPEC §1.3); exact in the f16 store.
                     let _t = de.events.stage("k.compressor_d.fp4kv", &de.compute)?;
@@ -1433,7 +1428,7 @@ impl HeterogeneousEngine {
             // maintained by the S1a store.
             let v41_index_k = cs.and_then(|c| c.index_k.as_ref());
             let v41_n_index = cs.map(|c| c.n_index_comp).unwrap_or(0);
-            if cfg!(feature = "v41")
+            if true
                 && v41_index_k.is_some()
                 && v41_n_index > crate::attention::ATTN_MIXED_MAX_KEYS
             {
@@ -1443,7 +1438,7 @@ impl HeterogeneousEngine {
                     crate::attention::ATTN_MIXED_MAX_KEYS
                 ));
             }
-            let (n_index_comp, keys_v41) = if cfg!(feature = "v41") && v41_index_k.is_some() {
+            let (n_index_comp, keys_v41) = if true && v41_index_k.is_some() {
                 (v41_n_index, v41_index_k)
             } else {
                 (n_index_comp, None)
@@ -1825,7 +1820,7 @@ impl HeterogeneousEngine {
             // most recent source's gathered rows, provided they belong to the same
             // compressed store. This is what takes the indexer from 8 of 40 layers to
             // all 40 — the reuse layers stop scoring their whole store.
-            let s2_reuse = cfg!(feature = "v41")
+            let s2_reuse = true
                 && index_k_enabled()
                 && !use_sparse
                 && !is_index_source_layer(layer)
@@ -2114,7 +2109,7 @@ impl HeterogeneousEngine {
                 }
             }
             de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
-            if cfg!(feature = "v41") {
+            if true {
                     // Single-pass mHC (ARCH_SPEC §1.1): collapse with the PREVIOUS
                     // sub-block's pre, then carry this sub-block's pre forward.
                     de.hc_weighted.launch(s, &mut dgpu_scratch.ffn_cur, &dgpu_scratch.after_attn_hc, &dgpu_scratch.hc_pre_carry, N_EMBD, N_HC)?;
@@ -3178,7 +3173,7 @@ impl HeterogeneousEngine {
                     }
                 }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &next.hc_attn_scale, &next.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
-                if cfg!(feature = "v41") {
+                if true {
                     // Single-pass mHC (ARCH_SPEC §1.1): collapse with the PREVIOUS
                     // sub-block's pre, then carry this sub-block's pre forward.
                     de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual_next, &dgpu_scratch.hc_pre_carry, N_EMBD, N_HC)?;

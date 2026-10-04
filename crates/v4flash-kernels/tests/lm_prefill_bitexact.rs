@@ -35,7 +35,6 @@
 //!   CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels \
 //!   --features v41 --release --test lm_prefill_bitexact -- --ignored --nocapture
 //! ```
-#![cfg(feature = "v41")]
 
 use std::path::Path;
 

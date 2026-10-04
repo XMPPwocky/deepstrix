@@ -17,7 +17,6 @@
 //!
 //!   BENCH_ROUNDS=300 BENCH_B=1 cargo test -p v4flash-kernels --release --features v41 \
 //!     --test bench_router_readback_ab -- --ignored --nocapture
-#![cfg(feature = "v41")]
 use color_eyre::eyre::{self, eyre};
 use std::time::Instant;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, PinnedBuffer, Stream};

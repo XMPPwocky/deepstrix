@@ -15,7 +15,6 @@
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels \
 //!   --release --features v41 --test mtp_ring_async -- --ignored --nocapture
 //! ```
-#![cfg(feature = "v41")]
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::V41HfWeights;

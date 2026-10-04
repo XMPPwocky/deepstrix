@@ -6,7 +6,6 @@
 //! alternatives really are ranks 7..6+n_alt.
 //!
 //! Runs on the iGPU (gfx1151); skips when there is none.
-#![cfg(feature = "v41")]
 
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer, Stream};

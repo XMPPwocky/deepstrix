@@ -152,7 +152,7 @@ fn parse_args() -> eyre::Result<Args> {
 
 fn main() -> eyre::Result<()> {
     install_panic_handler()?;
-    if !cfg!(feature = "v41") {
+    if !true {
         return Err(eyre!("deepstrix-expertd must be built with --features v41 (V4.1 experts from the HF checkpoint)"));
     }
     let args = parse_args()?;

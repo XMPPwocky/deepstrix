@@ -24,6 +24,6 @@ path = "src/bin/bench.rs"
 
 [features]
 # Model selection (non-additive!): the daemon serves DeepSeek-V4.1-Flash experts
-# from the HF checkpoint and only makes sense with `v41`. Build in target-v41
-# (docs/v41/ENGINE_PORT.md §0).
+# from the HF checkpoint. `v41` is a no-op kept for existing build commands
+# (V4.1 is the only DeepSeek model since 2026-09-24).
 v41 = ["v4flash-kernels/v41"]

@@ -22,7 +22,6 @@
 //!     -- --ignored --nocapture
 //!
 //! VRAM: < 80 MB at the largest indexer shape (3 rows x 235K keys).
-#![cfg(feature = "v41")]
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, GraphExec, PinnedBuffer, Stream};
 use v4flash_kernels::config::{

@@ -23,7 +23,6 @@
 //!     --test bench_decode_latency_ab -- --ignored --nocapture
 //!
 //! VRAM: < 20 MB.
-#![cfg(feature = "v41")]
 use color_eyre::eyre::{self, eyre};
 use std::cell::RefCell;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, GraphExec, Stream};

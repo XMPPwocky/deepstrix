@@ -13,9 +13,8 @@ use std::time::{Duration, SystemTime};
 use color_eyre::eyre::{self, eyre, WrapErr};
 use tokio::sync::{mpsc, oneshot};
 use v4flash_core::tokenizer::BpeVocab;
-#[cfg(any(test, not(feature = "v41")))]
+#[cfg(test)]
 use v4flash_core::MappedGguf;
-#[cfg(feature = "v41")]
 use v4flash_core::V41HfWeights;
 use v4flash_core::WeightSrc;
 use v4flash_hip::Device;
@@ -45,7 +44,6 @@ pub(crate) const STREAM_CHUNK_BUFFER: usize = 16_384;
 /// V4.1 Engram context: the n-gram hasher and one table handle per Engram layer
 /// (1 and 14). The tables themselves are 189 GiB on SSD and are never resident —
 /// each token gathers `ENGRAM_COLS` rows per layer through `gather_position`.
-#[cfg(feature = "v41")]
 pub struct EngramCtx {
     pub hasher: v4flash_core::EngramHash,
     pub tables: Vec<v4flash_core::EngramTable>,
@@ -58,7 +56,6 @@ pub struct EngramCtx {
     pub st: v4flash_core::SafetensorsDir,
 }
 
-#[cfg(feature = "v41")]
 impl EngramCtx {
     /// Append `token` and gather its Engram rows, one `Vec<f32>` per Engram layer
     /// in `ENGRAM_LAYERS` order. `pos` must be the token's KV position.
@@ -196,7 +193,6 @@ impl EngramCtx {
 /// Written as a macro rather than a method because the pager and the scratch
 /// buffers are disjoint fields of the same `WorkerState`: a method would have to
 /// borrow all of `self` mutably and conflict with itself.
-#[cfg(feature = "v41")]
 macro_rules! forward_one {
     ($state:expr, $residual:expr, $pos:expr, $tok:expr) => {
         if let Some(pg) = $state.pager.as_mut() {
@@ -245,29 +241,11 @@ macro_rules! forward_one {
     };
 }
 
-#[cfg(not(feature = "v41"))]
-macro_rules! forward_one {
-    ($state:expr, $residual:expr, $pos:expr, $tok:expr) => {
-        $state.engine.forward_token(
-            &mut $state.dgpu_scratch,
-            &mut $state.igpu_scratch,
-            &mut $state.state,
-            &$state.weights,
-            &$residual,
-            $pos,
-            $tok,
-        )
-    };
-}
 
 /// Verify-vs-decode argmax agreement (see `V41_DSPARK_XCHECK`).
-#[cfg(feature = "v41")]
 static XCHECK_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "v41")]
 static XCHECK_TOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "v41")]
 static XCHECK_COS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-#[cfg(feature = "v41")]
 static XCHECK_COS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// KL(decode || verify) in nats x 1e6, summed over row-0 softmax distributions.
 /// The principled "same distribution" measure — cosine on raw logits is
@@ -322,7 +300,6 @@ static XCHECK_ARM_US: [std::sync::atomic::AtomicU64; XCHECK_ARMS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; XCHECK_ARMS];
 
 /// Everything the DSpark drafter needs, loaded once at startup.
-#[cfg(feature = "v41")]
 pub struct MtpCtx {
     /// Layers + entry projection, iGPU.
     pub w: v4flash_kernels::het::weights::MtpWeights,
@@ -776,7 +753,6 @@ fn worker_main(
 
 /// Context of the stub single-sequence state multistream mode allocates when
 /// DSpark is off (`initialize_state`): ~11 MB of comp rows instead of ~1 GB.
-#[cfg(feature = "v41")]
 pub(crate) const LEGACY_STUB_CTX: u32 = 4096;
 
 pub struct WorkerState {
@@ -789,13 +765,11 @@ pub struct WorkerState {
     /// of making them resident. Owns the HF source, so the mmap it reads experts
     /// from lives as long as the model. `None` when `V41_PAGED_EXPERTS` is unset
     /// (full residency, which only fits for V4-Flash).
-    #[cfg(feature = "v41")]
     pub pager: Option<v4flash_kernels::het::ExpertPager>,
 
     /// V4.1 Engram: the n-gram hasher plus one table handle per Engram layer.
     /// The 189 GiB of tables stay on SSD and are row-gathered per token, so this
     /// holds only the hash parameters and the tensor descriptors.
-    #[cfg(feature = "v41")]
     pub engram: Option<EngramCtx>,
     pub vocab: Arc<BpeVocab>,
     pub token_embd_bytes: Vec<u8>,
@@ -805,7 +779,6 @@ pub struct WorkerState {
     /// iGPU residency, so it is not loaded unless asked for. The layer stack
     /// and its state live on the iGPU; the exit and the residual capture live
     /// on the dGPU, beside the tied `output` head.
-    #[cfg(feature = "v41")]
     pub mtp: Option<MtpCtx>,
     pub byte_decoder: std::collections::HashMap<char, u8>,
 
@@ -906,21 +879,12 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // Model source: a GGUF (V4-Flash) or the HF safetensors dir (V4.1). Both
     // present their tensors through `WeightSrc`, so everything downstream of
     // `src` is source-agnostic (compile-time model selection, see ENGINE_PORT §0).
-    #[cfg(not(feature = "v41"))]
-    let src_owner = {
-        tracing::info!(gguf = %cfg.gguf_path, "loading GGUF");
-        MappedGguf::open(&cfg.gguf_path)?
-    };
-    #[cfg(feature = "v41")]
     let src_owner = {
         tracing::info!(dir = %cfg.gguf_path, "loading V4.1 HF safetensors");
         V41HfWeights::open(&cfg.gguf_path, None)?
     };
     let src = WeightSrc::from(&src_owner);
 
-    #[cfg(not(feature = "v41"))]
-    let vocab = BpeVocab::from_gguf(src_owner.gguf())?;
-    #[cfg(feature = "v41")]
     let vocab = {
         // DeepSeek V4/V4.1 use the "joyai-llm" pre-tokenizer; the tokenizer.json
         // table is id-for-id identical to the GGUF one (tokenizer.rs).
@@ -971,7 +935,6 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // resident. `V41_PAGED_EXPERTS=1` leaves them out of the per-layer iGPU
     // weights and an ExpertPager (built below) pages the router's actual picks on
     // demand. Without the flag `load_all` still tries full residency and OOMs.
-    #[cfg(feature = "v41")]
     if v4flash_kernels::het::weights::v41_paged_experts() {
         tracing::info!("V4.1: paged expert tier ON — routed experts are NOT resident");
     } else {
@@ -980,13 +943,11 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
              resident (~276 GiB) and will OOM on this box"
         );
     }
-    #[cfg_attr(not(feature = "v41"), allow(unused_mut))]
     let mut weights = HetModelWeights::load_all(src, dgpu, igpu, &rope)?;
     tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "weights loaded");
 
     // DSpark drafter (`V41_DSPARK=1`, or `V41_MS_DSPARK=accept` on the
     // multistream arena). 7.93 GB of iGPU residency, so opt-in.
-    #[cfg(feature = "v41")]
     let mtp: Option<MtpCtx> = if matches!(
         std::env::var("V41_DSPARK").as_deref(),
         Ok("1") | Ok("on") | Ok("shadow") | Ok("accept")
@@ -1095,15 +1056,12 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // this one. Without DSpark a full-context copy is ~1.07 GB of idle dGPU at
     // --ctx 368640 (921,600 comp rows x 1,104 B + raw windows) = ~390K arena
     // positions, so allocate a stub; the legacy handler refuses to run on it.
-    #[cfg(feature = "v41")]
     // DSpark on the arena (`V41_MS_DSPARK`) runs no request on the legacy path either.
     let legacy_ctx = if crate::multistream::enabled() && (mtp.is_none() || crate::ms_dspark::enabled()) {
         LEGACY_STUB_CTX.min(cfg.n_kv_max)
     } else {
         cfg.n_kv_max
     };
-    #[cfg(not(feature = "v41"))]
-    let legacy_ctx = cfg.n_kv_max;
     let state = HetModelState::alloc(dgpu, igpu, legacy_ctx)?;
     // Two-lane pipelined prefill: each lane holds at most ceil(B_MAX/2)
     // rows of a chunk (forward_prompt_batch_v2_pipelined), so size the
@@ -1159,7 +1117,6 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
             }
             // V4.1 carries `bias_vl` in the checkpoint itself: derive the sidecar
             // the engine reads from the presented `exp_probs_b_vl.bias` tensors.
-            #[cfg(feature = "v41")]
             crate::vision_v41::ensure_bias_vl(
                 &mut weights,
                 &src,
@@ -1189,14 +1146,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
             // V4-Flash image rows widen them. Refuse at launch rather than
             // mid-prefill if --ctx makes that overrun. (V4.1 image tokens
             // attend causally — no widening, nothing to check.)
-            #[cfg(not(feature = "v41"))]
-            v4flash_kernels::attention::check_vision_ctx_fits(cfg.n_kv_max)?;
             tracing::info!(mmproj = %path.display(), "loading vision tower (iGPU)");
             let t0 = std::time::Instant::now();
-            #[cfg(not(feature = "v41"))]
-            let mut tower = v4flash_vision::Tower::load(path, igpu)
-                .map_err(|e| eyre!("loading mmproj {}: {e:#}", path.display()))?;
-            #[cfg(feature = "v41")]
             let mut tower = crate::vision_v41::load_tower(path, igpu)?;
             // Host mirror is only needed for requantisation experiments;
             // drop it so the worker doesn't sit on ~0.9 GiB of host RAM.
@@ -1231,7 +1182,6 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // model, since every routed expert is read from it on demand for the life of
     // the process. Built last so the `src` borrow above (load_all, fingerprint) is
     // finished. Slot count auto-sizes from V41_PAGER_POOL_GB.
-    #[cfg(feature = "v41")]
     let pager = if v4flash_kernels::het::weights::v41_paged_experts() {
         let t0 = std::time::Instant::now();
         let mut pg = v4flash_kernels::het::ExpertPager::new(src_owner, igpu, 0)?;
@@ -1251,7 +1201,6 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // a dumped dir; the tables are read straight out of the checkpoint. Both
     // Engram layers must resolve or the forward fails at layer 1, so this is a
     // hard error rather than a silent skip.
-    #[cfg(feature = "v41")]
     let engram = match pager.as_ref() {
         None => None,
         Some(pg) => {
@@ -1274,9 +1223,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     };
 
     Ok(WorkerState {
-        #[cfg(feature = "v41")]
         pager,
-        #[cfg(feature = "v41")]
         engram,
         dgpu,
         igpu,
@@ -1285,7 +1232,6 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         vocab: Arc::new(vocab),
         token_embd_bytes,
         token_embd_dtype,
-        #[cfg(feature = "v41")]
         mtp,
         byte_decoder,
         tower,
@@ -1689,7 +1635,6 @@ pub(crate) fn trim_heap_and_log(what: &'static str) {
 }
 
 fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
-    #[cfg(feature = "v41")]
     if crate::multistream::enabled() {
         return crate::multistream::worker_loop_ms(state, rx);
     }
@@ -1715,7 +1660,6 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                 }
                 state.progress.begin();
                 let _guard = InflightGuard(state.progress.clone());
-                #[cfg(feature = "v41")]
                 let pager_c0 = state
                     .pager
                     .as_ref()
@@ -1753,7 +1697,6 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                 // reader->caller one. Against a MEASURED 16.6 us raw TCP round
                 // trip on this link, anything here above a few us is the
                 // scheduler, and it is paid 80x per token.
-                #[cfg(feature = "v41")]
                 {
                     let (to_write, wake, slack, n_blocked, n) =
                         v4flash_kernels::het::remote_experts::take_hop_stats();
@@ -1781,7 +1724,6 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                 // relative to a request.
                 // M7: cumulative pager hit rate. Pool size only moves this number,
                 // never correctness, so it is the knob for decode throughput.
-                #[cfg(feature = "v41")]
                 if let Some(pg) = state.pager.as_ref() {
                     // PREFILL and DECODE are reported separately: prefill's dense
                     // path issues 384 requests per (layer, chunk) against decode's
@@ -1967,7 +1909,6 @@ pub(crate) fn short_hex(bytes: &[u8]) -> String {
 ///
 /// Hashes only the ACTIVE region of each buffer: rows a probe wrote past
 /// `n_raw` / `n_comp` are expected to differ and are never read.
-#[cfg(feature = "v41")]
 fn probe_fingerprint(state: &WorkerState) -> eyre::Result<Vec<(String, u64)>> {
     let mut out = Vec::new();
     let mut h = |name: String, v: &[u8]| out.push((name, u64::from_le_bytes(
@@ -2512,7 +2453,6 @@ pub(crate) fn handle_generate_stream(
                         // The snapshot carries the KV, not the Engram n-gram sequence; the
                         // suffix prefill / first decode will ask for rows at `loaded_len`
                         // and needs `compressed.len() == loaded_len` (see `rows_for`).
-                        #[cfg(feature = "v41")]
                         if let Some(ec) = state.engram.as_mut() {
                             ec.rebuild(&loaded);
                         }
@@ -2968,7 +2908,6 @@ fn save_and_forward_marker(
 /// want of its next token.
 ///
 /// `tokens` (the canonical live sequence) is kept for the log line only.
-#[cfg(feature = "v41")]
 fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyre::Result<()> {
     use v4flash_kernels::config::N_EMBD;
     let ne = N_EMBD as usize;
@@ -3063,7 +3002,6 @@ fn finish_decode(
     // position and writes them into the drafter's KV ring with the cheap
     // `ring_write_only` (a ring row depends only on the main residual at its
     // position). `V41_DSPARK_SEED_RING=0` disables.
-    #[cfg(feature = "v41")]
     if state.mtp.is_some()
         && std::env::var("V41_DSPARK_SEED_RING").as_deref() != Ok("0")
     {
@@ -3166,12 +3104,10 @@ fn finish_decode(
     // testable in isolation. Off unless set; it roughly doubles decode time.
     // Accepts a single K or a comma list ("2,4,6,8"), cycled per token, so one
     // run sweeps every verify width instead of one server load per B.
-    #[cfg(feature = "v41")]
     let verify_probe_ks: Vec<usize> = std::env::var("V41_VERIFY_PROBE")
         .ok()
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_default();
-    #[cfg(feature = "v41")]
     let verify_probe_k: usize = if verify_probe_ks.is_empty() { 0 } else { 1 };
     // `V41_VERIFY_BATCHED=1`: make the probe do ONE batched forward over K tokens
     // (the real DSpark verify step) instead of K sequential decodes (the reject
@@ -3179,14 +3115,11 @@ fn finish_decode(
     // `V41_DSPARK=accept`: actually ACT on the drafts — one batched verify per
     // step, keep the agreed prefix, roll the rest back. `V41_DSPARK=1` (shadow)
     // drafts and scores without touching the output.
-    #[cfg(feature = "v41")]
     let dspark_accept: bool = matches!(std::env::var("V41_DSPARK").as_deref(), Ok("accept"));
-    #[cfg(feature = "v41")]
     fn verify_decode_path() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| std::env::var("V41_VERIFY_DECODE_PATH").as_deref() == Ok("1"))
     }
-    #[cfg(feature = "v41")]
     let verify_probe_batched: bool =
         matches!(std::env::var("V41_VERIFY_BATCHED").as_deref(), Ok("1") | Ok("on"));
     let heartbeat_interval: u32 = std::env::var("DEEPSTRIX_HEARTBEAT_TOKENS")
@@ -3196,13 +3129,11 @@ fn finish_decode(
         .max(1);
     let mut hb_last_count: u32 = 0;
     let mut hb_last_at = std::time::Instant::now();
-    #[cfg(feature = "v41")]
     let mut hb_last_pager = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
     // Expert-read phase profile, deltaed between heartbeats. Heartbeats only fire
     // inside the decode loop, so a delta is DECODE-only reads (single-threaded, so
     // the ns sums are real wall) — unlike the cumulative figure, which is dominated
     // by prefill's 4-thread dense sweeps.
-    #[cfg(feature = "v41")]
     let mut hb_last_read = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
     // Tracks whether the decode loop exited because the client cancelled.
     // FinishReason::Stop covers both natural turn-end AND cancel, so we
@@ -3213,16 +3144,11 @@ fn finish_decode(
     // model's own half-finished output, producing "grammatically
     // correct but semantically scrambled" garbage on the retry.
     let mut was_cancelled = false;
-    #[cfg(feature = "v41")]
     let mut xcheck_pending: Option<i32> = None;
-    #[cfg(feature = "v41")]
     let mut xcheck_row0: Vec<f32> = Vec::new();
     // Which arm the in-flight probe ran under: 0 = catch-all off, 1 = on.
-    #[cfg(feature = "v41")]
     let mut xcheck_arm: usize = 0;
-    #[cfg(feature = "v41")]
     let probe_fprint: bool = std::env::var("V41_PROBE_FPRINT").as_deref() == Ok("1");
-    #[cfg(feature = "v41")]
     let mut probe_fp_before: Option<Vec<(String, u64)>> = None;
     let finish: FinishReason = loop {
         if cancel.load(Ordering::Relaxed) {
@@ -3242,7 +3168,6 @@ fn finish_decode(
             };
             // Decode's TRUE miss rate: `decode_*` counters only, over the tokens
             // in this beat. The old merged counter could not see this at all.
-            #[cfg(feature = "v41")]
             let (miss_per_tok, decode_hit, ms_per_miss) = match state.pager.as_ref() {
                 Some(pg) => {
                     let d = pg.counters() - hb_last_pager;
@@ -3259,9 +3184,6 @@ fn finish_decode(
                 }
                 None => (f64::NAN, f64::NAN, f64::NAN),
             };
-            #[cfg(not(feature = "v41"))]
-            let (miss_per_tok, decode_hit, ms_per_miss) = (f64::NAN, f64::NAN, f64::NAN);
-            #[cfg(feature = "v41")]
             if let Some(pg) = state.pager.as_ref() {
                 let d = pg.counters() - hb_last_read;
                 hb_last_read = pg.counters();
@@ -3411,7 +3333,6 @@ fn finish_decode(
         // device scratch is harmless: the previous token's logits have already been
         // sampled into `next`, and both are about to be overwritten anyway. After
         // `forward_one` below they hold the logits the next iteration samples.
-        #[cfg(feature = "v41")]
         if verify_probe_k > 0 && completion_tokens > 8 {
             let verify_probe_k =
                 verify_probe_ks[(completion_tokens as usize) % verify_probe_ks.len()];
@@ -3430,7 +3351,6 @@ fn finish_decode(
             // Interleave the small-B catch-all by step parity. Decode drives the
             // text, so both arms verify the SAME token sequence at the same
             // positions — the comparison is of the verify path alone.
-            #[cfg(feature = "v41")]
             {
                 let ab = small_b_catchall_ab();
                 if ab > 0 {
@@ -3615,7 +3535,6 @@ fn finish_decode(
                 xcheck_row0 = row.to_vec();
             }
             let dt = t_probe.elapsed();
-            #[cfg(feature = "v41")]
             {
                 // Record for EVERY bucketing mode, not just the catch-all A/B:
                 // bucketed by width this is the verify's cost curve, which is
@@ -3684,7 +3603,6 @@ fn finish_decode(
         // the longest draft prefix the model agrees with is kept. Everything
         // past the first disagreement is rolled back. The loop below then emits
         // the confirmed tokens one per iteration WITHOUT forwarding them again.
-        #[cfg(feature = "v41")]
         if dspark_accept
             && state
                 .mtp
@@ -4340,7 +4258,6 @@ fn finish_decode(
             t_embed.elapsed().as_nanos() as u64,
         );
         // Already in KV from the verify above: advance past it, forward nothing.
-        #[cfg(feature = "v41")]
         let spec_ingested = state.mtp.as_mut().is_some_and(|m| {
             let hit = m.ingested > 0;
             if hit {
@@ -4348,14 +4265,8 @@ fn finish_decode(
             }
             hit
         });
-        #[cfg(not(feature = "v41"))]
-        let spec_ingested = false;
-        #[cfg(feature = "v41")]
         let use_mtp = !spec_ingested && state.mtp.is_some() && state.pager.is_some();
-        #[cfg(not(feature = "v41"))]
-        let use_mtp = false;
         if use_mtp {
-            #[cfg(feature = "v41")]
             {
                 // Same forward, plus the hc-collapsed residual ENTERING layers
                 // 37/38/39 — the drafter's only input from the main model.
@@ -4418,7 +4329,6 @@ fn finish_decode(
         // Speculative tokens the verify already confirmed (and ingested) come
         // from the queue; `next_after` is the model's own correction that ends
         // the accepted run and is NOT yet in KV.
-        #[cfg(feature = "v41")]
         let spec_next: Option<i32> = state.mtp.as_mut().and_then(|m| {
             // By this point in the iteration `ingested` has already been
             // decremented for the token just emitted, so the queue of confirmed
@@ -4438,8 +4348,6 @@ fn finish_decode(
                 .pop_front()
                 .or_else(|| if m.ingested == 0 { m.next_after.take() } else { None })
         });
-        #[cfg(not(feature = "v41"))]
-        let spec_next: Option<i32> = None;
         next = match spec_next {
             Some(t) => t,
             None => state
@@ -4456,7 +4364,6 @@ fn finish_decode(
         // the server emits — the drafter is the part that had never been run
         // against real residuals, and acceptance is the only number that says
         // whether it is right.
-        #[cfg(feature = "v41")]
         if use_mtp && pos >= 1 {
             let mut token_row = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut token_row);
@@ -4492,7 +4399,6 @@ fn finish_decode(
             m.drafts_plain.push((pos + 1, drafts_plain));
             m.pending = Some(drafts);
         }
-        #[cfg(feature = "v41")]
         if let Some(vt) = xcheck_pending.take() {
             use std::sync::atomic::Ordering::Relaxed;
             XCHECK_TOT.fetch_add(1, Relaxed);
@@ -4551,7 +4457,6 @@ fn finish_decode(
         }
         completion_tokens += 1;
     };
-    #[cfg(feature = "v41")]
     {
         use std::sync::atomic::Ordering::Relaxed;
         let (ok, tot) = (XCHECK_OK.swap(0, Relaxed), XCHECK_TOT.swap(0, Relaxed));
@@ -4656,7 +4561,6 @@ fn finish_decode(
     // what the model actually generated. `E` counts the ingested token too, so
     // it is directly comparable to the Python oracle's 1.93 / 2.77 / 3.57 / 4.94
     // at K = 1 / 2 / 3 / 5 (a per-token acceptance of ~0.92 reproduces all four).
-    #[cfg(feature = "v41")]
     if let Some(m) = state.mtp.as_mut() {
         use v4flash_kernels::het::mtp::MTP_BLOCK;
         let mut hist = [0usize; MTP_BLOCK + 1];
@@ -5207,7 +5111,6 @@ fn prefill_suffix(
     // MTP_CAP_ROWS main-model residuals of this prefill so `seed_mtp_ring` can
     // write them into the drafter's ring. Costs one `hc_weighted` launch per MTP
     // source layer per chunk and nothing when no drafter is loaded.
-    #[cfg(feature = "v41")]
     {
         let rows = if state.mtp.is_some()
             && std::env::var("V41_DSPARK_SEED_RING").as_deref() != Ok("0")
@@ -5265,7 +5168,7 @@ fn prefill_suffix(
     // `get_image_visible`; image tokens attend causally like text), so it gets
     // NO spans — routing still picks `bias_vl` for image rows off their
     // synthetic ids, and the Engram rows above are already masked.
-    let image_spans = if cfg!(feature = "v41") {
+    let image_spans = if true {
         None
     } else {
         (!spans_abs.is_empty()).then_some(spans_abs.as_slice())
@@ -5278,7 +5181,6 @@ fn prefill_suffix(
     // Engram rows for the whole prompt: batched prefill stages them per layer
     // per lane. Gathered here because the tables are SSD-resident and the gather
     // needs the same HF source the pager owns.
-    #[cfg(feature = "v41")]
     let engram_chunk: Option<Vec<Vec<f32>>> = match (state.pager.as_ref(), state.engram.as_mut()) {
         (Some(pg), Some(ec)) => {
             let raw = pg.raw();
@@ -5318,14 +5220,8 @@ fn prefill_suffix(
         Some(&pet_each_chunk),
         image_spans,
         // M7: page experts per layer instead of reading resident buffers.
-        #[cfg(feature = "v41")]
         state.pager.as_mut(),
-        #[cfg(not(feature = "v41"))]
-        None,
-        #[cfg(feature = "v41")]
         engram_chunk.as_deref(),
-        #[cfg(not(feature = "v41"))]
-        None,
     )?;
     Ok(())
 }
@@ -5654,7 +5550,6 @@ const _: () = {
 /// in `HetModelState` and is reset there, but the drafter's ring lives on
 /// `MtpState` for the life of the process and had no reset at all. See
 /// `MtpState::reset_ring` for the measured cost of that omission.
-#[cfg(feature = "v41")]
 /// Per-request DSpark statistics, for reading real traffic rather than a fixed
 /// benchmark prompt.
 ///
@@ -5791,5 +5686,3 @@ pub(crate) fn reset_drafter_ring(state: &mut WorkerState) {
     }
 }
 
-#[cfg(not(feature = "v41"))]
-pub(crate) fn reset_drafter_ring(_state: &mut WorkerState) {}

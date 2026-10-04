@@ -353,7 +353,7 @@ enum RangeSeed<'a> {
 /// Decoder SWA Bounded Replay in `forward_prefill_pipelined` (last-token
 /// path). `V41_CED=0` restores the exact all-40-layer prefill.
 pub fn ced_enabled() -> bool {
-    cfg!(feature = "v41") && std::env::var("V41_CED").map(|v| v != "0").unwrap_or(true)
+    true && std::env::var("V41_CED").map(|v| v != "0").unwrap_or(true)
 }
 
 /// A CED continuation (`pos0 > 0`, suffix within the replay, so its decoder
@@ -387,7 +387,7 @@ fn engram_gemv_fallback() -> bool {
 /// and per-row `n_comp = 0` (`attention_mixed.hip`: "when n_comp == 0 and
 /// mask is null, the math reduces exactly to attention_swa").
 fn swa_via_mixed() -> bool {
-    cfg!(feature = "v41")
+    true
         && std::env::var("V41_SWA_MIXED").map(|v| v != "0").unwrap_or(true)
 }
 
@@ -2953,7 +2953,6 @@ impl HeterogeneousEngine {
         n: usize,
         weights: &HetModelWeights,
     ) -> eyre::Result<Vec<f32>> {
-        #[cfg(feature = "v41")]
         if self.forward_head_batch(
             head_scratch,
             &bd.residual,
@@ -2984,7 +2983,6 @@ impl HeterogeneousEngine {
     /// 129K-float host scan per row). `Ok(false)`: the batched head does not
     /// apply; use `head_rows`. `logits_b` keeps the full rows until the next
     /// head (`head_logits_row`, for a row the candidates cannot serve).
-    #[cfg(feature = "v41")]
     pub fn head_cands(
         &self,
         head_scratch: &mut DgpuScratch,
@@ -3044,7 +3042,7 @@ impl HeterogeneousEngine {
         head_scratch
             .residual
             .copy_from_buffer(&bd.residual.slice_view(idx * cs_hc, cs_hc))?;
-        if cfg!(feature = "v41") {
+        if true {
             let m = HC_MIX_DIM as usize;
             head_scratch
                 .hc_pre_carry
@@ -4670,7 +4668,7 @@ impl HeterogeneousEngine {
         // rms_nw → f16_narrow → sinkhorn → hc_weighted → rms_w
         // ========================================================
         let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
-        if cfg!(feature = "v41") && layer == 0 {
+        if true && layer == 0 {
             // Single-pass mHC: every token's layer-0 attention collapses with
             // the initial one-hot(copy 0) pre-mix (ARCH_SPEC §1.1). Rows are
             // independent, so the per-row carry survives the layer-major order.
@@ -4737,7 +4735,7 @@ impl HeterogeneousEngine {
         //   compute: waits hc_mixes_attn before `hc_post` (stage 7) reads split
         let mhc_split = cap_ok
             && ms_mhc_split()
-            && cfg!(feature = "v41")
+            && true
             && ced != CedMode::KvSourceOnly
             && b <= super::batch_scratch::MHC_SPLIT_MAX_ROWS;
         if mhc_split {
@@ -4789,7 +4787,7 @@ impl HeterogeneousEngine {
         // the launch's last WG then writes carry := split, except on a CED
         // source-only call, which leaves the carry as it entered the layer.
         let fast_attn = mhc_fast()
-            && cfg!(feature = "v41")
+            && true
             && mhc_arena_fused()
             && mhc_pre_scaled_for(b)
             && (b as usize) <= sd.mhc_counters.len();
@@ -4941,7 +4939,7 @@ impl HeterogeneousEngine {
             // w_stride: split is [B, HC_MIX_DIM]; pre-sigmoid w is first n_hc.
             // V4.1 collapses with the PREVIOUS sub-block's pre (carry), then
             // carries this sub-block's pre forward (decode twin: forward_layer.rs).
-            let w = if cfg!(feature = "v41") { &bd.hc_pre_carry } else { &bd.split };
+            let w = if true { &bd.hc_pre_carry } else { &bd.split };
             de.hc_weighted.launch_batched(&de.compute, &mut sd.attn_cur, &bd.residual, w, N_EMBD, N_HC, HC_MIX_DIM, b)?;
             // Bisect within layer 0 (KNOWN_BUGS #0b): attn_cur is the mHC
             // COLLAPSE output, before attention runs. If it already differs from
@@ -4957,7 +4955,7 @@ impl HeterogeneousEngine {
             }
             // M7 CED: a source-only call leaves the carry as it entered the
             // layer (the replay re-runs this sub-block and carries it then).
-            if cfg!(feature = "v41") && ced != CedMode::KvSourceOnly {
+            if true && ced != CedMode::KvSourceOnly {
                 let rows = b as usize * HC_MIX_DIM as usize;
                 let cur = bd.split.slice_view(0, rows);
                 bd.hc_pre_carry.slice_view_mut(0, rows).copy_from_buffer_async(&cur, &de.compute)?;
@@ -5134,7 +5132,7 @@ impl HeterogeneousEngine {
             }
         }
         // `V41_DEC_FUSE`: V4.1's `q_normed := q` copy and the q rope in one launch.
-        let q_rope_copy = cfg!(feature = "v41") && dec_fuse(b)
+        let q_rope_copy = true && dec_fuse(b)
             && crate::rope::RopeTail::copy_ok(&sd.q, &sd.q_normed, N_HEAD_DIM, N_ROT);
         if q_rope_copy {
             let _t = de.events.stage("k.q_chain.rope_copy", &de.compute)?;
@@ -5153,7 +5151,7 @@ impl HeterogeneousEngine {
         } else {
         {
             let _t = de.events.stage("k.q_chain.rms_nw_heads", &de.compute)?;
-            if cfg!(feature = "v41") {
+            if true {
                 // V4.1 has no per-head q RMSNorm after wq_b (ARCH_SPEC §1.2);
                 // rope reads q_normed, so pass q through (decode twin: forward_layer.rs).
                 let n = b as usize * Q_FLAT as usize;
@@ -5245,7 +5243,7 @@ impl HeterogeneousEngine {
             }
         }
         // `V41_DEC_FUSE`: V4.1 window KV rms(512) + rope + fp8 in one launch.
-        let kv_fused = cfg!(feature = "v41") && dec_fuse(b) && N_HEAD_DIM == 512 && N_ROT == 64;
+        let kv_fused = true && dec_fuse(b) && N_HEAD_DIM == 512 && N_ROT == 64;
         if kv_fused {
             let _t = de.events.stage("k.kv_chain.rms_rope_fp8", &de.compute)?;
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
@@ -5290,7 +5288,7 @@ impl HeterogeneousEngine {
         }
         if !kv_fused {
             let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
-            if cfg!(feature = "v41") {
+            if true {
                 // V4.1 window KV: E4M3 × 2^e per 32 over the whole row (decode twin: forward_layer.rs).
                 de.fp4kv.launch_fp8_window(&de.compute, &mut sd.kv_normed, b, N_HEAD_DIM)?;
             } else {
@@ -6018,7 +6016,7 @@ impl HeterogeneousEngine {
                 }
                 match &mut cs.comp_kv {
                     CompKvStore::F16(buf) => {
-                        if cfg!(feature = "v41") {
+                        if true {
                             // V4.1: E2M1 × E4M3/16 fake quant over the whole row
                             // (decode twin: forward_layer.rs `k.compressor_d.fp4kv`).
                             de.fp4kv.launch(&de.compute, &mut sd.comp_rows_batched, n_boundaries, N_HEAD_DIM)?;
@@ -7467,7 +7465,7 @@ impl HeterogeneousEngine {
         // heads16 cast unless the f16x arm reads it.
         let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
             .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
-        let heads_rope_quant_fused = cfg!(feature = "v41") && dec_fuse(b) && grp_variant != "f16x"
+        let heads_rope_quant_fused = true && dec_fuse(b) && grp_variant != "f16x"
             && N_HEAD == 64 && N_HEAD_DIM == 512 && N_ROT == 64;
         if heads_rope_quant_fused {
             let _t = de.events.stage("k.output_proj.rope_inv_quant", &de.compute)?;
@@ -7667,12 +7665,12 @@ impl HeterogeneousEngine {
             bd.mhc_ffn_split_pending = true;
         } else {
         let fused_ffn = mhc_arena_fused() && mhc_narrow_fallback_for(b) && (b as usize) <= sd.mhc_counters.len();
-        ffn_mix_late = fused_ffn && mhc_ffn_late() && cap_ok && cfg!(feature = "v41") && ced != CedMode::KvSourceOnly;
+        ffn_mix_late = fused_ffn && mhc_ffn_late() && cap_ok && true && ced != CedMode::KvSourceOnly;
         let cap = self.stage_cap(de, "g.mhc_pre_ffn", layer as usize, b, lane_ptr, cap_ok)?;
         if !cap.skip {
         // `V41_MHC_FAST`: collapse + rms_w as one launch (the mixes follow the
         // router under `mhc_ffn_late`), or the whole sub-block inline.
-        let fast_ffn = fused_ffn && mhc_fast() && cfg!(feature = "v41");
+        let fast_ffn = fused_ffn && mhc_fast() && true;
         if fast_ffn {
             let _t = de.events.stage("k.mhc_pre_ffn.fast", &de.compute)?;
             let mix = if ffn_mix_late {
@@ -7782,10 +7780,10 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.mhc_pre_ffn.hc_weighted", &de.compute)?;
-            let w = if cfg!(feature = "v41") { &bd.hc_pre_carry } else { &bd.split };
+            let w = if true { &bd.hc_pre_carry } else { &bd.split };
             de.hc_weighted.launch_batched(&de.compute, &mut sd.ffn_cur, &bd.after_attn_hc, w, N_EMBD, N_HC, HC_MIX_DIM, b)?;
             // Late mixes: the carry := split copy follows them after the router.
-            if cfg!(feature = "v41") && !ffn_mix_late {
+            if true && !ffn_mix_late {
                 let rows = b as usize * HC_MIX_DIM as usize;
                 let cur = bd.split.slice_view(0, rows);
                 bd.hc_pre_carry.slice_view_mut(0, rows).copy_from_buffer_async(&cur, &de.compute)?;
@@ -11742,7 +11740,7 @@ mod remote_sel_tests {
     }
 }
 
-#[cfg(all(test, feature = "v41"))]
+#[cfg(test)]
 mod lm_tests {
     use super::*;
 

@@ -218,7 +218,7 @@ impl HetCompressorState {
         };
         // Index-K only for V4.1's MAIN compressor (head_dim 512). The ratio-4
         // indexer compressor passes N_INDEXER_HEAD_DIM and must not get one.
-        let index_k = if cfg!(feature = "v41") && head_dim == N_HEAD_DIM {
+        let index_k = if true && head_dim == N_HEAD_DIM {
             dgpu_device.set_current()?;
             Some(DeviceBuffer::new(
                 dgpu_device.id,
@@ -864,7 +864,6 @@ mod tests {
 
     /// The same through a real mark: every V4.1 store that owns an accumulator,
     /// and the rows `advanced_by` then commits agree with it.
-    #[cfg(feature = "v41")]
     #[test]
     fn mark_uses_the_owning_layers_ratios() {
         let n = crate::config::N_LAYER as usize;

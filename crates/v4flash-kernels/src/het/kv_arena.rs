@@ -1497,7 +1497,6 @@ mod tests {
 
     /// A `KvArena` with stores and streams but no device buffers: `tables`,
     /// `can_step_rows`, `advance` and `commit_copies` touch only host state.
-    #[cfg(feature = "v41")]
     fn host_arena(n_slots: u32, rows_cap: u32) -> KvArena {
         let stores = KV_SOURCE_LAYERS
             .iter()
@@ -1518,7 +1517,6 @@ mod tests {
     /// The per-row dependency check (`check_row_dependencies`) passes the
     /// tables `tables` builds and catches each way a row could stop reading
     /// what its parent writes.
-    #[cfg(feature = "v41")]
     #[test]
     fn every_row_reads_what_its_parent_writes() {
         let mut ar = host_arena(3, 100_000);
@@ -1553,7 +1551,6 @@ mod tests {
     /// One `tables` call split by row range (`RowTables::rows`, the lanes of
     /// an ordered two-lane verify): reassembles exactly, equals per-lane calls
     /// at a cut between streams, continues positions at a cut through one.
-    #[cfg(feature = "v41")]
     #[test]
     fn lane_ranges_of_one_tables_call() {
         // Three streams at positions straddling ratio-2 parities and the raw
@@ -1621,7 +1618,6 @@ mod tests {
     /// group, into the next comp row of the region. A second stream steps one
     /// row at a time in the same steps (rows before and after the run) and
     /// must get the tables it gets alone.
-    #[cfg(feature = "v41")]
     #[test]
     fn multi_row_tables_match_one_row_steps() {
         let mut ar = host_arena(3, 100_000);
