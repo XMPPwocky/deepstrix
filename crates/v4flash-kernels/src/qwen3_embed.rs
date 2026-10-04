@@ -330,14 +330,28 @@ pub fn run(
     inputs: &[&[u32]],
     after_layer: &mut dyn FnMut(usize) -> eyre::Result<()>,
 ) -> eyre::Result<(Vec<Vec<f32>>, EmbedTimings)> {
-    let r = run_inner(k, g, model, file, bufs, host, compute, copy, inputs, after_layer);
+    // The events live here, past the streams' synchronize below: on an error
+    // path they may still be recorded / waited on when `run_inner` returns.
+    let ev = Events {
+        h2d_done: [Event::new_no_timing()?, Event::new_no_timing()?],
+        comp_done: [Event::new_no_timing()?, Event::new_no_timing()?],
+    };
+    let r = run_inner(k, g, model, file, bufs, host, compute, copy, inputs, after_layer, &ev);
     // Nothing may still be reading the host buffers or writing the loan.
     let s1 = compute.synchronize();
     let s2 = copy.synchronize();
+    drop(ev);
     let out = r?;
     s1?;
     s2?;
     Ok(out)
+}
+
+/// Per ring buffer: its H2D done (copy stream) / the compute that read it
+/// done (compute stream).
+struct Events {
+    h2d_done: [Event; 2],
+    comp_done: [Event; 2],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -352,7 +366,9 @@ fn run_inner(
     copy: &Stream,
     inputs: &[&[u32]],
     after_layer: &mut dyn FnMut(usize) -> eyre::Result<()>,
+    ev: &Events,
 ) -> eyre::Result<(Vec<Vec<f32>>, EmbedTimings)> {
+    let Events { h2d_done, comp_done } = ev;
     let t0 = Instant::now();
     let c = &model.cfg;
     let layout = &model.layout;
@@ -396,8 +412,6 @@ fn run_inner(
         HostBuf(host[1].as_mut_slice().as_mut_ptr(), layout.bytes),
     ];
     let [hs0, hs1] = host_bufs;
-    let h2d_done = [Event::new_no_timing()?, Event::new_no_timing()?];
-    let comp_done = [Event::new_no_timing()?, Event::new_no_timing()?];
     let mut comp_recorded = [false, false];
 
     std::thread::scope(|scope| -> eyre::Result<()> {
@@ -408,7 +422,11 @@ fn run_inner(
                 let t = Instant::now();
                 // SAFETY: see `HostBuf`.
                 let dst = unsafe { std::slice::from_raw_parts_mut(hs.0, hs.1) };
-                let r = model.read_layer_into_par(file, l, dst, READERS).map(|_| (l, t.elapsed().as_secs_f64() * 1e3));
+                // A reader panic becomes an error here, not a re-panic at the
+                // end of the scope (which would unwind with the loan out).
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.read_layer_into_par(file, l, dst, READERS)))
+                    .unwrap_or_else(|_| Err(eyre!("embed reader panicked reading layer {l}")))
+                    .map(|_| (l, t.elapsed().as_secs_f64() * 1e3));
                 let failed = r.is_err();
                 if done_tx.send(r).is_err() || failed {
                     break;

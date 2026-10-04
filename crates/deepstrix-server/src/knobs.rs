@@ -158,7 +158,7 @@ v4flash_kernels::knobs! {
     /// phase. Sizes the dGPU loan.
     pub static EMBED_PHASE_TOKENS = Knob::int("V41_EMBED_PHASE_TOKENS", 16384, 64, 1 << 20);
     /// `V41_EMBED_SUB_ROWS` (default 1024): rows per sub-batch. Sizes the loan.
-    pub static EMBED_SUB_ROWS = Knob::int("V41_EMBED_SUB_ROWS", 1024, 16, 1 << 16);
+    pub static EMBED_SUB_ROWS = Knob::int("V41_EMBED_SUB_ROWS", 1024, 16, 65_535);
     /// `V41_EMBED_MAX_INPUT_TOKENS` (default 8192): tokens per input (EOS
     /// included); at most the phase's tokens.
     pub static EMBED_MAX_INPUT_TOKENS = Knob::int("V41_EMBED_MAX_INPUT_TOKENS", 8192, 2, 1 << 20);

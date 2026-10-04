@@ -85,12 +85,14 @@ impl EmbedQueue {
         EmbedQueue { reqs: Mutex::new(VecDeque::new()), tokens: AtomicUsize::new(0), cap_tokens, wake_pending: AtomicBool::new(false) }
     }
 
-    /// Queue a request, or `Busy` when it would pass the cap. An empty queue
-    /// always takes one, so a request larger than the cap is not refused
-    /// forever.
+    /// Queue a request, or `Busy` when it would pass the cap. The cap counts
+    /// every UNFINISHED request's tokens (queued, or taken by the worker and
+    /// not yet replied to: `release`). With nothing unfinished one request is
+    /// always taken, so a request larger than the cap is not refused forever.
     pub fn push(&self, r: EmbedRequest) -> Result<(), SubmitError> {
         let mut q = self.reqs.lock().unwrap_or_else(|e| e.into_inner());
-        if !q.is_empty() && self.tokens.load(Ordering::Relaxed) + r.tokens > self.cap_tokens {
+        let held = self.tokens.load(Ordering::Relaxed);
+        if held > 0 && held + r.tokens > self.cap_tokens {
             return Err(SubmitError::Busy);
         }
         self.tokens.fetch_add(r.tokens, Ordering::Relaxed);
@@ -102,12 +104,19 @@ impl EmbedQueue {
         self.reqs.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// The worker takes a request (it still counts against the cap).
     fn pop(&self) -> Option<EmbedRequest> {
-        let r = self.reqs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-        if let Some(r) = &r {
-            self.tokens.fetch_sub(r.tokens, Ordering::Relaxed);
-        }
-        r
+        self.reqs.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+    }
+
+    /// A taken request is finished (replied, failed or dropped).
+    fn release(&self, tokens: usize) {
+        self.tokens.fetch_sub(tokens, Ordering::Relaxed);
+    }
+
+    /// Tokens of unfinished requests (tests, telemetry).
+    pub fn held_tokens(&self) -> usize {
+        self.tokens.load(Ordering::Relaxed)
     }
 
     /// True when the caller must send a wake (none is pending).
@@ -226,8 +235,14 @@ impl EmbedCtx {
         if vocab.pre.as_deref() != Some("qwen2") {
             tracing::warn!(pre = ?vocab.pre, "embed GGUF: tokenizer pre-type is not qwen2; encoding with the qwen2 splitter anyway");
         }
-        // The tokenizer arrays now live in `vocab`; free the parsed copy.
+        // Every id the tokenizer can emit has a token_embd row.
+        if vocab.vocab_size() > model.cfg.n_vocab {
+            return Err(eyre!("embed GGUF: the tokenizer has {} tokens, token_embd {} rows", vocab.vocab_size(), model.cfg.n_vocab));
+        }
+        // The tokenizer arrays now live in `vocab`; free the parsed copy. No
+        // readahead around the phase's reads (they drop what they read).
         file.drop_metadata();
+        file.advise_random();
         let sizing = EmbedSizing { phase_tokens: knobs::EMBED_PHASE_TOKENS.usize(), sub_rows: knobs::EMBED_SUB_ROWS.usize() };
         let max_input_tokens = knobs::EMBED_MAX_INPUT_TOKENS.usize().min(model.cfg.n_ctx_train);
         if max_input_tokens > sizing.phase_tokens {
@@ -311,11 +326,30 @@ impl EmbedCtx {
     pub fn fail_all(&mut self, msg: &str) {
         while let Some(mut r) = self.queue.pop() {
             r.fail(msg);
+            self.queue.release(r.tokens);
         }
         for r in self.active.iter_mut() {
             r.fail(msg);
+            self.queue.release(r.tokens);
         }
         self.active.clear();
+    }
+
+    /// Reply to finished requests and drop failed or abandoned ones; each
+    /// leaving request releases its tokens from the queue's cap.
+    fn settle_requests(&mut self) {
+        let queue = &self.queue;
+        self.active.retain_mut(|r| {
+            if r.reply.is_some() && r.results.iter().all(Option::is_some) {
+                let out: Vec<Vec<f32>> = r.results.iter_mut().map(|x| x.take().expect("checked")).collect();
+                let _ = r.reply.take().expect("checked").send(Ok(out));
+            }
+            if r.gone() {
+                queue.release(r.tokens);
+                return false;
+            }
+            true
+        });
     }
 
     /// The next phase's inputs: (index in `active`, input index), round-robin
@@ -323,12 +357,10 @@ impl EmbedCtx {
     /// last phase's first request) within the token budget. Every input fits
     /// alone (the handler caps inputs at `max_input_tokens <= phase_tokens`).
     fn take_batch(&mut self) -> Vec<(usize, usize)> {
-        self.active.retain(|r| !r.gone());
         while let Some(r) = self.queue.pop() {
-            if !r.gone() {
-                self.active.push_back(r);
-            }
+            self.active.push_back(r);
         }
+        self.settle_requests();
         let n = self.active.len();
         let mut batch = Vec::new();
         if n == 0 {
@@ -376,19 +408,30 @@ impl EmbedCtx {
         st.inputs = batch.len();
         st.tokens = batch.iter().map(|(ri, ii)| self.active[*ri].inputs[*ii].len()).sum();
         st.wait_ms = self.active.iter().map(|r| r.queued.elapsed().as_secs_f64() * 1e3).fold(0.0, f64::max);
-        let mut host: Option<[PinnedBuffer<u8>; 2]> = None;
+        // The pinned buffers BEFORE the loan is out: failing here (host memory
+        // pressure) touches nothing on the device, so it fails the batch's
+        // requests, not the hub.
+        let tp = Instant::now();
+        let mut host = match PinnedBuffer::<u8>::new(self.model.layout.bytes)
+            .and_then(|a| Ok([a, PinnedBuffer::<u8>::new(self.model.layout.bytes)?]))
+        {
+            Ok(h) => h,
+            Err(e) => {
+                let msg = format!("embedding failed: pinned host buffers: {e:#}");
+                tracing::error!(error = %msg, inputs = st.inputs, "embed phase: not started");
+                for (ri, _) in &batch {
+                    self.active[*ri].fail(&msg);
+                }
+                self.settle_requests();
+                return st;
+            }
+        };
+        st.pinned_ms = tp.elapsed().as_secs_f64() * 1e3;
         let out = LoanOut;
         let r = self.forward(engine, progress, &batch, &mut host, &mut st);
         // The loan goes back whatever the forward did.
         let tr = Instant::now();
-        let verify = knobs::EMBED_VERIFY.on();
-        let back = match host.as_mut() {
-            Some(h) => self.loan.give_back(&engine.dgpu.xfer, h, verify),
-            None => PinnedBuffer::<u8>::new(self.model.layout.bytes)
-                .and_then(|a| Ok([a, PinnedBuffer::<u8>::new(self.model.layout.bytes)?]))
-                .and_then(|mut h| self.loan.give_back(&engine.dgpu.xfer, &mut h, verify)),
-        };
-        match back {
+        match self.loan.give_back(&engine.dgpu.xfer, &mut host, knobs::EMBED_VERIFY.on()) {
             Ok(rs) => {
                 std::mem::forget(out);
                 st.return_ms = tr.elapsed().as_secs_f64() * 1e3;
@@ -398,7 +441,11 @@ impl EmbedCtx {
                     tracing::warn!(retried = rs.retried, "embed phase: loan chunks needed a second return");
                 }
                 if rs.guard_violations > 0 {
-                    tracing::error!(donors = rs.guard_violations, "embed phase: a kernel wrote past its loan (guard band changed; repaired by the return)");
+                    // The canaries are repaired, but a kernel that wrote
+                    // outside its buffer may also have written outside the
+                    // loan, into V4.1 state no image covers.
+                    tracing::error!(canaries = rs.guard_violations, "embed phase: a kernel wrote outside its loan buffer");
+                    drop(LoanOut); // aborts
                 }
             }
             Err(e) => {
@@ -408,6 +455,12 @@ impl EmbedCtx {
             }
         }
         drop(host);
+        // The engine's cached current device is stale after the phase (both
+        // the serial and the multistream loop).
+        engine.invalidate_device_cache();
+        if let Err(e) = engine.dgpu.device.set_current() {
+            tracing::warn!(error = %e, "embed phase: restoring the dGPU as current failed");
+        }
         match r {
             Ok(rows) => {
                 st.ok = true;
@@ -434,18 +487,12 @@ impl EmbedCtx {
         reqs.sort_unstable();
         reqs.dedup();
         st.requests = reqs.len();
-        // Reply to finished requests; drop failed (already replied) ones.
-        self.active.retain_mut(|r| {
-            if r.reply.is_none() {
-                return false;
-            }
-            if r.results.iter().all(Option::is_some) {
-                let out: Vec<Vec<f32>> = r.results.iter_mut().map(|x| x.take().expect("checked")).collect();
-                let _ = r.reply.take().expect("checked").send(Ok(out));
-                return false;
-            }
-            true
-        });
+        self.settle_requests();
+        // Constraint 2: no page of the GGUF stays cached. Per-range DONTNEED
+        // keeps partial edge pages (every 2.7 KB token row is one).
+        if let Err(e) = self.file.drop_page_cache() {
+            tracing::warn!(error = %e, "embed phase: dropping the GGUF's page cache failed");
+        }
         st.total_ms = t0.elapsed().as_secs_f64() * 1e3;
         self.last_end = Some(Instant::now());
         self.last_dur = t0.elapsed();
@@ -469,23 +516,20 @@ impl EmbedCtx {
     }
 
     /// The forward over `batch`: quiesce the dGPU, load the kernels, carve the
-    /// loan, run. Returns each batch entry's last hidden row. `host` receives
-    /// the phase's pinned buffers (the return reuses them).
+    /// loan, run. Returns each batch entry's last hidden row. `h` = the
+    /// phase's pinned buffers (the return reuses them).
     fn forward(
         &mut self,
         engine: &HeterogeneousEngine,
         progress: &WorkerProgress,
         batch: &[(usize, usize)],
-        host: &mut Option<[PinnedBuffer<u8>; 2]>,
+        h: &mut [PinnedBuffer<u8>; 2],
         st: &mut PhaseStats,
     ) -> eyre::Result<Vec<Vec<f32>>> {
         let dgpu: Device = engine.dgpu.device;
         dgpu.set_current()?;
         // L1: nothing queued on the dGPU may still read a donor.
         dgpu.synchronize()?;
-        let tp = Instant::now();
-        let h = host.insert([PinnedBuffer::<u8>::new(self.model.layout.bytes)?, PinnedBuffer::<u8>::new(self.model.layout.bytes)?]);
-        st.pinned_ms = tp.elapsed().as_secs_f64() * 1e3;
         let k = Qwen3EmbedKernels::for_arch(&self.arch)?;
         let mut alloc = self.loan.allocator()?;
         let mut bufs = EmbedBuffers::carve(&mut alloc, self.sizing, &self.model.cfg, &self.model.layout)?;
@@ -527,8 +571,13 @@ mod tests {
         assert!(q.push(big).is_ok(), "an empty queue takes anything");
         let (small, _r2) = req(&[2]);
         assert!(matches!(q.push(small), Err(SubmitError::Busy)));
-        assert!(q.pop().is_some());
+        // Taken by the worker, the request still counts until it finishes.
+        let taken = q.pop().expect("queued");
         let (small, _r3) = req(&[2]);
+        assert!(matches!(q.push(small), Err(SubmitError::Busy)));
+        q.release(taken.tokens);
+        assert_eq!(q.held_tokens(), 0);
+        let (small, _r4) = req(&[2]);
         assert!(q.push(small).is_ok());
     }
 

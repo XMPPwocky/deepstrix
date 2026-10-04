@@ -615,10 +615,20 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    /// The engine thread has exited (its request channel is closed).
+    pub fn worker_gone(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Queue an embedding request and wake the worker if no wake is pending.
     /// `Busy` when the embed queue is full (HTTP 503).
     pub fn submit_embed(&self, r: crate::embed_phase::EmbedRequest) -> Result<(), SubmitError> {
         let Some(info) = self.embed.as_ref() else { return Err(SubmitError::WorkerDead) };
+        // A dead worker never drains the queue (and a wake stuck pending
+        // would hide the closed channel below).
+        if self.worker_gone() {
+            return Err(SubmitError::WorkerDead);
+        }
         info.queue.push(r)?;
         if info.queue.claim_wake() {
             match self.tx.try_send(EngineRequest::EmbedWake) {

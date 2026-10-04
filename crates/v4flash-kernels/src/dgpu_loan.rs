@@ -8,6 +8,12 @@
 //! guarantees nothing reads them until [`Loan::give_back`] has returned (the
 //! hub: an exclusive embed phase between scheduler ticks).
 //!
+//! The job's buffers are PLANNED once ([`Loan::new`]) with CANARIES around
+//! them: a band before the first buffer of each donor, a gap between
+//! consecutive buffers, and a guard band after the last. Canaries are imaged
+//! but never lent; every return first checks that none changed (a kernel wrote
+//! outside its buffer).
+//!
 //! Generic over the donors: it knows device ranges, not what they hold.
 
 use std::fs::File;
@@ -19,8 +25,11 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre, WrapErr};
 use v4flash_hip::{DeviceBuffer, Event, PinnedBuffer, Stream};
 
-/// Alignment of every sub-allocation.
+/// Alignment of every lent buffer.
 pub const LOAN_ALIGN: usize = 256;
+
+/// Canary before each donor's first buffer and between consecutive buffers.
+pub const CANARY_BYTES: usize = 64 << 10;
 
 /// One donor: a non-owning view of an immutable device buffer.
 pub struct Donor {
@@ -29,8 +38,8 @@ pub struct Donor {
 }
 
 /// The image's content check: one 64-bit hash per `chunk` bytes of each
-/// donor range. Accidental corruption is what it guards against, so a fast
-/// non-cryptographic mix is enough.
+/// donor range, and one per canary. Accidental corruption is what it guards
+/// against, so a fast non-cryptographic mix is enough.
 pub fn chunk_hash(bytes: &[u8]) -> u64 {
     const P1: u64 = 0x9E37_79B9_7F4A_7C15;
     const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
@@ -55,25 +64,59 @@ pub struct ReturnStats {
     pub verify_ms: f64,
     /// Chunks whose read-back hash differed on the first attempt (retried).
     pub retried: u32,
-    /// Donors whose guard band (imaged, never lent) changed while lent: a
-    /// kernel wrote past its allocation. The return repairs the band.
+    /// Canaries that changed while lent: a kernel wrote outside its buffer.
+    /// The return repairs them, but what else it hit is unknown.
     pub guard_violations: u32,
+}
+
+/// Where one lent buffer lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Placement {
+    donor: usize,
+    offset: usize,
+    bytes: usize,
+}
+
+/// Plan `sizes` (in order) first-fit into donors of capacity `caps` (taken
+/// in order as needed): `canary` before each donor's first buffer and after
+/// every buffer, then `guard` after the last (capped at the donor's size).
+/// Returns the placements and each donor's imaged bytes.
+fn plan(caps: &[usize], sizes: &[usize], canary: usize, guard: usize) -> eyre::Result<(Vec<Placement>, Vec<usize>)> {
+    let mut cursor: Vec<usize> = Vec::new();
+    let mut out = Vec::with_capacity(sizes.len());
+    for &s in sizes {
+        let need = s.div_ceil(LOAN_ALIGN) * LOAN_ALIGN;
+        loop {
+            if let Some(d) = (0..cursor.len()).find(|&d| cursor[d] + need + canary <= caps[d]) {
+                out.push(Placement { donor: d, offset: cursor[d], bytes: need });
+                cursor[d] += need + canary;
+                break;
+            }
+            if cursor.len() == caps.len() {
+                return Err(eyre!("dGPU loan: donors exhausted placing a {need} B buffer (sizes {sizes:?})"));
+            }
+            cursor.push(canary);
+        }
+    }
+    // Imaged: through the last buffer's trailing canary, plus the guard.
+    let used = cursor.iter().zip(caps).map(|(c, cap)| (c + guard.saturating_sub(canary)).min(*cap)).collect();
+    Ok((out, used))
 }
 
 pub struct Loan {
     donors: Vec<Donor>,
-    /// Bytes of each donor handed to the allocator (its high-water mark).
-    lent: Vec<usize>,
-    /// Bytes of each donor in the image: `lent` plus a guard band.
+    plan: Vec<Placement>,
+    /// Bytes of each donor in the image (buffers + canaries + guard).
     used: Vec<usize>,
+    /// Canary regions: (donor, offset, len), everything imaged but not lent.
+    canaries: Vec<(usize, usize, usize)>,
+    canary_hash: Vec<u64>,
     image: PathBuf,
     /// Image layout: donor `d`'s imaged prefix starts at `image_off[d]`.
     image_off: Vec<u64>,
     /// `hashes[d][c]` = hash of donor `d`'s chunk `c` (`chunk` bytes, the last
     /// one shorter).
     hashes: Vec<Vec<u64>>,
-    /// Hash of each donor's guard band `[lent, used)`.
-    guard_hash: Vec<u64>,
     chunk: usize,
     /// The image, open and `flock`ed for the life of the process: a second
     /// hub on the same path fails at startup instead of overwriting it.
@@ -81,63 +124,56 @@ pub struct Loan {
 }
 
 impl Loan {
-    /// Take donors in the given order until every buffer of `sizes` fits,
-    /// placed first-fit in that order (`LOAN_ALIGN`-rounded): the placement
-    /// [`LoanAlloc::take`] reproduces when the job asks for the same sizes in
-    /// the same order. A donor is lent up to its high-water mark only; up to
-    /// `guard` bytes after that are imaged and checked at every return.
-    /// Errors when the donors run out.
+    /// Plan the job's buffers (`sizes`, in the order it will `take` them)
+    /// over the donors, taken in the given order as needed, with
+    /// [`CANARY_BYTES`] canaries and a `guard`-byte band after each donor's
+    /// last buffer. Errors when the donors run out. `chunk` (the image's I/O
+    /// and hash unit) must hold the largest canary.
     pub fn new(candidates: Vec<Donor>, sizes: &[usize], image: PathBuf, chunk: usize, guard: usize) -> eyre::Result<Self> {
         if chunk == 0 || chunk % LOAN_ALIGN != 0 {
             return Err(eyre!("loan chunk {chunk} must be a non-zero multiple of {LOAN_ALIGN}"));
         }
-        let cap = |d: &Donor| d.view.byte_len() / LOAN_ALIGN * LOAN_ALIGN;
-        let mut cands = candidates.into_iter();
-        let mut donors: Vec<Donor> = Vec::new();
-        let mut used: Vec<usize> = Vec::new();
-        for &s in sizes {
-            let need = s.div_ceil(LOAN_ALIGN) * LOAN_ALIGN;
-            loop {
-                if let Some(i) = (0..donors.len()).find(|&i| cap(&donors[i]) - used[i] >= need) {
-                    used[i] += need;
-                    break;
+        let canary = CANARY_BYTES.min(chunk);
+        let guard = guard.max(canary).min(chunk) / LOAN_ALIGN * LOAN_ALIGN;
+        let caps: Vec<usize> = candidates.iter().map(|d| d.view.byte_len() / LOAN_ALIGN * LOAN_ALIGN).collect();
+        let (plan, used) = plan(&caps, sizes, canary, guard)?;
+        let mut donors = candidates;
+        donors.truncate(used.len());
+        let mut canaries = Vec::new();
+        for (d, &u) in used.iter().enumerate() {
+            let mut at = 0;
+            for p in plan.iter().filter(|p| p.donor == d) {
+                if p.offset > at {
+                    canaries.push((d, at, p.offset - at));
                 }
-                let d = cands.next().ok_or_else(|| {
-                    eyre!("dGPU loan: donors exhausted placing a {need} B buffer (sizes {sizes:?})")
-                })?;
-                donors.push(d);
-                used.push(0);
+                at = p.offset + p.bytes;
+            }
+            if u > at {
+                canaries.push((d, at, u - at));
             }
         }
-        // A donor taken but never filled (everything after it fit earlier).
-        let mut keep = used.iter().map(|u| *u > 0).collect::<Vec<_>>().into_iter();
-        donors.retain(|_| keep.next().expect("same length"));
-        used.retain(|u| *u > 0);
-        let lent = used.clone();
-        let guard = guard.min(chunk) / LOAN_ALIGN * LOAN_ALIGN;
-        let used: Vec<usize> = donors.iter().zip(&lent).map(|(d, l)| (l + guard).min(cap(d))).collect();
         let mut image_off = Vec::with_capacity(donors.len());
         let mut off = 0u64;
         for u in &used {
             image_off.push(off);
             off += *u as u64;
         }
-        Ok(Loan { donors, lent, used, image, image_off, hashes: Vec::new(), guard_hash: Vec::new(), chunk, lock: None })
+        Ok(Loan { donors, plan, used, canaries, canary_hash: Vec::new(), image, image_off, hashes: Vec::new(), chunk, lock: None })
     }
 
-    /// Bytes lent (the job's memory).
+    /// Bytes lent (the job's buffers).
     pub fn lent_bytes(&self) -> usize {
-        self.lent.iter().sum()
+        self.plan.iter().map(|p| p.bytes).sum()
     }
 
-    /// Bytes imaged and returned per phase (lent + guard bands).
+    /// Bytes imaged and returned per phase (buffers + canaries + guard).
     pub fn total_bytes(&self) -> usize {
         self.used.iter().sum()
     }
 
-    /// `(donor name, bytes lent)` for the startup log.
+    /// `(donor name, bytes imaged)` for the startup log.
     pub fn donor_summary(&self) -> Vec<(String, usize)> {
-        self.donors.iter().zip(&self.lent).map(|(d, u)| (d.name.clone(), *u)).collect()
+        self.donors.iter().zip(&self.used).map(|(d, u)| (d.name.clone(), *u)).collect()
     }
 
     pub fn image_path(&self) -> &Path {
@@ -145,10 +181,10 @@ impl Loan {
     }
 
     /// Copy every donor's imaged bytes into the image file and record their
-    /// hashes. Call once, before the first loan, while the donors hold their
-    /// loaded contents. `stream` = a stream on the donors' device. Takes an
-    /// exclusive `flock` on the file first (held until the process exits).
-    /// The file's page cache is dropped after the write.
+    /// hashes (chunks and canaries). Call once, before the first loan, while
+    /// the donors hold their loaded contents. `stream` = a stream on the
+    /// donors' device. Takes an exclusive `flock` on the file first (held
+    /// until the process exits). The file's page cache is dropped after.
     pub fn write_image(&mut self, stream: &Stream) -> eyre::Result<()> {
         if let Some(dir) = self.image.parent() {
             std::fs::create_dir_all(dir).wrap_err_with(|| format!("create {}", dir.display()))?;
@@ -170,7 +206,6 @@ impl Loan {
         f.set_len(self.total_bytes() as u64).wrap_err("size loan image")?;
         let mut host = PinnedBuffer::<u8>::new(self.chunk)?;
         self.hashes.clear();
-        self.guard_hash.clear();
         for (d, donor) in self.donors.iter().enumerate() {
             let mut hs = Vec::new();
             let mut at = 0usize;
@@ -185,12 +220,12 @@ impl Loan {
                 at += n;
             }
             self.hashes.push(hs);
-            let g = self.used[d] - self.lent[d];
-            self.guard_hash.push(if g == 0 { 0 } else {
-                donor.view.slice_view(self.lent[d], g).copy_to_pinned_async(&mut host, 0, stream)?;
-                stream.synchronize()?;
-                chunk_hash(&host.as_slice()[..g])
-            });
+        }
+        self.canary_hash.clear();
+        for &(d, off, len) in &self.canaries {
+            self.donors[d].view.slice_view(off, len).copy_to_pinned_async(&mut host, 0, stream)?;
+            stream.synchronize()?;
+            self.canary_hash.push(chunk_hash(&host.as_slice()[..len]));
         }
         f.sync_data().wrap_err("sync loan image")?;
         drop_page_cache(&f);
@@ -198,29 +233,26 @@ impl Loan {
         Ok(())
     }
 
-    /// The loan's memory as a first-fit allocator over the lent ranges.
-    /// Errors until the image exists: lending before it would lose the bytes.
+    /// The planned buffers, in plan order. Errors until the image exists:
+    /// lending before it would lose the bytes.
     pub fn allocator(&self) -> eyre::Result<LoanAlloc> {
         if self.lock.is_none() {
             return Err(eyre!("dGPU loan: the image was never written; refusing to lend"));
         }
         Ok(LoanAlloc {
-            ranges: self.donors.iter().zip(&self.lent).map(|(d, u)| (d.view.slice_view(0, *u), 0usize)).collect(),
+            ranges: self.plan.iter().map(|p| self.donors[p.donor].view.slice_view(p.offset, p.bytes)).collect(),
+            next: 0,
         })
     }
 
-    /// Donors whose guard band no longer matches the image (`scratch`: a
-    /// pinned buffer of at least the guard size).
-    fn guard_violations(&self, stream: &Stream, scratch: &mut PinnedBuffer<u8>) -> eyre::Result<u32> {
+    /// Canaries that no longer match the image (`scratch`: a pinned buffer
+    /// of at least `chunk` bytes).
+    fn canary_violations(&self, stream: &Stream, scratch: &mut PinnedBuffer<u8>) -> eyre::Result<u32> {
         let mut bad = 0;
-        for (d, donor) in self.donors.iter().enumerate() {
-            let g = self.used[d] - self.lent[d];
-            if g == 0 {
-                continue;
-            }
-            donor.view.slice_view(self.lent[d], g).copy_to_pinned_async(scratch, 0, stream)?;
+        for (i, &(d, off, len)) in self.canaries.iter().enumerate() {
+            self.donors[d].view.slice_view(off, len).copy_to_pinned_async(scratch, 0, stream)?;
             stream.synchronize()?;
-            if chunk_hash(&scratch.as_slice()[..g]) != self.guard_hash[d] {
+            if chunk_hash(&scratch.as_slice()[..len]) != self.canary_hash[i] {
                 bad += 1;
             }
         }
@@ -228,11 +260,13 @@ impl Loan {
     }
 
     /// Put every donor back from the image: pread a chunk into one of the two
-    /// pinned `host` buffers (each at least `chunk` bytes) and H2D it on
+    /// pinned `host` buffers (each at least `chunk` bytes), check it against
+    /// its startup hash (disk / page corruption; always), and H2D it on
     /// `stream`; the next chunk's read overlaps that copy. With `verify`, each
-    /// chunk is read back into the other buffer and its hash compared with
-    /// the image's, and a mismatched chunk is copied once more. Returns only
-    /// when the device holds the image's bytes (`stream` synchronized).
+    /// chunk is also read back into the other buffer and hashed, and a
+    /// mismatched chunk is copied once more. Canaries are checked before
+    /// anything is overwritten. Returns only when the device holds the
+    /// image's bytes (`stream` synchronized).
     pub fn give_back(&self, stream: &Stream, host: &mut [PinnedBuffer<u8>; 2], verify: bool) -> eyre::Result<ReturnStats> {
         let t0 = Instant::now();
         if host.iter().any(|h| h.len() < self.chunk) {
@@ -240,8 +274,7 @@ impl Loan {
         }
         let f = self.lock.as_ref().ok_or_else(|| eyre!("give_back: the image was never written"))?;
         let mut st = ReturnStats::default();
-        // Before anything is overwritten: did a kernel write past its loan?
-        st.guard_violations = self.guard_violations(stream, &mut host[1])?;
+        st.guard_violations = self.canary_violations(stream, &mut host[1])?;
         let copied = [Event::new_no_timing()?, Event::new_no_timing()?];
         let mut pending = [false, false];
         let mut k = 0usize;
@@ -260,7 +293,7 @@ impl Loan {
                 f.read_exact_at(&mut host[b].as_mut_slice()[..n], self.image_off[d] + at as u64)
                     .wrap_err_with(|| format!("read loan image {}", self.image.display()))?;
                 st.read_ms += tr.elapsed().as_secs_f64() * 1e3;
-                if verify && chunk_hash(&host[b].as_slice()[..n]) != self.hashes[d][c] {
+                if chunk_hash(&host[b].as_slice()[..n]) != self.hashes[d][c] {
                     return Err(eyre!(
                         "loan image {} bytes for donor {} [{at}, {}) do not match their startup hash (disk corruption?)",
                         self.image.display(),
@@ -338,38 +371,31 @@ fn try_lock_exclusive(f: &File) -> bool {
     unsafe { flock(f.as_raw_fd(), 2 | 4) == 0 }
 }
 
-/// First-fit sub-allocation over the loan's ranges. Each allocation lies in
-/// one range (never spans two donors) and starts `LOAN_ALIGN`-aligned.
+/// The job's buffers, handed out in plan order.
 pub struct LoanAlloc {
-    ranges: Vec<(DeviceBuffer<u8>, usize)>,
+    ranges: Vec<DeviceBuffer<u8>>,
+    next: usize,
 }
 
 impl LoanAlloc {
-    /// An allocator over plain device buffers (tests, and the standalone GPU
-    /// gate that runs without the V4.1 model).
+    /// Plain device buffers as the plan (tests, and the standalone GPU gate
+    /// that runs without the V4.1 model): one buffer per `take`, in order.
     pub fn over(bufs: Vec<DeviceBuffer<u8>>) -> Self {
-        LoanAlloc { ranges: bufs.into_iter().map(|b| (b, 0usize)).collect() }
+        LoanAlloc { ranges: bufs, next: 0 }
     }
 
-    /// `bytes` of loan memory, typed. Never frees: the whole allocator is
-    /// dropped at the end of the job.
+    /// The next planned buffer, typed (`len` elements of `T`; any T here is a
+    /// plain numeric type, and every buffer starts `LOAN_ALIGN`-aligned).
     pub fn take<T>(&mut self, len: usize) -> eyre::Result<DeviceBuffer<T>> {
         let bytes = len * std::mem::size_of::<T>();
-        let need = bytes.div_ceil(LOAN_ALIGN) * LOAN_ALIGN;
-        for (buf, at) in self.ranges.iter_mut() {
-            if buf.byte_len() - *at >= need {
-                // SAFETY: [at, at + bytes) lies inside `buf`, `at` is 256-B
-                // aligned (any T here is a plain numeric type), and no other
-                // allocation from this allocator overlaps it.
-                let v = unsafe { buf.view_as::<T>(*at, len) };
-                *at += need;
-                return Ok(v);
-            }
+        let buf = self.ranges.get(self.next).ok_or_else(|| eyre!("dGPU loan: the plan has only {} buffers", self.ranges.len()))?;
+        if bytes > buf.byte_len() {
+            return Err(eyre!("dGPU loan: buffer {} wants {bytes} B, planned {}", self.next, buf.byte_len()));
         }
-        Err(eyre!(
-            "dGPU loan: no range has {need} B free (ranges free: {:?})",
-            self.ranges.iter().map(|(b, at)| b.byte_len() - at).collect::<Vec<_>>()
-        ))
+        self.next += 1;
+        // SAFETY: [0, bytes) lies inside the planned range, which no other
+        // `take` overlaps; offset 0 is aligned for T.
+        Ok(unsafe { buf.view_as::<T>(0, len) })
     }
 }
 
@@ -388,5 +414,22 @@ mod tests {
         }
         assert_eq!(chunk_hash(&v), h);
         assert_ne!(chunk_hash(&v[..4098]), h);
+    }
+
+    #[test]
+    fn plan_surrounds_every_buffer_with_canaries() {
+        let c = 1024;
+        let (p, used) = plan(&[10_000, 1 << 20], &[3000, 500, 9000, 100], c, 4096).unwrap();
+        // 3000 -> 3072 at 1024 in donor 0; 500 -> 512 after a canary; 9000
+        // does not fit donor 0 -> donor 1; 100 -> 256 back in donor 0.
+        assert_eq!(p[0], Placement { donor: 0, offset: c, bytes: 3072 });
+        assert_eq!(p[1], Placement { donor: 0, offset: c + 3072 + c, bytes: 512 });
+        assert_eq!(p[2], Placement { donor: 1, offset: c, bytes: 9216 });
+        assert_eq!(p[3].donor, 0);
+        assert_eq!(p[3].offset, p[1].offset + 512 + c);
+        // Imaged through the guard, capped at the donor.
+        assert_eq!(used[0], 10_000);
+        assert_eq!(used[1], c + 9216 + 4096);
+        assert!(plan(&[1000], &[2000], c, 0).is_err());
     }
 }

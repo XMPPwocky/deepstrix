@@ -148,7 +148,13 @@ fn text_ids(info: &EmbedInfo, s: &str) -> Result<Vec<u32>, ApiError> {
     if s.is_empty() {
         return Err(bad("`input` must not contain empty strings"));
     }
-    Ok(info.vocab.encode_qwen2(s).into_iter().map(|t| t as u32).collect())
+    let ids: Vec<u32> = info.vocab.encode_qwen2(s).into_iter().map(|t| t as u32).collect();
+    // Startup checks the vocab fits the embedding table; this keeps one bad
+    // id from failing a whole phase if that ever changes.
+    if let Some(&id) = ids.iter().find(|&&id| id as usize >= info.n_vocab) {
+        return Err(ApiError::EngineFailed(color_eyre::eyre::eyre!("tokenizer produced id {id} >= vocab {}", info.n_vocab)));
+    }
+    Ok(ids)
 }
 
 fn token_ids(info: &EmbedInfo, t: Vec<u32>) -> Result<Vec<u32>, ApiError> {
@@ -222,9 +228,21 @@ pub async fn embeddings(
             SubmitError::Busy => ApiError::Busy("embedding queue is full; retry shortly".into()),
             SubmitError::WorkerDead => ApiError::EngineFailed(color_eyre::eyre::eyre!("engine worker is gone")),
         })?;
-    let out = rx
-        .await
-        .map_err(|_| ApiError::EngineFailed(color_eyre::eyre::eyre!("the engine dropped the embedding job")))?
+    // Wait for the reply; a request queued before the engine thread died
+    // keeps its sender alive in the queue, so watch the worker too.
+    let mut rx = rx;
+    let reply = loop {
+        tokio::select! {
+            r = &mut rx => break r,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                if engine.worker_gone() {
+                    return Err(ApiError::EngineFailed(color_eyre::eyre::eyre!("the engine worker is gone")));
+                }
+            }
+        }
+    };
+    let out = reply
+        .map_err(|_| ApiError::EngineFailed(color_eyre::eyre::eyre!("the engine dropped the embedding request")))?
         .map_err(|e| ApiError::EngineFailed(color_eyre::eyre::eyre!("{e}")))?;
     tracing::info!(
         model = req.model.as_deref().unwrap_or(""),

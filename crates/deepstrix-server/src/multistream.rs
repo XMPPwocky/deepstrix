@@ -427,10 +427,6 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
                 e.run_phase(&state.engine, &state.progress, sched.streams.len(), sched.prefills.len());
                 // The interrupted burst is not charged for the phase.
                 sched.phase_since += t.elapsed();
-                state.engine.invalidate_device_cache();
-                if let Err(err) = state.dgpu.set_current() {
-                    tracing::warn!(error = %err, "embed phase: restoring the dGPU as current failed");
-                }
                 state.progress.pet();
                 continue;
             }

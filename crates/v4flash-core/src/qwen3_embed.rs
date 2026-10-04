@@ -602,33 +602,44 @@ pub fn cpu_forward(model: &Qwen3EmbedModel, file: &MappedGguf, inputs: &[Vec<u32
                 }
             }
         }
-        // Causal GQA attention per input.
-        let mut att = vec![0f32; t * c.q_width()];
-        for (s, inp) in starts.iter().zip(inputs) {
-            for p in 0..inp.len() {
-                let r = s + p;
-                for h in 0..c.n_head {
-                    let kh = h / group;
-                    let qv = &q[r * c.q_width() + h * hd..r * c.q_width() + (h + 1) * hd];
-                    let mut sc: Vec<f32> = (0..=p)
-                        .map(|j| dot(qv, &k[(s + j) * c.kv_width() + kh * hd..(s + j) * c.kv_width() + (kh + 1) * hd]) * scale)
-                        .collect();
-                    let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0f32;
-                    sc.iter_mut().for_each(|x| {
-                        *x = (*x - m).exp();
-                        sum += *x;
-                    });
-                    let out = &mut att[r * c.q_width() + h * hd..r * c.q_width() + (h + 1) * hd];
-                    for (j, w) in sc.iter().enumerate() {
-                        let vv = &v[(s + j) * c.kv_width() + kh * hd..(s + j) * c.kv_width() + (kh + 1) * hd];
-                        for e in 0..hd {
-                            out[e] += w / sum * vv[e];
+        // Causal GQA attention per input, threaded over rows (each thread owns
+        // a contiguous run of output rows).
+        let (qw, kvw) = (c.q_width(), c.kv_width());
+        let mut att = vec![0f32; t * qw];
+        let row_pos: Vec<(usize, usize)> = starts.iter().zip(inputs).flat_map(|(s, inp)| (0..inp.len()).map(move |p| (*s, p))).collect();
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(t.max(1));
+        let per = t.div_ceil(threads).max(1);
+        std::thread::scope(|sc| {
+            for (ci, chunk) in att.chunks_mut(per * qw).enumerate() {
+                let (row_pos, q, k, v) = (&row_pos, &q, &k, &v);
+                sc.spawn(move || {
+                    for (li, out_row) in chunk.chunks_mut(qw).enumerate() {
+                        let r = ci * per + li;
+                        let (s, p) = row_pos[r];
+                        for h in 0..c.n_head {
+                            let kh = h / group;
+                            let qv = &q[r * qw + h * hd..r * qw + (h + 1) * hd];
+                            let mut sc: Vec<f32> = (0..=p)
+                                .map(|j| dot(qv, &k[(s + j) * kvw + kh * hd..(s + j) * kvw + (kh + 1) * hd]) * scale)
+                                .collect();
+                            let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let mut sum = 0f32;
+                            sc.iter_mut().for_each(|x| {
+                                *x = (*x - m).exp();
+                                sum += *x;
+                            });
+                            let out = &mut out_row[h * hd..(h + 1) * hd];
+                            for (j, w) in sc.iter().enumerate() {
+                                let vv = &v[(s + j) * kvw + kh * hd..(s + j) * kvw + (kh + 1) * hd];
+                                for e in 0..hd {
+                                    out[e] += w / sum * vv[e];
+                                }
+                            }
                         }
                     }
-                }
+                });
             }
-        }
+        });
         let o = matmul(&att, t, &read_f32s(file, &layer.o)?, d, c.q_width());
         resid.iter_mut().zip(&o).for_each(|(a, b)| *a += b);
         for r in 0..t {
@@ -670,7 +681,10 @@ pub mod testing {
         Qwen3EmbedConfig {
             n_layer: 2,
             n_embd: 256,
-            n_ff: 384,
+            // Every K a multiple of 256: each Q8_0 row's scale section (2 B
+            // per block) is then 16-B aligned for the GEMM's b128 loads, as
+            // in the real model (n_ff 384 would give a 24-B section).
+            n_ff: 512,
             n_head: 4,
             n_kv_head: 2,
             head_dim: 128,

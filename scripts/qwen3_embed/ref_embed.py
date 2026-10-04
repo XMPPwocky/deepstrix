@@ -36,19 +36,37 @@ def main():
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     ap.add_argument("--max-length", type=int, default=8192)
     ap.add_argument("--threads", type=int, default=0, help="torch threads (0 = default)")
+    ap.add_argument("--tokens-only", action="store_true",
+                    help="only the tokenizer (gate E0): needs tokenizer.json etc., not the weights; no embeddings written")
     args = ap.parse_args()
 
-    import torch
-    import torch.nn.functional as F
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoTokenizer
 
-    if args.threads:
-        torch.set_num_threads(args.threads)
     with open(args.corpus) as f:
         corpus = json.load(f)
     texts = [c["text"] * c.get("repeat", 1) for c in corpus["cases"]]
 
     tok = AutoTokenizer.from_pretrained(args.model, padding_side="left")
+    eos = tok.convert_tokens_to_ids("<|endoftext|>")
+    if args.tokens_only:
+        cases = []
+        for c, text in zip(corpus["cases"], texts):
+            ids = tok([text], padding=False, truncation=True, max_length=args.max_length)["input_ids"][0]
+            cases.append({"kind": c["kind"], "text": text, "ids": ids, "embedding": []})
+        appended = all(c["ids"][-1] == eos for c in cases)
+        print(f"<|endoftext|> = {eos}; appended to every input: {appended}", file=sys.stderr)
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w") as f:
+            json.dump({"model": args.model, "dtype": None, "eos_appended": appended, "eos_id": eos, "cases": cases}, f)
+        print(f"wrote {len(cases)} tokenized cases (no embeddings) to {args.out}", file=sys.stderr)
+        return
+
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoModel
+
+    if args.threads:
+        torch.set_num_threads(args.threads)
     dtype = getattr(torch, args.dtype)
     model = AutoModel.from_pretrained(args.model, torch_dtype=dtype)
     model.eval()
@@ -65,7 +83,6 @@ def main():
         out_cases.append({"kind": c["kind"], "text": text, "ids": ids, "embedding": emb.tolist()})
         print(f"{c['kind']:12s} {len(ids):6d} tokens  last id {ids[-1]}  ({time.time() - t0:.1f} s)", file=sys.stderr)
 
-    eos = tok.convert_tokens_to_ids("<|endoftext|>")
     appended = all(c["ids"][-1] == eos for c in out_cases)
     print(f"<|endoftext|> = {eos}; appended to every input: {appended}", file=sys.stderr)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
