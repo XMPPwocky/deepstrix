@@ -18,10 +18,11 @@
 //!  5. The mechanism: ONE captured `_ind` graph replayed after storing entry A, then B,
 //!     reproduces the direct kernel on A, then on B; and a capture of N launches has N nodes
 //!     (design 2.5's vetted-count check assumes one node per launch).
-//!  The go / no-go: the exactness items, no drained queue, no BLOCKS, and ONE per-step budget --
-//!  writes x write cost + graph launches x the K = 8 relaunch delta (1- and 8-node) + twin launches
-//!  x the twin deltas, medians and ~96.7% upper bounds, vs 1% of ms.step p50 (GK_STEP_MS, default
-//!  60 = 2 rows / 2 lanes live): GO / MARGINAL (the live A/B decides) / NO-GO.
+//!  The go / no-go: the exactness items, no drained queue (a drained run is re-run up to 3 times),
+//!  no BLOCKS, and the per-step budget at each operating point (b = 1 / 4 / 8 per lane, two lanes,
+//!  ms.step 60 / 121.6 / 196.8 ms, GK_STEP_MS_B{1,4,8}) -- writes x write cost + graph launches x
+//!  the K = 8 relaunch delta (1- and 8-node) + twin launches x the twin deltas at that b, medians
+//!  and ~96.7% upper bounds, vs 1% of that step: GO / MARGINAL (the live A/B decides) / NO-GO.
 //!
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release \
 //!   --features v41 -p v4flash-kernels --test bench_graph_keys -- --ignored --nocapture
@@ -116,7 +117,9 @@ impl Stat {
 
 impl std::fmt::Display for Stat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:7.2} us [{:.2}..{:.2}]", self.med, self.min, self.max)
+        // A spread over 8% between runs flags clock-state changes (run 2: ~64 / ~74 us).
+        let flag = if self.max > 1.08 * self.min { " SPREAD" } else { "" };
+        write!(f, "{:7.2} us [{:.2}..{:.2}]{flag}", self.med, self.min, self.max)
     }
 }
 
@@ -151,7 +154,14 @@ impl Delta {
             }
             c = c * (n - i) as f64 / (i + 1) as f64;
         }
-        Delta { med: d[n / 2], ub: d[k.min(n) - 1], min: d[0], max: d[n - 1], pos: d.iter().filter(|v| **v > 0.0).count(), n }
+        Delta {
+            med: d[n / 2],
+            ub: d[k.min(n) - 1],
+            min: d[0],
+            max: d[n - 1],
+            pos: d.iter().filter(|v| **v > 0.0).count(),
+            n,
+        }
     }
 
     /// The budget's charge: the median, never negative.
@@ -175,10 +185,12 @@ impl std::fmt::Display for Delta {
     }
 }
 
-/// Pairs of runs of `reps` launches of `a` and of `b` (the order alternating pair to pair), each
-/// run queued behind `prefill` (a spin long enough to cover the enqueue, so the events time the
-/// GPU back to back, not the host): (a, b, b - a paired, runs whose spin ended before the host
-/// finished enqueueing).
+/// Pairs of runs of `reps` launches of `a` and of `b` (the order alternating pair to pair). Each
+/// run is queued behind `prefill` (a short spin covering the enqueue) and `warm` launches of `a`
+/// (real work: the clocks are up and the caches warm alike for both arms when the events start),
+/// so the events time the GPU back to back, not the host. A pair with a run whose queue drained
+/// before the host finished enqueueing (an OS stall) is discarded and re-run, up to 3 times:
+/// (a, b, b - a paired, pairs still drained after the retries, retries).
 fn time_ab(
     s: &Stream,
     reps: usize,
@@ -186,35 +198,52 @@ fn time_ab(
     prefill: &dyn Fn(&Stream) -> eyre::Result<()>,
     a: &mut dyn FnMut() -> eyre::Result<()>,
     b: &mut dyn FnMut() -> eyre::Result<()>,
-) -> eyre::Result<(Stat, Stat, Delta, usize)> {
-    let mut drained = 0usize;
-    let mut once = |f: &mut dyn FnMut() -> eyre::Result<()>| -> eyre::Result<f64> {
+) -> eyre::Result<(Stat, Stat, Delta, usize, usize)> {
+    let warm = (reps / 5).max(1);
+    a()?;
+    b()?;
+    // (us per launch, drained) of one run of `b` (else `a`)
+    let mut once = |use_b: bool| -> eyre::Result<(f64, bool)> {
         s.synchronize()?;
         let (e0, e1) = (Event::new()?, Event::new()?);
         prefill(s)?;
+        for _ in 0..warm {
+            a()?;
+        }
         e0.record(s)?;
         for _ in 0..reps {
-            f()?;
+            if use_b {
+                b()?
+            } else {
+                a()?
+            }
         }
-        drained += usize::from(e0.query()?);
+        let drained = e0.query()?;
         e1.record(s)?;
         e1.synchronize()?;
-        Ok(Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / reps as f64)
+        Ok((Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / reps as f64, drained))
     };
-    let mut ta = Vec::new();
-    let mut tb = Vec::new();
-    a()?;
-    b()?;
+    let (mut ta, mut tb) = (Vec::new(), Vec::new());
+    let (mut drained, mut retries) = (0usize, 0usize);
     for i in 0..pairs {
-        if i % 2 == 0 {
-            ta.push(once(&mut *a)?);
-            tb.push(once(&mut *b)?);
-        } else {
-            tb.push(once(&mut *b)?);
-            ta.push(once(&mut *a)?);
+        for attempt in 0..4 {
+            let ((xa, da), (xb, db)) = if i % 2 == 0 {
+                let ra = once(false)?;
+                (ra, once(true)?)
+            } else {
+                let rb = once(true)?;
+                (once(false)?, rb)
+            };
+            if !(da || db) || attempt == 3 {
+                drained += usize::from(da || db);
+                ta.push(xa);
+                tb.push(xb);
+                break;
+            }
+            retries += 1;
         }
     }
-    Ok((Stat::of(&ta), Stat::of(&tb), Delta::of(&ta, &tb), drained))
+    Ok((Stat::of(&ta), Stat::of(&tb), Delta::of(&ta, &tb), drained, retries))
 }
 
 /// One mhc_fast output set (the pre_attn case writes all of it).
@@ -238,7 +267,15 @@ impl MhcSet {
         };
         let mut cnt = DeviceBuffer::<u32>::new(id, bmax)?;
         cnt.fill_zero()?;
-        Ok(Self { split: z(bmax * m)?, mix: z(bmax * m)?, cnt, inv: z(bmax)?, carry: up(id, carry0)?, cur: z(bmax * ne)?, norm: z(bmax * ne)? })
+        Ok(Self {
+            split: z(bmax * m)?,
+            mix: z(bmax * m)?,
+            cnt,
+            inv: z(bmax)?,
+            carry: up(id, carry0)?,
+            cur: z(bmax * ne)?,
+            norm: z(bmax * ne)?,
+        })
     }
 
     fn reset(&mut self, carry0: &[f32]) -> eyre::Result<()> {
@@ -314,39 +351,52 @@ fn graph_keys_step0() -> eyre::Result<()> {
     let mut host_v = vec![Vec::new(); variants.len()];
     let mut gpu_v = vec![Vec::new(); variants.len()];
     let mut iter_max = vec![0f64; variants.len()];
+    let mut retries1 = 0usize;
     for _ in 0..3 {
         for (vi, variant) in variants.iter().enumerate() {
-            s.synchronize()?;
-            let (e0, e1) = (Event::new()?, Event::new()?);
-            e.q8.slack_probe_spin(&s, spin_ms(5.0))?;
-            e0.record(&s)?;
-            let t = Instant::now();
-            for i in 0..n {
-                let ti = Instant::now();
-                ctxk.nop(&s, &mut sink)?;
-                match *variant {
-                    "h2d" => {
-                        pinned.as_mut_slice()[ARENA_CTX_WORDS - 2] = i as u64;
-                        slot.copy_from_host_async(pinned.as_slice(), &s)?;
+            for attempt in 0..4 {
+                s.synchronize()?;
+                let (e0, e1) = (Event::new()?, Event::new()?);
+                e.q8.slack_probe_spin(&s, spin_ms(5.0))?;
+                e0.record(&s)?;
+                let t = Instant::now();
+                for i in 0..n {
+                    let ti = Instant::now();
+                    ctxk.nop(&s, &mut sink)?;
+                    match *variant {
+                        "h2d" => {
+                            pinned.as_mut_slice()[ARENA_CTX_WORDS - 2] = i as u64;
+                            slot.copy_from_host_async(pinned.as_slice(), &s)?;
+                        }
+                        "ctx_store" => {
+                            entry.seq = i as u64;
+                            ctxk.store(&s, &entry, &mut slot)?;
+                        }
+                        "write_value32" => unsafe { s.write_value32(slot.raw() as *mut u32, i as u32)? },
+                        _ => {}
                     }
-                    "ctx_store" => {
-                        entry.seq = i as u64;
-                        ctxk.store(&s, &entry, &mut slot)?;
-                    }
-                    "write_value32" => unsafe { s.write_value32(slot.raw() as *mut u32, i as u32)? },
-                    _ => {}
+                    ctxk.nop(&s, &mut sink)?;
+                    iter_max[vi] = iter_max[vi].max(ti.elapsed().as_secs_f64() * 1e6);
                 }
-                ctxk.nop(&s, &mut sink)?;
-                iter_max[vi] = iter_max[vi].max(ti.elapsed().as_secs_f64() * 1e6);
+                let host_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+                // The spin still running when the host finished = the GPU ran the loop back to back;
+                // a drained run (an OS stall) is re-run, up to 3 times.
+                let drained = e0.query()?;
+                e1.record(&s)?;
+                e1.synchronize()?;
+                if drained && attempt < 3 {
+                    retries1 += 1;
+                    continue;
+                }
+                bar(!drained, format!("1:{variant}:drained"));
+                host_v[vi].push(host_us);
+                gpu_v[vi].push(Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / n as f64);
+                break;
             }
-            host_v[vi].push(t.elapsed().as_secs_f64() * 1e6 / n as f64);
-            // The spin still running when the host finished = the GPU ran the loop back to back.
-            let drained = e0.query()?;
-            bar(!drained, format!("1:{variant}:drained"));
-            e1.record(&s)?;
-            e1.synchronize()?;
-            gpu_v[vi].push(Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / n as f64);
         }
+    }
+    if retries1 > 0 {
+        println!("  ({retries1} drained runs re-run)");
     }
     let med = |v: &Vec<f64>| Stat::of(v).med;
     let (base_h, base_g) = (med(&host_v[0]), med(&gpu_v[0]));
@@ -373,17 +423,22 @@ fn graph_keys_step0() -> eyre::Result<()> {
     // lane's other 7 stages (plus direct launches), so its pattern is round-robin over K >= 8: the
     // budget charges K = 8 vs all-distinct (today's legacy graphs), measured as alternating pairs.
     // K = 1 / 2 / 4 are diagnostics.
-    println!("== 2. 80 launches round-robin over K executables behind a 3 ms spin (GPU us/launch)");
+    println!("== 2. 80 launches round-robin over K executables behind a 1 ms spin + 10 warm-up graphs (GPU us/launch)");
     let (rows, k) = (1280usize, 5120usize);
     let w = q8_weight(dev.id, rows, k, 1)?;
     let mut xq = up(dev.id, &lcg_bytes(2, 8 * k).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
     let mut xs = up(dev.id, &vec![0.01f32; 8 * (k / 32)])?;
     let mut out = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
-    // (host us per launch, GPU us per launch, queue drained before the host finished)
+    // (host us per launch, GPU us per launch, queue drained before the host finished). `execs`
+    // holds 90: the timed launches use [0, kk), the warm-up (real work, so the clocks are up when
+    // the events start) [80, 90).
     let run = |execs: &[GraphExec], kk: usize, spin: f64| -> eyre::Result<(f64, f64, bool)> {
         s.synchronize()?;
         let (e0, e1) = (Event::new()?, Event::new()?);
         e.q8.slack_probe_spin(&s, spin_ms(spin))?;
+        for x in &execs[80..90] {
+            x.launch(&s)?;
+        }
         e0.record(&s)?;
         let t = Instant::now();
         for i in 0..80 {
@@ -403,14 +458,14 @@ fn graph_keys_step0() -> eyre::Result<()> {
             }
             Ok(())
         };
-        let execs: Vec<GraphExec> = (0..80).map(|_| capture(&s, &mut body).map(|c| c.1)).collect::<eyre::Result<_>>()?;
+        let execs: Vec<GraphExec> =
+            (0..90).map(|_| capture(&s, &mut body).map(|c| c.1)).collect::<eyre::Result<_>>()?;
         let mut any_drained = false;
         let mut line = format!("  {nodes} node(s), diagnostics (median of 3):");
         for kk in [1usize, 2, 4] {
             let mut g = Vec::new();
             for _ in 0..3 {
-                let (_, gpu, drained) = run(&execs, kk, 3.0)?;
-                any_drained |= drained;
+                let (_, gpu, _) = run(&execs, kk, 1.0)?; // diagnostics: no bar
                 g.push(gpu);
             }
             line += &format!("  K={kk} {}", Stat::of(&g));
@@ -418,22 +473,36 @@ fn graph_keys_step0() -> eyre::Result<()> {
         println!("{line}");
         // K = 8 vs K = 80, 21 alternating pairs.
         let (mut g8, mut g80, mut h8, mut h80) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut retries2 = 0usize;
         for i in 0..21 {
-            for kk in if i % 2 == 0 { [8usize, 80] } else { [80, 8] } {
-                let (h, g, drained) = run(&execs, kk, 3.0)?;
-                any_drained |= drained;
-                if kk == 8 {
-                    g8.push(g);
-                    h8.push(h);
-                } else {
-                    g80.push(g);
-                    h80.push(h);
+            // A pair with a drained run (an OS stall) is re-run, up to 3 times.
+            for attempt in 0..4 {
+                let order = if i % 2 == 0 { [8usize, 80] } else { [80, 8] };
+                let r0 = run(&execs, order[0], 1.0)?;
+                let r1 = run(&execs, order[1], 1.0)?;
+                if (r0.2 || r1.2) && attempt < 3 {
+                    retries2 += 1;
+                    continue;
                 }
+                any_drained |= r0.2 || r1.2;
+                let (r8, r80) = if order[0] == 8 { (r0, r1) } else { (r1, r0) };
+                g8.push(r8.1);
+                h8.push(r8.0);
+                g80.push(r80.1);
+                h80.push(r80.0);
+                break;
             }
+        }
+        if retries2 > 0 {
+            println!("  ({retries2} drained pairs re-run)");
         }
         let (dg, dh) = (Delta::of(&g80, &g8), Delta::of(&h80, &h8));
         println!("  {nodes} node(s): K=8 {} vs K=80 {}; GPU K=8 - K=80 {dg}", Stat::of(&g8), Stat::of(&g80));
-        println!("  {nodes} node(s): host per launch K=8 {} vs K=80 {}; host K=8 - K=80 {dh}", Stat::of(&h8), Stat::of(&h80));
+        println!(
+            "  {nodes} node(s): host per launch K=8 {} vs K=80 {}; host K=8 - K=80 {dh}",
+            Stat::of(&h8),
+            Stat::of(&h80)
+        );
         if any_drained {
             println!("  [a run DRAINED: host-bound]");
         }
@@ -475,7 +544,8 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let log = CanaryLog::new(dev.id, rounds as u32)?;
         // Slots 0 / 9 / 18 / 27 + seq / log: every 64-B line of the entry.
         const SL: [usize; 4] = [0, 9, 18, 27];
-        let ind = Ind::new(slot.raw() as u64).with(0, SL[0]).with(1, SL[1]).with(2, SL[2]).with(3, SL[3]).with_canary(7);
+        let ind =
+            Ind::new(slot.raw() as u64).with(0, SL[0]).with(1, SL[1]).with(2, SL[2]).with(3, SL[3]).with_canary(7);
         let (_, exec) = capture(&s, &mut |s| {
             e.q8.matvec_bpack_ind(s, ind, &mut tmp, &w0, &xq_c, &xs_c, rows_c as u32, k_c as u32, 1)
         })?;
@@ -498,7 +568,10 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let bad_seq = recs.iter().enumerate().filter(|&(i, r)| r.seq != i as u64 || r.tag != 7).count();
         // What each launch resolved: out (round i's row block), w (alternating), xq, xs.
         let want_xor = |i: usize| {
-            (outs.raw() as u64 + (i * rows_c * 4) as u64) ^ [&w0, &w1][i % 2].raw() as u64 ^ xq_c.raw() as u64 ^ xs_c.raw() as u64
+            (outs.raw() as u64 + (i * rows_c * 4) as u64)
+                ^ [&w0, &w1][i % 2].raw() as u64
+                ^ xq_c.raw() as u64
+                ^ xs_c.raw() as u64
         };
         let bad_xor = recs.iter().enumerate().filter(|&(i, r)| r.ptr_xor != want_xor(i)).count();
         let ok = bad == 0 && cursor as usize == rounds && bad_seq == 0 && bad_xor == 0;
@@ -517,7 +590,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
     xs = up(dev.id, &(0..8 * (k / 32)).map(|i| 0.002 + (i % 7) as f32 * 0.001).collect::<Vec<_>>())?;
     let mut out_d = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
     let mut out_i = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
-    let prefill = |s: &Stream| e.q8.slack_probe_spin(s, spin_ms(3.0));
+    let prefill = |s: &Stream| e.q8.slack_probe_spin(s, spin_ms(1.5));
     let mut gemv_d: Vec<Delta> = Vec::new(); // per b: _ind - direct, us per launch
     for b in [1u32, 4, 8] {
         out_i.fill_zero()?;
@@ -530,7 +603,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let ind = Ind::new(slot.raw() as u64).with(0, 0).with(1, 1).with(2, 2).with(3, 3);
         let mut out_x = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
         // The twin's real operands come from the slot (out_i); out_x is only size-checked.
-        let (sd_, si_, dt, drained) = time_ab(
+        let (sd_, si_, dt, drained, retries) = time_ab(
             &s,
             200,
             21,
@@ -546,9 +619,10 @@ fn graph_keys_step0() -> eyre::Result<()> {
         bar(diff == 0, format!("4a:b{b}:bitexact"));
         gemv_d.push(dt);
         println!(
-            "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff}{}",
+            "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff}{}{}",
             (si_.med / sd_.med - 1.0) * 100.0,
-            if drained > 0 { format!("; {drained} runs DRAINED (host-bound), FAILS") } else { String::new() }
+            if retries > 0 { format!("; {retries} pairs re-run") } else { String::new() },
+            if drained > 0 { format!("; {drained} pairs still DRAINED, FAILS") } else { String::new() }
         );
     }
 
@@ -560,7 +634,12 @@ fn graph_keys_step0() -> eyre::Result<()> {
         // f16 weights in a sane range: sign, exponent 10..14, random mantissa.
         let w_bits: Vec<u8> = lcg_bytes(11, 2 * m * hcd)
             .chunks(2)
-            .flat_map(|c| ((((c[0] >> 7) as u16) << 15) | ((10 + (c[0] as u16 % 5)) << 10) | (((c[0] as u16) << 8 | c[1] as u16) & 0x3ff)).to_le_bytes())
+            .flat_map(|c| {
+                ((((c[0] >> 7) as u16) << 15)
+                    | ((10 + (c[0] as u16 % 5)) << 10)
+                    | (((c[0] as u16) << 8 | c[1] as u16) & 0x3ff))
+                    .to_le_bytes()
+            })
             .collect();
         let mw = up(dev.id, &w_bits)?;
         let mx = up(dev.id, &lcg_f32(12, bmax * hcd, -2.0, 2.0))?;
@@ -576,9 +655,19 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let mut si = MhcSet::new(dev.id, bmax, &carry0)?;
         let mut ent = ArenaCtx::default();
         let ptrs = [
-            si.split.raw() as u64, si.mix.raw() as u64, si.cnt.raw() as u64, si.inv.raw() as u64,
-            mw.raw() as u64, mx.raw() as u64, msc.raw() as u64, mbase.raw() as u64,
-            si.carry.raw() as u64, mx.raw() as u64, si.cur.raw() as u64, si.norm.raw() as u64, mnw.raw() as u64,
+            si.split.raw() as u64,
+            si.mix.raw() as u64,
+            si.cnt.raw() as u64,
+            si.inv.raw() as u64,
+            mw.raw() as u64,
+            mx.raw() as u64,
+            msc.raw() as u64,
+            mbase.raw() as u64,
+            si.carry.raw() as u64,
+            mx.raw() as u64,
+            si.cur.raw() as u64,
+            si.norm.raw() as u64,
+            mnw.raw() as u64,
         ];
         ent.p[..13].copy_from_slice(&ptrs);
         ctxk.store(&s, &ent, &mut slot)?;
@@ -587,13 +676,43 @@ fn graph_keys_step0() -> eyre::Result<()> {
         // size-checks them (its operands come from the slot, pointing at `si`).
         let go = |set: &mut MhcSet, ind: Option<Ind>, b: u32| -> eyre::Result<()> {
             let mix = FastMix {
-                weight: &mw, x: &mx, scale: &msc, base: &mbase, mode: MIX_PRE_SCALED,
-                split_out: &mut set.split, mix_out: &mut set.mix, counters: &mut set.cnt, inv_rows: &mut set.inv,
+                weight: &mw,
+                x: &mx,
+                scale: &msc,
+                base: &mbase,
+                mode: MIX_PRE_SCALED,
+                split_out: &mut set.split,
+                mix_out: &mut set.mix,
+                counters: &mut set.cnt,
+                inv_rows: &mut set.inv,
             };
             let col = FastCollapse { x: &mx, cur_out: &mut set.cur, norm_out: &mut set.norm, norm_w: &mnw };
             match ind {
-                None => arena.launch_fast(&s, Some(mix), Some(col), &mut set.carry, true, HC_DIM, RMS_EPS, SINKHORN_ITERS, SINKHORN_EPS, b),
-                Some(ind) => arena.launch_fast_ind(&s, ind, Some(mix), Some(col), &mut set.carry, true, HC_DIM, RMS_EPS, SINKHORN_ITERS, SINKHORN_EPS, b),
+                None => arena.launch_fast(
+                    &s,
+                    Some(mix),
+                    Some(col),
+                    &mut set.carry,
+                    true,
+                    HC_DIM,
+                    RMS_EPS,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                    b,
+                ),
+                Some(ind) => arena.launch_fast_ind(
+                    &s,
+                    ind,
+                    Some(mix),
+                    Some(col),
+                    &mut set.carry,
+                    true,
+                    HC_DIM,
+                    RMS_EPS,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                    b,
+                ),
             }
         };
         for b in [1u32, 4, 8] {
@@ -606,18 +725,20 @@ fn graph_keys_step0() -> eyre::Result<()> {
             go(&mut sd, Some(ind), b)?;
             s.synchronize()?;
             let got = si.dump(b as usize)?;
-            let diff: usize = ref_out.iter().zip(&got).map(|(a, c)| a.iter().zip(c).filter(|(x, y)| x != y).count()).sum();
+            let diff: usize =
+                ref_out.iter().zip(&got).map(|(a, c)| a.iter().zip(c).filter(|(x, y)| x != y).count()).sum();
             let mut decoy = MhcSet::new(dev.id, bmax, &carry0)?;
-            let (sd_, si_, dt, drained) =
+            let (sd_, si_, dt, drained, retries) =
                 time_ab(&s, 200, 21, &prefill, &mut || go(&mut decoy, None, b), &mut || go(&mut sd, Some(ind), b))?;
             exact &= diff == 0;
             bar(diff == 0, format!("4b:b{b}:bitexact"));
             bar(drained == 0, format!("4b:b{b}:drained"));
             mhc_d.push(dt);
             println!(
-                "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff} (split, mix, inv, carry, cur, norm){}",
+                "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff} (split, mix, inv, carry, cur, norm){}{}",
                 (si_.med / sd_.med - 1.0) * 100.0,
-                if drained > 0 { format!("; {drained} runs DRAINED (host-bound), FAILS") } else { String::new() }
+                if retries > 0 { format!("; {retries} pairs re-run") } else { String::new() },
+                if drained > 0 { format!("; {drained} pairs still DRAINED, FAILS") } else { String::new() }
             );
         }
     }
@@ -627,7 +748,8 @@ fn graph_keys_step0() -> eyre::Result<()> {
     let w_b = q8_weight(dev.id, rows, k, 5)?;
     let b = 4u32;
     let ind = Ind::new(slot.raw() as u64).with(0, 0).with(1, 1).with(2, 2).with(3, 3);
-    let (_, exec) = capture(&s, &mut |s| e.q8.matvec_bpack_ind(s, ind, &mut out_d, &w, &xq, &xs, rows as u32, k as u32, b))?;
+    let (_, exec) =
+        capture(&s, &mut |s| e.q8.matvec_bpack_ind(s, ind, &mut out_d, &w, &xq, &xs, rows as u32, k as u32, b))?;
     for (label, weight) in [("A", &w), ("B", &w_b)] {
         let mut ent = ArenaCtx::default();
         ent.p[0] = out_i.raw() as u64;
@@ -655,39 +777,45 @@ fn graph_keys_step0() -> eyre::Result<()> {
     bar(nodes == launches, "5:nodes".into());
     println!("  {launches} captured launches -> {nodes} graph nodes");
 
-    // ---- the 2.0 per-step budget ----------------------------------------------------------
-    // Everything the design adds per step against 1% of `ms.step` p50. The worst case is 2 rows /
-    // 2 lanes (~60 ms live, 2026-10-04; 3 lanes need >= 6 rows): write and launch counts grow with
-    // lanes x layers, the step with rows. GK_STEP_MS overrides. Counts (review of 0122a52):
-    // 1 write per lane-layer (presubmit is off in production; 2 is a what-if line); 8 stage graphs
-    // per lane-layer, 4 of them 1-node (mhc_pre_attn, mhc_pre_ffn, router, mix_ffn_late) charged at
-    // the 1-node relaunch delta, 4 at the 8-node one; per lane-layer 8 gemv-like twins (q_b-shape
-    // delta: conservative), 3 mhc twins, 7 small twins (a fixed prologue cost: charged at the larger
-    // of the gemv / mhc deltas). Medians are charged when positive; the upper-bound total uses each
-    // delta's ~96.7% upper bound. GPU + host is an upper bound (only one is the pole at a time).
-    let step_ms: f64 = std::env::var("GK_STEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
+    // ---- the 2.0 per-step budget, per operating point ---------------------------------------
+    // Everything the design adds per step against 1% of that step, at each operating point -- the
+    // twin deltas grow with b, the write / launch counts do not, the step grows with rows (review
+    // of 752a3c3: pairing b=8's delta with b=1's step overstated run 2 about threefold). Points,
+    // two lanes (the binding case: 80 lane-layers): b = 1 / lane at 60 ms (2 rows, live 10-04),
+    // b = 4 at 121.6 ms (8 rows, MULTI_LADDER_TWO), b = 8 at 196.8 ms (16 rows: 159.2 at 12 + 4 x
+    // 9.4); GK_STEP_MS_B{1,4,8} override. Counts (review of 0122a52): 1 write per lane-layer
+    // (presubmit off; 2 is a what-if); 8 stage graphs per lane-layer, 4 of them 1-node, charged at
+    // the 1- / 8-node relaunch deltas; per lane-layer 8 gemv-like twins (q_b-shape delta:
+    // conservative), 3 mhc twins, 7 small twins (a fixed prologue cost: charged at the larger of the
+    // gemv / mhc deltas), each at the point's own b. Medians are charged when positive; the
+    // upper-bound total uses each delta's ~96.7% upper bound. GPU + host is an upper bound (only
+    // one is the pole at a time).
     let lane_layers = 2.0 * 40.0;
     let writes = lane_layers;
     let (gemv_per, mhc_per, small_per) = (8.0, 3.0, 7.0);
-    let worst = |v: &[Delta], ub: bool| v.iter().map(|d| if ub { d.charge_ub() } else { d.charge() }).fold(0.0, f64::max);
-    // (GPU us, host us) per step; `ub` = upper bounds.
-    let cost = |ub: bool| -> (f64, f64) {
+    let env_ms = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let points = [
+        (1u32, env_ms("GK_STEP_MS_B1", 60.0)),
+        (4, env_ms("GK_STEP_MS_B4", 121.6)),
+        (8, env_ms("GK_STEP_MS_B8", 196.8)),
+    ];
+    let bs = [1u32, 4, 8];
+    // (GPU us, host us) per step at batch `b`; `ub` = upper bounds.
+    let cost = |b: u32, ub: bool| -> (f64, f64) {
+        let ch = |d: &Delta| if ub { d.charge_ub() } else { d.charge() };
         let mut gpu = writes * write_cost.0.max(0.0);
         let mut host = writes * write_cost.1.max(0.0);
         for (_, dg, dh) in &relaunch {
             let launches = 4.0 * lane_layers; // 4 stage graphs per lane-layer of each size class
-            gpu += launches * if ub { dg.charge_ub() } else { dg.charge() };
-            host += launches * if ub { dh.charge_ub() } else { dh.charge() };
+            gpu += launches * ch(dg);
+            host += launches * ch(dh);
         }
-        let (g, m) = (worst(&gemv_d, ub), worst(&mhc_d, ub));
+        let i = bs.iter().position(|&x| x == b).expect("measured b");
+        let (g, m) = (ch(&gemv_d[i]), ch(&mhc_d[i]));
         gpu += lane_layers * (gemv_per * g + mhc_per * m + small_per * g.max(m));
         (gpu, host)
     };
-    let budget = 0.01 * step_ms * 1e3;
-    let pct = |us: f64| us / (step_ms * 1e3) * 100.0;
-    let (g_med, h_med) = cost(false);
-    let (g_ub, h_ub) = cost(true);
-    println!("== per-step budget at ms.step {step_ms:.0} ms (1% = {budget:.0} us; 2 lanes x 40 layers):");
+    println!("== per-step budget, 2 lanes x 40 layers, at each operating point:");
     println!(
         "  context writes   {writes:.0} x ({:.2} GPU + {:.2} host) us = {:.0} us  (what-if presubmit, 160 writes: {:.0} us)",
         write_cost.0,
@@ -705,39 +833,50 @@ fn graph_keys_step0() -> eyre::Result<()> {
             dh.charge_ub()
         );
     }
-    println!(
-        "  twins            {lane_layers:.0} x ({gemv_per:.0} gemv x {:.2} + {mhc_per:.0} mhc x {:.2} + {small_per:.0} small x {:.2}) us; ub gemv {:.2} mhc {:.2}",
-        worst(&gemv_d, false),
-        worst(&mhc_d, false),
-        worst(&gemv_d, false).max(worst(&mhc_d, false)),
-        worst(&gemv_d, true),
-        worst(&mhc_d, true)
-    );
-    let (med, ub) = (g_med + h_med, g_ub + h_ub);
-    println!(
-        "  total (medians)  {med:6.0} us = {:.2}%  (GPU-only {:.2}%, host-only {:.2}%)",
-        pct(med),
-        pct(g_med),
-        pct(h_med)
-    );
-    println!("  total (upper bd) {ub:6.0} us = {:.2}%  (GPU-only {:.2}%, host-only {:.2}%)", pct(ub), pct(g_ub), pct(h_ub));
-    // GO: the medians and the upper bounds fit. MARGINAL (the live A/B's <= 1% ms.step bar
-    // decides): the medians fit but the upper bounds do not, or the GPU + host sum does not fit
-    // while each timeline alone does. NO-GO otherwise.
-    let budget_verdict = if med <= budget && ub <= budget {
-        "GO"
-    } else if med <= budget || (g_med <= budget && h_med <= budget) {
-        "MARGINAL"
-    } else {
+    let mut verdicts = Vec::new();
+    for &(b, step_ms) in &points {
+        let i = bs.iter().position(|&x| x == b).expect("measured b");
+        let budget = 0.01 * step_ms * 1e3;
+        let pct = |us: f64| us / (step_ms * 1e3) * 100.0;
+        let (g_med, h_med) = cost(b, false);
+        let (g_ub, h_ub) = cost(b, true);
+        let (med, ub) = (g_med + h_med, g_ub + h_ub);
+        let (gm, mm) = (gemv_d[i].charge(), mhc_d[i].charge());
+        // GO: medians and upper bounds fit. MARGINAL (the live A/B's <= 1% ms.step bar decides): only
+        // the medians fit, or GPU + host does not while each timeline alone does. NO-GO otherwise.
+        let v = if med <= budget && ub <= budget {
+            "GO"
+        } else if med <= budget || (g_med <= budget && h_med <= budget) {
+            "MARGINAL"
+        } else {
+            "NO-GO"
+        };
+        println!(
+            "  b={b} at {step_ms:.1} ms (1% = {budget:.0} us): twins {lane_layers:.0} x ({gemv_per:.0} x {gm:.2} + {mhc_per:.0} x {mm:.2} + {small_per:.0} x {:.2}) us; total {med:.0} us = {:.2}% (GPU {:.2}%, host {:.2}%), upper bounds {:.2}% -> {v}",
+            gm.max(mm),
+            pct(med),
+            pct(g_med),
+            pct(h_med),
+            pct(ub)
+        );
+        verdicts.push((b, v, pct(med), pct(ub)));
+    }
+    let budget_verdict = if verdicts.iter().any(|v| v.1 == "NO-GO") {
         "NO-GO"
+    } else if verdicts.iter().all(|v| v.1 == "GO") {
+        "GO"
+    } else {
+        "MARGINAL"
     };
-    println!("  budget: {budget_verdict}");
+    let summary =
+        verdicts.iter().map(|(b, v, m, u)| format!("b{b} {v} {m:.2}%/{u:.2}%")).collect::<Vec<_>>().join(", ");
+    println!("  budget: {budget_verdict} ({summary})");
     if !nogo.is_empty() {
         println!("STEP0: NO-GO ({})", nogo.join(", "));
     } else if budget_verdict == "GO" {
         println!("STEP0: GO");
     } else {
-        println!("STEP0: {budget_verdict} (budget: medians {:.2}%, upper bounds {:.2}%)", pct(med), pct(ub));
+        println!("STEP0: {budget_verdict} (budget per point, medians/upper bounds: {summary})");
     }
     if !exact {
         return Err(eyre!("graph_keys step 0: a bit-exactness, coherence or node-count check failed"));

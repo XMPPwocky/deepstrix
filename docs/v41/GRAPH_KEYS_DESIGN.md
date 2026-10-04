@@ -68,13 +68,18 @@ that replaced 3-5 of them saved 13-20 us per lane-layer (tests/bench_decode_late
    direct kernel on A, then on B; and a capture of N launches has exactly N nodes (2.5's vetted
    count assumes one kernel node per launch -- if ROCm added nodes, every capture would taint and
    the design would silently run all-legacy).
-Go / no-go (rev 3.3, after runs 1-2 and two code reviews): coherence clean, every twin bit-exact,
-one node per launch, no drained queue, no BLOCKS, and ONE per-step budget vs 1% of `ms.step` p50 (60
-ms at 2 rows / 2 lanes, the worst case: counts grow with lanes x layers, the step with rows):
+Go / no-go (rev 3.4, after runs 1-2 and three code reviews): coherence clean, every twin
+bit-exact, one node per launch, no drained queue (a drained run is re-run up to 3 times), no
+BLOCKS, and the per-step budget at EACH operating point vs 1% of that point's `ms.step` p50 -- two
+lanes (the binding case), b = 1 / 4 / 8 per lane at 60 / 121.6 / 196.8 ms (live; MULTI_LADDER_TWO;
+its +9.4 ms/row extrapolation), each charging the twin deltas measured at its own b (rev 3.3 paired
+b=8's delta with b=1's step):
 writes (80 = 1 per lane-layer; presubmit is off in production, 160 printed as a what-if) x the
 `ctx_store` GPU + host cost + graph launches (320 1-node + 320 multi-node = 8 stages x 80
 lane-layers) x the K = 8 vs all-distinct relaunch delta of that size (GPU + host) + twin launches
-per lane-layer (8 gemv-like at the q_b delta, 3 mhc, 7 small at the larger of the two) x 80.
+per lane-layer (8 gemv-like at the q_b delta, 3 mhc, 7 small at the larger of the two) x 80. Each
+timed run is preceded by a short spin covering the enqueue and real work (warm-up launches), so the
+clocks are up when the events start.
 Deltas are paired (21 alternating pairs); the median is charged when positive and a ~96.7%
 upper-bound total uses the 16th of 21 paired differences. GO = medians and upper bounds fit;
 MARGINAL = only the medians fit, or GPU + host does not fit while each alone does (the live A/B's
@@ -235,7 +240,11 @@ thread submits to `ctx_dev` (documented invariant).
 `ensure_ctx` stamps each entry with an increasing `seq`; every `_ind_canary` twin (the `_ind`
 twin's dereference code plus the canary; picked by the wrappers when the canary is on --
 production twins carry no canary code, Step 0 run 2: a record after the body reshaped the body,
-gemv b=8 +9.8%) reads `seq` and the log pointer with scalar loads right
+gemv b=8 +9.8%; two conditions (review of 752a3c3): the canary mode is process-static
+(read once, like the other startup knobs) or part of the graph key -- a captured graph bakes its
+symbol, so a live toggle would replay production twins while the check expects records -- and the
+bit-exact gate arms (3) run with the canary OFF, so the production symbols are what G5 exercises,
+the canary being its own arm) reads `seq` and the log pointer with scalar loads right
 after its operand dereferences, before any store (one `s_load_b128`, verified in the disassembly),
 along with the XOR of its resolved operand pointers; after the body, thread 0 of block 0 appends
 {seq << 16 | stage id, pointer XOR} at an atomic cursor clamped at the log's end (the XOR shows
@@ -379,3 +388,12 @@ Review of 0122a52 (reviewer: APPROVE WITH CHANGES) and run 2:
 6. Run 2 (NO-GO 5.54%): the gemv b=8 twin's +4 us traced to the canary record after the body:
    production twins now carry no canary code (`_canary` variants, 2.8); spins shortened to the
    enqueue (the 50 ms idle spins made per-launch times bimodal); 21 pairs.
+
+Review of 752a3c3 (reviewer: APPROVE WITH CHANGES):
+
+1. The budget paired b=8's twin delta with b=1's 60 ms step (overstating run 2 about threefold):
+   FIXED -- per operating point (b = 1 / 4 / 8 at 60 / 121.6 / 196.8 ms), every point must fit.
+2. Canary off the production twins: ACCEPTED with two conditions for the build (2.8): canary mode
+   process-static or in the key; gate arms run canary-off, the canary its own arm.
+3. One OS stall would hard-fail the window: FIXED -- drained runs / pairs re-run up to 3 times.
+4. Clock state: FIXED -- warm-up with real work before every timed run; per-arm SPREAD flag.
