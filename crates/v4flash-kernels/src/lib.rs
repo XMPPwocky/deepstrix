@@ -116,6 +116,8 @@ pub mod q6_k;
 pub mod q6_k_dense;
 pub mod q8_0;
 pub mod q8_k;
+pub mod qwen3_embed;
+pub mod dgpu_loan;
 pub mod mhc_pre_fused;
 pub mod mhc_arena;
 pub mod readback_pack;
