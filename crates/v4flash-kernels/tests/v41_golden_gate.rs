@@ -575,7 +575,7 @@ fn v41_golden_gate() -> eyre::Result<()> {
                     l
                 } else {
                     engine.forward_step_arena(
-                        &mut bd_a, &mut bi_a, &mut sd, &mut si, arena.as_mut().unwrap(), dev.as_mut().unwrap(), &[slot], &weights,
+                        &mut bd_a, &mut bi_a, &mut sd, &mut si, arena.as_mut().unwrap(), dev.as_mut().unwrap(), &v4flash_kernels::het::step_rows::StepRows::plain(&[slot])?, &weights,
                         &[hc], &[tok], &mut LazyEngramRows::ready(Some(rows)), Some(&mut pg),
                     )?;
                     arena.as_mut().unwrap().accept(slot, 1, &engine.dgpu.compute)?;

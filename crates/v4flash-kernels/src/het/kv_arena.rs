@@ -42,6 +42,7 @@ use crate::config::{
     kv_source_of, CED_DECODER_START, COMPRESS_RATIOS, KV_SOURCE_LAYERS, NEG_INF, N_HEAD_DIM, N_LAYER, SWA_WINDOW,
 };
 use crate::het::state::{CompKvStore, HetCompressorState, HetLayerState, HetModelState};
+use crate::het::step_rows::StepRows;
 use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 
 /// Raw rows per slot beyond the SWA window. The arena only appends DECODE rows
@@ -1089,7 +1090,19 @@ impl KvArena {
     /// compressor group (`blocks_per_slot`). A slot that reappears after
     /// another slot's rows is refused. The counters do not move: the caller
     /// `accept`s each stream's kept rows after the step.
-    pub fn tables(&self, slots: &[u32]) -> eyre::Result<RowTables> {
+    ///
+    /// The rows' dependencies come from `rows` (`StepRows`,
+    /// docs/v41/MS_DSPARK_STREAMS_DESIGN.md 1): the tables express a CHAIN
+    /// layout only -- each stream's rows contiguous, row `j` at depth `j`
+    /// continuing row `j - 1` -- because a row's raw window, compressed rows
+    /// and index keys are contiguous ranges ending at its own append. A tree
+    /// (siblings, a non-prefix ancestry) needs ancestor-masked reads and
+    /// per-node accumulator blocks first, and is refused here.
+    pub fn tables(&self, rows: &StepRows) -> eyre::Result<RowTables> {
+        if !rows.is_chain_layout() {
+            return Err(eyre!("kv arena: the step's rows are not a chain layout (tree rows need ancestor-masked attention: not built)"));
+        }
+        let slots = rows.slots();
         let mut t = RowTables { stores: vec![StoreTables::default(); self.stores.len()], ..Default::default() };
         let mut cur: Option<(u32, StreamKv, u32)> = None; // (slot, counters at row j, pre-step pos)
         let mut j = 0u32;
@@ -1151,8 +1164,8 @@ impl KvArena {
         Ok(t)
     }
 
-    /// Rows per slot in a step's `slots` list (runs of one slot; `tables`
-    /// refuses anything else).
+    /// Rows per slot in a slot list read as runs (tests: the old reading).
+    #[cfg(test)]
     pub fn step_rows(slots: &[u32]) -> Vec<(u32, u32)> {
         let mut v: Vec<(u32, u32)> = Vec::new();
         for &s in slots {
@@ -1166,9 +1179,9 @@ impl KvArena {
 
     /// Compact every stream of the step whose raw region cannot take its rows
     /// (`needs_compaction_rows`). Call before `tables`.
-    pub fn compact_for_step(&mut self, slots: &[u32], stream: &Stream, scratch: &mut DeviceBuffer<u16>) -> eyre::Result<()> {
-        for (slot, rows) in Self::step_rows(slots) {
-            if self.needs_compaction_rows(slot, rows) {
+    pub fn compact_for_step(&mut self, rows: &StepRows, stream: &Stream, scratch: &mut DeviceBuffer<u16>) -> eyre::Result<()> {
+        for (slot, _, n) in rows.streams() {
+            if self.needs_compaction_rows(slot, n as u32) {
                 self.compact_raw(slot, stream, scratch)?;
             }
         }
@@ -1302,6 +1315,11 @@ impl KvArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `KvArena::tables` over a slot list read the arena's way (runs = chains).
+    fn tables_of(ar: &KvArena, slots: &[u32]) -> eyre::Result<RowTables> {
+        ar.tables(&StepRows::chains_from_runs(slots)?)
+    }
 
     #[test]
     fn free_list_first_fit_and_coalesce() {
@@ -1469,7 +1487,7 @@ mod tests {
         }
         let lists: [&[u32]; 5] = [&[0, 1, 2], &[0, 0, 0, 0, 0, 0], &[1, 1, 1, 1, 1], &[0, 0, 1, 2, 2], &[2, 2, 2, 2, 0]];
         for slots in lists {
-            let all = ar.tables(slots).unwrap();
+            let all = tables_of(&ar, slots).unwrap();
             for cut in 0..=slots.len() {
                 let (a, b) = (all.rows(0, cut), all.rows(cut, slots.len()));
                 // Reassembles exactly: rows in order, every fire in one lane.
@@ -1496,8 +1514,8 @@ mod tests {
                 assert_eq!(joined, all, "slots {slots:?} cut {cut}");
                 // A cut between streams: each side equals its own tables call.
                 if cut > 0 && cut < slots.len() && slots[cut - 1] != slots[cut] {
-                    assert_eq!(a, ar.tables(&slots[..cut]).unwrap(), "slots {slots:?} cut {cut} (left)");
-                    assert_eq!(b, ar.tables(&slots[cut..]).unwrap(), "slots {slots:?} cut {cut} (right)");
+                    assert_eq!(a, tables_of(&ar, &slots[..cut]).unwrap(), "slots {slots:?} cut {cut} (left)");
+                    assert_eq!(b, tables_of(&ar, &slots[cut..]).unwrap(), "slots {slots:?} cut {cut} (right)");
                 }
                 // A cut through a stream: the right side continues its positions.
                 if cut > 0 && cut < slots.len() && slots[cut - 1] == slots[cut] {
@@ -1578,9 +1596,9 @@ mod tests {
                     s.raw_off_dec = 0;
                 }
             }
-            let t = ar.tables(&slots).unwrap();
+            let t = tables_of(&ar, &slots).unwrap();
             // Stream 1's row equals its one-row tables.
-            let alone = ar.tables(&[1]).unwrap();
+            let alone = tables_of(&ar, &[1]).unwrap();
             let b1 = if b_first { 0 } else { r as usize };
             assert_eq!(t.pos_per[b1], alone.pos_per[0]);
             assert_eq!(t.slot_per[b1], alone.slot_per[0]);
@@ -1647,8 +1665,18 @@ mod tests {
             }
         }
         // Refusals.
-        assert!(ar.tables(&[0, 1, 0]).is_err(), "a slot split by another slot's rows");
-        assert!(ar.tables(&[0; ARENA_ROWS_PER_STREAM as usize + 1]).is_err(), "more rows than the blocks hold");
+        assert!(tables_of(&ar, &[0, 1, 0]).is_err(), "a slot split by another slot's rows");
+        assert!(tables_of(&ar, &[0; ARENA_ROWS_PER_STREAM as usize + 1]).is_err(), "more rows than the blocks hold");
+        // A tree (two children of one root) is expressible as StepRows and
+        // refused by the tables.
+        use crate::het::step_rows::StepRow;
+        let tree = StepRows::new(vec![
+            StepRow { slot: 0, parent: None },
+            StepRow { slot: 0, parent: Some(0) },
+            StepRow { slot: 0, parent: Some(0) },
+        ])
+        .unwrap();
+        assert!(ar.tables(&tree).is_err(), "tree rows are refused until ancestor-masked attention exists");
         assert!(!ar.can_step_rows(0, ARENA_ROWS_PER_STREAM + 1));
     }
 }

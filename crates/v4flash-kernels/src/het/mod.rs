@@ -37,6 +37,7 @@ pub mod prefill_stats;
 pub mod remote_experts;
 pub mod scratch;
 pub mod state;
+pub mod step_rows;
 pub mod sync;
 pub mod trace;
 pub mod route_probe;

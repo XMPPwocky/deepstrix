@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use v4flash_kernels::config::{ENGRAM_IN, HC_DIM, N_VOCAB};
 use v4flash_kernels::het::forward_prefill::{lane_rows, LazyEngramRows, PrefillJob};
 use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev, ARENA_ROWS_PER_STREAM};
+use v4flash_kernels::het::step_rows::StepRows;
 use v4flash_kernels::het::scratch::{HEAD_BATCH_MAX, HEAD_CAND_BAND, HEAD_CAND_CAP, HEAD_CAND_STRIDE};
 use v4flash_kernels::het::SampleMode;
 use v4flash_kernels::sampler::SamplerRng;
@@ -503,10 +504,12 @@ fn lanes_learned() -> bool {
 /// How a speculating lone stream's verify picks its lanes (two = an ordered
 /// cut, `forward_step_arena_ready_first`): `Off` when it cannot -- spec lanes
 /// off, lanes off, or not the ready-first driver (`V41_MS_STAGGER=2`). Also
-/// what the K policy prices a block's rows by. `min_rows` / `learned` = this
-/// step's snapshot (one read per step).
-pub(crate) fn spec_lane_rule(min_rows: usize, learned: bool) -> LaneRule {
-    let ready_first = knobs::MS_STAGGER.pick() == 2;
+/// what the K policy prices a block's rows by. `min_rows` / `learned` /
+/// `stagger_mode` = this step's snapshot (one read per step: a second read of
+/// `MS_STAGGER` for the driver choice could see a live flip and send an ordered
+/// cut to a driver that refuses it).
+pub(crate) fn spec_lane_rule(min_rows: usize, learned: bool, stagger_mode: usize) -> LaneRule {
+    let ready_first = stagger_mode == 2;
     match (ready_first && ms_pipeline() && spec_lanes_on(), learned) {
         (false, _) => LaneRule::Off,
         (true, true) => LaneRule::Learned,
@@ -1620,11 +1623,17 @@ impl Sched {
         // section 2); the plain lane choice below uses the plain rule.
         let min_rows = pipeline_min_rows();
         let learned = lanes_learned();
-        let spec_rule = spec_lane_rule(min_rows, learned);
+        let stagger_mode = knobs::MS_STAGGER.pick();
+        let spec_rule = spec_lane_rule(min_rows, learned, stagger_mode);
         // The drafted block's lane count (`MsDspark::k_for`).
         let mut spec_two = false;
         // The lone stream drafted and `k_for` gave K = 0 (`MsDspark::record_k0`).
         let mut drafted_k0 = false;
+        // Two or more live streams drafted: (stream index, confidence logits)
+        // of each that did, whatever its K (`MsDspark::record_multi`).
+        let mut multi_drafted: Vec<(usize, [f32; v4flash_kernels::het::mtp::MTP_BLOCK])> = Vec::new();
+        // How many live streams may all draft (`V41_MS_DSPARK_STREAMS`, one read per step).
+        let spec_max = ms_dspark::spec_streams();
         if self.streams.len() == 1 {
             if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
                 let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
@@ -1636,7 +1645,7 @@ impl Sched {
                 while cap > 0 && !self.arena.can_step_rows(s.slot, 1 + cap as u32) {
                     cap -= 1;
                 }
-                if cap > 0 && pos > 0 && dsp.should_draft(s.slot) {
+                if cap > 0 && pos > 0 && dsp.should_draft(s.slot, false) {
                     let mut row = vec![0f32; HC_DIM as usize];
                     embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, s.next, &mut row);
                     match dsp.draft(&state.engine, &state.weights, m, s.slot, pos - 1, s.next, &row, sampling.as_ref()) {
@@ -1660,6 +1669,52 @@ impl Sched {
                     }
                 }
             }
+        } else if self.streams.len() <= spec_max {
+            // Two or more live streams, all of them may draft
+            // (`V41_MS_DSPARK_STREAMS`, docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2):
+            // each drafts as the lone stream does (its own gate, KV cap and
+            // draft RNG; drafts run one after the other), then ONE joint policy
+            // (`MsDspark::ks_for`) picks every stream's K and the lanes.
+            if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
+                let mut blocks: Vec<ms_dspark::BlockConf> = Vec::new();
+                let mut got: Vec<(usize, ms_dspark::Drafted)> = Vec::new();
+                for (i, s) in self.streams.iter_mut().enumerate() {
+                    let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| s.draft_rng.next_f32());
+                    let sampling = ms_dspark::draft_sampling(&s.sample_mode, u);
+                    let pos = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
+                    let remaining = s.max_new.saturating_sub(s.completion_tokens as usize);
+                    let mut cap = remaining.saturating_sub(1).min(ms_dspark::k_max());
+                    while cap > 0 && !self.arena.can_step_rows(s.slot, 1 + cap as u32) {
+                        cap -= 1;
+                    }
+                    if cap == 0 || pos == 0 || !dsp.should_draft(s.slot, true) {
+                        continue;
+                    }
+                    let mut row = vec![0f32; HC_DIM as usize];
+                    embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, s.next, &mut row);
+                    match dsp.draft(&state.engine, &state.weights, m, s.slot, pos - 1, s.next, &row, sampling.as_ref()) {
+                        Ok(Some(d)) => {
+                            blocks.push(ms_dspark::BlockConf { conf: d.conf, cap });
+                            got.push((i, d));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(slot = s.slot, error = %e, "ms dspark: draft failed; plain row, ring restarts");
+                            let _ = dsp.reset(s.slot);
+                        }
+                    }
+                }
+                if !blocks.is_empty() {
+                    let sampled = got.iter().any(|(_, d)| d.q.is_some());
+                    let (ks, lanes) = dsp.ks_for(&blocks, self.streams.len(), sampled, spec_rule);
+                    spec_two = lanes >= 2;
+                    for ((i, d), k) in got.into_iter().zip(ks) {
+                        drafts[i] = d.ids[..k].to_vec();
+                        draft_q[i] = d.q.map(|mut q| { q.truncate(k); q });
+                        multi_drafted.push((i, d.conf));
+                    }
+                }
+            }
         }
         let spec = drafts.iter().any(|d| !d.is_empty());
         // `V41_SUB_DEFER_ACCEPTED`: a lone stream's speculative block records its
@@ -1676,22 +1731,32 @@ impl Sched {
             }
         }
         let _defer_guard = DeferGuard;
-        // Rows: per stream its next token, then its draft rows (positions
-        // pos+1.., consecutive, in one lane: `KvArena::tables`).
-        let mut row0: Vec<usize> = Vec::with_capacity(self.streams.len());
-        let mut slots: Vec<u32> = Vec::with_capacity(self.streams.len());
-        let mut toks: Vec<i32> = Vec::with_capacity(self.streams.len());
-        for (s, d) in self.streams.iter().zip(&drafts) {
-            row0.push(slots.len());
-            slots.push(s.slot);
-            toks.push(s.next);
-            for &t in d {
-                slots.push(s.slot);
-                toks.push(t);
-            }
+        // Rows: per stream its next token (a root), then its draft rows, each
+        // continuing the one before it (`StepRows::chains`: positions pos+1..).
+        // `step_rows` is the step's ONE description of its rows: the drivers'
+        // tables and lane ordering read it, and every per-row array below is
+        // indexed through it (`row0` = each stream's root). Blocks go in
+        // DESCENDING row count (stable: plain and lone steps keep the stream
+        // order), so the balanced lane cut falls between two streams' blocks
+        // whenever their K differ by at most one (MS_DSPARK_STREAMS_DESIGN 2.4).
+        let order: Vec<usize> = {
+            let mut o: Vec<usize> = (0..self.streams.len()).collect();
+            o.sort_by_key(|&i| std::cmp::Reverse(drafts[i].len()));
+            o
+        };
+        let step_rows = StepRows::chains(&order.iter().map(|&i| (self.streams[i].slot, drafts[i].len())).collect::<Vec<_>>())?;
+        let row0: Vec<usize> = self
+            .streams
+            .iter()
+            .map(|s| step_rows.root_of(s.slot).ok_or_else(|| eyre!("ms.step: stream slot {} has no root row", s.slot)))
+            .collect::<eyre::Result<_>>()?;
+        let mut toks: Vec<i32> = vec![0; step_rows.len()];
+        for ((s, d), &r) in self.streams.iter().zip(&drafts).zip(&row0) {
+            toks[r] = s.next;
+            toks[r + 1..=r + d.len()].copy_from_slice(d);
         }
         let t0 = Instant::now();
-        let b = slots.len();
+        let b = step_rows.len();
         // Event trace: one `hub_step` per step, fields filled BY NAME (see
         // `evtrace_kinds::HUB_STEP`); `hub_req` records carry this step number.
         let ev_on = v4flash_kernels::het::evtrace::enabled();
@@ -1812,7 +1877,7 @@ impl Sched {
         // the host runs whichever lane's next step is ready instead of a fixed
         // round robin (it was blocking 67 ms/step on its own dGPU router while
         // 52 of 80 box-2 replies sat ready). Gated by multistream_step G5e.
-        let stagger_mode = knobs::MS_STAGGER.pick();
+        // `stagger_mode`: the snapshot read with the spec rule above.
         let stagger2 = pipelined && !lanes3 && stagger_mode >= 1;
         let ready_first = stagger_mode == 2;
         let mut fwd_only_ms = 0.0f64;
@@ -1824,9 +1889,9 @@ impl Sched {
         }
         // Each row's sampling mode (a speculating stream's draft rows share
         // its stream's) and its `head_cands` params.
-        let mut row_modes: Vec<SampleMode> = Vec::with_capacity(b);
-        for (s, d) in self.streams.iter().zip(&drafts) {
-            row_modes.extend(std::iter::repeat_n(s.sample_mode, 1 + d.len()));
+        let mut row_modes: Vec<SampleMode> = vec![SampleMode::Argmax; b];
+        for ((s, d), &r) in self.streams.iter().zip(&drafts).zip(&row0) {
+            row_modes[r..=r + d.len()].fill(s.sample_mode);
         }
         if row_modes.len() != b {
             return Err(eyre!("ms.step: {} row modes for {b} rows", row_modes.len()));
@@ -1848,7 +1913,7 @@ impl Sched {
             {
                 let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 3] =
                     [(&mut *bd_a, &mut *bi_a, &mut self.dev), (&mut *bd_b, &mut *bi_b, &mut self.dev_b), (&mut *bd_c, &mut *bi_c, &mut self.dev_c)];
-                engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+                engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &step_rows, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             }
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             let sz = |i: usize| lane_rows(b, 3)[i];
@@ -1858,9 +1923,9 @@ impl Sched {
                 let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 2] =
                     [(&mut *bd_a, &mut *bi_a, &mut self.dev), (&mut *bd_b, &mut *bi_b, &mut self.dev_b)];
                 if ready_first {
-                    engine.forward_step_arena_ready_first(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+                    engine.forward_step_arena_ready_first(&mut lanes, sd, si, &mut self.arena, &step_rows, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
                 } else {
-                    engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+                    engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &step_rows, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
                 }
             }
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
@@ -1868,12 +1933,12 @@ impl Sched {
             let b_a = lane_rows(b, 2)[0];
             head_targets(engine, dgpu_scratch, &[(&*bd_a, b_a), (&*bd_b, b - b_a)], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         } else if pipelined {
-            engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+            engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &step_rows, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             let b_a = lane_rows(b, 2)[0];
             head_targets(engine, dgpu_scratch, &[(&*bd_a, b_a), (&*bd_b, b - b_a)], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         } else {
-            engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+            engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &step_rows, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             head_targets(engine, dgpu_scratch, &[(&*bd_a, b)], weights, &row_modes, &cand_params, &mut self.head_out, hc_mode)?
         };
@@ -2161,6 +2226,8 @@ impl Sched {
         let mut done: Vec<(usize, FinishReason)> = Vec::new();
         let mut keeps: Vec<u32> = vec![1; self.streams.len()];
         let mut spec_out: Option<(usize, usize, usize)> = None;
+        // Per stream: (K, accepted, emitted) of its verified block.
+        let mut spec_outs: Vec<Option<(usize, usize, usize)>> = vec![None; self.streams.len()];
         for (i, s) in self.streams.iter_mut().enumerate() {
             let r = row0[i];
             if drafts[i].is_empty() {
@@ -2192,11 +2259,19 @@ impl Sched {
                 if let Some(f) = stop_reason(s, tok) { done.push((i, f)); break; }
             }
             keeps[i] = n;
-            spec_out = Some((k, out.accepted, n as usize));
+            spec_outs[i] = Some((k, out.accepted, n as usize));
+            // The `ms.step` summary: the lone block, or the sums over blocks.
+            let (k0, a0, e0) = spec_out.unwrap_or((0, 0, 0));
+            spec_out = Some((k0 + k, a0 + out.accepted, e0 + n as usize));
         }
         let sample_ms = t_s.elapsed().as_secs_f64() * 1e3;
-        // Keep each stream's emitted rows (rollback = the counters stop there).
+        // Keep each stream's emitted rows (rollback = the counters stop there):
+        // a prefix of the rows it ran (`StepRows`; a chain keeps a prefix).
         for (s, &keep) in self.streams.iter().zip(&keeps) {
+            let ran = step_rows.rows_of(s.slot) as u32;
+            if keep > ran {
+                return Err(eyre!("ms.step: slot {} keeps {keep} rows of the {ran} it ran", s.slot));
+            }
             self.arena.accept(s.slot, keep, &state.engine.dgpu.compute)?;
         }
         if defer {
@@ -2211,8 +2286,9 @@ impl Sched {
             // (2026-10-01 09:54-10:05) left a gap of every plain step the
             // draft-or-not gate took while backing off; the next probe drafted
             // from that stale window, accepted less, and extended the back-off
-            // (73% of lone steps plain). `solo` only skips the 2+-stream steps.
-            let write = dsp.ring_all() || self.streams.len() == 1;
+            // (73% of lone steps plain). `solo` only skips the steps of more
+            // streams than may draft together (`V41_MS_DSPARK_STREAMS`).
+            let write = dsp.ring_all() || self.streams.len() <= spec_max;
             for (i, s) in self.streams.iter().enumerate() {
                 if done.iter().any(|&(d, _)| d == i) {
                     continue;
@@ -2225,15 +2301,38 @@ impl Sched {
                     let _ = dsp.reset(s.slot);
                 }
             }
-            if let Some((k, accepted, emitted)) = spec_out {
-                let lanes = if spec_lanes { 2 } else { 1 };
-                dsp.record(self.streams[0].slot, &draft_conf, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3, lanes);
-            } else if b == 1 {
-                let ms = t0.elapsed().as_secs_f64() * 1e3;
-                if drafted_k0 {
-                    dsp.record_k0(self.streams[0].slot, ms);
+            if self.streams.len() == 1 {
+                if let Some((k, accepted, emitted)) = spec_out {
+                    let lanes = if spec_lanes { 2 } else { 1 };
+                    dsp.record(self.streams[0].slot, &draft_conf, k, accepted, emitted, t0.elapsed().as_secs_f64() * 1e3, lanes);
+                } else if b == 1 {
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    if drafted_k0 {
+                        dsp.record_k0(self.streams[0].slot, ms);
+                    } else {
+                        dsp.note_plain_step(ms);
+                    }
+                }
+            } else if !multi_drafted.is_empty() {
+                // Two or more live streams drafted (design 2.5): per drafted
+                // block calibration, stats and the stage-1 gate (baseline: the
+                // plain step of these streams), and ONE cost sample -- into
+                // the multi tables if any draft was verified, else this was a
+                // plain step and `PlainLanes` takes it below.
+                let step_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let plain_ms = self.plain_lanes.cost(self.streams.len(), plain_rule);
+                if spec {
+                    let blocks: Vec<(u32, [f32; v4flash_kernels::het::mtp::MTP_BLOCK], usize, usize, usize)> = multi_drafted
+                        .iter()
+                        .map(|&(i, conf)| {
+                            let (k, acc, em) = spec_outs[i].unwrap_or((0, 0, keeps[i] as usize));
+                            (self.streams[i].slot, conf, k, acc, em)
+                        })
+                        .collect();
+                    dsp.record_multi(&blocks, b, if pipelined { 2 } else { 1 }, spec_rule, step_ms, plain_ms);
                 } else {
-                    dsp.note_plain_step(ms);
+                    let slots: Vec<u32> = multi_drafted.iter().map(|&(i, _)| self.streams[i].slot).collect();
+                    dsp.record_k0_multi(&slots, step_ms);
                 }
             }
         }
@@ -2242,6 +2341,14 @@ impl Sched {
         if !spec && b >= 2 && !lanes3 {
             self.plain_lanes.observe(b, if pipelined { 2 } else { 1 }, t0.elapsed().as_secs_f64() * 1e3);
         }
+        // Per speculating stream `K/accepted/emitted` (fairness, MS_DSPARK_STREAMS_DESIGN
+        // 2.6); `spec` above is their sum.
+        let spec_streams: String = spec_outs.iter().flatten().map(|(k, a, e)| format!("{k}/{a}/{e}")).collect::<Vec<_>>().join(",");
+        // Every stream's `slot:emitted` this step, riders and finishing streams
+        // included (before they are removed): the fairness metric is the slower
+        // stream's rate over steps with two live streams (design 2.6, review
+        // round 3).
+        let live_emitted: String = self.streams.iter().zip(&keeps).map(|(s, k)| format!("{}:{k}", s.slot)).collect::<Vec<_>>().join(",");
         for (r, f) in done.into_iter().rev() {
             let s = self.streams.remove(r);
             finish(state, &mut self.arena, s, f)?;
@@ -2251,7 +2358,7 @@ impl Sched {
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
             head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff,
             chain_waits, chain_wait_us, ring_settle_ms = format!("{ring_settle_ms:.2}"),
-            engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3), "ms.step");
+            engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),

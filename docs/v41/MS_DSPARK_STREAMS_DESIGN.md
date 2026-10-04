@@ -1,6 +1,6 @@
 # Two speculating streams on one row abstraction (StepRows)
 
-Status: DESIGN rev 3, 2026-10-04 (review rounds 1 and 2: APPROVE WITH CHANGES; dispositions in section 8).
+Status: DESIGN rev 3, APPROVED 2026-10-04 (review rounds 1-2 APPROVE WITH CHANGES, round 3 APPROVE; dispositions in section 8).
 Branch `worktree-ms-dspark2` (base = production `worktree-lm-prefill-prod` 9762c6f, hub 9c6f8ea5).
 
 ## 0. What and why
@@ -173,7 +173,7 @@ Objective (plan section 6, unchanged): `(S + sum_s E_s(K_s)) / (c(S + sum K_s) +
     control.
   - Plan 2.5 (the target must not depend on the draft it tests), stated honestly: `K_B` may read
     `conf_A[j+1]`, which reads `d_A[j]`; `K_B` changes the step's rows, so the lane cut and which
-    rows share a lane. Rows' outputs depend on lane composition only through (a) the cache prior's
+    rows share a lane. Rows' outputs depend on lane composition only through (a) the
     cache prior's cross-lane PENDING overlay (`V41_SUB=3`, production: read at chain time, so only
     when a stream's rows sit in the LATER lane), (b) lane-wide regime switches (`need_mask` past 512
     compressed rows, top-k chunking past 4096, small-B catch-all `b <= small_b_catchall_max`, default
@@ -184,7 +184,7 @@ Objective (plan section 6, unchanged): `(S + sum_s E_s(K_s)) / (c(S + sum K_s) +
     those thresholds the targets are bit-identical whatever the cut (G5h). The lone path has the
     same class today (its K moves its own cut). Accepted and documented (KNOWN_BUGS): a
     substitution-level effect, not an LSB one, and far below the cache prior's own swap effect;
-    1.1(6) closes the stronger same-stream route-order channel.
+    1.1(6) closes the route-order channel under `V41_SUB=2`.
 - Caps: rows per lane <= 8 (`SPEC_ROWS_PER_LANE`; plan 3.7 regimes, pin 16 / hot-set 8 per-lane
   bookkeeping); a row count no allowed lane count can hold costs infinity, so the policies never
   pick it. `V41_MS_DSPARK_K` (fixed K, which ignores costs) is clamped under the same cap: drafts
@@ -250,13 +250,15 @@ exactly as for a lone stream today. `lanes3` stays off for any speculating step.
 The objective is aggregate tokens per ms (plan section 6; the per-stream latency bound was left to
 the owner). A stream backing off beside a K = 5 block rides a ~100-120 ms step for one token
 (~8-10 tok/s, vs 15.4 at 2 plain rows). This build:
-- logs per step each speculating stream's `K/accepted/emitted` (`ms.step` gains `spec_streams`, at
-  the end of the line so the existing `rows= spec= lanes=` parsers keep working);
-- PRE-REGISTERS the A/B pass rule on requests, not steps (review round 2: a per-step rate never
-  samples a riding stream and has no knob-1 baseline): for every pair of concurrently decoding
-  requests, the SLOWER request's decode tok/s (`multistream: stream done ... tok_per_s`); pass =
-  its median at knob 2 >= 0.9 x its median at knob 1, beside the aggregate gain of 2-stream
-  steps;
+- logs per step each speculating stream's `K/accepted/emitted` (`spec_streams`) and EVERY live
+  stream's `slot:emitted`, riders included (`live_emitted`), at the end of the `ms.step` line so the
+  existing `rows= spec= lanes=` parsers keep working;
+- PRE-REGISTERS the A/B pass rule (review rounds 2-3): for every pair of requests decoding together,
+  the SLOWER stream's decode rate over the steps with exactly two live streams (its tokens from
+  `live_emitted` over those steps' wall time), counting only pairs whose whole overlap falls inside
+  one knob arm; pass = that rate's median at knob 2 >= 0.9 x its median at knob 1, beside the
+  aggregate gain of 2-stream steps (a whole-request `stream done tok_per_s` would dilute the
+  together-time with lone stretches and prefill waits);
 - does NOT build a latency bound (owner's call; a knob `V41_MS_DSPARK_FAIR` bounding each stream's
   expected per-token time at `(1 + f) x plain(S)` fits the stopping rule -- it reads only confs up
   to each frontier -- and is the follow-up if the A/B shows the slower stream losing).
@@ -319,8 +321,8 @@ GPU window (hub down, box 2 attached, `V41_REMOTE_SPLIT=1 V41_T2_CATCHALL=2` as 
   the same request's output run alone (greedy); prompts on the same side of `need_mask` and of the
   4096 top-k chunking (lane-wide switches could flip an argmax otherwise).
 
-Production: A/B per turn, `V41_MS_DSPARK_STREAMS` 1 vs 2: aggregate tok/s of 2-stream steps,
-per-stream p10 tok/s (2.6), lone-stream steps unchanged.
+Production: A/B per turn, `V41_MS_DSPARK_STREAMS` 1 vs 2: aggregate tok/s of 2-stream steps, the
+slower-stream rule of 2.6, lone-stream steps unchanged.
 
 ## 6. Sequencing and rollback
 
@@ -376,3 +378,6 @@ Review round 2 (reviewer: APPROVE WITH CHANGES):
 - R2-6 ladder text: FIXED (2.3).
 - R2-7 per-regime gates: ACCEPTED, replacing the reset (2.5).
 - R2-8 end-to-end prompts: ACCEPTED (5).
+
+Review round 3 (reviewer: APPROVE): R3-1 the fairness window (steps with two live streams, every
+stream's emitted tokens logged) ADOPTED (2.6); R3-2 three doc lines FIXED.

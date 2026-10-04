@@ -43,6 +43,7 @@ use super::scratch::{DgpuScratch, IgpuScratch};
 use crate::config::{ENGRAM_CHUNK, ENGRAM_IN, ENGRAM_OUT};
 use super::state::{CompKvStore, HetLayerState, HetModelState, KV_CACHE_ROWS};
 use super::kv_arena::{store_index_of, KvArena, RowTables, RowTablesDev};
+use super::step_rows::StepRows;
 use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
 use super::sync::{peer_push_f32, peer_push_i32, peer_push_u8};
 use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
@@ -249,21 +250,22 @@ pub fn lane_rows(b: usize, n: usize) -> Vec<usize> {
     (0..n).map(|i| b / n + usize::from(i < b % n)).collect()
 }
 
-fn check_lane_cuts(who: &str, slots: &[u32], cuts: &[usize], ordered: bool) -> eyre::Result<()> {
-    // A stream's rows (DSpark: next token + drafts) stay in ONE lane unless the
-    // driver ORDERS the cut (`ordered`: `forward_step_arena_ready_first`, whose
-    // tables are one `KvArena::tables` call split by row range, and whose later
-    // lane enters each layer's chain -- every KV / compressor / index write of
-    // that layer, all on `de.compute` -- only after the earlier lane has).
-    // Otherwise row `j` would restart at the stream's pre-step position and the
+fn check_lane_cuts(who: &str, rows: &StepRows, cuts: &[usize], ordered: bool) -> eyre::Result<()> {
+    // A row and the rows it depends on (DSpark: a draft and the rows before it,
+    // `StepRows`) stay in ONE lane unless the driver ORDERS the cut (`ordered`:
+    // `forward_step_arena_ready_first`, whose tables are one `KvArena::tables`
+    // call split by row range, and whose later lane enters each layer's chain
+    // -- every KV / compressor / index write of that layer, all on
+    // `de.compute` -- only after the earlier lane has). Otherwise the later
+    // lane's tables would restart at the stream's pre-step position and the
     // compressor state of a group written by one lane would not be ordered
     // before the other lane's pool (plan 3.5).
     if ordered {
         return Ok(());
     }
     for &c in cuts {
-        if c > 0 && c < slots.len() && slots[c - 1] == slots[c] {
-            return Err(eyre!("{who}: lane cut at row {c} splits slot {}'s rows", slots[c]));
+        if c > 0 && c < rows.len() && rows.crosses(c) {
+            return Err(eyre!("{who}: lane cut at row {c} separates rows from the rows they depend on"));
         }
     }
     Ok(())
@@ -3670,7 +3672,7 @@ impl HeterogeneousEngine {
         si: &mut BatchIgpuShared,
         arena: &mut KvArena,
         dev: &mut RowTablesDev,
-        slots: &[u32],
+        rows: &StepRows,
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
@@ -3680,6 +3682,7 @@ impl HeterogeneousEngine {
         // Decode-phase link window (the rows are decode rows of live streams).
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
+        let slots = rows.slots();
         let b = tokens.len();
         if b == 0 {
             return Ok(RowTables::default());
@@ -3703,8 +3706,8 @@ impl HeterogeneousEngine {
 
         // A full raw region moves its window down before the tables are
         // derived (the tables carry the append slot).
-        arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
-        let tables = arena.tables(slots)?;
+        arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
+        let tables = arena.tables(rows)?;
         dev.upload(&tables, &self.dgpu.compute)?;
 
         for (i, hc) in input_hcs.iter().enumerate() {
@@ -3768,7 +3771,7 @@ impl HeterogeneousEngine {
         arena: &mut KvArena,
         dev_a: &mut RowTablesDev,
         dev_b: &mut RowTablesDev,
-        slots: &[u32],
+        rows: &StepRows,
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
@@ -3777,6 +3780,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<(RowTables, RowTables)> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
+        let slots = rows.slots();
         let b = tokens.len();
         if b < 2 {
             return Err(eyre!("forward_step_arena_pipelined: needs >= 2 rows (got {b})"));
@@ -3791,17 +3795,19 @@ impl HeterogeneousEngine {
         }
         let b_a = b.div_ceil(2);
         let b_b = b - b_a;
-        check_lane_cuts("forward_step_arena_pipelined", slots, &[b_a], false)?;
+        check_lane_cuts("forward_step_arena_pipelined", rows, &[b_a], false)?;
         check_scratch_rows("forward_step_arena_pipelined", b_a, bd_a, bi_a, sd, si)?;
         check_scratch_rows("forward_step_arena_pipelined", b_b, bd_b, bi_b, sd, si)?;
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
         arena.state.restore_compressor_lending();
-        arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
-        let (slots_a, slots_b) = slots.split_at(b_a);
+        arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         let (tokens_a, tokens_b) = tokens.split_at(b_a);
-        let tables_a = arena.tables(slots_a)?;
-        let tables_b = arena.tables(slots_b)?;
+        // ONE tables call split at the cut; no row depends across it (checked
+        // above), so each half equals a call for that lane's rows alone.
+        let all_tables = arena.tables(rows)?;
+        let tables_a = all_tables.rows(0, b_a);
+        let tables_b = all_tables.rows(b_a, b);
         dev_a.upload(&tables_a, &self.dgpu.compute)?;
         dev_b.upload(&tables_b, &self.dgpu.compute)?;
         for (i, hc) in input_hcs.iter().enumerate() {
@@ -3954,7 +3960,7 @@ impl HeterogeneousEngine {
         sd: &mut BatchDgpuShared,
         si: &mut BatchIgpuShared,
         arena: &mut KvArena,
-        slots: &[u32],
+        rows: &StepRows,
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
@@ -3963,6 +3969,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
+        let slots = rows.slots();
         let b = tokens.len();
         let n = lanes.len();
         if n < 2 || n > Self::MAX_LANES || b < n {
@@ -3983,7 +3990,7 @@ impl HeterogeneousEngine {
             let sz = lane_rows(b, n)[i];
             offs.push(offs[i] + sz);
         }
-        check_lane_cuts("forward_step_arena_lanes", slots, &offs, false)?;
+        check_lane_cuts("forward_step_arena_lanes", rows, &offs, false)?;
         for (i, (bd, bi, _)) in lanes.iter().enumerate() {
             let bl = offs[i + 1] - offs[i];
             check_scratch_rows("forward_step_arena_lanes", bl, bd, bi, sd, si)?;
@@ -3991,11 +3998,14 @@ impl HeterogeneousEngine {
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
         arena.state.restore_compressor_lending();
-        arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
+        arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
+        // ONE tables call split by lane; no row depends across a cut (checked
+        // above), so each range equals a call for that lane's rows alone.
+        let all_tables = arena.tables(rows)?;
         let mut tables: Vec<RowTables> = Vec::with_capacity(n);
         for (i, (bd, _, dev)) in lanes.iter_mut().enumerate() {
             let (lo, hi) = (offs[i], offs[i + 1]);
-            let t = arena.tables(&slots[lo..hi])?;
+            let t = all_tables.rows(lo, hi);
             dev.upload(&t, &self.dgpu.compute)?;
             for (k, hc) in input_hcs[lo..hi].iter().enumerate() {
                 let mut slot = bd.residual.slice_view_mut(k * HC_DIM as usize, HC_DIM as usize);
@@ -4099,7 +4109,7 @@ impl HeterogeneousEngine {
         sd: &mut BatchDgpuShared,
         si: &mut BatchIgpuShared,
         arena: &mut KvArena,
-        slots: &[u32],
+        rows: &StepRows,
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
@@ -4108,6 +4118,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
+        let slots = rows.slots();
         let b = tokens.len();
         let n = lanes.len();
         if n < 2 || n > Self::MAX_LANES || b < n {
@@ -4128,7 +4139,7 @@ impl HeterogeneousEngine {
             let sz = lane_rows(b, n)[i];
             offs.push(offs[i] + sz);
         }
-        check_lane_cuts("forward_step_arena_ready_first", slots, &offs, true)?;
+        check_lane_cuts("forward_step_arena_ready_first", rows, &offs, true)?;
         for (i, (bd, bi, _)) in lanes.iter().enumerate() {
             let bl = offs[i + 1] - offs[i];
             check_scratch_rows("forward_step_arena_ready_first", bl, bd, bi, sd, si)?;
@@ -4136,15 +4147,19 @@ impl HeterogeneousEngine {
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
         arena.state.restore_compressor_lending();
-        arena.compact_for_step(slots, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
+        arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         // ONE tables call for the step, split by row range: a lane that cuts
         // through a stream (an ordered DSpark verify) continues its positions
         // instead of restarting at the stream's pre-step state; for lanes that
         // split no stream it equals a per-lane call (`RowTables::rows`).
-        let all_tables = arena.tables(slots)?;
-        // Lanes `i - 1` and `i` share a stream at the cut: lane `i` may enter a
-        // layer's chain only after lane `i - 1` has (see `Ph::Chain`).
-        let ordered_dep: Vec<bool> = (0..n).map(|i| i > 0 && slots[offs[i] - 1] == slots[offs[i]]).collect();
+        let all_tables = arena.tables(rows)?;
+        // A row at or after lane `i`'s start depends on a row before it
+        // (`StepRows::crosses`): lane `i` may enter a layer's chain only after
+        // lane `i - 1` has (see `Ph::Chain`). The waits chain, and a dependency
+        // of a row in lane `i` on a row in lane `i - k` crosses EVERY lane start
+        // in between (its ancestor path steps below each of them), so each of
+        // those lanes is ordered too: ordering adjacent pairs suffices.
+        let ordered_dep: Vec<bool> = (0..n).map(|i| i > 0 && rows.crosses(offs[i])).collect();
         let mut tables: Vec<RowTables> = Vec::with_capacity(n);
         for (i, (bd, _, dev)) in lanes.iter_mut().enumerate() {
             let (lo, hi) = (offs[i], offs[i + 1]);
@@ -4232,11 +4247,24 @@ impl HeterogeneousEngine {
         enum Ph { Chain(usize), Route(usize), Post(usize), Done }
         let unordered = READY_FIRST_TEST_UNORDERED.load(std::sync::atomic::Ordering::Relaxed);
         let hold_lane0 = READY_FIRST_TEST_HOLD_LANE0.load(std::sync::atomic::Ordering::Relaxed) && n > 1;
-        // Layers whose chain lane `i` has enqueued / that it has posted.
+        // Layers whose chain lane `i` has enqueued / routed / posted.
         let mut entered: Vec<usize> = vec![0; n];
+        let mut routed: Vec<usize> = vec![0; n];
         let mut posted: Vec<usize> = vec![0; n];
         let mut wait_since: Vec<Option<std::time::Instant>> = vec![None; n];
         let may_enter = |entered: &[usize], i: usize, l: usize| !ordered_dep[i] || unordered || entered[i - 1] > l;
+        // An ordered lane also ROUTES a layer only after the lane before it
+        // has (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 1.1(6)). Under the cache
+        // prior (`V41_SUB=3`) nothing route-time reads the other lane (the
+        // prior is read at chain time, and chains are ordered above), but the
+        // route-time substitution (`V41_SUB=2`, `pre_moe_route`) reads the box-2
+        // mirror with its PENDING overlay: a later lane routed first would show
+        // its picks -- rows whose inputs are later drafts -- to the earlier
+        // lane's rows (plan 2.5). Both selection events firing between two
+        // polls let the later lane win. Lane `i - 1`'s route waits only on its
+        // own selection event, earlier on `de.compute` than anything lane `i`
+        // enqueued for the layer: no cycle, and normally no wait at all.
+        let may_route = |routed: &[usize], i: usize, l: usize| !ordered_dep[i] || unordered || routed[i - 1] > l;
         let mut carry: Vec<Option<PreMoeCarry>> = Vec::with_capacity(n);
         for i in 0..n {
             carry.push(Some(chain!(i, 0)));
@@ -4263,10 +4291,11 @@ impl HeterogeneousEngine {
                         }
                     }
                     Ph::Route(l) => {
-                        let ready = self.sync_events_lane(i).layers[l].selected_ready.query().unwrap_or(true);
+                        let ready = may_route(&routed, i, l) && self.sync_events_lane(i).layers[l].selected_ready.query().unwrap_or(true);
                         if ready {
                             let mut c = carry[i].take().expect("carry for Route");
                             rest!(i, l, &mut c);
+                            routed[i] = l + 1;
                             ph[i] = Ph::Post(l);
                             progressed = true;
                         }

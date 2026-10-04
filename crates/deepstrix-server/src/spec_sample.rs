@@ -895,6 +895,150 @@ mod tests {
         assert_exact("q = p + stopping rule", &toy, Drafter::QEqualsP, KPolicy::Stopping, 108);
     }
 
+    /// TWO streams, each drafting 5 from its own previous token with its own
+    /// RNG (production: `Stream::rng` / `draft_rng`), verified in one step with
+    /// K per stream from the JOINT stopping rule (`ms_dspark::choose_ks_stopping`)
+    /// over synthetic confidences that depend on each stream's drafts through
+    /// the markov-prev channel. `peek_a`: the negative control, stream 0's
+    /// first draft verified only when its drawn value is `a`.
+    #[cfg(feature = "v41")]
+    fn generate_two(toy: &Toy, starts: [i32; 2], len: usize, drafter: Drafter, peek_a: Option<i32>, rngs: &mut [SamplerRng; 2]) -> [Vec<i32>; 2] {
+        use crate::ms_dspark::{choose_ks_stopping, BlockConf};
+        let mut seqs: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+        let mut prev = starts;
+        while seqs.iter().any(|s| s.len() < len) {
+            let mut drafts: [Vec<Draft>; 2] = [Vec::new(), Vec::new()];
+            let mut conf = [[0f32; 5]; 2];
+            for s in 0..2 {
+                let mut dp = prev[s];
+                for j in 0..5 {
+                    let r = &toy.drafter[dp as usize];
+                    let mx = r.iter().cloned().fold(f32::MIN, f32::max);
+                    conf[s][j] = (mx - r.iter().sum::<f32>() / r.len() as f32) * 2.0 - 2.0;
+                    let d = match drafter {
+                        Drafter::PointMass => Draft { token: toy.drafter_argmax(dp), q: DraftDist::PointMass },
+                        Drafter::Sampled { tau, m } => {
+                            let q = toy.drafter_q(dp, tau, m);
+                            Draft { token: draw_sparse(&q, rngs[s].next_f32()), q: DraftDist::Sampled(q) }
+                        }
+                        Drafter::QEqualsP => {
+                            let q = toy.q_equals_p(dp);
+                            Draft { token: draw_sparse(&q, rngs[s].next_f32()), q: DraftDist::Sampled(q) }
+                        }
+                    };
+                    dp = d.token;
+                    drafts[s].push(d);
+                }
+            }
+            let blocks = [BlockConf { conf: conf[0], cap: 5 }, BlockConf { conf: conf[1], cap: 5 }];
+            let mut ks = choose_ks_stopping(&blocks, 2, &*STOPPING_COST);
+            if let Some(a) = peek_a {
+                ks[0] = usize::from(drafts[0][0].token == a); // the forbidden, draft-value-dependent K
+            }
+            for s in 0..2 {
+                drafts[s].truncate(ks[s]);
+                let mut rows = vec![toy.p(prev[s])];
+                for d in &drafts[s] {
+                    rows.push(toy.p(d.token));
+                }
+                let out = verify_block(&rows, &drafts[s], &mut rngs[s]);
+                seqs[s].extend_from_slice(&out.tokens);
+                prev[s] = *seqs[s].last().unwrap();
+            }
+        }
+        for s in seqs.iter_mut() {
+            s.truncate(len);
+        }
+        seqs
+    }
+
+    /// Chi-square of the JOINT distribution of both streams' `len`-token
+    /// prefixes against the product of the two exact plain-sampling chains
+    /// (independent streams): catches a bias in either stream and any
+    /// coupling between them. (statistic, critical value at p = 1e-4).
+    #[cfg(feature = "v41")]
+    fn chi_square_two(toy: &Toy, starts: [i32; 2], len: usize, drafter: Drafter, peek_a: Option<i32>, n: usize, seed: u64) -> (f64, f64) {
+        let mut rngs = [SamplerRng::new(seed), SamplerRng::new(seed ^ 0x5DEE_CE66_D1CE_4E5B)];
+        let mut counts: HashMap<(Vec<i32>, Vec<i32>), usize> = HashMap::new();
+        for _ in 0..n {
+            let [a, b] = generate_two(toy, starts, len, drafter, peek_a, &mut rngs);
+            *counts.entry((a, b)).or_default() += 1;
+        }
+        let chain = |start: i32| {
+            let mut exact: Vec<(Vec<i32>, f64)> = vec![(vec![], 1.0)];
+            for _ in 0..len {
+                let mut next = Vec::new();
+                for (prefix, pr) in &exact {
+                    let p = toy.p(*prefix.last().unwrap_or(&start));
+                    for x in 0..V as i32 {
+                        if p.prob(x) > 0.0 {
+                            let mut s = prefix.clone();
+                            s.push(x);
+                            next.push((s, pr * p.prob(x)));
+                        }
+                    }
+                }
+                exact = next;
+            }
+            exact
+        };
+        let (ea, eb) = (chain(starts[0]), chain(starts[1]));
+        let (mut stat, mut cells, mut seen) = (0.0f64, 0usize, 0usize);
+        let (mut pooled_obs, mut pooled_exp) = (0.0f64, 0.0f64);
+        for (sa, pa) in &ea {
+            for (sb, pb) in &eb {
+                let e = pa * pb * n as f64;
+                let o = *counts.get(&(sa.clone(), sb.clone())).unwrap_or(&0) as f64;
+                seen += o as usize;
+                if e < 5.0 {
+                    pooled_obs += o;
+                    pooled_exp += e;
+                } else {
+                    stat += (o - e) * (o - e) / e;
+                    cells += 1;
+                }
+            }
+        }
+        pooled_obs += (n - seen) as f64;
+        if pooled_exp > 0.0 {
+            stat += (pooled_obs - pooled_exp) * (pooled_obs - pooled_exp) / pooled_exp.max(1e-9);
+            cells += 1;
+        } else {
+            assert_eq!(n - seen, 0, "sequences outside the target's support were emitted");
+        }
+        let dof = (cells - 1) as f64;
+        let h = 2.0 / (9.0 * dof);
+        (stat, dof * (1.0 - h + 3.719 * h.sqrt()).powi(3))
+    }
+
+    #[cfg(feature = "v41")]
+    #[test]
+    fn g_rs1_two_streams_with_the_joint_stopping_rule_are_exact() {
+        let toy = Toy::new(sampled_mode(0.9));
+        for (name, drafter, seed) in [
+            ("two streams, sampled + joint stopping rule", Drafter::Sampled { tau: 1.0, m: 4 }, 111u64),
+            ("two streams, q = p + joint stopping rule", Drafter::QEqualsP, 112),
+            ("two streams, point-mass + joint stopping rule", Drafter::PointMass, 113),
+        ] {
+            let (stat, crit) = chi_square_two(&toy, [2, 4], 2, drafter, None, 150_000, seed);
+            println!("{name}: chi2 {stat:.1} (critical at p=1e-4: {crit:.1})");
+            assert!(stat < crit, "{name}: chi2 {stat:.1} >= critical {crit:.1}: NOT distributed as two independent plain samplers");
+        }
+    }
+
+    /// The two-stream harness has power: stream 0 verifying its first SAMPLED
+    /// draft only when the draft's drawn value is `a` must be caught.
+    #[cfg(feature = "v41")]
+    #[test]
+    fn g_rs1_two_streams_negative_control_is_caught() {
+        let toy = Toy::new(sampled_mode(1.0));
+        let p = toy.p(2);
+        let a = (0..V as i32).max_by(|&x, &y| p.prob(x).partial_cmp(&p.prob(y)).unwrap()).unwrap();
+        let (stat, crit) = chi_square_two(&toy, [2, 4], 2, Drafter::QEqualsP, Some(a), 150_000, 511);
+        println!("two-stream negative control: chi2 {stat:.1} (critical at p=1e-4: {crit:.1})");
+        assert!(stat > 5.0 * crit, "two-stream negative control NOT detected: chi2 {stat:.1} vs critical {crit:.1}");
+    }
+
     #[test]
     fn g_rs1_point_mass_drafts_are_exact() {
         let toy = Toy::new(sampled_mode(0.9));

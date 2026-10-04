@@ -96,13 +96,12 @@ struct SlotDraft {
     /// `(pos, mtp_src of row pos)` for the stream's LAST row in KV: what its
     /// next draft reads.
     hidden: Option<(u32, Vec<f32>)>,
-    /// Draft-or-not (plan section 6, stage 1): EWMA of the realized speed-up
-    /// of a drafted step over a plain one, `emitted * cost(1) / (step +
-    /// draft)`; below `V41_MS_DSPARK_MIN_GAIN` the stream stops drafting for
-    /// `backoff` steps (4, doubling to 64), then probes with one block.
-    gain: f64,
-    skip_left: u32,
-    backoff: u32,
+    /// Draft-or-not (plan section 6, stage 1), one gate per regime:
+    /// `[LONE, MULTI]` -- drafting alone and drafting beside other live
+    /// streams pay differently (a K = 0 beside another stream's block can be
+    /// a lost competition for rows), so a back-off earned in one says nothing
+    /// about the other (MS_DSPARK_STREAMS_DESIGN 2.5).
+    gates: [Gate; 2],
     /// The last draft's wall time (ms), for its block's gain.
     last_draft_ms: f64,
     /// Recorded on `igpu.compute` after this slot's last ASYNC ring write
@@ -157,6 +156,14 @@ struct Stats {
     explored_two: u64,
     /// Blocks by rows (index rows - 1): on one lane, on two.
     lanes_by_rows: [[u64; 2]; CELLS],
+    /// Steps where two or more streams were offered drafts
+    /// (`MsDspark::ks_for`; docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2), of them
+    /// steps that verified any draft, and the blocks verified in them.
+    multi_steps: u64,
+    multi_spec_steps: u64,
+    multi_blocks: u64,
+    /// Exploration draws among those steps.
+    multi_explored: u64,
 }
 
 impl Stats {
@@ -172,7 +179,35 @@ impl Stats {
     }
 }
 
-/// Stage-1 gate (`SlotDraft::gain`): fold one drafted step's realized speed-up
+/// `SlotDraft::gates` index: one live stream.
+const LONE: usize = 0;
+/// `SlotDraft::gates` index: two or more live streams.
+const MULTI: usize = 1;
+
+/// One slot's stage-1 gate in one regime: EWMA of the realized speed-up of a
+/// drafted step over the step it would otherwise have run (`gain`); below
+/// `V41_MS_DSPARK_MIN_GAIN` the stream stops drafting for `backoff` steps (4,
+/// doubling to 64), then probes with one block.
+#[derive(Clone, Copy, Debug)]
+struct Gate {
+    gain: f64,
+    skip_left: u32,
+    backoff: u32,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self { gain: GAIN0, skip_left: 0, backoff: 0 }
+    }
+}
+
+impl Gate {
+    fn update(&mut self, g: f64) {
+        gate_update(&mut self.gain, &mut self.backoff, &mut self.skip_left, g, min_gain());
+    }
+}
+
+/// Stage-1 gate (`Gate::gain`): fold one drafted step's realized speed-up
 /// `g` into the EWMA and back off below `min_gain` (4 steps, doubling to 64).
 /// A probe after a back-off moves the estimate half way at once.
 fn gate_update(gain: &mut f64, backoff: &mut u32, skip_left: &mut u32, g: f64, min_gain: f64) {
@@ -210,6 +245,46 @@ pub struct MsDspark {
     /// The last `k_for` returning K = 0 was an exploration draw (`record_k0`
     /// then feeds no gain sample).
     k0_explored: bool,
+    /// Step cost of steps where two or more streams speculate, by the step's
+    /// TOTAL rows, on one lane and on two (design 2.3): their own tables --
+    /// neither the lone blocks' (one KV stream, an ordered cut at every split)
+    /// nor the plain steps' (one row per stream) -- aged by those steps.
+    multi: LaneTables,
+}
+
+/// Most rows of a speculating step per lane: kernel families switch regime
+/// above 8 rows per lane (plan 3.7: `mhc_pre_scaled_for`, the dp4a arms), a
+/// regime production decode never runs; it also keeps a lane under the pin
+/// (16) and hot-set (8) bookkeeping limits.
+pub const SPEC_ROWS_PER_LANE: usize = 8;
+
+/// The most rows a multi-stream speculating step prices: two streams' blocks.
+const MULTI_ROWS: usize = 2 * (1 + MTP_BLOCK);
+
+/// The multi-stream tables' starting cells (design 2.3), MEASURED 2026-10-04
+/// 00:50-08:33 UTC (hub 9c6f8ea5, `ms.step` p50): one lane, rows 1..=6 =
+/// the plain lone row and the lone one-lane verify blocks, then +9.7 ms/row;
+/// two lanes, rows 2..=6 = 2 plain streams (62.5) and the lone two-lane
+/// verify blocks, then +9.4 ms/row (row 1 never runs two lanes).
+const MULTI_LADDER_ONE: [f64; 8] = [54.7, 71.1, 84.4, 97.9, 108.3, 117.1, 126.8, 136.5];
+const MULTI_LADDER_TWO: [f64; 12] = [54.7, 62.5, 74.4, 83.1, 93.9, 102.8, 112.2, 121.6, 131.0, 140.4, 149.8, 159.2];
+
+/// The multi-stream cost tables (design 2.3), starting from the 10-04 ladders;
+/// `m` = the startup two-lane threshold (`LaneTables::new`).
+fn multi_tables(m: usize) -> LaneTables {
+    let memory = crate::knobs::MS_DSPARK_COST_MEMORY.f64();
+    let live = crate::knobs::MS_DSPARK_COST_LIVE.on();
+    LaneTables::new(
+        StepCost::new(MULTI_LADDER_ONE.to_vec(), 0.0, live, memory).with_shape(CostShape::Cells).with_rows(MULTI_ROWS),
+        StepCost::with_first_row(MULTI_LADDER_TWO.to_vec(), m, 0.0, live, memory).with_shape(CostShape::Cells).with_rows(MULTI_ROWS),
+        m,
+    )
+}
+
+/// `V41_MS_DSPARK_STREAMS`: the most live streams that may all draft in one
+/// step (1 = a lone stream only, today's rule).
+pub fn spec_streams() -> usize {
+    crate::knobs::MS_DSPARK_STREAMS.usize().clamp(1, 2)
 }
 
 impl MsDspark {
@@ -224,7 +299,7 @@ impl MsDspark {
             let rings = mtp.state.rings.iter().map(|r| DeviceBuffer::<u16>::new(igpu_id, r.len())).collect::<eyre::Result<Vec<_>>>()?;
             let write_done = v4flash_hip::Event::new_no_timing()?;
             slots.push(SlotDraft {
-                rings, writes: 0, last_ring_pos: None, hidden: None, gain: GAIN0, skip_left: 0, backoff: 0, last_draft_ms: 0.0,
+                rings, writes: 0, last_ring_pos: None, hidden: None, gates: [Gate::default(); 2], last_draft_ms: 0.0,
                 write_done, write_pending: false,
             });
         }
@@ -234,7 +309,137 @@ impl MsDspark {
         // which cells the steps feed.
         let m = crate::multistream::pipeline_min_rows();
         let lanes = LaneTables::new(StepCost::from_env(), StepCost::from_env_two_lane(m), m);
-        Ok(Self { slots, plain_ms: lanes.one.cost(1), lanes, switches: Switches::default(), calib: Calib::default(), stats: Stats::default(), since: Instant::now(), rng: explore_rng(), k0_explored: false })
+        Ok(Self::with_slots(slots, lanes, m))
+    }
+
+    fn with_slots(slots: Vec<SlotDraft>, lanes: LaneTables, m: usize) -> Self {
+        Self {
+            slots, plain_ms: lanes.one.cost(1), lanes, switches: Switches::default(), calib: Calib::default(), stats: Stats::default(),
+            since: Instant::now(), rng: explore_rng(), k0_explored: false, multi: multi_tables(m),
+        }
+    }
+
+    /// No slots (no device rings or events): the policy and accounting alone.
+    #[cfg(test)]
+    fn bare() -> Self {
+        let lanes = LaneTables::new(StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0), StepCost::with_first_row(DEFAULT_LADDER_TWO_LANE.to_vec(), 4, 12.0, true, 500.0), 4);
+        Self::with_slots(Vec::new(), lanes, 4)
+    }
+
+    /// K per drafting stream and the lane count for a step where two or more
+    /// streams speculate (design 2.2). `blocks` = the drafting streams' blocks,
+    /// `base_rows` = the step's rows before drafts (one per live stream),
+    /// `sampled` = any stream's drafts are sampled (then the joint stopping
+    /// rule, else the global search), `rule` = this step's lane snapshot. The
+    /// draft time charged is one draft per drafting stream (serial drafts).
+    /// Exploration first, drawn before any confidence is read. Rows are
+    /// capped at `SPEC_ROWS_PER_LANE` per lane.
+    pub fn ks_for(&mut self, blocks: &[BlockConf], base_rows: usize, sampled: bool, rule: LaneRule) -> (Vec<usize>, usize) {
+        self.stats.multi_steps += 1;
+        let draft = self.lanes.one.draft_ms() * blocks.len() as f64;
+        if fixed_k().is_none() {
+            // Draw a feasible (rows, lanes) CELL by staleness, then one of the
+            // K vectors that land there uniformly: drawing over K vectors
+            // would favour the cells many vectors map to.
+            let cands = multi_choices(&self.multi, blocks, base_rows, rule);
+            let mut cells: Vec<(usize, usize)> = cands.iter().map(|c| (c.1, c.2)).collect();
+            cells.sort_unstable();
+            cells.dedup();
+            let t = &self.multi;
+            if let Some(i) = explore(&mut self.rng, cells.len(), explore_p(), |i| t.weight(cells[i].0, cells[i].1)) {
+                self.stats.multi_explored += 1;
+                let mut these: Vec<&(Vec<usize>, usize, usize)> = cands.iter().filter(|c| (c.1, c.2) == cells[i]).collect();
+                let pick = these.swap_remove(self.rng.gen_range(0..these.len()));
+                self.k0_explored = pick.0.iter().all(|&k| k == 0);
+                return (pick.0.clone(), pick.2);
+            }
+        }
+        self.k0_explored = false;
+        let cost = MultiPriced { t: &self.multi, rule, draft };
+        let mut ks = if sampled { choose_ks_stopping(blocks, base_rows, &cost) } else { choose_ks(blocks, base_rows, &cost) };
+        if fixed_k().is_some() {
+            fit_rows(&mut ks, base_rows, &self.multi, rule);
+        } else {
+            // The policies price an unfit step at infinity and never pick it;
+            // trimming a stopping-rule result after it read `conf_s[K_s]` would
+            // let a draft's inclusion read its own value (review round 2).
+            debug_assert!(
+                ks.iter().all(|&k| k == 0) || multi_best(&self.multi, base_rows + ks.iter().sum::<usize>(), rule).is_some(),
+                "ks_for: the policy chose an unfit step {ks:?}"
+            );
+        }
+        let rows = base_rows + ks.iter().sum::<usize>();
+        let lanes = multi_best(&self.multi, rows, rule).map(|b| b.1).unwrap_or(1);
+        (ks, lanes)
+    }
+
+
+    /// One step where two or more live streams were offered drafts and some
+    /// verified any (`ks_for` gave a K > 0): every drafting stream's block
+    /// (`(slot, conf, k, accepted, emitted)`; K = 0 included: it drafted and
+    /// paid for it), the step's rows / lanes / lane rule / wall time, and
+    /// `plain_ms` = the plain step of the same streams (`PlainLanes`).
+    ///
+    /// The stage-1 sample of stream s compares it with the step it would have
+    /// RIDDEN without drafting (review round 2): the same step less its rows
+    /// and its draft, `g_s = emitted_s x (c(R - K_s) + D - D_s) / (step + D)`,
+    /// `c` = `plain_ms` when the rest is plain, else the multi tables. A
+    /// stream whose draft bought no rows (K_s = 0) gets `< 1` and backs off; a
+    /// weaker stream beside a deep block is judged on what its own rows bought.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_multi(&mut self, blocks: &[(u32, [f32; MTP_BLOCK], usize, usize, usize)], rows: usize, lanes: usize, rule: LaneRule, step_ms: f64, plain_ms: f64) {
+        self.multi.observe(rows, lanes, step_ms);
+        self.stats.multi_spec_steps += 1;
+        let draft_of = |d: &Self, slot: u32| d.slots.get(slot as usize).map(|sd| sd.last_draft_ms).unwrap_or(0.0);
+        let drafts_ms: f64 = blocks.iter().map(|b| draft_of(self, b.0)).sum();
+        let base_rows = rows - blocks.iter().map(|b| b.2).sum::<usize>();
+        for &(slot, conf, k, accepted, emitted) in blocks {
+            if k > 0 {
+                self.calib.observe(&conf, k, accepted);
+                if self.calib.blocks % CALIB_EVERY == 0 {
+                    self.calib.log();
+                }
+            }
+            let rode = if rows - k == base_rows { plain_ms } else { multi_best(&self.multi, rows - k, rule).map(|b| b.0).unwrap_or(plain_ms) };
+            let d_s = draft_of(self, slot);
+            if let Ok(sd) = self.slot(slot) {
+                sd.gates[MULTI].update(emitted as f64 * (rode + drafts_ms - d_s) / (step_ms + drafts_ms).max(1.0));
+            }
+            let s = &mut self.stats;
+            s.blocks += 1;
+            s.multi_blocks += 1;
+            s.drafts_verified += k as u64;
+            s.accepted += accepted as u64;
+            s.emitted += emitted as u64;
+            s.k_hist[k.min(MTP_BLOCK)] += 1;
+            s.step_ms += step_ms / blocks.len() as f64;
+        }
+        self.maybe_log();
+    }
+
+    /// A step where two or more live streams drafted and `ks_for` verified
+    /// none: a plain step that paid for its drafts. Each drafting stream's
+    /// sample is the step without its own draft over the step with it,
+    /// `(step + D - D_s) / (step + D)` (< 1: it backs off, as `record_k0`);
+    /// the step's time goes to the PLAIN tables (the caller's
+    /// `PlainLanes::observe`), not these.
+    pub fn record_k0_multi(&mut self, slots: &[u32], step_ms: f64) {
+        let draft_of = |d: &Self, slot: u32| d.slots.get(slot as usize).map(|sd| sd.last_draft_ms).unwrap_or(0.0);
+        let drafts_ms: f64 = slots.iter().map(|&s| draft_of(self, s)).sum();
+        for &slot in slots {
+            // An exploration draw measures a choice the policy did not make: no gain.
+            if !self.k0_explored {
+                let d_s = draft_of(self, slot);
+                if let Ok(sd) = self.slot(slot) {
+                    sd.gates[MULTI].update((step_ms + drafts_ms - d_s) / (step_ms + drafts_ms).max(1.0));
+                }
+            }
+            self.stats.blocks += 1;
+            self.stats.emitted += 1;
+            self.stats.k_hist[0] += 1;
+            self.stats.step_ms += step_ms / slots.len() as f64;
+        }
+        self.maybe_log();
     }
 
     /// K and the lane count for the lone stream's drafted block (plan section
@@ -352,18 +557,18 @@ impl MsDspark {
         sd.writes = 0;
         sd.last_ring_pos = None;
         sd.hidden = None;
-        sd.gain = GAIN0;
-        sd.skip_left = 0;
-        sd.backoff = 0;
+        sd.gates = [Gate::default(); 2];
         Ok(())
     }
 
     /// Stage 1: should `slot`'s stream draft this step? False while it backs
     /// off after its drafted blocks stopped paying (each call counts a step).
-    pub fn should_draft(&mut self, slot: u32) -> bool {
+    /// `multi` = other live streams may draft beside it (its MULTI gate).
+    pub fn should_draft(&mut self, slot: u32, multi: bool) -> bool {
         let Ok(sd) = self.slot(slot) else { return false };
-        if sd.skip_left > 0 {
-            sd.skip_left -= 1;
+        let gate = &mut sd.gates[if multi { MULTI } else { LONE }];
+        if gate.skip_left > 0 {
+            gate.skip_left -= 1;
             self.stats.skipped += 1;
             return false;
         }
@@ -550,7 +755,7 @@ impl MsDspark {
         }
         if let Ok(sd) = self.slot(slot) {
             let g = emitted as f64 * plain_ms / (step_ms + sd.last_draft_ms).max(1.0);
-            gate_update(&mut sd.gain, &mut sd.backoff, &mut sd.skip_left, g, min_gain());
+            sd.gates[LONE].update(g);
         }
         let s = &mut self.stats;
         s.blocks += 1;
@@ -577,7 +782,7 @@ impl MsDspark {
         if !self.k0_explored {
             if let Ok(sd) = self.slot(slot) {
                 let g = plain_ms / (step_ms + sd.last_draft_ms).max(1.0);
-                gate_update(&mut sd.gain, &mut sd.backoff, &mut sd.skip_left, g, min_gain());
+                sd.gates[LONE].update(g);
             }
         }
         self.stats.note_k0(step_ms);
@@ -621,6 +826,14 @@ impl MsDspark {
                 draft_est_ms = format!("{:.1}", self.lanes.one.draft_ms()),
                 cost_samples = self.lanes.one.samples,
                 cost2_samples = self.lanes.two.samples,
+                multi_steps = s.multi_steps,
+                multi_spec_steps = s.multi_spec_steps,
+                multi_blocks = s.multi_blocks,
+                multi_explored = s.multi_explored,
+                mcells = cells_str(self.multi.one.cell_costs(), 2),
+                mcells2 = cells_str(self.multi.two.cell_costs(), 2),
+                mcells_w = cells_str(&self.multi.one.cell_weights(), 2),
+                mcells2_w = cells_str(&self.multi.two.cell_weights(), 2),
                 window_s = self.since.elapsed().as_secs(),
                 "ms dspark: blocks"
             );
@@ -875,6 +1088,84 @@ impl CostModel for Priced<'_> {
     }
 }
 
+/// The cheapest of `rule`'s lane counts for a speculating step of `rows`
+/// rows that keeps every lane at most `SPEC_ROWS_PER_LANE`: `(cost, lanes)`,
+/// `None` when no allowed lane count can hold the rows.
+fn multi_best(t: &LaneTables, rows: usize, rule: LaneRule) -> Option<(f64, usize)> {
+    let mut best: Option<(f64, usize)> = None;
+    for &l in t.choices(rows, rule) {
+        if rows > l * SPEC_ROWS_PER_LANE {
+            continue;
+        }
+        let c = t.cost(rows, l);
+        if best.is_none_or(|b| c < b.0) {
+            best = Some((c, l));
+        }
+    }
+    best
+}
+
+/// Drop drafts from the deepest block (the first on a tie) until the step's
+/// rows fit a lane count `rule` allows at `SPEC_ROWS_PER_LANE` per lane. The
+/// policies never pick an unfit step (it costs infinity); a fixed K
+/// (`V41_MS_DSPARK_K`) ignores costs, and this is its cap.
+fn fit_rows(ks: &mut [usize], base_rows: usize, t: &LaneTables, rule: LaneRule) {
+    while ks.iter().sum::<usize>() > 0 && multi_best(t, base_rows + ks.iter().sum::<usize>(), rule).is_none() {
+        let deepest = (0..ks.len()).max_by_key(|&s| (ks[s], std::cmp::Reverse(s))).expect("a block");
+        ks[deepest] -= 1;
+    }
+}
+
+/// Every `(K per stream, rows, lanes)` a multi-stream speculating step may
+/// run under `rule` (exploration draws one): K_s in `0..=cap_s`, lanes among
+/// the rule's choices for the rows, at most `SPEC_ROWS_PER_LANE` per lane.
+/// Reads the caps only, never a confidence.
+fn multi_choices(t: &LaneTables, blocks: &[BlockConf], base_rows: usize, rule: LaneRule) -> Vec<(Vec<usize>, usize, usize)> {
+    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(MTP_BLOCK)).collect();
+    let mut out = Vec::new();
+    let mut ks = vec![0usize; blocks.len()];
+    loop {
+        let rows = base_rows + ks.iter().sum::<usize>();
+        for &l in t.choices(rows, rule) {
+            if rows <= l * SPEC_ROWS_PER_LANE {
+                out.push((ks.clone(), rows, l));
+            }
+        }
+        let mut s = 0;
+        while s < ks.len() {
+            if ks[s] < caps[s] {
+                ks[s] += 1;
+                break;
+            }
+            ks[s] = 0;
+            s += 1;
+        }
+        if s == ks.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// The multi-stream tables under one rule as the joint policy's
+/// `CostModel`: the step's TOTAL rows at the cheapest allowed lane count
+/// (`multi_best`; infinite when none can hold them, so no rule picks them),
+/// `draft` = the step's total draft time.
+struct MultiPriced<'a> {
+    t: &'a LaneTables,
+    rule: LaneRule,
+    draft: f64,
+}
+
+impl CostModel for MultiPriced<'_> {
+    fn cost(&self, rows: usize) -> f64 {
+        multi_best(self.t, rows, self.rule).map(|b| b.0).unwrap_or(f64::INFINITY)
+    }
+    fn draft_ms(&self) -> f64 {
+        self.draft
+    }
+}
+
 /// How often the POLICY's lane count for a row count changed (exploration
 /// draws excluded), since the last log line: `LaneRule::Learned` flip-flop
 /// (review round 12: a slow spell lands on the active lane's mature cell
@@ -970,6 +1261,12 @@ impl PlainLanes {
             self.t.log_switch("plain", rows, lanes);
         }
         lanes
+    }
+
+    /// What a plain step of `rows` streams costs under `rule` (the cheaper
+    /// allowed lane count): the stage-1 baseline of a multi-stream DSpark step.
+    pub fn cost(&self, rows: usize, rule: LaneRule) -> f64 {
+        self.t.best(rows, rule).0
     }
 
     /// A plain step of `rows` streams on `lanes` lanes took `ms`.
@@ -1508,6 +1805,144 @@ pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize, cost: &dyn CostModel) -> us
     best_k
 }
 
+/// One drafting stream's block as the JOINT policy sees it
+/// (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2.2): its confidence logits and the
+/// most drafts it may verify.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockConf {
+    pub conf: [f32; MTP_BLOCK],
+    pub cap: usize,
+}
+
+/// K per stream for several streams' blocks verified in ONE step, SAMPLED
+/// drafts allowed: the S-stream form of `choose_k_stopping`. `base_rows` = the
+/// step's rows before any draft (one per live stream, drafting or not); `cost`
+/// prices the step's TOTAL rows and `cost.draft_ms()` is the TOTAL draft time
+/// (paid either way). From K = 0 everywhere it prices every extension of the
+/// frontier -- each stream's depths beyond its current K forecast at
+/// `sigmoid(conf[K])`, as the one-stream rule does -- and, while the best
+/// extension beats stopping, adds ONE draft: the next draft of the stream with
+/// the highest immediate value `P(its drafts so far accepted) x sigmoid(conf[K])`
+/// among the streams that extension extends.
+///
+/// Exact: including draft k of stream s reads `conf_s[..=k]` (conf_k reads
+/// draft k-1, never draft k) and other streams' confidences, which do not
+/// depend on s's drafts (separate drafter runs, separate draft RNGs). No
+/// draft's inclusion reads its own value. One stream with `base_rows` = 1 gives
+/// exactly `choose_k_stopping` (the same sums in the same order).
+pub fn choose_ks_stopping(blocks: &[BlockConf], base_rows: usize, cost: &dyn CostModel) -> Vec<usize> {
+    let n = blocks.len();
+    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(MTP_BLOCK)).collect();
+    if let Some(k) = fixed_k() {
+        return caps.iter().map(|&c| k.min(c)).collect();
+    }
+    let draft = cost.draft_ms();
+    let mut k = vec![0usize; n];
+    let mut run = vec![1.0f64; n];
+    let mut e = base_rows as f64;
+    loop {
+        let rows = base_rows + k.iter().sum::<usize>();
+        let stop = e / (cost.cost(rows) + draft);
+        let p: Vec<f64> = (0..n).map(|s| if k[s] < caps[s] { sigmoid(blocks[s].conf[k[s]]) } else { 0.0 }).collect();
+        // Every extension m (m_s more drafts of stream s), m != 0.
+        let mut best: Option<(f64, Vec<usize>)> = None;
+        let mut m = vec![0usize; n];
+        loop {
+            // Next m in mixed radix (m_s in 0..=caps[s] - k[s]).
+            let mut s = 0;
+            while s < n {
+                if m[s] < caps[s] - k[s] {
+                    m[s] += 1;
+                    break;
+                }
+                m[s] = 0;
+                s += 1;
+            }
+            if s == n {
+                break;
+            }
+            let mut ee = e;
+            for t in 0..n {
+                let mut r = run[t];
+                for _ in 0..m[t] {
+                    r *= p[t];
+                    ee += r;
+                }
+            }
+            let rate = ee / (cost.cost(rows + m.iter().sum::<usize>()) + draft);
+            if best.as_ref().is_none_or(|b| rate > b.0) {
+                best = Some((rate, m.clone()));
+            }
+        }
+        let Some((go, bm)) = best else { break };
+        if go <= stop {
+            break;
+        }
+        let s = (0..n)
+            .filter(|&s| bm[s] > 0)
+            .max_by(|&a, &b| (run[a] * p[a]).partial_cmp(&(run[b] * p[b])).unwrap_or(std::cmp::Ordering::Equal).then(b.cmp(&a)))
+            .expect("the best extension extends some stream");
+        run[s] *= p[s];
+        e += run[s];
+        k[s] += 1;
+    }
+    k
+}
+
+/// K per stream for several streams' blocks in ONE step, POINT-MASS drafts
+/// only (any K rule is exact for point-mass tests, plan 2.4): the global
+/// search of `choose_k` over every `(K_1, .., K_S)`. One stream with
+/// `base_rows` = 1 gives exactly `choose_k`.
+pub fn choose_ks(blocks: &[BlockConf], base_rows: usize, cost: &dyn CostModel) -> Vec<usize> {
+    let n = blocks.len();
+    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(MTP_BLOCK)).collect();
+    if let Some(k) = fixed_k() {
+        return caps.iter().map(|&c| k.min(c)).collect();
+    }
+    let draft = cost.draft_ms();
+    // runs[s][j]: P(stream s's first j drafts all accepted), j >= 1.
+    let runs: Vec<Vec<f64>> = (0..n)
+        .map(|s| {
+            let mut v = vec![1.0f64; caps[s] + 1];
+            for j in 1..=caps[s] {
+                v[j] = v[j - 1] * sigmoid(blocks[s].conf[j - 1]);
+            }
+            v
+        })
+        .collect();
+    let mut best_k = vec![0usize; n];
+    let mut best = base_rows as f64 / (cost.cost(base_rows) + draft);
+    let mut ks = vec![0usize; n];
+    loop {
+        let mut s = 0;
+        while s < n {
+            if ks[s] < caps[s] {
+                ks[s] += 1;
+                break;
+            }
+            ks[s] = 0;
+            s += 1;
+        }
+        if s == n {
+            break;
+        }
+        // Added term by term onto the base: one stream is `choose_k`'s
+        // running `e`, bit for bit.
+        let mut e = base_rows as f64;
+        for t in 0..n {
+            for &r in &runs[t][1..=ks[t]] {
+                e += r;
+            }
+        }
+        let r = e / (cost.cost(base_rows + ks.iter().sum::<usize>()) + draft);
+        if r > best {
+            best = r;
+            best_k = ks.clone();
+        }
+    }
+    best_k
+}
+
 /// Calibration of the confidence head: sigmoid(conf_k) is read as P(draft k
 /// accepted | drafts before it accepted). Draft k of a block is OBSERVED when
 /// the block verified it and accepted every draft before it. Per decile of
@@ -1622,6 +2057,167 @@ mod tests {
             }
             assert_eq!(choose_k_stopping(&[6.0; MTP_BLOCK], MTP_BLOCK, &c), MTP_BLOCK);
             assert_eq!(choose_k_stopping(&[-6.0; MTP_BLOCK], MTP_BLOCK, &c), 0);
+        }
+    }
+
+    /// A live-fitted cost model (cells), as production prices blocks.
+    fn live_cost(seed: u64) -> StepCost {
+        let mut live = StepCost::new(DEFAULT_LADDER.to_vec(), 12.0, true, 500.0).with_rows(16);
+        let mut st = seed;
+        for _ in 0..3000 {
+            let rows = 1 + (lcg(&mut st).abs() * 12.0) as usize;
+            live.observe_step(rows, 53.2 + 9.4 * rows as f64 + 10.0 * lcg(&mut st));
+        }
+        live
+    }
+
+    fn random_conf(st: &mut u64) -> [f32; MTP_BLOCK] {
+        std::array::from_fn(|_| (lcg(st) * 6.0) as f32)
+    }
+
+    /// One stream, one base row: the joint rules ARE the one-stream rules, bit
+    /// for bit (same sums in the same order), on any cost model and cap.
+    #[test]
+    fn joint_rules_with_one_stream_are_the_lone_rules() {
+        let mut st = 99u64;
+        for c in [static_cost(), live_cost(3)] {
+            for _ in 0..4000 {
+                let conf = random_conf(&mut st);
+                let cap = (lcg(&mut st).abs() * 6.0) as usize;
+                let b = [BlockConf { conf, cap }];
+                assert_eq!(choose_ks_stopping(&b, 1, &c), vec![choose_k_stopping(&conf, cap, &c)], "conf {conf:?} cap {cap}");
+                assert_eq!(choose_ks(&b, 1, &c), vec![choose_k(&conf, cap, &c)], "conf {conf:?} cap {cap}");
+            }
+        }
+    }
+
+    /// The joint stopping rule never reads a confidence past a stream's
+    /// frontier: changing `conf_s[j]` for any `j > K_s` changes NO stream's K
+    /// (conf_j reads draft j-1, which is then not verified). Reading
+    /// `conf_s[K_s]` is allowed: it reads draft K_s - 1, which IS verified.
+    #[test]
+    fn joint_stopping_rule_never_reads_past_any_frontier() {
+        let mut st = 12345u64;
+        for c in [static_cost(), live_cost(5)] {
+            for _ in 0..1500 {
+                let blocks = [BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }];
+                let base = 2;
+                let ks = choose_ks_stopping(&blocks, base, &c);
+                for s in 0..2 {
+                    for j in (ks[s] + 1)..MTP_BLOCK {
+                        let mut b2 = blocks;
+                        b2[s].conf[j] = (lcg(&mut st) * 6.0) as f32;
+                        assert_eq!(choose_ks_stopping(&b2, base, &c), ks, "blocks {blocks:?}: K moved when stream {s} conf[{j}] changed");
+                    }
+                }
+            }
+            // Confident blocks go to their caps, unconfident ones verify nothing.
+            let sure = BlockConf { conf: [6.0; MTP_BLOCK], cap: MTP_BLOCK };
+            let unsure = BlockConf { conf: [-6.0; MTP_BLOCK], cap: MTP_BLOCK };
+            assert_eq!(choose_ks_stopping(&[sure, sure], 2, &c), vec![MTP_BLOCK, MTP_BLOCK]);
+            assert_eq!(choose_ks_stopping(&[unsure, unsure], 2, &c), vec![0, 0]);
+            assert_eq!(choose_ks_stopping(&[sure, unsure], 2, &c), vec![MTP_BLOCK, 0]);
+            assert_eq!(choose_ks_stopping(&[BlockConf { cap: 2, ..sure }, sure], 2, &c), vec![2, MTP_BLOCK]);
+        }
+    }
+
+    /// Changing `conf_s[m]` with `m <= K_s` may change K, but never the first
+    /// `m` inclusion decisions of stream s: `min(K_s, m)` stays (they were
+    /// made before `conf_s[m]` was read).
+    #[test]
+    fn joint_stopping_rule_decides_each_draft_before_reading_past_it() {
+        let mut st = 4242u64;
+        let c = live_cost(9);
+        for _ in 0..2000 {
+            let blocks = [BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }];
+            let ks = choose_ks_stopping(&blocks, 2, &c);
+            for s in 0..2 {
+                for m in 0..MTP_BLOCK {
+                    let mut b2 = blocks;
+                    b2[s].conf[m] = (lcg(&mut st) * 6.0) as f32;
+                    let k2 = choose_ks_stopping(&b2, 2, &c);
+                    assert_eq!(k2[s].min(m), ks[s].min(m), "blocks {blocks:?}: stream {s}'s first {m} decisions moved with conf[{m}]");
+                }
+            }
+        }
+    }
+
+    /// A multi-stream step's accounting feeds the MULTI tables only: the lone
+    /// blocks' cells, their weights (aging) and `plain_ms` stay as they were.
+    #[test]
+    fn a_multi_step_feeds_only_the_multi_tables() {
+        let mut d = MsDspark::bare();
+        let (one, two, w1, w2, plain) = (
+            d.lanes.one.cell_costs().to_vec(),
+            d.lanes.two.cell_costs().to_vec(),
+            d.lanes.one.cell_weights(),
+            d.lanes.two.cell_weights(),
+            d.plain_ms,
+        );
+        let before = d.multi.two.cell_weight(8);
+        d.record_multi(&[(0, [1.0; MTP_BLOCK], 3, 2, 3), (1, [1.0; MTP_BLOCK], 3, 3, 4)], 8, 2, LaneRule::Learned, 120.0, 62.5);
+        d.record_k0_multi(&[0, 1], 70.0);
+        assert_eq!(d.lanes.one.cell_costs(), &one[..]);
+        assert_eq!(d.lanes.two.cell_costs(), &two[..]);
+        assert_eq!(d.lanes.one.cell_weights(), w1);
+        assert_eq!(d.lanes.two.cell_weights(), w2);
+        assert_eq!(d.plain_ms, plain);
+        assert!(d.multi.two.cell_weight(8) > before, "the multi step's cell took the sample");
+        assert_eq!((d.stats.multi_blocks, d.stats.multi_spec_steps, d.stats.blocks), (2, 1, 4));
+    }
+
+    /// A fixed K is capped at 8 rows per lane; the policies' candidates never
+    /// exceed it either.
+    #[test]
+    fn speculating_steps_keep_every_lane_within_the_cap() {
+        let t = multi_tables(4);
+        let mut ks = vec![5, 5];
+        fit_rows(&mut ks, 2, &t, LaneRule::Off);
+        assert_eq!(ks, vec![3, 3], "one lane holds 8 rows");
+        let mut ks = vec![5, 5];
+        fit_rows(&mut ks, 2, &t, LaneRule::Learned);
+        assert_eq!(ks, vec![5, 5], "two lanes hold 12 rows");
+        let blocks = [BlockConf { conf: [0.0; MTP_BLOCK], cap: MTP_BLOCK }; 2];
+        for rule in [LaneRule::Off, LaneRule::Threshold(4), LaneRule::Learned] {
+            let cands = multi_choices(&t, &blocks, 2, rule);
+            assert!(!cands.is_empty());
+            for (ks, rows, lanes) in cands {
+                assert_eq!(rows, 2 + ks.iter().sum::<usize>());
+                assert!(rows <= lanes * SPEC_ROWS_PER_LANE, "{rule:?}: {rows} rows on {lanes} lanes");
+                assert!(t.choices(rows, rule).contains(&lanes));
+            }
+        }
+    }
+
+    /// A cost model with a row cap: rows past `max` cost infinity.
+    struct Capped<'a>(&'a StepCost, usize);
+    impl CostModel for Capped<'_> {
+        fn cost(&self, rows: usize) -> f64 {
+            if rows > self.1 { f64::INFINITY } else { self.0.cost(rows) }
+        }
+        fn draft_ms(&self) -> f64 {
+            self.0.draft_ms()
+        }
+    }
+
+    /// The global search is the best of every (K_1, K_2) (point-mass drafts),
+    /// and both rules respect a row cap priced as infinite cost.
+    #[test]
+    fn joint_search_is_optimal_and_rules_respect_a_row_cap() {
+        let mut st = 777u64;
+        let c = live_cost(11);
+        for _ in 0..1500 {
+            let blocks = [BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }];
+            let rate = |ks: &[usize]| {
+                let e: f64 = 2.0 + (0..2).map(|s| (1..=ks[s]).map(|k| (0..k).map(|j| sigmoid(blocks[s].conf[j])).product::<f64>()).sum::<f64>()).sum::<f64>();
+                e / (c.cost(2 + ks[0] + ks[1]) + c.draft_ms())
+            };
+            let got = choose_ks(&blocks, 2, &c);
+            let best = (0..=MTP_BLOCK).flat_map(|a| (0..=MTP_BLOCK).map(move |b| [a, b])).map(|k| rate(&k)).fold(f64::MIN, f64::max);
+            assert!(rate(&got) >= best * (1.0 - 1e-12), "{got:?} rate {} < best {best}", rate(&got));
+            let capped = Capped(&c, 8);
+            assert!(choose_ks(&blocks, 2, &capped).iter().sum::<usize>() + 2 <= 8);
+            assert!(choose_ks_stopping(&blocks, 2, &capped).iter().sum::<usize>() + 2 <= 8);
         }
     }
 
