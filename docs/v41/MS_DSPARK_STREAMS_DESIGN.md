@@ -421,3 +421,19 @@ raised to 10 s (prefill bursts end runs through `ms.phase`); CR3-3 the window sc
 hardened (a spawned hub counts as up, a second signal cannot abort the recovery, a hub that
 survives SIGKILL is never doubled); CR3-4 noted: the stop patterns also stop dev hubs from other
 worktrees (they would hold the GPUs anyway).
+
+## 9. Gates and deploy (2026-10-04)
+
+- Window run 1 (18:57 UTC): FAILED on a G5h TEST bug (its arenas were admitted after the decode
+  oracle had advanced the prefilled states: "source windows 17/17 rows at pos 5"); G5g and the
+  drafter-isolation gate had passed; hub back on 9c6f8ea5 at 19:12. Fixed in 988c53a, which also
+  adds the explicit dependency checks (`KvArena::check_row_dependencies`, the ready-first
+  `deps_done` before every chain enter and route, the server's chain-layout guard).
+- Window run 2 (19:14-19:28 UTC, box 2 attached, V41_SUB unset, split added): PASSED.
+  G5h one lane / two lanes / forced overtake 0 differing rows of 48 (312 Chain waits), UNORDERED
+  control 14 of 48, cuts between / through first / through second [2, 2, 4], KL 0; G5a, G5c-G5g 0;
+  G5b KL(dec||batch) mean 0.071 / max 0.675 (the 10-04 00:50 baseline); mtp_ring_async 0 and
+  drafter isolation 0 of 9 drafts. End to end (127.0.0.1:18099, knob 2, V41_SUB=0, temperature 0):
+  both concurrent outputs identical to their alone runs, 47 steps with two speculating streams.
+- Production hub 363fc1ec (988c53a) since 19:28:22 UTC, `V41_MS_DSPARK_STREAMS` = 1 (default).
+  Next: the per-turn A/B (`~/scratch-ms/ab_streams.py`, analysis `ab_streams_analyze.py`, rule 2.6).
