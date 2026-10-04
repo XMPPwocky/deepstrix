@@ -4,21 +4,24 @@
 //!  1. The context write, AMORTIZED (queue pre-filled behind a spin, N small enough for the AQL
 //!     ring): N x [nop; write; nop] for write = none / H2D from pinned / `arena_ctx_store` by
 //!     value / `hipStreamWriteValue32`; host enqueue time (mean, max) and GPU time per write.
-//!  2. 80 `hipGraphLaunch` round-robin over K executables (K = 1 back to back, 2, 4, 8, 80 all
-//!     distinct), 1- and 8-node graphs, behind a 50 ms spin. BLOCKS = the host enqueue time grows
-//!     with the spin (5 vs 50 ms); SERIALIZES = GPU time per launch at production's pattern (K = 8,
-//!     8 nodes) > 10% above all-distinct.
+//!  2. 80 `hipGraphLaunch` round-robin over K executables (K = 1 back to back, 2, 4 as
+//!     diagnostics; K = 8, production's pattern, vs 80 all distinct as 11 alternating pairs), 1-
+//!     and 8-node graphs, behind a 50 ms spin. BLOCKS = the host enqueue time grows with the spin
+//!     (5 vs 50 ms).
 //!  3. COHERENCE: `arena_ctx_store` then a captured `_ind` graph reading the slot (operands on
 //!     every 64-B line of the entry), alternating entries, 10k rounds; every output and every
 //!     canary record (the seq and the operand pointers each launch resolved) checked.
 //!  4. `_ind` twins vs direct, bit-exact and timed with the canary compiled in (null):
 //!     `q8_0_gemv_bpack_tB{1,4,8}` on the q_b shape and `mhc_fast_batched` (13 operands,
-//!     pre_attn case) at b = 1, 4, 8, each round queued behind a spin (median [min..max] of 5).
-//!     Bar: within max(2%, 0.3 us). (VGPR / SGPR counts come from the code objects, offline:
+//!     pre_attn case) at b = 1, 4, 8, 11 alternating pairs queued behind a spin. (VGPR / SGPR counts come from the code objects, offline:
 //!     ~/scratch-ms/graph_keys_regs.py.)
 //!  5. The mechanism: ONE captured `_ind` graph replayed after storing entry A, then B,
 //!     reproduces the direct kernel on A, then on B; and a capture of N launches has N nodes
 //!     (design 2.5's vetted-count check assumes one node per launch).
+//!  The go / no-go: the exactness items, no drained queue, no BLOCKS, and ONE per-step budget --
+//!  writes x write cost + graph launches x the K = 8 relaunch delta + twin launches x the twin
+//!  deltas (paired deltas charged only when the sign test resolves them) <= 1% of ms.step p50
+//!  (GK_STEP_MS, default 60 = 2 rows / 2 lanes live).
 //!
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release \
 //!   --features v41 -p v4flash-kernels --test bench_graph_keys -- --ignored --nocapture
@@ -103,23 +106,67 @@ struct Stat {
     max: f64,
 }
 
+impl Stat {
+    fn of(v: &[f64]) -> Self {
+        let mut v = v.to_vec();
+        v.sort_by(f64::total_cmp);
+        Stat { med: v[v.len() / 2], min: v[0], max: v[v.len() - 1] }
+    }
+}
+
 impl std::fmt::Display for Stat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:7.2} us [{:.2}..{:.2}]", self.med, self.min, self.max)
     }
 }
 
-/// `rounds` alternating rounds of `reps` launches of `a` and of `b`, each round queued behind
-/// `prefill` (a spin long enough to cover the enqueue, so the events time the GPU back to back,
-/// not the host): (a, b, rounds whose spin ended before the host finished enqueueing).
+/// Paired differences b_i - a_i (us) of alternating runs: median, range, and a sign test. The
+/// budget charges a delta only when it is RESOLVED positive: >= 80% of the pairs positive (9 of
+/// 11: one-sided sign test p = 0.033); an unresolved delta counts as zero, a negative one never
+/// earns credit.
+#[derive(Clone, Copy, Debug)]
+struct Delta {
+    med: f64,
+    min: f64,
+    max: f64,
+    pos: usize,
+    n: usize,
+}
+
+impl Delta {
+    fn of(a: &[f64], b: &[f64]) -> Self {
+        let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| y - x).collect();
+        let st = Stat::of(&d);
+        Delta { med: st.med, min: st.min, max: st.max, pos: d.iter().filter(|v| **v > 0.0).count(), n: d.len() }
+    }
+
+    fn charge(&self) -> f64 {
+        if self.med > 0.0 && self.pos * 100 >= 80 * self.n { self.med } else { 0.0 }
+    }
+}
+
+impl std::fmt::Display for Delta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:+.2} us [{:+.2}..{:+.2}], {}/{} pairs > 0 -> charged {:.2}",
+            self.med, self.min, self.max, self.pos, self.n, self.charge()
+        )
+    }
+}
+
+/// Pairs of runs of `reps` launches of `a` and of `b` (the order alternating pair to pair), each
+/// run queued behind `prefill` (a spin long enough to cover the enqueue, so the events time the
+/// GPU back to back, not the host): (a, b, b - a paired, runs whose spin ended before the host
+/// finished enqueueing).
 fn time_ab(
     s: &Stream,
     reps: usize,
-    rounds: usize,
+    pairs: usize,
     prefill: &dyn Fn(&Stream) -> eyre::Result<()>,
     a: &mut dyn FnMut() -> eyre::Result<()>,
     b: &mut dyn FnMut() -> eyre::Result<()>,
-) -> eyre::Result<(Stat, Stat, usize)> {
+) -> eyre::Result<(Stat, Stat, Delta, usize)> {
     let mut drained = 0usize;
     let mut once = |f: &mut dyn FnMut() -> eyre::Result<()>| -> eyre::Result<f64> {
         s.synchronize()?;
@@ -138,15 +185,16 @@ fn time_ab(
     let mut tb = Vec::new();
     a()?;
     b()?;
-    for _ in 0..rounds {
-        ta.push(once(&mut *a)?);
-        tb.push(once(&mut *b)?);
+    for i in 0..pairs {
+        if i % 2 == 0 {
+            ta.push(once(&mut *a)?);
+            tb.push(once(&mut *b)?);
+        } else {
+            tb.push(once(&mut *b)?);
+            ta.push(once(&mut *a)?);
+        }
     }
-    let stat = |v: &mut Vec<f64>| {
-        v.sort_by(f64::total_cmp);
-        Stat { med: v[v.len() / 2], min: v[0], max: v[v.len() - 1] }
-    };
-    Ok((stat(&mut ta), stat(&mut tb), drained))
+    Ok((Stat::of(&ta), Stat::of(&tb), Delta::of(&ta, &tb), drained))
 }
 
 /// One mhc_fast output set (the pre_attn case writes all of it).
@@ -210,8 +258,9 @@ fn graph_keys_step0() -> eyre::Result<()> {
     for (i, p) in entry.p.iter_mut().enumerate() {
         *p = 0x1000 + i as u64;
     }
-    // Every 2.0 bar this bench decides alone, by item: bit-exactness / coherence / node count
-    // (`exact`) and the timing bars. The last line says STEP0: GO or STEP0: NO-GO (items).
+    // Every 2.0 bar, by item: bit-exactness / coherence / node count (`exact`), no drained queue,
+    // no BLOCKS, and ONE per-step budget (end of the run). The last line says STEP0: GO or
+    // STEP0: NO-GO (items).
     let mut exact = true;
     let mut nogo: Vec<String> = Vec::new();
     let mut bar = |ok: bool, item: String| {
@@ -237,67 +286,78 @@ fn graph_keys_step0() -> eyre::Result<()> {
     // ---- 1. the context write, amortized behind a spin ---------------------------------
     // N x 3 packets stays well inside the AQL ring (ROC_AQL_QUEUE_SIZE, 4096 by default) and the
     // kernarg pool: a full queue would block the host until the spin ends, timing the host.
-    println!("== 1. context write between two launches, queue pre-filled behind a 50 ms spin (per write; 'none' = bare launches)");
+    println!("== 1. context write between two launches, queue pre-filled behind a 50 ms spin (per write, median of 3; 'none' = bare launches)");
     let n = 400usize;
-    let mut base = (0.0, 0.0);
-    for variant in ["none", "h2d", "ctx_store", "write_value32"] {
-        s.synchronize()?;
-        let (e0, e1) = (Event::new()?, Event::new()?);
-        e.q8.slack_probe_spin(&s, spin_ms(50.0))?;
-        e0.record(&s)?;
-        let t = Instant::now();
-        let mut iter_max = 0f64;
-        for i in 0..n {
-            let ti = Instant::now();
-            ctxk.nop(&s, &mut sink)?;
-            match variant {
-                "h2d" => {
-                    pinned.as_mut_slice()[ARENA_CTX_WORDS - 2] = i as u64;
-                    slot.copy_from_host_async(pinned.as_slice(), &s)?;
+    let variants = ["none", "h2d", "ctx_store", "write_value32"];
+    let mut host_v = vec![Vec::new(); variants.len()];
+    let mut gpu_v = vec![Vec::new(); variants.len()];
+    let mut iter_max = vec![0f64; variants.len()];
+    for _ in 0..3 {
+        for (vi, variant) in variants.iter().enumerate() {
+            s.synchronize()?;
+            let (e0, e1) = (Event::new()?, Event::new()?);
+            e.q8.slack_probe_spin(&s, spin_ms(50.0))?;
+            e0.record(&s)?;
+            let t = Instant::now();
+            for i in 0..n {
+                let ti = Instant::now();
+                ctxk.nop(&s, &mut sink)?;
+                match *variant {
+                    "h2d" => {
+                        pinned.as_mut_slice()[ARENA_CTX_WORDS - 2] = i as u64;
+                        slot.copy_from_host_async(pinned.as_slice(), &s)?;
+                    }
+                    "ctx_store" => {
+                        entry.seq = i as u64;
+                        ctxk.store(&s, &entry, &mut slot)?;
+                    }
+                    "write_value32" => unsafe { s.write_value32(slot.raw() as *mut u32, i as u32)? },
+                    _ => {}
                 }
-                "ctx_store" => {
-                    entry.seq = i as u64;
-                    ctxk.store(&s, &entry, &mut slot)?;
-                }
-                "write_value32" => unsafe { s.write_value32(slot.raw() as *mut u32, i as u32)? },
-                _ => {}
+                ctxk.nop(&s, &mut sink)?;
+                iter_max[vi] = iter_max[vi].max(ti.elapsed().as_secs_f64() * 1e6);
             }
-            ctxk.nop(&s, &mut sink)?;
-            iter_max = iter_max.max(ti.elapsed().as_secs_f64() * 1e6);
+            host_v[vi].push(t.elapsed().as_secs_f64() * 1e6 / n as f64);
+            // The spin still running when the host finished = the GPU ran the loop back to back.
+            let drained = e0.query()?;
+            bar(!drained, format!("1:{variant}:drained"));
+            e1.record(&s)?;
+            e1.synchronize()?;
+            gpu_v[vi].push(Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / n as f64);
         }
-        let host_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
-        // The spin still running when the host finished = the GPU ran the loop back to back.
-        let drained = e0.query()?;
-        bar(!drained, format!("1:{variant}:drained"));
-        e1.record(&s)?;
-        e1.synchronize()?;
-        let gpu_us = Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / n as f64;
-        if variant == "none" {
-            base = (host_us, gpu_us);
+    }
+    let med = |v: &Vec<f64>| Stat::of(v).med;
+    let (base_h, base_g) = (med(&host_v[0]), med(&gpu_v[0]));
+    let mut write_cost = (0.0, 0.0); // ctx_store: (GPU, host) us per write
+    for (vi, variant) in variants.iter().enumerate() {
+        let (h, g) = (med(&host_v[vi]), med(&gpu_v[vi]));
+        if *variant == "ctx_store" {
+            write_cost = (g - base_g, h - base_h);
         }
         println!(
-            "  {variant:>14}: host {host_us:7.2} us/iter (+{:6.2}, max {iter_max:.1}), GPU {gpu_us:7.2} us/iter (+{:6.2}){}; at 160 writes/step: +{:.0} us host, +{:.0} us GPU",
-            host_us - base.0,
-            gpu_us - base.1,
-            if drained { "  [queue DRAINED before the host finished: host-bound, FAILS]" } else { "" },
-            160.0 * (host_us - base.0),
-            160.0 * (gpu_us - base.1),
+            "  {variant:>14}: host {h:7.2} us/iter (+{:6.2}, max {:.1}), GPU {:7.2} us/iter [{:.2}..{:.2}] (+{:6.2})",
+            h - base_h,
+            iter_max[vi],
+            g,
+            Stat::of(&gpu_v[vi]).min,
+            Stat::of(&gpu_v[vi]).max,
+            g - base_g,
         );
     }
 
     // ---- 2. re-launching executables that are still in flight ----------------------------
     // Step 0 run 1 (2026-10-04): 80 BACK-TO-BACK launches of one 8-node executable cost +7..13% GPU
     // time per launch vs 80 distinct executables. Production replays a stage graph only after the
-    // lane's other stages (~8 launches later), so: round-robin over K executables (K = 1 back to
-    // back ... 80 all distinct), 1- and 8-node graphs, median of 3. The 2.0 bar applies to
-    // production's pattern, K = 8.
-    println!("== 2. 80 launches round-robin over K executables behind a 50 ms spin (GPU us/launch, median [min..max] of 3)");
+    // lane's other 7 stages (plus direct launches), so its pattern is round-robin over K >= 8: the
+    // budget charges K = 8 vs all-distinct (today's legacy graphs), measured as alternating pairs.
+    // K = 1 / 2 / 4 are diagnostics.
+    println!("== 2. 80 launches round-robin over K executables behind a 50 ms spin (GPU us/launch)");
     let (rows, k) = (1280usize, 5120usize);
     let w = q8_weight(dev.id, rows, k, 1)?;
     let mut xq = up(dev.id, &lcg_bytes(2, 8 * k).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
     let mut xs = up(dev.id, &vec![0.01f32; 8 * (k / 32)])?;
     let mut out = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
-    // (host ms for the 80 launches, GPU us per launch, queue drained before the host finished)
+    // (host us per launch, GPU us per launch, queue drained before the host finished)
     let run = |execs: &[GraphExec], kk: usize, spin: f64| -> eyre::Result<(f64, f64, bool)> {
         s.synchronize()?;
         let (e0, e1) = (Event::new()?, Event::new()?);
@@ -307,12 +367,13 @@ fn graph_keys_step0() -> eyre::Result<()> {
         for i in 0..80 {
             execs[i % kk].launch(&s)?;
         }
-        let host_ms = t.elapsed().as_secs_f64() * 1e3;
+        let host_us = t.elapsed().as_secs_f64() * 1e6 / 80.0;
         let drained = e0.query()?;
         e1.record(&s)?;
         e1.synchronize()?;
-        Ok((host_ms, Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / 80.0, drained))
+        Ok((host_us, Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / 80.0, drained))
     };
+    let mut relaunch = None; // (GPU delta, host delta) per launch, K = 8 vs K = 80, 8 nodes
     for nodes in [1u32, 8] {
         let mut body = |s: &Stream| -> eyre::Result<()> {
             for b in 1..=nodes {
@@ -321,38 +382,58 @@ fn graph_keys_step0() -> eyre::Result<()> {
             Ok(())
         };
         let execs: Vec<GraphExec> = (0..80).map(|_| capture(&s, &mut body).map(|c| c.1)).collect::<eyre::Result<_>>()?;
-        let mut med = std::collections::BTreeMap::new();
-        let mut line = format!("  {nodes} node(s):");
         let mut any_drained = false;
-        for kk in [1usize, 2, 4, 8, 80] {
+        let mut line = format!("  {nodes} node(s), diagnostics (median of 3):");
+        for kk in [1usize, 2, 4] {
             let mut g = Vec::new();
             for _ in 0..3 {
                 let (_, gpu, drained) = run(&execs, kk, 50.0)?;
                 any_drained |= drained;
                 g.push(gpu);
             }
-            g.sort_by(f64::total_cmp);
-            med.insert(kk, g[1]);
-            line += &format!("  K={kk} {:.2} [{:.2}..{:.2}]", g[1], g[0], g[2]);
+            line += &format!("  K={kk} {}", Stat::of(&g));
         }
-        let base = med[&80];
-        line += &format!("  | vs K=80: K=1 {:+.1}%, K=2 {:+.1}%, K=8 {:+.1}%", (med[&1] / base - 1.0) * 100.0, (med[&2] / base - 1.0) * 100.0, (med[&8] / base - 1.0) * 100.0);
-        println!("{line}{}", if any_drained { "  [a run DRAINED: host-bound]" } else { "" });
+        println!("{line}");
+        // K = 8 vs K = 80, 11 alternating pairs.
+        let (mut g8, mut g80, mut h8, mut h80) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..11 {
+            for kk in if i % 2 == 0 { [8usize, 80] } else { [80, 8] } {
+                let (h, g, drained) = run(&execs, kk, 50.0)?;
+                any_drained |= drained;
+                if kk == 8 {
+                    g8.push(g);
+                    h8.push(h);
+                } else {
+                    g80.push(g);
+                    h80.push(h);
+                }
+            }
+        }
+        let (dg, dh) = (Delta::of(&g80, &g8), Delta::of(&h80, &h8));
+        println!("  {nodes} node(s): K=8 {} vs K=80 {}; GPU K=8 - K=80 {dg}", Stat::of(&g8), Stat::of(&g80));
+        println!("  {nodes} node(s): host per launch K=8 {} vs K=80 {}; host K=8 - K=80 {dh}", Stat::of(&h8), Stat::of(&h80));
+        if any_drained {
+            println!("  [a run DRAINED: host-bound]");
+        }
         bar(!any_drained, format!("2:{nodes}n:drained"));
         if nodes == 8 {
-            let serializes = med[&8] > 1.10 * base;
-            bar(!serializes, "2:SERIALIZES(K=8)".into());
-            println!("  8 nodes, production pattern K=8 vs distinct: {}", if serializes { "SERIALIZES" } else { "does not serialize" });
+            relaunch = Some((dg, dh));
             // BLOCKS: the host enqueue time of 80 launches must not grow with the spin ahead.
             for (label, kk) in [("K=1", 1usize), ("K=80", 80)] {
                 let (h5, _, _) = run(&execs, kk, 5.0)?;
                 let (h50, _, _) = run(&execs, kk, 50.0)?;
-                let blocks = h50 - h5 > 22.5; // half the 45 ms the spin grew by
+                let blocks = (h50 - h5) * 80.0 / 1e3 > 22.5; // half the 45 ms the spin grew by
                 bar(!blocks, format!("2:{label}:BLOCKS"));
-                println!("  {label}: host {h5:.3} ms behind 5 ms, {h50:.3} ms behind 50 ms -> {}", if blocks { "BLOCKS" } else { "does not block" });
+                println!(
+                    "  {label}: host {:.3} ms behind 5 ms, {:.3} ms behind 50 ms -> {}",
+                    h5 * 80.0 / 1e3,
+                    h50 * 80.0 / 1e3,
+                    if blocks { "BLOCKS" } else { "does not block" }
+                );
             }
         }
     }
+    let (relaunch_gpu, relaunch_host) = relaunch.expect("8-node relaunch measured");
 
     // ---- 3. coherence: store then a graph that reads the slot, 10k rounds ----------------
     println!("== 3. coherence: arena_ctx_store then a captured _ind gemv (canary on), alternating entries");
@@ -415,8 +496,8 @@ fn graph_keys_step0() -> eyre::Result<()> {
     xs = up(dev.id, &(0..8 * (k / 32)).map(|i| 0.002 + (i % 7) as f32 * 0.001).collect::<Vec<_>>())?;
     let mut out_d = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
     let mut out_i = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
-    let twin_ok = |td: f64, ti: f64| ti - td <= f64::max(0.02 * td, 0.3);
     let prefill = |s: &Stream| e.q8.slack_probe_spin(s, spin_ms(10.0));
+    let mut gemv_charge = 0f64; // the largest resolved twin delta over b, us per launch
     for b in [1u32, 4, 8] {
         out_i.fill_zero()?;
         let mut ent = ArenaCtx::default();
@@ -428,33 +509,31 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let ind = Ind::new(slot.raw() as u64).with(0, 0).with(1, 1).with(2, 2).with(3, 3);
         let mut out_x = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
         // The twin's real operands come from the slot (out_i); out_x is only size-checked.
-        let (sd_, si_, drained) = time_ab(
+        let (sd_, si_, dt, drained) = time_ab(
             &s,
             200,
-            5,
+            11,
             &prefill,
             &mut || e.q8.matvec_bpack(&s, &mut out_d, &w, &xq, &xs, rows as u32, k as u32, b),
             &mut || e.q8.matvec_bpack_ind(&s, ind, &mut out_x, &w, &xq, &xs, rows as u32, k as u32, b),
         )?;
-        let (td, ti) = (sd_.med, si_.med);
         bar(drained == 0, format!("4a:b{b}:drained"));
         s.synchronize()?;
         let n = b as usize * rows;
         let diff = down(&out_d, n)?.iter().zip(down(&out_i, n)?).filter(|(a, c)| **a != *c).count();
-        let pass = twin_ok(td, ti);
         exact &= diff == 0;
         bar(diff == 0, format!("4a:b{b}:bitexact"));
-        bar(pass, format!("4a:b{b}:time"));
+        gemv_charge = gemv_charge.max(dt.charge());
         println!(
-            "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%, {}); differing outputs {diff}{}",
-            (ti / td - 1.0) * 100.0,
-            if pass { "within bar" } else { "OVER BAR" },
-            if drained > 0 { format!("; {drained} rounds DRAINED (host-bound), FAILS") } else { String::new() }
+            "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff}{}",
+            (si_.med / sd_.med - 1.0) * 100.0,
+            if drained > 0 { format!("; {drained} runs DRAINED (host-bound), FAILS") } else { String::new() }
         );
     }
 
     // ---- 4b. mhc_fast_batched `_ind` twin vs direct, b = 1, 4, 8 -------------------------
     println!("== 4b. mhc_fast_batched_ind vs direct (pre_attn: mix pre-scaled + collapse + write_carry), 13 operands indirect");
+    let mut mhc_charge = 0f64;
     {
         let (hcd, m, ne, bmax) = (HC_DIM as usize, HC_MIX_DIM as usize, N_EMBD as usize, 8usize);
         // f16 weights in a sane range: sign, exponent 10..14, random mantissa.
@@ -508,19 +587,16 @@ fn graph_keys_step0() -> eyre::Result<()> {
             let got = si.dump(b as usize)?;
             let diff: usize = ref_out.iter().zip(&got).map(|(a, c)| a.iter().zip(c).filter(|(x, y)| x != y).count()).sum();
             let mut decoy = MhcSet::new(dev.id, bmax, &carry0)?;
-            let (sd_, si_, drained) =
-                time_ab(&s, 200, 5, &prefill, &mut || go(&mut decoy, None, b), &mut || go(&mut sd, Some(ind), b))?;
-            let (td, ti) = (sd_.med, si_.med);
-            let pass = twin_ok(td, ti);
+            let (sd_, si_, dt, drained) =
+                time_ab(&s, 200, 11, &prefill, &mut || go(&mut decoy, None, b), &mut || go(&mut sd, Some(ind), b))?;
             exact &= diff == 0;
             bar(diff == 0, format!("4b:b{b}:bitexact"));
-            bar(pass, format!("4b:b{b}:time"));
             bar(drained == 0, format!("4b:b{b}:drained"));
+            mhc_charge = mhc_charge.max(dt.charge());
             println!(
-                "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%, {}); differing outputs {diff} (split, mix, inv, carry, cur, norm){}",
-                (ti / td - 1.0) * 100.0,
-                if pass { "within bar" } else { "OVER BAR" },
-                if drained > 0 { format!("; {drained} rounds DRAINED (host-bound), FAILS") } else { String::new() }
+                "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff} (split, mix, inv, carry, cur, norm){}",
+                (si_.med / sd_.med - 1.0) * 100.0,
+                if drained > 0 { format!("; {drained} runs DRAINED (host-bound), FAILS") } else { String::new() }
             );
         }
     }
@@ -558,8 +634,35 @@ fn graph_keys_step0() -> eyre::Result<()> {
     bar(nodes == launches, "5:nodes".into());
     println!("  {launches} captured launches -> {nodes} graph nodes");
 
-    // The write cost vs 1% of `ms.step` p50 needs the live step time: section 1 is compared by hand.
-    println!("== section 1's write cost vs 1% of ms.step p50: compare by hand");
+    // ---- the 2.0 per-step budget ----------------------------------------------------------
+    // Everything the design adds per step, GPU + host critical path, against 1% of `ms.step` p50.
+    // The worst case is 2 rows / 2 lanes (~60 ms live, 2026-10-04): the write and launch counts
+    // grow with lanes and layers, not rows, while the step grows with rows. GK_STEP_MS overrides.
+    let step_ms: f64 = std::env::var("GK_STEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
+    let (lane_layers, stages) = (2.0 * 40.0, 8.0); // 2 lanes x 40 layers; 8 captured stages
+    let writes = 2.0 * lane_layers; // 1 per lane-layer, 2 with the presubmit shared expert
+    let launches = stages * lane_layers;
+    let (gemv_per, mhc_per) = (8.0, 3.0); // twin launches per lane-layer (q_b-shape delta: conservative)
+    let c_write = writes * (write_cost.0.max(0.0) + write_cost.1.max(0.0));
+    let c_relaunch = launches * (relaunch_gpu.charge() + relaunch_host.charge());
+    let c_twins = lane_layers * (gemv_per * gemv_charge + mhc_per * mhc_charge);
+    let total = c_write + c_relaunch + c_twins;
+    let budget = 0.01 * step_ms * 1e3;
+    println!("== per-step budget at ms.step {step_ms:.0} ms (1% = {budget:.0} us; 2 lanes x 40 layers):");
+    println!(
+        "  context writes   {writes:.0} x ({:.2} GPU + {:.2} host) us = {c_write:6.0} us",
+        write_cost.0, write_cost.1
+    );
+    println!(
+        "  graph relaunch   {launches:.0} x ({:.2} GPU + {:.2} host) us = {c_relaunch:6.0} us",
+        relaunch_gpu.charge(),
+        relaunch_host.charge()
+    );
+    println!(
+        "  twins            {lane_layers:.0} x ({gemv_per:.0} x {gemv_charge:.2} + {mhc_per:.0} x {mhc_charge:.2}) us = {c_twins:6.0} us"
+    );
+    println!("  total            {total:6.0} us = {:.2}% of the step", total / (step_ms * 1e3) * 100.0);
+    bar(total <= budget, format!("budget:{:.2}%", total / (step_ms * 1e3) * 100.0));
     if nogo.is_empty() {
         println!("STEP0: GO");
     } else {

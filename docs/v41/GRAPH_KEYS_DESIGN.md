@@ -68,10 +68,15 @@ that replaced 3-5 of them saved 13-20 us per lane-layer (tests/bench_decode_late
    direct kernel on A, then on B; and a capture of N launches has exactly N nodes (2.5's vetted
    count assumes one kernel node per launch -- if ROCm added nodes, every capture would taint and
    the design would silently run all-legacy).
-Go / no-go: per step, the added GPU time plus the host critical-path time <= 1% of `ms.step` p50
-(~80-160 writes per step at <= ~5 us GPU each); neither BLOCKS nor SERIALIZES; coherence clean;
-each twin bit-exact and within max(2%, 0.3 us) of its direct kernel. Otherwise the design stops
-and is revised.
+Go / no-go (rev 3.2, after run 1; code review): coherence clean, every twin bit-exact, one node per
+launch, no drained queue, no BLOCKS, and ONE per-step budget: writes (160 = 2 lanes x 40 layers x 2
+with presubmit) x the `ctx_store` GPU + host cost + graph launches (640 = 8 stages x 80
+lane-layers) x the relaunch delta at production's pattern (K = 8 vs all-distinct, GPU + host) + twin
+launches (80 lane-layers x (8 gemv + 3 mhc)) x the twin deltas <= 1% of `ms.step` p50 (60 ms at 2
+rows / 2 lanes, the worst case: counts grow with lanes, the step with rows). Deltas are paired
+(11 alternating pairs) and charged only when a sign test resolves them (>= 9 of 11 positive);
+per-item ratios are diagnostics. A 10% relaunch penalty alone would be ~4 ms = 7% of the step, so
+SERIALIZES as a ratio bar was far too loose. Otherwise the design stops and is revised.
 
 #### Step 0 run 1 (2026-10-04 22:07 UTC, 06bae25, hub down 57 s): NO-GO
 
@@ -332,3 +337,10 @@ Code review round 2, 936363f (reviewer: APPROVE):
 1. `ArenaCanaryLog::rec[2]` written past its bound: FIXED -- flexible array member `rec[]`.
 2. A no-go exited 0: FIXED -- the bench's last line is `STEP0: GO` / `STEP0: NO-GO (items)`; the
    window script reports and logs it.
+
+Review of a7dc914 (reviewer: APPROVE WITH CHANGES):
+
+1. The ratio bars were too loose for the 1% budget: FIXED -- one per-step budget sum (2.0).
+2. Run 2 could not resolve sub-1% deltas: FIXED -- K = 8 vs K = 80 and the twins as 11 alternating
+   pairs with a sign test; section 1 median of 3.
+3. AS1-typed slot load: sound (the slot only ever holds host-written device addresses).
