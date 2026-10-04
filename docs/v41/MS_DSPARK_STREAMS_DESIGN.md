@@ -265,7 +265,7 @@ the owner). A stream backing off beside a K = 5 block rides a ~100-120 ms step f
 
 ## 3. Knobs
 
-- `V41_MS_DSPARK_STREAMS` (live, 1..=2, default 1). 1 = today's policy and outputs (under `V41_MS_DSPARK_RING=solo` it also ring-writes on 2-stream steps, async: drafter state only, so a live flip to 2 finds dense rings; review round 2 A1). Rollback of the POLICY
+- `V41_MS_DSPARK_STREAMS` (live, 1..=2, default 1). 1 = today's policy and outputs (under `V41_MS_DSPARK_RING=solo`, once the knob has been above 1 in the process, it also ring-writes on 2-stream steps so a live flip finds dense rings; before that, exactly today; review rounds 2-3). Rollback of the POLICY
   = 1. Rolling back the StepRows refactor and the route-order fix needs a binary revert (they change
   no numerics: G5a-g gate them bit-exact).
 
@@ -413,3 +413,11 @@ timestamp-based analysis confirmed unbiased):
 - W2 no trap: FIXED (an EXIT / INT / TERM / HUP trap relaunches OLD whenever the hub is down;
   SIGKILL escalation when a hub does not stop). W3: the e2e is capped at 1500 s. W4: the deploy
   marker carries the worktree's commit.
+
+Code review round 3 (309d2e1; reviewer: APPROVE): CR3-1 knob 1 under `RING=solo` wrote rings on
+2-stream steps -- FIXED, the extra writes start only once the knob has been above 1 in the process
+(`ms_dspark::ring_streams`), so a deploy at 1 is today's behaviour; CR3-2 the analysis's gap rule
+raised to 10 s (prefill bursts end runs through `ms.phase`); CR3-3 the window script's trap
+hardened (a spawned hub counts as up, a second signal cannot abort the recovery, a hub that
+survives SIGKILL is never doubled); CR3-4 noted: the stop patterns also stop dev hubs from other
+worktrees (they would hold the GPUs anyway).

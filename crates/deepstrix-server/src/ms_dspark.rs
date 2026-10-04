@@ -288,10 +288,26 @@ fn multi_tables(m: usize) -> LaneTables {
 /// owner: more than two is not worth it).
 pub const MAX_SPEC_STREAMS: usize = 2;
 
+/// Set the first time `spec_streams` returned more than 1 in this process.
+static MULTI_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// `V41_MS_DSPARK_STREAMS`: the most live streams that may all draft in one
 /// step (1 = a lone stream only, today's rule).
 pub fn spec_streams() -> usize {
-    crate::knobs::MS_DSPARK_STREAMS.usize().clamp(1, MAX_SPEC_STREAMS)
+    let n = crate::knobs::MS_DSPARK_STREAMS.usize().clamp(1, MAX_SPEC_STREAMS);
+    if n > 1 {
+        MULTI_EVER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    n
+}
+
+/// The most live streams whose drafter rings are kept written under
+/// `V41_MS_DSPARK_RING=solo`: the knob's value until it has ever been above
+/// 1 in this process (a deploy at 1 writes exactly what it did before), then
+/// its ceiling, so a live flip back and forth (the per-turn A/B) always finds
+/// every stream's ring dense (review rounds 2-3).
+pub fn ring_streams(spec_max: usize) -> usize {
+    if MULTI_EVER.load(std::sync::atomic::Ordering::Relaxed) { MAX_SPEC_STREAMS } else { spec_max }
 }
 
 impl MsDspark {
