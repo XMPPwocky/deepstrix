@@ -129,9 +129,8 @@ pub struct IgpuLayerWeights {
     pub layer_idx: i32,
     pub ratio: u32,
 
-    /// Routed experts: a 1-slot placeholder (the ExpertPager holds the real ones). Historically all 256; with `IGPU_DEDUP_HOT` only the
-    /// `256 - n_hot` experts that are NOT dGPU-resident, packed dense
-    /// (`routed.n_slots`).
+    /// Routed experts: a 1-slot placeholder. The ExpertPager holds the real
+    /// ones (paged experts are the only mode since 2026-09-24).
     pub routed: RoutedExpertWeights,
 
     /// Per-layer RoPE params. Mirrors the dGPU side for any future
@@ -859,11 +858,6 @@ fn expert_load_profile() -> bool {
 /// unsloth UD-IQ2_XXS mix.
 ///
 /// Off by default until the GPU A/B lands.
-pub fn igpu_dedup_hot() -> bool {
-    std::env::var("IGPU_DEDUP_HOT").map(|v| v != "0").unwrap_or(false)
-}
-
-
 /// M58.3 leg balance: max dGPU-resident slots the dGPU computes per token;
 /// the rest overflow back to the otherwise-idle iGPU. Default 4 (misses×32.5 µs
 /// vs hits×12.3 µs + shared ~46 µs cross near h*≈3.3-4).
@@ -876,9 +870,6 @@ pub fn igpu_dedup_hot() -> bool {
 /// overflow slot has nowhere to run.
 pub fn dgpu_hot_cap() -> u32 {
     static CAP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        if igpu_dedup_hot() {
-            return crate::config::N_EXPERT_USED as u32;
-        }
         std::env::var("DGPU_HOT_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4)
     });
     *CAP

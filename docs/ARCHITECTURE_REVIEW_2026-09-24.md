@@ -639,3 +639,23 @@ Run each case through serial prefill, serial decode, multistream rows at S=1/2/4
 - **`9191d50` (milestone 2a):** routing PIN (`het/fidelity_tap.rs`). It forces the reference's top-6 at every serial-decode and batched row, weighting those experts from the engine's own router logits. Rows whose pick set already matches are untouched. Pinned KL isolates the engine's numerics; free KL minus pinned KL is the cost of routing flips. A pinned run hard-fails unless every pick matches.
 - **`0e47b83` (milestone 2b):** residual sink plus per-layer relative L2 against the reference. `GOLDEN_DECODE_FROM=0` runs every layer on the exact path the reference runs.
 - **Next:** first run (server down, ~45 min: `short` with decode-from-0 free+pinned, then `agentic` serial+arena free+pinned) to set the baseline thresholds. Then milestone 3: the restore path and an indexer pin (`compress_idxs`).
+
+**2026-10-04 (branch `worktree-v4flash-removal`, rebased onto main):**
+
+*Owner:* "rebase it onto main". Main had moved 243 commits since this branch's base (f38679e), including two-stream DSpark, layer-major prefill, the pin protocol and the cache prior. The branch was rebuilt on main `c2db000`, and the original branch is untouched.
+- **v41 cfg collapse, redone rather than cherry-picked.** Main had 133 positive and 43 negative sites by then.
+  - Stage 1 (`d7b1284`) is mechanical. rustc's expanded source with the feature ON is identical before and after for the kernels lib, the server lib and expertd, apart from two moved docs.
+  - Stage 2 (`27d37cf`) folds the 45 `true`s and deletes the branches they killed: the `qkv_chain` graph, the `!packed_store` fallback, the V4 vision ctx check, and the V4 q-norm / fp8 / hc arms.
+- **Non-paged and hot-tier removal** (`1facc10`, conflicts resolved per its message), **V4 template** (`fc46c07`), **V4-only tests, bins and phase1** (`4383680`), **hash router** (`7b86a76`), plus the docs, oracle and deploy commits. The three golden-gate commits were already on main.
+- **Rebase follow-ups.** `IGPU_DEDUP_HOT` is gone: it would have pinned the two-box split cap. `router_logits_host` (hash-router readback) and `HOT_MAX_EXPERTS` are removed, and the stale hot-leg comments are fixed.
+- **`deploy/run-hub.sh` now matches the live hub of 2026-10-04.** A dry run against `/proc/<hub>` gives an identical env and argv.
+- **Adversarial review:** APPROVE WITH CHANGES; the changes are applied. It found no production change in the forward path: every deleted branch was unreachable under `V41_PAGED_EXPERTS=1`, and the two folds that touch live code (`fuse_remote_add` and the PUSH_XQ dtype source) are value-identical.
+- **Verification:** `cargo check --workspace --tests` is clean with no new warnings. Server lib tests: 139 passed, 0 failed (the 18 that no longer run were the V4 template's). Release build OK.
+
+*Before merging to main:* run the golden gate and multistream_step G5a-h on this build in a GPU window. It removes code from the production binary, even though none of it was reachable.
+
+*Deferred:*
+- **Port `tests/snapshot_fp8_roundtrip.rs` to V4.1.** It is deleted because it needs the V4-Flash GGUF and ratio-4 FP8 stores. It was the only test of the snapshot v5 round trip, the encoding-mismatch refusal, and main's 10-03 `n_comp`-vs-token-count restore cross-check. Port it to a V4.1 `HetModelState` and run it in the GPU window: it allocates dGPU memory, and the dGPU is near full under production.
+- **Fix `docs/v41/KNOB_AUDIT_2026-10-04.md`.** It still lists `DGPU_HOT_*`, `DGPU_HOT_ALPHA` and the `DGPU_HOT_EXPERTS_FILE` set_var race, all deleted here.
+- **`~/.cache/deepstrix/hot_experts.txt` is no longer written.** `scripts/hot_cov.py` and `scripts/sim_fixed.py` will read a frozen file. Box 2 runs `--experts L0-L39:<range>`, so nothing in production reads it.
+- **Remaining comments that describe the hot leg** (`batch_scratch.rs` R1 notes, `forward_prefill.rs` near the remote-split cap) go in the ontology doc pass.

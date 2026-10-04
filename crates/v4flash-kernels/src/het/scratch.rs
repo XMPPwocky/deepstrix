@@ -215,7 +215,6 @@ pub struct DgpuScratch {
     // hash router host path) writes d_selected/d_ew. Both are then
     // peer-pushed to iGPU MoE.
     pub router_logits: DeviceBuffer<f32>,
-    pub router_logits_host: Vec<f32>,
     /// M60: backing allocation for d_selected + d_ew (single peer push).
     pub sel_ew_pack: DeviceBuffer<u8>,
     pub d_selected: DeviceBuffer<i32>,
@@ -447,7 +446,6 @@ impl DgpuScratch {
 
             // Router (dGPU-resident).
             router_logits: DeviceBuffer::new(device_id, N_EXPERT as usize)?,
-            router_logits_host: vec![0f32; N_EXPERT as usize],
             sel_ew_pack,
             d_selected,
             d_ew,

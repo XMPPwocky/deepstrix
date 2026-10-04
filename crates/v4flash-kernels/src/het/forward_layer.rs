@@ -2115,7 +2115,7 @@ impl HeterogeneousEngine {
                 N_EMBD,
             )?;
         }
-{
+        {
             let _t = de.events.stage("k.router.topk", &de.compute)?;
             de.router_topk.launch(
                 &de.compute,

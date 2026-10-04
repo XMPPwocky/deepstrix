@@ -192,13 +192,10 @@ fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
 ///   `hc_post` after the lane switch.
 /// * `ffn_shared` — P10 output, read by P12 `vec_add`.
 /// * `ffn_moe_recv` — written by `ie.xfer` (peer push), read in P12.
-/// * `ffn_input_norm` — read by `de.xfer` (peer push to the iGPU) and by
-///   the P11h hot leg; the only fence is `selected_pushed` on `de.xfer`.
-/// * `d_selected` / `d_ew` — read by `de.xfer` (same push) and by the
-///   P11h hot leg.
+/// * `ffn_input_norm` — read by `de.xfer` (peer push to the iGPU); the only
+///   fence is `selected_pushed` on `de.xfer`.
+/// * `d_selected` / `d_ew` — read by `de.xfer` (same push).
 /// * `pos_per_b` — uploaded once per chunk, read every layer.
-/// * (removed 2026-09-24: `hot_ffn_moe_dgpu`, the M61 dGPU hot-tier reduce output) read
-///   by P12 `vec_add_hot` after the lane switch.
 ///
 /// ~128 MiB at rows=512: residual / residual_next / after_attn_hc 32 MiB
 /// each, ffn_input_norm / ffn_shared / ffn_moe_recv
@@ -714,9 +711,6 @@ pub struct BatchDgpuShared {
     pub look_ew: DeviceBuffer<f32>,
     pub look_sel2: DeviceBuffer<i32>,
     pub look_ew2: DeviceBuffer<f32>,
-    /// Host readback area for the hash router path (synchronous readback
-    /// inside P9). `[B, N_EXPERT]`.
-    pub router_logits_host: Vec<f32>,
 
     // ---- Shared expert temporaries (P10) ----
     pub gate_sh: DeviceBuffer<f32>,
@@ -727,14 +721,6 @@ pub struct BatchDgpuShared {
 
 }
 
-/// Static work-item geometry for the dGPU hot-expert prefill leg.
-/// Members per hot expert are capped at the scratch's `rows`, so each
-/// expert needs at most `ceil(rows / HOT_CHUNK)` chunks
-/// ([`hot_chunks_per_expert`]). The work-items list is e-major and
-/// uploaded ONCE; per-layer launches set grid.y = n_hot × chunks and the
-/// matvec kernels' `member_end <= member_start` guard early-exits empty
-/// chunks — no per-layer host readback of n_work_items on de.compute.
-pub const HOT_MAX_EXPERTS: usize = crate::config::N_EXPERT as usize;
 
 
 
@@ -1493,7 +1479,6 @@ impl BatchDgpuShared {
             look_ew: mk_f32(N_EXPERT_USED)?,
             look_sel2: mk_i32(N_EXPERT_USED)?,
             look_ew2: mk_f32(N_EXPERT_USED)?,
-            router_logits_host: vec![0.0f32; b * (N_EXPERT as usize)],
 
             gate_sh: mk_f32(N_FF_SHARED as usize)?,
             up_sh: mk_f32(N_FF_SHARED as usize)?,

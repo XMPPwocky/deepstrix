@@ -763,8 +763,8 @@ pub struct WorkerState {
 
     /// M7 expert tier: pages V4.1's ~276 GiB of routed experts on demand instead
     /// of making them resident. Owns the HF source, so the mmap it reads experts
-    /// from lives as long as the model. always `Some` (paged experts are the only mode)
-    /// (full residency, which only fits for V4-Flash).
+    /// from lives as long as the model. Always `Some`: paged experts are the
+    /// only mode since 2026-09-24 (full residency only ever fit V4-Flash).
     pub pager: Option<v4flash_kernels::het::ExpertPager>,
 
     /// V4.1 Engram: the n-gram hasher plus one table handle per Engram layer.

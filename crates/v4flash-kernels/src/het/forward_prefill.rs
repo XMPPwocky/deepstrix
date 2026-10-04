@@ -184,11 +184,6 @@ fn remote_split_dryrun() -> bool {
 
 fn hot_prefill_cap() -> u32 {
     static CAP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        if crate::het::weights::igpu_dedup_hot() {
-            // M63: must equal the decode cap (see dgpu_hot_cap) — both are
-            // pinned to N_EXPERT_USED, so the partitions still match.
-            return crate::het::weights::dgpu_hot_cap();
-        }
         std::env::var("DGPU_HOT_CAP_PREFILL")
             .ok()
             .or_else(|| std::env::var("DGPU_HOT_CAP").ok())
@@ -1911,7 +1906,7 @@ impl HeterogeneousEngine {
         let mut look: Option<Vec<i32>> = None;
         if layer + 1 < N_LAYER as usize {
             let nl = &weights.dgpu_layers[layer + 1];
-{
+            {
                 let mut logits = v4flash_hip::DeviceBuffer::<f32>::new(de.device.id, b * N_EXPERT as usize)?;
                 let mut sel = v4flash_hip::DeviceBuffer::<i32>::new(de.device.id, b * nu)?;
                 let mut ew = v4flash_hip::DeviceBuffer::<f32>::new(de.device.id, b * nu)?;
