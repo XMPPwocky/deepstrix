@@ -1,6 +1,6 @@
 # name	occ	distinct  (scripts/ontology_census.py --save)
-drafter / dspark	235	66
-mtp	828	67
+drafter / dspark	270	68
+mtp	868	67
 V41_INDEXER_*	4	3
 V41_INDEX_* / V41_IDX_*	8	4
 RawWindow (the bare `raw_window` is the V4 image window until it is deleted)	0	0
@@ -8,43 +8,43 @@ decoder ring (a decoder layer's raw window)	20	2
 GgufType (the dtype enum of a safetensors model)	427	1
 RequestId	0	0
 StreamId	0	0
-slot outside the pools (stream id, append row, block base, capacity; arena/scheduler files)	406	9
+slot outside the pools (stream id, append row, block base, capacity; arena/scheduler files)	517	13
 request shape as a literal (b > 16, prefill_shaped)	20	2
 RequestShape	0	0
 _v2 declared (fn/struct/enum/const/static/type)	6	6
 LaneCtl / LanePlan	0	0
-lane by letter or t1/t2	349	5
+lane by letter or t1/t2	356	5
 advertises / accepts / home / PlacedPicks	0	0
 owns	90	9
 T2 (tier 2 = box 2)	16	3
 partition_box2	19	1
-het (engine module / types)	620	37
+het (engine module / types)	636	38
 ExpertKey	0	0
 Remap	0	0
 span read	0	0
 coalesce (= span read)	57	16
 pins meaning evict-protect	14	3
-registry knob	77	77
-raw env read of a V41_ knob	333	246
+registry knob	83	83
+raw env read of a V41_ knob	332	245
 env .is_ok() used as a boolean	35	20
-v4flash crate names	1569	7
+v4flash crate names	1588	8
 milestone code inside an identifier	0	0
-slot	2197	100
-stream (outside the HIP crate)	4074	53
+slot	2314	102
+stream (outside the HIP crate)	4148	62
 seq	227	1
-ring	389	59
-prefill	1191	199
-phase	320	27
-pin	1073	159
-mirror	194	24
-hot	615	93
-split	755	127
-window	507	61
+ring	397	61
+prefill	1207	204
+phase	324	27
+pin	1074	159
+mirror	204	24
+hot	632	94
+split	754	127
+window	511	61
 chunk	1671	170
-admit	173	42
+admit	192	44
 restore	297	54
-remote	613	100
-prefetch	250	58
-tier	58	17
-region	109	9
+remote	617	101
+prefetch	257	60
+tier	61	18
+region	114	9
 dense	552	71
