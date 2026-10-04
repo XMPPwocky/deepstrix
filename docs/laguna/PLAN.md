@@ -1,6 +1,7 @@
 # Plan: Add Laguna-S-2.1 as deepstrix's second model
 
-Status: **APPROVED v3** (architect review 3 rounds; all blockers/majors/must-fixes resolved). Ready for Phase 0.
+Status: **SHIPPED 2026-07-23** (corrected 2026-10-04; see §0 OUTCOME): the Phase-1 spike merged as the product; Phase 2 (Model-trait refactor) deferred. Laguna runs through `laguna-chat` / `laguna-oracle-gen` (`crates/deepstrix-cli`), not `deepstrix-server`. The YaRN "factor 128" in §2/§3 below is wrong; the GGUF and code use factor 32 (`laguna/ARCH_SPEC.md` §1, `LagunaHparams::from_gguf`).
+Was: **APPROVED v3** (architect review 3 rounds; all blockers/majors/must-fixes resolved). Ready for Phase 0.
 Branch: `laguna-model-support`
 
 ---

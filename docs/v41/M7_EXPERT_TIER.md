@@ -1,5 +1,10 @@
 # M7 expert tier — plan (2026-09-13)
 
+> **Status (docs audit 2026-10-04):** historical. The paged tier this plan built is `ExpertPager`
+> (`het/expert_pager.rs`, box 1) and box 2's catch-all pool (REMOTE_EXPERTS.md §3.2). The OPEN
+> HAZARD below is fixed: `DeviceBuffer::new` enters `Device::scoped(device_id)` before `hipMalloc`
+> (`crates/v4flash-hip/src/buffer.rs`), already in the first commit, 857bca6.
+
 V4.1 has 289 GB of MXFP4 experts (384 × 40 × 18.8 MB). Box 1 has 96 GB, box 2 128 GB; even
 together (209 GB usable) they cannot hold them all resident. `HetModelWeights::load_all` loads
 every expert resident, which OOMs on V4.1. This tier fixes that.
@@ -113,6 +118,7 @@ BIT-IDENTICAL wrong output), and every kernel scalar.
 **=> The M7 core mechanism is VALIDATED: 289 GB of experts can run on a 96 GB box.**
 
 ### OPEN HAZARD (route to review): `DeviceBuffer::new`'s `device_id` is inert
+**[2026-10-04: FIXED — `device_id` is authoritative now (`DeviceGuard`, `buffer.rs`).]**
 It looks like it selects the device but does not; every call site silently depends on ambient
 `hipSetDevice` state. This cost a multi-hour misdiagnosis. Either make it call `hipSetDevice` or
 rename the argument. It lives in `v4flash-hip`, blast radius = every allocation in the repo.

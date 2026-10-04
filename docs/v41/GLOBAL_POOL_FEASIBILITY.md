@@ -1,6 +1,12 @@
 # Box 2's per-layer regions -> one global pool: feasible, no kernel change
 ### 2026-09-14. The largest measured non-requant decode lever.
 
+**Status (2026-10-04): IMPLEMENTED.** Box 2 runs one shard-wide pool (`ShardPool`,
+`remote_experts.rs`): `V41_B2_GLOBAL_POOL`, default on for decode since 2026-09-15 (714eabc) and
+for prefill too since 2026-09-18 (eb002bb); `=0` restores the per-layer search. The "reserved
+floors" option below became `V41_B2_POOL_FLOOR`, default 0 since 2026-09-16 (148044b; it was
+0.90). Current layout: REMOTE_EXPERTS.md §3.2. The `geom.py` replay is `scripts/geom.py`.
+
 ## The prize
 
 Box 2 runs an INDEPENDENT LRU per layer, sized by ownership: 260 slots on encoder
@@ -18,6 +24,7 @@ and is almost entirely these misses, so this attacks the dominant term directly.
 ## It needs no kernel change
 
 `REMOTE_EXPERTS.md` and `DECODE_CAPACITY_WALL.md` both record this as blocked
+**[2026-10-04: only DECODE_CAPACITY_WALL.md has this claim]**
 because "the wire format hands the executor a contiguous `[base_slot,
 base_slot+n)` range per layer, so a global pool changes the executor contract".
 **That is only true of `layer_views`, host-side.** The kernel does:
@@ -57,7 +64,7 @@ increasing order of effort:
   * **Phase-aware**: per-layer regions during prefill, global during decode. The
     slot contents survive the switch; only the bookkeeping changes. Cheapest, and
     decode and prefill never run concurrently.
-  * **Reserved floors**:每 layer keeps a guaranteed minimum (say 128 on encoder
+  * **Reserved floors**: each layer keeps a guaranteed minimum (say 128 on encoder
     layers) and the remainder is globally shared. Bounds prefill's worst case
     while giving decode most of the win.
   * **Two pools**: split the 6,560 slots into a per-layer prefill region and a

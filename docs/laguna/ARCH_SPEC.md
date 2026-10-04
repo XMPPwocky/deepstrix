@@ -110,6 +110,7 @@ MuP/embed scale, no logit softcap, no attention sinks, no per-layer output scala
 - gate=softplus (attn) vs router=sigmoid (MoE) — distinct.
 
 ## UNRESOLVED — verify in Phase 0 (GGUF header)
+**[2026-10-04: items 1-3 are resolved above: per-tensor quant in §9 (mixed Q4_K/Q6_K, dispatch on actual dtype), a real `output.weight` (Q6_K, §9), YaRN factor 32 / attn_factor 1.0 "verified from GGUF" (§1; `LagunaHparams::from_gguf` in `laguna.rs` reads them). Item 4: the code hardcodes `SWA_WINDOW = 512` (`laguna_het.rs`) rather than reading the GGUF key.]**
 1. Per-tensor quant types (§9). 2. Real `output.weight` present vs tied. 3. Exact YaRN
 attn_factor written to GGUF (vs mscale pre-division). 4. Confirm `sliding_window=512` +
 swa rope keys carried in the S-2.1 GGUF.

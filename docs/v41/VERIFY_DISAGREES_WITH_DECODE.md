@@ -1,9 +1,18 @@
 # The verify path does not reproduce the decode path, and it gets worse with B
 ### measured 2026-09-15, direct argmax cross-check
 
+> **Status (docs audit 2026-10-04):** historical record of the LEGACY verify; production DSpark
+> verifies on the multistream arena (DSPARK_ARENA_PLAN.md). The `V41_VERIFY_DECODE_PATH=1` results
+> in the CORRECTION below are SUSPECT: that layer-major loop let earlier rows see later draft
+> tokens until it was fixed on 2026-10-03 (KNOWN_BUGS #45, now token-major through `forward_one!`).
+> "The drafter is already validated" was wrong: the 09-27 parity work fixed a real drafter bug
+> (761e46f). `V41_DSPARK_XCHECK` never existed in code; the cross-check runs with
+> `V41_VERIFY_PROBE=K` + `V41_VERIFY_BATCHED=1`.
+
 ## The test
 
-`V41_DSPARK_XCHECK=1` with the verify probe. Row 0 of the probe's batch sits at
+`V41_DSPARK_XCHECK=1` with the verify probe **[2026-10-04: the switch never existed in code; the
+check runs whenever `V41_VERIFY_PROBE=K` runs with `V41_VERIFY_BATCHED=1`]**. Row 0 of the probe's batch sits at
 `pos` with `next` as its input — exactly the same work the decode forward on the
 next line does — so `argmax(probe_logits[0])` MUST equal the token decode then
 samples. Any disagreement is the verify computing something different from what
@@ -149,7 +158,7 @@ I claimed the verify's disagreement with decode capped DSpark's acceptance at
 
 `V41_VERIFY_DECODE_PATH=1` runs the verify through decode's own per-layer
 function, layer-major over the B rows — numerically what decode computes, by
-construction. If the divergence were the cap, acceptance should have risen
+construction. **[2026-10-04: it was not (KNOWN_BUGS #45); the table below is suspect.]** If the divergence were the cap, acceptance should have risen
 toward 4.38. It did not:
 
 | verify | E[tokens/step] |

@@ -1,5 +1,15 @@
 # Overnight plan, 2026-09-22 -> 23
 
+> **Status (docs audit 2026-10-04):** one-night plan; no outcomes were recorded here. Later state
+> of the items that can be read from the code: (1) stream buffer landed —
+> `engine_worker::STREAM_CHUNK_BUFFER` = 16384; (7) B=1 hits-first came another way — every
+> submit carries `REQ_FLAG_BATCHED` (a7799a7, 2026-10-03; `V41_REMOTE_BATCHED_B1=0` reverts), no
+> `decode_max_b` knob; (8) DSpark verify moved onto the arena (1ddedf3, 2026-10-01; two streams
+> 4c139ae, 2026-10-04; docs/v41/MS_DSPARK_STREAMS_DESIGN.md); (9) the scheduler compacts the arena
+> stores when a reservation does not fit (`KvArena::compact_stores` from `multistream.rs`, added in
+> affd80a, 2026-09-20, before this plan) — whether parking still happens for fragmentation is not
+> recorded. Items 2–6 and 10: outcomes not recorded.
+
 Production at start: box 1 on `6c103f7`+ with `V41_MS_STAGGER=2` (ready-first), hot set 103,
 merge=1 on box 2. Built but NOT deployed: stream-buffer fix (64 -> 16384 tokens, never
 silently drop a token; dropped streams must log a distinct finish reason -- TODO).

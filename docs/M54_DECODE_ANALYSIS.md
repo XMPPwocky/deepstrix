@@ -1,5 +1,7 @@
 # M54 — decode roofline + gap attribution (2026-06-09)
 
+> **Status (docs audit 2026-10-04):** HISTORICAL (V4-Flash). The `INDEXER_DECODE=sw` rollback now hard-errors with the default packed-E2M1 index-key store (`forward_layer.rs`); it works only with `INDEXER_KEYS_E2M1=0`. V4-Flash was dropped as a direction on 2026-09-24.
+
 ## Measured (bench_decode_het_parallel, FAKE_POS, B=1)
 
 | depth | ms/tok (p50-p70) | tok/s |
@@ -220,7 +222,7 @@ INDEXER re-ranking the full history every token:
 - indexer_topk merge/bitonic: ~0.6 ms/tok
 
 **Shipped: indexer_score_wmma_mw** (M52 port, bit-exact, INDEXER_DECODE=sw
-rollback): 96K decode 37.5 → 35.8 ms = **27.9 tok/s** (was 23.6 at M54).
+rollback **[2026-10-04: only with `INDEXER_KEYS_E2M1=0`]**): 96K decode 37.5 → 35.8 ms = **27.9 tok/s** (was 23.6 at M54).
 4K unaffected. At 128K, indexer cost scales ~×1.33 (n_comp 32768) → still
 sub-ms for score.
 

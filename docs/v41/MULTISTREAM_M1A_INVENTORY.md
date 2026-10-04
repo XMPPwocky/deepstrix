@@ -1,5 +1,10 @@
 # Multi-stream M1a: decode-layer launch and host-scalar inventory (2026-09-21)
 
+> **Status (docs audit 2026-10-04):** frozen inventory of 2026-09-21; line cites have drifted.
+> Since then: a row-grid sampler exists (`Sampler::launch_argmax_rows`, `sampler.rs`), so
+> Finding 3's "no batched sampler anywhere" no longer holds; the kernel is
+> `engram_gate_add.hip`; `ATTN_MIXED_MAX_KEYS` is based on `V41_MAX_CTX` = 368_640, not 307_200.
+
 Produced by a code-search pass over `forward_layer.rs`, `engine.rs`, `state.rs`,
 `scratch.rs`, `batch_scratch.rs` and the kernel wrappers, as the input for the
 batched multi-stream step (docs/v41/MULTISTREAM_DECODE_PLAN.md section 3). Every

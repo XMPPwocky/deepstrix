@@ -1,6 +1,14 @@
 # The router one layer early: accurate, and useless for prefetch
 ### `route_probe.py` on a 1,006-token dump, 2026-09-14
 
+> **Status (docs audit 2026-10-04):** not as closed as stated. Look-ahead routing prefetch was
+> built on 2026-09-21 (b9a2122): the hub runs layer L+1's (and L+2's, `V41_LOOKAHEAD_DEPTH`,
+> default 2) router on layer L's router input and sends box 2's predicted picks as
+> `REQ_FLAG_PREFETCH` words (REMOTE_EXPERTS.md §2; measured ~75% precision on decoder layers,
+> 2026-09-22). It is OFF by default since a 2026-09-21 A/B (`V41_LOOKAHEAD_PREFETCH=1` opts in;
+> unset in the production hub env 2026-10-04): the speculative reads contended with demand misses
+> on box 2's drives. The certain early paging of queued requests (`V41_B2_EARLY_PAGE`) took its place.
+
 **Question (user):** how accurate is layer L's router if run one layer "too
 early" — on the residual entering L-1 rather than L? It is a residual stream, so
 the input should barely change.

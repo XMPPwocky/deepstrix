@@ -1,7 +1,34 @@
 # DSpark on the multistream arena — build plan
 
 rev 3, 2026-09-27. Base: production branch `worktree-b2-pin-deploy` @ 04c00f3.
-Status: PLAN. Review round 1: APPROVE WITH CHANGES (15 findings, addressed in
+
+**Status (corrected 2026-10-04): BUILT in large part and LIVE** (production runs
+`V41_MULTISTREAM=1`, `V41_MS_DSPARK=accept`, hub env 2026-10-04). On top of the SINGLE-STREAM
+BUILD noted in section 9 (1ddedf3, 24df0e9), all on main:
+
+* stage 1, draft or not from the stream's realized gain with exponential back-off (7058d7b,
+  `V41_MS_DSPARK_MIN_GAIN`);
+* **sampled drafts, M6** (aeda639; `V41_MS_DSPARK_DRAFTS=sampled` is the default): q is the
+  drafter's top-64 at the REQUEST's temperature, min-p and top-p (2.2), accepted with
+  min(1, p/q); depth by the stopping rule (`choose_k_stopping`);
+* a live step-cost model (f76492f) with one time-aged estimate per row count
+  (`V41_MS_DSPARK_COST_SHAPE=cells`, 3bf626e), one table per lane count; the configured ladder is
+  only the fit's prior; a confidence-calibration LOG (the K policy still reads the raw
+  sigmoid(conf), section 6);
+* epsilon-uniform K exploration that favours stale cost cells (8cb2467, 7aded76;
+  `V41_MS_DSPARK_EXPLORE` 1/32);
+* the **ordered two-lane verify** (18ecbf0): the ready-first driver may cut a stream's rows
+  across lanes (`check_lane_cuts(.., ordered)`), with per-regime K cost and async ring writes;
+  it engages only with `V41_MS_STAGGER=2` (production) and `V41_MS_SPEC_LANES` on; learned lane
+  counts (268b48b, `V41_MS_LANES_LEARNED`);
+* **two speculating streams** in one step on the per-row dependency abstraction `StepRows`
+  (4c139ae, `V41_MS_DSPARK_STREAMS`, MS_DSPARK_STREAMS_DESIGN.md; default 1).
+
+Not built: the batched multi-stream drafter (two streams draft serially), ring in snapshots,
+shadow mode, online confidence calibration applied to K, M2.5, M8; G-RS3 as specified here (the
+name is reused for a head-candidate equivalence test). Live knobs: section 5.0.
+
+Original status line: Status: PLAN. Review round 1: APPROVE WITH CHANGES (15 findings, addressed in
 rev 1; one pushed back: the production row mix, 1.3). Round 2: APPROVE WITH
 CHANGES (N1-N7, addressed in rev 2). Round 3: APPROVE WITH CHANGES (R3-1..R3-5,
 addressed in rev 3: paired gate + more reference positions, what 4.382 means,
@@ -192,7 +219,11 @@ M0 measures it before anything expensive is built.
 `p_j` is exactly the distribution `multistream::sample_row` draws from for row j:
 temperature, then top-p over the tempered weights, then min-p. Checked: the OpenAI
 request path accepts temperature (default 1.0), top_p (default 0.95) and seed;
-`min_p_rel` is hard-coded 0.0; no penalties, logit_bias or top_k exist. Three
+`min_p_rel` is hard-coded 0.0; no penalties, logit_bias or top_k exist.
+**(corrected 2026-10-04)** `min_p` now comes from the request (`openai::handler::resolve_min_p`,
+default 0.0; a0f1f1e) and feeds both `TargetDist` and the sampled drafts (KNOWN_BUGS #50). The
+order as implemented is min-p first, then top-p over the min-p survivors (`TargetDist::from_logits`,
+`mtp::draft_dist`). Three
 implementations of this distribution exist today (device kernel, legacy f64
 `row_sample`, arena f32 `sample_row`); the arena one is the reference. Refactor `sample_row` into
 `TargetDist::from_logits(row, mode)` (the survivors with their unnormalised
@@ -216,6 +247,11 @@ Two cheap, exact choices:
   sample from, it is exact, and only M (id, prob) pairs per position cross to the
   host. `tau_d` is a free, lossless knob; tune it for acceptance at the production
   temperature (point-mass is `tau_d -> 0`, the right choice for temp-0 requests).
+  **(corrected 2026-10-04) As built (M6, aeda639): there is no `tau_d` knob. q uses the
+  request's own temperature, min-p and top-p (`ms_dspark::draft_sampling` -> `DraftSampling`).
+  Only the top-M selection (M = `MTP_DRAFT_TOP_M` = 64) and the gather of its logits run on the
+  device; q is normalised and the draft drawn on the host (`mtp::draft_dist`) with the drafter
+  RNG's uniform. A temperature-0 request gets point-mass drafts.**
 
 ### 2.3 The block procedure (host, f64 over survivors)
 
@@ -367,7 +403,9 @@ is the compressor accumulator.
     Host side: truncate `seq`/`compressed`, write drafter ring rows only for kept
     rows. Do NOT reuse the legacy `KvMark::advanced_by`: its accumulator restore
     is documented approximate when the kept prefix ends mid-segment (`state.rs`
-    ~500-511), i.e. about half of all ratio-2 accepts. Do not use the
+    ~500-511), i.e. about half of all ratio-2 accepts. **[2026-10-04: it was wrong, not
+    approximate (KNOWN_BUGS #43, fixed 2026-10-03); the legacy path now commits only rows whose
+    accumulators restore exactly (`KvMark::exact_accumulator_rows`) and re-forwards the rest.]** Do not use the
     process-global `SpeculativeAppend` flag either; it changes pager policy.
 
 3.5 **A stream's rows stay in one lane (default).** Per-row tables are pure
@@ -431,7 +469,16 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
     `ring_write_only` runs `entry()` first, so ring rows + `ring_writes` are the
     only persistent state; make it a deterministic bitwise test (ring after N
     steps == a pure `ring_write_only` replay), not an A/B.
-    **Who writes which row** (else the last kept row is written twice: a duplicate
+    **(corrected 2026-10-04) As built (`ms_dspark.rs`: module doc, `keep_rows`, `draft`,
+    `seed`):** every row a step KEEPS is ring-written after the step, in position order, once
+    (`keep_rows`; rows already in the ring are skipped; batched up to `RING_ROWS_MAX` rows per
+    write; enqueued without a sync under `V41_MS_DSPARK_RING_ASYNC`, default on, and waited for
+    by `settle_writes`). A draft from position `pos` reads the ring INCLUDING row `pos`, and its
+    forward writes row `pos` itself; when that row is already the ring's latest write, the
+    counter is wound back by one first (`with_ring(.., rewind)`), so the forward REWRITES the row
+    with identical values instead of appending a duplicate key. Seeding writes every captured row
+    of the contiguous run ending at the prompt's last position, INCLUDING the last. The rev-3
+    text this replaced follows. **Who writes which row** (else the last kept row is written twice: a duplicate
     key and a drifting slot, invisible in output, visible only as lower E): the
     draft forward itself writes the row for its own `pos` (`mtp.rs` ~1110) and
     bumps `ring_writes` (~935). So after a block with `keep` kept rows,
@@ -456,7 +503,8 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
     per-stream ring base and `n_kv`, MoE/router/mHC are per-row loops, and the
     markov loop runs position-by-position in lockstep across streams.
 
-4.3 **Exit: sample on device, export `q` compactly.** Replace the argmax markov
+4.3 **[2026-10-04: built as top-M on the device, q and the draw on the host; see 2.2.]**
+    **Exit: sample on device, export `q` compactly.** Replace the argmax markov
     loop with: bias, temperature `tau_d`, top-M (M ~ 64) truncation, renormalize,
     draw with a host-supplied uniform, feed the draw to the next position's bias.
     Export per position the M (id, prob) pairs, the draw, and `conf`; one D2H for
@@ -504,8 +552,39 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
 
 ## 5. Scheduler integration (`multistream.rs`)
 
+5.0 **Live DSpark knobs (added 2026-10-04)**, code defaults from
+    `crates/deepstrix-server/src/knobs.rs`; "live" = re-read from `V41_KNOBS_FILE` while running;
+    production values from the hub env / knob file of 2026-10-04 where set.
+
+| knob | code default | production | what |
+|---|---|---|---|
+| `V41_MULTISTREAM` | off | `1` | the arena scheduler; `V41_MS_DSPARK` does nothing without it |
+| `V41_MS_DSPARK` | `off` (`0`/`off`, `accept`/`1`/`on`) | `accept` | DSpark on the arena; loads the drafter |
+| `V41_MS_DSPARK_STREAMS` | 1 (1..=2), live | 1 | speculate while at most this many streams are live |
+| `V41_MS_DSPARK_DRAFTS` | `sampled` | | `argmax` = point-mass drafts for every request |
+| `V41_MS_DSPARK_RING` | `all` | `solo` | `all`: every live stream's kept rows are ring-written each step; `solo`: only while the live-stream count is within the speculation limit (`ms_dspark::ring_streams`: 1, or 2 once `V41_MS_DSPARK_STREAMS` has been above 1) |
+| `V41_MS_DSPARK_RING_ASYNC` | on | | kept-row ring writes without a sync |
+| `V41_MS_DSPARK_MIN_GAIN` | 1.0 | | stage-1 draft-or-not bar |
+| `V41_MS_DSPARK_EXPLORE` / `_EXPLORE_SEED` | 1/32 / entropy | | epsilon-uniform K exploration |
+| `V41_MS_DSPARK_COST_LIVE` | on | | live cost fit (`0` = the configured ladder as given) |
+| `V41_MS_DSPARK_COST_SHAPE` | `cells` | | one estimate per row count (`line` = a + b * rows) |
+| `V41_MS_DSPARK_COST` / `_COST2` | unset | `68.3,83.4,...,174.0` / unset | one-lane / two-lane ladder, ms by rows: the live fit's prior |
+| `V41_MS_DSPARK_COST_MEMORY` | 500 lone steps | | cost-cell time constant |
+| `V41_MS_LANES_MEMORY` | 1000 plain steps | | the same for the plain multi-stream lane tables |
+| `V41_MS_DSPARK_DRAFT_MS` | 20 | 12 | the draft's starting estimate (ms) |
+| `V41_MS_DSPARK_K` / `_KMAX` | unset (policy) / 5 | | fixed K / cap |
+| `V41_MS_SPEC_LANES` | on, live | (legacy file) | ordered two-lane verify; only with `V41_MS_STAGGER=2` |
+| `V41_MS_STAGGER` | `0` | `2` | `2` = ready-first driver |
+| `V41_MS_LANES_LEARNED` | off, live | `1` | lane count learned per row count |
+| `V41_MS_PIPELINE_MIN_ROWS` | 6, live | 4 | two lanes from this many rows (threshold rule; cold start when learned) |
+
+The legacy single-sequence driver is `V41_DSPARK` (it accepts `shadow`); it runs only when
+`V41_MS_DSPARK` is off.
+
 5.1 **Routing.** Delete `is_legacy = mtp_on`; DSpark becomes a per-stream property
-    on the arena path (`V41_MS_DSPARK=off|shadow|accept`), so a DSpark server keeps
+    on the arena path (`V41_MS_DSPARK=off|shadow|accept` **(corrected 2026-10-04: the knob
+    accepts `0`/`off` and `accept`/`1`/`on` only; `shadow` is an invalid value, warned and
+    ignored; and it needs `V41_MULTISTREAM=1`)**), so a DSpark server keeps
     multistream. Requests keep the legacy path only for what still needs it (none,
     once M8 lands). Also change main's legacy-state stub condition
     (`engine_worker.rs` ~1098: `multistream::enabled() && mtp.is_none()`) and the
@@ -647,7 +726,10 @@ the arena's per-stream KV headroom.
   and the zero-mass residual case.
 * **G-RS2**: refactored plain sampler bit-identical to today's `sample_row`.
 * **G-RS3** (GPU): device-side draft sampling, exported `(id, q)` vs empirical
-  draw frequencies, chi-square.
+  draw frequencies, chi-square. **[2026-10-04: not written. The draw moved to the host
+  (`draft_dist`, unit-tested in `mtp.rs`); `tests/mtp_draft_sampling.rs` checks the device top-M
+  against a host sort; the name G-RS3 in `spec_sample.rs` is a different test (head candidates
+  reproduce the row sampler).]**
 * **G-RING** (GPU): after N accept/reject steps the drafter rings are bitwise equal
   to a pure `ring_write_only` replay of the kept rows (catches the double write
   of 4.1).
@@ -783,7 +865,8 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     the arena path gets a position-indexed capture (4.5).
   * **A3, engine end to end**: teacher-force the gen2 transcript through the
     engine and score our drafter on OUR residuals. Route: export a gen2 golden case
-    from the oracle's gen2 dump (`scripts/v41_oracle/export_golden.py`; the
+    from the oracle's gen2 dump (`scripts/v41_oracle/export_golden.py` **[2026-10-04: only on the
+    unmerged branch `worktree-architecture-review`, not on main]**; the
     existing `agentic` golden is a different 1,006-token transcript that shares
     only its first 258 tokens with gen2), add a tap that dumps the per-position
     mean-over-hc residuals after layers 36/37/38 during `tests/v41_golden_gate.rs`,
@@ -846,7 +929,9 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
   device sampler (M3).
 * **SINGLE-STREAM BUILD (2026-10-01, owner "how do we get to 22 t/s now?"),
   commits 1ddedf3, 24df0e9; `V41_MS_DSPARK=accept`**: the cores of M2, M3 and M5
-  for a LONE stream. Done: multi-row tables + per-slot group blocks + `accept`
+  for a LONE stream. **[2026-10-04: superseded in part by the items in the Status block at the
+  top: sampled drafts, live cost cells, exploration, stage 1, the ordered two-lane verify (which
+  lifts the lane-cut refusal for the ready-first driver), two streams.]** Done: multi-row tables + per-slot group blocks + `accept`
   (3.1-3.4, host-tested), drivers refuse lane cuts through a stream (3.5),
   capture on arena rows, one ring per slot swapped into the shared `MtpState`,
   seeding from the CED replay at prefill finish, kept rows ring-written every
@@ -867,7 +952,8 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
   `PrefillJob` (both lanes, ring-only), ring in snapshots. Tests: batched drafter
   == per-stream drafter; point-mass drafts == the legacy drafter's for identical
   inputs.
-* **M4: shadow in production** (`V41_MS_DSPARK=shadow`, time-boxed or sampled,
+* **M4: shadow in production** **[2026-10-04: not built; `shadow` is not a value of
+  `V41_MS_DSPARK`]** (`V41_MS_DSPARK=shadow`, time-boxed or sampled,
   since shadow costs throughput): drafts computed, nothing acted on. **Exact
   renewal replay** for point-mass drafts: along the realized path `y`, a block
   started at t accepts exactly the leading drafts equal to `y`, so the shadow runs
@@ -893,7 +979,9 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
 * **M6: sampled drafts and the full policy**: online confidence calibration at the
   production temperature, the stopping rule for sampled drafts, `tau_d` from
   M0/M4, the draft-or-not stage, stream-aligned lane balancing, the 8-row lane
-  cap.
+  cap. **[2026-10-04: DONE except calibration-in-the-policy and `tau_d`: sampled drafts
+  (aeda639), the stopping rule, the draft-or-not stage (7058d7b); q uses the request's
+  temperature, and calibration is logged, not applied.]**
 * **M7: cost levers** (section 7): drafter attention kernel for gfx1151, drafter
   quantization, drafter under the other lane, early Engram for draft rows, the
   iGPU per-row cost investigation.

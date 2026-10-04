@@ -1,5 +1,11 @@
 # Design B — "hide every latency: prediction, pipelining, every device busy" (independent architect, 2026-09-13)
 
+**Status (2026-10-04): partly built, in another form.** The wavefront idea became the multistream
+lanes: the two-lane pipelined step (`forward_step_arena_pipelined`), the ready-first N-lane driver
+(`forward_step_arena_ready_first`, `V41_MS_STAGGER=2`), and DSpark's ordered two-lane verify
+(`V41_MS_SPEC_LANES`). Send-before-route, the replicated router on box 2 and the disjoint-LRU
+directory were not built.
+
 **Verdict.** Routing prediction is dead on this hardware (measured on the trace); the RTT is
 hideable; **SSD misses are the un-hidden latency and no scheduling design hides them**. The one big
 overlap lever left is *intra-step*: run the speculative verify batch as a two-sub-batch **layer

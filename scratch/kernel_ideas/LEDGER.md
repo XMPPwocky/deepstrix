@@ -1,5 +1,15 @@
 # Kernel-ideas sweep 2026-09-26 — LEDGER
 
+> **Status (docs audit 2026-10-04):** INTEGRATED on main (six family commits, 2026-09-26/27, 24 knobs, all default ON; `V41_KV_F16_ROUNDTRIP` has the inverted sense: default OFF, `1` = restore the dropped launch). "Nothing here is merged" below is stale. Of the 28 CONFIRMED rows: 23 integrated as-is, #6 only in part, 4 not integrated. Per row (ranked-table #):
+> - e282846 D_attention: #9 fused_vt_qreg_sp (`V41_ATTN_DEC_FUSED`), #22 score_blk128 (`V41_ATTN_DEC_SCORE_BLK128`), #24 drop_f16_roundtrip (`V41_KV_F16_ROUNDTRIP`).
+> - c997165 C1_dense_decode: #5 tB_compile_time_batch (`V41_GEMV_TB`), #19 quantize_wave (`V41_Q8_QUANT_WAVE`), #18 quantize_grid_pad (`V41_Q8_QUANT_GRID_PAD`), #12 shared_expert_fused_chain (`V41_SHARED_FUSED`).
+> - 3e5347b F_mhc_glue: #20 rms_fast (`V41_RMS_FAST`), #15 router_mv_h20 (`V41_ROUTER_MV_H20`), #25 topk_wfred (`V41_TOPK_WFRED`), #3 gemm_narrow_m24 (`V41_MHC_GEMM_NARROW`).
+> - 35f2515 E_indexer: #8 score_qreg_hw (`V41_IDX_SCORE_QREG`), #11 topk_select_hybrid_sort_vec4 (`V41_IDX_TOPK_HYBRID`), #26 candidate_threshold_ilp (`V41_CAND_THRESH_ILP`), #2 gather_b128 (`V41_IDX_GATHER_B128`).
+> - 1c5972f A_moe_smallb + B_moe_prefill: #10 dn2_member_outer (`V41_MOE_DOWN_DN2`; this is the dn2 part of #6 wl_c8dn2), #27 wmma_i8_gateup (`V41_MOE_WMMA_GATEUP`), #28 wmma_i8_down (`V41_MOE_WMMA_DOWN`).
+> - cba1b00 C2_dense_prefill: #7 engram_i8x_db (`V41_ENGRAM_I8X`), #4 engram_chunk128 (`V41_ENGRAM_CHUNK128`), #23 replay_bpack_z16 (`V41_GEMV_BPACK_Z16`), #17 f16x_db_bn64 (`V41_F16X_DB_BN64`), #16 f16x_256x128 (`V41_F16X_256`), plus the UNREVIEWED #31 replay_f16x_b64 (`V41_REPLAY_F16X`, not bit-exact).
+> - NOT integrated: #1 two_lane_merged_dense (EXCLUDED, c997165: would serialize the two decode lanes behind a cross-lane join); #13 flash_splitk and #14 smwsum_pf2 (dominated by #9 per their merge notes; #13 not bit-exact); #21 kwide_c8 (SKIPPED, 1c5972f: gain came from empty WGs); #6 wl_c8dn2's wl_cap + kwide_c8 parts (wl_cap REFUTED). Also skipped: #33 collapse_prefill (REFUTED), #29 f16x_pf2 and #32 i8x_r1_codegen (unreviewed).
+> - Round 2 (`ROUND2_BRIEF.md`) moved four of these gates (343896b) and added four knobs (d18cde2, 0193166, 4f773bf). These sweep knobs are raw `LazyLock` env reads, outside the `knobs.rs` framework (2026-10-01): not live, not in its tables.
+
 Branch `worktree-kernel-ideas-2026-09-26` (base 361d4f9 = production). Nothing here is merged; candidates live under `scratch/kernel_ideas/<family>/`, reviewer artefacts under `<family>/review/`. Numbers are kernel-level medians against the UNMODIFIED production code object built with the production flags, at production shapes; "reviewer x" is the independent re-run. est columns are engineer estimates (kernel delta x production call count), not e2e measurements.
 
 Totals: 81 ideas, 34 measured wins, 28 CONFIRMED by review, 2 REFUTED.

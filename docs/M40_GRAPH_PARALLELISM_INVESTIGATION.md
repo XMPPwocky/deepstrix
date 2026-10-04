@@ -1,5 +1,7 @@
 # M40 — HIP graph parallelism investigation (postmortem)
 
+> **Status (docs audit 2026-10-04):** HISTORICAL (V4-Flash). The investigated path is gone: `forward_pair_interleaved` / pair mode was retired 2026-05-29 (cc8cefa). None of the "Files left behind" are on main (`bench_mhc_pre_pair_microbench.rs`, `Graph::add_kernel_node`, the `hipGraphAddKernelNode` binding, `Function::raw_handle()`); they exist only in WIP commit f21b530 on branch `wip/m40-spec-decode-validation`. V4-Flash was dropped as a direction on 2026-09-24.
+
 **Status:** investigation suspended. Conclusions below; open questions for a future session.
 
 ## Goal

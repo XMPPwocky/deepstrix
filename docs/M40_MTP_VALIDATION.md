@@ -1,5 +1,7 @@
 # M40 MTP Validation Findings
 
+> **Status (docs audit 2026-10-04):** HISTORICAL (V4-Flash). The V4-Flash MTP draft implementation described here ("our MTP") was removed 2026-05-29 (cc8cefa: `het/{spec_decode,forward_mtp,mtp_weights}.rs`), and the `forward_full_logits` oracle was deleted the same day (67ec8bf). The only MTP code on main is the V4.1 DSpark drafter (`crates/v4flash-kernels/src/het/mtp.rs`), a different 3-layer model. V4-Flash was dropped as a direction on 2026-09-24.
+
 ## TL;DR
 
 Our V4-Flash MTP draft implementation is **architecturally correct** — every MTP-specific stage matches an independent reference (CPU and SGLang algorithm). It still **draws ~14 percentage points lower hit rate than ds4's hipify'd ROCm port** on the same input sequence. The remaining gap is not in MTP itself — it's that our main-model HC differs from ds4's ROCm main-model HC by ~10-15% rel rms at MTP-call time, and the MoE softmax-style weighting amplifies that into ~30-100% rel-rms divergence on routed MoE output.

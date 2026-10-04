@@ -1,5 +1,13 @@
 # M0 audit — raw grep classification (generated 2026-09-12)
 
+> **Status (docs audit 2026-10-04):** resolved; raw input to ENGINE_PORT.md "M0 status". The
+> classified sites are fixed: `ROUTER_MAX_EXPERTS` = 512 under `v41` (`router_topk.rs`),
+> `HOT_MAX_EXPERTS` = `N_EXPERT` (`het/batch_scratch.rs`), the rms_norm width caps are `HC_DIM`
+> (`rms_norm.rs`), `mhc_pre_fused.hip` dims are `#ifndef`-guarded and `build.rs` passes
+> `-DMHC_N_EMBD/-DMHC_HC_DIM/-DROUTER_MAX_EXPERTS` for v41, the residual swap is guarded by
+> `N_LAYER % 2 == 1` (`het/engine.rs`), and `COMPRESS_RATIOS` is cfg-gated per model. Every line
+> number below is obsolete.
+
 ## literal 256 as N_EXPERT candidates (src, non-test)
 crates/v4flash-kernels/src/config.rs:30:pub const N_EXPERT: u32 = 256;
 crates/v4flash-kernels/src/embed.rs:196:        let mut out = [0f32; 256];

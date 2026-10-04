@@ -1,5 +1,7 @@
 # Phase 2 — Kernel validation framework
 
+> **Status (docs audit 2026-10-04):** V4-Flash kernel-validation reference (ds4 CPU oracle). V4-Flash was dropped as a direction on 2026-09-24; V4.1 kernels validate against DeepSeek's `inference/model.py` via `scripts/v41_oracle/` (e.g. `tests/v41_layer0_parity.rs`, `tests/v41_golden_gate.rs`). The `attention_mixed`, `mixed_attention_chain` and `hca_chain` threshold rows below name tests deleted 2026-05-29 (67ec8bf). The current 0731 dump has 77,880 tensors (`PHASE1_REFERENCE.md`), not the 14,792 below; the ds4 patch stack is 0001-0011.
+
 Per-kernel ports validate against the **M2 activation dump** (the canonical ds4-CPU forward trajectory). This doc is the template every future kernel milestone (M3+) follows.
 
 ## Where the oracle lives
@@ -218,7 +220,7 @@ If a real algorithmic divergence shows up, fix the kernel — don't raise the th
 If `external/ds4` is updated (e.g. antirez merges fixes) such that CPU outputs change:
 
 1. `git submodule update --init`
-2. `external/apply-patches.sh` (reapplies 0001 + 0002)
+2. `external/apply-patches.sh` (reapplies 0001 + 0002) **[2026-10-04: the stack is 0001-0011; a fresh checkout of the pinned submodule needs `DS4_SKIP_BAKED=1`, see `PHASE1_DS4_ISSUES.md`]**
 3. Rerun `ds4-dump-activations` against the canonical prompt
 4. Verify SHAs differ deliberately; update `docs/PHASE1_REFERENCE.md` with new SHAs and a one-line note on what changed upstream
 5. Reruns of every kernel test should still pass within tolerance — if any *now* fail with a wider divergence, that's the moment to investigate.
@@ -228,5 +230,5 @@ Don't silently re-baseline. Every M2-dump SHA change is a deliberate event.
 ## Notes for future-us
 
 - The ds4 patch fires hooks only on the **single-token CPU forward path** (`forward_token_raw_swa_cpu_decode_scratch`). To stay on this path the dumper bypasses `ds4_session_sync` and uses `ds4_session_eval` for every prompt token too — this is the source of the per-token-vs-batched-prefill trajectory divergence noted in `PHASE1_REFERENCE.md`.
-- Per-arch hsaco blobs (`gfx1201`, `gfx1151`, `gfx1100`) all compile via `crates/v4flash-kernels/build.rs`. Only `gfx1201` (dGPU) and `gfx1151` (iGPU) are wired into the Rust dispatch in `rms_norm.rs`; gfx1100 builds for future portability but isn't selected at runtime on this hardware.
+- Per-arch hsaco blobs (`gfx1201`, `gfx1151`, `gfx1100`) all compile via `crates/v4flash-kernels/build.rs`. **[2026-10-04: `build.rs` now defaults to `gfx1201 gfx1151` only; other arches need `DEEPSTRIX_GFX_TARGETS`.]** Only `gfx1201` (dGPU) and `gfx1151` (iGPU) are wired into the Rust dispatch in `rms_norm.rs`; gfx1100 builds for future portability but isn't selected at runtime on this hardware.
 - ds4 itself rebuilds whenever its sources change; the dump_activations binary depends on patched `ds4.o` so a re-patched ds4 means re-running the dump capture for full consistency.

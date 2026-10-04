@@ -1,5 +1,11 @@
 # Cold-expert residency: static placement vs dynamic caching — MEASURED 2026-09-11
 
+> **Status (docs audit 2026-10-04):** historical measurement (V4-Flash as the proxy); its LRU
+> conclusion is what box 1's pager and box 2's catch-all pool run. Repro: `analyze3.py` is now
+> `scripts/analyze3.py`; `~/run_deepstrix.sh` is an out-of-repo launcher (the hook is
+> `DEEPSTRIX_EXPERT_TRACE`, `het/engine.rs`); `[[hot-expert-placement-inert]]` is a memory note,
+> not a repo file.
+
 **Bottom line: dynamic (LRU) residency beats static frequency placement by 11-48× on SSD reads
 per token, which is what makes a fully-native (zero quality loss) V4.1 configuration viable on
 two boxes.** Measured on V4-Flash as a locality proxy; V4.1 numbers are extrapolated.

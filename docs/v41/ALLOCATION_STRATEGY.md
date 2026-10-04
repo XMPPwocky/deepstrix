@@ -1,5 +1,13 @@
 # Expert pool allocation strategy for the agentic workload (draft 1, 2026-09-13)
 
+**Status (2026-10-04): draft, overtaken; proposals 1-3 landed in other forms.** (1) The window
+count is derived from `V41_PAGER_DECODE_FRAC` (default 0.75; `expert_pager.rs`), not a fixed 8;
+production runs `V41_PAGER_WINDOWS=0` (one window) with `V41_PREFILL_UNIFIED_POOL=1` (prefill on
+the LRU residency), per the hub env 2026-10-04. (2) Layer-major CED prefill exists as
+`V41_LM_PREFILL` (179963e, 2026-09-29; live knob, code default off, production on), with group
+passes rather than a dedicated streaming arena. (3) Box 2 boots a uniform per-layer range
+(`scripts/patch_b2.py`, 2026-09-16) and pages everything else (`--paged`, REMOTE_EXPERTS.md §3.2).
+
 ## The workload (from the user, not inferred)
 
 **Mode A — agentic steady state (the common case).** One medium prefill (system

@@ -1,6 +1,13 @@
 # Half the decode misses are allocation geometry, not capacity
 ### simulated against the real routing trace, validated against the live measurement, 2026-09-14
 
+> **Status (docs audit 2026-10-04):** historical. What it recommended shipped in other forms: box
+> 2's global pool (`V41_B2_GLOBAL_POOL`, default on) and box 1's victim cache (`V41_VICTIM_CACHE`,
+> default on, `expert_pager.rs`), later the hot-set ownership (box 1 owns each layer's hottest
+> ids, 2026-09-21). Repro scripts are in `scripts/` (`geom.py`, `lru_curve.py`,
+> `buf_vs_direct.py`); `run_v41_server.sh` is an out-of-repo launcher and the
+> `[[project_v41_...]]` links are memory notes, not repo files.
+
 `DECODE_MISS_PATH_AND_CAPACITY.md` concluded the decode wall was capacity and the
 only exit was a ~2.5-bit expert format. **That conclusion was drawn from one
 number — 20.2 misses/token — without asking why it was 20.2.** It should have

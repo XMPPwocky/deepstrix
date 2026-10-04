@@ -1,5 +1,12 @@
 # Box 2's decode misses are an ALLOCATION artifact (2026-09-14)
 
+> **Status (docs audit 2026-10-04):** historical. The 268/40 split it found was replaced on
+> 2026-09-16 by a uniform boot assignment (`L0-L39:230-383`, no placement file;
+> `scripts/patch_b2.py`) under the global pool (REMOTE_EXPERTS.md §3.2). Its O_DIRECT verdict is
+> about the bouncing reader (`V41_EXPERT_ODIRECT`, `hf_v41.rs`, still default off); box 2's
+> zero-copy O_DIRECT page-in (`V41_B2_ODIRECT`) has been default ON since 2026-09-15 (e1b7b65).
+> `~/box2_placement.txt` and the launcher's `EXPERTS` default are outside the repo.
+
 Found by an architecture review challenging the assumption, then verified against
 box 2's own load log and re-simulated. **This invalidates every residency
 simulation in `DECODE_CAPACITY_WALL.md`**, which modelled 154 slots/layer uniform.
@@ -147,7 +154,9 @@ reading until the requested subrange is covered and treating `Ok(0)` as EOF.)
     260/68 O_DIRECT   read  8.38 ms/miss   decode 3.13 tok/s   (-16%)
 
 Per-miss read improved by 1.7 ms exactly as predicted, and end-to-end decode
-regressed 16% anyway. **Not adopted** — the gate stays default-off.
+regressed 16% anyway. **Not adopted** — the gate stays default-off. **[2026-10-04: still
+true of this bouncing path; the zero-copy box-2 path that followed, `V41_B2_ODIRECT`, is default
+on since 2026-09-15.]**
 
 The most likely cause is the implementation, not the idea: every miss allocates a
 fresh ~6 MB page-aligned bounce buffer (three per expert, one per role), which

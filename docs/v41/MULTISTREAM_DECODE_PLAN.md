@@ -1,5 +1,31 @@
 # Multi-stream decode: plan, ceiling, scheduler (2026-09-19, rev 1.2, APPROVED by review at 1.1)
 
+**Status (corrected 2026-10-04): partly implemented, and diverged from the plan.**
+
+* **Built:** M1a and M1b (`V41_MULTISTREAM`, code default off, on in production per the hub env
+  2026-10-04; `crates/deepstrix-server/src/multistream.rs`). Since then: burst scheduling
+  (`V41_MS_PREFILL_BURST_MS` 120 s / `V41_MS_DECODE_BURST_MS` 30 s, floors 10 s / 3 s,
+  `V41_MS_BURST_SCALE`), store compaction, parking, a 16384-position KV reservation per admission
+  with growth (`V41_MS_KV_HEADROOM`, `V41_MS_KV_GROW`), and the **two-lane pipelined step** this
+  plan rejected (§10): `V41_MS_PIPELINE` default on, two lanes from `V41_MS_PIPELINE_MIN_ROWS`
+  rows (code default 6, production 4), plus three lanes (`V41_MS_LANES=3`), ready-first
+  (`V41_MS_STAGGER=2`, production) and learned lane counts (`V41_MS_LANES_LEARNED`, production on).
+  Box 2: hits-first (`V41_B2_HITS_FIRST`, default off), park, merge (REMOTE_EXPERTS.md §3.2).
+  f16 box-2 prefill partials ship default on (`V41_PREFILL_F16_REPLIES`) **without the KLD gate
+  §3.4/M3 require: gate pending.**
+* **DSpark** shipped before M3 and not as M5: the arena verifies the drafter's block inside the
+  ordinary step for a lone stream (DSPARK_ARENA_PLAN.md, `V41_MS_DSPARK=accept`), and for two live
+  streams with `V41_MS_DSPARK_STREAMS=2` (MS_DSPARK_STREAMS_DESIGN.md; default 1, and 1 in the
+  production knob file 2026-10-04). No batched drafter.
+* **Not built:** `prefill_share` (`V41_MS_PREFILL_SHARE` was removed by the burst scheduler,
+  7612ead); `V41_DECODE_PROTECTED_SLOTS` (never written); RESIDENT streams and the extend path;
+  the background snapshot writer (`snapshot::save` still runs inline in the scheduler); per-stream
+  `KvMark` step retry.
+* The serial layer-major oracle this plan uses as a reference (`V41_VERIFY_DECODE_PATH=1`) let
+  earlier rows see later draft tokens until 2026-10-03 (KNOWN_BUGS.md #45); results measured with
+  it before then are suspect. `simms2.py` and `m0_measure.sh` (scratchpad) are not in the repo; the
+  file:line cites are from 2026-09-19..21.
+
 Rev 1 after an adversarial architecture review of rev 0 (31 findings; the ones that
 changed conclusions are marked "REV" below); rev 1.1 after the re-review (7 new
 findings, verdict APPROVE WITH CHANGES; the changes are marked "REV2"). Model: `scripts/multistream_plan_model.py`
@@ -337,7 +363,8 @@ rows; the verify sends B<=8 today). REV2: a third box needs a second
 `RemoteExpertClient` (one socket + ordered `in_flight` deque each) so the two remote
 legs actually run in parallel; the client is one socket today. Above ~16 rows two link items become real: an f16
 reply (`ffn_combine.vec_add_remote` f16 variant, +numerics change, so it lands with
-its own KLD gate in M3) and a busy-poll setting that does not hold multi-segment
+its own KLD gate in M3) **[2026-10-04: shipped for prefill rows only (`V41_PREFILL_F16_REPLIES`,
+default on since 2026-10-01, widened to f32 on the host) with NO KLD gate run yet: gate pending]** and a busy-poll setting that does not hold multi-segment
 replies (a 64-row f32 reply is 20 segments; M1). `miss_mask` feedback is b==1-only
 and irrelevant under `V41_T2_PARTITION=1`.
 
@@ -605,7 +632,8 @@ demux samples -> update the live miss-rate estimate.
   decode misses at S>=8) because the scan is ~104 experts per encoder layer per
   chunk and decode re-touches its set every step. A decode-protected generation
   (`V41_DECODE_PROTECTED_SLOTS`, capped at ~60% of the pool) is an M2 A/B, scored
-  with the miss histogram, not a precondition.
+  with the miss histogram, not a precondition. **[2026-10-04: never built. Box 2 got a
+  two-class LRU, a prefill staging band and mode-aware eviction instead (REMOTE_EXPERTS.md §3.2).]**
 * Host: per-stream host state is small (tokens, Engram id sequence, sampler); the
   Engram gather is batched (3.3).
 
@@ -635,7 +663,8 @@ demux samples -> update the live miss-rate estimate.
 
 * **Bursts with hysteresis** (`7612ead`): the tick runs in `Phase::Prefill` /
   `Phase::Decode` bursts of `V41_MS_PREFILL_BURST_MS` / `V41_MS_DECODE_BURST_MS`
-  (default 30 s each) whenever both kinds of work exist. Alternating one 256-row
+  (default 30 s each **[2026-10-04: now 120 s / 30 s, floors `_MIN_MS` 10 s / 3 s; knobs.rs]**)
+  whenever both kinds of work exist. Alternating one 256-row
   chunk with one decode step evicted the decode working set from the expert pool
   every tick; 30 s bursts keep locality and still bound the wait for either side.
   512-row chunks while decoding (`48205c2`).
@@ -647,7 +676,9 @@ demux samples -> update the live miss-rate estimate.
   scratch state and is retried every tick as streams finish; it is no longer
   failed. (Consequence: one prefill scratch state is tied up while it waits.)
 * Budget: three ~269K-context agents need ratio-2 stores of >= 403365 rows, i.e.
-  `V41_MS_CTX_ROWS=844800` (2.75x `--ctx`); the 2x default fits two.
+  `V41_MS_CTX_ROWS=844800` (2.75x `--ctx`); the 2x default fits two. **[2026-10-04: predates the
+  16384-position admission reservation (`V41_MS_KV_HEADROOM`, 2026-09-27); production sets
+  `V41_MS_CTX_ROWS=1300000`.]**
 
 ## 6. DSpark on the batched path
 
@@ -655,7 +686,8 @@ Rows = streams x (1 + K). The verify IS the batched step over one stream's rows;
 fidelity is 3.6 (batch-invariant by construction, KLD-gated against decode, exact
 rollback from the K-launch compressor). The drafter (3 blocks, iGPU, 16.8 ms + 11 ms
 per accepted token per stream today) must be batched across streams or it
-serialises. It pays modestly with fast drives (S=8: 6.8 vs 6.1 tok/s per stream at
+serialises. **[2026-10-04: built differently: one stream (or two, `V41_MS_DSPARK_STREAMS`)
+speculates inside the ordinary arena step; more live streams step plainly. See Status.]** It pays modestly with fast drives (S=8: 6.8 vs 6.1 tok/s per stream at
 E=2.9, ~10 at the oracle E=4.4) and strongly at zero misses. Sequenced after M3.
 
 ## 7. Hardware, re-ranked (REV)
@@ -734,7 +766,11 @@ per-row sampling with the kernel's composed top_p/min_p rule); up to
 `V41_MS_PREFILL_JOBS` (2) prompts prefilling at once, each in its own scratch
 `HetModelState`, round-robin one chunk (`V41_MS_CHUNK_ROWS` 256 while decoding,
 512 idle) per chunk tick, chunk ticks 1 in `V41_MS_PREFILL_SHARE` (2) while decode
-rows exist; shortest prompt first with `V41_MS_AGING_S` (60 s) aging; snapshot
+rows exist **[2026-10-04: chunks are 1024 rows busy and idle (`V41_MS_CHUNK_ROWS`,
+`V41_MS_CHUNK_ROWS_IDLE`); the share was replaced by bursts (5.7); a full client buffer now drops
+the client at once; images ride the multistream path since 2026-09-21 and DSpark runs on the
+arena, so only legacy DSpark (`V41_DSPARK` without `V41_MS_DSPARK`) still takes the serial
+handler]**; shortest prompt first with `V41_MS_AGING_S` (60 s) aging; snapshot
 probe/restore on entry and the prompt snapshot saved after the prefill (as the
 legacy path); per-step watchdog pet; `try_send` emits with a 30-failure drop;
 cancellation per row; a step error aborts every live stream and drains/redials
@@ -764,7 +800,8 @@ figures (61 tok/s at the assumed 6.5 GB/s); +pf S=16 >= 34.
 **M4 — capacity (#4 or the requant).** **Gate:** decode-only S=16 >= 85 tok/s,
 per-stream decode >= 5; +pf S=16 >= 44.
 
-**M5 — DSpark on the batched path.** Batched drafter; K=5 rows per stream.
+**M5 — DSpark on the batched path.** Batched drafter; K=5 rows per stream. **[2026-10-04:
+superseded; see Status and §6.]**
 **Gate:** per-stream >= 9 tok/s at S=8.
 
 ## 9. Risks and open questions
@@ -789,7 +826,9 @@ per-stream decode >= 5; +pf S=16 >= 44.
 * **Layer-pipeline split**: box 2 would run attention on its iGPU, each box needs all
   experts of its 20 layers (worse residency), KV on both boxes. No.
 * **Two-lane ping-pong**: hides the 22 ms chain but halves each lane's union; a wash
-  at S=16, a loss at S=32.
+  at S=16, a loss at S=32. **[2026-10-04: REVERSED. The two-lane pipelined step
+  (`forward_step_arena_pipelined`, 0f23cfe, 2026-09-20) is on by default from
+  `V41_MS_PIPELINE_MIN_ROWS` rows; box 2 merges the two lanes' requests (`REQ_FLAG_PARTNER`).]**
 * **Fusing prefill chunks with decode rows** (5.3), **parking rows on a miss** (4.3),
   **reusing the daemon's host-staged executor on box 1** (3.4), **page-cache tiers and
   id-based prefetch** (prefetch study).

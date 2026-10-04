@@ -1,7 +1,15 @@
 # DeepSeek-V4.1-Flash — architecture spec from the shipped reference (rev 0, 2026-09-11)
 
-Source of truth: `/persist/lumi/models/dsv4.1f-full/inference/{model,engram,kernel,convert}.py`
-and `encoding/`. This is DeepSeek's own readable reference implementation (tilelang kernels,
+> **Status (docs audit 2026-10-04):** living spec of the reference model. §1/§3 constants still
+> match `config.rs` and `hf_v41.rs`. Corrected 2026-10-04: the reference path below, §2 tensor
+> names, the engine-presentation table (MXFP4 layout v2, DSpark presented), and the layer-role
+> words (mapping under §1.5). Vocabulary: docs/GLOSSARY.md.
+
+Source of truth: `inference/{model,engram,kernel,convert}.py` and `encoding/` in the HF snapshot,
+`~/.cache/deepstrix/models/dsv4.1f/` (corrected 2026-10-04; `scripts/v41_oracle/oracle.py` default
+`V41_MODEL`, and `V41HfWeights::open` reads `<snapshot>/inference/config.json`.
+`/persist/lumi/models/dsv4.1f-full` is the abandoned partial copy, PLAN.md header).
+This is DeepSeek's own readable reference implementation (tilelang kernels,
 torch glue). Everything below is read off that code, not the paper. Where the paper's
 production behaviour differs (bounded replay), it is called out.
 
@@ -99,6 +107,19 @@ Block score = max over 8 consecutive positions (pad −inf); the block holding t
 position is pinned (+inf); top-2048 blocks; mask = union of selected blocks (16,384 positions).
 Reuse layers (everything else) take `shared.topk_idxs` from the most recent index source.
 
+**Layer-role words (added 2026-10-04).** PLAN.md, ENGINE_PORT.md and this spec use three mode
+words for the compressed layers (2–39). In code (`config.rs`) they are the reference's source
+tables:
+- **Full** (2, 8, 14, 20) = `KV_SOURCE_LAYERS`: owns its compressor, comp store and index keys
+  (also an index source).
+- **Reindex** (24, 28, 32, 36) = `INDEX_SOURCE_LAYERS` minus `KV_SOURCE_LAYERS`: runs its own
+  indexer query over the keys of its KV source (20).
+- **Reuse** (all other layers ≥ 2): neither. Attends over `kv_source_of(l)`'s comp store with the
+  selection published by `index_source_of(l)`, the nearest index source at or below it.
+- Layer 20 is also `CANDIDATE_SOURCE_LAYER` (builds the §1.5 pool); 24–36 use it.
+- Layers 0–1 (ratio 0) have no role. `config.rs` calls them "Full (no compression)", a different
+  sense of the word. Some older text calls layer 20 "Reindex"; it is a KV source.
+
 ### 1.6 Gate / MoE
 ```
 s = sqrt(softplus(x_f32 @ W_gate^T))            # gate weight [384,5120] (bf16 in ckpt), fp32 math
@@ -143,14 +164,18 @@ unshuffle), w2 5120→5120; learned image_start/end/newline embeddings; image to
 ---
 
 ## 2. On-disk format (HF safetensors, 48 shards, 475 GiB)
-- Names: `model.layers.N.self_attn.{wq_a,wq_b,wkv,wo_a,wo_b,q_norm,kv_norm,attn_sink,compressor.*,indexer.*}`,
-  `model.layers.N.mlp.{experts.E.w{1,2,3}, shared_experts.w{1,2,3}, gate.weight, gate.e_score_correction_bias[_vl]}`,
-  `model.layers.N.{hc_attn_fn,hc_ffn_fn,hc_*_base,hc_*_scale,attn_norm,ffn_norm}`,
-  `model.layers.{1,14}.engram.{embed.weight,embed.scale?,wkv,q_weight,k_weight}`, `mtp.N.*`
-  (DSpark; embed/head tied), `vision.*`, `aligner.*`, `embed.weight`, `head.weight`, `norm`.
+- Names as stored in the checkpoint (corrected 2026-10-04; rev 0 listed `model.py`-style names
+  such as `model.layers.N.self_attn.*`, `mlp.*`, `e_score_correction_bias`, `weight_scale_inv`,
+  which the checkpoint does not use — the loader's names are in `hf_v41.rs::build_layer`):
+  `layers.L.attn.{wq_a,wq_b,wkv,wo_a,wo_b,q_norm,kv_norm,attn_sink,compressor.*,indexer.*}`,
+  `layers.L.ffn.{experts.E.w{1,2,3}, shared_experts.w{1,2,3}, gate.weight, gate.bias, gate.bias_vl}`,
+  `layers.L.{hc_attn_fn,hc_ffn_fn,hc_*_base,hc_*_scale,attn_norm.weight,ffn_norm.weight}`,
+  `layers.{1,14}.engram.{embed.weight,embed.scale,wkv.weight,q_weight,k_weight}`, `mtp.N.*`
+  (DSpark; embed/head tied), `vision.*`, `aligner.*`, `image_start`/`image_newline`/`image_end`,
+  `embed.weight`, `head.weight`, `norm.weight`.
 - Expert weights: **int8 tensors of packed E2M1 nibbles, [out, in/2], low nibble = element 2i**;
-  `weight_scale_inv` [out, in/32] E8M0. FP4 table: idx 0-7 = {0,.5,1,1.5,2,3,4,6}, bit 3 = sign.
-- FP8 linears: `weight` E4M3 [out,in] + `weight_scale_inv` [out/32, in/32] E8M0 (32×32 blocks).
+  `.scale` [out, in/32] E8M0. FP4 table: idx 0-7 = {0,.5,1,1.5,2,3,4,6}, bit 3 = sign.
+- FP8 linears: `.weight` E4M3 [out,in] + `.scale` [out/32, in/32] E8M0 (32×32 blocks).
   wo_a may be (128,128)-blocked; the reference dequantizes it to bf16.
 - Engram tables: rows FP8 + per-row E8M0 scales (block 32) — 189 GiB in shards 47/48.
 - Shard 1 = vision+aligner (bf16), shard 2 = embed + image_* (bf16), 3–42 = layers, 43–46 misc.
@@ -171,6 +196,8 @@ unshuffle), w2 5120→5120; learned image_start/end/newline embeddings; image to
   Decoder SWA Bounded Replay (decoder over the last 128 tokens only) and Encoder SWA Bounded
   Replay on cache hits — both *approximate* by the paper's own statement. deepstrix should have
   an exact mode (oracle parity) and a bounded-replay mode (speed); compare like with like.
+  (Note 2026-10-04: both exist — CED with decoder bounded replay is the default,
+  `forward_prefill::ced_enabled()`; `V41_CED=0` runs the exact all-40-layer prefill.)
 - The reference's DSpark verification loop is absent; only the drafter forward exists.
 
 ## 5. Prompt format (encoding/README.md)
@@ -180,7 +207,10 @@ unshuffle), w2 5120→5120; learned image_start/end/newline embeddings; image to
   `<｜DSML｜ parameter>`. Mid-conversation `<｜System｜>` supported. Tool results are merged into
   the preceding user message as `<tool_result>` blocks, ordered by the assistant's tool_calls.
 - `encoding/test_encoding.py` + `tests/` are golden vectors: port them into the server's renderer
-  tests (cf. the V4 render_prompt divergence in docs/TOOL_PROMPT_FIDELITY.md).
+  tests (cf. the V4 render_prompt divergence in docs/TOOL_PROMPT_FIDELITY.md). Done (note
+  2026-10-04): `crates/deepstrix-server/tests/v41_prompt_vectors.rs` pins
+  `prompt_v41::render_prompt_text_v41` byte-for-byte against `encoding/encoding.py`
+  (fixtures from `scripts/v41_oracle/gen_prompt_vectors.py`).
 
 ## 6. Per-layer weight bytes (decode-relevant, fp8 unless noted)
 | tensor | shape | bytes |
@@ -197,28 +227,30 @@ unshuffle), w2 5120→5120; learned image_start/end/newline embeddings; image to
 | indexer (source layers) | wq_b 4096×1280 + proj | 5.4 MB |
 | **per layer, non-routed** | | **~168 MB** (avg) |
 | ×40 + head (662 MB fp8 / 1.3 GB bf16) | | **~7.4–8 GB** |
-This is ~2× the first-pass estimate in PLAN.md §6: the dGPU attention+shared leg is ~11-12 ms at
-640 GB/s, not 6.5. wo_a must be kept fp8 (block-scaled) rather than the reference's bf16.
+This is ~2× PLAN.md's first-pass estimate: the dGPU attention+shared leg is ~11-12 ms at
+640 GB/s, not 6.5 (PLAN.md §6 has since adopted this table's numbers; note 2026-10-04). wo_a
+must be kept fp8 (block-scaled) rather than the reference's bf16.
 
 ## Checkpoint storage formats (HF safetensors, 48 shards, 96 085 tensors) — measured 2026-09-12
 
 | role | HF tensors | storage | engine presentation (`V41HfWeights`) |
 |---|---|---|---|
-| routed experts w1/w3/w2 (384/layer) | `layers.L.ffn.experts.E.wN.weight` I8 `[out, in/2]` (elem 2i = low nibble) + `.scale` F8_E8M0 `[out, in/32]` | MXFP4 native, 0.53125 B/elem | MXFP4 ggml 17-B blocks, stacked `[n_expert, out, in]`; scale byte verbatim |
+| routed experts w1/w3/w2 (384/layer) | `layers.L.ffn.experts.E.wN.weight` I8 `[out, in/2]` (elem 2i = low nibble) + `.scale` F8_E8M0 `[out, in/32]` | MXFP4 native, 0.53125 B/elem | MXFP4 stacked `[n_expert, out, in]`, engine super-block **layout v2** (corrected 2026-10-04): 136 B per 256 elems = `[8 × 16 B nibbles][8 B e8m0 scales]`, nibbles re-paired; same size as ggml's 8 × 17-B `[e8m0 \| 16 B]` blocks but NOT interchangeable with them. Scale byte verbatim. Both boxes repack independently and must agree: `mxfp4_tables::MXFP4_LAYOUT_VERSION` = 2, guarded by the wire `proto::VERSION`. CPU repack `hf_v41.rs::read_expert_raw`, GPU repack `kernels/mxfp4_repack.hip` (byte-identical by contract) |
 | attn wq_a/wq_b/wkv/wo_a/wo_b, shared experts, indexer wq_b, engram wkv | `.weight` F8_E4M3 `[out, in]` + `.scale` F8_E8M0 `[out/32, in/32]` | fp8 with **32×32 e8m0 block scales** (not V3's 128×128 f32) | Q8_0 (dequant f32 → ggml quantiser) |
 | router gate | `ffn.gate.weight` BF16 `[384, 5120]`, `.bias`/`.bias_vl` F32 | | raw BF16 / F32 |
 | norms, hc_*, attn_sink, compressor norm, indexer proj/k_norm | BF16 or F32 | | F32 |
 | compressor wkv/wgate, indexer wk | BF16 | | F16 |
 | Engram table (layers 1, 14) | `engram.embed.weight` F8_E4M3 `[384 006 168, 256]` + `.scale` F8_E8M0 `[…, 8]` | 98.3 GB + 3.1 GB per layer | not presented; gathered per token via `raw()` |
-| DSpark | `mtp.0.*` (128-expert gate, own attn/hc) | | not presented yet |
+| DSpark | `mtp.{0,1,2}.*` (128-expert gate, own attn/hc) | | presented (corrected 2026-10-04): `build_mtp` maps stage s to `blk.{40+s}.*` with the main-layer formats (128 MXFP4 routed experts, `MTP_N_EXPERT`; 128-wide BF16 router), plus `mtp.s.{main_proj,main_norm,norm,confidence,markov_embd,markov_head}` |
 
-Layer 0–1 have no compressor/indexer/engram tensors; layer 20 (kv_source Reindex) has indexer
+Layer 0–1 have no compressor/indexer/engram tensors; layer 20 (KV source, ratio 1; "Reindex" here was wrong, see §1.5) has indexer
 k/norm but no compressor gate; e8m0 byte e means 2^(e−127) (torch `float8_e8m0fnu`).
 
 **Per-layer tensor sets by CSA2 role (measured from the index, 2026-09-12).** Every layer has the
 base set (attn wq_a/wq_b/wkv/wo_a/wo_b, q_norm/kv_norm, attn_sink, norms, hc_*, gate, shared +
 routed experts) — Reuse-mode layers (3–7, 9–13, 15–19, 21–23, …) still carry `attn.wkv`, so the
-loader presents it; whether the reference uses it there is a model.py question (§1). On top:
+loader presents it. It is used there: every layer computes its window KV from `wkv` (§1.2,
+`kv_w = kv_norm(wkv(x))`), and the engine does the same on every layer (answered 2026-10-04). On top:
 
 | layer role | extra tensors |
 |---|---|

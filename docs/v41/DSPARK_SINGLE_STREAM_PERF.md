@@ -1,6 +1,15 @@
 # DSpark single-stream throughput: two-lane verify, early Engram, async ring writes
 
-Status: DESIGN rev 3, APPROVED (review round 3, 2026-10-01; dispositions at the end). Branch `worktree-ms-tail` (production = this branch's
+Status (corrected 2026-10-04): **items 1, 2 and 4 IMPLEMENTED (18ecbf0, 2026-10-01); item 3's
+pre-draft Engram spawn NOT built** (only the `V41_MS_ENGRAM_THREADS` fan-out knob and
+`engram_gather_ms`, "to measure before the pre-draft spawn"; the decode gather is still spawned
+after the draft). Section 2 was replaced the same day: the code keeps `LaneTables` (a one-lane
+and a two-lane `StepCost`) chosen by `LaneRule {Off, Threshold(min_rows), Learned}`
+(`V41_MS_LANES_LEARNED`, 268b48b), and a `StepCost` is per-row-count cells by default
+(`V41_MS_DSPARK_COST_SHAPE=cells`), not a line; `two_from` does not exist; the split helper is
+`lane_rows(b, n)`. The two-lane verify engages only with `V41_MS_STAGGER=2` (code default 0;
+production 2 per the hub env 2026-10-04) and `V41_MS_SPEC_LANES` on (default on).
+Original: DESIGN rev 3, APPROVED (review round 3, 2026-10-01; dispositions at the end). Branch `worktree-ms-tail` (production = this branch's
 f9ebe2c: merged head + nucleus candidates). Owner approved items 1, 3, 4 of the ranked list.
 
 ## 0. Where a lone stream's block goes (MEASURED 2026-10-01, production, 4-6 row verifies)

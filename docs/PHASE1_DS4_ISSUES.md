@@ -6,10 +6,11 @@ deepstrix uses antirez's ds4 (rocm branch) as the Phase 1 correctness baseline. 
 
 Patches live in `external/ds4-patches/` and are applied by `external/apply-patches.sh` (idempotent — safe to re-run; checks `git apply --reverse --check` first). Each `.patch` is a unified diff of one logical change.
 
-Re-apply after any `git submodule update --init`:
+Re-apply after any `git submodule update --init` (corrected 2026-10-04):
 ```bash
-external/apply-patches.sh
+DS4_SKIP_BAKED=1 external/apply-patches.sh
 ```
+There are 11 patches (`0001`-`0011`). The pinned submodule commit already contains most of them: per the state note in `external/apply-patches.sh`, 0001-0009 are baked into d1b9565 and 0002-0009 then apply in neither direction (0006 drifted after the bake), so the script exits 1 unless `DS4_SKIP_BAKED=1`. The submodule has since been re-pinned at b8b2351 (b019252, 2026-08-15), which records the Track R working tree (0010/0011 content, per 9445351); the script's note still names d1b9565. Do not set `DS4_SKIP_BAKED` on a pristine upstream ds4: it masks real apply failures. Only 0001 is described below; 0002-0009 add the activation-dump hooks (commits 1373385..b347ace, see `PHASE1_REFERENCE.md`), 0010 the IQ3_XXS/IQ2_S/MXFP4 CPU quants, 0011 the type-dispatched MoE workers for the unsloth dumper variant (both 9445351).
 
 ### 0001-expose-logits-buffer.patch
 
@@ -123,7 +124,7 @@ In rough order of likelihood-to-help:
 If antirez ships a meaningful update on the rocm branch:
 
 1. `cd external/ds4 && git pull origin rocm`
-2. `cd ../.. && external/apply-patches.sh` — reapply our patches; if conflicts surface, regenerate patches from the new base
+2. `cd ../.. && external/apply-patches.sh` — reapply our patches; if conflicts surface, regenerate patches from the new base (set `DS4_SKIP_BAKED=1` only if the tree still carries the baked patches; see the state note in the script) (corrected 2026-10-04)
 3. Re-baseline `docs/PHASE1_REFERENCE.md` explicitly (changed upstream = changed numerics)
 
 Don't `git submodule update` blindly without rerunning the apply step.

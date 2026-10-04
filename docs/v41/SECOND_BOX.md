@@ -1,5 +1,14 @@
 # Second Strix Halo box — provisioning + interconnect (rev 1, 2026-09-13)
 
+> **Status (docs audit 2026-10-04):** historical bring-up log. The live flake is lumi-flake on box 1
+> (`/home/claude-code/lumi-flake`, HEAD e73b702), not `docs/v41/second_box_flake.patch`. It persists
+> the host tuning on both hosts: `net.core.busy_read = busy_poll = 5000` and TSO/GSO/GRO off on
+> thunderbolt0 (`modules/interconnect.nix`), governor performance, C2/C3 off, C1 off on the link CCX,
+> NVMe APST off (`modules/host-tuning.nix`), thunderbolt runtime PM off (udev rule). TCP_QUICKACK is
+> off by default (REMOTE_EXPERTS.md §5.4). Hardware move 2026-10-03: lumi-brain (hub, box 1, eGPU) now
+> runs on the 128 GB machine and lumi-brain2 (box 2) on the 96 GB one (lumi-flake cead625); the box-2
+> link is USB4 / thunderbolt0 (hub -> 10.99.0.2:7431), with the 2.5 GbE `eno1` cable as fallback.
+
 Facts from this box (`lumi-brain`, NixOS 26.11 "Zokor" 2026-08-31 channel, kernel 7.2.2):
 
 | item | this box | what it means for box 2 |
@@ -82,6 +91,7 @@ iperf3 -s   |   iperf3 -c <peer> -P 1  and  -P 4      # throughput, 1 and 4 stre
 ping -c 200 -i 0.005 <peer>        # RTT floor (look at min/avg, not just avg)
 # application RTT: a 32 KB request/reply ping-pong over TCP_NODELAY (the engine's real pattern):
 #   scripts/netbench/rtt_pingpong.py  (to write: python socket, 2000 iterations, p50/p99)
+#   [2026-10-04: written; it is in the repo]
 ```
 
 Expected from Linux `thunderbolt-net` reports: 10–20 Gbit/s single-stream throughput
@@ -221,7 +231,9 @@ Steps (details + BIOS notes in the flake README, "PXE netboot"):
   The median was the receive interrupt path, not scheduler wakeups (userspace spinning alone
   had trimmed only the tails). 32 KB does not benefit at a 100 µs window because the reply
   arrives after the poll gives up; try 500 µs. Now in `modules/interconnect.nix`
-  (`boot.kernel.sysctl`, 500 µs) for both hosts. Decode's 40 serialised round trips at the
+  (`boot.kernel.sysctl`, 500 µs) for both hosts. **[2026-10-04: the flake has carried 5000 µs
+  since 2026-09-19 (lumi-flake `modules/interconnect.nix`): the hub's decode phase asks for a
+  3000 µs window and an unprivileged socket may not exceed `busy_read`.]** Decode's 40 serialised round trips at the
   activation size fit the 4 ms budget with this alone; native XDP / AF_XDP in thunderbolt-net
   remains the lever for bandwidth (8 Gbit/s today) and a ~30 µs floor.
 - **busy_read=500 + explicit 4 MB socket buffers + TCP_QUICKACK (2026-09-13 02:55):**
@@ -238,6 +250,8 @@ Steps (details + BIOS notes in the flake README, "PXE netboot"):
   fix it. Anything above one segment (> 65516 B payload) still pays ~500 µs — keep messages
   under the MTU. Transport recipe for the engine: persistent TCP, TCP_NODELAY, SO_SNDBUF/RCVBUF
   ≥ 1 MB, TCP_QUICKACK, blocking recv on a pinned thread with busy_read=500 (in the flake).
+  **[2026-10-04: TCP_QUICKACK was measured harmful on ≥ 16 KB replies and is off by default
+  (`SocketOptions::default`, REMOTE_EXPERTS.md §5.4); busy_read is 5000 in the flake.]**
   Decode's 40 round trips at the activation size are 1.3–2.7 ms/token serialised, i.e. inside
   the 4 ms budget before any overlap.
 - **UDP iperf (2026-09-13 02:59, box loaded ~35):** 8.5–8.6 Gbit/s received box 2 → box 1 at 8 KB

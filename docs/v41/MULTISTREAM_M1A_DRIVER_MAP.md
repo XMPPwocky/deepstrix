@@ -1,5 +1,10 @@
 # Multi-stream M1a: map of the batched layer driver (2026-09-21)
 
+> **Status (docs audit 2026-10-04):** frozen code map of 2026-09-21. The symbols still exist, but
+> every `FP:`/`BS:`/`EW:` line number has drifted (e.g. `forward_layer_pre_moe_v2` is now at
+> `forward_prefill.rs` ~4437, not 1787), the absolute paths point into the old working tree, and
+> `V41_MAX_CTX` is 368_640 (`attention.rs`), not 307_200. Use symbol names, not line numbers.
+
 Structure of `forward_layer_pre_moe_v2` / `post_moe_v2` and the two-lane driver,
 classified stage by stage as activation-only (reusable for rows from different
 sequences as-is) or per-sequence (needs the KvArena's per-row tables). Produced by

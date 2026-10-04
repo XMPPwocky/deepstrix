@@ -1,5 +1,15 @@
 # DECODE_M8_PLAN.md — from 2 tok/s paged decode to 30 tok/s (2026-09-13, plan rev 0)
 
+**Status (2026-10-04): SUPERSEDED.** Rev 0 was never signed off (R5 below) and its build steps
+were not carried out as written: `het/slot_table.rs`, `het/forward_verify.rs`,
+`kernels/moe_union.hip`, `spec_accept` and `forward_verify_batch` were never created. DSpark went
+another way: the verify runs as rows of the batched multistream arena step (`forward_step_arena`,
+DSPARK_ARENA_PLAN.md), against §3.2's "cannot be the verify path", with host-side rejection
+sampling (`spec_sample::verify_block`). The V4.1 indexer that M-c says does not exist was ported
+(index-K cache `V41_INDEX_K`, candidate pool `V41_CANDIDATE_POOL`; both default off, both on in
+production per the hub env 2026-10-04). The knobs in "What was added" still exist with the stated
+defaults. Line numbers are from the 2026-09-13 tree.
+
 Scope: the single-stream decode path of the V4.1 server (`forward_token_paged`) on box 1 + box 2. Everything here is against the code as of this evening; line numbers are from the uncommitted tree. Other agents own `forward_prefill.rs`, `expert_pager.rs` internals, the remote-experts module and the vision crate — this plan names the interfaces it needs from them and does not touch their files' internals.
 
 Inputs treated as facts: PLAN §6/§7a–§7f, decode designs A/B/C, M7_EXPERT_TIER, ARCH_SPEC §6, memory notes (`project_decode_dgpu_bound`, `project_m54_decode`, `project_decode_at_floor`, `feedback_two_box_maximize_busy`), the server log `logs/v41-server.log`, and the measured link (32 µs RTT, 1.1 GB/s, single segment ≤ 64 KB).
@@ -364,7 +374,8 @@ independent reasons, so R5.7's "make the gate correct" is not a gate fix:
    index-source layers whose top-512 is *shared* with their reuse layers, keys owned by
    the four kv-source layers, plus the layer-20 hierarchical candidate pool
    (2048 blocks × 8) that layers 24/28/32/36 mask against. None of that exists in the
-   tree; ENGINE_PORT M5 already says so.
+   tree; ENGINE_PORT M5 already says so. **[2026-10-04: ported since (`V41_INDEX_K`,
+   `V41_CANDIDATE_POOL`, `forward_layer.rs`), see Status.]**
 
 So this is the **M5 leftover in full** (index-key cache, 8 shared top-512 sites,
 candidate pool), priced at 3.5 ms/token @ 8 K and 14.8 @ 32 K. No numerics change was

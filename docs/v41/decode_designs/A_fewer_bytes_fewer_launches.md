@@ -1,5 +1,10 @@
 # Design A — "move fewer bytes, launch fewer kernels" (independent architect, 2026-09-13)
 
+**Status (2026-10-04): not built; treat as an abandoned proposal.** Its core — persistent
+grid-barrier phase kernels, cross-device doorbells, a CPU forwarder — does not exist on main (no
+cooperative launches in `v4flash-hip`, no doorbell code). Kernel-count work happened piecemeal
+instead (fused kernels; captured per-stage HIP graphs on the arena path, `V41_MS_GRAPHS`).
+
 **Anchor:** per-layer dGPU attention chain 0.50 ms ≈ 0.22 ms of weight bytes (136 MB @ ~620 GB/s) +
 ~0.28 ms in ~30 kernel boundaries ≈ **9 µs per boundary** (CP dispatch bubble + end-of-kernel L2
 writeback + ramp/tail). HIP graphs were dead because they remove host submission cost, which was

@@ -1,5 +1,15 @@
 # The drafter is the blocker, and it has two named deficits (2026-09-15)
 
+> **Status (docs audit 2026-10-04):** historical. Its conclusion ("the drafter is correct; the
+> whole gap is seeding") was overturned on 2026-09-27: the engine figures here came from a
+> self-generated 500-token run compared with the reference on a different span
+> (DSPARK_ARENA_PLAN.md, M-A), and the drafter had a real bug (its shared expert ran on the
+> attention input's quantization, fixed in 761e46f), after which parity reached E 4.348 vs 4.382.
+> The "oracle base" row does not sum to its E: 1 + 0.843 + 0.730 + 0.674 + 0.607 + 0.562 = 4.416;
+> DSPARK_ARENA_PLAN.md M-A gives d4/d5 = 0.596 / 0.539, which sum to 4.382. "`ring_writes` is never
+> reset" no longer holds: rings are reset per conversation (`MtpState::reset_ring`) and per arena
+> slot (`ms_dspark.rs`).
+
 After the verify's two bugs were fixed (`read_f32` missing stream sync; the
 batched MoE never zeroing `partials`), the verify is cheap and can be faithful,
 and DSpark's binding constraint moved to DRAFTER ACCEPTANCE.

@@ -1,5 +1,20 @@
 # DeepSeek-V4.1-Flash on two Strix Halo boxes + one 9070 XT — plan (rev 6, end of 2026-09-12)
 
+> **Status (docs audit 2026-10-04):** historical plan, last revised 2026-09-13. Superseded parts:
+> - The "Where things stand" block below is a 2026-09-12 snapshot: its V4-Flash items are history
+>   (V4-Flash dropped as a direction 2026-09-24), box 2 arrived 2026-09-13 (§8 item 5),
+>   ENGINE_PORT.md is rev 2, DSpark is presented (`hf_v41.rs::build_mtp`) and live on the arena
+>   (`V41_MS_DSPARK=accept`, hub env 2026-10-04). Engram tables are still gathered, not presented.
+> - TL;DR "Phase 1 = uniform IQ3_XXS" and §3's IQ3_XXS phase 1 were dropped by this doc's own
+>   §3.3/§7: the engine loads native MXFP4 experts (`hf_v41.rs::push_experts`, MXFP4 layout v2)
+>   and pages them over two boxes (box-1 pool `het/expert_pager.rs`, box 2 `deepstrix-expertd`).
+> - The headline targets in §0, §7 (rev 3, 32 tok/s), §7a (rev 4, ~26), §7d (~55/40/32) and §7f
+>   (~30) are successive revisions of one estimate, interleaved out of order; none is current.
+>   Sections run 7a, 7a.1, 7c, 7d, 7e, 7f, 7b, 7, 8, 9, 7f.1.
+>
+> Current state: docs/README.md, docs/v41/ARCH_SPEC.md (model), docs/v41/ENGINE_PORT.md
+> (milestones), docs/v41/TUNING.md (knobs), docs/v41/KNOWN_BUGS.md. Vocabulary: docs/GLOSSARY.md.
+
 **Where things stand (for the morning):**
 - **Weights: DOWNLOADED**, 476 GB, all 48 shards, at `~/.cache/deepstrix/models/dsv4.1f` (symlink
   into `/persist/hf_cache`). Abandoned partial copy at `/persist/lumi/models/dsv4.1f-full` (65 GB,
@@ -25,7 +40,7 @@
   10.9 warm); fp8→Q8_0 is CPU-bound at 1.1 GB/s / 8 threads (~7 s per model) — acceptable, and
   native fp8 dGPU kernels would delete it.
 
-Status: **DRAFT (rev 6)**. Earlier revision notes follow.
+Status: **DRAFT (rev 6)**. Earlier revision notes follow. **[2026-10-04: SUPERSEDED in part, see the status block at the top.]**
 
 ---
 
@@ -61,7 +76,7 @@ Status: **DRAFT (rev 6)**. Earlier revision notes follow.
 | experts | 384 routed + 1 shared, top-6 | `sqrtsoftplus`, `noaux_tc`, `swiglu_limit` 10, scale 1.5 |
 | expert size | 3×5120×2304 = 35.4M | **17.9 MiB (18.8 MB) at MXFP4** (17 B / 32 w) |
 | attention | MLA: 64 heads, head_dim 512, rope 64, q_lora 1280, kv heads 1 | W_O grouped low-rank (o_lora 1024, 8 groups) |
-| CSA2 modes | Full: 2,8,14,20 · Reindex: 24,28,32,36 · rest Reuse | enc ratio 2, dec ratio 1 |
+| CSA2 modes | Full: 2,8,14,20 · Reindex: 24,28,32,36 · rest Reuse | enc ratio 2, dec ratio 1; code: `KV_SOURCE_LAYERS` / `INDEX_SOURCE_LAYERS` / reuse via `index_source_of` (ARCH_SPEC §1.5 mapping, 2026-10-04) |
 | indexer | 32 heads × 128, top-512; FP4 QAT | hierarchical: layer-20 Full builds 2048 blocks×8 = 16K pool for Reindex layers |
 | SWA | window 128, every layer, FP8 KV | decoder SWA via **bounded replay** of last 128 tokens |
 | main KV | E2M1 + E4M3 scale / 16 ch, quantized after RoPE | ≈ 890 B/token global |

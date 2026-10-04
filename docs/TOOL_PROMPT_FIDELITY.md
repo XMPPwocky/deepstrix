@@ -1,5 +1,17 @@
 # Tool-prompt fidelity audit — `render_prompt` vs the GGUF chat template
 
+> **Status (docs audit 2026-10-04):** superseded. D1–D10 and D13 were fixed in 00fb4d7
+> (2026-09-04, `prompt.rs` / `dsml.rs` / `openai/types.rs`); the `developer` half of D11 in
+> c6888df (2026-09-18, `#[serde(alias = "developer")] System`). Still open: D11 `function` role —
+> no `Role` variant, so serde rejects the body as an axum `JsonDataError`, HTTP **422** (not the
+> 400 stated below);
+> D12 `tool_choice` — no field on `ChatCompletionRequest`, silently ignored, and
+> `check_unsupported_params` does not warn about it. Scope: this audits only the V4-Flash path
+> (`prompt.rs::render_prompt`, V4-Flash dropped 2026-09-24). The live V4.1 build renders with
+> `prompt_v41::render_prompt_v41` (`openai/handler.rs`, `#[cfg(feature = "v41")]`), pinned
+> byte-for-byte against DeepSeek's `encoding/encoding.py` by
+> `crates/deepstrix-server/tests/v41_prompt_vectors.rs`. Line references below are pre-00fb4d7.
+
 **Date:** 2026-09-04 · **Repo HEAD:** `21acf48` · **ds4 submodule:** `b8b2351`
 **Model audited:** `/persist/lumi/models/dsv4f-exp-q2-k-xl/UD-Q2_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q2_K_XL-00001-of-00003.gguf`
 (`tokenizer.chat_template`, 14 679 bytes, re-extracted from the live GGUF; byte-identical to the

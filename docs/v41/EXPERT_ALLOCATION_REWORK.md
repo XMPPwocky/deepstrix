@@ -1,5 +1,18 @@
 # Expert allocation rework — plan
 
+**Status (corrected 2026-10-04): SUPERSEDED, not built as written.** The live design went
+another way: `V41_T2_PARTITION=1` (code default off; set in production, hub env 2026-10-04)
+splits expert ids between the boxes, and since 2026-09-21 (b67d1cc) hot-set ownership
+(`expert_pager::hot_set`, `V41_B1_HOT` default on) makes box 1 OWN each layer's hottest ids by
+live decode pick mass while box 2 is the cold tier -- the tier inversion v2 below says not to
+do. v1/v2's premise, the 140 us/expert box-1 cost, was retracted (ROUTED_MOE_IS_NOT_A_KERNEL.md);
+the 2026-10-03 fit has box 1 at ~82 us per distinct expert against ~100 us on box 2
+(HOT_SPLIT_SIM.md §2). Box 1's dense windows are bypassed in production
+(`V41_PAGER_WINDOWS=0` = one window, `V41_PREFILL_UNIFIED_POOL=1`: prefill uses the LRU
+residency; both code defaults differ). Box 2 boots from a uniform per-layer range, not a placement
+file (`scripts/patch_b2.py`). The line references below (`expert_pager.rs:1188-1193`,
+`remote_experts.rs:1835`, `moe_group_builder.rs:110-113`) no longer point at the code described.
+
 **Status: PLANNED — v1 REWRITTEN 2026-09-16 after adversarial review.**
 
 > **v1's central proposal ("box 1 = hot cache, box 2 = victim cache, one flat
@@ -185,7 +198,9 @@ prose covers only 35.2% of CODE picks).
 # v2 — what actually survives
 
 **Do NOT invert the tiers.** Keep box 1 exclusive/victim; the 140-vs-87 us
-asymmetry is structural. Re-target at CAPACITY FOR THE VICTIM SET, not at making
+asymmetry is structural. **[2026-10-04: retracted premise and reversed in practice: the 140 us
+figure was withdrawn (ROUTED_MOE_IS_NOT_A_KERNEL.md) and box 1 owns the hot set since 2026-09-21
+(see Status).]** Re-target at CAPACITY FOR THE VICTIM SET, not at making
 box 1 the hot cache.
 
 **Make it phase-aware, not flat.** Per-layer regions during prefill (preserving

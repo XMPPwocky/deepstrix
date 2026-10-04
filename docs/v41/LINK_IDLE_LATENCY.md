@@ -1,6 +1,15 @@
 # The USB4 link costs ~575 us/layer because it goes to sleep between layers
 ### measured 2026-09-14, prompted by a user observation in a perfetto trace
 
+> **Status (docs audit 2026-10-04):** measurement record, still the basis of the hub's per-phase
+> window (`HetEngine::remote_set_phase_busy_poll`: `V41_DECODE_BUSY_POLL_US` code default 3000,
+> production 5000 per the hub env 2026-10-04; `V41_BATCH_BUSY_POLL_US` 50). Since 2026-09-25 box 2
+> also adapts its reader per request (`b2_adapt_busy_poll`): `V41_B2_DECODE_BUSY_POLL_US`, default
+> 5000, while `REQ_FLAG_DECODE` is set and request and reply each fit one ~64 KB segment; its base
+> window otherwise. All host tuning named here is persisted in lumi-flake (box 1
+> `/home/claude-code/lumi-flake`): busy_read/busy_poll 5000 and TSO/GSO/GRO off on thunderbolt0 in
+> `modules/interconnect.nix`; governor, C-states, C1-off link CCX in `modules/host-tuning.nix`.
+
 Decode submits to box 2 once per layer and then leaves the link idle for ~5.5 ms
 while box 1 runs the next layer's dGPU chain (246 ms/token / 40 layers = 6.15 ms,
 of which box 2's own service is ~0.4 ms). That idle is not free.
@@ -212,7 +221,9 @@ Two hard rules fall out:
   1. A response LARGER THAN THE 65,520 B MTU (>= 2 TCP segments) is HELD by the
      busy-poll loop until the window expires: B=4 link ~= window - 1900 us. And a
      spinning reader on the DAEMON side wrecks its own big sends (1.3 MB: 1.9 -> 6.6 ms).
-     So the daemon stays at `--busy-poll 500`, and the hub's window must be small
+     So the daemon stays at `--busy-poll 500` **[2026-10-04: as its base window; since
+     2026-09-25 it spins `V41_B2_DECODE_BUSY_POLL_US` (5000) for single-segment decode
+     requests, `b2_adapt_busy_poll`]**, and the hub's window must be small
      (<= 500) whenever responses exceed one segment: prefill, verify, any B >= 4.
   2. Decode's 20.6 KB response is one segment and gains the full 130 us/call at any
      window >= 2000; use ~3000 (the per-layer period is ~2.2 ms and the reader's spin
@@ -296,5 +307,8 @@ segment go hub -> box 2 too), decode keeps 3000 us, and the batch phase
 (`V41_BATCH_BUSY_POLL_US`) now defaults to 50 us. Quick-ACK adds nothing once TSO
 is off. Persisting the ethtool setting needs the flake (systemd-networkd
 `[Link] TCPSegmentationOffload=no GenericSegmentationOffload=no` for thunderbolt0).
+**[2026-10-04: done. lumi-flake `modules/interconnect.nix` has the `.link` (TSO, GSO and GRO
+off) plus a `thunderbolt0-offload` service that re-applies and verifies it after every link-up
+(added 2026-09-27: the `.link` alone came up with TSO on).]**
 For the multi-stream plan this puts the per-call link at 0.4-0.8 ms for 8-32 rows
 f32, i.e. the model's 19-34 ms/step link term, not the 80+ ms the hold implied.

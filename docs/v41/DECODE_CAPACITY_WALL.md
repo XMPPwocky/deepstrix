@@ -1,5 +1,15 @@
 # *** CORRECTED 2026-09-14 — READ THIS FIRST ***
 
+> **Status (docs audit 2026-10-04):** do not stop at the banner below; the file's own later
+> sections overrule parts of it. CORRECTION 2 (end of file) withdraws the global-vs-per-layer
+> result ("within 2% of optimal") and the flat capacity curve: policy headroom is ~95 ms/token and
+> the curve is steep. CORRECTION 1 says sub-3-bit experts are "a different model" and full
+> residency is not reachable, against the banner's IQ2_S target; no requantised set was built
+> (EXPERT_FORMAT_IS_THE_REMAINING_LEVER.md). The closing LOOKAHEAD/PREFETCH lever was built
+> (look-ahead routing, 2026-09-21) and turned off by default after an A/B
+> (ROUTER_LOOKAHEAD_AND_PREFETCH.md status). The "contiguous `[base_slot, base_slot+n)` range per
+> layer" blocker was false; box 2 runs one global pool (GLOBAL_POOL_FEASIBILITY.md).
+
 **The format conclusion at the bottom of this file is WRONG in both directions.**
 It assumes experts are Q8_K (~8.5 bits/weight). They are **MXFP4 at 4.25
 bits/weight, 18.80 MB/expert** — so "Q5_K fits, Q6_K doesn't" would have made the

@@ -1,5 +1,7 @@
 # iGPU VRAM carve-out pool — findings and plan (2026-09-02)
 
+> **Status (docs audit 2026-10-04):** R2 NOT IMPLEMENTED on any branch (no `vram_pool.rs`, `VramPool` or `DEEPSTRIX_IGPU_VRAM_POOL_MIB` outside docs commit 0e448b9). Whether R1 (carve-out shrink, a sysfs/firmware setting outside the repo) was applied is not recorded here. The premise (one box whose iGPU holds every routed expert in GTT) is superseded by the two-box V4.1 design with per-box expert paging (`het/expert_pager.rs`, `deepstrix-expertd`); V4-Flash was dropped as a direction on 2026-09-24. The probe programs lived in a job tmp dir and are not in the repo.
+
 Goal: move ~1.8 GiB of iGPU-resident data out of GTT (= host RAM) into the
 iGPU's 2 GiB UMA carve-out so a bigger expert quant fits. Everything below was
 measured on this box (NixOS, kernel 7.1.5, ROCm 7.2.3, Strix Halo gfx1151 =

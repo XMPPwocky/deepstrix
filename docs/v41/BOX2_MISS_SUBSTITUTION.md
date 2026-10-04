@@ -1,6 +1,16 @@
 # Box-2 miss substitution — design sketch
 ### 2026-09-24/25 · status: BUILT (`V41_SUB`, branch `worktree-b2-miss-substitution`), not deployed
 
+**Status (corrected 2026-10-04): merged to main and LIVE as mode 3.** The branch is an ancestor of
+main (`het/b2_mirror.rs`). Production runs the CACHE-PRIOR mode `V41_SUB=3` (25afd2c, 2026-09-25;
+section "Mode 3" below), not the route-time rewrite `V41_SUB=2`: hub env 2026-10-04 has `V41_SUB=3`,
+`V41_SUB_PROTECT=1`, `V41_SUB_ADMIT_GATE=1`, `V41_SUB_PENDING=0`, `V41_SUB_LAMBDA=0.25`, and the live
+knob file holds `V41_SUB_LAMBDA=0.15` (the file wins). Code default stays `V41_SUB=0`. Box-2
+pinning (`V41_B2_PIN=1` in production) is described in the `b2_mirror.rs` module doc and in
+REMOTE_EXPERTS.md §2/§3.2. Not built: the box-2-side fallback (its planned flag bit 256 is now
+`REQ_FLAG_PIN`), and invariant 6 (the fidelity-pin skip; `fidelity_tap` is on main, but neither
+`substitution_active` nor `cache_prior_active` checks `fidelity_tap::pin_on()`).
+
 ## The idea
 
 When a box-2 decode pick is not resident, do not block on the NVMe read. Compute
@@ -117,7 +127,7 @@ expert, whoever owns it". So box 1 should make the decision itself:
 
 The box-2-side policy below stays as the fallback for mirror errors.
 
-### Implemented 2026-09-25 (not yet deployed)
+### Implemented 2026-09-25 (not yet deployed) [2026-10-04: merged; mode 3 is live, see Status]
 
 - **Mirror via per-layer residency maps, not deltas.** A request with
   `REQ_FLAG_RESID` (64) gets box 2's map for that request's layer (384 bits
@@ -140,7 +150,10 @@ The box-2-side policy below stays as the fallback for mirror errors.
 - **Knobs:** `V41_SUB` = 0 off / 1 dry run (plan and count, no rewrite) / 2 on;
   `V41_SUB_MIN_RANK` (default 6); `V41_SUB_MAX_W` (unset = no cap);
   `V41_SUB_PENDING` (default on; turn OFF when box 2 PARKs, see below); needs
-  `V41_ROUTER_ALTS > 0`.
+  `V41_ROUTER_ALTS > 0`. **(corrected 2026-10-04)** Plus `V41_SUB=3` = cache prior (below, no
+  alternatives needed) and, in modes 2 and 3, `V41_SUB_ADMIT` (default on: displaced box-2
+  experts are read in the background as PREFETCH words), `V41_SUB_ADMIT_GATE` (default off:
+  TinyLFU-style gate on those admissions in pin mode), `V41_SUB_INCOMING` (default 2 steps).
 - **Profile** (`ms.stage`, per step): `sub.predicted_miss`,
   `sub.reads_avoided`, `sub.picks_swapped`, `sub.blocked`, `sub.plan_failed`
   (must stay 0). Compare `sub.predicted_miss` with `box2.misses_x1e6` for
@@ -218,7 +231,23 @@ The box-2-side policy below stays as the fallback for mirror errors.
   and lower for cold experts.
 - Not yet: DSpark verify rows (Contiguous + `speculative_append`, excluded),
   the fidelity-pin skip (the pin lives on `worktree-architecture-review`), and
-  the box-2-side fallback.
+  the box-2-side fallback. **[2026-10-04: the legacy verify is still excluded; the arena
+  DSpark verify rows are `RowLayout::Arena` and get mode 3. `fidelity_tap` is on main; the skip
+  is still not implemented.]**
+
+### Mode 3: cache prior (added 2026-10-04 from `het/b2_mirror.rs`, 25afd2c)
+
+No host-side rewrite. The router adds `lambda * Delta_layer` to the selection score of every
+expert the computing box holds (box 2's mirror, box 1's pager), keeps the original top
+`V41_SUB_PROTECT` picks (default 2), and renormalizes over the final set. `Delta_layer` is a
+running average of each token's selection-score range, so `V41_SUB_LAMBDA` (live, default 0.1,
+0..=1; legacy file `V41_SUB_LAMBDA_FILE`) is a per-layer gap gate: a missing pick is displaced
+only by a held expert within `lambda * Delta` of it. `V41_SUB_DRY=1` computes the prior's picks
+but routes the plain ones and counts/traces (`c` lines) the would-be swaps. Gate
+(`forward_prefill::cache_prior_active`): arena rows (decode, and the arena DSpark verify rows),
+a learned (not hash) router, the remote split on, the T2 partition, box 2 owns the layer. `V41_SUB_DEFER_ACCEPTED` (live, default off;
+0 in the production knob file 2026-10-04) holds a speculative block's admissions, pin want counts
+and hot-set picks until its accept and applies only the kept rows'.
 
 ## Box-2-side policy (fallback)
 
@@ -262,7 +291,7 @@ clearly worse.
 ## Wire protocol for the box-2-side fallback (NOT built)
 
 What is built is the residency map (`REQ_FLAG_RESID` = 64, see above); this
-section is the fallback's own design. New request flag `REQ_FLAG_ALTS = 256` (64 is `REQ_FLAG_RESID`, 128 `REQ_FLAG_DECODE`). After the prefetch block: `u32 m`, then
+section is the fallback's own design. New request flag `REQ_FLAG_ALTS = 256` (64 is `REQ_FLAG_RESID`, 128 `REQ_FLAG_DECODE`). **[2026-10-04: 256 is now `REQ_FLAG_PIN`, 512 `REQ_FLAG_RELEASE`, 1024 `REQ_FLAG_LONG_JOB`; the next free bit is 2048, and its block would follow the RELEASE block.]** After the prefetch block: `u32 m`, then
 `b * m` `i32` alternative ids, per row in rank order (ranks 7..6+m), `NO_PICK`
 for an unusable slot. The frame length changes when the flag is set, and a daemon
 that does not know the flag rejects the length, so the hub may set it only once
@@ -280,7 +309,9 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
   computed over the first `n_used` only. A top-6 prefix of an insertion sort is the
   same whatever the array length (each element's position depends only on the
   comparisons ahead of it), so `sel`/`ew` must stay **bit-identical**: test it.
-  `ROUTER_MAX_USED` is 8, so m <= 2 fits as is; m = 3 needs 9.
+  `ROUTER_MAX_USED` is 8, so m <= 2 fits as is; m = 3 needs 9. **[2026-10-04: built
+  differently: alternatives are a separate output capped at `ROUTER_MAX_ALT` = 4
+  (`router_topk.rs`), so m = 0..=4.]**
   Call sites: `forward_prefill.rs` ~5922 and ~6019 (arena decode lanes), `:859`.
 - **Readback** with `sel` in the existing sync (`lh.sel_d2h`): b*m*4 bytes.
 - **Mask** each alternative to box-2-owned (`owns_eff[a]`), else `NO_PICK`. A 7th
@@ -295,7 +326,8 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
 
 ## Box 2 (daemon) changes
 
-- **Decision** in `ExpertExecutor::run` (`remote_experts.rs` ~3336), before the
+- **Decision** in `ExpertExecutor::run` (`remote_experts.rs` ~3336; **[2026-10-04: now
+  `MoeExecutor::run_path`; the merge is in `serve_connection`]**), before the
   `path_decode` / hits-first split, on a local copy `self.sel_sub` (b x nu). Guard:
   alternatives present && `b <= 16` (the existing "verify is still decode" line)
   && `knobs::sub()`. Everything downstream (`resident_mask`, pass A/B, reduce,
@@ -317,13 +349,15 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
    `deepstrix-expert-bench --check-*` and determinism recipe).
 2. Router with m > 0: `sel`/`ew` bit-identical to m = 0.
 3. Substitution on but everything resident: bit-identical (the plan is empty).
-4. Test daemon (`:7432`, small pool, `--catchall`), `sub=1`: substituted requests
+4. Test daemon (`:7432`, small pool, `--catchall` **[2026-10-04: a `deepstrix-expert-bench`
+   flag; the daemon's is `--paged`]**), `sub=1`: substituted requests
    do no read (`n_reads_avoided` > 0, pread count drops), and the result equals the
    local reference computed with the *rewritten* `sel`. The bench needs the plan
    echoed back for that (debug flag).
 5. Every determinism gate runs with `sub=0`, and says so.
 6. **Never under the fidelity pin.** The golden gate's routing pin
-   (`het::fidelity_tap::pin_device_rows`, branch `worktree-architecture-review`)
+   (`het::fidelity_tap::pin_device_rows`, branch `worktree-architecture-review`;
+   **[2026-10-04: on main; this invariant is NOT implemented]**)
    rewrites rows to the CPU reference's picks right after the router launch in
    `pre_moe_chain`. Box-1 substitution runs later (`pre_moe_route`, after the
    readback), so it is ordered after the pin. It must also be skipped entirely
@@ -365,7 +399,8 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
    6 -> 5 -> 1. ABBA on a warm pool (`box2.page_ms`, step wall, subs/step), with
    free-running quality at each step: echo2 at 1.5K/6K under >= 4 rows, needle,
    and the golden fidelity gate once it exists.
-4. **Box-2-side fallback** (policy above, `REQ_FLAG_ALTS` = 256), only if mirror errors
+4. **Box-2-side fallback** (policy above, `REQ_FLAG_ALTS` = 256 **[2026-10-04: taken by
+   `REQ_FLAG_PIN`]**), only if mirror errors
    leave material paging. `sub_admit` background reads can come with step 3 or 4.
 
 ## Expected gain

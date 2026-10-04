@@ -1,13 +1,24 @@
 # Remote expert executor — `deepstrix-expertd` (M8, 2026-09-13/14)
 
 Expert-parallel topology from PLAN.md §4 / §7b: the hub (box 1: dGPU + iGPU) runs attention,
-routers, shared/hot experts and its own iGPU expert share; box 2 (128 GB, iGPU only) holds a
+routers, shared/hot experts and its own iGPU expert share; box 2 (128 GB then; 96 GB since the
+2026-10-03 hardware move, lumi-flake cead625; iGPU only) holds a
 large share of the routed experts resident in its iGPU pool and computes weighted MoE partial
 sums for the hub over the USB4 link. This document is the protocol, the code layout, the
-measurements, and exactly what is left to wire into `forward_layer` / `forward_prefill`.
+measurements, and (§6) the integration plan as written on 2026-09-14.
 
-Status: **built, loopback bit-identical, cross-box measured, clock-synced and traced** (numbers in
-§5). Not yet called from the forward pass (§6 is the proposed call site). Nothing committed.
+Status (corrected 2026-10-04): **integrated and in production.** The engine integration was
+committed together with this doc (857bca6, 2026-09-13). The hub submits from `forward_prefill`
+(`RemoteExpertClient::submit_dispatch`: arena decode rows, verify rows, prefill chunks) and from
+`forward_layer` (`submit_unmasked`, the per-token serial decode path), adds box 2's partial after
+the MoE, and `HetEngine` owns the client (`HetEngine::remote`). Box 2 runs as a catch-all paged
+tier (`--paged`, §3.2), not as a static assignment; the hub-side ownership model is the T2
+partition plus box 1's hot set (`expert_pager::hot_set`), not the §6 remap plan. The reference
+sections — §2 (wire protocol v4), §3 (daemon, CLI), §3.2 (miss path) and §3.3 (knobs) — describe
+the code at origin/main c2db000. §5 is the 2026-09-13/14 measurement record (protocol v1, static
+shard), §6-§8 the 2026-09-14 plan; both kept as written, with inline notes where they mislead.
+Original status line (2026-09-14): "built, loopback bit-identical, cross-box measured,
+clock-synced and traced. Not yet called from the forward pass. Nothing committed."
 
 ## 1. Code layout
 
@@ -20,6 +31,11 @@ Status: **built, loopback bit-identical, cross-box measured, clock-synced and tr
 | `crates/v4flash-kernels/src/het/perfetto.rs` | **additive only**: `TrackExporter` (open track set, device + host-time slices) alongside the existing `DeviceTimingExporter`, which is untouched |
 | `crates/v4flash-kernels/src/het/mod.rs`, root `Cargo.toml` | one `pub mod` line, one workspace member line |
 
+**[2026-10-04: the hub side now lives in `forward_prefill.rs` (`submit_dispatch`, the post-MoE
+partial upload, `prefill_f16_replies`), `forward_layer.rs` (serial decode), `engine.rs`
+(`remote_set_phase_busy_poll`, `remote_set_long_job`) and `b2_mirror.rs` (box-2 residency mirror,
+pinning). More tests: `tests/remote_experts_fast_chain.rs`, `remote_experts_chain_trace.rs`,
+`remote_experts_pin_loopback.rs`.]** As written 2026-09-14:
 Untouched (other agents own them): `forward_prefill.rs`, `forward_layer.rs`, `expert_pager.rs`,
 `weights.rs`. The executor calls the same public dispatch functions those files call
 (`het::dispatch::moe_gate_up_batch_hetsplit`, `moe_down_batched_hetsplit`, `moe_gate_up_chunked`,
@@ -33,27 +49,64 @@ CARGO_TARGET_DIR=target-v41 nix develop -c cargo build --release -p deepstrix-ex
 ~/b2-dev.sh cargo build --release --offline -p deepstrix-expertd --features v41     # target-b2/
 ```
 
-## 2. Wire protocol (`remote_experts::proto`, version 1)
+## 2. Wire protocol (`remote_experts::proto`, version 4) (corrected 2026-10-04)
 
-Persistent TCP, one connection at a time per daemon, length-prefixed little-endian frames:
+Persistent TCP, one connection at a time per daemon, length-prefixed little-endian frames.
+`proto::VERSION` = 4; `parse_header` rejects any other version, so both boxes are rebuilt and
+restarted together whenever it changes (v2: `t_page_us`/`n_miss`; v3: MXFP4 super-block layout v2,
+tied to `mxfp4_tables::MXFP4_LAYOUT_VERSION`; v4: the PREFETCH word list). Offsets below are
+frame offsets (header included).
 
 ```
-header (16 B):  magic u32 = 0x50585344 "DSXP" | version u16 = 1 | kind u16 | seq u32 | payload_len u32
-kind 1 HELLO     daemon → client on connect: n_layer, n_expert, n_used, n_embd, xq_bytes_per_token,
-                 max_batch, decode_max_b, n_resident, bytes_per_expert, then n_layer × ceil(n_expert/32)
-                 u32 ownership bitsets (which experts of which layer the daemon holds)
-kind 2 REQUEST   layer u32, b u32, flags u32, n_used u32 (=6), xq_bpt u32 (=5840), reserved u32,
-                 t1 u64                  client send stamp (CLOCK_MONOTONIC_RAW), offset 40
-                 xq  [b × 5840 B]        Q8_K activation rows (the MoE gate/up input, see below)
-                 sel [b × 6] i32         expert ids, -1 = "no pick in this slot" (NO_PICK)
+header (16 B):  magic u32 = 0x50585344 "DSXP" | version u16 = 4 | kind u16 | seq u32 | payload_len u32
+kind 1 HELLO     daemon → client on connect, u32 words:
+                 [0..9)  n_layer, n_expert, n_used, n_embd, xq_bytes_per_token, max_batch, decode_max_b,
+                         n_resident, bytes_per_expert
+                 [9..13) clock pair: mono_raw lo, hi, realtime lo, hi (sampled at HELLO, not at load)
+                 [13..)  n_layer × ceil(n_expert/32) ownership bitsets = the LOAD assignment
+                         (unchanged by --paged; the hub's prefill exclusion reads it)
+kind 2 REQUEST   layer u32, b u32, flags u32, n_used u32 (=6), xq_bpt u32 (=5840), reserved u32
+                 t1  u64 @40             client send stamp (CLOCK_MONOTONIC_RAW), patched by the writer
+                 xq  @48 [b × 5840 B]    Q8_K activation rows (REQ_FIXED = 32, so xq stays 8-aligned)
+                 sel [b × 6] i32         expert ids, -1 = NO_PICK
                  ew  [b × 6] f32         router weights (0 for NO_PICK slots)
-kind 3 RESPONSE  layer, b, flags, status, t_compute_us, t_server_us, n_embd u32 (=5120), elem_bytes u32,
-                 t1 u64 (echoed), t2 u64 (daemon receive), t3 u64 (daemon send)   offsets 48/56/64
-                 data [b × 5120] × elem_bytes — weighted partial sums, f16 by default
+                 then, in this order, each present only if its flag is set:
+                 [HINTS]    n_admit u32, n_evict u32, (n_admit + n_evict) words (layer << 16 | expert)
+                 [PREFETCH] n u32, n words (layer << 16 | expert)
+                 [RELEASE]  n u32, n words (layer << 16 | expert)
+                 The daemon rejects a frame whose length is not exactly what b and the flags imply.
+kind 3 RESPONSE  layer, b, flags, status, t_compute_us, t_server_us, n_embd u32 (=5120), elem_bytes u32 (2|4)
+                 t1 u64 @48 (echoed), t2 u64 @56 (daemon receive), t3 u64 @64 (patched just before write)
+                 t_page_us u32 @72, n_miss u32 @76   box-2 NVMe paging this request did (v2+)
+                 data @80 (RESP_FIXED = 64) [b × 5120] × elem_bytes — weighted partial sums
+                 [RESP_FLAG_RESID] RESID_WORDS = 12 u32: bit e = expert e of `layer` resident and landed
+                                   after this request's paging (pin mode: the layer's PINNED set)
+                 [RESP_FLAG_PIN]   PIN_WORDS = 16 u32: epoch, pinned, budget, reserved, then 12 words
+                                   of PAGED bits (expert e not landed when this request's pass started)
 kind 4 ERROR     status u32 + UTF-8 message (the daemon then closes the connection)
-flags bit 0 (REQ_FLAG_RESP_F32): return f32 partials instead of f16.
-flags bit 1 (REQ_FLAG_BATCHED):  take the by-expert (prefill) chain even at small B.
 ```
+
+Request flags (`proto::REQ_FLAG_*`):
+
+| bit | value | flag | meaning |
+|---|---|---|---|
+| 0 | 1 | `RESP_F32` | f32 partials instead of f16 |
+| 1 | 2 | `BATCHED` | by-expert chain even when `b <= decode_max_b`. The hub sets it on every submit (`V41_REMOTE_BATCHED_MULTI`, and for B=1 `V41_REMOTE_BATCHED_B1`, both default on; B=1 since 2026-10-03, a7799a7) |
+| 2 | 4 | `HINTS` | box-1 residency hints: ADMITTED (box 2 marks its copy evict-first), EVICTED. Sent only under `V41_B1_PREFETCH=1` |
+| 3 | 8 | `PREFETCH` | words box 2 reads into its pool in the background: look-ahead routing (`V41_LOOKAHEAD_PREFETCH`), cache-prior admissions (`b2_mirror`), layer-major group prefetch (`V41_LM_PREFETCH`), pin restores. Wrong words cost bandwidth only |
+| 4 | 16 | `PARTNER` | another request for the same layer follows (the other lane); box 2 may wait up to `V41_B2_MERGE_WAIT_US` and run both as one pass |
+| 5 | 32 | `OOO` | the sender matches replies by `seq`, so box 2 may answer out of order. The hub sets it on every request |
+| 6 | 64 | `RESID` | append the residency map (hub mirror, `het::b2_mirror`) |
+| 7 | 128 | `DECODE` | the hub is in its decode phase: box 2 adapts its reader window (`b2_adapt_busy_poll`); mode-aware eviction classes the request as decode |
+| 8 | 256 | `PIN` | pin mode (hub `V41_B2_PIN`): what box 2 reports held stays until RELEASEd; the reply's map is the pinned set plus a pin block |
+| 9 | 512 | `RELEASE` | trailing RELEASE words, applied in order before the request is served. Sent only after the peer has answered with `RESP_FLAG_PIN` |
+| 10 | 1024 | `LONG_JOB` | prefill request of a job longer than `V41_LONG_PREFILL_TOKENS` (default 16384); never with `DECODE`; no payload (2026-10-03, dd83657) |
+
+Echoed response `flags` word: the request's flags in the low bits; **bits 16-31 = miss mask**
+(`RESP_MISS_SHIFT`): bit i = sel slot i (first 16 slots) missed on box 2 and was paged, filled for
+B=1 and for any hits-first two-pass request; **bit 15 = `RESP_FLAG_RESID`**, **bit 14 =
+`RESP_FLAG_PIN`** (only ever together with RESID). An older daemon echoes RESID/PIN request bits
+without setting the response bits, which is how the hub falls back.
 
 **HELLO** also carries the daemon's back-to-back `(CLOCK_MONOTONIC_RAW, CLOCK_REALTIME)` pair,
 which is what lets a daemon monotonic stamp — and hence its perfetto trace — be mapped onto the
@@ -92,7 +145,14 @@ rounding on the wire. It is also smaller than f16 (10240 B) and only 10% larger 
 scales. f16/fp8 activations would have forced a re-quantisation on the remote and a rounding
 difference against the local branches.
 
-**Response is f16** (`__float2half`, RNE, done on the device by `f32_to_f16_cast`), 10240 B/token:
+**Response precision (corrected 2026-10-04).** The daemon replies f16 unless the request sets
+`REQ_FLAG_RESP_F32`. What the hub asks for: **decode is f32** — arena rows (`forward_prefill`,
+`!(prefill_f16_replies() && !decode_rows)`) and the serial per-token path (`forward_layer`,
+`submit_unmasked(.., true)`); **prefill chunks are f16** while `V41_PREFILL_F16_REPLIES` is on
+(default on since 2026-10-01; `0` = f32). The f16 prefill partials have **no KLD/golden fidelity
+gate yet (gate pending)**; the hub logs an "UNTESTED FIDELITY" warning at startup and widens the
+rows to f32 on the host (`widen_f16`). The 2026-09-14 text, for the record: **Response is f16**
+(`__float2half`, RNE, done on the device by `f32_to_f16_cast`), 10240 B/token:
 at B=1024 that is 10.5 MB vs 21 MB for f32, i.e. 9.5 ms vs 19 ms on the 1.1 GB/s link. The f16
 rounding applies to the remote partial only (≤ 2⁻¹¹ relative on that branch, below the Q8/MXFP4
 weight noise); `REQ_FLAG_RESP_F32` is there for the bit-identity tests and is cheap at decode
@@ -103,13 +163,22 @@ skips the request entirely when no token of the batch has a remote pick (`submit
 Sizes: decode B=1: 5.9 KB out / 10.3 KB back (f32: 20.5 KB). Prefill B=1024: 6.03 MB out /
 10.49 MB back. Header/pick overhead is 48 B/token.
 
-Framing rules: `seq` is echoed; responses are FIFO (the daemon is single-queue), so the client
-may keep several layers in flight; the client rejects a response whose seq/layer/b differ from
-its oldest ticket. Buffers are recycled through channels on both sides (no per-request
-allocation once warm). Transport recipe from SECOND_BOX.md: TCP_NODELAY, SO_SNDBUF/RCVBUF 4 MB,
-TCP_QUICKACK re-armed after every receive, SO_BUSY_POLL 500 µs (plus the flake's
-`net.core.busy_read=500`), all applied by `apply_socket_options` (four raw `setsockopt`s,
-declared `extern "C"` — no `libc` dependency added).
+Framing rules (corrected 2026-10-04): `seq` is echoed and the client matches every reply to its
+ticket by `seq` (`RemoteExpertClient::stash`), so several layers may be in flight and **replies
+may arrive out of order**: every hub request carries `REQ_FLAG_OOO`, and with `V41_B2_PARK=1`
+box 2 parks a request that must page and answers requests queued behind it first (§3.2). A
+merged pair (`PARTNER`) is answered as two replies from one pass. Buffers are recycled through
+channels on both sides (no per-request allocation once warm). Transport recipe from
+SECOND_BOX.md, as `SocketOptions::default()` now has it: TCP_NODELAY, SO_SNDBUF/RCVBUF 4 MB,
+SO_BUSY_POLL 500 µs, **TCP_QUICKACK off** (§5.4; `--quickack` re-arms it per frame), applied by
+`apply_socket_options` (raw `setsockopt`s declared `extern "C"` — no `libc` dependency). The
+hub switches its window per phase (`HetEngine::remote_set_phase_busy_poll`:
+`V41_DECODE_BUSY_POLL_US`, code default 3000, production 5000 per the hub env 2026-10-04;
+`V41_BATCH_BUSY_POLL_US`, default 50), and box 2 adapts its reader to `REQ_FLAG_DECODE`
+(`V41_B2_DECODE_BUSY_POLL_US`, default 5000, while request and reply each fit one ~64 KB
+segment; base window otherwise). Windows above `net.core.busy_read` are refused for an
+unprivileged process; the flake sets `net.core.busy_read = net.core.busy_poll = 5000` on both
+hosts (lumi-flake `modules/interconnect.nix`), not the 500 this paragraph originally cited.
 
 ## 3. Daemon: shard + executor
 
@@ -140,8 +209,15 @@ fixed shape (graph-capturable later), gate/up zero-fills the slot's `mid`, down/
 **no partials zero-fill is needed** — the M53 no-fill invariant holds. (Padding with -1 instead
 would have made `q2_k_reduce_partials_hetsplit` sum a stale partial row: `e >= 0 && remap[e] >= 0`
 is false for -1, so `take = true`.) Unowned real ids are rejected host-side with an ERROR frame
-rather than silently skipped.
+rather than silently skipped. **[2026-10-04: only without `--paged`. A paged daemon owns every
+id and pages a non-resident pick in from its own disk (§3.2).]**
 
+**[2026-10-04: the hub sets `REQ_FLAG_BATCHED` on every submit (B=1 included since 2026-10-03),
+so production requests take the batched path below at every B; the decode path is reached only
+with `V41_REMOTE_BATCHED_MULTI=0` / `V41_REMOTE_BATCHED_B1=0`. Batched passes of
+`b <= FAST_CHAIN_MAX_B` = 16 rows run the fused short chain (`V41_B2_FAST_CHAIN`, default on:
+one upload, one fused group + work-item builder `b2_moe_group_wi_builder`, f16 reduce straight into
+pinned host memory; bit-identical, `tests/remote_experts_fast_chain.rs`).]**
 Two launch paths, chosen by `b <= --decode-max-b` (default 4):
 * **decode**: per token `moe_gate_up_batch_hetsplit` (grid 2304/8 × 6) → `q8k` (mid) →
   `moe_down_batched_hetsplit`; 3 launches/token, no host sync (the wire already carries Q8_K, so
@@ -166,6 +242,32 @@ the client can split its round trip into link time and daemon time (`RemoteParti
 While idle the compute thread issues one trivial launch every `--keep-warm-us` (default 250 µs)
 so the iGPU does not downclock between two layers' requests — worth 4x at B=1, see §5.3.
 
+### 3.1 Daemon CLI (`crates/deepstrix-expertd/src/main.rs`) (corrected 2026-10-04)
+
+| flag | default | what |
+|---|---|---|
+| `--model PATH` | `$V41_MODEL`, else `~/.cache/deepstrix/models/dsv4.1f` | HF checkpoint |
+| `--experts SPEC` | (required unless `--experts-file`) | load assignment, `Assignment::parse` grammar above |
+| `--experts-file PATH` + `--experts-k K` | — | frequency-ranked placement file (`Assignment::from_placement_file`, the `parse_hot_expert_file` format); budget `K × N_LAYER` by global count rank, so per-layer counts vary. Takes precedence over `--experts`; `--experts-k` is required with it |
+| `--paged` | off | catch-all paged tier (§3.2): after the load every layer serves all 384 experts, paging misses from this box's disk. The HELLO bitmap stays the load assignment |
+| `--listen ADDR` | `0.0.0.0:7431` | |
+| `--max-batch N` | `B_MAX` = 1024 | executor scratch rows (1..=1024) |
+| `--decode-max-b N` | 4 | `b <=` this takes the per-token decode chain unless the request sets `REQ_FLAG_BATCHED` |
+| `--load-threads N` / `--load-batch N` | 8 / 32 | parallel readers / experts staged per device copy at load |
+| `--busy-poll US` | 500 | base `SO_BUSY_POLL` window (`SocketOptions::default`) |
+| `--sndbuf N` / `--rcvbuf N` | 4194304 | socket buffers |
+| `--quickack` / `--no-quickack` | off | re-arm TCP_QUICKACK per frame (§5.4) |
+| `--keep-warm-us US` | 250 | idle keep-warm launch period, 0 = off (§5.3) |
+| `--trace FILE` / `--machine NAME` | — / hostname | perfetto trace (§5.6) |
+| `--verbose` (`-v`), `--log-every N` | off / 0 | per-request lines / periodic percentiles |
+
+Signals: `SIGUSR1` flips hits-first (`V41_B2_HITS_FIRST`), `SIGUSR2` re-reads the knob file at once.
+`V41_EVTRACE_DIR` turns on the event trace (`evtrace::init_env("b2")`). The production command line
+is an out-of-repo launcher (`~/b2_run_expertd.sh`, edited in place by `scripts/patch_b2.py`,
+which on 2026-09-16 made a uniform `--experts L0-L39:230-383` with no placement file the
+default); the current box-2 command line and env were not captured for the 2026-10-04 audit.
+
+As written 2026-09-14:
 CLI: `deepstrix-expertd --model /weights/dsv4.1f --experts L20-L32 [--listen 0.0.0.0:7431]
 [--max-batch 1024] [--decode-max-b 4] [--load-threads 8] [--load-batch 32] [--verbose]
 [--log-every N] [--busy-poll 5000] [--keep-warm-us 250] [--sndbuf N] [--rcvbuf N] [--quickack]`.
@@ -174,6 +276,88 @@ Box 2 recipe used for every number below:
 ~/b2-dev.sh ./target-b2/release/deepstrix-expertd --model /weights/dsv4.1f \
     --experts L20-L32 --listen 0.0.0.0:7431 --load-threads 8 --busy-poll 5000 --keep-warm-us 250
 ```
+
+### 3.2 Miss path: the catch-all paged tier (`--paged`) (added 2026-10-04)
+
+`ExpertShard::enable_paging` (after the normal load, so the pool starts warm with the assigned
+set) marks every expert of every layer servable and pages a non-resident pick from box 2's own
+NVMe. The advertised HELLO bitmap is left as loaded. Pieces, all in `remote_experts.rs`:
+
+* **One shard-wide pool** (`ShardPool`): a single global LRU over all layers (`V41_B2_GLOBAL_POOL`,
+  default on: decode since 2026-09-15, 714eabc; prefill too since 2026-09-18, eb002bb; `0` =
+  per-layer region search). `V41_B2_POOL_FLOOR` (default 0)
+  is the fraction of its region a layer keeps against global eviction.
+* **Two-class LRU** (`V41_B2_SCAN_CLASS`, default on): prefill-class slots age ahead of
+  decode-class ones, so a prefill sweep evicts its own pages before decode's.
+* **Prefill staging band** (`V41_B2_PREFILL_STAGE`, default 384 = one layer union; 0 = off):
+  slots at the end of the pool only prefill-shaped passes claim.
+* **Pinning** (`REQ_FLAG_PIN`/`RELEASE`, hub `V41_B2_PIN`): an expert box 2 reported held is not
+  evicted until the hub releases it; `V41_B2_PIN_RESERVE` main-band slots are never pinnable
+  (default 192 with staging, 480 without = `PIN_RESERVE_MIN`).
+* **Mode-aware eviction** (`V41_B2_MODE_EVICT=1`, default off; ignored unless
+  `V41_B2_PREFILL_STAGE=0`, the two-class LRU and the global pool are all on): a prefill phase
+  takes at most `V41_B2_PREFILL_BUDGET` (3500) decode victims, then evicts its own oldest pages; a
+  long job's phase (`REQ_FLAG_LONG_JOB`) may take `V41_B2_PREFILL_BUDGET_LONG` (unlimited) and
+  evicts its own pages farthest-next-use first; `V41_B2_RESTORE=1` reads the evicted decode
+  experts back after the phase.
+* **Reads**: zero-copy O_DIRECT into GTT staging (`V41_B2_ODIRECT`, default on; needs the GPU
+  MXFP4 repack `V41_B2_GPU_REPACK`, default on, and an aligned staging), split across two drives
+  when `V41_EXPERT_MIRROR_DIR` names a complete mirror (`V41_EXPERT_MIRROR_FRAC`, `V41_B2_ROUTE`).
+* **Background readers**: PREFETCH words and early paging (`V41_B2_EARLY_PAGE`, default on: a
+  queued request's misses start under the current request's tail) run on `V41_B2_PREFETCH_PAR`
+  readers into `V41_B2_PREFETCH_SETS` staging sets, in `V41_B2_SPEC_CHUNK_KB` pieces that yield
+  to demand reads.
+* **Hits-first** (`V41_B2_HITS_FIRST`, default off; `SIGUSR1` flips it): on the batched path the
+  resident experts run while the misses read, then a second pass computes the misses. **Park**
+  (`V41_B2_PARK`, default off; needs a hits-first two-pass request with `REQ_FLAG_OOO` and no
+  merged partner) serves and answers requests queued behind a paging one on a second executor.
+* **Merge** (`V41_B2_MERGE`, default on): a queued request for the same layer runs in the same
+  pass; with `REQ_FLAG_PARTNER` box 2 waits up to `V41_B2_MERGE_WAIT_US` (400) for it.
+* **Reporting**: each reply carries `t_page_us`, `n_miss`, the miss mask, and on request the
+  residency map / pin block the hub's mirror (`het::b2_mirror`) is built from.
+
+### 3.3 Box-2 knobs (added 2026-10-04)
+
+Code defaults from `remote_experts.rs` (`pub mod knobs` and the `b2_*` fns). LIVE = re-read from
+the knob file (`V41_KNOBS_FILE`, else `V41_B2_KNOBS`, default `~/expertd-knobs.txt`) every second
+and at once on `SIGUSR2`, by env name or the short key; the rest read their env once.
+
+| knob (file key) | default | gates |
+|---|---|---|
+| `V41_B2_MERGE` (`merge`) | on, LIVE | run a same-layer queued request in the same pass |
+| `V41_B2_MERGE_WAIT_US` (`merge_wait_us`) | 400, LIVE | wait for a promised `PARTNER` |
+| `V41_B2_MISS_PAR` (`miss_par`) | 1 (1..16), LIVE (lower only) | concurrent miss reads per layer; startup value sizes staging |
+| `V41_B2_PARK` (`park`) | off, LIVE | park a paging request (above) |
+| `V41_B2_COALESCE` (`coalesce`) | off, LIVE | two preads per expert instead of eight; `V41_B2_COALESCE_CHECK=1` byte-compares |
+| `V41_B2_ROUTE` (`route`) | `split`, LIVE | drive per read: `split` = every read split by `mirror_frac`; `urgency` = demand and certain reads wholly from the mirror, speculative ones from the primary (needs a complete mirror) |
+| `V41_B2_PREFILL_ROUTE` (`prefill_route`) | `split`, LIVE | under `route=urgency`, stripe prefill demand reads across both drives (`mirror` = old) |
+| `V41_EXPERT_MIRROR_FRAC` (`mirror_frac`) | 0.6, LIVE | share of a split read from the mirror |
+| `V41_B2_FAST_CHAIN` (`fast_chain`) | on, LIVE | fused short chain for batched passes of <= 16 rows |
+| `V41_B2_PREFILL_BUDGET` (`prefill_budget`) | 3500, LIVE | mode-aware eviction: decode victims per prefill phase |
+| `V41_B2_PREFILL_BUDGET_LONG` (`prefill_budget_long`) | unlimited (0 = off), LIVE | same, for a long job's phase |
+| `V41_B2_ENCODER_VICTIMS_FIRST` (`encoder_victims_first`) | on, LIVE | rank decode victims by the prefill's layer sweep |
+| `V41_B2_EVTRACE_DEV` | off, LIVE | per-request GPU span to evtrace Tier B |
+| `V41_B2_GLOBAL_POOL` | on | one shard-wide LRU |
+| `V41_B2_POOL_FLOOR` | 0 (0.90 until 2026-09-16) | fraction of its region a layer keeps against global eviction |
+| `V41_B2_SCAN_CLASS` | on | two-class LRU |
+| `V41_B2_PREFILL_STAGE` | 384 | prefill staging band, 0 = off |
+| `V41_B2_PIN_RESERVE` | 192 (480 without staging) | unpinnable main-band slots |
+| `V41_B2_ASSERT_PINNED` | off | panic on a pin violation (else counted and logged) |
+| `V41_B2_MODE_EVICT` | off | mode-aware eviction (conditions above) |
+| `V41_B2_RESTORE` | off | read evicted decode experts back after a prefill phase |
+| `V41_B2_HITS_FIRST` | off (`SIGUSR1` flips) | hits-first two-pass |
+| `V41_B2_EARLY_PAGE` | on | start a queued request's misses early |
+| `V41_B2_ODIRECT` | on | O_DIRECT zero-copy page-ins (box 1's `V41_EXPERT_ODIRECT` is a different knob, default off) |
+| `V41_B2_GPU_REPACK` | on | MXFP4 repack on box 2's iGPU |
+| `V41_B2_PREFETCH_PAR` / `_SETS` / `_RESERVE` | 4 / 8 / 1 | background readers / staging sets / readers kept for certain reads |
+| `V41_B2_SPEC_CHUNK_KB` | 1024 (0 = unchunked) | background read piece size |
+| `V41_B2_DECODE_BUSY_POLL_US` | 5000 (0 = never adapt) | reader window for small decode requests |
+| `V41_B2_DECODE_DOWN` | off | diagnostic: per-token decode down kernel on the batched path |
+
+Hub-side, in the same file: `V41_REMOTE_BATCHED_MULTI` / `V41_REMOTE_BATCHED_B1` (both default on;
+see the BATCHED flag), `V41_MASK_DBG` (count live picks a masked submit drops). The box-2 env of
+the running daemon was not captured on 2026-10-04, so which of these production overrides is not
+recorded here.
 
 ## 4. Hub client (`RemoteExpertClient`)
 
@@ -188,6 +372,12 @@ if let Some(t) = ticket { let p = rc.wait(t)?; /* p.f16(): &[u16] b×5120 */ ...
 `submit` masks non-owned picks, encodes the frame into a recycled buffer and hands it to a
 writer thread (returns in ~µs at decode sizes; the 6 MB memcpy at B=1024 costs ~0.5 ms);
 `wait` blocks on the reader thread's channel. Several tickets may be outstanding (FIFO).
+**[2026-10-04: replies are matched by `seq`, not FIFO (§2). Production does not call `submit`:
+the arena/prefill driver calls `submit_dispatch` (masked by the HELLO bitmap only when box 1
+computes part of the layer, adds `PARTNER`, `RESID`/`PIN` from `b2_mirror`), the serial decode
+path `submit_unmasked`; `submit_inner` adds `BATCHED`, `HINTS`, `PREFETCH`, `RELEASE`, `OOO` and
+`DECODE`/`LONG_JOB`. `RemoteExpertClient::ensure_connected` redials a broken link at the start of
+the next request.]**
 
 ## 5. Measurements
 
@@ -223,6 +413,10 @@ Executor scratch at max_batch 1024: 237 MB.
 **Bit-identity across the boxes**: `--check-layer {20,24,27} --check-n 4` loads 4 of the daemon's
 experts onto box 1's iGPU and compares — **f32 and f16 bit-identical at B=1, 4 and 64** every
 time. Same kernels, same gfx1151, same Q8_K bytes on the wire ⇒ no tolerance needed.
+**[2026-10-04: B=4 on the daemon's decode branch has mismatched since 2026-09-19
+(16,769/20,480 f32 values against a static 3-expert daemon; still OPEN in KNOWN_BUGS.md,
+"`deepstrix-expert-bench --check-layer` MISMATCHES at B=4"). Same-path checks with `--batched`
+were bit-identical on 2026-09-21.]**
 
 Per-layer round trip (client busy-poll 5000 µs, `--gap-us 1000` = a realistic 1 ms of hub
 attention between layers; `link = rtt − daemon server time`):
@@ -374,8 +568,15 @@ mandatory, and it is as accurate as the offset (µs) rather than NTP's ms.
 
 The SSD spans currently cover the *load* reads (the daemon serves exactly its assignment, so there
 is no serve-time miss path yet); when the cold tier lands they are the same spans on the same track.
+**[2026-10-04: the paged tier exists (§3.2); per-request paging also travels in the reply
+(`t_page_us`, `n_miss`) and per read in evtrace (`V41_EVTRACE_DIR`).]**
 
 ## 6. What remains to integrate (proposed call sites)
+
+**[2026-10-04: historical. All of this is integrated (see Status), with a different ownership
+model: box 1 owns each layer's hot set under the T2 partition, box 2 is the paged catch-all, and
+box 2's partial is added after the MoE (`forward_prefill`, `V41_REMOTE_PARTIAL_ASYNC` for the
+async upload). The placement file in the last paragraph exists as `--experts-file`.]**
 
 Nothing in `forward_layer.rs` / `forward_prefill.rs` was modified. The hub needs, per layer,
 (a) to send its picks + Q8_K activations to the remote at router time, (b) to exclude the
@@ -452,6 +653,9 @@ straightforward extension of `Assignment::parse`.
 
 ## 7. Known limits / next levers
 
+**[2026-10-04: the decode-path and miss bullets below are done: every hub request takes the
+batched path (`REQ_FLAG_BATCHED`, §3) and box 2 pages misses (§3.2).]**
+
 * Decode path serialises tokens (B=4 = 4 × B=1); a DSpark verify batch at B=3–4 should go
   through the batched path or a graph-captured 4-token decode chain — measure with
   `--decode-max-b 1`.
@@ -471,6 +675,11 @@ straightforward extension of `Assignment::parse`.
   prefill batches are not reaching link rate; unexplained, worth a look before B≈256 chunks matter.
 
 ## 8. Placement note after CED (2026-09-14)
+
+**[2026-10-04: superseded by the paged tier. Box 2 boots from a uniform per-layer range (the
+2026-09-16 launcher default `L0-L39:230-383`, `scripts/patch_b2.py`) and pages the rest; the
+global pool moves capacity between layers, so the boot assignment only sets initial residency
+and the advertised prefill set.]**
 
 CED prefill (now default) touches only the **20 encoder layers** plus a 128-token decoder replay,
 so the prefill-relevant expert set is ~144 GB, not 289 GB. The share measured above (L20–L32,

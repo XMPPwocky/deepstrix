@@ -1,5 +1,7 @@
 # M50 — Full Batched Prefill: Progress
 
+> **Status (docs audit 2026-10-04):** HISTORICAL (V4-Flash, May 2026). `forward_layer_pair_mode` was renamed `forward_layer_standalone_graphs` (763adcd, 2026-05-29); the "Remaining for Phase 2" list was not maintained after the oracle passed. V4-Flash was dropped as a direction on 2026-09-24; the V4.1 prefill paths are `forward_prefill.rs` (`forward_prefill_pipelined`, `PrefillJob`) — see `v41/ARCH_SPEC.md`.
+
 ## What this is
 
 V4-Flash decode is single-token at 27-28 tok/s (35.6 ms floor). For prefill (turning N prompt tokens into N forward-passes worth of KV cache + comp_kv state), naive sequential decode means N × 36 ms. A 200-token prompt = 7.2 seconds wall before generation starts.

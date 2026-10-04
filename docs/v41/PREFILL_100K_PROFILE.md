@@ -1,5 +1,12 @@
 # Prefill @100K, measured stage profile (2026-09-14)
 
+> **Status (docs audit 2026-10-04):** the doc corrects itself further down; read it to the end.
+> The "PREFILL IS iGPU-MoE-BOUND" section and its ~890 tok/s projection are withdrawn by "RESOLVED
+> AGAINST THIS DOCUMENT" (stage timings include intra-stage idle), which "CORRECTION 2" then
+> revises (box 2 runs the same kernels on more experts and emits no stages). Names such as
+> `project_v41_prefill_moe_roofline_2026-09-14`, `reference_rocprofv3_kernel_trace` and
+> `project_iq2_roofline_2026-06` are the owner's memory notes, not files in the repo.
+
 First run of `DEEPSTRIX_PREFILL_PROFILE=1` at the context the goal names. Indexer
 ON (`V41_INDEX_K=1`), box 2 on the adopted 260/68 placement.
 

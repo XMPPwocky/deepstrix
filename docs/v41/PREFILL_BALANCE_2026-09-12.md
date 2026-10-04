@@ -1,5 +1,11 @@
 # Prefill device balance at 32K — MEASURED 2026-09-12 (and it inverts the June finding)
 
+> **Status (docs audit 2026-10-04):** historical V4-Flash measurement. V4-Flash was dropped as a
+> direction on 2026-09-24; its code (`bench_prefill_chunked`, `DGPU_HOT_EXPERTS`) is still on main
+> (the removal commits exist only on branch `worktree-architecture-review`). PLAN §5.3 (stream
+> experts to the dGPU) has no implementation on main; V4.1 prefill runs CED (`het/forward_prefill.rs`)
+> with experts paged over two boxes.
+
 **The dGPU is the prefill ceiling, not the iGPU.** This kills the "stream experts to the dGPU
 for its spare FLOPs" idea on V4-Flash, and removes most of the V4-Flash motivation for
 super-chunk layer-major prefill. It does not invalidate the V4.1 plan, but it does invalidate a

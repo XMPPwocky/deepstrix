@@ -1,5 +1,7 @@
 # Integration brief — kernel-ideas sweep 2026-09-26
 
+> **Status (docs audit 2026-10-04):** DONE — the six family commits are on main (e282846, c997165, 3e5347b, 35f2515, 1c5972f, cba1b00; per-item record in `LEDGER.md`). The `LazyLock` env-read knob convention below predates `crates/v4flash-kernels/src/knobs.rs` (2026-10-01, "one implementation for every `V41_*` setting"); the sweep knobs still use it and are not in the `knobs.rs` tables (not live). New knobs go through `knobs.rs`.
+
 You are integrating the CONFIRMED kernel wins of ONE family from `scratch/kernel_ideas/LEDGER.md`
 into the production tree of this worktree (`/home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26`,
 branch `worktree-kernel-ideas-2026-09-26`, base 361d4f9 = the deployed hub). The owner's decision:

@@ -1,11 +1,19 @@
 # DSpark: complete state after the correctness pass (2026-09-15)
 
+> **Status (docs audit 2026-10-04):** historical; this is the LEGACY single-sequence verify
+> (`V41_DSPARK`, `V41_VERIFY_*`). Production DSpark verifies on the multistream arena
+> (DSPARK_ARENA_PLAN.md). The drafter conclusion ("matches the reference `noseed` config") was
+> overturned: the 09-27 parity work found a real drafter bug (its shared expert ran on the
+> attention input's quantization, fixed in 761e46f) and reached E 4.348 vs the reference 4.382.
+> `V41_DSPARK_XCHECK` never existed in code: the cross-check runs with `V41_VERIFY_PROBE=K` +
+> `V41_VERIFY_BATCHED=1`.
+
 ## What now works (proven at the logit level, not greedy)
 
 - **Verify fidelity is measured with KLD, not cosine.** KL(decode‖verify) over the
   row-0 softmax. Cosine on raw logits is scale-sensitive and ignores the softmax;
   KLD is the distribution-level truth. Instrument: `V41_DSPARK_XCHECK=1` emits
-  `mean_kld_nats`.
+  `mean_kld_nats`. **[2026-10-04: no code reads `V41_DSPARK_XCHECK` (none ever did). The cross-check runs whenever the verify probe runs batched: `V41_VERIFY_PROBE=K` with `V41_VERIFY_BATCHED=1` (`engine_worker.rs`).]**
 - **The verify reproduces decode's distribution.** Decode chain, any context
   length: **KLD 0.0005 nats, argmax agree 0.99–1.00**. This required fixing three
   real bugs and one addressing mismatch (below).
@@ -90,6 +98,8 @@ agreement is a STRUCTURAL difference, not f32 rounding (which is ~1e-4).
 
 Matches the reference `noseed` config (E≈3.08 shadow, fresh ring). Prefill window
 seeding is unimplemented and worth +1.1 E (oracle noseed 3.281 → base 4.382).
+**[2026-10-04: overturned, see Status: the comparison was on different spans; the shared-expert
+bug (761e46f) was real.]**
 
 ## Validation still owed — and it may REDEFINE the blocker
 

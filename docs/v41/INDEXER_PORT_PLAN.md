@@ -1,5 +1,16 @@
 # V4.1 sparse indexer port — plan
 
+> **Status (docs audit 2026-10-04): IMPLEMENTED, S0–S3.** S4 (measure prefill at 32K / 100K):
+> 100K was measured with the indexer on 2026-09-14 (docs/v41/PREFILL_100K_PROFILE.md), and the
+> 2026-09-14 status below re-scoped the port away from prefill. S1 (sparse gate on index
+> sources) and S2 (shared selection) behind `V41_INDEX_K=1`; S3 (§1.5 candidate pool, `candidate_blocks.rs`, c2f32e7 2026-09-18) behind
+> `V41_CANDIDATE_POOL=1`, wired in decode (`het/forward_layer.rs`) and prefill
+> (`het/forward_prefill.rs`). Both knobs: code default off, production sets 1 (hub env
+> 2026-10-04). Corrected below: S2 is keyed on `config::index_source_of(layer)`, not
+> `kv_source_of` (3409948, 2026-09-18); index-K rows are 80 B (`E2M1_KEY_ROW_BYTES`), not 68; the
+> `ATTN_MIXED_MAX_KEYS` truncation risk happened and was closed 2026-09-18. The `--ctx` cap is
+> `attention::V41_MAX_CTX` = 368640. Line numbers cited in this doc have all moved.
+
 > **STATUS 2026-09-14: DO NOT START THIS AS A PREFILL PROJECT.**
 >
 > The premise below ("this gates the 1000 tok/s prefill goal") was WRONG. It was
@@ -168,7 +179,8 @@ semantics exactly — per-head dot, ReLU, then head-weighted sum — and is gene
    query's newest position pinned (+inf), top-2048 blocks, mask = union of
    selected blocks (16,384 positions). Entirely new.
 5. Index K lives only on the 4 **kv_source** layers (2, 8, 14 at ratio 2; 20 at
-   ratio 1), stored E2M1 + E8M0 per 32 = 68 B/entry.
+   ratio 1), stored E2M1 + E8M0 per 32 = 68 B/entry (reference packing; the engine row is
+   80 B, `index_kv_e2m1::E2M1_KEY_ROW_BYTES` — corrected 2026-10-04).
 
 ## The free correctness oracle
 
@@ -232,6 +244,9 @@ Gate still false; nothing calls them. Proof: server starts, VRAM/GTT delta match
 >
 > STILL TO DO for S1: (b) the indexer Q path (`wq_b` -> RoPE -> fp4) + score + top-512 + the causal
 > block mask; (c) the SELECTION-SET oracle; (d) then flip the gate.
+>
+> **[2026-10-04: the path below is the abandoned partial copy (PLAN.md header); the reference used
+> by `scripts/v41_oracle/` is `~/.cache/deepstrix/models/dsv4.1f/inference/model.py`.]**
 >
 > **S1 SPEC, transcribed from the reference** `/persist/lumi/models/dsv4.1f-full/inference/model.py`
 > (`Indexer.forward`, :528-565). Implement against THIS, not from memory — three of these
@@ -300,7 +315,9 @@ Proof: **bit-identical at 512 tokens**; divergence only above it.
 `topk_idxs`. Proof: still bit-identical at 512 tokens; measure the 32K decode
 delta (expect the +18 ms/token to go away).
 
-**S3 — §1.5 candidate pool.** Layer 20 builds it; 24/28/32/36 mask against it.
+**S3 — §1.5 candidate pool.** Layer 20 builds it; 24/28/32/36 mask against it. **[2026-10-04:
+implemented — `candidate_blocks.rs` (c2f32e7, 2026-09-18), `V41_CANDIDATE_POOL=1`; production sets
+it. No long-context quality result is recorded in this doc.]**
 Proof: CPU oracle only (no bit-exact test exists above 512 tokens) — use
 `dense_index.py`'s teacher-forced NLL and attention-mass probes, with the
 duplicate-row control, since two equally-correct runs of this model diverge.
@@ -318,7 +335,10 @@ duplicate-row control, since two equally-correct runs of this model diverge.
   do not own it — a lifetime/ownership question the current state model does not
   express.
 * `ATTN_MIXED_MAX_KEYS` currently clamps `n_index_comp`; check it does not
-  silently truncate the store at long context.
+  silently truncate the store at long context. **[2026-10-04: it did — past 131,200 tokens the
+  indexer scored only the first 131,200 compressed positions. Closed 2026-09-18: the clamps are
+  hard errors and admission uses `attention::indexer_max_scored_keys` (doc comment on
+  `ATTN_MIXED_MAX_KEYS`).]**
 * At 100K the dense **scores scratch** is ~3.2 GB/lane; if S1-S3 leave any dense
   path reachable at long context it will OOM rather than merely be slow.
 
@@ -350,7 +370,9 @@ Also fixed en route: the three per-token indexer scratch buffers were gated on t
 `indexer_ever_fires()` (false for v41), so the gather failed with `active_comp_kv_b has 1
 f16, need 4718592`. New `attention::indexer_scratch_needed()` ORs in `V41_INDEX_K=1`.
 NOT applied to `attn_max_scored_keys` — only 8 of 40 layers gather under V4.1, so the
-scores-scratch and `--ctx` caps must stay dense-sized until S2.
+scores-scratch and `--ctx` caps must stay dense-sized until S2. **[2026-10-04: done after S2 —
+sizing uses `attention::scored_keys_are_gathered`, true for every compressed V4.1 layer under
+`V41_INDEX_K=1`.]**
 
 ## S1 FUNCTIONAL ON PREFILL 2026-09-14 — measured +7.4% at 32K
 
@@ -368,7 +390,8 @@ is ~6%. **S2 (shared selection — reuse layers consume the most recent source's
 `topk_idxs`) is what turns this into the real win**, and it matters more at 100K where
 attention is ~59% of prefill.
 
-Enable with `V41_INDEX_K=1`. Still default OFF.
+Enable with `V41_INDEX_K=1`. Still default OFF. **[2026-10-04: still the code default; production
+sets `V41_INDEX_K=1` and `V41_CANDIDATE_POOL=1`, hub env 2026-10-04.]**
 
 SEPARATE REGRESSION TO CHASE: the 32K prefill baseline moved 393 -> 271 tok/s between the
 window sweep and this run. Both arms above share a config so the +7.4% is sound, but
@@ -383,6 +406,13 @@ source publishes its gathered rows and the store group it belongs to
 matches reuses `active_comp_kv` as-is — no rescore, no regather. Guarding on the store
 group is what stops a selection leaking across a kv-source boundary (layer 8 opens a new
 store, so layer 2's selection must not carry into it).
+
+**[Corrected 2026-10-04: the key is now `config::index_source_of(layer)`, the nearest INDEX
+source at or below the layer (3409948, 2026-09-18), in decode (`forward_layer.rs`, `s2_reuse`)
+and prefill (`forward_prefill.rs`, `indexer_saved_store`). Layers 20/24/28/32/36 share KV source
+20, so the store-group key cannot tell which of them published, and a reuse layer could
+consume an older source's selection (rationale on `config::index_source_of`). Read "store
+group" in this section and the next as "index source".]**
 
 Validated:
 * 37-token prompt (n_comp ~293 < INDEXER_TOP_K): output BIT-IDENTICAL to dense and
@@ -453,6 +483,8 @@ Verified safe below the gate: short-prompt output BIT-IDENTICAL to dense (sha
 NO cross-chunk reset is needed, and this is why: every store group's FIRST layer
 (2, 8, 14, 20) is itself an index source, so a group's selection is always refreshed
 within the chunk before any reuse layer can consume it. Layers 0-1 have no compressor.
+**[2026-10-04: under the `index_source_of` key each group starts at its index source, so the
+argument still holds.]**
 
 **WIN NOT YET MEASURED.** 32K gave 474 tok/s (S1+S2) vs 488 (dense), but dense itself
 swung 399 -> 488 tok/s between runs, so this is inside run-to-run variance and proves

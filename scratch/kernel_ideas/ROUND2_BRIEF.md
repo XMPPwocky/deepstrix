@@ -1,5 +1,7 @@
 # Round 2 — pattern-driven kernel wins (one agent, sequential)
 
+> **Status (docs audit 2026-10-04):** DONE 2026-09-27, all on main. (a) d18cde2 `V41_GRID_PAD` on four launch sites; (b) 343896b crossover scan, four gates moved (`V41_F16X_256` from 192 rows, `V41_GEMV_BPACK_Z16` only n_rows >= 2048 or b >= 48, `V41_IDX_GATHER_B128` from b = 3 with the pad, `V41_CAND_THRESH_ILP` up to b = 32); (c) 0193166 `V41_F16_MV_Z16`; (d) 4f773bf `V41_DEC_SKIP_DEAD` + `V41_DEC_FUSE`; (e) 0fa2ba5 measured LOSS, `V41_DENSE_I8X` not added. 6770ff1 = final test pass. Correction to the context line below: not all 28 round-1 CONFIRMED items were integrated — #1 two_lane_merged_dense EXCLUDED, #13 flash_splitk and #14 smwsum_pf2 not wired (dominated by #9), #21 kwide_c8 SKIPPED, #6 wl_c8dn2 only as its dn2 part; the 24-knob count is right. Per-row record: `LEDGER.md` status block.
+
 Context: `LEDGER.md` (round 1: 81 ideas, 28 confirmed, all integrated on this branch and DEPLOYED
 2026-09-27 00:38 UTC behind 24 `V41_*` knobs — read the family commit messages e282846, c997165,
 3e5347b, 35f2515, 1c5972f, cba1b00 for what is now production). `INVENTORY.md` = kernel map.

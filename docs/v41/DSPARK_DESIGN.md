@@ -1,6 +1,17 @@
 # DSpark: the drafter is three transformer layers, and every kernel exists
 ### checkpoint inventory + build plan, 2026-09-15
 
+**Status (2026-10-04): inventory current, build order superseded.** The checkpoint facts match
+the code (`MTP_BLOCK` = 5, `MTP_WINDOW` = 128, `MTP_SRC_LAYERS` = [37, 38, 39], `het/mtp.rs`). The
+build order V/A below (batched-decode verify, "accept the longest matching prefix", rollback that
+REQUIRES `V41_T2_CATCHALL=2`) was replaced by the multistream-arena verify with rejection sampling
+(DSPARK_ARENA_PLAN.md); production runs `V41_T2_CATCHALL=1` with the T2 partition (hub env
+2026-10-04). `forward_mtp_stage` was never written: the drafter forward is
+`HeterogeneousEngine::dspark_draft` (one bidirectional B=5 pass). "Run autoregressively" in the
+inventory is wrong; the section further down ("not autoregressive") is right. E = 1.93 / 2.77 /
+3.57 / 4.94 is the pre-EOS (<= 330, 69-step) subset; over all 89 steps K=5 gives 4.382
+(DSPARK_ACCEPTANCE_INVESTIGATION.md).
+
 ## What is actually in the checkpoint
 
 `mtp.0`, `mtp.1`, `mtp.2` — **2.65 / 2.57 / 2.71 GB, 7.93 GB total**, so the whole
@@ -14,7 +25,8 @@ and only the exit layer has the final norm and heads:
     mtp.1   layer                                             (middle)
     mtp.2   layer -> norm -> confidence_head + markov_head     (exit)
 
-Run autoregressively to emit K draft tokens. Each layer is otherwise a standard
+Run autoregressively to emit K draft tokens **[2026-10-04: wrong; one B=5 pass emits all five,
+see below]**. Each layer is otherwise a standard
 layer, and every tensor maps onto a kernel the engine already runs:
 
     main_proj.weight      F8_E4M3  (5120, 15360)   <- 3 x 5120 residuals -> 5120

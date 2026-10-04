@@ -1,5 +1,7 @@
 # IQ3_S gate/up kernel plan (unsloth UD-IQ3_XXS blk.26)
 
+> **Status (docs audit 2026-10-04):** IMPLEMENTED and MERGED to main (91b4053, 2026-09-03); kernels, wrapper and `tests/iq3_s_oracle.rs` are on main. The UD-IQ3_XXS Vision-Exp model was the production model measured in `FP8_KV_IMPL_2026-09.md` step 5 (2026-09-10); which of the §9 e2e items below were each run is not recorded. ds4 patch 0012 was never written (the stack ends at 0011). `build.rs` now defaults to gfx1201 + gfx1151 only. V4-Flash was dropped as a direction on 2026-09-24.
+
 Status: IMPLEMENTED on branch `iq3s-kernel`, 2026-09-03 (steps 1–7 of §7;
 oracle landed as `tests/iq3_s_oracle.rs`, not `iq3_s_pair_oracle.rs`).
 Outstanding: §3.11 ds4 patch 0012 (deferred until a dump is wanted) and the

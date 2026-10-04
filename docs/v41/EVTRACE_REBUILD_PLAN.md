@@ -1,7 +1,13 @@
 # Tracing rebuilt around evtrace
 
 Status: PLAN rev 3, APPROVED by the architect review (round 3, 2026-10-01);
-the round-3 notes are in section 6. Owner's call, 10-01:
+**PARTLY BUILT (docs audit 2026-10-04): P0 (2871b69), P1 (849dd90) and P3 (ee1fe74) built;
+P2, P4 and P5 not built.** No `EvtLayer`, `evtrace::Span`, `span` or `instant` kind exists;
+`evt2perfetto.py` still writes Chrome JSON; `DeviceTimingExporter`, `ExpertdTracer` and
+`TrackExporter` are still in the tree; `deepstrix-expertd` has no `tracing-subscriber`
+dependency. The kinds, ring and dump mechanics as built differ from section 2: see section 8.
+Production runs with `V41_EVTRACE_DEV=0` (Tier B device timing off) — section 8.
+The round-3 notes are in section 6. Owner's call, 10-01:
 keep building on evtrace rather than go back to emitting perfetto directly,
 with our own tracing layer for the CPU side.
 
@@ -25,7 +31,7 @@ the readers (R2.6); P3 causality rules on host stamps (R2.7); and R2.8-R2.13.
   `expertd --trace`). `tracing-perfetto` survives in one test.
 - **They drift.** The hub exporter was drained only on the serial decode path;
   on the arena path it recorded nothing for weeks (fixed 10-01, 0773ad1..464146e,
-  not deployed).
+  not deployed; both on main since — note 2026-10-04).
 - **evtrace is where the analysis lives**: request joins across the boxes by
   seq, the clock-offset fit, percentiles over 40-field records. It has no
   strings, no CPU spans, no device intervals (device time only as per-step sums
@@ -462,3 +468,49 @@ Where it differs from sections 2.4 / 6:
   default 600 ~ the hub's): conversion vs `elapsed` twins, causality, anchors,
   every record call's latency early vs late -- run with
   `V41_EVTRACE_DEV_BUFS=2` and `=6` to compare -- and the anchors' bracket bound.
+
+## 8. As built vs sections 2-3 (docs audit 2026-10-04)
+
+Checked against `het/evtrace.rs`, `het/evtrace_kinds.rs`, `het/evtrace_ring.rs`,
+`het/evtrace_dev.rs`, `scripts/trace_now.sh` and `scripts/evt_dump_now.sh`.
+
+**Kinds** (`evtrace::kinds()`: `meta` 0, `sys` 1, `str` 3, `site` 4, `knob` 5, `dev` 6, `cal` 7,
+plus `evtrace_kinds::ALL`: `hub_req` 10, `hub_step` 11, `hub_phase` 12, `step_dev` 13,
+`b2_req` 20, `b2_read` 21, `b2_ensure` 22, `b2_write` 23):
+- `str` (3) packs **six** bytes per f64, as an exact integer (byte i at bit 8i), not eight —
+  raw bit patterns could form NaNs a reader might not preserve.
+- `dev` is id **6**, not 31. Fields: `t_start, t_end, name, device, stream, step, unit, layer,
+  lane, t_host, q_us`. `name` / `device` / `stream` are string ids (no numeric 0/1/2 device code);
+  `t_host` is the host's RAW stamp before it recorded the start; `q_us` replaces `quality_us`.
+- `step_dev` is id **13**, not 32.
+- `cal` (7) is new: one device-clock calibration anchor per record (`t, device, ok, spin_us,
+  q_us, resid_us, tol_us, slope_ppm, slope_q_ppm, link_ms, anchors`).
+- `span` (30) and `instant` (33) do not exist (P2 not built). `site` (4) is defined but nothing
+  registers span callsites yet.
+
+**P1 ring and dumps** (`evtrace_ring.rs` module doc):
+- No Tier B channel. A producer serializes into its own thread's buffer (`emit_b`); a full buffer
+  is copied into the ring's open block if the ring lock is free; the Tier B thread drains every
+  registered buffer every 100 ms and is the only thread that seals or evicts. Records sit in batch
+  order, not time order; readers sort.
+- Dump file name: `<ring dir>/<role>-dump-<utc>-<pid>-<n>.evt`, streamed block by block in synced
+  4 MB pieces; pruning (`V41_EVTRACE_RING_KEEP_MB`, default 256) touches only that role's
+  `-dump-` files.
+- Ring dir: `V41_EVTRACE_RING_DIR`, default `/dev/shm/evtrace-ring` on box 2 (role `b2`) and
+  `<V41_EVTRACE_DIR>-ring` elsewhere; it may never be the Tier A dir. The hub's
+  `V41_EVTRACE_DIR` is `~/logs/evtrace` in production (hub env 2026-10-04), so its ring dir is
+  `~/logs/evtrace-ring`.
+- Request file as planned (`<ring dir>/dump-request`, seconds or `all`, temp-then-rename, polled
+  every 250 ms); `scripts/evt_dump_now.sh RING_DIR ROLE SINCE_RAW_NS` writes it and waits.
+- `trace_now.sh` has no `--dump` flag. The hub dump is on by default (`DUMP=1`; `DUMP=0` skips it,
+  `RING=` overrides the dir, windows older than `DUMP_MAX_S`, default 150 s, get none). The box-2
+  dump is opt-in (`B2DUMP=1`, `B2DUMP_MAX_S`). A box-2 dump is **not** deleted after the pull; only
+  the script's temp dirs are removed.
+
+**Production state.** Code default `V41_EVTRACE_DEV=1` (`knobs::EVTRACE_DEV`, live). Production
+sets `V41_EVTRACE_DEV=0` (hub env 2026-10-04): since 2026-10-02 03:34 UTC, after Tier B device
+timing measurably regressed decode (two-lane DSpark about +100 ms); cause not isolated.
+The section 5 default "Tier B ON in production" is therefore not what runs, and a launch without
+that setting turns the regression back on. The 2026-10-03 event-renewal change in section 7
+(`Buf::renew_used`) is one hypothesis for it and is still unmeasured. Box-2 device records
+(`V41_B2_EVTRACE_DEV`) default off.

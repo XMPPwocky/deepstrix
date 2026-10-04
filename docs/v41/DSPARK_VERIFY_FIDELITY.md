@@ -1,5 +1,10 @@
 # The verify's fidelity, measured (2026-09-15)
 
+> **Status (docs audit 2026-10-04):** historical record of the LEGACY verify (`V41_VERIFY_*`);
+> production DSpark verifies on the multistream arena (DSPARK_ARENA_PLAN.md). The row marked
+> INVALID stays invalid (KNOWN_BUGS #48). **[2026-10-04: no code reads `V41_DSPARK_XCHECK` (none ever did). The cross-check runs whenever the verify probe runs batched: `V41_VERIFY_PROBE=K` with `V41_VERIFY_BATCHED=1` (`engine_worker.rs`).]**
+> `box2_placement_164_164.txt` is an out-of-repo file.
+
 `V41_DSPARK_XCHECK` compares row 0 of the batched verify against the decode
 forward that immediately follows it: same token, same position, same prefix. Its
 logits must match. This is the DIRECT correctness test — acceptance is a proxy,

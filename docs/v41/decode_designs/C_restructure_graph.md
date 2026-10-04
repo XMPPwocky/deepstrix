@@ -1,5 +1,11 @@
 # Design C — "restructure around what V4.1 itself gives you" (independent architect, 2026-09-13)
 
+**Status (2026-10-04): partly built.** DSpark with confidence-gated K (`ms_dspark.rs`) and the
+Engram gather issued ahead (`V41_MS_ENGRAM_AHEAD`, default on) exist. The drafter's layers run on
+the iGPU with only its exit on the dGPU ("DSpark drafter loaded (layers+entry on iGPU, exit on
+dGPU)", `engine_worker.rs`), not C's preferred dGPU placement. The mHC bridge split exists only as
+`V41_MHC_SPLIT`, off by default and kept as a documented negative result (`forward_layer.rs`).
+
 Sources: ARCH_SPEC.md (all), PLAN.md §4–7b, ENGINE_PORT.md, model.py (Block, Attention/CSA2,
 Indexer, Compressor, DSparkBlock/Attention, Transformer.forward/forward_spec), engram.py.
 

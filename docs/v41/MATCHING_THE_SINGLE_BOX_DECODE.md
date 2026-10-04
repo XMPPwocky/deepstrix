@@ -1,5 +1,13 @@
 # Matching the single-box decode number (2026-09-15)
 
+> **Status (docs audit 2026-10-04): the retraction below was itself retracted, and the default
+> changed.** Bisection traced the non-deterministic output to coalesced expert reads
+> (`V41_B2_COALESCE`), not to floor 0: coalescing went default OFF the same day (fea6807), and
+> with it off floor 0.00 is bit-identical to 0.90 (sha 13af380180431910, three runs each) and
+> faster (76-86 vs 115-122 ms/tok); see the doc comment on `b2_pool_floor` (`remote_experts.rs`).
+> `V41_B2_POOL_FLOOR` has defaulted to **0** since 2026-09-16 (148044b), not 0.90. The coalescing
+> root cause (role order gate/down/up in the file) was found 2026-09-22 (cbcd181).
+
 > **RETRACTED IN PART, SAME DAY.** The `floor 0.00` decode figures below
 > (66-70 ms/tok, 15.1 tok/s) are NOT VALID: that configuration is numerically
 > unsound. With `V41_T2_CATCHALL=2` -- a constant partition, where residency
@@ -50,7 +58,8 @@ Box 2 owns 260 slots on encoder layers and **68 on decoder layers**. The trace
 says decode actually needs **202/layer encoder and 177/layer decoder**. So the
 decoder half runs a 68-slot cache against a 177-expert working set while the
 encoder half is over-provisioned — and capacity cannot migrate, because
-`V41_B2_POOL_FLOOR` (default 0.90) guarantees each layer 90% of its own region.
+`V41_B2_POOL_FLOOR` (default 0.90 **[2026-10-04: default 0 since 2026-09-16]**) guarantees each
+layer 90% of its own region.
 
 Dropping the floor lets the pool serve the working set globally. Clean arms,
 each a fresh box-2 + box-1, six same-prompt runs, last runs reported:
@@ -79,6 +88,7 @@ a 512-token generation (working set ~140 GB, fits under NO configuration) while 
 100-token generation's working set fits globally but not partitioned. **The
 floor's cost is prefill; its benefit scales with how well the working set fits.**
 
-Default left at 0.90 deliberately — the earlier session picked it as the point
+**[2026-10-04: no longer true; the default is 0 since 2026-09-16 (148044b).]** Default left at
+0.90 deliberately — the earlier session picked it as the point
 that costs prefill nothing, and lowering it is a real prefill trade that belongs
 to the operator. For decode-focused work: `V41_B2_POOL_FLOOR=0`.

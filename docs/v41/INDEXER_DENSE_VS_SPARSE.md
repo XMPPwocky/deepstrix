@@ -1,5 +1,13 @@
 # The missing CSA2 indexer: dense vs sparse compressed attention
 
+> **Status (docs audit 2026-10-04):** historical. §0's "never ported" is no longer true: the
+> indexer (S1), shared selection (S2) and candidate pool (S3) were ported 2026-09-14..18
+> (docs/v41/INDEXER_PORT_PLAN.md) and production enables them (`V41_INDEX_K=1`,
+> `V41_CANDIDATE_POOL=1`, hub env 2026-10-04; both code default off). The fidelity results that §1
+> promises ("measured fidelity is below", NLL / attention-mass) were never written into this
+> doc; it ends at the §2 cost arithmetic. `scripts/v41_oracle/indexer_ab_report.py` produces the
+> tables.
+
 **Status: measured 2026-09-13 on the CPU oracle (DeepSeek's unmodified `inference/model.py`).**
 Scripts: `scripts/v41_oracle/dense_index.py` (the switch), `indexer_ab.py` (the A/B driver),
 `indexer_ab_report.py` (tables), `indexer_cost.py` (arithmetic). Nothing here touches the GPU.
@@ -13,7 +21,8 @@ small FP4 side-attention and keep `index_topk = 512` rows; every other layer reu
 recent source's selection; layer 20 additionally builds the hierarchical candidate pool (§1.5)
 that layers 24/28/32/36 search inside.
 
-deepstrix never ported any of it. `forward_layer.rs:1050` gates the sparse path on
+deepstrix never ported any of it **[2026-10-04: as of 2026-09-13; ported since, see status]**.
+`forward_layer.rs:1050` gated the sparse path on
 `ratio == 4 && n_index_comp > INDEXER_TOP_K`; V4.1's ratios are 1 and 2, so the gate never fires
 and V4.1 attention **scores densely over the entire compressed store** at every layer ≥ 2.
 

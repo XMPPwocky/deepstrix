@@ -1,5 +1,11 @@
 # Is expert prefetch plausible? — trace study, 2026-09-18
 
+> **Status (docs audit 2026-10-04):** historical. `V41_B1_PREFETCH` (code default off) is on in
+> production (hub env 2026-10-04: `V41_B1_PREFETCH=1`, `V41_B1_PREFETCH_ADMIT=24`);
+> `V41_PREFILL_READAHEAD` is still default off and unset there. `scripts/analyze_picks.py` is not
+> in the repo or its history. The CORRECTION in §4 refers to a "22% first-touch" figure that no
+> longer appears earlier in this doc.
+
 Source: `~/logs/picks-20260918-1501.trace` (`V41_PICK_TRACE`), 2.74 M rows =
 **19,139 decode tokens** x 40 layers x 6 picks, plus 101 prefill chunks.
 Scripts: `scripts/prefetch_study.py`, `scripts/prefetch_control.py`

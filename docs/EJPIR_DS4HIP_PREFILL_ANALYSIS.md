@@ -1,5 +1,7 @@
 # ejpir/ds4-hip — how the Strix Halo fork hits ~200 tok/s prefill, and what we're missing
 
+> **Status (docs audit 2026-10-04):** HISTORICAL (V4-Flash, 2026-06-02). The "structural gap in our code" (per-member IQ2 unpack, B_MAX=512) was closed by the kwide kernels in M51 (2026-06-09, unpack once per lane; `IQ2_VARIANT` default `kwide`, `het/forward_prefill.rs`) and by later B_MAX=1024 (see `M51_IGPU_MOE_JOURNAL.md`). The external analysis of the fork stays as written. V4-Flash was dropped as a direction on 2026-09-24.
+
 **Date:** 2026-06-02
 **Source:** [antirez/ds4 issue #16](https://github.com/antirez/ds4/issues/16), fork
 [`ejpir/ds4-hip` branch `rocm-upstream-shape-cyberneurova`](https://github.com/ejpir/ds4-hip/tree/rocm-upstream-shape-cyberneurova)

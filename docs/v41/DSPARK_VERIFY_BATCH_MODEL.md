@@ -1,5 +1,10 @@
 # DSpark verify: how box 2 scales with batch size (MEASURED 2026-09-14)
 
+> **Status (docs audit 2026-10-04):** measurement still consistent with the code (`--decode-max-b`
+> default 4). Since 2026-10-03 the hub sends every request batched (`REQ_FLAG_BATCHED`,
+> REMOTE_EXPERTS.md §2), so box 2's per-token decode chain is no longer used. Repro scripts are
+> `scripts/dedup.py` and `scripts/proj.py`.
+
 Bottom line: **DSpark at B=5 projects 39-43 tok/s and clears 30 even at E=3.0** —
 *provided decode first reaches its zero-miss floor*. The batch multiplier is
 favourable, not hostile, and the reason is that the dominant per-request costs do

@@ -1,6 +1,16 @@
 # DSpark: what is built, what blocks 20 tok/s, and what to do next
 ### state as of 2026-09-15
 
+> **Status (docs audit 2026-10-04): superseded** by DSPARK_ARENA_PLAN.md (which says so): the
+> verify no longer runs as a prefill-shaped forward but as rows of the multistream arena step, and
+> production DSpark is that path. "The drafter was never the limit" was refuted twice: by this
+> doc's own successor VERIFY_DISAGREES_WITH_DECODE.md (CORRECTION) and by the 09-27 drafter
+> parity work (shared-expert bug fixed in 761e46f; E 4.348 vs the reference 4.382). The
+> layer-major `V41_VERIFY_DECODE_PATH` experiment below (E ~1.1-1.24) predates KNOWN_BUGS #45
+> (fixed 2026-10-03: earlier rows saw later draft tokens), so its numbers are suspect.
+> `V41_DSPARK_XCHECK` never existed in code; the cross-check is `V41_VERIFY_PROBE=K` +
+> `V41_VERIFY_BATCHED=1`.
+
 ## Built and validated
 
 * **Drafter** (`het/mtp.rs`, `het/weights.rs`): 3-layer stack at B=MTP_BLOCK=5,
@@ -13,7 +23,7 @@
   kept, re-draft from the verify's own per-row captured residual. Correct and
   stable: **E = 2.878** warm, identical across consecutive runs.
 * **Instruments**: `V41_DSPARK_XCHECK=1` (verify-vs-decode argmax + logit cosine,
-  the tool that found the blocker), `V41_LAYER_MISS_HIST=1` (per-layer expert
+  the tool that found the blocker) **[2026-10-04: no code reads `V41_DSPARK_XCHECK` (none ever did). The cross-check runs whenever the verify probe runs batched: `V41_VERIFY_PROBE=K` with `V41_VERIFY_BATCHED=1` (`engine_worker.rs`).]**, `V41_LAYER_MISS_HIST=1` (per-layer expert
   misses, split at `CED_DECODER_START`), `V41_LAYER_HOST_TIMING=1` (per-layer
   host phases), `V41_DSPARK=1` shadow mode (acceptance without acting).
 
@@ -45,6 +55,7 @@ so attention, the q/kv chain, output projection and mHC differ too.
 **This caps acceptance.** A verify that disagrees with decode ~45% of the time
 rejects a perfect drafter at that rate, which is why E sits at 2.878 against the
 oracle's 4.38. The drafter was never the limit, and neither was expert paging.
+**[2026-10-04: refuted, see Status.]**
 
 ## What 20 tok/s requires
 

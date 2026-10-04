@@ -1,5 +1,15 @@
 # The expert format is the remaining lever (2026-09-15)
 
+**Status (2026-10-04): NOT STARTED.** No requantised expert set exists; experts are MXFP4 on
+both boxes. Two inputs below are stale: 19.25 MB/expert is a GiB/GB slip, the real figure is
+18.80 MB (IQ2_S 11.06 MB; DECODE_CAPACITY_WALL.md CORRECTION), and box 1's pool is no longer
+52 GB with 21 windows: those were launcher settings (code default `V41_PAGER_POOL_GB` 60, windows
+derived from `V41_PAGER_DECODE_FRAC` 0.75); the launcher went to 78 GB on 2026-09-16 (148044b's
+message) and production now runs `V41_PAGER_POOL_GB=95`, `V41_PAGER_WINDOWS=0` (hub env
+2026-10-04). Decode since went the DSpark and allocation routes (global pool, hot-set ownership,
+cache prior, pinning). The "box-2 slot rebalance refuted" result conflicts with
+SLOT_RESPLIT_MEASURED.md (+22%); see its status.
+
 Scoped from the session's measurements. This is the only identified path to
 20 tok/s; everything else on the decode and verify paths has been measured and
 refuted. It is a PROJECT, not a change — written down so it can be started

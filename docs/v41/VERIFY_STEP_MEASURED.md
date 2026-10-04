@@ -1,6 +1,11 @@
 # The verify step, measured — and why the number does not yet test the projection
 ### 2026-09-14
 
+> **Status (docs audit 2026-10-04):** historical. "That path does not exist" no longer holds: a
+> batched decode-shaped verify is the multistream arena step (`forward_step_arena`), which is
+> where production DSpark verifies (DSPARK_ARENA_PLAN.md). E = 4.13 is the K=5 (B=6)
+> rejection-sampling figure, not B=5's. `state.rs:279` has moved (`HetModelState::rollback_kv`).
+
 ## What was built
 
 `V41_VERIFY_PROBE=K[,K...]` with `V41_VERIFY_BATCHED=1` makes the decode loop, on

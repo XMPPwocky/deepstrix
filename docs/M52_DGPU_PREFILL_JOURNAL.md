@@ -1,5 +1,7 @@
 # M52 — dGPU prefill (long-context) journal
 
+> **Status (docs audit 2026-10-04):** HISTORICAL (V4-Flash, 2026-06). The `INDEXER_SCORE_VARIANT=sw` rollback below now hard-errors with the default packed-E2M1 index-key store (`forward_prefill.rs`); it works only with `INDEXER_KEYS_E2M1=0`. V4-Flash was dropped as a direction on 2026-09-24.
+
 Context: after M51 (kwide MoE, 320 tok/s @4K), the depth curve sagged at long
 ctx (290.8 @64K, 261.1 @96K) — the dGPU attention/indexer side stopped being
 hidden behind the now-faster iGPU. All profiling per user guidance at LONG
@@ -47,7 +49,7 @@ per-wave early-outs can't deadlock. Grid (ceil(cols/1024), B), block 256.
 Wall saved at 96K (684 ms) > kernel time saved (~310 ms): the shorter dGPU
 per-layer critical path also dissolved most of the per-layer packing stalls.
 **Depth penalty eliminated — 96K runs at 4K speed.** Rollback:
-INDEXER_SCORE_VARIANT=sw.
+INDEXER_SCORE_VARIANT=sw. **[2026-10-04: needs `INDEXER_KEYS_E2M1=0` too; with packed E2M1 keys (default) the sw path returns an error.]**
 
 ## Remaining (next levers at long ctx)
 

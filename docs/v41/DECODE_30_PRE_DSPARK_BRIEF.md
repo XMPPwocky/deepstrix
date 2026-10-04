@@ -1,5 +1,11 @@
 # Brief: get V4.1-Flash decode to 30 tok/s WITHOUT speculative decoding
 
+> **Status (docs audit 2026-10-04):** historical review prompt (2026-09-14). Item 1 of "measured
+> DEAD" was retracted the same day in the same commit (d721bb7) by DECODE_CAPACITY_WALL.md
+> CORRECTION 2: on a converged trace policy headroom is ~95 ms/token, not 32, and the global pool
+> is not within 2% of optimal. Later work did pursue box-2 pool policy (two-class LRU, pinning,
+> TinyLFU-gated admissions; REMOTE_EXPERTS.md §3.2). DSpark was built (DSPARK_ARENA_PLAN.md).
+
 Everything below is MEASURED on this hardware 2026-09-14 unless marked. Current
 decode is **3.24 tok/s (308.6 ms/token)**, steady state, warm pool. Target 30 tok/s
 = **33 ms/token**. That is a 9.3x gap, so incremental tuning is not the answer and

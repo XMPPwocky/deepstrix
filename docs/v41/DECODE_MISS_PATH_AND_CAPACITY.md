@@ -1,6 +1,13 @@
 # The decode miss path, and why 30 tok/s needs a smaller expert format
 ### measured 2026-09-14, box 2 = Crucial T500 / 128 GB Strix Halo
 
+> **Status (docs audit 2026-10-04):** historical; two conclusions were overturned. (1) O_DIRECT:
+> the zero-copy reader (`read_range_into_direct_padded`) became box 2's default the next day,
+> `V41_B2_ODIRECT` default on since 2026-09-15 (e1b7b65; per-miss 8.04 -> 7.00 ms under load);
+> only box 1's bouncing `V41_EXPERT_ODIRECT` stays off. (2) "Expert format is the only lever" was
+> withdrawn the same day by DECODE_MISSES_ARE_GEOMETRY.md and EXPERT_ALLOCATION_REWORK.md (the
+> working set fits with better allocation). `scratchpad/qd.py` is `scripts/qd.py`. Box 2's drives changed in the 2026-10-03 hardware move (lumi-flake cead625).
+
 Two results. First, box 2's miss path was 1.6x more expensive than its own drive
 and is now fixed (`c758a07`). Second — and this is the one that matters — even a
 *perfect* miss path cannot reach 30 tok/s, because of how many bytes a token
@@ -16,7 +23,7 @@ box-1 weight load), arms back-to-back on ONE binary via `V41_B2_GPU_REPACK`:
         10.57    9.46   --        --       1.11     --      before
          7.51    6.28  6.08      0.00      1.23    0.04     + GPU repack
          6.60    6.17  5.97      0.00      0.43    0.41     + zero-copy staging   <- shipped
-         6.99    6.49  6.23      0.00      0.50    0.48     + O_DIRECT (rejected)
+         6.99    6.49  6.23      0.00      0.50    0.48     + O_DIRECT (rejected)  [2026-10-04: zero-copy O_DIRECT default on since 09-15]
 
 * The HF->ggml MXFP4 permute ran on box 2's **CPU** every fault. On the iGPU it
   costs 0.04 ms. Box 1's pager moved this at M7; box 2 never followed.

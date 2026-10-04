@@ -1,6 +1,12 @@
 # Which kernel regressed under the 81.6 GB pool
 ### `DEEPSTRIX_TOKEN_PROFILE=1` stage diff, 2026-09-14
 
+> **Status (docs audit 2026-10-04): ATTRIBUTION RETRACTED.** `igpu.routed_moe` is a 378-line host
+> scope that also holds the router sync, `pg.ensure` and the box-2 submit, not the iGPU MoE
+> kernel (ROUTED_MOE_IS_NOT_A_KERNEL.md, same day). The regression itself was reproduced; its
+> cause is unattributed, and the **140 us/expert** figure below must not be reused. The
+> 2026-10-03 fit has box 1 at ~82 us per distinct expert vs ~100 us on box 2 (HOT_SPLIT_SIM.md §2).
+
 The 81.6 GB pool is a reproduced loss. Rather than keep guessing at a cause
 (I floated page-cache starvation and withdrew it), here is the stage table.
 

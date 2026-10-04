@@ -1,5 +1,15 @@
 # Profiling / tracing audit (2026-09-21)
 
+> **Status (docs audit 2026-10-04):** dated audit; §8 records the step-1 fixes. Superseded since:
+> §3.1 — the arena path exports perfetto per step (0773ad1, 2026-10-01; live trigger
+> `V41_PERFETTO_STEPS`, `multistream.rs`); §4.1 / §4.4 (no timeline, no distributions) and
+> "`HOP_*` drained only by the legacy loop" — evtrace (df39a37, 2026-09-25) records per-request
+> `hub_req` / `b2_req` and per-step `hub_step` (with `hop_*` fields) on both boxes; device stage
+> intervals come from evtrace Tier B (docs/v41/EVTRACE_REBUILD_PLAN.md, P3; production runs it
+> off, `V41_EVTRACE_DEV=0`). Phase atomics are spelled `SEL_SYNC_NS` / `REMOTE_SRV_NS` /
+> `ENGRAM_STAGE_NS` in `het/trace.rs`. `~/scratch-ms/*`, `restart_expertd_b2.sh` and
+> `~/scripts/analyze_pftrace_gaps.py` are not in the repo.
+
 Scope: everything that measures the two-box decode path at 8 rows — the hub's
 `V41_MS_PROFILE` stage rollup, the LH_* host counters, the perfetto exporters
 (hub and daemon), the daemon's page stats and per-request records, the client's

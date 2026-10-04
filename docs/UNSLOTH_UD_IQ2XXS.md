@@ -1,5 +1,7 @@
 # unsloth DeepSeek-V4-Flash-0731 UD-IQ2_XXS support
 
+> **Status (docs audit 2026-10-04):** HISTORICAL (V4-Flash). "UD-Q2_K_XL (default since 2026-08-12)" was superseded: the 2026-09-10 FP8-KV window ran UD-IQ3_XXS Vision-Exp (`FP8_KV_IMPL_2026-09.md` step 5), and the live engine is now V4.1 from the HF checkpoint (`v41` feature), not a GGUF mix; V4-Flash was dropped as a direction on 2026-09-24. The "deferred" fp8 compressed KV and the indexer-key follow-up both shipped 2026-09-10 (`FP8_KV_IMPL_2026-09.md`, `E2M1_INDEXER_KEYS_2026-09.md`).
+
 Branch `unsloth-ud-iq2xxs`, 2026-08-09/10. Second quant mix of the same 0731
 checkpoint, runnable via `--gguf` (NO default switch — explicit decision).
 Plan: `~/.claude/plans/make-a-plan-remember-piped-kite.md`.

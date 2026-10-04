@@ -1,6 +1,12 @@
 # Speculating against a degraded expert — and the better idea inside it
 ### user proposal + adversarial review, 2026-09-14
 
+**Status (2026-10-04): NOT BUILT.** No residency-tiered low-bit expert pool exists: box 1's pager
+and box 2's shard hold MXFP4 routed experts only (`remote_experts::expert_geometry`, one format).
+The expert-format work was re-scoped on 2026-09-15 as an unstarted project
+(EXPERT_FORMAT_IS_THE_REMAINING_LEVER.md); decode went the speculative (DSpark) and allocation
+(global pool, hot set, cache prior) routes instead.
+
 ## The proposal
 
 Keep all 15,360 experts resident at IQ2_XXS (~140 GB). Keep a separate MXFP4

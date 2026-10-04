@@ -1,6 +1,11 @@
 # Static expert placement does not generalize; use a victim cache
 ### held-out evaluation, 2026-09-14
 
+> **Status (docs audit 2026-10-04):** the held-out result stands. The victim cache shipped without
+> a hub swap (`V41_VICTIM_CACHE`, default on, `expert_pager.rs`); the swap was CLOSED on
+> 2026-09-13 (SECOND_BOX.md). The "52 GB ceiling" below is false: 76 GB allocates
+> (DECODE_MISSES_ARE_GEOMETRY.md). Repro scripts are `scripts/holdout.py`, `scripts/adaptive.py`.
+
 Two levers died here and a better one replaced them. The cause in both cases was
 the same methodological error: **a placement fit and scored on the same trace is
 an oracle bound, not a deployable policy.**
@@ -72,7 +77,7 @@ history-dependent partitioning.
 
 **Blocking constraint, unchanged:** box 1's pool is 2,766 slots of which 2,688 are
 prefill's pinned windows (`forward_layer.rs:2320`: "Box 1's decode LRU is only ~25
-slots"). 52 GB is the measured ceiling, 76 GB OOMs. So the sizes above are not
+slots"). 52 GB is the measured ceiling, 76 GB OOMs **[2026-10-04: false, see Status]**. So the sizes above are not
 free — 960 slots costs 7 of 21 windows. **This lever is worth building AFTER the
 hub swap**, when box 1 becomes a pure expert executor with no dense weights, no KV
 and no prefill windows to defend.

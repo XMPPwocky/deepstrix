@@ -1,6 +1,16 @@
 # Decode plan — what to build, in order, and why everything else was cut
 ### 2026-09-15. Baseline: 4.94 tok/s (202 ms/token) after the host tuning.
 
+**Status (2026-10-04): steps 1 and 3 shipped, step 2 built but no gain; "request concurrency" was
+overturned.** Step 1: box 2's global pool (`V41_B2_GLOBAL_POOL`, default on; floor
+`V41_B2_POOL_FLOOR` default 0). Step 2: concurrent miss reads exist on box 2
+(`V41_B2_MISS_PAR`, default 1: measured no gain at 4 on 2026-09-20, `remote_experts.rs`). Step 3:
+DSpark runs on the multistream arena (DSPARK_ARENA_PLAN.md), not on a separate batched decode
+path, and does not need `V41_T2_CATCHALL=2` (production runs `V41_T2_CATCHALL=1` with the T2
+partition, hub env 2026-10-04). The cut "request concurrency = 0" was overturned by the
+multistream scheduler (MULTISTREAM_DECODE_PLAN.md; `V41_MULTISTREAM`, on in production). The
+"+22%" 164/164 figure below conflicts with a later -48% measurement (SLOT_RESPLIT_MEASURED.md).
+
 Fifteen ideas were generated, five shortlisted, and an adversarial workflow
 killed four of them. This is what survives, in build order, with the arithmetic
 each step is accountable to.

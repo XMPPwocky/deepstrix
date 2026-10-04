@@ -1,6 +1,12 @@
 # `igpu.routed_moe` is a 378-line host scope, not the iGPU MoE kernel
 ### found by the user in a perfetto trace, 2026-09-14
 
+> **Status (docs audit 2026-10-04):** the retraction stands. The proposed lever is built: the
+> serial decode path ships the activations to box 2 BEFORE `pg.ensure` (`forward_layer.rs`,
+> "Ship this token's activations to box 2 BEFORE the pager runs"). The DPM question was answered
+> the same day: box 2's server time is flat across idle gaps, so DPM is not a lever
+> (LINK_IDLE_LATENCY.md). Line numbers below are from 2026-09-14.
+
 **Observation:** the `expert pager` host span appears to sit INSIDE the
 `igpu.routed_moe` device span. It does. Literally.
 
@@ -47,7 +53,7 @@ here are hundreds of lines long.
 ## The lever the observation exposes
 
 The user's framing: *"as soon as the device finishes the router we should RACE to
-tell box 2 what experts to start loading."* Today the order inside this scope is
+tell box 2 what experts to start loading."* Today **[2026-10-04: was; reordered since, see Status]** the order inside this scope is
 
     router done -> [~300 us] -> sel_sync -> pg.ensure -> submit to box 2
 

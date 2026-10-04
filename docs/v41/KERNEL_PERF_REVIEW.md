@@ -1,5 +1,17 @@
 # V4.1-Flash kernel-path performance review (2026-09-13, read-only)
 
+> **Status (docs audit 2026-10-04):** dated review; findings not re-measured. Overtaken since:
+> **#1** — the V4.1 indexer is ported (S1–S3, docs/v41/INDEXER_PORT_PLAN.md; production sets
+> `V41_INDEX_K=1` and `V41_CANDIDATE_POOL=1`, hub env 2026-10-04), sizing uses
+> `attention::scored_keys_are_gathered`, and the context cap is `attention::V41_MAX_CTX` = 368640;
+> PREFILL_100K_PROFILE.md measured 100K with the indexer on 2026-09-14. **#7** — the expert repack
+> runs on the GPU by default (`expert_pager::pager_gpu_repack`, `V41_PAGER_GPU_REPACK=0` reverts;
+> `kernels/mxfp4_repack.hip`). **#2** — prefill Engram runs 128-row passes by default
+> (`forward_prefill::engram_chunk_rows`, `V41_ENGRAM_CHUNK128`). "No per-kernel device timing of
+> the V4.1 path" is no longer true: per-stage timing in the `ms.stage` rollup (`V41_MS_PROFILE=1`,
+> set in production) and evtrace Tier B `dev` / `step_dev` records (docs/v41/EVTRACE_REBUILD_PLAN.md;
+> production runs Tier B device timing off, `V41_EVTRACE_DEV=0`). Line numbers are from 2026-09-13.
+
 Scope: the `--features v41` kernel path — `kernels/mxfp4_*`, router, mHC, compressor, f16 pair,
 Engram, SWA/compressed attention — their launchers, and the call sites in `het/forward_layer.rs`
 (decode), `het/forward_prefill.rs` (CED prefill: encoder 0..19 over the prompt, layer 20 as

@@ -1,6 +1,13 @@
 # DSpark verify: the fixed cost is the blocker, not the expert traffic
 ### measured 2026-09-15, box 1 + box 2, production config (V41_CED=1)
 
+> **Status (docs audit 2026-10-04): superseded** by DSPARK_ARENA_PLAN.md (which says so): it
+> priced a prefill-shaped verify; production DSpark verifies inside the multistream arena step.
+> The single-lane path below did NOT stay on: `V41_PREFILL_SINGLE_LANE_MAX` defaults to 0 (off;
+> 1af8fa1 reverted the 8 in the same batch after acceptance fell 2.26 -> 1.74; 5fcaddf later
+> traced that drop to a logits-readback bug, the default stayed 0). `V41_SMALL_B_OFFLOAD_MAX` is
+> now `V41_SMALL_B_CATCHALL_MAX` (code default 0; production sets 8, hub env 2026-10-04).
+
 The drafter works (see `DSPARK_DESIGN.md`; acceptance validated against the CPU
 oracle). This is about whether a speculative step can PAY.
 
@@ -124,12 +131,12 @@ and the mechanism is named.** At `cost = 38.5 B` a B=6 verify is 231 ms for
 is the prize, and it is entirely in scheduling, not in arithmetic.
 
 
-## SHIPPED: single lane below B=8 (-10 to -16% on the verify)
+## SHIPPED: single lane below B=8 (-10 to -16% on the verify) [2026-10-04: reverted, default 0; see Status]
 
 The two-lane pipeline exists to overlap one lane's GPU work with the other's
 host scheduling. At verify batch sizes there is no GPU work to hide behind — the
 cost IS the host scopes — so splitting just runs every per-layer scope twice.
-Below `V41_PREFILL_SINGLE_LANE_MAX` (default 8, `0` restores the old path) the
+Below `V41_PREFILL_SINGLE_LANE_MAX` (default 8 **[2026-10-04: 0]**, `0` restores the old path) the
 whole chunk goes in lane A and lane B is skipped. Guarded on `spans.is_empty()`,
 since image spans are the reason `lane_split` has to cut carefully.
 
@@ -174,7 +181,8 @@ returned `HTTP 200` with no error, and `verify_routing_exactly_once` passed
 throughout — it validates the hub's own `owns_eff` vector, not what box 2
 actually computed, so an under-computed expert is silent.
 
-`V41_SMALL_B_OFFLOAD_MAX` stays at its default of 0. What survives is the
+`V41_SMALL_B_OFFLOAD_MAX` stays at its default of 0. **[2026-10-04: renamed
+`V41_SMALL_B_CATCHALL_MAX`, default 0; production sets 8 (hub env 2026-10-04).]** What survives is the
 diagnosis: **94% of a B=6 verify is box 1's expert paging** (`prefill_requests`
 ~316, `prefill_misses` ~250, `prefill_read_ms` ~700 of ~950 ms), because a
 verify's DRAFT tokens route to experts the decode LRU has never touched. Any fix

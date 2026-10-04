@@ -1,5 +1,14 @@
 # Vision-Exp (`vision-exp` branch) — status
 
+> **Status (docs audit 2026-10-04):** historical. This is the V4-Flash
+> Vision-Exp pass of 2026-09-04 (GGUF `mmproj-F16.gguf`). Vision merged to main
+> in d34011a. The live V4.1 server reads the tower from the HF snapshot
+> directory (`--mmproj <same dir as --gguf>`; a non-directory is refused, see
+> `vision_v41::load_tower`) and auto-writes the `bias_vl` sidecar
+> (`ensure_bias_vl`); V4.1 status is `docs/v41/VISION_PORT.md`, which served
+> images end to end on 2026-09-13. The `image` crate below was signed off by the
+> owner on 2026-10-04.
+
 DeepSeek-V4-Flash-**Vision-Exp** image support: the `mmproj-F16.gguf` ViT +
 aligner tower on the iGPU, the text-side image geometry in the engine, and
 the OpenAI-compatible image parts in the server.
@@ -135,6 +144,9 @@ roofline block at the top of `tower.rs`.
 
 ## API
 
+**[2026-10-04: V4-Flash only. Under the V4.1 build `--mmproj` takes the HF
+snapshot directory and a missing `bias_vl` sidecar is written, not fatal.]**
+
 ```
 deepstrix-server --mmproj <mmproj-F16.gguf> [--allow-image-dir <dir> ...]
   env: DEEPSTRIX_MMPROJ, DEEPSTRIX_ALLOW_IMAGE_DIRS (':'-separated)
@@ -166,7 +178,7 @@ Library surface: `Tower::load(&Path, Device)` → `encode(&PreprocessedImage,
 (aligner rows only) + `place_rows`; `preprocess(&[u8])`,
 `layout_for(&PreprocessedImage, start_pos)`.
 
-## NEEDS USER SIGN-OFF — the `image` crate
+## ~~NEEDS USER SIGN-OFF~~ SIGNED OFF 2026-10-04 — the `image` crate
 
 `image 0.25.10` (`default-features = false`, features `["png", "jpeg"]`) is
 the **only** new dependency, used solely for `decode → RGB8`; resize, pad,
@@ -201,6 +213,9 @@ drops 5 of the 14 crates, costs a hand-rolled `DynamicImage → RGB8`.
   fully released on drop.
 
 ## What remains
+
+**[2026-10-04: as of 2026-09-04, for V4-Flash. V4.1 image prompts have been
+served end to end since 2026-09-13 (`docs/v41/VISION_PORT.md` §5).]**
 
 1. **End-to-end image prefill vs llama.cpp / ds4 — NOT DONE.** This needs
    the full text model resident, i.e. **the production server down**, and

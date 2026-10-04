@@ -102,7 +102,9 @@ prefix, i.e. given drafts 1..k−1 accepted).
 | ts=−1 (anchor = tok[i]) | 88 | 0.045 ± 0.022 | — | 1.05 1.08 1.11 1.14 1.16 | 0.14 | 0.04 | 1.04 1.06 1.08 1.11 |
 | legacy, start 255 (in-process alignment) | 90 | 0.433 ± 0.052 | 0.54 0.43 0.33 0.33 | 1.43 1.67 1.77 1.80 1.81 | 0.67 | 0.37 | 1.37 1.57 1.65 1.69 |
 
-PROSE_ROW_PLACEHOLDER
+**[2026-10-04: the prose row was never filled in here. The prose run's figures are recorded in
+DSPARK_ARENA_PLAN.md ("What 4.382 is and is not"): E 1.99 greedy, 1.82 rejection sampling at T=1,
+with only 74 seed rows (the whole prompt) against gen2's 128.]**
 
 Other diagnostics of the fixed run: confidence-head AUC at position 1 **0.94** (was 0.52) and
 0.80–0.82 at positions 2–5 — the confidence head is calibrated once its input is right, which

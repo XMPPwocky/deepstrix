@@ -1,5 +1,7 @@
 # Laguna-S-2.1 — FP8 (e4m3fn) KV-cache revive & re-measure (2026-07-27)
 
+> **Status (docs audit 2026-10-04):** the e4m3fn format described up top was replaced by INT8 symmetric (amax/127) in the ADDENDUM 2026-07-29 at the end of this file; the code matches the addendum (`LAGUNA_FP8_KV=1` = int8, `kernels/laguna_ops.hip`, `src/laguna.rs`). Read the addendum first.
+
 **Branch** `fp8-kv-revive` off `master @ 79c4f99`. Merged the shelved
 `stash@{1}` ("fp8-kv-noship") forward over the `ee557a0` decode-attention
 rewrite and re-measured decode / prefill / quality with back-to-back A/B on the

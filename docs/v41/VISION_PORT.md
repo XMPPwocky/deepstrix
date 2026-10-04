@@ -17,7 +17,14 @@ The goal requires multimodal. V4.1 ships a standard ViT + MLP aligner; the check
   aligner rows into the IMAGE slots in reading order and the three learned embeddings into the
   delimiters; routing uses `bias_vl` for image rows; Engram masks image tokens out.
 
-## Status: BUILT + VALIDATED (tower), WIRED (server), NOT YET SERVED (needs a restart)
+## Status: BUILT + VALIDATED (tower), WIRED (server), SERVED since 2026-09-13 (§5)
+
+> **Docs audit 2026-10-04:** the original heading said "NOT YET SERVED (needs a
+> restart)"; §5 records the restart and the first served image. Open item (a) is
+> resolved: under `--features v41` the handler renders with
+> `prompt_v41::render_prompt_v41` (`openai/handler.rs`). Item (c)'s comment no
+> longer exists. Items (b) and (d) stand. The `image` crate was signed off on
+> 2026-10-04.
 
 ### 1. Loader — `crates/v4flash-vision/src/hf_v41.rs`
 `Tower::load_v41(dir)` / `Tower::load_v41_from(&SafetensorsDir, &config)` read the 266 tensors
@@ -162,6 +169,10 @@ CARGO_TARGET_DIR=target-v41 nix develop --profile ~/.cache/deepstrix/devshell --
   cargo build --release -p deepstrix-server --features v41
 pkill -x deepstrix-serve && nohup /tmp/run_v41_server.sh > logs/v41-vision.log 2>&1 &
 # (the script now adds --mmproj "$MODEL"; MMPROJ= disables it)
+# [2026-10-04: historical recipe. The production launcher is ~/run_v41_server.sh
+#  (not in the repo), run under a supervisor that relaunches the hub with its OLD
+#  env if only the hub is killed; box 2 (expertd) must be up first. Follow the
+#  current restart procedure, not this line.]
 # then
 curl -s localhost:18141/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "deepseek-v4.1-flash", "max_tokens": 200,

@@ -1,5 +1,11 @@
 # Brief: how does V4.1-Flash decode reach 30 tok/s WITHOUT DSpark?
 
+> **Status (docs audit 2026-10-04):** historical review prompt, undated in the text; committed
+> 2026-09-14 12:07 UTC in 40d1201, the commit that ported the CSA2 sparse indexer, so "sparse
+> indexer is NOT ported" was stale when committed. DSpark is built since (DSPARK_ARENA_PLAN.md).
+> DECODE_30_PRE_DSPARK_BRIEF.md (3.24 tok/s baseline, committed 13:17 UTC the same day) is the
+> later of the two briefs. The hardware and box-2 assignment below predate the 2026-10-03 move.
+
 Question for review. DSpark (speculative decode, `dspark_target_layer_ids [37,38,39]`,
 128 experts, top-3) is NOT yet built and we want the non-speculative path to 30 first.
 

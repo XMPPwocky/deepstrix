@@ -1,6 +1,11 @@
 # `V41_LOCAL_CLAIM_MAX=0` is a no-op at the shipped pool — a retracted result
 ### 2026-09-14
 
+> **Status (docs audit 2026-10-04):** the retraction stands. "What is still true" does not: its
+> 140 us/expert break-even was itself retracted (ROUTED_MOE_IS_NOT_A_KERNEL.md), and the
+> 2026-10-03 fit has box 1 cheaper per distinct expert than box 2 (~82 vs ~100 us,
+> HOT_SPLIT_SIM.md §2). `forward_layer.rs:2320` has moved.
+
 I measured `V41_LOCAL_CLAIM_MAX=0` at +7.8%, confirmed it at +10.7% over two runs
 per arm, and was about to make it the default. **It is a no-op.** Recording the
 retraction and, more usefully, the measurement that settles it.
@@ -56,8 +61,8 @@ well beyond the noise band, and corroborated by `igpu.routed_moe` +89%).
 
 ## What is still true
 
-The break-even from the pool-regression stage diff is unaffected: box 1 costs
-140 us/expert against box 2's 87 us, so serving a pick box 2 would HIT is -53 us
+The break-even from the pool-regression stage diff is unaffected **[2026-10-04: retracted, see
+Status]**: box 1 costs 140 us/expert against box 2's 87 us, so serving a pick box 2 would HIT is -53 us
 and serving one it would MISS is +6547 us. And the point that box 1 claiming a
 pick denies box 2's LRU a touch of it — so box 2 may evict it and pay a miss
 later — is sound reasoning. **Neither is measurable at the shipped config,

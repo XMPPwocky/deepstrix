@@ -5,6 +5,8 @@ this document is the build order, the design choices where the two differ, and t
 gates. Priority order for every choice below: quality > RAM > decode perf > prefill
 perf > implementation complexity.
 
+> **Status (docs audit 2026-10-04):** IMPLEMENTED and shipped (step 5 DONE 2026-09-10, below). Superseded since: the v3->v4 snapshot conversion (D5, "mutually readable") was deleted with the E2M1 work (`E2M1_INDEXER_KEYS_2026-09.md` D4); snapshots are now `FORMAT_VERSION` 6 and restore accepts only 6, refusing a format mismatch as a cache miss (`crates/deepstrix-server/src/snapshot.rs`). `COMP_KV_FP8=0` IS a runtime rollback (default on, `CompKvStore::fp8_enabled`, `het/state.rs`). Names as built: `kernels/comp_kv_fp8.hip`; `CompKvStore::Fp8 { rows, head }` (no `comp_kv_head` field); test kernels `fp8_kv_table_check` / `fp8_kv_expand_exhaustive` (`tests/fp8_kv_format.rs`); host reference `comp_kv_fp8::{expand_half_bits_host, unpack_row_host}` in `src/comp_kv_fp8.rs`. `ATTN_MIXED_MAX_KEYS` (V4-Flash) is now 82176 and `ATTN_SCORES_STRIDE` 3072 (`attention.rs`).
+
 Rev 2 = rev 1 after the architect review and the build. Status: steps 1-4 are
 committed and verified beside the live server (1c23813 kernels + proof, b3d6d08
 engine + snapshots, da03067 one-load A/B); step 5 (full-model oracles, benches, VRAM
@@ -121,7 +123,7 @@ cache miss (reset, evict the entry, full prefill), not a failed request.
 
 `COMP_KV_FP8=0` keeps the f16 store (rollback and the one-load A/B knob); restore
 converts in both directions, so v3/v4 files and f16/FP8 stores are all mutually
-readable.
+readable. **[2026-10-04: no longer true; conversion deleted, snapshot format 6 only, an encoding mismatch is refused and evicted.]**
 
 ## Build order
 
@@ -251,10 +253,10 @@ Each weight load is ~2 min; keep it to two (one oracle process, then the server)
    restored session and a fresh one. Spend the freed VRAM per the section below.
 Rollback: `COMP_KV_FP8=0` in the run script (no rebuild), or the parent commit.
 The v3 acceptance path can be deleted (owner's call, 2026-09-10: old cache entries
-may simply be evicted); it is kept because it is proven and free.
+may simply be evicted); it is kept because it is proven and free. **[2026-10-04: deleted later with the E2M1 work (snapshot v5, now v6).]**
 
 No runtime toggle (as the plan says): a format that fails an oracle does not ship.
-Rollback is the parent commit.
+Rollback is the parent commit. **[2026-10-04: contradicted above and by the code: `COMP_KV_FP8=0` is a runtime rollback.]**
 
 ## Effort
 

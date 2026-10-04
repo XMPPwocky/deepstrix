@@ -2,6 +2,8 @@
 
 **Status: READ-ONLY investigation (2026-07-27). No files changed, no GPU touched.**
 
+> **Status (docs audit 2026-10-04):** no step outcome was recorded. Step 0 was never applied: the `prefill_batched` comment in `laguna_het.rs` still says het is "Single-lane, env-gated", while `prefill_batched_het` dispatches to `prefill_batched_het_pipelined` unless `LAGUNA_PIPELINE=0`. Line numbers below have drifted (`prefill_batched_het_pipelined` is now near line 2563, not 2329).
+
 ## TL;DR (the premise is already satisfied)
 
 The task asked us to make Laguna's het prefill two-lane, on the belief that

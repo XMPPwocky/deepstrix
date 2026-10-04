@@ -1,5 +1,7 @@
 # Prefill Global-Attention Kernel Redesign: `gqa_attn_prefill_flash_wmma_fa2_rowpar`
 
+> **Status (docs audit 2026-10-04):** BUILT, MEASURED, KILLED 2026-07-26 — see §10 at the end. The kernel and its `LAGUNA_ATTN_ROWPAR` knob are not on main.
+
 Read-only design study. Target: gfx1201 (RDNA4, 9070 XT), 64 CU, 64 KB LDS/CU,
 wave32, 256 VGPR/lane, `v_wmma_f32_16x16x16_f16_w32_gfx12` (synchronous), 600 GB/s
 DRAM, 64 MB Infinity Cache (MALL). Model: Laguna-S-2.1 **global full-attention

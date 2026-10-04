@@ -1,6 +1,15 @@
 # DSpark: what exists, what is missing, and what it is worth
 ### grounded in measurements taken 2026-09-14
 
+**Status (2026-10-04): SUPERSEDED.** DSpark is implemented and live: the drafter is
+`het/mtp.rs` (`HeterogeneousEngine::dspark_draft`), the production verify runs as rows of the
+multistream arena step with rejection sampling (`ms_dspark.rs`, `spec_sample.rs`;
+DSPARK_ARENA_PLAN.md). The legacy single-sequence driver (`V41_DSPARK`) survives only when the
+arena DSpark is off. E = 4.13 is the T=1 rejection-sampling figure at K=5 (a B=6 verify) on
+gen2, though the projections below pair it with B=5; the greedy figure is 4.382
+(DSPARK_ACCEPTANCE_INVESTIGATION.md). `state.rs:279` has moved
+(`HetModelState::rollback_kv`).
+
 **DSpark is not implemented in the engine.** `grep` for dspark/speculative across
 `het/` and `deepstrix-server` returns nothing; the E=4.13 figure every projection
 rests on comes from `scripts/v41_oracle/dspark_accept.py`, a Python reference

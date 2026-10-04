@@ -1,5 +1,12 @@
 # V4 Flash Heterogeneous Inference Engine — Design Doc (v2)
 
+> **Status (docs audit 2026-10-04):** HISTORICAL. This is the original single-box V4-Flash design (2026-05). V4-Flash was dropped as a direction on 2026-09-24; the built system is two-box V4.1. Current state: [`README.md`](README.md) (docs index) and [`v41/ARCH_SPEC.md`](v41/ARCH_SPEC.md). Biggest departures:
+> 1. **Two boxes.** Box 1 runs the hub (`deepstrix-server`, 9070 XT + Strix iGPU); box 2 runs `deepstrix-expertd`, which holds a resident routed-expert pool on its iGPU and returns weighted MoE partial sums over USB4. §4.1's "Strix Halo holds all 43 x 256 experts" is gone.
+> 2. **Model and format.** DeepSeek V4.1 (40 layers, 384 routed experts, `config.rs` under `v41`) loaded from the HF checkpoint with native MXFP4 routed experts (`hf_v41.rs`), paged on both boxes (box 1 `het/expert_pager.rs`, box 2 the expertd pool), not the IQ2_XXS/Q2_K/Q8_0 GGUF mix.
+> 3. **No distilled router, no MALL prefetch.** §4.3/§4.4 and Phase 3 were never built (no `distill` code anywhere under `crates/`). Speculation is the V4.1 DSpark drafter (`het/mtp.rs`); V4-Flash MTP was removed 2026-05-29 (cc8cefa).
+> 4. **Multi-stream serving.** The `V41_MULTISTREAM` scheduler (8 arena slots by default, `V41_MS_SLOTS`) serves concurrent requests; §12 listed multi-user concurrency and distributed inference as out of scope.
+> 5. **Crate layout.** Workspace = `deepstrix-{server,expertd,cli}`, `v4flash-{core,hip,kernels,vision}`, `phase0`, `phase1` (`Cargo.toml`); kernels live flat in `crates/v4flash-kernels/kernels/`. The §5.1 crates (`v4flash-engine`, `v4flash-server`, `v4flash-router-distill`, `v4flash-cli`) and repo-root `kernels/` never existed.
+
 ## Phase 0 status: complete
 
 All five Phase 0 gates passed; full measurement results in [`PHASE0.md`](PHASE0.md). The doc below has been updated inline to reflect measured numbers — search for **[P0 measured]** for the load-bearing reconciliations.

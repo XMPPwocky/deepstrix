@@ -1,5 +1,16 @@
 # V4.1-Flash engine port — plan (rev 2, 2026-09-12)
 
+> **Status (docs audit 2026-10-04):** no status was written here after 2026-09-13. M0–M6 done
+> (statuses below). M7 done: tokenizer + chat encoding; CED committed (`CedMode`, `ced_enabled()`,
+> `V41_CED` default on); the expert tier became the box-1 pool (`het/expert_pager.rs`) plus box 2
+> (`deepstrix-expertd`); the server serves V4.1 through the multistream arena
+> (`multistream::worker_loop_ms`, `PrefillJob`; `V41_MULTISTREAM` code default off, production sets
+> 1, hub env 2026-10-04). M8: two-box expert server, CED scheduling and the DSpark drafter
+> (`het/mtp.rs`, `ms_dspark.rs`) are built; **native fp8 dGPU kernels are not** — the loader still
+> requantises fp8 projections to Q8_0 (`hf_v41.rs::push_q8`). The "Maximum runnable context"
+> section is superseded: the indexer is ported (S1–S3, docs/v41/INDEXER_PORT_PLAN.md) and the cap
+> is `attention::V41_MAX_CTX` = 368640. Current state: docs/README.md, docs/v41/KNOWN_BUGS.md.
+
 Rev 2 folds in the architect review of rev 1 (verdict REVISE, option C upheld). Changes are
 marked **[R]** with the review item number.
 
@@ -50,7 +61,9 @@ strictly more expensive than C on this codebase **[R1]**.
 **Decision: (C)**, with two hardenings **[R1]**: a compiled-model vs loaded-weights assertion at
 load (`V41HfWeights::config()` / GGUF metadata carry `n_layers`, `dim`, `n_routed_experts`; a
 V4.1 directory in a V4-Flash binary fails at the door), and per-layer tables as
-`&'static [u32]` role tables with length asserts rather than fixed-size arrays.
+`&'static [u32]` role tables with length asserts rather than fixed-size arrays. **[2026-10-04:
+partly — the source tables are slices (`KV_SOURCE_LAYERS`, `INDEX_SOURCE_LAYERS: &[i32]`), but
+`COMPRESS_RATIOS` is still `[u32; N_LAYER]`, cfg-gated per model.]**
 
 **Feature hygiene [R2].** A model-select feature is non-additive. Rules: never `--all-features`
 or `--workspace` builds that could unify `v41`; separate `CARGO_TARGET_DIR` per model in the run
@@ -174,13 +187,16 @@ most sensitive projections) is required for quality parity — promote from M8 t
   norm-only. The main-KV store is a **new format** (E2M1 + E4M3 scale per 16; existing is
   E2M1 + E8M0 per 32). Indexer at 32 heads, top-512 sparse attention. **Design rule (CED):**
   "produce store S from H_L" is a stage callable independently of "run layer L"; reuse layers
-  read stores by source-layer id (`state.layers[l].kv = StoreRef(source)`); exact mode and the
+  read stores by source-layer id (`state.layers[l].kv = StoreRef(source)` **[2026-10-04: `StoreRef`
+was never built; `HetModelState::with_kv_source` lends the source's compressor state instead, see
+M4 status]**); exact mode and the
   decoder's bounded replay share the producer. Snapshot v6 falls out of stores owned by source
   layers (today `PerLayerMeta {has_compressor, ratio, …}` assumes each layer owns its own).
 - **M4 — layers 3–7: Reuse mode.** KV and index from layer 2 via `StoreRef`; confirm against
   `model.py` whether the checkpoint's `attn.wkv` on reuse layers is used; drop it from residency
   if not.
-- **M5 — layers 20 and 24 [R17].** Ratio-1 Reindex with the hierarchical candidate pool: block-max
+- **M5 — layers 20 and 24 [R17].** Ratio-1 Reindex (layer 20 is a KV source, "Full" in the
+  ARCH_SPEC §1.5 role mapping; note 2026-10-04) with the hierarchical candidate pool: block-max
   over 8, top-2048 of ~37.5K blocks at 300K context, mask applied inside the top-512 of the four
   index-source-only layers (24/28/32/36). New kernels whose cost grows with context: add a rough
   cost line and a 300K test before building.
@@ -482,6 +498,11 @@ the argmax there (ref 3001 → Q8 86219); the engine beat the Q8 oracle at T=6 s
 
 ### M7 CED prefill — encoder-only + Decoder SWA Bounded Replay (2026-09-13, UNCOMMITTED)
 
+**[2026-10-04: committed since — `CedMode` / `ced_enabled()` / `ReplayRow` in
+`het/forward_prefill.rs`. Production prefill runs through `PrefillJob` (multistream), not
+`forward_prefill_pipelined`. `/tmp/run_v41_server.sh` and `scratchpad/*` below are session-local
+paths that are not in the repo.]**
+
 Tech report §2.2/§3.2.2 (`scratchpad/v41_report.txt` 379–416, 990–1032). Production semantics, now
 in `forward_prefill_pipelined` (the server path), default ON under the feature, `V41_CED=0` = the
 exact all-40-layer prefill (the parity harness and the single-lane `forward_prefill` stay exact):
@@ -568,6 +589,15 @@ nothing, leaving the ~31 s replay and the dGPU as the ceiling.
 
 ### Maximum runnable context (2026-09-13) — the three caps were derived for ratio >= 4
 
+**[2026-10-04: superseded. The V4.1 indexer is ported (S1–S3, docs/v41/INDEXER_PORT_PLAN.md) and
+production sets `V41_INDEX_K=1` and `V41_CANDIDATE_POOL=1` (hub env 2026-10-04; both code default
+off). Sizing now goes through `attention::scored_keys_are_gathered` (true for every compressed
+V4.1 layer when `V41_INDEX_K=1`); `--ctx` admission uses `attention::indexer_max_scored_keys`,
+which has no gathered shortcut. The cap is `attention::V41_MAX_CTX` = 368640 (raised 2026-09-22),
+and `ATTN_MIXED_MAX_KEYS` = `V41_MAX_CTX + IMAGE_RAW_WINDOW_MAX` (raised 2026-09-18 to close a
+silent truncation past 131200 tokens). `indexer_gathers` is now the V4-Flash-only predicate. The
+131072 ceiling, the "no ported indexer" premise and the memory table below are history.]**
+
 Until today the engine could not run a prompt past ~2944 tokens. Three constants had been derived
 on the assumption that the model's smallest *ungathered* compressed store is `n_kv/4` — true for
 V4-Flash (its ratio-4 layers are gathered by the CSA indexer to `INDEXER_TOP_K` = 512, and only its
@@ -641,9 +671,11 @@ appended there). The indexer port (ENGINE_PORT M5 leftover) is what turns that b
 - `norm_eps = 1e-20`: verified non-issue (eps is a launch argument in every norm kernel; only the
   `RMS_EPS` const changes) **[R18]**.
 - Q8_0 from fp8 is a lossy requant; gated by the measured noise floor (§2) and deleted by native
-  fp8 kernels (M8).
+  fp8 kernels (M8). **[2026-10-04: native fp8 kernels not built; Q8_0 requant still in the loader.]**
 - `token_embd` F16 costs 1.3 GB host (host-side embed only).
-- Reuse layers carry `attn.wkv`; the contract must say whether it is used (M4).
+- Reuse layers carry `attn.wkv`; the contract must say whether it is used (M4). **[2026-10-04:
+  answered — every layer computes window KV from `wkv` (ARCH_SPEC §1.2); the loader presents it
+  on every layer.]**
 - Feature-gated consts double kernel/crate build time when both artifacts are built; separate
   target dirs make it a one-time cost.
 - Even layer count (40) changes every `[..; 43]` table, the residual swap parity, and the

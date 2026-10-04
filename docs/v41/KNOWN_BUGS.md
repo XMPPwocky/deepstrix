@@ -4,17 +4,88 @@ Living list. Add here the moment something is found, even when it is not being
 fixed right now, and delete only when it is fixed AND has a regression test.
 Ranked by risk of SILENT WRONGNESS (produces wrong numbers rather than an error).
 
-Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
+Status key: **OPEN** / *MITIGATED* / ~~FIXED~~. Most headings say FIXED or OPEN
+in words; the index below is the authoritative list of what is still open.
+
+## Status index (docs audit 2026-10-04, main c2db000)
+
+Everything not listed here is FIXED. "Re-checked" = the 2026-10-04 docs-vs-code
+audit read the code and found the entry still accurate; "not re-checked" = not
+looked at in that pass.
+
+| entry | status | note |
+|---|---|---|
+| #53 | **OPEN** | f16 box-2 prefill partials are on by default with no fidelity gate (new 2026-10-04) |
+| #54 | **OPEN** | `V41_SUB=1/2` substitution runs after the fidelity pin; production's mode 3 is unaffected (new 2026-10-04) |
+| #55 | **OPEN** | OpenAI `tool_choice` silently ignored; `"role": "function"` answered with a bare 422 (new 2026-10-04) |
+| #28 | FIXED, **gate not closed** | regression run failed the 0.05 bar once (0.068); pre-fix baseline still owed |
+| expert-bench B=4 | **OPEN** | decode-branch mismatch; unreachable in production since 2026-10-03 |
+| #17 | on in production, **unvalidated** | candidate pool above 16384 compressed positions |
+| #2, #5 | **OPEN** | re-checked |
+| #4, #6 | **OPEN** | not re-checked |
+| #3 | **OPEN** | startup validation missing; production's `WINDOWS=0` + unified pool is not the degenerate case |
+| #7 | **OPEN** | measured on the legacy DSpark driver; not re-checked on the arena path |
+| #8 | **OPEN** | not re-checked |
+| #9 | *MITIGATED* | — |
+| #15 | **OPEN**, narrowed | the phase partition is gone under `V41_PREFILL_UNIFIED_POOL=1`; the dense region remains |
+| #16 | **OPEN** (catch-all only) | re-checked |
+| #18 | **OPEN** | not re-checked |
+| #10, #13 | **OPEN** | structural; not re-checked |
+| #11 | **OPEN** | the unified framework (`knobs.rs`, 2026-10-01) exists; 333 names are still read outside it (`KNOB_AUDIT_2026-10-04.md`) |
+| #12, #14 | **OPEN** | structural; re-checked |
 
 ---
 
-## Open
+## Recent entries (newest first; most are FIXED)
 
-Entries 30-49: review of 2026-10-03 (11 auditors, one adversarial verifier per
-finding, read-only), all FIXED 2026-10-03 on branch `claude/sharp-feynman-j1ry6t`,
-NOT deployed. GPU paths were compile-checked only (no ROCm in the review
-sandbox); host regression tests named per entry. **Deploying it deletes every
-snapshot** (`KV_EPOCH` 1, #39) and changes token ids for non-ASCII text (#35).
+### 53. OPEN (found 2026-10-04) — box 2's prefill MoE partials travel as f16 by default, and no fidelity gate has been run on that
+
+`V41_PREFILL_F16_REPLIES` (`forward_prefill.rs`, default ON since 2026-10-01,
+`0` = f32) halves the prefill reply bytes on the box-2 link. The code itself
+logs `UNTESTED FIDELITY: ... No KLD / golden gate has been run on f16
+partials`. `MULTISTREAM_DECODE_PLAN.md` had planned f16 partials to "land with
+their own KLD gate"; that gate was skipped. Decode replies stay f32. Owner
+2026-10-04: the gate is still needed. Close with a KLD / golden-gate run
+(f16 vs `V41_PREFILL_F16_REPLIES=0`) on long prompts; until then any prefill
+fidelity number is measured with f16 partials.
+
+### 54. OPEN (found 2026-10-04) — `V41_SUB=1/2` miss substitution runs AFTER the fidelity pin and can swap pinned picks
+
+`BOX2_MISS_SUBSTITUTION.md` requires substitution to be skipped entirely under
+the golden gate's routing pin (`fidelity_tap::pin_on()`). Neither
+`substitution_active` nor `cache_prior_active` (`forward_prefill.rs`) checks it;
+both only say "fidelity/determinism runs must leave `V41_SUB` unset". In the
+batched driver the pin is applied right after routing, and substitution
+(modes 1/2) runs later on the read-back picks, before the box-2 submit, so it
+would replace a pinned pick with an alternative. Mode 3 (cache prior, what
+production runs) is NOT affected: its boost goes to the top-k kernel through a
+separate `d_prior` buffer, and the pin rewrites any differing row's picks and
+weights from the unbiased `router_logits`. Exposure: a golden-gate run launched
+with `V41_SUB=1` or `2` in its environment. Fix: `&& !fidelity_tap::pin_on()` in
+both gates.
+
+### 55. OPEN (found 2026-10-04) — OpenAI `tool_choice` is silently ignored, and a `"function"`-role message gets a bare 422
+
+`ChatCompletionRequest` (`openai/types.rs`) has no `tool_choice` field, so
+`"tool_choice": "none"` / `"required"` / a named function is dropped by serde,
+and `check_unsupported_params` neither refuses nor warns (unlike #38's sampling
+modifiers). `Role` has System (alias `developer`), User, Assistant and Tool
+only, so a legacy `"role": "function"` message fails deserialization and axum
+answers 422 with its JSON-rejection text rather than a 400 naming the field.
+Both were D12 / D11 in `TOOL_PROMPT_FIDELITY.md` (2026-09), the only two of its
+fourteen divergences still open. Fix: warn (or 400 under `V41_API_STRICT=1`) on
+any `tool_choice` other than `"auto"`, and map a `function` role to a clear 400.
+
+### Entries 30-49 (review of 2026-10-03)
+
+11 auditors, one adversarial verifier per finding, read-only; all FIXED
+2026-10-03 on branch `claude/sharp-feynman-j1ry6t`. GPU paths were
+compile-checked only (no ROCm in the review sandbox); host regression tests
+named per entry. **Merged and deployed** (corrected 2026-10-04): the branch tip
+a7799a7 is on main, and the 2026-10-03 18:52 UTC hardware-move deploy ran it
+(#50: every request since then logged `min_p`, a field added by #38's fix). That
+deploy deleted every pre-epoch snapshot (`KV_EPOCH` 1, #39) and changed token
+ids for non-ASCII text (#35).
 
 ### 30. FIXED 2026-10-03 — a whole-prompt snapshot hit streamed the chain of thought as answer content
 
@@ -252,7 +323,7 @@ the old loop, kept as `bpe_emit_piece_greedy`), `bpe_heap_merge_real_vocab`
 (ignored: the real vocab, piece by piece); benches
 `prompt_v41::tests::{prompt_cost_breakdown, bpe_long_piece_cost}` (ignored).
 
-### 29. FIXED 2026-09-30 (NOT deployed) — under the T2 partition, a lane-layer with no box-2 pick was sent to box 2 masked by its static HELLO set while box 1 computed every pick: experts in box 2's `--experts` range were added TWICE
+### 29. FIXED 2026-09-30 (deployed 2026-09-30 04:24 UTC: d140ab5 is in d4f7e3d) — under the T2 partition, a lane-layer with no box-2 pick was sent to box 2 masked by its static HELLO set while box 1 computed every pick: experts in box 2's `--experts` range were added TWICE
 
 `pre_moe_route` built the hub's own box-2 pick list (`sel_for_remote`, masked by
 `owns_eff`) only when `extra_remote` had an entry. Under `V41_T2_PARTITION=1`
@@ -287,8 +358,9 @@ intermittent looping reported at 170-180K context. Fix: empty the rings when
 `pos0 == 0 || t > b_seg`. **2026-09-24:** cc47607 fixed only `prefill_job_finish`;
 the duplicate CED replay inside `forward_prefill_pipelined` (serial
 `prefill_suffix`, reached by any launch without `V41_MULTISTREAM=1` or with
-DSpark on) still had `pos0 == 0` -- fixed the same way on branch
-`worktree-architecture-review`, not deployed. Same review (read-only, 2 agents): mid-prefill
+DSpark on) still had `pos0 == 0` -- fixed the same way in 09ec544 (from the
+`worktree-architecture-review` work), which is on main and deployed (corrected
+2026-10-04). Same review (read-only, 2 agents): mid-prefill
 checkpoints saved never-updated decoder rings (now saved empty); a short or
 partial `index_k.bin` half-restored with another request's keys (now a cache
 miss; all 446 live snapshots were checked clean); a failed session-hint restore
@@ -302,6 +374,10 @@ The 0.05 bar FAILED on one case. NOT yet known whether that is residual error or
 chunk-split noise (fresh = 1024+76 rows, continued = 600 then 500; chunk size
 alone moves KL 0.01-0.04): run the same mode on the PRE-fix build (0920276)
 and with MS_RESTORE_CHUNK equalised before trusting or re-setting the bar.
+**Status 2026-10-04: NOT CLOSED.** Neither follow-up run has been done, so
+whether the 0.068 case is residual error or chunk-split noise is unknown. The
+code fix stands; the entry stays in the index until the gate passes or the bar
+is re-set with that evidence.
 Also: `tests/snapshot_v41_restore_guards.rs`, `kv_arena_compact`
 `failed_admit_from_state_releases_its_slot`, `restore_candidates` unit test (all pass).
 
@@ -548,6 +624,13 @@ the local reference in the bench uses the same executor. Suspects: the
 batch-size-dependent decode-vs-verify disagreement (`VERIFY_DISAGREES_WITH_DECODE.md`)
 or the B>1 `moe_gate_up_batch_hetsplit`/`moe_down_batched_hetsplit` row handling.
 Production decode is B=1 (identical), so this bites DSpark verify (B=2..6) only.
+**[2026-10-04: that exposure statement is out of date.** Since a7799a7
+(2026-10-03) the hub sets `REQ_FLAG_BATCHED` on every submit, B=1 included
+(`V41_REMOTE_BATCHED_B1`, default on), and production box 2 runs
+`--decode-max-b 1`, so no production request reaches the daemon's decode
+branch. Multistream decode also runs up to 8 rows. The mismatch is reachable
+only with `V41_REMOTE_BATCHED_B1=0` / `V41_REMOTE_BATCHED_MULTI=0` or a larger
+`--decode-max-b`.**]**
 
 2026-09-21 addendum: with the bench's local reference forced onto the SAME path as
 the remote (`--batched` on both, bench patched that day), a `--paged` daemon and
@@ -743,6 +826,10 @@ store. S2 makes every layer attend only its index source's top-512, so the real
 bound is `raw_window + INDEXER_TOP_K`, with no `n_kv_max` term. Scratch 2080 ->
 192 MiB and CONSTANT in context; dGPU freed 1.9 GiB; `--ctx 307200` now boots
 with identical throughput and bit-identical output.
+**[2026-10-04: see #19.** The same commit truncated the indexer to 131,200
+positions, so output was NOT bit-identical at long context. The #19 fix sizes
+`attn_scores` by `ATTN_MIXED_MAX_KEYS = V41_MAX_CTX + IMAGE_RAW_WINDOW_MAX`
+again (`attention.rs`).**]**
 
 ### FIXED — the `developer` role 422'd every request (`c6888df`)
 OpenAI renamed the system role for o1-era models; prime-agent sends `developer`
@@ -1276,6 +1363,12 @@ exclusion builder runs afterwards: the >=90% union->dense arm with
 so all 40 layers share one 384-slot window and overwrite each other. Emits CJK
 garbage, E=1.000. Should be rejected at startup. Do NOT use as an "unpacked
 reference" -- it is not one.
+**[2026-10-04:** `V41_PAGER_WINDOWS=0` is mapped to 1 too (`expert_pager.rs`,
+`Some(0) => 1`). Production runs `WINDOWS=0` together with
+`V41_PREFILL_UNIFIED_POOL=1` and logged `prefill dense = 1 (pinned layers 0..0)`
+without garbage (`AUDIT_2026-09-22.md` B12), presumably because the unified pool
+pages prefill through the decode LRU. The degenerate case is 1 (or 0) WITHOUT
+the unified pool. Startup still rejects neither.**]**
 
 ### 4. OPEN — `remap_dev` carries three incompatible slot spaces, untyped
 `ensure` -> ABSOLUTE pool slot (whole-pool view); `ensure_layer_union`/`_dense`
@@ -1330,6 +1423,11 @@ request inherits that silently. Real fix is a `CompressorLoan` RAII guard;
 `with_kv_source` is the model.
 
 ### 15. OPEN — the expert pool is statically partitioned BY PHASE
+
+**[2026-10-04:** `V41_PREFILL_UNIFIED_POOL=1` (production; code default off)
+runs prefill through the same LRU as decode, so there is no phase partition in
+production. What remains is the `dense_slots()` region (384 slots) that every
+LRU allocation skips. With the unified pool off, the text below still holds.**]**
 
 UPDATE 2026-09-18: still true (384 dense slots reserved for prefill, 4070 for
 decode), but the measured stakes are smaller than the table below suggests. On a
@@ -1460,6 +1558,10 @@ HIP property. 91 `set_current*` calls in `het/`, zero guards. One site is
 hand-patched with a comment explaining the cache goes stale.
 
 ### 11. OPEN — env-var sprawl: 292 `std::env::var` reads in production `src/`
+**[2026-10-04:** the single implementation exists for part of the tree:
+`crates/v4flash-kernels/src/knobs.rs` (2026-10-01; defaults, live vs static,
+`V41_KNOBS_FILE`, `<file>.effective`). `KNOB_AUDIT_2026-10-04.md` lists the 333
+env names still read outside it.**]**
 113 distinct names in `het/` alone. 21 per layer in the prefill hot path
 (~840/step) -- measured at ~42 us/layer, i.e. NOT a bottleneck, but several
 select different NUMERICS from a free integer rather than a validated enum.

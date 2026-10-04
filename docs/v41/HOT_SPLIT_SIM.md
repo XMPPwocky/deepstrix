@@ -1,5 +1,14 @@
 # Hot-split simulator: where should the routed experts live? (2026-10-03)
 
+> **Status (docs audit 2026-10-04):** the side finding's fix landed right after this doc as
+> `V41_REMOTE_PARTIAL_ASYNC` (fe90910; live knob, code default off, production on per the hub env
+> 2026-10-04). The hot-set parameters used below (top-103, hysteresis 100, <= 3 newcomers) are the
+> production env (`V41_B1_HOT_PER_LAYER=103`, `V41_B1_HOT_HYST=100`, `V41_B1_HOT_MAX_CHANGE=3`);
+> the code defaults in `expert_pager::hot_set` are 90 / 40 / 0 (unlimited), and `simlib.HotSet`
+> hardcodes the production values. Re-running needs `data/final/params.json`, which no step of
+> `run_all.sh` writes and which is not committed; `calibrate.py` implements `--grid`, not the
+> `--fit` its usage line names. The box-2 link of the post-move run is USB4 / thunderbolt0.
+
 Offline replay simulator for single-stream DSpark decode steps under different
 policies for splitting the routed experts between box 1 (hub iGPU) and box 2.
 Code: `scripts/split_sim/` (stdlib Python, streams every input). Data: the
@@ -21,7 +30,8 @@ warm single-stream steps (after the first hot-set refresh).
   (chain -> route -> max(iGPU, box 2) -> post -> next chain) plus a host/dGPU
   coupling (next point) bounds a 2-lane step, not the devices' busy sums.
 * **Side finding, policy-independent:** box 2's partial is uploaded with a
-  synchronous `hipMemcpy` (`forward_prefill.rs:10904`, `copy_from_host`) on the
+  synchronous `hipMemcpy` (`forward_prefill.rs:10904`, `copy_from_host`; **[2026-10-04: now
+  the blocking arm of `V41_REMOTE_PARTIAL_ASYNC`]**) on the
   null stream, and `de.compute` is a blocking stream (`engine.rs:217`), so every
   post with a box-2 reply drains the dGPU queue -- including the posting lane's
   `wait(moe_arrived)` -- with the single host thread blocked. The model only

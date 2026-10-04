@@ -20,7 +20,7 @@ This is the immutable baseline. Every Phase 1 milestone (M2+) validates ported k
   - iGPU: AMD Radeon 8060S Graphics (Strix Halo, gfx1151) — HIP device 1
   - dGPU: AMD Radeon RX 9070 XT (gfx1201) — HIP device 0 (NOT used for inference; 16 GiB VRAM is too small for 86 GiB model)
 - ds4 submodule: `external/ds4` @ branch `rocm` (initial: 7a751eb)
-- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks, 0006-comp-mask-hooks, 0007-compressor-indexer-hooks, 0008-moe-router-hooks}.patch`
+- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks, 0006-comp-mask-hooks, 0007-compressor-indexer-hooks, 0008-moe-router-hooks}.patch` **[2026-10-04: the stack is now 0001-0011 (0009 FFN output hooks 2026-05-24; 0010/0011 IQ3_XXS/IQ2_S/MXFP4 CPU quants + dumper-variant dispatch, 9445351, 2026-08-10). Submodule pinned at b8b2351 since b019252; see `PHASE1_DS4_ISSUES.md` for the `DS4_SKIP_BAKED=1` re-apply.]**
 
 ## Model
 
@@ -167,9 +167,11 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
 [53091, 4374, 1465, 13582, 22, 32958, 344]
 ```
 
-This confirms `ds4_dump_text_tokenization`'s `tokenize_rendered_chat_vocab` path degenerates to plain BPE for marker-free input. Rust-side `BpeVocab::encode()` comparison is still TODO (needs a small CLI binary in `v4flash-core`).
+This confirms `ds4_dump_text_tokenization`'s `tokenize_rendered_chat_vocab` path degenerates to plain BPE for marker-free input. Rust-side `BpeVocab::encode()` comparison is still TODO (needs a small CLI binary in `v4flash-core`). **[2026-10-04: `BpeVocab` encoding is now pinned against HF `tokenizers` goldens (`crates/v4flash-core/tests/joyai_pretok_goldens.rs`) and GGUF-vs-`tokenizer.json` equality (`tests/tokenizer_json_vs_gguf.rs`); this exact 7-token ds4 cross-check was never added.]**
 
 ## Reproduction command
+
+**[2026-10-04: per the state note in `external/apply-patches.sh`, the pinned submodule already contains patches that then apply in neither direction, and the script exits 1 on them; on a fresh checkout run it as `DS4_SKIP_BAKED=1 ./external/apply-patches.sh` (see `PHASE1_DS4_ISSUES.md`).]**
 
 ```bash
 nix develop -c bash -c '

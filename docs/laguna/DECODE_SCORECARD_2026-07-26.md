@@ -12,7 +12,7 @@ completed cleanly (only benign timestamp-swap warnings).
 `LAGUNA_HOT_EXPERTS_DGPU`), so *all* routed MoE runs on the iGPU (the
 `layer_moe` non-split path).  This is the pure-roofline picture.  The server
 runs K=6–8 hot experts mirrored to the dGPU, which rebalances iGPU↔dGPU (see
-levers).
+levers). **[2026-10-04: `deepstrix-server` has no Laguna path; "the server" here means the het default that `laguna-chat` loads (the K=8 hot-expert file, `DEFAULT_HOT_EXPERTS` in `crates/deepstrix-cli/src/bin/laguna_chat.rs`).]**
 
 **Wall (from the traced run, self-consistent denominator):**
 - ctx 4096:  36.7 ms/token  (27.2 tok/s)

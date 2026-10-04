@@ -1,5 +1,7 @@
 # Path to 280–290 t/s prefill: sub-warp partitioned accumulator for iq2/q2k
 
+> **Status (docs audit 2026-10-04):** NOT IMPLEMENTED; rejected. M51 attributed the cost to per-member overhead, not dequant ("Subwarp/chunk-64 plan stays rejected", `M51_IGPU_MOE_JOURNAL.md`), and shipped the kwide kernels instead: `IQ2_VARIANT` now defaults to `kwide` (`het/forward_prefill.rs`), not `staged`. No `_subwarp` kernel or `IQ2_VARIANT=subwarp` exists in `crates/`. The q2k by-expert kernel lives in `kernels/q2_k_accumulate_matvec_par.hip`; `q2_k_matvec_par.hip` never existed. V4-Flash was dropped as a direction on 2026-09-24.
+
 **Date:** 2026-06-08
 **HEAD when authored:** `3d9cdd0` (post ATTN_SCORES_STRIDE + B_MAX=1024, baseline 230 t/s cold-cache T=4K–32K)
 **Target:** 270–290 t/s cold-cache, no model-file change, no persistent cache infrastructure

@@ -1,5 +1,7 @@
 # Freeing dGPU VRAM (and therefore host RAM) — plan, 2026-09-09 (rev 3)
 
+> **Status (docs audit 2026-10-04):** PARTLY IMPLEMENTED. Lever 2 (FP8 compressed KV) shipped 2026-09-10 (`FP8_KV_IMPL_2026-09.md`); lever 3 (E2M1 indexer keys) shipped (`E2M1_INDEXER_KEYS_2026-09.md`). Lever 1 (per-layer weight arenas) was never built (`weights.rs` has one `load_to_device` path); lever 4's `DGPU_MEMORY_SLOTS` exists only in docs commit 6705c37. Both formats DO have runtime toggles, default on: `COMP_KV_FP8` and `INDEXER_KEYS_E2M1` (`CompKvStore::{fp8_enabled, e2m1_enabled}`, `het/state.rs`). V4-Flash was dropped as a direction on 2026-09-24.
+
 Rev 3 = rev 2 + the second-pass corrections (naive IndexerScore converted, not deleted;
 lever-4 rationale corrected; index_comp_kv v3 recovery + per-blob format flags;
 exhaustive expansion oracles; 60-min window; back-to-back baseline).
@@ -213,7 +215,7 @@ model loads, the oracle process and then the server):
    (736 tok/s prefill on the IQ2_S WMMA path, 29.0 decode at short ctx, both on
    UD-IQ3_XXS) are the reference only if taken in the same window.
 Rollback: previous K in the run script + the branch's parent commit. FP8/E2M1 formats
-have no runtime toggle; a lever that fails an oracle does not ship.
+have no runtime toggle; a lever that fails an oracle does not ship. **[2026-10-04: as built, both formats have runtime toggles (`COMP_KV_FP8=0`, `INDEXER_KEYS_E2M1=0`).]**
 
 ## Not in this plan (measured dead, stale, or not lossless)
 

@@ -1,6 +1,14 @@
 # The 260/68 -> 164/164 re-split: +22% decode, -37% prefill
 ### measured 2026-09-14. The cheap falsifier for the global-pool thesis.
 
+> **Status (docs audit 2026-10-04):** contradicted, not reconciled. A day later the same
+> 260/68 -> 164/164 re-split measured **48% SLOWER** on decode (177.95 vs 263.37 ms/token, box-2
+> LRU warmed to convergence; DSPARK_VERIFY_FIDELITY.md), and EXPERT_FORMAT_IS_THE_REMAINING_LEVER.md
+> lists the rebalance as refuted. The later run converged box 2's LRU first; nobody re-ran the
+> two side by side, so which one holds is open. Neither layout is in use: box 2 boots a uniform
+> `L0-L39:230-383` (154/layer, no placement file) since 2026-09-16 and its global pool moves
+> capacity between layers (`scripts/patch_b2.py`, REMOTE_EXPERTS.md §3.2).
+
 ## Result
 
 Identical total capacity (6,560 slots, 123.33 GB) on box 2, reallocated from

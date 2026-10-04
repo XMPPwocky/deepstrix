@@ -1,5 +1,7 @@
 # Remaining integration — families F, E, A+B, C2 (one agent, sequential)
 
+> **Status (docs audit 2026-10-04):** DONE — F 3e5347b, E 35f2515, A+B 1c5972f, C2 cba1b00 (2026-09-26/27), all 17 knobs on main, default ON. Round 2 later moved four gates (343896b: `V41_F16X_256` from 192 rows, `V41_GEMV_BPACK_Z16` only n_rows >= 2048 or b >= 48, `V41_IDX_GATHER_B128` from b = 3, `V41_CAND_THRESH_ILP` up to b = 32), so the gates written below are not the current ones; read the knob doc comments in code.
+
 Follow `INTEGRATION_BRIEF.md` for conventions, build, tests, commit format. Families D and C1 are
 already integrated on this branch (commits `e282846`, and C1's); four golden-gate commits were
 cherry-picked (`fidelity_tap.rs` + small hooks) — do not touch them. Work family by family in the

@@ -1,5 +1,27 @@
 # DeepStrix architecture and quality review
 
+> **Status (docs audit 2026-10-04):** review of `f38679e`; main has moved far past it.
+> - **§2.1 is replaced** by docs/GLOSSARY.md (CANONICAL, owner sign-off 2026-10-04). Several §2.1
+>   choices were reversed there ("seq", "expert server", "stream = HIP stream only").
+> - **Proposed names are proposals.** About 35 type/function/file names in §2.1, §4, §5 and §7 exist
+>   nowhere in the tree (checked 2026-10-04, `grep -rnw` over `crates/` and `scripts/`, 0 hits):
+>   `RuntimeKnobs`, `LaneSchedule`, `LaneBufs`, `LaneCtl`, `LayerCtx`, `SubmitExtras`,
+>   `verify_restored`, `sample_host`, `on_request_end`, `TurnAssembler`, `decode_loop_plain`,
+>   `RouteOpts`, `PassOpts`, `LayerHostCounters`, `indexer_kind`, `IndexerKind`, `take_stats`,
+>   `expert_io`, `MoeWorkItems`/`MoeGateUp`/`MoeDown`, `RemoteSplitMode`, `hot_tier_active`,
+>   `slice_view_unchecked`, `decode_token_bytes`, `SemanticsAltering`, `layout_version`,
+>   `DEEPSTRIX_UNSAFE_DIAGNOSTICS`, `ExpertKey`, `Remap`, `RequestShape`, `TensorDesc`, `RawWindow`,
+>   `fixture_or_skip`, `scripts/gates.sh`, `placement.rs`, `hc.rs`, `model/{v4,v41}.rs`.
+> - **Fixed on main since:** §5 #1 (#28 twin), #5 (ShardPool claim rollback; `B2Prefetch` joins
+>   its readers on drop, `OwnerPtr` gone), #6 (restores verified by `byte_aligned_lcp_vl` with
+>   image spans), #7 (DSML entity decode), #10 (`MAX_LANES` = 3 enforced), #12 (multistream heap
+>   trim), readyz deadline, tool-result image order — all in 09ec544 (2026-09-24). §5 #3 / step 2:
+>   `knobs.rs` framework since 6860f0b (2026-10-01), but 293 V4.1 env names still bypass it
+>   (docs/v41/KNOB_AUDIT_2026-10-04.md). Step 0: golden gate milestones 1–2 landed
+>   (`tests/v41_golden_gate.rs`, `het/fidelity_tap.rs`; 7e44cce, 52d8aee, 02c6011).
+> - **Not on main:** the §9 progress log, the V4-Flash removal (86a2aeb, e39e0c2, f0a73b3, d03d089,
+>   b40174d) and `deploy/` (06bd689) exist only on branch `worktree-architecture-review`.
+
 *Scope: every crate in the workspace at `f38679e`. Read-only. Built from eight subsystem maps, merged by an architect pass, then checked claim by claim by an adversarial reviewer against the code. Corrections from that check are folded in; where it changed a verdict the text says so. Items marked **(verified)** were re-read by both the architect and the reviewer. Line numbers refer to `f38679e`.*
 
 ---
@@ -22,6 +44,11 @@ That structure is now causing real bugs, not just slowing work down. A KNOWN_BUG
 ## 2. Ontology
 
 ### 2.1 Canonical glossary
+
+**[2026-10-04: superseded by docs/GLOSSARY.md, which is canonical. This table mixes real names
+with proposals that were never built (`ExpertKey`, `Remap`, `RequestShape`, `RawWindow`,
+`IndexerKind`, `TensorDesc`, `LaneCtl`). The `knob` row's "nowhere" predates `knobs.rs`
+(2026-10-01).]**
 
 | Term (canonical) | Meaning | Aliases to retire | Where it lives now → should live |
 |---|---|---|---|

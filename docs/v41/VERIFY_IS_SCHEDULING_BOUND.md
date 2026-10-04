@@ -1,6 +1,11 @@
 # The verify is 80% idle: a costed path to 20 tok/s DSpark
 ### perfetto trace + analyzer, 2026-09-15, B=6 verify probe
 
+> **Status (docs audit 2026-10-04):** historical trace of the LEGACY verify probe; production
+> DSpark verifies inside the multistream arena step (DSPARK_ARENA_PLAN.md). The analyzer
+> (`~/scripts/analyze_pftrace_gaps.py`) is outside the repo and `[[project-decode-at-floor]]` is
+> a memory note, not a repo file.
+
 ## Every track is idle
 
 `~/scripts/analyze_pftrace_gaps.py` over a trace containing 6 verify probes at
