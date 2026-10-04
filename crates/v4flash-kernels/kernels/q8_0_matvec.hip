@@ -420,6 +420,35 @@ Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB8, 8)
 Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB9, 9)
 Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB10, 10)
 
+// `_ind` twins (docs/v41/GRAPH_KEYS_DESIGN.md 2.3): the same body; for each of operands 0..3
+// (out, w, xq, xscale) whose bit of `ind_mask` is set, the pointer argument is the address of
+// its arena context slot and is dereferenced first, so one captured graph serves every layer /
+// lane. Resolution happens before any store; same instructions on the same data as the direct
+// kernel.
+#include "arena_ctx.inc"
+#define Q8_0_GEMV_BPACK_TB_IND(NAME, B)                                                    \
+    extern "C" __global__ void NAME(uint32_t ind_mask, const ArenaCtx* canary,             \
+                                    uint32_t canary_tag, float* out,                       \
+                                    const unsigned char* w, const int8_t* xq,              \
+                                    const float* xscale, uint32_t in_dim,                  \
+                                    uint32_t out_dim, uint32_t blocks, uint32_t batch) {   \
+        (void)batch;                                                                       \
+        ARENA_CTX_DEREF(ind_mask, 0, float*, out);                                         \
+        ARENA_CTX_DEREF(ind_mask, 1, const unsigned char*, w);                             \
+        ARENA_CTX_DEREF(ind_mask, 2, const int8_t*, xq);                                   \
+        ARENA_CTX_DEREF(ind_mask, 3, const float*, xscale);                                \
+        ARENA_CTX_CANARY(canary, canary_tag);                                              \
+        q8_0_gemv_bpack_tb_body<B>(out, w, xq, xscale, in_dim, out_dim, blocks);           \
+    }
+Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB1_ind, 1)
+Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB2_ind, 2)
+Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB3_ind, 3)
+Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB4_ind, 4)
+Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB5_ind, 5)
+Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB6_ind, 6)
+Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB7_ind, 7)
+Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB8_ind, 8)
+
 // Quantize, one WAVE per 32-element block (lane i owns element i; amax via shfl_xor
 // fmaxf, which is order-free so d/id are bit-identical), 8 blocks per 256-thread WG:
 // grid = ceil(blocks/8) x 256. `q8_0_quantize_f32` above launches one 32-thread WG per

@@ -611,6 +611,60 @@ impl Q8_0Matvec {
         ])
     }
 
+    /// `matvec_bpack` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md 2.3):
+    /// operands 0..3 (out, weight, xq, xscale) marked in `ind` are read from the arena
+    /// context slot at run time; the buffers passed here are still the real ones (their
+    /// sizes are checked, and they are what a direct launch would use). Twins exist for
+    /// the compile-time batch kernels b = 1..8 (same body, bit-identical); any other arm
+    /// launches the direct kernel on those real buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_bpack_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        // No twin on this arm (b > 8, or the runtime kernel under V41_GEMV_TB=0): the DIRECT
+        // kernel on the real buffers (design 2.5's fallback rule; unvetted, so a capture taints).
+        if !(1..=8).contains(&batch) || !gemv_tb_on() {
+            return self.matvec_bpack(stream, out, weight, xq, xscale, n_rows, k, batch);
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 matvec_bpack_ind: k={k} not a multiple of 32"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        if weight.byte_len() != (n_rows as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize)
+            || out.len() < (batch as usize) * (n_rows as usize)
+            || xq.len() < (batch as usize) * (k as usize)
+            || xscale.len() < (batch as usize) * (blocks as usize)
+        {
+            return Err(eyre!("q8_0 matvec_bpack_ind: operand sizes do not fit n_rows={n_rows} k={k} batch={batch}"));
+        }
+        const IND_SYMBOLS: [&str; 8] = [
+            "q8_0_gemv_bpack_tB1_ind", "q8_0_gemv_bpack_tB2_ind", "q8_0_gemv_bpack_tB3_ind", "q8_0_gemv_bpack_tB4_ind",
+            "q8_0_gemv_bpack_tB5_ind", "q8_0_gemv_bpack_tB6_ind", "q8_0_gemv_bpack_tB7_ind", "q8_0_gemv_bpack_tB8_ind",
+        ];
+        let function = self.module.get_function(IND_SYMBOLS[(batch - 1) as usize])?;
+        let cfg = LaunchConfig {
+            grid: (n_rows.div_ceil(GEMV_ROWS_PER_BLOCK), 1, 1),
+            block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (p_out, p_w, p_xq, p_xs) = (
+            ind.ptr(0, out.raw() as u64),
+            ind.ptr(1, weight.raw() as u64),
+            ind.ptr(2, xq.raw() as u64),
+            ind.ptr(3, xscale.raw() as u64),
+        );
+        launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, p_out, p_w, p_xq, p_xs, k, n_rows, blocks, batch])
+    }
+
     /// M40-P4.5: 2-wide pair GEMV. Same as `matvec` but processes TWO input
     /// columns against ONE weight matrix per call. Reads W once and computes
     /// both outputs in the same kernel pass — halves W bandwidth vs two

@@ -95,6 +95,47 @@ impl MhcArena {
         sinkhorn_eps: f32,
         batch: u32,
     ) -> eyre::Result<()> {
+        self.launch_fast_impl(None, stream, mix, collapse, carry, write_carry, k, rms_eps, sinkhorn_iters, sinkhorn_eps, batch)
+    }
+
+    /// `launch_fast` through its `_ind` twin `mhc_fast_batched_ind`
+    /// (docs/v41/GRAPH_KEYS_DESIGN.md 2.3): the operands marked in `ind` -- numbered as the
+    /// kernel's pointer arguments, 0 = split_out .. 8 = carry .. 12 = norm_w -- are read from
+    /// the arena context slot at run time; the buffers passed are the real ones (checked,
+    /// as for a direct launch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fast_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        mix: Option<FastMix<'_>>,
+        collapse: Option<FastCollapse<'_>>,
+        carry: &mut DeviceBuffer<f32>,
+        write_carry: bool,
+        k: u32,
+        rms_eps: f32,
+        sinkhorn_iters: u32,
+        sinkhorn_eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        self.launch_fast_impl(Some(ind), stream, mix, collapse, carry, write_carry, k, rms_eps, sinkhorn_iters, sinkhorn_eps, batch)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_fast_impl(
+        &self,
+        ind: Option<crate::het::arena_ctx::Ind>,
+        stream: &Stream,
+        mix: Option<FastMix<'_>>,
+        collapse: Option<FastCollapse<'_>>,
+        carry: &mut DeviceBuffer<f32>,
+        write_carry: bool,
+        k: u32,
+        rms_eps: f32,
+        sinkhorn_iters: u32,
+        sinkhorn_eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
         }
@@ -161,11 +202,22 @@ impl MhcArena {
             }
             None => (null, null, null, null, 0u32),
         };
-        let function = self.fast.get_function("mhc_fast_batched")?;
         let cfg = LaunchConfig { grid: (n_mix + do_collapse + rms_wg, 1, batch), block: (256, 1, 1), shared_mem_bytes: 0 };
+        let Some(ind) = ind else {
+            let function = self.fast.get_function("mhc_fast_batched")?;
+            return launch_kernel!(function, cfg, stream, [
+                split_p, mix_p, cnt_p, inv_p, w_p, x_p, scale_p, base_p, carry.raw(),
+                cx_p, cur_p, norm_p, nw_p,
+                k, ne, n_mix, do_collapse, write_carry as u32, mode, rms_eps,
+                N_HC, sinkhorn_iters, sinkhorn_eps
+            ]);
+        };
+        let direct = [split_p, mix_p, cnt_p, inv_p, w_p, x_p, scale_p, base_p, carry.raw(), cx_p, cur_p, norm_p, nw_p];
+        let p: [u64; 13] = std::array::from_fn(|i| ind.ptr(i, direct[i] as u64));
+        let function = self.fast.get_function("mhc_fast_batched_ind")?;
         launch_kernel!(function, cfg, stream, [
-            split_p, mix_p, cnt_p, inv_p, w_p, x_p, scale_p, base_p, carry.raw(),
-            cx_p, cur_p, norm_p, nw_p,
+            ind.mask(), ind.canary, ind.tag,
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12],
             k, ne, n_mix, do_collapse, write_carry as u32, mode, rms_eps,
             N_HC, sinkhorn_iters, sinkhorn_eps
         ])

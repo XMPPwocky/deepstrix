@@ -196,7 +196,8 @@ __device__ __forceinline__ static void mf_sinkhorn_tail(
     }
 }
 
-extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched(
+// The kernel body, shared by `mhc_fast_batched` and its `_ind` twin (GRAPH_KEYS_DESIGN.md 2.3).
+__device__ __forceinline__ void mhc_fast_body(
         float          *              split_out,   // [B, 24]            (mix)
         float          *              mix_out,     // [B, 24]            (mix; read back by the tail)
         unsigned int   *              counters,    // [B], zero between launches (mix)
@@ -392,4 +393,61 @@ extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched(
                      split_out + (size_t)b * (size_t)MF_MIX,
                      write_carry ? carry + (size_t)b * (size_t)MF_MIX : nullptr,
                      scale, base, n_hc, iters, eps);
+}
+
+extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched(
+        float          *              split_out,
+        float          *              mix_out,
+        unsigned int   *              counters,
+        float          *              inv_rows,
+        const __half   * __restrict__ weight,
+        const float    * __restrict__ x,
+        const float    * __restrict__ scale,
+        const float    * __restrict__ base,
+        float          *              carry,
+        const float    * __restrict__ cx,
+        float          * __restrict__ cur_out,
+        float          * __restrict__ norm_out,
+        const float    * __restrict__ norm_w,
+        unsigned int     k,
+        unsigned int     ne,
+        unsigned int     n_mix,
+        unsigned int     do_collapse,
+        unsigned int     write_carry,
+        unsigned int     mode,
+        float            rms_eps,
+        unsigned int     n_hc,
+        unsigned int     iters,
+        float            eps) {
+    mhc_fast_body(split_out, mix_out, counters, inv_rows, weight, x, scale, base, carry, cx, cur_out, norm_out, norm_w,
+                  k, ne, n_mix, do_collapse, write_carry, mode, rms_eps, n_hc, iters, eps);
+}
+
+// `_ind` twin: operands 0..12 (split_out .. norm_w, in order) resolve through the arena context
+// when their `ind_mask` bit is set (arena_ctx.inc), then the canary, then the same body.
+#include "arena_ctx.inc"
+extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ind(
+        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag,
+        float* split_out, float* mix_out, unsigned int* counters, float* inv_rows,
+        const __half* weight, const float* x, const float* scale, const float* base,
+        float* carry, const float* cx, float* cur_out, float* norm_out, const float* norm_w,
+        unsigned int k, unsigned int ne, unsigned int n_mix, unsigned int do_collapse,
+        unsigned int write_carry, unsigned int mode, float rms_eps, unsigned int n_hc,
+        unsigned int iters, float eps) {
+    ARENA_CTX_DEREF(ind_mask, 0, float*, split_out);
+    ARENA_CTX_DEREF(ind_mask, 1, float*, mix_out);
+    ARENA_CTX_DEREF(ind_mask, 2, unsigned int*, counters);
+    ARENA_CTX_DEREF(ind_mask, 3, float*, inv_rows);
+    ARENA_CTX_DEREF(ind_mask, 4, const __half*, weight);
+    ARENA_CTX_DEREF(ind_mask, 5, const float*, x);
+    ARENA_CTX_DEREF(ind_mask, 6, const float*, scale);
+    ARENA_CTX_DEREF(ind_mask, 7, const float*, base);
+    ARENA_CTX_DEREF(ind_mask, 8, float*, carry);
+    ARENA_CTX_DEREF(ind_mask, 9, const float*, cx);
+    ARENA_CTX_DEREF(ind_mask, 10, float*, cur_out);
+    ARENA_CTX_DEREF(ind_mask, 11, float*, norm_out);
+    ARENA_CTX_DEREF(ind_mask, 12, const float*, norm_w);
+    ARENA_CTX_CANARY(canary, canary_tag);
+    mhc_fast_body(split_out, mix_out, counters, inv_rows, weight, x, scale, base, carry, cx, cur_out, norm_out, norm_w,
+                  k, ne, n_mix, do_collapse, write_carry, mode, rms_eps, n_hc, iters, eps);
 }
