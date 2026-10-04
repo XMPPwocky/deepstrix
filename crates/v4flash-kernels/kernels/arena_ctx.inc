@@ -14,7 +14,7 @@
 struct ArenaCanaryLog {
     uint32_t cursor;
     uint32_t cap;
-    uint64_t rec[2];  // [2 * cap]
+    uint64_t rec[];   // [2 * cap] (flexible array member)
 };
 
 struct ArenaCtx {

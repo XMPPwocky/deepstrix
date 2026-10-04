@@ -1,7 +1,8 @@
 # Arena stage graphs keyed by (stage, rows) only
 
 Status: DESIGN rev 3.1, 2026-10-04 -- APPROVED (review round 1 NEEDS REWORK, round 2 APPROVE
-WITH CHANGES, round 3 APPROVE; dispositions in section 7). Next: Step 0 (2.0) on the GPU.
+WITH CHANGES, round 3 APPROVE; dispositions in section 7). Step 0 code (2.0) review-APPROVED
+(2 rounds); next: Step 0 on the GPU (hub-only window).
 Branch `worktree-ms-dspark2` (on eb84ebb).
 
 ## 0. Problem
@@ -304,3 +305,9 @@ Code review round 1, Step 0 code 4ba68da (reviewer: APPROVE WITH CHANGES):
 9. One-node graph in section 2: FIXED -- an 8-node graph.
 10. `out_i` poisoned per b: FIXED.
 11. Debug-assert no indirect operand of an absent mhc half: ADDED.
+
+Code review round 2, 936363f (reviewer: APPROVE):
+
+1. `ArenaCanaryLog::rec[2]` written past its bound: FIXED -- flexible array member `rec[]`.
+2. A no-go exited 0: FIXED -- the bench's last line is `STEP0: GO` / `STEP0: NO-GO (items)`; the
+   window script reports and logs it.

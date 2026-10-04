@@ -209,8 +209,15 @@ fn graph_keys_step0() -> eyre::Result<()> {
     for (i, p) in entry.p.iter_mut().enumerate() {
         *p = 0x1000 + i as u64;
     }
-    let mut exact = true; // every bit-exactness / coherence / node-count check
-    let mut gate = true; // the 2.0 go / no-go bars this bench can decide alone
+    // Every 2.0 bar this bench decides alone, by item: bit-exactness / coherence / node count
+    // (`exact`) and the timing bars. The last line says STEP0: GO or STEP0: NO-GO (items).
+    let mut exact = true;
+    let mut nogo: Vec<String> = Vec::new();
+    let mut bar = |ok: bool, item: String| {
+        if !ok {
+            nogo.push(item);
+        }
+    };
 
     // The spin's clock (wall_clock64, constant rate): ticks per ms.
     let tpm = {
@@ -260,7 +267,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let host_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
         // The spin still running when the host finished = the GPU ran the loop back to back.
         let drained = e0.query()?;
-        gate &= !drained;
+        bar(!drained, format!("1:{variant}:drained"));
         e1.record(&s)?;
         e1.synchronize()?;
         let gpu_us = Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / n as f64;
@@ -315,12 +322,12 @@ fn graph_keys_step0() -> eyre::Result<()> {
     for (label, reuse) in [("same exec", true), ("distinct execs", false)] {
         let grow = res[&(reuse, 50)].0 - res[&(reuse, 5)].0;
         let blocks = grow > 22.5; // half the 45 ms the spin grew by
-        gate &= !blocks;
+        bar(!blocks, format!("2:{label}:BLOCKS"));
         println!("  {label}: host time grew {grow:+.3} ms with the spin -> {}", if blocks { "BLOCKS" } else { "does not block" });
     }
     let (same, distinct) = (res[&(true, 50)].1, res[&(false, 50)].1);
     let serializes = same > 1.10 * distinct;
-    gate &= !serializes;
+    bar(!serializes, "2:SERIALIZES".into());
     println!("  GPU per launch same {same:.2} vs distinct {distinct:.2} us -> {}", if serializes { "SERIALIZES" } else { "does not serialize" });
 
     // ---- 3. coherence: store then a graph that reads the slot, 10k rounds ----------------
@@ -368,7 +375,9 @@ fn graph_keys_step0() -> eyre::Result<()> {
             (outs.raw() as u64 + (i * rows_c * 4) as u64) ^ [&w0, &w1][i % 2].raw() as u64 ^ xq_c.raw() as u64 ^ xs_c.raw() as u64
         };
         let bad_xor = recs.iter().enumerate().filter(|&(i, r)| r.ptr_xor != want_xor(i)).count();
-        exact &= bad == 0 && cursor as usize == rounds && bad_seq == 0 && bad_xor == 0;
+        let ok = bad == 0 && cursor as usize == rounds && bad_seq == 0 && bad_xor == 0;
+        exact &= ok;
+        bar(ok, "3:coherence".into());
         println!(
             "  {rounds} rounds: {bad} outputs from a stale / wrong entry; canary {cursor} records, {bad_seq} with a wrong seq, {bad_xor} with wrong resolved pointers"
         );
@@ -404,13 +413,14 @@ fn graph_keys_step0() -> eyre::Result<()> {
             &mut || e.q8.matvec_bpack_ind(&s, ind, &mut out_x, &w, &xq, &xs, rows as u32, k as u32, b),
         )?;
         let (td, ti) = (sd_.med, si_.med);
-        gate &= drained == 0;
+        bar(drained == 0, format!("4a:b{b}:drained"));
         s.synchronize()?;
         let n = b as usize * rows;
         let diff = down(&out_d, n)?.iter().zip(down(&out_i, n)?).filter(|(a, c)| **a != *c).count();
         let pass = twin_ok(td, ti);
         exact &= diff == 0;
-        gate &= pass;
+        bar(diff == 0, format!("4a:b{b}:bitexact"));
+        bar(pass, format!("4a:b{b}:time"));
         println!(
             "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%, {}); differing outputs {diff}{}",
             (ti / td - 1.0) * 100.0,
@@ -479,7 +489,9 @@ fn graph_keys_step0() -> eyre::Result<()> {
             let (td, ti) = (sd_.med, si_.med);
             let pass = twin_ok(td, ti);
             exact &= diff == 0;
-            gate &= pass && drained == 0;
+            bar(diff == 0, format!("4b:b{b}:bitexact"));
+            bar(pass, format!("4b:b{b}:time"));
+            bar(drained == 0, format!("4b:b{b}:drained"));
             println!(
                 "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%, {}); differing outputs {diff} (split, mix, inv, carry, cur, norm){}",
                 (ti / td - 1.0) * 100.0,
@@ -508,6 +520,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let n = b as usize * rows;
         let diff = down(&out_d, n)?.iter().zip(down(&out_i, n)?).filter(|(a, c)| **a != *c).count();
         exact &= diff == 0;
+        bar(diff == 0, format!("5:context{label}"));
         println!("  context {label}: differing outputs vs direct on {label}: {diff}");
     }
     let launches = 4;
@@ -518,13 +531,16 @@ fn graph_keys_step0() -> eyre::Result<()> {
         e.q8.matvec_bpack_ind(s, ind, &mut out_d, &w, &xq, &xs, rows as u32, k as u32, 1)
     })?;
     exact &= nodes == launches;
+    bar(nodes == launches, "5:nodes".into());
     println!("  {launches} captured launches -> {nodes} graph nodes");
 
-    println!(
-        "== bit-exact / coherence / nodes: {}; BLOCKS / SERIALIZES / twin bars: {} (write cost vs 1% of ms.step p50: compare section 1 by hand)",
-        if exact { "PASS" } else { "FAIL" },
-        if gate { "PASS" } else { "FAIL" }
-    );
+    // The write cost vs 1% of `ms.step` p50 needs the live step time: section 1 is compared by hand.
+    println!("== section 1's write cost vs 1% of ms.step p50: compare by hand");
+    if nogo.is_empty() {
+        println!("STEP0: GO");
+    } else {
+        println!("STEP0: NO-GO ({})", nogo.join(", "));
+    }
     if !exact {
         return Err(eyre!("graph_keys step 0: a bit-exactness, coherence or node-count check failed"));
     }
