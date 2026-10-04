@@ -550,6 +550,29 @@ mod tests {
     use super::*;
     use v4flash_core::qwen3_embed::testing::tiny_config;
 
+    /// `qe_q8_0_repack_rows`' word map, run on the host, against the
+    /// production host repack (the GPU twin is `repack_matches_host`).
+    #[test]
+    fn repack_word_map_matches_host_repack() {
+        for (rows, blocks) in [(3usize, 80usize), (2, 128), (2, 304), (1, REPACK_MAX_BLOCKS)] {
+            let n = rows * blocks * 34;
+            let src: Vec<u8> = (0..n).map(|i| (i as u32).wrapping_mul(2_654_435_761).rotate_left(11) as u8).collect();
+            let want = crate::weights::repack_q8_0(&src, rows, blocks);
+            let mut got = src.clone();
+            for r in 0..rows {
+                let row = &mut got[r * blocks * 34..(r + 1) * blocks * 34];
+                let s: Vec<u16> = row.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                for i in 0..blocks * 17 {
+                    let w = if i < blocks { s[i * 17] } else { let q = i - blocks; s[(q / 16) * 17 + 1 + q % 16] };
+                    row[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+            assert_eq!(got, want, "rows {rows} blocks {blocks}");
+        }
+        // The LDS stage holds the widest row: 480 blocks x 17 words x 2 B.
+        assert!(REPACK_MAX_BLOCKS * 17 * 2 <= 64 * 1024);
+    }
+
     #[test]
     fn pitches_avoid_powers_of_two() {
         assert_eq!(act_pitch(2560), 2560);
