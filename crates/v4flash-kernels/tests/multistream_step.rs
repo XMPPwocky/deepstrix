@@ -44,7 +44,7 @@
 //!   G5f  SPECULATIVE BLOCKS (docs/v41/DSPARK_ARENA_PLAN.md 3.1-3.4): each
 //!        stream alone runs blocks of 1-8 rows of ITSELF at consecutive
 //!        positions (its next token plus "draft" rows) and keeps a prefix
-//!        (`KvArena::accept`). Arm `spec` puts WRONG tokens in the rows past the
+//!        (`KvArena::commit`). Arm `spec` puts WRONG tokens in the rows past the
 //!        kept prefix (a rejected tail), arm `spec_true` the right ones; both
 //!        run the same block shapes. Gates: spec == spec_true bit-exactly on
 //!        every kept row (a rejected tail leaves nothing behind: raw KV, comp
@@ -683,7 +683,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 &mut bd_a, &mut bi_a, &mut sd, &mut si, &mut arena_alone, &mut dev, &StepRows::plain(&[slots_alone[s]])?, &weights,
                 &[embed(tok)?], &[tok], &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
             )?;
-            arena_alone.accept(slots_alone[s], 1, &engine.dgpu.compute)?;
+            arena_alone.commit(slots_alone[s], 1, &engine.dgpu.compute)?;
             let l = engine.head_rows(&mut ds, &bd_a, 1, &weights)?;
             logits_alone[s].push(l);
         }
@@ -724,7 +724,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                     &mut bd_a, &mut bi_a, &mut sd, &mut si, arena, &mut dev_spec, &StepRows::chains(&[(slots[s], r - 1)])?, &weights,
                     &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b)), Some(&mut pg),
                 )?;
-                arena.accept(slots[s], keep as u32, &engine.dgpu.compute)?;
+                arena.commit(slots[s], keep as u32, &engine.dgpu.compute)?;
                 let l = engine.head_rows(&mut ds, &bd_a, r, &weights)?;
                 for j in 0..keep {
                     out[s].push(l[j * nv..(j + 1) * nv].to_vec());
@@ -809,7 +809,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                     )?;
                     engine.head_rows(&mut ds, &bd_a, r, &weights)?
                 };
-                arena.accept(slots[s], keep as u32, &engine.dgpu.compute)?;
+                arena.commit(slots[s], keep as u32, &engine.dgpu.compute)?;
                 for j in 0..keep {
                     out[s].push(l[j * nv..(j + 1) * nv].to_vec());
                 }
@@ -978,7 +978,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 for &(k, _, keep) in &blocks {
                     let s = pair[k];
                     let r0 = rows.root_of(slots[s]).ok_or_else(|| eyre!("G5h: no root row for stream {s}"))?;
-                    arena.accept(slots[s], keep as u32, &engine.dgpu.compute)?;
+                    arena.commit(slots[s], keep as u32, &engine.dgpu.compute)?;
                     for j in 0..keep {
                         out[s].push(l[(r0 + j) * nv..(r0 + j + 1) * nv].to_vec());
                     }
@@ -1042,7 +1042,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             &mut bd_a, &mut bi_a, &mut sd, &mut si, &mut arena_batch, &mut dev, &StepRows::plain(&slots_batch)?, &weights,
             &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
         )?;
-        for &sl in &slots_batch { arena_batch.accept(sl, 1, &engine.dgpu.compute)?; }
+        for &sl in &slots_batch { arena_batch.commit(sl, 1, &engine.dgpu.compute)?; }
         let all = engine.head_rows(&mut ds, &bd_a, n_streams, &weights)?;
         step_ms.push(t0.elapsed().as_secs_f64() * 1e3);
         for s in 0..n_streams {
@@ -1080,7 +1080,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut arena_pipe, &mut dev, &mut dev_b, &StepRows::plain(&slots_pipe)?, &weights,
             &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
         )?;
-        for &sl in &slots_pipe { arena_pipe.accept(sl, 1, &engine.dgpu.compute)?; }
+        for &sl in &slots_pipe { arena_pipe.commit(sl, 1, &engine.dgpu.compute)?; }
         let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
         all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
         step_ms_p.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -1121,7 +1121,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
             )?;
         }
-        for &sl in &slots_stag { arena_stag.accept(sl, 1, &engine.dgpu.compute)?; }
+        for &sl in &slots_stag { arena_stag.commit(sl, 1, &engine.dgpu.compute)?; }
         let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
         all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
         step_ms_s.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -1165,7 +1165,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
             )?;
         }
-        for &sl in &slots_rf { arena_rf.accept(sl, 1, &engine.dgpu.compute)?; }
+        for &sl in &slots_rf { arena_rf.commit(sl, 1, &engine.dgpu.compute)?; }
         let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
         all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
         step_ms_rf.push(t0.elapsed().as_secs_f64() * 1e3);

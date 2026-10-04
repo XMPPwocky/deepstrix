@@ -68,7 +68,7 @@ pub const ARENA_ROWS_PER_STREAM: u32 = 8;
 /// the rows of one stream never share a block unless they share a group, and a
 /// firing row pools a block that holds its whole group: positions written
 /// earlier in the same launch, or (block 0) carried from the previous step.
-/// Block 0 is the only one that lives across steps; `accept` moves the live
+/// Block 0 is the only one that lives across steps; `commit` moves the live
 /// partial group there.
 fn blocks_per_slot(ratio: u32) -> u32 {
     1 + (ARENA_ROWS_PER_STREAM - 1).div_ceil(ratio)
@@ -553,7 +553,7 @@ impl KvArena {
     /// Admit a stream that will run up to `ctx_cap` positions: a free slot plus
     /// `ceil(ctx_cap / ratio)` rows in every store. Fails without touching
     /// anything if any store cannot fit it (first-fit, no compaction).
-    pub fn admit(&mut self, ctx_cap: u32, pos0: u32) -> eyre::Result<u32> {
+    pub fn carve(&mut self, ctx_cap: u32, pos0: u32) -> eyre::Result<u32> {
         let slot = self
             .streams
             .iter()
@@ -592,7 +592,7 @@ impl KvArena {
         stream: &Stream,
     ) -> eyre::Result<u32> {
         let (n_raw, n_raw_dec) = self.source_windows(src, pos)?;
-        let slot = self.admit(ctx_cap.max(pos + 1), pos)?;
+        let slot = self.carve(ctx_cap.max(pos + 1), pos)?;
         // Any failure below must give the slot back: it used to stay allocated
         // with no Stream owning it, and a parked request retried every tick.
         match self.fill_admitted(src, slot, n_raw, n_raw_dec, stream) {
@@ -605,12 +605,12 @@ impl KvArena {
     }
 
     /// Reserve a slot and `ceil(ctx_cap / ratio)` rows per store for a stream
-    /// whose prompt is still being prefilled: `admit` at position 0, filled
+    /// whose prompt is still being prefilled: `carve` at position 0, filled
     /// later by `fill_reserved`. The scheduler steps only its own streams, so a
     /// reservation is never a step row; compaction and `grow` move it like any
     /// region (zero rows written).
     pub fn reserve(&mut self, ctx_cap: u32) -> eyre::Result<u32> {
-        self.admit(ctx_cap.max(1), 0)
+        self.carve(ctx_cap.max(1), 0)
     }
 
     /// Fill reservation `slot` from the prefilled `src` (as `admit_from_state`)
@@ -1089,7 +1089,7 @@ impl KvArena {
     /// nothing after it. Its accumulator rows go to the block of its own
     /// compressor group (`blocks_per_slot`). A slot that reappears after
     /// another slot's rows is refused. The counters do not move: the caller
-    /// `accept`s each stream's kept rows after the step.
+    /// `commit`s each stream's kept rows after the step.
     ///
     /// The rows' dependencies come from `rows` (`StepRows`,
     /// docs/v41/MS_DSPARK_STREAMS_DESIGN.md 1): the tables express a CHAIN
@@ -1306,7 +1306,7 @@ impl KvArena {
     /// (`blocks_per_slot`); one block copy on `stream`, after the step's
     /// kernels (same stream). A one-row step never copies (its group's block
     /// IS the first). `keep` must not exceed the rows the stream ran.
-    pub fn accept(&mut self, slot: u32, keep: u32, stream: &Stream) -> eyre::Result<()> {
+    pub fn commit(&mut self, slot: u32, keep: u32, stream: &Stream) -> eyre::Result<()> {
         if keep == 0 || keep > ARENA_ROWS_PER_STREAM {
             return Err(eyre!("kv arena: accept of {keep} rows for slot {slot}"));
         }
@@ -1333,7 +1333,7 @@ impl KvArena {
 
     /// The commit's block copies for a stream that ran from `pos0` and kept
     /// `keep` rows: `(from, to, layer, len)` in floats of the store's
-    /// accumulator buffers. Pure, for `accept` and the unit test.
+    /// accumulator buffers. Pure, for `commit` and the unit test.
     fn commit_copies(&self, slot: u32, pos0: u32, keep: u32) -> Vec<(usize, usize, usize, usize)> {
         let pos1 = pos0 + keep;
         self.stores
@@ -1612,7 +1612,7 @@ mod tests {
     /// raw region and of the accumulator blocks replays exactly what the
     /// kernels do with the tables (append at `slot_per`; attend the driver's
     /// window; state-write `state_base_per + (q % ratio) * width`; pool block
-    /// `fire_state_idx`; then `accept`'s block copies), keeping the rejected
+    /// `fire_state_idx`; then `commit`'s block copies), keeping the rejected
     /// rows' writes in place. Every row must see exactly its causal window
     /// (positions q-W+1..=q, in order) and every fire must pool exactly its
     /// group, into the next comp row of the region. A second stream steps one

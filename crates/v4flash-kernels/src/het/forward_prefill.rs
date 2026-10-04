@@ -3604,7 +3604,7 @@ impl HeterogeneousEngine {
     /// token and DSpark draft rows at the following positions; `KvArena::
     /// tables`). Compacts any stream whose raw region cannot take its rows,
     /// uploads the step's tables, runs the 40 layers. The counters do NOT
-    /// move: the caller `KvArena::accept`s each stream's kept rows (1 for a
+    /// move: the caller `KvArena::commit`s each stream's kept rows (1 for a
     /// plain decode row).
     /// On return `bd.residual` holds the post-last-layer HC per row and
     /// `bd.hc_pre_carry` the carries: `head_rows(ds, bd, b, weights)` turns
@@ -7294,7 +7294,7 @@ impl HeterogeneousEngine {
         if arena.is_some() {
             // ARENA: the windows and store counters are the KvArena's; the
             // caller keeps each stream's rows after the step
-            // (`KvArena::accept`) and compacts a full region before it.
+            // (`KvArena::commit`) and compacts a full region before it.
         } else if speculative_append() {
             // Keep the SWA invariant even before the caller's rollback: the
             // appended speculative rows live past the window in the oversized

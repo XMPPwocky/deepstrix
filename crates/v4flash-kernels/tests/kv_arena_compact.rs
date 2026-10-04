@@ -54,9 +54,9 @@ fn compaction_makes_free_space_contiguous_and_preserves_rows() -> eyre::Result<(
     // 4096 comp rows per store; three streams of ctx 2048 (ratio-1 store: 2048
     // rows each) -> the third does not fit at all; two fit.
     let mut arena = KvArena::alloc(dgpu, 4, 4096)?;
-    let a = arena.admit(1500, 0)?;
-    let b = arena.admit(1500, 0)?;
-    let c = arena.admit(1000, 0)?;
+    let a = arena.carve(1500, 0)?;
+    let b = arena.carve(1500, 0)?;
+    let c = arena.carve(1000, 0)?;
     // Populate counters: advance each stream some steps.
     for _ in 0..900 { arena.advance(a)?; }
     for _ in 0..1300 { arena.advance(b)?; }
@@ -67,7 +67,7 @@ fn compaction_makes_free_space_contiguous_and_preserves_rows() -> eyre::Result<(
     arena.release(b)?;
     // ratio-1 store: free = 1500 (middle) + 96 (tail) = 1596; largest run 1500.
     let want = 1550;
-    assert!(arena.admit(want, 0).is_err(), "should not fit before compaction");
+    assert!(arena.carve(want, 0).is_err(), "should not fit before compaction");
     assert!(arena.fits_after_compaction(want));
     let old_a = arena.stream(a).unwrap().comp.clone();
     arena.compact_stores(&stream, &mut bounce_f16, &mut bounce_u8)?;
@@ -80,7 +80,7 @@ fn compaction_makes_free_space_contiguous_and_preserves_rows() -> eyre::Result<(
     }
     check(&arena, a, &da)?;
     check(&arena, c, &dc)?;
-    let d = arena.admit(want, 0)?;
+    let d = arena.carve(want, 0)?;
     assert_eq!(arena.stream(d).unwrap().comp[arena.stores.len() - 1].base, new_c[arena.stores.len() - 1].base + new_c[arena.stores.len() - 1].cap);
     // Compaction with nothing to move is a no-op.
     arena.compact_stores(&stream, &mut bounce_f16, &mut bounce_u8)?;

@@ -2281,7 +2281,7 @@ impl Sched {
             if keep > ran {
                 return Err(eyre!("ms.step: slot {} keeps {keep} rows of the {ran} it ran", s.slot));
             }
-            self.arena.accept(s.slot, keep, &state.engine.dgpu.compute)?;
+            self.arena.commit(s.slot, keep, &state.engine.dgpu.compute)?;
         }
         if defer {
             // The lone stream's kept rows are positions [pos_end - keep, pos_end).

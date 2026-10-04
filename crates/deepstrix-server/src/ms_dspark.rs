@@ -3,7 +3,7 @@
 //! drafter's block in the SAME arena step as its next token (rows `[next, d_0
 //! .. d_{K-1}]`, `KvArena::tables`), rejection-samples the rows against the
 //! drafts (`spec_sample::verify_block`, point-mass tests) and keeps the KV of
-//! the rows it emitted (`KvArena::accept`). With several live streams every
+//! the rows it emitted (`KvArena::commit`). With several live streams every
 //! step is a plain multistream step (K = 0), and the rings are kept current
 //! so a stream that becomes the lone one drafts from a dense window.
 //!
