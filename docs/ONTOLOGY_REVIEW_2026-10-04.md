@@ -398,6 +398,14 @@ Merge it first. Every rename in those files waits for that merge.
 
 ## 10. Questions for the owner
 
+**Answered 2026-10-04.**
+- **Q1:** approved as proposed.
+- **Q2:** **drafter**, option (a).
+- **Q3:** merge `ms-dspark2` onto main first. Main was fast-forwarded to `eb84ebb` the same day.
+- **Q4:** rebase `worktree-architecture-review` onto main.
+
+Q5–Q8 are still open. Until Q5 is answered, the ratchet stays advisory.
+
 1. **The glossary picks that differ from 09-24.** Approve these, or name the word you'd rather use.
    - **stream** for a live sequence, not `seq`. The HIP type stays `Stream` inside its crate and is imported as `HipStream` everywhere else.
    - **box 1 / box 2** (`b1_` / `b2_`) for the machines and, since each box runs one process, for that process's state as the other box sees it. **hub / expertd** in prose and crate names.

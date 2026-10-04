@@ -1,6 +1,6 @@
 # DeepStrix glossary
 
-**Status: PROPOSED (2026-10-04).** This glossary comes from `docs/ONTOLOGY_REVIEW_2026-10-04.md`. It becomes canonical when the owner signs off (review §10), and it replaces the glossary in `docs/ARCHITECTURE_REVIEW_2026-09-24.md` §2.1.
+**Status: CANONICAL (owner sign-off 2026-10-04).** This glossary comes from `docs/ONTOLOGY_REVIEW_2026-10-04.md`; the owner's answers are recorded in its §10. It replaces the glossary in `docs/ARCHITECTURE_REVIEW_2026-09-24.md` §2.1.
 
 Its machine-readable half is `scripts/ontology_terms.tsv`. `scripts/ontology_census.py` reports adoption. With `--ratchet`, it fails when a retired name mints a new identifier; turn that on at the `worktree-ms-dspark2` merge (review §9).
 
@@ -49,7 +49,7 @@ These names follow the reference. Engine code uses them as they are.
 | Engram | Reference name (layers 1 and 14) | `engram_*` | — |
 | mHC | Hyper-connection mixing (`hc_pre`, `hc_post`, mixes, sinkhorn) | `hc_*`, `mhc_*` | — |
 | head | The LM head (`ParallelHead`, including the HC collapse) | `head.rs`, `forward_head` | "hot head" (say **top experts**) |
-| **drafter** | The engine's drafting role: the three `DSparkBlock`s plus the Markov and confidence heads. The reference has two names here: `mtp` for the checkpoint namespace and container (`self.mtp`, `n_mtp_layers`) and `DSpark*` for the classes. "Drafter" is the owner's word for the role. | `drafter`, `draft_*`; `DSpark*` for model parts | **`mtp`, `Mtp*`, `MTP_*` for runtime state.** The string `"mtp."` stays in the loader. The `V41_MTP_*` env names wait for registry aliases. Pending owner choice: review §10 Q2. |
+| **drafter** | The engine's drafting role: the three `DSparkBlock`s plus the Markov and confidence heads. The reference has two names here: `mtp` for the checkpoint namespace and container (`self.mtp`, `n_mtp_layers`) and `DSpark*` for the classes. "Drafter" is the owner's word for the role. | `drafter`, `draft_*`; `DSpark*` for model parts | **`mtp`, `Mtp*`, `MTP_*` for runtime state.** The string `"mtp."` stays in the loader. The `V41_MTP_*` env names wait for registry aliases. Owner's choice (review §10 Q2: option a). |
 | drafted block / K | Up to `block_size` drafted tokens / how many of them are verified this step | `Drafted`, `k_for` | — |
 | weight format | The number format of a stored tensor (MXFP4 v2, Q8_0, IQ2_S, …) | `GgufType` → `QuantType` | `GgufType` for a safetensors model; "GGUF" for the HF checkpoint path (`--gguf <HF dir>`) |
 
