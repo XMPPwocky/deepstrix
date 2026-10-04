@@ -1,6 +1,6 @@
 # Two speculating streams on one row abstraction (StepRows)
 
-Status: DESIGN rev 2, 2026-10-04 (review round 1: APPROVE WITH CHANGES; dispositions in section 8).
+Status: DESIGN rev 3, 2026-10-04 (review rounds 1 and 2: APPROVE WITH CHANGES; dispositions in section 8).
 Branch `worktree-ms-dspark2` (base = production `worktree-lm-prefill-prod` 9762c6f, hub 9c6f8ea5).
 
 ## 0. What and why
@@ -100,12 +100,17 @@ dependency from slot repetition.
 5. The ready-first driver's per-layer `Ph::Chain` wait: on iff `rows.crosses(offs[i])`. Sufficient
    for any StepRows: any dependency edge crosses EVERY lane start between its two ends, so each lane
    in between is ordered too and the adjacent-pair waits chain.
-6. NEW (review finding 1): on an ordered lane pair, lane `i` may also ROUTE layer `l` only after
-   lane `i - 1` has. Today the host loop can route lane 1 first when both selection events fire
-   between two polls; with the cache prior (`V41_SUB=3`) the earlier lane then sees the later lane's
-   picks as box-2 PENDING (`b2_mirror` overlay), i.e. row `j`'s target would read the picks of rows
-   whose inputs are drafts `>= j` (plan 2.5). Within a lane all rows route in one launch against a
-   map fixed before it, so lane order is the whole channel. Cost: at most one host poll.
+6. NEW (review rounds 1-2): on an ordered lane pair, lane `i` may also ROUTE layer `l` only after
+   lane `i - 1` has. Under the cache prior (`V41_SUB=3`, production) and `V41_SUB` 0/1 this is not
+   needed: the prior reads the box-2 mirror (PENDING overlay included) at CHAIN time
+   (`pre_moe_chain`), chains are already ordered by `may_enter`, and a lane's PENDING bits are set
+   at its submit, after its own chain. It IS needed under `V41_SUB=2`: the route-time substitution
+   (`pre_moe_route` -> `b2_mirror::substitute`) reads the mirror with the overlay, and the host loop
+   can route lane 1 first when both selection events fire between two polls -- the earlier rows
+   would then read the picks of rows whose inputs are later drafts (plan 2.5). The gate is three
+   lines, holds for every mode, costs nothing outside that race (by stream order lane `i - 1`'s
+   event fires first), is deadlock-free (lane `i - 1`'s route waits only on its own selection
+   event), and the `unordered` test flag disables it with the chain ordering.
 7. Server (`multistream::decode_rows`): builds the step's `StepRows` once and derives from it
    `row0` (roots), the token / hc / mode / Engram row arrays, the head and capture slicing and each
    stream's verify rows; accept keeps each stream's kept PATH (a chain: a prefix,
@@ -169,17 +174,23 @@ Objective (plan section 6, unchanged): `(S + sum_s E_s(K_s)) / (c(S + sum K_s) +
   - Plan 2.5 (the target must not depend on the draft it tests), stated honestly: `K_B` may read
     `conf_A[j+1]`, which reads `d_A[j]`; `K_B` changes the step's rows, so the lane cut and which
     rows share a lane. Rows' outputs depend on lane composition only through (a) the cache prior's
-    cross-lane PENDING overlay (`V41_SUB=3`, production), (b) lane-wide regime switches
-    (`need_mask` past 512 compressed rows, top-k chunking past 4096; the 8-rows-per-lane kernel
-    regimes are excluded by the cap). With `V41_SUB` unset and both streams on the same side of
+    cache prior's cross-lane PENDING overlay (`V41_SUB=3`, production: read at chain time, so only
+    when a stream's rows sit in the LATER lane), (b) lane-wide regime switches (`need_mask` past 512
+    compressed rows, top-k chunking past 4096, small-B catch-all `b <= small_b_catchall_max`, default
+    off; the 8-rows-per-lane kernel regimes are excluded by the cap), (c) box-1 residency: with
+    `V41_B1_PREFETCH` on (production) box-1 misses are computed on box 2 and admissions land at the
+    token boundary, so residency is fixed within a step; with it off `pg.ensure` pages synchronously
+    inside the step (its cross-layer eviction is unverified: a stated flag dependency). With `V41_SUB` unset and both streams on the same side of
     those thresholds the targets are bit-identical whatever the cut (G5h). The lone path has the
     same class today (its K moves its own cut). Accepted and documented (KNOWN_BUGS): a
     substitution-level effect, not an LSB one, and far below the cache prior's own swap effect;
     1.1(6) closes the stronger same-stream route-order channel.
 - Caps: rows per lane <= 8 (`SPEC_ROWS_PER_LANE`; plan 3.7 regimes, pin 16 / hot-set 8 per-lane
-  bookkeeping); a row count no allowed lane count can hold costs infinity. `V41_MS_DSPARK_K`
-  (fixed K) is clamped under the same cap (review finding 6): drafts are dropped from the deepest
-  block first until the step fits.
+  bookkeeping); a row count no allowed lane count can hold costs infinity, so the policies never
+  pick it. `V41_MS_DSPARK_K` (fixed K, which ignores costs) is clamped under the same cap: drafts
+  are dropped from the deepest block first (`fit_rows`). ONLY the fixed-K path is trimmed: trimming
+  a stopping-rule result after it read `conf_s[K_s]` would let a draft's inclusion read its own
+  value (review round 2); the policy path asserts (debug) that its result fits.
 - S = 1 (one root) never reaches these: `k_for` (unchanged). Host test: one block with
   `base_rows` = 1 gives exactly `choose_k` / `choose_k_stopping`, bit for bit.
 
@@ -191,7 +202,8 @@ exploration as the other pairs. Not the lone tables (one KV stream, ordered cut 
 the plain tables (rows = streams, no drafts): the slopes differ (~9.4 ms per same-stream row vs ~14
 for the 2 -> 3 independent rows, 10-04). Cells START from the 10-04 measured p50 ladders (review
 finding 11; `DEFAULT_LADDER*` is 09-30 and reads 2 rows at 81-84 ms vs 62.5-65.3 now):
-- two lanes, rows 1..=12: 62.5 (plain 2 streams), 65.3, 74.4, 83.1, 93.9, 102.8, then +9.4/row;
+- two lanes, rows 1..=12: 54.7 (row 1 never runs two lanes), 62.5 (plain 2 streams), 74.4, 83.1,
+  93.9, 102.8, then +9.4/row (a multi spec step always has R >= 3);
 - one lane, rows 1..=8: 54.7, 71.1, 84.4, 97.9, 108.3, 117.1, then +9.7/row.
 
 Each step feeds exactly ONE table, once (review finding 2): lone block -> `lanes` (today),
@@ -221,13 +233,16 @@ exactly as for a lone stream today. `lanes3` stays off for any speculating step.
 - Accounting API (review finding 2): per drafted block, calibration (K > 0), stats and the stage-1
   gate sample; per STEP, one cost sample into the one table it ran (2.3). Lone steps keep
   `record` / `record_k0` / `note_plain_step` as today.
-- Stage-1 gain for a multi step, per drafted stream: `g_s = emitted_s x plain(S) / (step_ms + D)`,
-  `plain(S)` = `PlainLanes`' best cost for S rows under the plain rule. It compares stream s's
-  tokens per ms with the both-plain step; a K = 0 that came from competition for rows still wasted
-  the draft, so backing off is right (the size of the gain is approximate: noted, not refined).
-  An exploration draw of all K = 0 feeds no gain (as `record_k0`).
-- Back-off is reset (gain to its optimistic start) for every live stream when S changes (review
-  finding 5): a back-off earned beside another stream is not carried into lone mode.
+- Stage-1 gain for a multi step (review round 2), per drafted stream: compared with the step it
+  would have RIDDEN without drafting, `g_s = emitted_s x (c(R - K_s) + D - D_s) / (step_ms + D)`,
+  `c` = `plain(S)` (`PlainLanes`' best under the plain rule) when the rest is a plain step, else the
+  multi tables. K_s = 0 gives `(step + D - D_s) / (step + D) < 1` (it backs off: the draft bought
+  nothing); a weaker stream beside a deep block is judged on what its own rows bought, not against
+  a both-plain step it was never going to get. A step whose drafts all came out K = 0: each stream
+  `(step + D - D_s) / (step + D)`. An exploration draw of all K = 0 feeds no gain (as `record_k0`).
+- One gate per slot per REGIME (`LONE` = S 1, `MULTI` = S >= 2; review round 2): a back-off earned
+  beside another stream says nothing about drafting alone, and the reverse, without re-probing a
+  low-acceptance stream at every 1 <-> 2 flip.
 - DEFER stays lone-only (1.2).
 
 ### 2.6 Fairness (review finding 10)
@@ -235,11 +250,13 @@ exactly as for a lone stream today. `lanes3` stays off for any speculating step.
 The objective is aggregate tokens per ms (plan section 6; the per-stream latency bound was left to
 the owner). A stream backing off beside a K = 5 block rides a ~100-120 ms step for one token
 (~8-10 tok/s, vs 15.4 at 2 plain rows). This build:
-- logs per step each stream's emitted tokens (`ms.step` gains `spec_streams`) and the `ms dspark:
-  blocks` line gains a per-stream rate summary of multi steps (`multi_tok_s` p10 / p50 over
-  streams-steps);
-- makes the A/B pass rule include the slower stream: per-stream p10 tok/s with the knob at 2 no
-  worse than at 1, beside the aggregate gain;
+- logs per step each speculating stream's `K/accepted/emitted` (`ms.step` gains `spec_streams`, at
+  the end of the line so the existing `rows= spec= lanes=` parsers keep working);
+- PRE-REGISTERS the A/B pass rule on requests, not steps (review round 2: a per-step rate never
+  samples a riding stream and has no knob-1 baseline): for every pair of concurrently decoding
+  requests, the SLOWER request's decode tok/s (`multistream: stream done ... tok_per_s`); pass =
+  its median at knob 2 >= 0.9 x its median at knob 1, beside the aggregate gain of 2-stream
+  steps;
 - does NOT build a latency bound (owner's call; a knob `V41_MS_DSPARK_FAIR` bounding each stream's
   expected per-token time at `(1 + f) x plain(S)` fits the stopping rule -- it reads only confs up
   to each frontier -- and is the follow-up if the A/B shows the slower stream losing).
@@ -299,7 +316,8 @@ GPU window (hub down, box 2 attached, `V41_REMOTE_SPLIT=1 V41_T2_CATCHALL=2` as 
 - Drafter state: drafting stream B right after stream A (one `MtpState`, rings swapped) gives
   bit-identical drafts / q / conf to drafting B alone (`mtp_ring_async`-style).
 - Server end to end: temperature 0, `V41_SUB=0`, knob 2, two concurrent requests: each output equals
-  the same request's output run alone (greedy).
+  the same request's output run alone (greedy); prompts on the same side of `need_mask` and of the
+  4096 top-k chunking (lane-wide switches could flip an argmax otherwise).
 
 Production: A/B per turn, `V41_MS_DSPARK_STREAMS` 1 vs 2: aggregate tok/s of 2-stream steps,
 per-stream p10 tok/s (2.6), lone-stream steps unchanged.
@@ -345,3 +363,16 @@ per-stream p10 tok/s (2.6), lone-stream steps unchanged.
 14. Test gaps: ACCEPTED (section 5: frontier-min property, joint chi-square, G5h arms, drafter state,
    end-to-end greedy).
 15. Sequencing: ACCEPTED (section 6).
+
+Review round 2 (reviewer: APPROVE WITH CHANGES):
+
+- R2-1 route order: ACCEPTED -- scoped (not needed under SUB 0/1/3, needed under SUB 2), the gate kept
+  (1.1(6)); B1_PREFETCH / catch-all dependency stated (2.2).
+- R2-2 gain baseline: ACCEPTED -- the ridden step (2.5).
+- R2-3 fairness metric: ACCEPTED -- per request, slower stream of each concurrent pair, threshold
+  pre-registered (2.6); the per-step rate stat dropped.
+- R2-4 lane-wide switches: ACCEPTED (2.2).
+- R2-5 `fit_rows` only on the fixed-K path: ACCEPTED (2.2).
+- R2-6 ladder text: FIXED (2.3).
+- R2-7 per-regime gates: ACCEPTED, replacing the reset (2.5).
+- R2-8 end-to-end prompts: ACCEPTED (5).
