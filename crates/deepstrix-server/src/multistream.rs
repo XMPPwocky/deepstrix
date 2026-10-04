@@ -1750,6 +1750,10 @@ impl Sched {
             o
         };
         let step_rows = StepRows::chains(&order.iter().map(|&i| (self.streams[i].slot, drafts[i].len())).collect::<Vec<_>>())?;
+        // The per-row arrays below are filled root + offset: a chain layout.
+        if !step_rows.is_chain_layout() {
+            return Err(eyre!("ms.step: the step's rows are not a chain layout (a StepRows bug)"));
+        }
         let row0: Vec<usize> = self
             .streams
             .iter()

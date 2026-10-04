@@ -397,6 +397,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut arena_spec2 = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_spec2_hold = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_spec2_unord = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    // G5h's four arms (one lane, two lanes, forced overtake, unordered).
+    let mut arena_h: Vec<KvArena> = (0..4).map(|_| KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)).collect::<eyre::Result<_>>()?;
+    let mut slots_h: Vec<Vec<u32>> = vec![Vec::new(); 4];
     let mut dev_spec = RowTablesDev::alloc(dgpu, ARENA_ROWS_PER_STREAM, KV_SOURCE_LAYERS.len())?;
     let mut dev_spec_b = RowTablesDev::alloc(dgpu, ARENA_ROWS_PER_STREAM, KV_SOURCE_LAYERS.len())?;
     let mut dev_b = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
@@ -440,6 +443,12 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         slots_spec2.push(arena_spec2.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
         slots_spec2_hold.push(arena_spec2_hold.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
         slots_spec2_unord.push(arena_spec2_unord.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
+        // Admitted HERE, from the freshly prefilled state: the decode oracle
+        // advances `states` later (the 2026-10-04 gate run admitted G5h's arenas
+        // after it and failed "source windows 17/17 rows at pos 5").
+        for (a, sl) in arena_h.iter_mut().zip(slots_h.iter_mut()) {
+            sl.push(a.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
+        }
         engine.dgpu.compute.synchronize()?;
         first_tok.push(if s == 0 { forced.as_ref().map(|f| *f.last().unwrap()) } else { None }.unwrap_or(argmax(&logits) as i32));
         prefill_logits.push(logits);
@@ -985,19 +994,6 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         }
         Ok((out, waits, cuts))
     };
-    let mut arena_h: Vec<KvArena> = Vec::new();
-    let mut slots_h: Vec<Vec<u32>> = Vec::new();
-    for _ in 0..4 {
-        let mut a = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
-        let mut sl = Vec::with_capacity(n_streams);
-        for (s, st) in states.iter().enumerate() {
-            let pos = prompts[s].len() as u32;
-            sl.push(a.admit_from_state(st, pos + n_steps as u32 + 8 + ARENA_ROWS_PER_STREAM, pos, &engine.dgpu.compute)?);
-        }
-        engine.dgpu.compute.synchronize()?;
-        arena_h.push(a);
-        slots_h.push(sl);
-    }
     let (logits_h1, _, _) = run_pairs(&mut arena_h[0], &slots_h[0], H::One)?;
     let (logits_h2, waits_h2, cuts_h2) = run_pairs(&mut arena_h[1], &slots_h[1], H::Two { hold: false, unordered: false })?;
     let (logits_h2_hold, waits_h2_hold, _) = run_pairs(&mut arena_h[2], &slots_h[2], H::Two { hold: true, unordered: false })?;

@@ -4265,8 +4265,32 @@ impl HeterogeneousEngine {
         // own selection event, earlier on `de.compute` than anything lane `i`
         // enqueued for the layer: no cycle, and normally no wait at all.
         let may_route = |routed: &[usize], i: usize, l: usize| !ordered_dep[i] || unordered || routed[i - 1] > l;
+        // The CHECK behind the waits: the lanes holding an ancestor of any of
+        // lane `i`'s rows (`StepRows::ancestors`). Before lane `i` enqueues a
+        // layer's chain (its KV reads) or routes it, every one of them must
+        // already have done so for that layer -- "the parent's layer is written
+        // first", stated per lane instead of argued from the adjacent waits.
+        // An `Err` is a bug (`unordered`, the test's negative control, skips it).
+        let lane_of = |r: usize| (0..n).find(|&j| r >= offs[j] && r < offs[j + 1]).expect("every row is in a lane");
+        let dep_lanes: Vec<Vec<usize>> = (0..n)
+            .map(|i| {
+                let mut d: Vec<usize> = (offs[i]..offs[i + 1]).flat_map(|r| rows.ancestors(r)).map(lane_of).filter(|&j| j != i).collect();
+                d.sort_unstable();
+                d.dedup();
+                d
+            })
+            .collect();
+        let deps_done = |counts: &[usize], i: usize, l: usize, what: &str| -> eyre::Result<()> {
+            match dep_lanes[i].iter().find(|&&j| j > i || counts[j] <= l) {
+                Some(&j) if !unordered => Err(eyre!(
+                    "forward_step_arena_ready_first: lane {i} would {what} layer {l} before lane {j}, which holds rows it depends on (an ordering bug)"
+                )),
+                _ => Ok(()),
+            }
+        };
         let mut carry: Vec<Option<PreMoeCarry>> = Vec::with_capacity(n);
         for i in 0..n {
+            deps_done(&entered, i, 0, "enter")?;
             carry.push(Some(chain!(i, 0)));
             entered[i] = 1;
         }
@@ -4282,6 +4306,7 @@ impl HeterogeneousEngine {
                                 READY_FIRST_CHAIN_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 READY_FIRST_CHAIN_WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                             }
+                            deps_done(&entered, i, l, "enter")?;
                             carry[i] = Some(chain!(i, l));
                             entered[i] = l + 1;
                             ph[i] = Ph::Route(l);
@@ -4293,6 +4318,7 @@ impl HeterogeneousEngine {
                     Ph::Route(l) => {
                         let ready = may_route(&routed, i, l) && self.sync_events_lane(i).layers[l].selected_ready.query().unwrap_or(true);
                         if ready {
+                            deps_done(&routed, i, l, "route")?;
                             let mut c = carry[i].take().expect("carry for Route");
                             rest!(i, l, &mut c);
                             routed[i] = l + 1;
@@ -4318,6 +4344,7 @@ impl HeterogeneousEngine {
                             posted[i] = l + 1;
                             if l + 1 < n_layer {
                                 if may_enter(&entered, i, l + 1) {
+                                    deps_done(&entered, i, l + 1, "enter")?;
                                     carry[i] = Some(chain!(i, l + 1));
                                     entered[i] = l + 2;
                                     ph[i] = Ph::Route(l + 1);

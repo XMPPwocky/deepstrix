@@ -1161,7 +1161,56 @@ impl KvArena {
                 }
             }
         }
+        self.check_row_dependencies(rows, &t)?;
         Ok(t)
+    }
+
+    /// Every row's tables READ what its parent WRITES (`StepRows`): a root
+    /// sits at its stream's committed counters; any other row sits one position
+    /// after its parent, appends right after the parent's append (so its raw
+    /// window ends at the parent's KV row), and counts the parent's compressed
+    /// row when the parent fired. The run-stepping above computes exactly this
+    /// for a chain layout; this states it per row, so a regression in either
+    /// (or a future layout) fails the step instead of attending to the wrong
+    /// rows. An `Err` here is a bug.
+    fn check_row_dependencies(&self, rows: &StepRows, t: &RowTables) -> eyre::Result<()> {
+        for i in 0..rows.len() {
+            let slot = rows.slot(i);
+            let bad = |what: &str| eyre!("kv arena: row {i} (slot {slot}, depth {}) {what} (a StepRows / tables bug)", rows.depth(i));
+            match rows.parent(i) {
+                None => {
+                    let s = self.stream(slot).ok_or_else(|| bad("has no live stream"))?;
+                    let region = Self::raw_region_base(slot);
+                    if t.pos_per[i] != s.pos as i32
+                        || t.n_raw_per[i] != s.n_raw as i32
+                        || t.slot_per[i] != (region + s.raw_off + s.n_raw) as i32
+                        || t.slot_per_dec[i] != (region + s.raw_off_dec + s.n_raw_dec) as i32
+                    {
+                        return Err(bad("is a root not at its stream's committed counters"));
+                    }
+                    for (si, ts) in t.stores.iter().enumerate() {
+                        if ts.n_comp_per[i] != s.comp[si].n_comp as i32 {
+                            return Err(bad("is a root not at its stream's committed compressed rows"));
+                        }
+                    }
+                }
+                Some(p) => {
+                    if t.pos_per[i] != t.pos_per[p] + 1 {
+                        return Err(bad("is not one position after its parent"));
+                    }
+                    if t.slot_per[i] != t.slot_per[p] + 1 || t.slot_per_dec[i] != t.slot_per_dec[p] + 1 || t.n_raw_per[i] < 1 {
+                        return Err(bad("does not append right after its parent (its raw window would miss the parent's KV row)"));
+                    }
+                    for (st, ts) in self.stores.iter().zip(&t.stores) {
+                        let fired = (t.pos_per[p] + 1) % st.ratio as i32 == 0;
+                        if ts.n_comp_per[i] != ts.n_comp_per[p] + i32::from(fired) {
+                            return Err(bad("does not count its parent's compressed row"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rows per slot in a slot list read as runs (tests: the old reading).
@@ -1466,6 +1515,41 @@ mod tests {
         }
     }
 
+    /// The per-row dependency check (`check_row_dependencies`) passes the
+    /// tables `tables` builds and catches each way a row could stop reading
+    /// what its parent writes.
+    #[cfg(feature = "v41")]
+    #[test]
+    fn every_row_reads_what_its_parent_writes() {
+        let mut ar = host_arena(3, 100_000);
+        for (slot, pos) in [(0u32, 37u32), (1, 200), (2, 129)] {
+            let comp = ar.stores.iter().map(|st| CompRegion {
+                base: 100 + slot * 30_000,
+                cap: 30_000,
+                n_comp: pos / st.ratio,
+                n_index_comp: pos / st.ratio,
+            }).collect();
+            let n_raw = pos.min(SWA_WINDOW);
+            ar.streams[slot as usize] = Some(StreamKv { pos, raw_off: 0, n_raw, raw_off_dec: 0, n_raw_dec: n_raw, comp });
+        }
+        // Rows 0-4 slot 0 (a chain), 5-7 slot 2, 8 slot 1 (plain).
+        let rows = StepRows::chains(&[(0, 4), (2, 2), (1, 0)]).unwrap();
+        let t = ar.tables(&rows).unwrap();
+        ar.check_row_dependencies(&rows, &t).unwrap();
+        let broken = |f: &dyn Fn(&mut RowTables)| {
+            let mut b = t.clone();
+            f(&mut b);
+            ar.check_row_dependencies(&rows, &b).is_err()
+        };
+        assert!(broken(&|b| b.slot_per[2] += 1), "a child appending away from its parent's append");
+        assert!(broken(&|b| b.slot_per_dec[6] += 1), "the decoder-window twin");
+        assert!(broken(&|b| b.pos_per[3] += 1), "a child not one position after its parent");
+        assert!(broken(&|b| b.n_raw_per[5] += 1), "a root off its stream's committed window");
+        assert!(broken(&|b| b.pos_per[8] -= 1), "a plain root off its stream's position");
+        assert!(broken(&|b| b.stores[0].n_comp_per[4] += 1), "a child miscounting its parent's compressed rows");
+        assert!(broken(&|b| b.stores[3].n_comp_per[0] -= 1), "a root off its stream's compressed rows");
+    }
+
     /// One `tables` call split by row range (`RowTables::rows`, the lanes of
     /// an ordered two-lane verify): reassembles exactly, equals per-lane calls
     /// at a cut between streams, continues positions at a cut through one.
@@ -1485,6 +1569,7 @@ mod tests {
             let n_raw = pos.min(SWA_WINDOW);
             ar.streams[slot as usize] = Some(StreamKv { pos, raw_off: 0, n_raw, raw_off_dec: 0, n_raw_dec: n_raw, comp });
         }
+        // Every tables call below also runs the per-row dependency check.
         let lists: [&[u32]; 5] = [&[0, 1, 2], &[0, 0, 0, 0, 0, 0], &[1, 1, 1, 1, 1], &[0, 0, 1, 2, 2], &[2, 2, 2, 2, 0]];
         for slots in lists {
             let all = tables_of(&ar, slots).unwrap();
