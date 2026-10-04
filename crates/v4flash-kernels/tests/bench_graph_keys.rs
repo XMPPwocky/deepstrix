@@ -1,19 +1,20 @@
 //! Step 0 of docs/v41/GRAPH_KEYS_DESIGN.md (2.0): the measurements that gate building
 //! (stage, rows)-keyed arena graphs. dGPU only; the hub must be DOWN (it holds the dGPU).
 //!
-//!  1. The context write, AMORTIZED (queue pre-filled behind a spin): N x [nop; write; nop]
-//!     for write = none / H2D from pinned / `arena_ctx_store` by value /
-//!     `hipStreamWriteValue32`; host enqueue time and GPU time per write.
-//!  2. 80 `hipGraphLaunch` of ONE executable vs 80 distinct executables behind a 5 ms and a
-//!     50 ms spin. BLOCKS = the host enqueue time grows with the spin; SERIALIZES = GPU time
+//!  1. The context write, AMORTIZED (queue pre-filled behind a spin, N small enough for the AQL
+//!     ring): N x [nop; write; nop] for write = none / H2D from pinned / `arena_ctx_store` by
+//!     value / `hipStreamWriteValue32`; host enqueue time (mean, max) and GPU time per write.
+//!  2. 80 `hipGraphLaunch` of ONE 8-node executable vs 80 distinct executables behind a 5 ms and
+//!     a 50 ms spin. BLOCKS = the host enqueue time grows with the spin; SERIALIZES = GPU time
 //!     per launch of the one executable > 10% above the distinct executables'.
-//!  3. COHERENCE: `arena_ctx_store` then a captured `_ind` graph reading the slot, alternating
-//!     entries, 10k rounds; every output and every canary record (the seq each launch read)
-//!     checked.
+//!  3. COHERENCE: `arena_ctx_store` then a captured `_ind` graph reading the slot (operands on
+//!     every 64-B line of the entry), alternating entries, 10k rounds; every output and every
+//!     canary record (the seq and the operand pointers each launch resolved) checked.
 //!  4. `_ind` twins vs direct, bit-exact and timed with the canary compiled in (null):
 //!     `q8_0_gemv_bpack_tB{1,4,8}` on the q_b shape and `mhc_fast_batched` (13 operands,
-//!     pre_attn case) at b = 1, 4, 8. Bar: within max(2%, 0.3 us). (VGPR / SGPR counts come
-//!     from the code objects, offline.)
+//!     pre_attn case) at b = 1, 4, 8, each round queued behind a spin (median [min..max] of 5).
+//!     Bar: within max(2%, 0.3 us). (VGPR / SGPR counts come from the code objects, offline:
+//!     ~/scratch-ms/graph_keys_regs.py.)
 //!  5. The mechanism: ONE captured `_ind` graph replayed after storing entry A, then B,
 //!     reproduces the direct kernel on A, then on B; and a capture of N launches has N nodes
 //!     (design 2.5's vetted-count check assumes one node per launch).
@@ -23,8 +24,8 @@
 #![cfg(feature = "v41")]
 use color_eyre::eyre::{self, eyre};
 use std::time::Instant;
-use v4flash_hip::{launch_kernel, sys, Device, DeviceBuffer, Event, GraphExec, LaunchConfig, Module, PinnedBuffer, Stream};
-use v4flash_kernels::config::{HC_DIM, HC_MIX_DIM, N_EMBD, N_HC, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS};
+use v4flash_hip::{sys, Device, DeviceBuffer, Event, GraphExec, PinnedBuffer, Stream};
+use v4flash_kernels::config::{HC_DIM, HC_MIX_DIM, N_EMBD, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS};
 use v4flash_kernels::het::arena_ctx::{ArenaCtx, ArenaCtxKernels, CanaryLog, Ind, ARENA_CTX_WORDS};
 use v4flash_kernels::het::engine::DeviceEngine;
 use v4flash_kernels::mhc_arena::{FastCollapse, FastMix, MIX_PRE_SCALED};
@@ -93,21 +94,41 @@ fn capture(s: &Stream, body: &mut dyn FnMut(&Stream) -> eyre::Result<()>) -> eyr
     Ok((g.nodes()?.len(), g.instantiate()?))
 }
 
-/// Median over `rounds` alternating rounds of `reps` launches each: (us per launch of a, of b).
+/// us per launch over the rounds of one arm.
+#[derive(Clone, Copy, Debug)]
+struct Stat {
+    med: f64,
+    min: f64,
+    max: f64,
+}
+
+impl std::fmt::Display for Stat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:7.2} us [{:.2}..{:.2}]", self.med, self.min, self.max)
+    }
+}
+
+/// `rounds` alternating rounds of `reps` launches of `a` and of `b`, each round queued behind
+/// `prefill` (a spin long enough to cover the enqueue, so the events time the GPU back to back,
+/// not the host): (a, b, rounds whose spin ended before the host finished enqueueing).
 fn time_ab(
     s: &Stream,
     reps: usize,
     rounds: usize,
+    prefill: &dyn Fn(&Stream) -> eyre::Result<()>,
     a: &mut dyn FnMut() -> eyre::Result<()>,
     b: &mut dyn FnMut() -> eyre::Result<()>,
-) -> eyre::Result<(f64, f64)> {
-    let once = |f: &mut dyn FnMut() -> eyre::Result<()>| -> eyre::Result<f64> {
+) -> eyre::Result<(Stat, Stat, usize)> {
+    let mut drained = 0usize;
+    let mut once = |f: &mut dyn FnMut() -> eyre::Result<()>| -> eyre::Result<f64> {
         s.synchronize()?;
         let (e0, e1) = (Event::new()?, Event::new()?);
+        prefill(s)?;
         e0.record(s)?;
         for _ in 0..reps {
             f()?;
         }
+        drained += usize::from(e0.query()?);
         e1.record(s)?;
         e1.synchronize()?;
         Ok(Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / reps as f64)
@@ -120,11 +141,11 @@ fn time_ab(
         ta.push(once(&mut *a)?);
         tb.push(once(&mut *b)?);
     }
-    let med = |v: &mut Vec<f64>| {
+    let stat = |v: &mut Vec<f64>| {
         v.sort_by(f64::total_cmp);
-        v[v.len() / 2]
+        Stat { med: v[v.len() / 2], min: v[0], max: v[v.len() - 1] }
     };
-    Ok((med(&mut ta), med(&mut tb)))
+    Ok((stat(&mut ta), stat(&mut tb), drained))
 }
 
 /// One mhc_fast output set (the pre_attn case writes all of it).
@@ -206,16 +227,20 @@ fn graph_keys_step0() -> eyre::Result<()> {
     println!("wall_clock64: {:.0} ticks/ms", tpm);
 
     // ---- 1. the context write, amortized behind a spin ---------------------------------
-    println!("== 1. context write between two launches, queue pre-filled behind a 300 ms spin (per write; 'none' = bare launches)");
-    let n = 3000usize;
+    // N x 3 packets stays well inside the AQL ring (ROC_AQL_QUEUE_SIZE, 4096 by default) and the
+    // kernarg pool: a full queue would block the host until the spin ends, timing the host.
+    println!("== 1. context write between two launches, queue pre-filled behind a 50 ms spin (per write; 'none' = bare launches)");
+    let n = 400usize;
     let mut base = (0.0, 0.0);
     for variant in ["none", "h2d", "ctx_store", "write_value32"] {
         s.synchronize()?;
         let (e0, e1) = (Event::new()?, Event::new()?);
-        e.q8.slack_probe_spin(&s, spin_ms(300.0))?;
+        e.q8.slack_probe_spin(&s, spin_ms(50.0))?;
         e0.record(&s)?;
         let t = Instant::now();
+        let mut iter_max = 0f64;
         for i in 0..n {
+            let ti = Instant::now();
             ctxk.nop(&s, &mut sink)?;
             match variant {
                 "h2d" => {
@@ -230,10 +255,12 @@ fn graph_keys_step0() -> eyre::Result<()> {
                 _ => {}
             }
             ctxk.nop(&s, &mut sink)?;
+            iter_max = iter_max.max(ti.elapsed().as_secs_f64() * 1e6);
         }
         let host_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
         // The spin still running when the host finished = the GPU ran the loop back to back.
         let drained = e0.query()?;
+        gate &= !drained;
         e1.record(&s)?;
         e1.synchronize()?;
         let gpu_us = Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / n as f64;
@@ -241,23 +268,29 @@ fn graph_keys_step0() -> eyre::Result<()> {
             base = (host_us, gpu_us);
         }
         println!(
-            "  {variant:>14}: host {host_us:7.2} us/iter (+{:6.2}), GPU {gpu_us:7.2} us/iter (+{:6.2}){}; at 160 writes/step: +{:.0} us host, +{:.0} us GPU",
+            "  {variant:>14}: host {host_us:7.2} us/iter (+{:6.2}, max {iter_max:.1}), GPU {gpu_us:7.2} us/iter (+{:6.2}){}; at 160 writes/step: +{:.0} us host, +{:.0} us GPU",
             host_us - base.0,
             gpu_us - base.1,
-            if drained { "  [queue DRAINED before the host finished: GPU figure is host-bound]" } else { "" },
+            if drained { "  [queue DRAINED before the host finished: host-bound, FAILS]" } else { "" },
             160.0 * (host_us - base.0),
             160.0 * (gpu_us - base.1),
         );
     }
 
     // ---- 2. one executable re-launched 80x vs 80 executables ---------------------------
-    println!("== 2. 80 graph launches queued behind a 5 ms / 50 ms spin");
+    println!("== 2. 80 launches of an 8-node graph queued behind a 5 ms / 50 ms spin");
     let (rows, k) = (1280usize, 5120usize);
     let w = q8_weight(dev.id, rows, k, 1)?;
     let mut xq = up(dev.id, &lcg_bytes(2, 8 * k).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
     let mut xs = up(dev.id, &vec![0.01f32; 8 * (k / 32)])?;
     let mut out = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
-    let mut gemv = |s: &Stream| e.q8.matvec_bpack(s, &mut out, &w, &xq, &xs, rows as u32, k as u32, 1);
+    // Eight kernel nodes, like a real stage (a 1-node graph could take a fast path).
+    let mut gemv = |s: &Stream| -> eyre::Result<()> {
+        for b in 1..=8u32 {
+            e.q8.matvec_bpack(s, &mut out, &w, &xq, &xs, rows as u32, k as u32, b)?;
+        }
+        Ok(())
+    };
     let one = capture(&s, &mut gemv)?.1;
     let many: Vec<GraphExec> = (0..80).map(|_| capture(&s, &mut gemv).map(|c| c.1)).collect::<eyre::Result<_>>()?;
     let mut res = std::collections::HashMap::new();
@@ -307,17 +340,19 @@ fn graph_keys_step0() -> eyre::Result<()> {
         }
         let outs = DeviceBuffer::<f32>::new(dev.id, rounds * rows_c)?;
         let log = CanaryLog::new(dev.id, rounds as u32)?;
-        let ind = Ind::new(slot.raw() as u64).with(0, 0).with(1, 1).with(2, 2).with(3, 3).with_canary(7);
+        // Slots 0 / 9 / 18 / 27 + seq / log: every 64-B line of the entry.
+        const SL: [usize; 4] = [0, 9, 18, 27];
+        let ind = Ind::new(slot.raw() as u64).with(0, SL[0]).with(1, SL[1]).with(2, SL[2]).with(3, SL[3]).with_canary(7);
         let (_, exec) = capture(&s, &mut |s| {
             e.q8.matvec_bpack_ind(s, ind, &mut tmp, &w0, &xq_c, &xs_c, rows_c as u32, k_c as u32, 1)
         })?;
         e.q8.slack_probe_spin(&s, spin_ms(20.0))?;
         for i in 0..rounds {
             let mut ent = ArenaCtx::default();
-            ent.p[0] = outs.raw() as u64 + (i * rows_c * 4) as u64;
-            ent.p[1] = [&w0, &w1][i % 2].raw() as u64;
-            ent.p[2] = xq_c.raw() as u64;
-            ent.p[3] = xs_c.raw() as u64;
+            ent.p[SL[0]] = outs.raw() as u64 + (i * rows_c * 4) as u64;
+            ent.p[SL[1]] = [&w0, &w1][i % 2].raw() as u64;
+            ent.p[SL[2]] = xq_c.raw() as u64;
+            ent.p[SL[3]] = xs_c.raw() as u64;
             ent.seq = i as u64;
             ent.log = log.buf.raw() as u64;
             ctxk.store(&s, &ent, &mut slot)?;
@@ -327,9 +362,16 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let host = down(&outs, rounds * rows_c)?;
         let bad = (0..rounds).filter(|&i| host[i * rows_c..(i + 1) * rows_c] != refs[i % 2][..]).count();
         let (cursor, recs) = log.read()?;
-        let bad_seq = recs.iter().enumerate().filter(|&(i, &(seq, tag))| seq != i as u64 || tag != 7).count();
-        exact &= bad == 0 && cursor as usize == rounds && bad_seq == 0;
-        println!("  {rounds} rounds: {bad} outputs from a stale / wrong entry; canary {cursor} records, {bad_seq} out of order");
+        let bad_seq = recs.iter().enumerate().filter(|&(i, r)| r.seq != i as u64 || r.tag != 7).count();
+        // What each launch resolved: out (round i's row block), w (alternating), xq, xs.
+        let want_xor = |i: usize| {
+            (outs.raw() as u64 + (i * rows_c * 4) as u64) ^ [&w0, &w1][i % 2].raw() as u64 ^ xq_c.raw() as u64 ^ xs_c.raw() as u64
+        };
+        let bad_xor = recs.iter().enumerate().filter(|&(i, r)| r.ptr_xor != want_xor(i)).count();
+        exact &= bad == 0 && cursor as usize == rounds && bad_seq == 0 && bad_xor == 0;
+        println!(
+            "  {rounds} rounds: {bad} outputs from a stale / wrong entry; canary {cursor} records, {bad_seq} with a wrong seq, {bad_xor} with wrong resolved pointers"
+        );
     }
 
     // ---- 4a. gemv `_ind` twin vs direct, b = 1, 4, 8 -------------------------------------
@@ -339,9 +381,11 @@ fn graph_keys_step0() -> eyre::Result<()> {
     xq = up(dev.id, &lcg_bytes(4, 8 * k).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
     xs = up(dev.id, &(0..8 * (k / 32)).map(|i| 0.002 + (i % 7) as f32 * 0.001).collect::<Vec<_>>())?;
     let mut out_d = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
-    let out_i = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
+    let mut out_i = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
     let twin_ok = |td: f64, ti: f64| ti - td <= f64::max(0.02 * td, 0.3);
+    let prefill = |s: &Stream| e.q8.slack_probe_spin(s, spin_ms(10.0));
     for b in [1u32, 4, 8] {
+        out_i.fill_zero()?;
         let mut ent = ArenaCtx::default();
         ent.p[0] = out_i.raw() as u64;
         ent.p[1] = w.raw() as u64;
@@ -351,13 +395,16 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let ind = Ind::new(slot.raw() as u64).with(0, 0).with(1, 1).with(2, 2).with(3, 3);
         let mut out_x = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
         // The twin's real operands come from the slot (out_i); out_x is only size-checked.
-        let (td, ti) = time_ab(
+        let (sd_, si_, drained) = time_ab(
             &s,
             200,
             5,
+            &prefill,
             &mut || e.q8.matvec_bpack(&s, &mut out_d, &w, &xq, &xs, rows as u32, k as u32, b),
             &mut || e.q8.matvec_bpack_ind(&s, ind, &mut out_x, &w, &xq, &xs, rows as u32, k as u32, b),
         )?;
+        let (td, ti) = (sd_.med, si_.med);
+        gate &= drained == 0;
         s.synchronize()?;
         let n = b as usize * rows;
         let diff = down(&out_d, n)?.iter().zip(down(&out_i, n)?).filter(|(a, c)| **a != *c).count();
@@ -365,9 +412,10 @@ fn graph_keys_step0() -> eyre::Result<()> {
         exact &= diff == 0;
         gate &= pass;
         println!(
-            "  b={b}: direct {td:7.2} us, _ind {ti:7.2} us ({:+.1}%, {}); differing outputs {diff}",
+            "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%, {}); differing outputs {diff}{}",
             (ti / td - 1.0) * 100.0,
-            if pass { "within bar" } else { "OVER BAR" }
+            if pass { "within bar" } else { "OVER BAR" },
+            if drained > 0 { format!("; {drained} rounds DRAINED (host-bound), FAILS") } else { String::new() }
         );
     }
 
@@ -390,10 +438,6 @@ fn graph_keys_step0() -> eyre::Result<()> {
             .enumerate()
             .map(|(i, &v)| if i % m < 4 { 0.1 + 0.5 * v } else { v - 0.5 })
             .collect();
-        let old_mhc = match std::env::var("GK_OLD_MHC") {
-            Ok(p) => Some(Module::load_data(&std::fs::read(&p)?)?),
-            Err(_) => None,
-        };
         let mut sd = MhcSet::new(dev.id, bmax, &carry0)?;
         let mut si = MhcSet::new(dev.id, bmax, &carry0)?;
         let mut ent = ArenaCtx::default();
@@ -430,39 +474,18 @@ fn graph_keys_step0() -> eyre::Result<()> {
             let got = si.dump(b as usize)?;
             let diff: usize = ref_out.iter().zip(&got).map(|(a, c)| a.iter().zip(c).filter(|(x, y)| x != y).count()).sum();
             let mut decoy = MhcSet::new(dev.id, bmax, &carry0)?;
-            let (td, ti) = time_ab(&s, 200, 5, &mut || go(&mut decoy, None, b), &mut || go(&mut sd, Some(ind), b))?;
+            let (sd_, si_, drained) =
+                time_ab(&s, 200, 5, &prefill, &mut || go(&mut decoy, None, b), &mut || go(&mut sd, Some(ind), b))?;
+            let (td, ti) = (sd_.med, si_.med);
             let pass = twin_ok(td, ti);
             exact &= diff == 0;
-            gate &= pass;
+            gate &= pass && drained == 0;
             println!(
-                "  b={b}: direct {td:7.2} us, _ind {ti:7.2} us ({:+.1}%, {}); differing outputs {diff} (split, mix, inv, carry, cur, norm)",
+                "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%, {}); differing outputs {diff} (split, mix, inv, carry, cur, norm){}",
                 (ti / td - 1.0) * 100.0,
-                if pass { "within bar" } else { "OVER BAR" }
+                if pass { "within bar" } else { "OVER BAR" },
+                if drained > 0 { format!("; {drained} rounds DRAINED (host-bound), FAILS") } else { String::new() }
             );
-            // Moving the body into a __device__ function rescheduled the DIRECT kernel (same
-            // arithmetic ops, offline disassembly): GK_OLD_MHC = the pre-refactor code object
-            // (hipcc flags as build.rs) times and checks the old direct kernel against the new.
-            if let Some(old) = old_mhc.as_ref() {
-                let f = old.get_function("mhc_fast_batched")?;
-                let rms_wg = 1u32;
-                let cfg = LaunchConfig { grid: (HC_MIX_DIM + 1 + rms_wg, 1, b), block: (256, 1, 1), shared_mem_bytes: 0 };
-                let go_old = |set: &mut MhcSet| -> eyre::Result<()> {
-                    launch_kernel!(f, cfg, &s, [
-                        set.split.raw(), set.mix.raw(), set.cnt.raw(), set.inv.raw(), mw.raw(), mx.raw(), msc.raw(), mbase.raw(),
-                        set.carry.raw(), mx.raw(), set.cur.raw(), set.norm.raw(), mnw.raw(),
-                        HC_DIM, HC_DIM / N_HC, HC_MIX_DIM, 1u32, 1u32, MIX_PRE_SCALED, RMS_EPS, N_HC, SINKHORN_ITERS, SINKHORN_EPS
-                    ])
-                };
-                si.reset(&carry0)?;
-                go_old(&mut si)?;
-                s.synchronize()?;
-                let got = si.dump(b as usize)?;
-                let diff: usize = ref_out.iter().zip(&got).map(|(a, c)| a.iter().zip(c).filter(|(x, y)| x != y).count()).sum();
-                let mut decoy2 = MhcSet::new(dev.id, bmax, &carry0)?;
-                let (tn, to) = time_ab(&s, 200, 5, &mut || go(&mut decoy, None, b), &mut || go_old(&mut decoy2))?;
-                exact &= diff == 0;
-                println!("        direct new {tn:7.2} us vs pre-refactor {to:7.2} us ({:+.1}%); differing outputs {diff}", (tn / to - 1.0) * 100.0);
-            }
         }
     }
 

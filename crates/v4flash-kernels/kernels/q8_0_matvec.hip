@@ -437,8 +437,10 @@ Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB10, 10)
         ARENA_CTX_DEREF(ind_mask, 1, const unsigned char*, w);                             \
         ARENA_CTX_DEREF(ind_mask, 2, const int8_t*, xq);                                   \
         ARENA_CTX_DEREF(ind_mask, 3, const float*, xscale);                                \
-        ARENA_CTX_CANARY(canary, canary_tag);                                              \
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(out) ^ ARENA_CTX_U64(w) ^              \
+                                          ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale));      \
         q8_0_gemv_bpack_tb_body<B>(out, w, xq, xscale, in_dim, out_dim, blocks);           \
+        ARENA_CTX_CANARY_STORE(canary_tag);                                                \
     }
 Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB1_ind, 1)
 Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB2_ind, 2)

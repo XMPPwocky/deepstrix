@@ -32,6 +32,9 @@ pub struct ArenaCtx {
     pub log: u64,
 }
 
+// `arena_ctx_store`'s by-value kernel argument (static_asserts in arena_ctx.inc mirror this).
+const _: () = assert!(std::mem::size_of::<ArenaCtx>() == 8 * ARENA_CTX_WORDS);
+
 impl Default for ArenaCtx {
     fn default() -> Self {
         Self { p: [0; ARENA_CTX_SLOTS], seq: 0, log: 0 }
@@ -113,7 +116,7 @@ impl ArenaCtxKernels {
             return Err(eyre!("arena_ctx store: slot buffer of {} u64, need {}", dst.len(), ARENA_CTX_WORDS));
         }
         let function = self.module.get_function("arena_ctx_store")?;
-        let cfg = LaunchConfig { grid: (1, 1, 1), block: (64, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig { grid: (1, 1, 1), block: (32, 1, 1), shared_mem_bytes: 0 };
         let e = *entry;
         launch_kernel!(function, cfg, stream, [e, dst.raw()])
     }
@@ -121,36 +124,73 @@ impl ArenaCtxKernels {
     /// A do-nothing launch (Step 0's empty-launch baseline).
     pub fn nop(&self, stream: &Stream, sink: &mut DeviceBuffer<u32>) -> eyre::Result<()> {
         let function = self.module.get_function("arena_ctx_nop")?;
-        let cfg = LaunchConfig { grid: (1, 1, 1), block: (64, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig { grid: (1, 1, 1), block: (32, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [sink.raw(), 0u32])
     }
 }
 
 /// A device canary log (`ArenaCanaryLog`): word 0 = cursor (low u32) | cap (high u32), then
-/// `cap` records of `seq << 16 | tag`.
+/// `cap` records of two words: `seq << 16 | tag`, the XOR of the launch's resolved operand
+/// pointers.
 pub struct CanaryLog {
     pub buf: DeviceBuffer<u64>,
     pub cap: u32,
 }
 
+/// One canary record: what an `_ind` launch read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanaryRec {
+    pub seq: u64,
+    pub tag: u16,
+    /// XOR of the operand pointers the launch resolved.
+    pub ptr_xor: u64,
+}
+
 impl CanaryLog {
     pub fn new(device: i32, cap: u32) -> eyre::Result<Self> {
-        let mut buf = DeviceBuffer::<u64>::new(device, 1 + cap as usize)?;
-        buf.copy_from_host(&[(cap as u64) << 32])?;
-        Ok(Self { buf, cap })
+        let buf = DeviceBuffer::<u64>::new(device, 1 + 2 * cap as usize)?;
+        let mut log = Self { buf, cap };
+        log.reset()?;
+        Ok(log)
     }
 
     /// Reset the cursor (synchronous; between steps).
     pub fn reset(&mut self) -> eyre::Result<()> {
-        self.buf.copy_from_host(&[(self.cap as u64) << 32])
+        self.buf.slice_view_mut(0, 1).copy_from_host(&[(self.cap as u64) << 32])
     }
 
     /// (launches logged, including any past `cap`; the records written), synchronous.
-    pub fn read(&self) -> eyre::Result<(u32, Vec<(u64, u16)>)> {
-        let mut host = vec![0u64; 1 + self.cap as usize];
+    pub fn read(&self) -> eyre::Result<(u32, Vec<CanaryRec>)> {
+        let mut host = vec![0u64; 1 + 2 * self.cap as usize];
         self.buf.copy_to_host(&mut host)?;
         let cursor = host[0] as u32;
         let n = cursor.min(self.cap) as usize;
-        Ok((cursor, host[1..1 + n].iter().map(|&r| (r >> 16, (r & 0xffff) as u16)).collect()))
+        let recs = host[1..1 + 2 * n]
+            .chunks(2)
+            .map(|r| CanaryRec { seq: r[0] >> 16, tag: (r[0] & 0xffff) as u16, ptr_xor: r[1] })
+            .collect();
+        Ok((cursor, recs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ind_mask_and_slot_addresses() {
+        let ctx = 0x7f00_0000_1000u64;
+        let ind = Ind::new(ctx).with(0, 0).with(3, 27).with(12, 31);
+        assert_eq!(ind.mask(), 1 | 1 << 3 | 1 << 12);
+        assert_eq!(ind.ptr(0, 0xdead), ctx);
+        assert_eq!(ind.ptr(3, 0xdead), ctx + 8 * 27);
+        assert_eq!(ind.ptr(12, 0xdead), ctx + 8 * 31);
+        assert_eq!(ind.ptr(1, 0xbeef), 0xbeef, "direct operands pass through");
+        assert_eq!((ind.canary, ind.tag), (0, 0), "canary off by default (production)");
+        let c = ind.with_canary(9);
+        assert_eq!((c.canary, c.tag), (ctx, 9));
+        // seq / log sit right after the slots (arena_ctx.inc static_asserts the same).
+        assert_eq!(std::mem::offset_of!(ArenaCtx, seq), 8 * ARENA_CTX_SLOTS);
+        assert_eq!(std::mem::offset_of!(ArenaCtx, log), 8 * ARENA_CTX_SLOTS + 8);
     }
 }

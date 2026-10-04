@@ -9,19 +9,25 @@
 #define ARENA_CTX_SLOTS 32
 
 // The canary log (design 2.8): thread 0 of block 0 of every `_ind` launch with a non-null canary
-// appends (seq << 16 | tag) at an atomic cursor; records past `cap` are counted, not written.
+// appends {seq << 16 | tag, XOR of its resolved operand pointers} at an atomic cursor; records
+// past `cap` are counted, not written.
 struct ArenaCanaryLog {
     uint32_t cursor;
     uint32_t cap;
-    uint64_t rec[1];  // [cap]
+    uint64_t rec[2];  // [2 * cap]
 };
 
 struct ArenaCtx {
     const void* p[ARENA_CTX_SLOTS];
     uint64_t seq;          // stamped by the host per write (the canary, design 2.8)
-    ArenaCanaryLog* log;   // where `_ind` launches log the seq they read
+    ArenaCanaryLog* log;   // where `_ind` launches log what they read
 };
 #define ARENA_CTX_WORDS (ARENA_CTX_SLOTS + 2)
+// The layout `het::arena_ctx` (Rust, #[repr(C)]) and `arena_ctx_store`'s by-value argument assume.
+static_assert(sizeof(ArenaCtx) == 8 * ARENA_CTX_WORDS, "ArenaCtx layout");
+static_assert(__builtin_offsetof(ArenaCtx, seq) == 8 * ARENA_CTX_SLOTS, "ArenaCtx::seq offset");
+static_assert(__builtin_offsetof(ArenaCtx, log) == 8 * ARENA_CTX_SLOTS + 8, "ArenaCtx::log offset");
+static_assert(__builtin_offsetof(ArenaCanaryLog, rec) == 8, "ArenaCanaryLog::rec offset");
 
 // Operand i of an `_ind` twin (design 2.3): when bit i of `mask` is set, the operand's own
 // pointer argument is the ADDRESS of its context slot (process-static, safe to bake into a
@@ -34,18 +40,34 @@ struct ArenaCtx {
         }                                                                                  \
     } while (0)
 
-// The canary (design 2.8), after the operands resolved: `canary` is the context slot's own address
-// (null in production -- one uniform branch, compiled into every twin), read in the same prologue
-// load sequence as the operands.
-#define ARENA_CTX_CANARY(canary, tag)                                                      \
+// The canary (design 2.8), in two halves.
+// ARENA_CTX_CANARY_LOAD, right after the operands resolved: `canary` (the context slot's own address,
+// a kernel argument; null in production -- one uniform branch compiled into every twin) is read with
+// scalar loads in the same prologue sequence as the operand dereferences, before any store, along
+// with `xorv` (the XOR of the resolved operand pointers: what this launch really computes on).
+// ARENA_CTX_CANARY_STORE, after the body (so no store precedes the body's loads): thread 0 of
+// block 0 appends {seq << 16 | tag, xorv}.
+#define ARENA_CTX_CANARY_LOAD(canary, xorv)                                                \
+    uint64_t arena_canary_seq_ = 0, arena_canary_x_ = 0;                                   \
+    ArenaCanaryLog* arena_canary_log_ = nullptr;                                           \
+    if ((canary) != nullptr) {                                                             \
+        arena_canary_seq_ = (canary)->seq;                                                 \
+        arena_canary_log_ = (canary)->log;                                                 \
+        arena_canary_x_ = (xorv);                                                          \
+    }
+
+#define ARENA_CTX_CANARY_STORE(tag)                                                        \
     do {                                                                                   \
-        if ((canary) != nullptr && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && \
-            threadIdx.x == 0) {                                                            \
-            const uint64_t seq_ = (canary)->seq;                                           \
-            ArenaCanaryLog* const log_ = (canary)->log;                                    \
-            if (log_ != nullptr) {                                                         \
-                const uint32_t i_ = atomicAdd(&log_->cursor, 1u);                          \
-                if (i_ < log_->cap) log_->rec[i_] = (seq_ << 16) | (uint64_t)((tag) & 0xffffu); \
+        if (arena_canary_log_ != nullptr && blockIdx.x == 0 && blockIdx.y == 0 &&          \
+            blockIdx.z == 0 && threadIdx.x == 0) {                                         \
+            const uint32_t i_ = atomicAdd(&arena_canary_log_->cursor, 1u);                 \
+            if (i_ < arena_canary_log_->cap) {                                             \
+                arena_canary_log_->rec[2 * i_] =                                           \
+                    (arena_canary_seq_ << 16) | (uint64_t)((tag) & 0xffffu);               \
+                arena_canary_log_->rec[2 * i_ + 1] = arena_canary_x_;                      \
             }                                                                              \
         }                                                                                  \
     } while (0)
+
+// The XOR of resolved operand pointers ARENA_CTX_CANARY_LOAD records.
+#define ARENA_CTX_U64(ptr) ((uint64_t)(uintptr_t)(ptr))

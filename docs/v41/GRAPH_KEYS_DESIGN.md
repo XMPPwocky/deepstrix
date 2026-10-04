@@ -111,7 +111,12 @@ around its existing `__device__ __forceinline__` body: the twin takes the usual 
 argument, the address of its context slot (`ctx_dev + 8 x slot`, process-static, safe to bake),
 and the prologue dereferences it, before any store: `p_i = (ind_mask >> i) & 1 ? *(T* const*)p_i :
 p_i` (thread-uniform, scalar loads). No slot table or slot ids in HIP. The canary's `seq` and log
-pointer (2.8) come the same way, read in the same prologue load sequence. Direct kernels are untouched (prefill, single-token decode, uncaptured paths). Families:
+pointer (2.8) come the same way, read in the same prologue load sequence. Direct kernels are untouched (prefill, single-token decode, uncaptured paths) -- INSTRUCTION-identical, checked offline
+against the pre-twin build by disassembly: calling an inlined body from the direct kernel is NOT
+enough (the kernel-argument noalias becomes scoped metadata and the schedule moves; Step 0's
+`mhc_fast_batched`), so a kernel whose body is not already a device function keeps its original
+signature and `#include`s its body file, which the twin's device function includes too
+(`mhc_fast_body.inc`). Families:
 `mhc_fast_batched`, `q8_0_gemv_bpack_tB{b}`, `q8_0_grouped_gemv_bpack[_tB{b}]`,
 `rms_quant_q8_1280_batched`, `rope_tail_batched_copy`, `kv_rms_rope_fp8`, `rope_inv_quant_q8`,
 `f16_matvec_batched_h20`, `shared_gateup_swiglu_q8_tB{b}_r1`, `q8_0_quantize_f32_wave`, and the b
@@ -145,7 +150,9 @@ runtime `q8_0_gemv_bpack_warp8` under `V41_GEMV_TB=0`, `q8_0_quantize_f32` under
 carries, unvetted: the capture taints and runs once, correctly (never `Err`, which would fail the
 step; never the slot address to a direct kernel, which would compute on garbage). (b) A converted
 wrapper whose operands are all whitelisted `Dev` vets and launches its direct kernel (the q_chain
-and output_proj quantizes on `sd`, forward_prefill.rs:5013, 7576).
+and output_proj quantizes on `sd`, forward_prefill.rs:5013, 7576). Conversion happens at the
+DISPATCHING entry (`matvec_batched`, not `matvec_bpack`), so `Dev` and `Ctx` always take the same
+arm under every knob (`V41_GEMV_BPACK=0` sends both to `q8_0_gemv_batched_warp8`).
 A tainted capture is instantiated and launched ONCE (its `_ind` nodes read the entry written
 before `begin_capture`, its direct nodes baked this lane-layer's pointers: this call is correct),
 pushed onto a per-step RETIRE list (dropping a `GraphExec` destroys it at once, graph.rs:164-168,
@@ -177,10 +184,13 @@ thread submits to `ctx_dev` (documented invariant).
 
 ### 2.8 Device canary (tests and `V41_MS_CTX_CHECK=1`)
 
-`ensure_ctx` stamps each entry with an increasing `seq`; every `_ind` kernel reads `seq` in its
-prologue load sequence (the same path as its operands) and, when the log pointer is non-null (a
-uniform branch COMPILED INTO the production twins, so the canary tests the production binary),
-thread 0 of block 0 appends (seq, stage id) at an atomic cursor clamped at the log's end; the host
+`ensure_ctx` stamps each entry with an increasing `seq`; every `_ind` kernel, when its canary
+pointer (the slot's own address) is non-null -- a uniform branch COMPILED INTO the production twins,
+so the canary tests the production binary -- reads `seq` and the log pointer with scalar loads right
+after its operand dereferences, before any store (one `s_load_b128`, verified in the disassembly),
+along with the XOR of its resolved operand pointers; after the body, thread 0 of block 0 appends
+{seq << 16 | stage id, pointer XOR} at an atomic cursor clamped at the log's end (the XOR shows
+what the launch computed on, not only that the slot was fresh); the host
 knows each graph's `_ind` launch count (recorded at capture, the vetted counter of 2.5) and checks
 after the step that every indirect launch read the seq enqueued for its lane-layer. (A readback of the slot
 proves memory contents, not what the kernels read.)
@@ -206,6 +216,8 @@ both. The eb84ebb reserve stays.
 
 ## 3. Correctness and gates
 
+- Offline, per build: every direct kernel instruction-identical to the pre-twin build
+  (disassembly diff, trailing padding excluded); twins' VGPR / SGPR / spill / scratch.
 - Per kernel (host GPU tests): every `_ind` twin vs its direct kernel bit-exact (extend
   q8_0_tb_bitexact, mhc_arena_bitexact, decode_fusion_bitexact) and timed.
 - multistream_step, with `stage_b`: G5a-h; PLUS a `stage_b` vs `legacy` vs `V41_MS_GRAPHS=0` arm on
@@ -272,3 +284,23 @@ Review round 3 (reviewer: APPROVE):
 3. `matvec_bpack_ind` ignored `V41_GEMV_TB`: FIXED in code -- routes through rule (a).
 4. Canary not yet in the twin: FIXED in code -- `ARENA_CTX_CANARY` in every twin (one extra
    `const ArenaCtx* canary` argument, null in production; the log pointer lives in the entry).
+
+Code review round 1, Step 0 code 4ba68da (reviewer: APPROVE WITH CHANGES):
+
+1. `CanaryLog` header write length (blocker): FIXED (`slice_view_mut(0, 1)`).
+2. Section 1 could overflow the AQL ring: FIXED -- N = 400 (1200 packets), a drained queue fails
+   the item, max per-iteration host time logged.
+3. `time_ab` host-bound: FIXED -- every round queued behind a 10 ms spin, drained rounds fail,
+   median [min..max] reported.
+4. Canary witness: FIXED -- uniform scalar loads after the dereferences (`s_load_b128` at +0x100,
+   disassembly), pointer XOR logged, record written after the body (2.8).
+5. Coherence on one cache line: FIXED -- slots 0 / 9 / 18 / 27.
+6. Rescheduled direct `mhc_fast_batched`: FIXED -- `static` alone did not help; the direct kernel
+   `#include`s `mhc_fast_body.inc` with its original signature: instruction-identical to the pre-twin
+   build over all 3189 instructions (only trailing alignment padding differs); gemv tB1 / 4 / 8
+   identical. GK_OLD_MHC dropped (2.3, 3).
+7. Convert at the dispatching function: ADOPTED for the build (2.5).
+8. ABI asserts: ADDED (HIP static_asserts, Rust const assert); `arena_ctx_store` scratch 0; block 32.
+9. One-node graph in section 2: FIXED -- an 8-node graph.
+10. `out_i` poisoned per b: FIXED.
+11. Debug-assert no indirect operand of an absent mhc half: ADDED.

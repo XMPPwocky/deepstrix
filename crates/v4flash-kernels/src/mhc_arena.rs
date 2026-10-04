@@ -213,6 +213,11 @@ impl MhcArena {
             ]);
         };
         let direct = [split_p, mix_p, cnt_p, inv_p, w_p, x_p, scale_p, base_p, carry.raw(), cx_p, cur_p, norm_p, nw_p];
+        // An absent half's operands are null: never resolved through the context.
+        debug_assert!(
+            (0..13).all(|i| ind.slots[i].is_none() || !direct[i].is_null()),
+            "mhc_fast_ind: an indirect operand of an absent half"
+        );
         let p: [u64; 13] = std::array::from_fn(|i| ind.ptr(i, direct[i] as u64));
         let function = self.fast.get_function("mhc_fast_batched_ind")?;
         launch_kernel!(function, cfg, stream, [
