@@ -373,7 +373,7 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
         if bad_logits > 0 {
             diffs.push(format!("prefill logits: {bad_logits} of {} differ", l_c.len()));
         }
-        // A few greedy decode steps on each state: the replayed decoder rings and
+        // A few greedy decode steps on each state: the replayed decoder-layer raw windows and
         // the encoder KV together.
         let mut tok = argmax(&l_c) as i32;
         let mut seq = prompt.clone();

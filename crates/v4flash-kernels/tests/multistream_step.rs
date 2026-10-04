@@ -329,7 +329,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // MS_DIAG=restore[:P,S] -- REGRESSION for KNOWN_BUGS #28 (2026-09-23): a
     // continuation (snapshot restored at P, suffix S) must match an
     // UNINTERRUPTED prefill of P+S. Under CED the replay runs only the last
-    // SWA_WINDOW rows; with S > SWA_WINDOW the decoder rings used to keep the
+    // SWA_WINDOW rows; with S > SWA_WINDOW the decoder-layer raw windows used to keep the
     // previous turn's rows from `S - 128` positions back and attend them as
     // neighbours. Gate: KL(fresh || continued) on the last row below
     // MS_RESTORE_KLD (default 0.05; the only legitimate difference is the chunk

@@ -1155,10 +1155,10 @@ impl Sched {
                             && tokens[..r.tokens.len()] == r.tokens[..]
                             && byte_aligned_lcp_vl(&r.tokens, &r.image_spans, tokens, &p.req.image_spans,
                                 state.vocab.as_ref(), &state.byte_decoder).live_tokens == r.tokens.len();
-                        // A mid-prefill checkpoint (decoder rings saved empty)
+                        // A mid-prefill checkpoint (decoder-layer raw windows saved empty)
                         // resumes only a suffix longer than the CED replay
                         // (decided above from the meta; this is the backstop).
-                        let resumable = snapshot::resume_ok(r.decoder_rings_empty, tokens.len().saturating_sub(r.tokens.len()), ced);
+                        let resumable = snapshot::resume_ok(r.decoder_windows_empty, tokens.len().saturating_sub(r.tokens.len()), ced);
                         if is_prefix && resumable {
                             let _ = state.snapshot_index.touch(&snap_hash);
                             prefix = r.tokens;
@@ -1262,7 +1262,7 @@ impl Sched {
             if let Some(tokens_saved) = key {
                 let t = Instant::now();
                 pf.kv.restore_compressor_lending();
-                pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
+                pf.job.clear_decoder_windows_for_checkpoint(&mut pf.kv);
                 match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
                     state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None)) {
                     Ok(entry) => {
@@ -1348,7 +1348,7 @@ impl Sched {
                 // 32768): a server restart does not run the cancel path, so a
                 // long prefill used to restart from zero (2026-09-22: a 262K
                 // prompt lost 98K rows). The encoder state at a chunk boundary is
-                // what a resumed prefill restores; the decoder rings are saved
+                // what a resumed prefill restores; the decoder-layer raw windows are saved
                 // empty (see the cancel checkpoint above).
                 let every = knobs::MS_CHECKPOINT_EVERY.usize();
                 let done = pf.job.done_rows();
@@ -1358,7 +1358,7 @@ impl Sched {
                 if let Some(tokens_saved) = key {
                     let t = Instant::now();
                     pf.kv.restore_compressor_lending();
-                    pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
+                    pf.job.clear_decoder_windows_for_checkpoint(&mut pf.kv);
                     match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
                         state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None)) {
                         Ok(entry) => {

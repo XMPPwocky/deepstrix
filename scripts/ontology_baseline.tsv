@@ -1,10 +1,10 @@
 # name	occ	distinct  (scripts/ontology_census.py --save)
-drafter / dspark	616	94
-mtp	91	16
+drafter / dspark	625	94
+mtp	78	11
 V41_INDEXER_*	4	3
 V41_INDEX_* / V41_IDX_*	8	4
 RawWindow (the bare `raw_window` is the V4 image window until it is deleted)	0	0
-decoder ring (a decoder layer's raw window)	20	2
+decoder ring (a decoder layer's raw window)	0	0
 GgufType (the dtype enum of a safetensors model)	375	1
 RequestId	0	0
 StreamId	0	0
@@ -32,14 +32,14 @@ milestone code inside an identifier	0	0
 slot	2234	92
 stream (outside the HIP crate)	3911	62
 seq	224	1
-ring	396	61
+ring	376	59
 prefill	1072	187
 phase	318	26
 pin	1074	159
 mirror	204	24
 hot	394	57
 split	740	126
-window	492	61
+window	512	63
 chunk	1577	160
 admit	192	44
 restore	290	54

@@ -2352,7 +2352,7 @@ pub(crate) fn handle_generate_stream(
                 if let Some(crate::snapshot::RestoredSnapshot {
                     tokens: loaded,
                     image_spans: loaded_spans,
-                    decoder_rings_empty,
+                    decoder_windows_empty,
                 }) = restored
                 {
                     let loaded_len = loaded.len() as u32;
@@ -2380,7 +2380,7 @@ pub(crate) fn handle_generate_stream(
                     let rest = req.tokens.len().saturating_sub(verify.req_tokens);
                     let resumable = (rest > 0 || trailing_marker.is_some())
                         && snapshot::resume_ok(
-                            decoder_rings_empty,
+                            decoder_windows_empty,
                             rest,
                             v4flash_kernels::het::forward_prefill::ced_enabled(),
                         );
@@ -2391,7 +2391,7 @@ pub(crate) fn handle_generate_stream(
                             verify_req = verify.req_tokens,
                             req_len = req.tokens.len(),
                             marker = trailing_marker.is_some(),
-                            decoder_rings_empty,
+                            decoder_windows_empty,
                             snap_hash = %short_hex(&snap_hash[..4]),
                             "{}",
                             if is_prefix {
@@ -2400,7 +2400,7 @@ pub(crate) fn handle_generate_stream(
                                 "restored snapshot bytes are NOT a prefix of the request; falling back"
                             }
                         );
-                        if is_prefix && decoder_rings_empty {
+                        if is_prefix && decoder_windows_empty {
                             if let Some(sid) = session_id.as_deref() {
                                 state.snapshot_index.drop_session_hint(sid, &snap_hash);
                             }

@@ -1422,9 +1422,9 @@ pub struct RestoredSnapshot {
     pub tokens: Vec<i32>,
     /// Image spans recorded at save time (empty for pre-vision snapshots).
     pub image_spans: Vec<ImageSpan>,
-    /// The CED decoder rings were saved EMPTY (a mid-prefill checkpoint):
+    /// The CED decoder-layer raw windows were saved EMPTY (a mid-prefill checkpoint):
     /// see [`resume_ok`] before prefilling a suffix onto it.
-    pub decoder_rings_empty: bool,
+    pub decoder_windows_empty: bool,
 }
 
 /// The checks on a snapshot's meta.json that need no device: format, model,
@@ -1475,11 +1475,11 @@ fn check_meta(meta: &SnapshotMeta, fingerprint: &ModelFingerprint) -> eyre::Resu
     Ok(())
 }
 
-/// Were the CED decoder rings (layers `CED_DECODER_START..`) saved empty at a
+/// Were the CED decoder-layer raw windows (layers `CED_DECODER_START..`) saved empty at a
 /// non-empty position? Only a mid-prefill checkpoint
-/// (`PrefillJob::clear_decoder_rings_for_checkpoint`) does that: any state
-/// that ran the decoder over a row holds it in every decoder ring.
-fn decoder_rings_empty(meta: &SnapshotMeta) -> bool {
+/// (`PrefillJob::clear_decoder_windows_for_checkpoint`) does that: any state
+/// that ran the decoder over a row holds it in every decoder-layer raw window.
+fn decoder_windows_empty(meta: &SnapshotMeta) -> bool {
     meta.token_count > 0
         && CED_DECODER_START < meta.layers.len()
         && meta.layers[CED_DECODER_START..].iter().all(|l| l.n_raw == 0)
@@ -1488,15 +1488,15 @@ fn decoder_rings_empty(meta: &SnapshotMeta) -> bool {
 /// May a restored snapshot be resumed by prefilling `suffix_rows` more prompt
 /// rows (the trailing think marker, forwarded after them, not counted; a
 /// marker forwarded IN the prefill because the suffix is empty counts as 0)?
-/// Always, unless its decoder rings are empty: then only under CED and only
+/// Always, unless its decoder-layer raw windows are empty: then only under CED and only
 /// when the suffix is longer than the replay (`SWA_WINDOW` rows), which then
 /// starts past `pos0` and empties the rings anyway, exactly like a fresh
 /// prompt. A shorter suffix is a continuation: the rings are KEPT (KNOWN_BUGS
 /// #25), and the replay and the first ~SWA_WINDOW decoded tokens would attend
 /// a window of only the suffix rows. Without CED every suffix row runs the
 /// decoder layers on the empty rings.
-pub fn resume_ok(decoder_rings_empty: bool, suffix_rows: usize, ced: bool) -> bool {
-    !decoder_rings_empty || (ced && suffix_rows > SWA_WINDOW as usize)
+pub fn resume_ok(decoder_windows_empty: bool, suffix_rows: usize, ced: bool) -> bool {
+    !decoder_windows_empty || (ced && suffix_rows > SWA_WINDOW as usize)
 }
 
 /// [`resume_ok`] decided from `src`'s meta.json alone, BEFORE [`restore_vl`]
@@ -1512,7 +1512,7 @@ pub fn resume_ok_from_meta(src: &Path, suffix_rows: usize, ced: bool) -> bool {
     else {
         return true;
     };
-    resume_ok(decoder_rings_empty(&meta), suffix_rows, ced)
+    resume_ok(decoder_windows_empty(&meta), suffix_rows, ced)
 }
 
 /// [`restore`] that also returns the snapshot's image spans.
@@ -1790,8 +1790,8 @@ pub fn restore_vl(
 
     // Leave dgpu current for the caller's subsequent prefill.
     dgpu.set_current()?;
-    let decoder_rings_empty = decoder_rings_empty(&meta);
-    Ok(RestoredSnapshot { tokens, image_spans: meta.image_spans, decoder_rings_empty })
+    let decoder_windows_empty = decoder_windows_empty(&meta);
+    Ok(RestoredSnapshot { tokens, image_spans: meta.image_spans, decoder_windows_empty })
 }
 
 /// hex encode/decode for the snapshot directory names. We avoid pulling
@@ -2121,7 +2121,7 @@ mod retention_tests {
         for suffix in [0, 1, w, w + 1, 100_000] {
             for ced in [false, true] {
                 assert_eq!(resume_ok_from_meta(&full, suffix, ced), resume_ok(false, suffix, ced));
-                assert_eq!(resume_ok_from_meta(&ckpt_dir, suffix, ced), resume_ok(decoder_rings_empty(&ckpt), suffix, ced));
+                assert_eq!(resume_ok_from_meta(&ckpt_dir, suffix, ced), resume_ok(decoder_windows_empty(&ckpt), suffix, ced));
             }
         }
         if CED_DECODER_START < N_LAYER as usize {
@@ -2159,15 +2159,15 @@ mod retention_tests {
     #[test]
     fn checkpoint_rings_resume_only_past_the_replay() {
         let full = meta_at(5000);
-        assert!(!decoder_rings_empty(&full));
+        assert!(!decoder_windows_empty(&full));
         let mut ckpt = meta_at(5000);
         for l in &mut ckpt.layers[CED_DECODER_START..] {
             l.n_raw = 0;
             l.kv_rows = 0;
         }
         // V4-Flash has no decoder range: never "empty".
-        assert_eq!(decoder_rings_empty(&ckpt), CED_DECODER_START < N_LAYER as usize);
-        assert!(!decoder_rings_empty(&meta_at(0)), "an empty state is not a checkpoint");
+        assert_eq!(decoder_windows_empty(&ckpt), CED_DECODER_START < N_LAYER as usize);
+        assert!(!decoder_windows_empty(&meta_at(0)), "an empty state is not a checkpoint");
         let w = SWA_WINDOW as usize;
         assert!(resume_ok(false, 0, true) && resume_ok(false, 1, false), "full rings: any suffix");
         assert!(resume_ok(true, w + 1, true), "the replay empties the rings anyway");

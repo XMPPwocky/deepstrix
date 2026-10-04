@@ -315,9 +315,9 @@ pub fn ced_enabled() -> bool {
 }
 
 /// A CED continuation (`pos0 > 0`, suffix within the replay, so its decoder
-/// rings are KEPT) whose decoder rings (layers `split..`) hold nothing: the
+/// rings are KEPT) whose decoder-layer raw windows (layers `split..`) hold nothing: the
 /// state is a mid-prefill checkpoint
-/// (`PrefillJob::clear_decoder_rings_for_checkpoint`), and the replay and the
+/// (`PrefillJob::clear_decoder_windows_for_checkpoint`), and the replay and the
 /// first ~SWA_WINDOW decoded tokens would attend a window of only the suffix
 /// rows (KNOWN_BUGS #25). Restores refuse such a resume (the server's
 /// `snapshot::resume_ok`); this is the backstop.
@@ -950,7 +950,7 @@ impl PrefillJob {
     /// run it. Harmless for this job whenever its suffix exceeds the replay
     /// (the finish empties the rings anyway), which the default checkpoint
     /// knobs guarantee; otherwise its finish refuses the same way.
-    pub fn clear_decoder_rings_for_checkpoint(&self, state: &mut HetModelState) {
+    pub fn clear_decoder_windows_for_checkpoint(&self, state: &mut HetModelState) {
         if !self.ced {
             return;
         }
@@ -1436,7 +1436,7 @@ impl HeterogeneousEngine {
             return Err(eyre!("PrefillJob: replay segment {b_seg} of {t} rows"));
         }
         let seg_pos0 = job.pos0 + (t - b_seg) as u32;
-        // Keep the decoder rings ONLY when the replay starts exactly at `pos0`
+        // Keep the decoder-layer raw windows ONLY when the replay starts exactly at `pos0`
         // of a continuation (snapshot restored, suffix <= SWA_WINDOW): they then
         // hold the previous turn's rows at [pos0 - k, pos0), directly before the
         // replay -- the window the reference decoder carries incrementally.
@@ -3302,7 +3302,7 @@ impl HeterogeneousEngine {
 
         if ced {
             // Decoder SWA Bounded Replay (§3.2.2): feed the last SWA_WINDOW
-            // rows' encoder outputs through the decoder with the decoder rings
+            // rows' encoder outputs through the decoder with the decoder-layer raw windows
             // emptied, so a segment query at index i sees window keys in
             // [max(s, i-W+1), i] and the complete global KV. Approximate by
             // design for N > SWA_WINDOW (identical to the exact path otherwise).
@@ -3316,7 +3316,7 @@ impl HeterogeneousEngine {
                 return Err(eyre!("CED prefill: replay segment {b_seg} of {t} rows"));
             }
             let seg_pos0 = pos0 + (t - b_seg) as u32;
-            // Keep the decoder rings only when the replay starts exactly at
+            // Keep the decoder-layer raw windows only when the replay starts exactly at
             // `pos0` of a continuation; empty them for a fresh prompt or a
             // suffix longer than the replay segment. Same rule as
             // `prefill_job_finish` (KNOWN_BUGS #25, #28) -- this copy missed
