@@ -437,3 +437,36 @@ Q5–Q8 are still open. Until Q5 is answered, the ratchet stays advisory.
 - **What "distinct" counts.** Each different matched string counts separately: `mtp`, `Mtp` and `MTP_BLOCK` are three identifiers, and a string literal such as `"mtp."` is one too. A rename that only changes case passes; a new string literal using a retired word fails.
 - **Comment stripping.** It removes `//` to end of line, including a `//` inside a string literal (a URL), and it ignores `/* */`. That is exact enough for Rust and slightly loose for `.hip`.
 - **Scope.** Homonym rows are reported, never enforced. The `stream` row excludes the HIP crate; `RawWindow` counts only the type, because the bare `raw_window` names the V4 image window until it is deleted.
+
+---
+
+## Progress
+
+**2026-10-04, after the owner's answers (§10 Q1–Q4).**
+
+*On main:*
+- Main was fast-forwarded to `worktree-ms-dspark2` `eb84ebb`.
+- This review, `docs/GLOSSARY.md` (now CANONICAL) and the census landed as `c2db000`.
+- The ratchet baseline was taken on that commit.
+
+*On branch `worktree-v4flash-removal`, not merged; it needs the GPU gate below.* The order differs from §9: the Phase 3.1 rebase was done first, so that every rename applies to the smaller tree.
+- **Phase 3.1: V4-Flash removal**, rebased onto main as `d7b1284` .. `4838a27`. Details are in `docs/ARCHITECTURE_REVIEW_2026-09-24.md` §9 (2026-10-04 entry).
+- **Phase 1**, all Rust identifiers. Every pure rename was verified token-for-token against rustc's `-Zunpretty=expanded` output: every differing token is an old→new pair from the rename map.
+  - 1.6 `mtp` → drafter: `06586f9`, plus message text in `3de31d2` and `f6d6d73`.
+  - 1.5 decoder rings → decoder-layer raw windows: `8655c62`.
+  - 1.7 evict-protect → protect: `5bbeffb`.
+  - 1.4 `KvArena::admit` / `accept` → `carve` / `commit`: `fa9c855`.
+  - 1.2 S8: `7fcdfb9`. `prefill_job_unit`; `Prefill.tokens`; `lm_window_open()` as a separate predicate, because renaming `checkpoint_ok` to `window_open` would have inverted it.
+  - 1.1 the §6 doc fixes: `bcb557c`.
+- **Phase 1.3 (`StreamId`) is deferred.** The files it rewrites (`ms_dspark.rs`, `kv_arena.rs`, `multistream.rs`, `step_rows.rs`) are under active two-stream DSpark development. It is structural, not a token rename, so it should be done in a quiet window.
+- **The tools are re-runnable.** `scripts/rename_idents.py` with `scripts/renames/*.py`, and `scripts/rename_prose.py` for comments. A branch that conflicts with a rename re-runs the same rules instead of hand-merging.
+
+*Census at the branch head:*
+
+| Alias | Distinct names | Note |
+|---|---|---|
+| `mtp` | 67 → 16 | all inside strings: env knobs, telemetry fields, the checkpoint prefix |
+| decoder ring | 2 → 0 | |
+| pins meaning evict-protect | 3 → 0 | |
+
+*Before merging the branch to main:* run the golden gate and multistream_step G5a-h on its release build in a GPU window. The owner decides the deploy.
