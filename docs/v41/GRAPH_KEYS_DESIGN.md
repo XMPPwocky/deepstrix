@@ -68,15 +68,18 @@ that replaced 3-5 of them saved 13-20 us per lane-layer (tests/bench_decode_late
    direct kernel on A, then on B; and a capture of N launches has exactly N nodes (2.5's vetted
    count assumes one kernel node per launch -- if ROCm added nodes, every capture would taint and
    the design would silently run all-legacy).
-Go / no-go (rev 3.2, after run 1; code review): coherence clean, every twin bit-exact, one node per
-launch, no drained queue, no BLOCKS, and ONE per-step budget: writes (160 = 2 lanes x 40 layers x 2
-with presubmit) x the `ctx_store` GPU + host cost + graph launches (640 = 8 stages x 80
-lane-layers) x the relaunch delta at production's pattern (K = 8 vs all-distinct, GPU + host) + twin
-launches (80 lane-layers x (8 gemv + 3 mhc)) x the twin deltas <= 1% of `ms.step` p50 (60 ms at 2
-rows / 2 lanes, the worst case: counts grow with lanes, the step with rows). Deltas are paired
-(11 alternating pairs) and charged only when a sign test resolves them (>= 9 of 11 positive);
-per-item ratios are diagnostics. A 10% relaunch penalty alone would be ~4 ms = 7% of the step, so
-SERIALIZES as a ratio bar was far too loose. Otherwise the design stops and is revised.
+Go / no-go (rev 3.3, after runs 1-2 and two code reviews): coherence clean, every twin bit-exact,
+one node per launch, no drained queue, no BLOCKS, and ONE per-step budget vs 1% of `ms.step` p50 (60
+ms at 2 rows / 2 lanes, the worst case: counts grow with lanes x layers, the step with rows):
+writes (80 = 1 per lane-layer; presubmit is off in production, 160 printed as a what-if) x the
+`ctx_store` GPU + host cost + graph launches (320 1-node + 320 multi-node = 8 stages x 80
+lane-layers) x the K = 8 vs all-distinct relaunch delta of that size (GPU + host) + twin launches
+per lane-layer (8 gemv-like at the q_b delta, 3 mhc, 7 small at the larger of the two) x 80.
+Deltas are paired (21 alternating pairs); the median is charged when positive and a ~96.7%
+upper-bound total uses the 16th of 21 paired differences. GO = medians and upper bounds fit;
+MARGINAL = only the medians fit, or GPU + host does not fit while each alone does (the live A/B's
+<= 1% `ms.step` bar decides); NO-GO otherwise. A 10% relaunch penalty alone would be ~4 ms = 7% of
+the step, so SERIALIZES as a ratio bar was far too loose. Otherwise the design stops and is revised.
 
 #### Step 0 run 1 (2026-10-04 22:07 UTC, 06bae25, hub down 57 s): NO-GO
 
@@ -98,6 +101,24 @@ use exactly the direct kernels' global_load / global_store counts (tB8 27 / 8, m
 the canary's cold path stays FLAT. Two attempts that did NOT work (kept here to save the next
 person the time): a generic -> global -> generic cast round trip (folded away as a no-op pair) and
 `__builtin_assume(!is_shared / !is_private)` (gone before the backend). Run 2 re-times the twins.
+
+#### Step 0 run 2 (2026-10-04 22:25 UTC, 0122a52, hub down 57 s): NO-GO (budget 5.54%)
+
+| item | result |
+|---|---|
+| 1 write cost | ctx_store +2.79 us GPU / +1.03 us host (median of 3) |
+| 2 relaunch, K = 8 vs 80 (11 pairs) | 8-node GPU -0.72 us (4/11 > 0), host -0.04; 1-node GPU -0.37, host -0.04: no penalty at production's pattern. Even K = 1 (69.75 us) = K = 80 (69.47): run 1's SERIALIZES was drift between sequential runs. Per-launch times bimodal (~64 / ~74 us) -- the 50 ms idle spins let the dGPU clock down: run 3 spins only cover the enqueue |
+| 3 coherence, 5 mechanism / nodes | clean |
+| 4 gemv twin (FLAT fixed) | b=1 +0.15 us, b=4 +0.29 us (+0.9%), b=8 +4.05 us (+9.8%, 11/11) |
+| 4 mhc twin | +0.14 / +0.50 / +0.43 us |
+
+Cause of b=8: the canary record AFTER the body (code after the body forces the compiler to
+reconverge the body's divergent tail: +24 s_nop, +8 s_wait_alu, extra moves in the body). Offline:
+without canary code the twin's body matches the direct kernel's (tB8 1040 of 1081 instructions in
+order; the rest is the dereference prologue); a record BEFORE the body is worse (1251). Design
+change (2.8): production twins carry NO canary code; each twin has an `_canary` variant (same
+dereference macro + the canary) that the wrappers pick when the canary is on (tests,
+`V41_MS_CTX_CHECK=1`).
 
 ### 2.1 Operands: `Arg` and a pointer-only context
 
@@ -211,9 +232,10 @@ thread submits to `ctx_dev` (documented invariant).
 
 ### 2.8 Device canary (tests and `V41_MS_CTX_CHECK=1`)
 
-`ensure_ctx` stamps each entry with an increasing `seq`; every `_ind` kernel, when its canary
-pointer (the slot's own address) is non-null -- a uniform branch COMPILED INTO the production twins,
-so the canary tests the production binary -- reads `seq` and the log pointer with scalar loads right
+`ensure_ctx` stamps each entry with an increasing `seq`; every `_ind_canary` twin (the `_ind`
+twin's dereference code plus the canary; picked by the wrappers when the canary is on --
+production twins carry no canary code, Step 0 run 2: a record after the body reshaped the body,
+gemv b=8 +9.8%) reads `seq` and the log pointer with scalar loads right
 after its operand dereferences, before any store (one `s_load_b128`, verified in the disassembly),
 along with the XOR of its resolved operand pointers; after the body, thread 0 of block 0 appends
 {seq << 16 | stage id, pointer XOR} at an atomic cursor clamped at the log's end (the XOR shows
@@ -344,3 +366,16 @@ Review of a7dc914 (reviewer: APPROVE WITH CHANGES):
 2. Run 2 could not resolve sub-1% deltas: FIXED -- K = 8 vs K = 80 and the twins as 11 alternating
    pairs with a sign test; section 1 median of 3.
 3. AS1-typed slot load: sound (the slot only ever holds host-written device addresses).
+
+Review of 0122a52 (reviewer: APPROVE WITH CHANGES) and run 2:
+
+1. 160 writes: FIXED -- 80 (presubmit off in production), 160 printed as a what-if.
+2. The ~7 small twins per lane-layer uncharged: FIXED -- charged at the larger of the gemv / mhc
+   deltas.
+3. Sign-test charging biased toward GO: FIXED -- the median is charged when positive; an
+   upper-bound total (order statistic); GO / MARGINAL / NO-GO.
+4. Relaunch by graph size: FIXED -- 320 launches at the 1-node delta, 320 at the 8-node one.
+5. GPU-only / host-only totals: ADDED.
+6. Run 2 (NO-GO 5.54%): the gemv b=8 twin's +4 us traced to the canary record after the body:
+   production twins now carry no canary code (`_canary` variants, 2.8); spins shortened to the
+   enqueue (the 50 ms idle spins made per-launch times bimodal); 21 pairs.

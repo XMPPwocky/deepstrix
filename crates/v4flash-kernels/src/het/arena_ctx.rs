@@ -50,7 +50,9 @@ pub const IND_MAX_OPERANDS: usize = 16;
 /// bake into a graph) and its `mask` bit tells the kernel to dereference it.
 ///
 /// `canary` (design 2.8) is the context slot's address when the kernel should log the `seq` it
-/// read (0 = off, the production value: one uniform branch in every twin), `tag` the stage id.
+/// read (0 = off, the production value), `tag` the stage id. A non-zero `canary` selects the
+/// `_canary` twin symbols; the production twins carry no canary code (a record after the body
+/// reshaped it: Step 0 run 2, gemv b=8 +9.8%).
 #[derive(Clone, Copy, Debug)]
 pub struct Ind {
     pub ctx: u64,

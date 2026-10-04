@@ -252,37 +252,50 @@ __device__ __forceinline__ static void mhc_fast_body(
 #include "mhc_fast_body.inc"
 }
 
-// `_ind` twin: operands 0..12 (split_out .. norm_w, in order) resolve through the arena context
-// when their `ind_mask` bit is set (arena_ctx.inc); the canary's loads, the same body, the canary's
-// record.
+// `_ind` twins: operands 0..12 (split_out .. norm_w, in order) resolve through the arena context
+// when their `ind_mask` bit is set (arena_ctx.inc), then the same body. `mhc_fast_batched_ind` is
+// the production twin (no canary code: a record after the body reshapes it, see q8_0_matvec.hip);
+// `mhc_fast_batched_ind_canary` adds the canary's loads and record (tests, V41_MS_CTX_CHECK=1).
 #include "arena_ctx.inc"
-extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ind(
-        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag,
-        float* split_out, float* mix_out, unsigned int* counters, float* inv_rows,
-        const __half* weight, const float* x, const float* scale, const float* base,
-        float* carry, const float* cx, float* cur_out, float* norm_out, const float* norm_w,
-        unsigned int k, unsigned int ne, unsigned int n_mix, unsigned int do_collapse,
-        unsigned int write_carry, unsigned int mode, float rms_eps, unsigned int n_hc,
-        unsigned int iters, float eps) {
-    ARENA_CTX_DEREF(ind_mask, 0, float*, split_out);
-    ARENA_CTX_DEREF(ind_mask, 1, float*, mix_out);
-    ARENA_CTX_DEREF(ind_mask, 2, unsigned int*, counters);
-    ARENA_CTX_DEREF(ind_mask, 3, float*, inv_rows);
-    ARENA_CTX_DEREF(ind_mask, 4, const __half*, weight);
-    ARENA_CTX_DEREF(ind_mask, 5, const float*, x);
-    ARENA_CTX_DEREF(ind_mask, 6, const float*, scale);
-    ARENA_CTX_DEREF(ind_mask, 7, const float*, base);
-    ARENA_CTX_DEREF(ind_mask, 8, float*, carry);
-    ARENA_CTX_DEREF(ind_mask, 9, const float*, cx);
-    ARENA_CTX_DEREF(ind_mask, 10, float*, cur_out);
-    ARENA_CTX_DEREF(ind_mask, 11, float*, norm_out);
+#define MHC_FAST_IND_PARAMS                                                                     \
+        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag,                         \
+        float* split_out, float* mix_out, unsigned int* counters, float* inv_rows,              \
+        const __half* weight, const float* x, const float* scale, const float* base,            \
+        float* carry, const float* cx, float* cur_out, float* norm_out, const float* norm_w,    \
+        unsigned int k, unsigned int ne, unsigned int n_mix, unsigned int do_collapse,          \
+        unsigned int write_carry, unsigned int mode, float rms_eps, unsigned int n_hc,          \
+        unsigned int iters, float eps
+#define MHC_FAST_IND_DEREF                                                                      \
+    ARENA_CTX_DEREF(ind_mask, 0, float*, split_out);                                            \
+    ARENA_CTX_DEREF(ind_mask, 1, float*, mix_out);                                              \
+    ARENA_CTX_DEREF(ind_mask, 2, unsigned int*, counters);                                      \
+    ARENA_CTX_DEREF(ind_mask, 3, float*, inv_rows);                                             \
+    ARENA_CTX_DEREF(ind_mask, 4, const __half*, weight);                                        \
+    ARENA_CTX_DEREF(ind_mask, 5, const float*, x);                                              \
+    ARENA_CTX_DEREF(ind_mask, 6, const float*, scale);                                          \
+    ARENA_CTX_DEREF(ind_mask, 7, const float*, base);                                           \
+    ARENA_CTX_DEREF(ind_mask, 8, float*, carry);                                                \
+    ARENA_CTX_DEREF(ind_mask, 9, const float*, cx);                                             \
+    ARENA_CTX_DEREF(ind_mask, 10, float*, cur_out);                                             \
+    ARENA_CTX_DEREF(ind_mask, 11, float*, norm_out);                                            \
     ARENA_CTX_DEREF(ind_mask, 12, const float*, norm_w);
+#define MHC_FAST_IND_BODY                                                                       \
+    mhc_fast_body(split_out, mix_out, counters, inv_rows, weight, x, scale, base, carry, cx,    \
+                  cur_out, norm_out, norm_w, k, ne, n_mix, do_collapse, write_carry, mode,      \
+                  rms_eps, n_hc, iters, eps);
+extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ind(MHC_FAST_IND_PARAMS) {
+    (void)canary;
+    (void)canary_tag;
+    MHC_FAST_IND_DEREF
+    MHC_FAST_IND_BODY
+}
+extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ind_canary(MHC_FAST_IND_PARAMS) {
+    MHC_FAST_IND_DEREF
     ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(split_out) ^ ARENA_CTX_U64(mix_out) ^ ARENA_CTX_U64(counters) ^
                                   ARENA_CTX_U64(inv_rows) ^ ARENA_CTX_U64(weight) ^ ARENA_CTX_U64(x) ^
                                   ARENA_CTX_U64(scale) ^ ARENA_CTX_U64(base) ^ ARENA_CTX_U64(carry) ^
                                   ARENA_CTX_U64(cx) ^ ARENA_CTX_U64(cur_out) ^ ARENA_CTX_U64(norm_out) ^
                                   ARENA_CTX_U64(norm_w));
-    mhc_fast_body(split_out, mix_out, counters, inv_rows, weight, x, scale, base, carry, cx, cur_out, norm_out, norm_w,
-                  k, ne, n_mix, do_collapse, write_carry, mode, rms_eps, n_hc, iters, eps);
+    MHC_FAST_IND_BODY
     ARENA_CTX_CANARY_STORE(canary_tag);
 }

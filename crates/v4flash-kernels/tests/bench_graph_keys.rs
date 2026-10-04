@@ -19,9 +19,9 @@
 //!     reproduces the direct kernel on A, then on B; and a capture of N launches has N nodes
 //!     (design 2.5's vetted-count check assumes one node per launch).
 //!  The go / no-go: the exactness items, no drained queue, no BLOCKS, and ONE per-step budget --
-//!  writes x write cost + graph launches x the K = 8 relaunch delta + twin launches x the twin
-//!  deltas (paired deltas charged only when the sign test resolves them) <= 1% of ms.step p50
-//!  (GK_STEP_MS, default 60 = 2 rows / 2 lanes live).
+//!  writes x write cost + graph launches x the K = 8 relaunch delta (1- and 8-node) + twin launches
+//!  x the twin deltas, medians and ~96.7% upper bounds, vs 1% of ms.step p50 (GK_STEP_MS, default
+//!  60 = 2 rows / 2 lanes live): GO / MARGINAL (the live A/B decides) / NO-GO.
 //!
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release \
 //!   --features v41 -p v4flash-kernels --test bench_graph_keys -- --ignored --nocapture
@@ -120,13 +120,14 @@ impl std::fmt::Display for Stat {
     }
 }
 
-/// Paired differences b_i - a_i (us) of alternating runs: median, range, and a sign test. The
-/// budget charges a delta only when it is RESOLVED positive: >= 80% of the pairs positive (9 of
-/// 11: one-sided sign test p = 0.033); an unresolved delta counts as zero, a negative one never
-/// earns credit.
+/// Paired differences b_i - a_i (us) of alternating runs: the median (charged when positive,
+/// resolved or not), a ~96.7% one-sided upper bound on it (the k-th smallest difference, k the
+/// smallest with P(Bin(n, 1/2) <= k - 1) >= 0.967: the 9th of 11, the 16th of 21), the range, and
+/// the sign count as a label.
 #[derive(Clone, Copy, Debug)]
 struct Delta {
     med: f64,
+    ub: f64,
     min: f64,
     max: f64,
     pos: usize,
@@ -135,13 +136,32 @@ struct Delta {
 
 impl Delta {
     fn of(a: &[f64], b: &[f64]) -> Self {
-        let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| y - x).collect();
-        let st = Stat::of(&d);
-        Delta { med: st.med, min: st.min, max: st.max, pos: d.iter().filter(|v| **v > 0.0).count(), n: d.len() }
+        let mut d: Vec<f64> = a.iter().zip(b).map(|(x, y)| y - x).collect();
+        d.sort_by(f64::total_cmp);
+        let n = d.len();
+        // Binomial(n, 1/2) CDF, smallest k with CDF(k - 1) >= 0.967.
+        let mut cdf = 0.0;
+        let mut c = 1.0f64; // C(n, i)
+        let mut k = n;
+        for i in 0..n {
+            cdf += c / 2f64.powi(n as i32);
+            if cdf >= 0.967 {
+                k = i + 1;
+                break;
+            }
+            c = c * (n - i) as f64 / (i + 1) as f64;
+        }
+        Delta { med: d[n / 2], ub: d[k.min(n) - 1], min: d[0], max: d[n - 1], pos: d.iter().filter(|v| **v > 0.0).count(), n }
     }
 
+    /// The budget's charge: the median, never negative.
     fn charge(&self) -> f64 {
-        if self.med > 0.0 && self.pos * 100 >= 80 * self.n { self.med } else { 0.0 }
+        self.med.max(0.0)
+    }
+
+    /// The upper-bound charge.
+    fn charge_ub(&self) -> f64 {
+        self.ub.max(0.0)
     }
 }
 
@@ -149,8 +169,8 @@ impl std::fmt::Display for Delta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:+.2} us [{:+.2}..{:+.2}], {}/{} pairs > 0 -> charged {:.2}",
-            self.med, self.min, self.max, self.pos, self.n, self.charge()
+            "{:+.2} us (ub {:+.2}) [{:+.2}..{:+.2}], {}/{} pairs > 0",
+            self.med, self.ub, self.min, self.max, self.pos, self.n
         )
     }
 }
@@ -286,7 +306,9 @@ fn graph_keys_step0() -> eyre::Result<()> {
     // ---- 1. the context write, amortized behind a spin ---------------------------------
     // N x 3 packets stays well inside the AQL ring (ROC_AQL_QUEUE_SIZE, 4096 by default) and the
     // kernarg pool: a full queue would block the host until the spin ends, timing the host.
-    println!("== 1. context write between two launches, queue pre-filled behind a 50 ms spin (per write, median of 3; 'none' = bare launches)");
+    // The spins only cover the enqueue (drained = fail): a long idle spin lets the dGPU clock down
+    // before the timed work (run 2: per-launch times bimodal at ~64 / ~74 us behind 50 ms spins).
+    println!("== 1. context write between two launches, queue pre-filled behind a 5 ms spin (per write, median of 3; 'none' = bare launches)");
     let n = 400usize;
     let variants = ["none", "h2d", "ctx_store", "write_value32"];
     let mut host_v = vec![Vec::new(); variants.len()];
@@ -296,7 +318,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
         for (vi, variant) in variants.iter().enumerate() {
             s.synchronize()?;
             let (e0, e1) = (Event::new()?, Event::new()?);
-            e.q8.slack_probe_spin(&s, spin_ms(50.0))?;
+            e.q8.slack_probe_spin(&s, spin_ms(5.0))?;
             e0.record(&s)?;
             let t = Instant::now();
             for i in 0..n {
@@ -351,7 +373,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
     // lane's other 7 stages (plus direct launches), so its pattern is round-robin over K >= 8: the
     // budget charges K = 8 vs all-distinct (today's legacy graphs), measured as alternating pairs.
     // K = 1 / 2 / 4 are diagnostics.
-    println!("== 2. 80 launches round-robin over K executables behind a 50 ms spin (GPU us/launch)");
+    println!("== 2. 80 launches round-robin over K executables behind a 3 ms spin (GPU us/launch)");
     let (rows, k) = (1280usize, 5120usize);
     let w = q8_weight(dev.id, rows, k, 1)?;
     let mut xq = up(dev.id, &lcg_bytes(2, 8 * k).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
@@ -373,7 +395,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
         e1.synchronize()?;
         Ok((host_us, Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / 80.0, drained))
     };
-    let mut relaunch = None; // (GPU delta, host delta) per launch, K = 8 vs K = 80, 8 nodes
+    let mut relaunch = Vec::new(); // (nodes, GPU delta, host delta) per launch, K = 8 vs K = 80
     for nodes in [1u32, 8] {
         let mut body = |s: &Stream| -> eyre::Result<()> {
             for b in 1..=nodes {
@@ -387,18 +409,18 @@ fn graph_keys_step0() -> eyre::Result<()> {
         for kk in [1usize, 2, 4] {
             let mut g = Vec::new();
             for _ in 0..3 {
-                let (_, gpu, drained) = run(&execs, kk, 50.0)?;
+                let (_, gpu, drained) = run(&execs, kk, 3.0)?;
                 any_drained |= drained;
                 g.push(gpu);
             }
             line += &format!("  K={kk} {}", Stat::of(&g));
         }
         println!("{line}");
-        // K = 8 vs K = 80, 11 alternating pairs.
+        // K = 8 vs K = 80, 21 alternating pairs.
         let (mut g8, mut g80, mut h8, mut h80) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for i in 0..11 {
+        for i in 0..21 {
             for kk in if i % 2 == 0 { [8usize, 80] } else { [80, 8] } {
-                let (h, g, drained) = run(&execs, kk, 50.0)?;
+                let (h, g, drained) = run(&execs, kk, 3.0)?;
                 any_drained |= drained;
                 if kk == 8 {
                     g8.push(g);
@@ -416,8 +438,8 @@ fn graph_keys_step0() -> eyre::Result<()> {
             println!("  [a run DRAINED: host-bound]");
         }
         bar(!any_drained, format!("2:{nodes}n:drained"));
+        relaunch.push((nodes, dg, dh));
         if nodes == 8 {
-            relaunch = Some((dg, dh));
             // BLOCKS: the host enqueue time of 80 launches must not grow with the spin ahead.
             for (label, kk) in [("K=1", 1usize), ("K=80", 80)] {
                 let (h5, _, _) = run(&execs, kk, 5.0)?;
@@ -433,7 +455,6 @@ fn graph_keys_step0() -> eyre::Result<()> {
             }
         }
     }
-    let (relaunch_gpu, relaunch_host) = relaunch.expect("8-node relaunch measured");
 
     // ---- 3. coherence: store then a graph that reads the slot, 10k rounds ----------------
     println!("== 3. coherence: arena_ctx_store then a captured _ind gemv (canary on), alternating entries");
@@ -496,8 +517,8 @@ fn graph_keys_step0() -> eyre::Result<()> {
     xs = up(dev.id, &(0..8 * (k / 32)).map(|i| 0.002 + (i % 7) as f32 * 0.001).collect::<Vec<_>>())?;
     let mut out_d = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
     let mut out_i = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
-    let prefill = |s: &Stream| e.q8.slack_probe_spin(s, spin_ms(10.0));
-    let mut gemv_charge = 0f64; // the largest resolved twin delta over b, us per launch
+    let prefill = |s: &Stream| e.q8.slack_probe_spin(s, spin_ms(3.0));
+    let mut gemv_d: Vec<Delta> = Vec::new(); // per b: _ind - direct, us per launch
     for b in [1u32, 4, 8] {
         out_i.fill_zero()?;
         let mut ent = ArenaCtx::default();
@@ -512,7 +533,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let (sd_, si_, dt, drained) = time_ab(
             &s,
             200,
-            11,
+            21,
             &prefill,
             &mut || e.q8.matvec_bpack(&s, &mut out_d, &w, &xq, &xs, rows as u32, k as u32, b),
             &mut || e.q8.matvec_bpack_ind(&s, ind, &mut out_x, &w, &xq, &xs, rows as u32, k as u32, b),
@@ -523,7 +544,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
         let diff = down(&out_d, n)?.iter().zip(down(&out_i, n)?).filter(|(a, c)| **a != *c).count();
         exact &= diff == 0;
         bar(diff == 0, format!("4a:b{b}:bitexact"));
-        gemv_charge = gemv_charge.max(dt.charge());
+        gemv_d.push(dt);
         println!(
             "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff}{}",
             (si_.med / sd_.med - 1.0) * 100.0,
@@ -533,7 +554,7 @@ fn graph_keys_step0() -> eyre::Result<()> {
 
     // ---- 4b. mhc_fast_batched `_ind` twin vs direct, b = 1, 4, 8 -------------------------
     println!("== 4b. mhc_fast_batched_ind vs direct (pre_attn: mix pre-scaled + collapse + write_carry), 13 operands indirect");
-    let mut mhc_charge = 0f64;
+    let mut mhc_d: Vec<Delta> = Vec::new();
     {
         let (hcd, m, ne, bmax) = (HC_DIM as usize, HC_MIX_DIM as usize, N_EMBD as usize, 8usize);
         // f16 weights in a sane range: sign, exponent 10..14, random mantissa.
@@ -588,11 +609,11 @@ fn graph_keys_step0() -> eyre::Result<()> {
             let diff: usize = ref_out.iter().zip(&got).map(|(a, c)| a.iter().zip(c).filter(|(x, y)| x != y).count()).sum();
             let mut decoy = MhcSet::new(dev.id, bmax, &carry0)?;
             let (sd_, si_, dt, drained) =
-                time_ab(&s, 200, 11, &prefill, &mut || go(&mut decoy, None, b), &mut || go(&mut sd, Some(ind), b))?;
+                time_ab(&s, 200, 21, &prefill, &mut || go(&mut decoy, None, b), &mut || go(&mut sd, Some(ind), b))?;
             exact &= diff == 0;
             bar(diff == 0, format!("4b:b{b}:bitexact"));
             bar(drained == 0, format!("4b:b{b}:drained"));
-            mhc_charge = mhc_charge.max(dt.charge());
+            mhc_d.push(dt);
             println!(
                 "  b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff} (split, mix, inv, carry, cur, norm){}",
                 (si_.med / sd_.med - 1.0) * 100.0,
@@ -635,41 +656,105 @@ fn graph_keys_step0() -> eyre::Result<()> {
     println!("  {launches} captured launches -> {nodes} graph nodes");
 
     // ---- the 2.0 per-step budget ----------------------------------------------------------
-    // Everything the design adds per step, GPU + host critical path, against 1% of `ms.step` p50.
-    // The worst case is 2 rows / 2 lanes (~60 ms live, 2026-10-04): the write and launch counts
-    // grow with lanes and layers, not rows, while the step grows with rows. GK_STEP_MS overrides.
+    // Everything the design adds per step against 1% of `ms.step` p50. The worst case is 2 rows /
+    // 2 lanes (~60 ms live, 2026-10-04; 3 lanes need >= 6 rows): write and launch counts grow with
+    // lanes x layers, the step with rows. GK_STEP_MS overrides. Counts (review of 0122a52):
+    // 1 write per lane-layer (presubmit is off in production; 2 is a what-if line); 8 stage graphs
+    // per lane-layer, 4 of them 1-node (mhc_pre_attn, mhc_pre_ffn, router, mix_ffn_late) charged at
+    // the 1-node relaunch delta, 4 at the 8-node one; per lane-layer 8 gemv-like twins (q_b-shape
+    // delta: conservative), 3 mhc twins, 7 small twins (a fixed prologue cost: charged at the larger
+    // of the gemv / mhc deltas). Medians are charged when positive; the upper-bound total uses each
+    // delta's ~96.7% upper bound. GPU + host is an upper bound (only one is the pole at a time).
     let step_ms: f64 = std::env::var("GK_STEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
-    let (lane_layers, stages) = (2.0 * 40.0, 8.0); // 2 lanes x 40 layers; 8 captured stages
-    let writes = 2.0 * lane_layers; // 1 per lane-layer, 2 with the presubmit shared expert
-    let launches = stages * lane_layers;
-    let (gemv_per, mhc_per) = (8.0, 3.0); // twin launches per lane-layer (q_b-shape delta: conservative)
-    let c_write = writes * (write_cost.0.max(0.0) + write_cost.1.max(0.0));
-    let c_relaunch = launches * (relaunch_gpu.charge() + relaunch_host.charge());
-    let c_twins = lane_layers * (gemv_per * gemv_charge + mhc_per * mhc_charge);
-    let total = c_write + c_relaunch + c_twins;
+    let lane_layers = 2.0 * 40.0;
+    let writes = lane_layers;
+    let (gemv_per, mhc_per, small_per) = (8.0, 3.0, 7.0);
+    let worst = |v: &[Delta], ub: bool| v.iter().map(|d| if ub { d.charge_ub() } else { d.charge() }).fold(0.0, f64::max);
+    // (GPU us, host us) per step; `ub` = upper bounds.
+    let cost = |ub: bool| -> (f64, f64) {
+        let mut gpu = writes * write_cost.0.max(0.0);
+        let mut host = writes * write_cost.1.max(0.0);
+        for (_, dg, dh) in &relaunch {
+            let launches = 4.0 * lane_layers; // 4 stage graphs per lane-layer of each size class
+            gpu += launches * if ub { dg.charge_ub() } else { dg.charge() };
+            host += launches * if ub { dh.charge_ub() } else { dh.charge() };
+        }
+        let (g, m) = (worst(&gemv_d, ub), worst(&mhc_d, ub));
+        gpu += lane_layers * (gemv_per * g + mhc_per * m + small_per * g.max(m));
+        (gpu, host)
+    };
     let budget = 0.01 * step_ms * 1e3;
+    let pct = |us: f64| us / (step_ms * 1e3) * 100.0;
+    let (g_med, h_med) = cost(false);
+    let (g_ub, h_ub) = cost(true);
     println!("== per-step budget at ms.step {step_ms:.0} ms (1% = {budget:.0} us; 2 lanes x 40 layers):");
     println!(
-        "  context writes   {writes:.0} x ({:.2} GPU + {:.2} host) us = {c_write:6.0} us",
-        write_cost.0, write_cost.1
+        "  context writes   {writes:.0} x ({:.2} GPU + {:.2} host) us = {:.0} us  (what-if presubmit, 160 writes: {:.0} us)",
+        write_cost.0,
+        write_cost.1,
+        writes * (write_cost.0 + write_cost.1).max(0.0),
+        2.0 * writes * (write_cost.0 + write_cost.1).max(0.0)
     );
+    for (nodes, dg, dh) in &relaunch {
+        println!(
+            "  relaunch {nodes}-node {:.0} x ({:.2} GPU + {:.2} host) us, ub ({:.2} + {:.2})",
+            4.0 * lane_layers,
+            dg.charge(),
+            dh.charge(),
+            dg.charge_ub(),
+            dh.charge_ub()
+        );
+    }
     println!(
-        "  graph relaunch   {launches:.0} x ({:.2} GPU + {:.2} host) us = {c_relaunch:6.0} us",
-        relaunch_gpu.charge(),
-        relaunch_host.charge()
+        "  twins            {lane_layers:.0} x ({gemv_per:.0} gemv x {:.2} + {mhc_per:.0} mhc x {:.2} + {small_per:.0} small x {:.2}) us; ub gemv {:.2} mhc {:.2}",
+        worst(&gemv_d, false),
+        worst(&mhc_d, false),
+        worst(&gemv_d, false).max(worst(&mhc_d, false)),
+        worst(&gemv_d, true),
+        worst(&mhc_d, true)
     );
+    let (med, ub) = (g_med + h_med, g_ub + h_ub);
     println!(
-        "  twins            {lane_layers:.0} x ({gemv_per:.0} x {gemv_charge:.2} + {mhc_per:.0} x {mhc_charge:.2}) us = {c_twins:6.0} us"
+        "  total (medians)  {med:6.0} us = {:.2}%  (GPU-only {:.2}%, host-only {:.2}%)",
+        pct(med),
+        pct(g_med),
+        pct(h_med)
     );
-    println!("  total            {total:6.0} us = {:.2}% of the step", total / (step_ms * 1e3) * 100.0);
-    bar(total <= budget, format!("budget:{:.2}%", total / (step_ms * 1e3) * 100.0));
-    if nogo.is_empty() {
+    println!("  total (upper bd) {ub:6.0} us = {:.2}%  (GPU-only {:.2}%, host-only {:.2}%)", pct(ub), pct(g_ub), pct(h_ub));
+    // GO: the medians and the upper bounds fit. MARGINAL (the live A/B's <= 1% ms.step bar
+    // decides): the medians fit but the upper bounds do not, or the GPU + host sum does not fit
+    // while each timeline alone does. NO-GO otherwise.
+    let budget_verdict = if med <= budget && ub <= budget {
+        "GO"
+    } else if med <= budget || (g_med <= budget && h_med <= budget) {
+        "MARGINAL"
+    } else {
+        "NO-GO"
+    };
+    println!("  budget: {budget_verdict}");
+    if !nogo.is_empty() {
+        println!("STEP0: NO-GO ({})", nogo.join(", "));
+    } else if budget_verdict == "GO" {
         println!("STEP0: GO");
     } else {
-        println!("STEP0: NO-GO ({})", nogo.join(", "));
+        println!("STEP0: {budget_verdict} (budget: medians {:.2}%, upper bounds {:.2}%)", pct(med), pct(ub));
     }
     if !exact {
         return Err(eyre!("graph_keys step 0: a bit-exactness, coherence or node-count check failed"));
     }
     Ok(())
+}
+
+/// Host only: the upper bound is the k-th smallest paired difference (9th of 11, 16th of 21:
+/// P(Bin(21, 1/2) <= 14) = 0.961 < 0.967 <= P(<= 15) = 0.987).
+#[test]
+fn delta_upper_bound_order_statistic() {
+    for (n, k) in [(11usize, 9usize), (21, 16)] {
+        let a = vec![0.0; n];
+        let b: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+        let d = Delta::of(&a, &b);
+        assert_eq!(d.ub, k as f64, "n={n}");
+        assert_eq!(d.med, (n / 2 + 1) as f64);
+        assert_eq!(d.pos, n);
+    }
 }

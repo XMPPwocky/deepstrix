@@ -219,7 +219,9 @@ impl MhcArena {
             "mhc_fast_ind: an indirect operand of an absent half"
         );
         let p: [u64; 13] = std::array::from_fn(|i| ind.ptr(i, direct[i] as u64));
-        let function = self.fast.get_function("mhc_fast_batched_ind")?;
+        // Production twin without canary code; the canary (design 2.8) has its own symbol.
+        let function =
+            self.fast.get_function(if ind.canary != 0 { "mhc_fast_batched_ind_canary" } else { "mhc_fast_batched_ind" })?;
         launch_kernel!(function, cfg, stream, [
             ind.mask(), ind.canary, ind.tag,
             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12],

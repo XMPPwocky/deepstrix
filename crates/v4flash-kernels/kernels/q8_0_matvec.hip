@@ -424,19 +424,34 @@ Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB10, 10)
 // (out, w, xq, xscale) whose bit of `ind_mask` is set, the pointer argument is the address of
 // its arena context slot and is dereferenced first, so one captured graph serves every layer /
 // lane. Resolution happens before any store; same instructions on the same data as the direct
-// kernel.
+// kernel. Two symbols per b: `_ind` (production, no canary code: Step 0 run 2 measured a canary
+// record after the body reshaping the body -- reconvergence, +24 s_nop -- gemv b=8 +9.8%) and
+// `_ind_canary` (tests, V41_MS_CTX_CHECK=1: the same derefs, plus the canary record, 2.8). Both
+// take the same arguments; the production twin ignores `canary` / `canary_tag`.
 #include "arena_ctx.inc"
+#define Q8_0_GEMV_BPACK_TB_IND_PROLOGUE                                                    \
+        (void)batch;                                                                       \
+        ARENA_CTX_DEREF(ind_mask, 0, float*, out);                                         \
+        ARENA_CTX_DEREF(ind_mask, 1, const unsigned char*, w);                             \
+        ARENA_CTX_DEREF(ind_mask, 2, const int8_t*, xq);                                   \
+        ARENA_CTX_DEREF(ind_mask, 3, const float*, xscale);
 #define Q8_0_GEMV_BPACK_TB_IND(NAME, B)                                                    \
     extern "C" __global__ void NAME(uint32_t ind_mask, const ArenaCtx* canary,             \
                                     uint32_t canary_tag, float* out,                       \
                                     const unsigned char* w, const int8_t* xq,              \
                                     const float* xscale, uint32_t in_dim,                  \
                                     uint32_t out_dim, uint32_t blocks, uint32_t batch) {   \
-        (void)batch;                                                                       \
-        ARENA_CTX_DEREF(ind_mask, 0, float*, out);                                         \
-        ARENA_CTX_DEREF(ind_mask, 1, const unsigned char*, w);                             \
-        ARENA_CTX_DEREF(ind_mask, 2, const int8_t*, xq);                                   \
-        ARENA_CTX_DEREF(ind_mask, 3, const float*, xscale);                                \
+        (void)canary;                                                                      \
+        (void)canary_tag;                                                                  \
+        Q8_0_GEMV_BPACK_TB_IND_PROLOGUE                                                    \
+        q8_0_gemv_bpack_tb_body<B>(out, w, xq, xscale, in_dim, out_dim, blocks);           \
+    }                                                                                      \
+    extern "C" __global__ void NAME##_canary(uint32_t ind_mask, const ArenaCtx* canary,    \
+                                    uint32_t canary_tag, float* out,                       \
+                                    const unsigned char* w, const int8_t* xq,              \
+                                    const float* xscale, uint32_t in_dim,                  \
+                                    uint32_t out_dim, uint32_t blocks, uint32_t batch) {   \
+        Q8_0_GEMV_BPACK_TB_IND_PROLOGUE                                                    \
         ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(out) ^ ARENA_CTX_U64(w) ^              \
                                           ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale));      \
         q8_0_gemv_bpack_tb_body<B>(out, w, xq, xscale, in_dim, out_dim, blocks);           \

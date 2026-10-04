@@ -646,11 +646,18 @@ impl Q8_0Matvec {
         {
             return Err(eyre!("q8_0 matvec_bpack_ind: operand sizes do not fit n_rows={n_rows} k={k} batch={batch}"));
         }
+        // Production twins carry no canary code; the canary (design 2.8) has its own symbols.
         const IND_SYMBOLS: [&str; 8] = [
             "q8_0_gemv_bpack_tB1_ind", "q8_0_gemv_bpack_tB2_ind", "q8_0_gemv_bpack_tB3_ind", "q8_0_gemv_bpack_tB4_ind",
             "q8_0_gemv_bpack_tB5_ind", "q8_0_gemv_bpack_tB6_ind", "q8_0_gemv_bpack_tB7_ind", "q8_0_gemv_bpack_tB8_ind",
         ];
-        let function = self.module.get_function(IND_SYMBOLS[(batch - 1) as usize])?;
+        const IND_CANARY_SYMBOLS: [&str; 8] = [
+            "q8_0_gemv_bpack_tB1_ind_canary", "q8_0_gemv_bpack_tB2_ind_canary", "q8_0_gemv_bpack_tB3_ind_canary",
+            "q8_0_gemv_bpack_tB4_ind_canary", "q8_0_gemv_bpack_tB5_ind_canary", "q8_0_gemv_bpack_tB6_ind_canary",
+            "q8_0_gemv_bpack_tB7_ind_canary", "q8_0_gemv_bpack_tB8_ind_canary",
+        ];
+        let symbols = if ind.canary != 0 { &IND_CANARY_SYMBOLS } else { &IND_SYMBOLS };
+        let function = self.module.get_function(symbols[(batch - 1) as usize])?;
         let cfg = LaunchConfig {
             grid: (n_rows.div_ceil(GEMV_ROWS_PER_BLOCK), 1, 1),
             block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
