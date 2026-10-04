@@ -23,7 +23,7 @@ ExpertKey	0	0
 Remap	0	0
 span read	0	0
 coalesce (= span read)	57	16
-pins meaning evict-protect	14	3
+pins meaning evict-protect	0	0
 registry knob	83	83
 raw env read of a V41_ knob	328	243
 env .is_ok() used as a boolean	34	19
@@ -35,7 +35,7 @@ seq	224	1
 ring	376	59
 prefill	1072	187
 phase	318	26
-pin	1074	159
+pin	1043	154
 mirror	204	24
 hot	394	57
 split	740	126

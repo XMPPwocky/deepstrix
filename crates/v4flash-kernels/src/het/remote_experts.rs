@@ -1824,7 +1824,7 @@ fn park_waits_for(
     pending.contains(&key) && !(urgency && (spec.contains(&key) || resident(&key)))
 }
 
-/// Push `layer`'s real picks in `sel` onto `pins` (a shard's `parked_pins`) and
+/// Push `layer`'s real picks in `sel` onto `pins` (a shard's `parked_protect`) and
 /// return the length to `truncate` back to when the park ends.
 ///
 /// The park block RE-ENTERS: a request served inside a park runs `run_path`
@@ -1835,7 +1835,7 @@ fn park_waits_for(
 /// parked loop's later `admit_landed` and every further nested request could
 /// pick them as victims and repack them mid-read. Appending and truncating to
 /// the mark keeps every enclosing request's pins until its own park ends.
-fn push_parked_pins(pins: &mut Vec<(u32, u32)>, layer: u32, sel: &[i32]) -> usize {
+fn push_parked_protect(pins: &mut Vec<(u32, u32)>, layer: u32, sel: &[i32]) -> usize {
     let mark = pins.len();
     for &e in sel.iter().filter(|&&e| e != NO_PICK && (0..N_EXPERT as i32).contains(&e)) {
         pins.push((layer, e as u32));
@@ -2235,15 +2235,15 @@ pub struct ExpertShard {
     /// 4096-aligned. See [`b2_odirect`].
     direct: bool,
     /// `(layer, expert)` slots a request still computing on the GPU reads:
-    /// never a victim while set (the compute loop pins the in-flight request's
-    /// picks around a queued request's early paging).
-    pub pinned: Vec<(u32, u32)>,
+    /// never a victim while set (the compute loop protects the in-flight
+    /// request's picks around a queued request's early paging).
+    pub protected: Vec<(u32, u32)>,
     /// A PARKED request's picks (`knobs::park`): never victims while other
     /// requests are served under its in-flight reads. A stack: a request served
-    /// inside the park appends its own and truncates back (`push_parked_pins`).
+    /// inside the park appends its own and truncates back (`push_parked_protect`).
     /// Separate from `pinned`, which the early-paging hook sets and clears
     /// around each hint.
-    pub parked_pins: Vec<(u32, u32)>,
+    pub parked_protect: Vec<(u32, u32)>,
     /// The parked request's non-resident picks as `layer << 16 | expert`, for
     /// the park hook to hand to the prefetch readers.
     pub park_words: Vec<u32>,
@@ -3016,9 +3016,9 @@ impl EarlyPaged {
 }
 
 /// `(layer, e)` pairs a victim search must not take besides the hub's pins
-/// and the pass's own wanted ids: a parked request's picks (`parked_pins`)
+/// and the pass's own wanted ids: a parked request's picks (`parked_protect`)
 /// and the early-page `pinned` set.
-type ExtraPins<'a> = &'a [(u32, u32)];
+type ExtraProtect<'a> = &'a [(u32, u32)];
 
 impl ShardPool {
     /// A pool of `n_slots`, seeded with `(layer, base_slot, ids)` regions as
@@ -3180,7 +3180,7 @@ impl ShardPool {
         global: bool,
         want_layer: u32,
         want: &[u32],
-        extra: ExtraPins<'_>,
+        extra: ExtraProtect<'_>,
         for_layer: u32,
         stamp: u64,
     ) -> Option<u32> {
@@ -3274,7 +3274,7 @@ impl ShardPool {
         range: std::ops::Range<u32>,
         want_layer: u32,
         want: &[u32],
-        extra: ExtraPins<'_>,
+        extra: ExtraProtect<'_>,
         for_layer: u32,
         ignore_hub_pins: bool,
         prefill_mode: bool,
@@ -3335,7 +3335,7 @@ impl ShardPool {
         band: Band,
         want_layer: u32,
         want: &[u32],
-        extra: ExtraPins<'_>,
+        extra: ExtraProtect<'_>,
         for_layer: u32,
         ignore_hub_pins: bool,
         prefill_mode: bool,
@@ -3416,7 +3416,7 @@ impl ShardPool {
         layer: u32,
         e: u32,
         want: &[u32],
-        extra: ExtraPins<'_>,
+        extra: ExtraProtect<'_>,
         region: (u32, u32),
         global: bool,
         prefill_shaped: bool,
@@ -4187,8 +4187,8 @@ impl ExpertShard {
             pf_stages_spare: pf_stages,
             direct,
             pool: None,
-            pinned: Vec::new(),
-            parked_pins: Vec::new(),
+            protected: Vec::new(),
+            parked_protect: Vec::new(),
             park_words: Vec::new(),
             park_prefill: false,
             req_prefill: false,
@@ -4468,7 +4468,7 @@ impl ExpertShard {
     /// Land every prefetch read that has COMPLETED, without waiting for any
     /// (the park loop, `knobs::park`). `layer` is only the caller's current
     /// layer for the dirty bookkeeping; nothing is protected beyond `pinned` /
-    /// `parked_pins`.
+    /// `parked_protect`.
     pub fn admit_landed(&mut self, layer: u32) -> eyre::Result<()> {
         self.admit_prefetched(layer, &[])
     }
@@ -4502,7 +4502,7 @@ impl ExpertShard {
     /// any layer. Called at the top of `ensure_layer_inner`, where nothing
     /// reads the pool. `want` protects the current layer's picks from eviction.
     fn admit_prefetched(&mut self, cur_layer: u32, want: &[u32]) -> eyre::Result<()> {
-        let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
+        let protect: Vec<(u32, u32)> = self.protected.iter().chain(self.parked_protect.iter()).copied().collect();
         let Some(pf) = self.prefetch.as_mut() else { return Ok(()) };
         let Some(pool) = self.pool.as_mut() else { return Ok(()) };
         let global = b2_global_pool();
@@ -4627,7 +4627,7 @@ impl ExpertShard {
                 continue;
             }
             let victim = if restore_stamp != 0 {
-                match pool.restore_victim(region, global, cur_layer, want, &pinned, d.layer, restore_stamp) {
+                match pool.restore_victim(region, global, cur_layer, want, &protect, d.layer, restore_stamp) {
                     Some(v) => Some(v),
                     None => {
                         pool.me.rc.stopped += 1;
@@ -4637,12 +4637,12 @@ impl ExpertShard {
                     }
                 }
             } else {
-                pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, false, prefill_landing)
+                pool.pick_victim_any(region, global, band, cur_layer, want, &protect, d.layer, false, prefill_landing)
             };
             let Some(victim) = victim else {
                 if d.stage {
                     pool.sc.drops += 1;
-                } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, true, prefill_landing).is_some() {
+                } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &protect, d.layer, true, prefill_landing).is_some() {
                     pool.pins.c.no_victim_drops += 1;
                 }
                 pf.free.push(d.set);
@@ -5103,7 +5103,7 @@ impl ExpertShard {
     }
 
     fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool) -> eyre::Result<()> {
-        let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
+        let protect: Vec<(u32, u32)> = self.protected.iter().chain(self.parked_protect.iter()).copied().collect();
         // `evtrace` (`b2_ensure` + one `b2_read` per demand miss): NaN when off.
         let ev_on = super::evtrace::enabled();
         let nan = f64::NAN;
@@ -5207,7 +5207,7 @@ impl ExpertShard {
                 m.push(e);
             }
             let ev_t_scan = std::time::Instant::now();
-            let claim = pool.claim_miss(layer, e, &want, &pinned, region, global, prefill_mode, scan_class);
+            let claim = pool.claim_miss(layer, e, &want, &protect, region, global, prefill_mode, scan_class);
             let ev_scan = ev_t_scan.elapsed().as_nanos() as f64;
             ev_scan_ns += ev_scan;
             let Some((victim, ev_victim)) = claim else {
@@ -6274,10 +6274,10 @@ impl MoeExecutor {
                         shard.park_words.push((layer << 16) | e as u32);
                     }
                     shard.park_prefill = if shard.mode_evict_on() { shard.req_prefill } else { b > 16 };
-                    // Append + truncate, never clear: see `push_parked_pins`.
-                    let mark = push_parked_pins(&mut shard.parked_pins, layer, sel);
+                    // Append + truncate, never clear: see `push_parked_protect`.
+                    let mark = push_parked_protect(&mut shard.parked_protect, layer, sel);
                     let r = overlap(shard, true);
-                    shard.parked_pins.truncate(mark);
+                    shard.parked_protect.truncate(mark);
                     shard.park_words.clear();
                     r?;
                 }
@@ -7229,9 +7229,9 @@ pub fn serve_connection(
                 // readers as CERTAIN hints; B's own `ensure` then finds them in
                 // flight and waits for the remainder (`waited`) instead of
                 // reading from scratch. `V41_B2_EARLY_PAGE=0` disables.
-                let mut cur_pins: Vec<(u32, u32)> = req.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)).collect();
+                let mut cur_protect: Vec<(u32, u32)> = req.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)).collect();
                 if let Some(rb) = reqb.as_ref() {
-                    cur_pins.extend(rb.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)));
+                    cur_protect.extend(rb.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)));
                 }
                 let (exec_device, exec_rows, exec_decode_max_b) = (exec.device(), exec.rows(), exec.decode_max_b());
                 let rx_in_ref = &rx_in;
@@ -7280,12 +7280,12 @@ pub fn serve_connection(
                             }
                         }
                         if !words.is_empty() {
-                            shard.pinned = cur_pins.clone();
+                            shard.protected = cur_protect.clone();
                             // A prefill chunk's reads land in the staging band.
                             // Mode-aware eviction: the frame's hub flag, not its shape.
                             let pf_class = if shard.mode_evict_on() { nreq.flags & proto::REQ_FLAG_DECODE == 0 } else { nreq.b > proto::PIN_DECODE_MAX_ROWS };
                             shard.prefetch_words_cls(&words, true, pf_class);
-                            shard.pinned.clear();
+                            shard.protected.clear();
                         }
                     };
                     let pull = |shard: &mut ExpertShard, pending: &mut std::collections::VecDeque<Inbound>| {
@@ -9051,11 +9051,11 @@ mod tests {
     /// A request served inside a park re-enters the park block: its pins come
     /// and go without dropping the parked request's (they used to be cleared).
     #[test]
-    fn nested_park_keeps_the_parked_requests_pins() {
+    fn nested_park_keeps_the_parked_requests_protected() {
         let mut pins: Vec<(u32, u32)> = Vec::new();
-        let outer = push_parked_pins(&mut pins, 7, &[3, NO_PICK, 9, 400]);
+        let outer = push_parked_protect(&mut pins, 7, &[3, NO_PICK, 9, 400]);
         assert_eq!(pins, vec![(7, 3), (7, 9)], "NO_PICK and out-of-range ids are not pins");
-        let inner = push_parked_pins(&mut pins, 8, &[1, 2]);
+        let inner = push_parked_protect(&mut pins, 8, &[1, 2]);
         assert_eq!(pins.len(), 4);
         pins.truncate(inner); // the nested request's park ends
         assert_eq!(pins, vec![(7, 3), (7, 9)], "the parked request is still protected");
