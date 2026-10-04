@@ -55,30 +55,39 @@ pub struct ReturnStats {
     pub verify_ms: f64,
     /// Chunks whose read-back hash differed on the first attempt (retried).
     pub retried: u32,
+    /// Donors whose guard band (imaged, never lent) changed while lent: a
+    /// kernel wrote past its allocation. The return repairs the band.
+    pub guard_violations: u32,
 }
 
 pub struct Loan {
     donors: Vec<Donor>,
-    /// Bytes of each donor that the loan uses (a prefix; the last donor may be
-    /// used only partly).
+    /// Bytes of each donor handed to the allocator (its high-water mark).
+    lent: Vec<usize>,
+    /// Bytes of each donor in the image: `lent` plus a guard band.
     used: Vec<usize>,
     image: PathBuf,
-    /// Image layout: donor `d`'s used prefix starts at `image_off[d]`.
+    /// Image layout: donor `d`'s imaged prefix starts at `image_off[d]`.
     image_off: Vec<u64>,
     /// `hashes[d][c]` = hash of donor `d`'s chunk `c` (`chunk` bytes, the last
     /// one shorter).
     hashes: Vec<Vec<u64>>,
+    /// Hash of each donor's guard band `[lent, used)`.
+    guard_hash: Vec<u64>,
     chunk: usize,
-    image_written: bool,
+    /// The image, open and `flock`ed for the life of the process: a second
+    /// hub on the same path fails at startup instead of overwriting it.
+    lock: Option<File>,
 }
 
 impl Loan {
     /// Take donors in the given order until every buffer of `sizes` fits,
     /// placed first-fit in that order (`LOAN_ALIGN`-rounded): the placement
     /// [`LoanAlloc::take`] reproduces when the job asks for the same sizes in
-    /// the same order. A donor is used up to its high-water mark only. Errors
-    /// when the donors run out.
-    pub fn new(candidates: Vec<Donor>, sizes: &[usize], image: PathBuf, chunk: usize) -> eyre::Result<Self> {
+    /// the same order. A donor is lent up to its high-water mark only; up to
+    /// `guard` bytes after that are imaged and checked at every return.
+    /// Errors when the donors run out.
+    pub fn new(candidates: Vec<Donor>, sizes: &[usize], image: PathBuf, chunk: usize, guard: usize) -> eyre::Result<Self> {
         if chunk == 0 || chunk % LOAN_ALIGN != 0 {
             return Err(eyre!("loan chunk {chunk} must be a non-zero multiple of {LOAN_ALIGN}"));
         }
@@ -104,39 +113,64 @@ impl Loan {
         let mut keep = used.iter().map(|u| *u > 0).collect::<Vec<_>>().into_iter();
         donors.retain(|_| keep.next().expect("same length"));
         used.retain(|u| *u > 0);
+        let lent = used.clone();
+        let guard = guard.min(chunk) / LOAN_ALIGN * LOAN_ALIGN;
+        let used: Vec<usize> = donors.iter().zip(&lent).map(|(d, l)| (l + guard).min(cap(d))).collect();
         let mut image_off = Vec::with_capacity(donors.len());
         let mut off = 0u64;
         for u in &used {
             image_off.push(off);
             off += *u as u64;
         }
-        Ok(Loan { donors, used, image, image_off, hashes: Vec::new(), chunk, image_written: false })
+        Ok(Loan { donors, lent, used, image, image_off, hashes: Vec::new(), guard_hash: Vec::new(), chunk, lock: None })
     }
 
+    /// Bytes lent (the job's memory).
+    pub fn lent_bytes(&self) -> usize {
+        self.lent.iter().sum()
+    }
+
+    /// Bytes imaged and returned per phase (lent + guard bands).
     pub fn total_bytes(&self) -> usize {
         self.used.iter().sum()
     }
 
-    /// `(donor name, bytes used)` for the startup log.
+    /// `(donor name, bytes lent)` for the startup log.
     pub fn donor_summary(&self) -> Vec<(String, usize)> {
-        self.donors.iter().zip(&self.used).map(|(d, u)| (d.name.clone(), *u)).collect()
+        self.donors.iter().zip(&self.lent).map(|(d, u)| (d.name.clone(), *u)).collect()
     }
 
     pub fn image_path(&self) -> &Path {
         &self.image
     }
 
-    /// Copy every donor's used bytes into the image file and record their
+    /// Copy every donor's imaged bytes into the image file and record their
     /// hashes. Call once, before the first loan, while the donors hold their
-    /// loaded contents. `stream` = a stream on the donors' device. The file's
-    /// page cache is dropped after the write.
+    /// loaded contents. `stream` = a stream on the donors' device. Takes an
+    /// exclusive `flock` on the file first (held until the process exits).
+    /// The file's page cache is dropped after the write.
     pub fn write_image(&mut self, stream: &Stream) -> eyre::Result<()> {
         if let Some(dir) = self.image.parent() {
             std::fs::create_dir_all(dir).wrap_err_with(|| format!("create {}", dir.display()))?;
         }
-        let f = File::create(&self.image).wrap_err_with(|| format!("create loan image {}", self.image.display()))?;
+        // Open WITHOUT truncating: the lock must be ours before a byte changes.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.image)
+            .wrap_err_with(|| format!("open loan image {}", self.image.display()))?;
+        if !try_lock_exclusive(&f) {
+            return Err(eyre!(
+                "loan image {} is locked by another process (another hub?); set V41_EMBED_LOAN_IMAGE to a private path",
+                self.image.display()
+            ));
+        }
+        f.set_len(self.total_bytes() as u64).wrap_err("size loan image")?;
         let mut host = PinnedBuffer::<u8>::new(self.chunk)?;
         self.hashes.clear();
+        self.guard_hash.clear();
         for (d, donor) in self.donors.iter().enumerate() {
             let mut hs = Vec::new();
             let mut at = 0usize;
@@ -151,22 +185,46 @@ impl Loan {
                 at += n;
             }
             self.hashes.push(hs);
+            let g = self.used[d] - self.lent[d];
+            self.guard_hash.push(if g == 0 { 0 } else {
+                donor.view.slice_view(self.lent[d], g).copy_to_pinned_async(&mut host, 0, stream)?;
+                stream.synchronize()?;
+                chunk_hash(&host.as_slice()[..g])
+            });
         }
         f.sync_data().wrap_err("sync loan image")?;
         drop_page_cache(&f);
-        self.image_written = true;
+        self.lock = Some(f);
         Ok(())
     }
 
-    /// The loan's memory as a first-fit allocator over the donor ranges.
+    /// The loan's memory as a first-fit allocator over the lent ranges.
     /// Errors until the image exists: lending before it would lose the bytes.
     pub fn allocator(&self) -> eyre::Result<LoanAlloc> {
-        if !self.image_written {
+        if self.lock.is_none() {
             return Err(eyre!("dGPU loan: the image was never written; refusing to lend"));
         }
         Ok(LoanAlloc {
-            ranges: self.donors.iter().zip(&self.used).map(|(d, u)| (d.view.slice_view(0, *u), 0usize)).collect(),
+            ranges: self.donors.iter().zip(&self.lent).map(|(d, u)| (d.view.slice_view(0, *u), 0usize)).collect(),
         })
+    }
+
+    /// Donors whose guard band no longer matches the image (`scratch`: a
+    /// pinned buffer of at least the guard size).
+    fn guard_violations(&self, stream: &Stream, scratch: &mut PinnedBuffer<u8>) -> eyre::Result<u32> {
+        let mut bad = 0;
+        for (d, donor) in self.donors.iter().enumerate() {
+            let g = self.used[d] - self.lent[d];
+            if g == 0 {
+                continue;
+            }
+            donor.view.slice_view(self.lent[d], g).copy_to_pinned_async(scratch, 0, stream)?;
+            stream.synchronize()?;
+            if chunk_hash(&scratch.as_slice()[..g]) != self.guard_hash[d] {
+                bad += 1;
+            }
+        }
+        Ok(bad)
     }
 
     /// Put every donor back from the image: pread a chunk into one of the two
@@ -180,10 +238,12 @@ impl Loan {
         if host.iter().any(|h| h.len() < self.chunk) {
             return Err(eyre!("give_back: need two pinned buffers of >= {} B", self.chunk));
         }
-        let f = File::open(&self.image).wrap_err_with(|| format!("open loan image {}", self.image.display()))?;
+        let f = self.lock.as_ref().ok_or_else(|| eyre!("give_back: the image was never written"))?;
+        let mut st = ReturnStats::default();
+        // Before anything is overwritten: did a kernel write past its loan?
+        st.guard_violations = self.guard_violations(stream, &mut host[1])?;
         let copied = [Event::new_no_timing()?, Event::new_no_timing()?];
         let mut pending = [false, false];
-        let mut st = ReturnStats::default();
         let mut k = 0usize;
         for (d, donor) in self.donors.iter().enumerate() {
             let mut at = 0usize;
@@ -200,6 +260,14 @@ impl Loan {
                 f.read_exact_at(&mut host[b].as_mut_slice()[..n], self.image_off[d] + at as u64)
                     .wrap_err_with(|| format!("read loan image {}", self.image.display()))?;
                 st.read_ms += tr.elapsed().as_secs_f64() * 1e3;
+                if verify && chunk_hash(&host[b].as_slice()[..n]) != self.hashes[d][c] {
+                    return Err(eyre!(
+                        "loan image {} bytes for donor {} [{at}, {}) do not match their startup hash (disk corruption?)",
+                        self.image.display(),
+                        donor.name,
+                        at + n
+                    ));
+                }
                 let mut dst = donor.view.slice_view(at, n);
                 dst.copy_from_host_async(&host[b].as_slice()[..n], stream)?;
                 if verify {
@@ -234,7 +302,7 @@ impl Loan {
             }
         }
         stream.synchronize()?;
-        drop_page_cache(&f);
+        drop_page_cache(f);
         st.total_ms = t0.elapsed().as_secs_f64() * 1e3;
         Ok(st)
     }
@@ -259,6 +327,15 @@ unsafe fn libc_fadvise_dontneed(fd: i32) {
         fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
     }
     let _ = posix_fadvise(fd, 0, 0, 4);
+}
+
+/// `flock(LOCK_EX | LOCK_NB)`: false when another open file holds it.
+fn try_lock_exclusive(f: &File) -> bool {
+    extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    // LOCK_EX = 2, LOCK_NB = 4.
+    unsafe { flock(f.as_raw_fd(), 2 | 4) == 0 }
 }
 
 /// First-fit sub-allocation over the loan's ranges. Each allocation lies in

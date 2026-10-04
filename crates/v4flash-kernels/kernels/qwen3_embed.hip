@@ -11,8 +11,40 @@
 
 #define QE_BLOCK 256u
 
+// Largest Q8_0 row the in-place repack stages in LDS (blocks * 34 bytes):
+// 480 blocks = K 15360 (Qwen3-Embedding-4B's widest row is K 9728, 10336 B).
+#define QE_REPACK_MAX_BLOCKS 480u
+
+// f32 -> f16, saturating to +-65504 instead of overflowing to inf (Qwen-family
+// activations can be large); NaN stays NaN so it surfaces in the output check.
 __device__ __forceinline__ unsigned short qe_f16(float v) {
+    if (!isnan(v)) v = fminf(fmaxf(v, -65504.0f), 65504.0f);
     return __half_as_ushort(__float2half_rn(v));
+}
+
+// In-place Q8_0 repack of `rows` rows of `blocks` blocks each, from the GGUF
+// layout (per block: f16 scale, 32 x i8) to the split layout the WMMA GEMM
+// reads (`gemm_f16x`; host twin `weights::repack_q8_0`): per row, all
+// `blocks` scales, then all `blocks * 32` quants. Same bytes per row. One
+// workgroup per row; the row is staged in LDS as u16 words (17 per block:
+// the scale, then 16 words of quants), so rows must start 2-byte aligned.
+extern "C" __global__ void qe_q8_0_repack_rows(
+        unsigned short *w,
+        unsigned int blocks) {
+    __shared__ unsigned short s[QE_REPACK_MAX_BLOCKS * 17u];
+    unsigned short *row = w + (size_t)blockIdx.x * blocks * 17u;
+    const unsigned int words = blocks * 17u;
+    for (unsigned int i = threadIdx.x; i < words; i += blockDim.x) s[i] = row[i];
+    __syncthreads();
+    for (unsigned int i = threadIdx.x; i < words; i += blockDim.x) {
+        if (i < blocks) {
+            row[i] = s[i * 17u];
+        } else {
+            const unsigned int q = i - blocks;      // quant word index
+            const unsigned int b = q / 16u;         // its block
+            row[i] = s[b * 17u + 1u + (q % 16u)];
+        }
+    }
 }
 
 // Block-wide sum over QE_BLOCK threads (every thread gets the result).

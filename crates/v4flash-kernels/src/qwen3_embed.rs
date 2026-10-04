@@ -1,22 +1,26 @@
 //! Qwen3-Embedding forward on the dGPU, for the hub's embed phase
 //! (docs/v41/EMBED_PHASE_DESIGN.md §5).
 //!
-//! Layer-major over every token of a phase, weights STREAMED: a reader thread
-//! preads layer `l + 1` from the GGUF into a pinned host slot while the dGPU
-//! computes layer `l`; the copy stream moves it into a two-slot dGPU ring. All
-//! device memory comes from a [`LoanAlloc`] (the hub: an in-place loan of
-//! immutable V4.1 weights; the standalone gate: a plain allocation), carved
-//! in the order [`EmbedSizing::buffer_sizes`] lists.
+//! Layer-major over every token of a phase, weights STREAMED: reader threads
+//! pread layer `l + 1` from the GGUF into a pinned host buffer while the dGPU
+//! computes layer `l`; the copy stream moves it into one of two dGPU ring
+//! buffers, where `qe_q8_0_repack_rows` turns the GGUF Q8_0 blocks into the
+//! split layout the GEMM reads. All device memory comes from a [`LoanAlloc`]
+//! (the hub: an in-place loan of immutable V4.1 weights; the standalone gate:
+//! a plain allocation), carved in the order [`EmbedSizing::buffer_sizes`] lists.
 //!
-//! Projections: the production Q8_0 x f16 WMMA GEMM (`gemm_f16x`, gfx1201).
-//! Attention: `GqaAttention::prefill_flash_wmma_fa2`, one launch per input
-//! segment of a sub-batch. Everything else: `kernels/qwen3_embed.hip`.
+//! Projections: the production Q8_0 x f16 WMMA GEMM (`gemm_f16x`, gfx1201; the
+//! caller passes the engine's resident module). Attention: the Laguna-era
+//! `GqaAttention::prefill_flash_wmma_fa2` (kernel-tested at kv_group 6/9; gate
+//! E2 covers Qwen's 4), one launch per input segment of a sub-batch.
+//! Everything else: `kernels/qwen3_embed.hip`. The modules here are loaded per
+//! phase and dropped after it.
 
 use std::sync::mpsc;
 use std::time::Instant;
 
 use color_eyre::eyre::{self, eyre};
-use v4flash_core::qwen3_embed::{Qwen3EmbedConfig, Qwen3EmbedModel, SlotLayout};
+use v4flash_core::qwen3_embed::{Qwen3EmbedConfig, Qwen3EmbedModel, LayerLayout};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{launch_kernel, DeviceBuffer, Event, LaunchConfig, Module, PinnedBuffer, Stream};
 
@@ -37,9 +41,14 @@ pub fn act_pitch(k: usize) -> usize {
     if p.is_power_of_two() { p + 8 } else { p }
 }
 
+/// Reader threads per layer read and for the token-embedding rows.
+pub const READERS: usize = 4;
+
+/// Max blocks per row of `qe_q8_0_repack_rows` (mirrors `QE_REPACK_MAX_BLOCKS`).
+const REPACK_MAX_BLOCKS: usize = 480;
+
 pub struct Qwen3EmbedKernels {
     module: Module,
-    gemm: Q8_0MatvecWmma,
     attn: GqaAttention,
 }
 
@@ -51,11 +60,37 @@ impl Qwen3EmbedKernels {
             return Err(eyre!("qwen3 embed forward needs gfx1201 (the dGPU), got {arch}"));
         }
         let _ = QWEN3_EMBED_GFX1151; // built for every target; never loaded there
-        Ok(Qwen3EmbedKernels {
-            module: Module::load_data(QWEN3_EMBED_GFX1201)?,
-            gemm: Q8_0MatvecWmma::for_arch(arch)?,
-            attn: GqaAttention::for_arch(arch)?,
-        })
+        Ok(Qwen3EmbedKernels { module: Module::load_data(QWEN3_EMBED_GFX1201)?, attn: GqaAttention::for_arch(arch)? })
+    }
+
+    /// In place: `rows` GGUF Q8_0 rows of `blocks` blocks starting at `w[0]`
+    /// -> the split layout `gemm_f16x` reads (`weights::repack_q8_0`).
+    pub fn repack_q8_0_rows(&self, stream: &Stream, w: &mut DeviceBuffer<u8>, rows: usize, blocks: usize) -> eyre::Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if blocks == 0 || blocks > REPACK_MAX_BLOCKS || w.byte_len() < rows * blocks * 34 || (w.raw() as usize) % 2 != 0 {
+            return Err(eyre!("qe_q8_0_repack_rows: rows {rows} x blocks {blocks} do not fit the buffer / LDS / alignment"));
+        }
+        let f = self.module.get_function("qe_q8_0_repack_rows")?;
+        let cfg = LaunchConfig { grid: (rows as u32, 1, 1), block: (QE_BLOCK, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [w.raw(), blocks as u32])
+    }
+
+    /// Repack every Q8_0 matrix of the layer in ring buffer `w`.
+    fn repack_layer(&self, stream: &Stream, c: &Qwen3EmbedConfig, l: &LayerLayout, w: &DeviceBuffer<u8>) -> eyre::Result<()> {
+        let (d, qw, ff) = (c.n_embd, c.q_width(), c.n_ff);
+        let groups = [
+            (l.q, c.qkv_rows(), d / 32),
+            (l.o, d, qw / 32),
+            (l.gate, 2 * ff, d / 32),
+            (l.down, d, ff / 32),
+        ];
+        for (off, rows, blocks) in groups {
+            let mut v = w.slice_view(off, rows * blocks * 34);
+            self.repack_q8_0_rows(stream, &mut v, rows, blocks)?;
+        }
+        Ok(())
     }
 
     /// `out16[r, :n] = f16(rmsnorm(x[r, :]) * w)` for `rows` rows of `x` (pitch n).
@@ -162,11 +197,13 @@ impl Qwen3EmbedKernels {
         launch_kernel!(f, cfg, stream, [out.raw(), src.raw(), idx.raw(), n])
     }
 
-    /// The projection GEMM: `out[rows, m] = x16[rows, :k] · W[m, k]^T`.
-    #[allow(clippy::too_many_arguments)]
-    fn gemm(&self, stream: &Stream, out: &mut DeviceBuffer<f32>, w: &DeviceBuffer<u8>, x16: &DeviceBuffer<u16>, k: usize, m: usize, rows: usize, pitch: usize) -> eyre::Result<()> {
-        self.gemm.gemm_f16x_tile(F16xTile::Base, stream, out, w, x16, k as u32, m as u32, 1, rows as u32, pitch as u32)
-    }
+}
+
+/// The projection GEMM: `out[rows, m] = x16[rows, :k] · W[m, k]^T`, `W` in the
+/// split Q8_0 layout (after `qe_q8_0_repack_rows`).
+#[allow(clippy::too_many_arguments)]
+fn gemm(g: &Q8_0MatvecWmma, stream: &Stream, out: &mut DeviceBuffer<f32>, w: &DeviceBuffer<u8>, x16: &DeviceBuffer<u16>, k: usize, m: usize, rows: usize, pitch: usize) -> eyre::Result<()> {
+    g.gemm_f16x_tile(F16xTile::Base, stream, out, w, x16, k as u32, m as u32, 1, rows as u32, pitch as u32)
 }
 
 /// The two knobs that size one phase's device memory.
@@ -192,12 +229,12 @@ impl EmbedSizing {
 
     /// Bytes of each buffer, in the order [`EmbedBuffers::carve`] takes them
     /// (the hub sizes its loan with this; the order IS the placement).
-    pub fn buffer_sizes(&self, cfg: &Qwen3EmbedConfig, slot: &SlotLayout) -> Vec<(&'static str, usize)> {
+    pub fn buffer_sizes(&self, cfg: &Qwen3EmbedConfig, layout: &LayerLayout) -> Vec<(&'static str, usize)> {
         let (t, r) = (self.phase_tokens, self.sub_rows);
         let sizes = [
             t * cfg.n_embd * 4,
-            slot.bytes,
-            slot.bytes,
+            layout.bytes,
+            layout.bytes,
             r * Self::gemm_out_width(cfg) * 4,
             t * cfg.kv_width() * 2,
             t * cfg.kv_width() * 2,
@@ -210,8 +247,8 @@ impl EmbedSizing {
         BUFFERS.iter().copied().zip(sizes).collect()
     }
 
-    pub fn total_bytes(&self, cfg: &Qwen3EmbedConfig, slot: &SlotLayout) -> usize {
-        self.buffer_sizes(cfg, slot).iter().map(|(_, b)| b.div_ceil(crate::dgpu_loan::LOAN_ALIGN) * crate::dgpu_loan::LOAN_ALIGN).sum()
+    pub fn total_bytes(&self, cfg: &Qwen3EmbedConfig, layout: &LayerLayout) -> usize {
+        self.buffer_sizes(cfg, layout).iter().map(|(_, b)| b.div_ceil(crate::dgpu_loan::LOAN_ALIGN) * crate::dgpu_loan::LOAN_ALIGN).sum()
     }
 }
 
@@ -231,8 +268,8 @@ pub struct EmbedBuffers {
 }
 
 impl EmbedBuffers {
-    pub fn carve(alloc: &mut LoanAlloc, sizing: EmbedSizing, cfg: &Qwen3EmbedConfig, slot: &SlotLayout) -> eyre::Result<Self> {
-        let s = sizing.buffer_sizes(cfg, slot);
+    pub fn carve(alloc: &mut LoanAlloc, sizing: EmbedSizing, cfg: &Qwen3EmbedConfig, layout: &LayerLayout) -> eyre::Result<Self> {
+        let s = sizing.buffer_sizes(cfg, layout);
         let n = |i: usize, elem: usize| s[i].1 / elem;
         Ok(EmbedBuffers {
             sizing,
@@ -263,23 +300,26 @@ pub struct EmbedTimings {
     pub total_ms: f64,
 }
 
-/// A pinned host slot handed to the reader thread.
-struct HostSlot(*mut u8, usize);
-// SAFETY: the engine thread never touches a slot while the reader fills it:
-// it hands the slot over only after the slot's previous H2D completed, and
+/// A pinned host buffer handed to the reader thread.
+struct HostBuf(*mut u8, usize);
+// SAFETY: the engine thread never touches a buffer while the reader fills it:
+// it hands the buffer over only after its previous H2D completed, and
 // reads it (H2D) only after the reader reported it filled.
-unsafe impl Send for HostSlot {}
+unsafe impl Send for HostBuf {}
 
 /// Run the forward over `inputs` (token ids, EOS included) and return each
 /// input's LAST hidden row, before `output_norm` (the caller finishes it with
 /// `Qwen3EmbedModel::finish` and the request's `dimensions`).
 ///
-/// `host` = two pinned buffers of at least `slot.bytes`. `compute` and `copy`
+/// `g` = the GEMM module (the hub passes its engine's resident `q8_wmma`).
+/// `host` = two pinned buffers of at least `layout.bytes`. `compute` and `copy`
 /// are streams on the dGPU. `pet` runs after every layer (the hub's watchdog).
-/// On return every queued device operation has completed, also on error.
+/// On return every queued device operation has completed, also on error, and
+/// the reader threads have exited.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     k: &Qwen3EmbedKernels,
+    g: &Q8_0MatvecWmma,
     model: &Qwen3EmbedModel,
     file: &MappedGguf,
     bufs: &mut EmbedBuffers,
@@ -289,8 +329,8 @@ pub fn run(
     inputs: &[&[u32]],
     pet: &mut dyn FnMut(),
 ) -> eyre::Result<(Vec<Vec<f32>>, EmbedTimings)> {
-    let r = run_inner(k, model, file, bufs, host, compute, copy, inputs, pet);
-    // Nothing may still be reading the slots or writing the loan.
+    let r = run_inner(k, g, model, file, bufs, host, compute, copy, inputs, pet);
+    // Nothing may still be reading the host buffers or writing the loan.
     let s1 = compute.synchronize();
     let s2 = copy.synchronize();
     let out = r?;
@@ -302,6 +342,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
     k: &Qwen3EmbedKernels,
+    g: &Q8_0MatvecWmma,
     model: &Qwen3EmbedModel,
     file: &MappedGguf,
     bufs: &mut EmbedBuffers,
@@ -313,14 +354,14 @@ fn run_inner(
 ) -> eyre::Result<(Vec<Vec<f32>>, EmbedTimings)> {
     let t0 = Instant::now();
     let c = &model.cfg;
-    let slot = &model.slot;
+    let layout = &model.layout;
     let d = c.n_embd;
     let mut tm = EmbedTimings::default();
     if inputs.is_empty() {
         return Ok((Vec::new(), tm));
     }
-    if host.iter().any(|h| h.len() < slot.bytes) {
-        return Err(eyre!("embed forward: pinned slots must hold {} B", slot.bytes));
+    if host.iter().any(|h| h.len() < layout.bytes) {
+        return Err(eyre!("embed forward: pinned buffers must hold {} B", layout.bytes));
     }
     // Pack the inputs.
     let mut starts = Vec::with_capacity(inputs.len());
@@ -340,7 +381,7 @@ fn run_inner(
         return Err(eyre!("embed forward: {t} tokens > the phase's {}", bufs.sizing.phase_tokens));
     }
     let tr = Instant::now();
-    let rows = model.token_rows(file, &ids)?;
+    let rows = model.token_rows(file, &ids, READERS)?;
     bufs.resid.slice_view_mut(0, t * d).copy_from_host(&rows)?;
     bufs.pos.slice_view_mut(0, t).copy_from_host(&pos)?;
     let last: Vec<u32> = starts.iter().zip(inputs).map(|(s, inp)| (s + inp.len() - 1) as u32).collect();
@@ -349,24 +390,24 @@ fn run_inner(
     drop(rows);
 
     let n_layer = c.n_layer;
-    let host_slots: [HostSlot; 2] = [
-        HostSlot(host[0].as_mut_slice().as_mut_ptr(), slot.bytes),
-        HostSlot(host[1].as_mut_slice().as_mut_ptr(), slot.bytes),
+    let host_bufs: [HostBuf; 2] = [
+        HostBuf(host[0].as_mut_slice().as_mut_ptr(), layout.bytes),
+        HostBuf(host[1].as_mut_slice().as_mut_ptr(), layout.bytes),
     ];
-    let [hs0, hs1] = host_slots;
+    let [hs0, hs1] = host_bufs;
     let h2d_done = [Event::new_no_timing()?, Event::new_no_timing()?];
     let comp_done = [Event::new_no_timing()?, Event::new_no_timing()?];
     let mut comp_recorded = [false, false];
 
     std::thread::scope(|scope| -> eyre::Result<()> {
-        let (job_tx, job_rx) = mpsc::channel::<(usize, HostSlot)>();
+        let (job_tx, job_rx) = mpsc::channel::<(usize, HostBuf)>();
         let (done_tx, done_rx) = mpsc::channel::<eyre::Result<(usize, f64)>>();
         scope.spawn(move || {
             for (l, hs) in job_rx {
                 let t = Instant::now();
-                // SAFETY: see `HostSlot`.
+                // SAFETY: see `HostBuf`.
                 let dst = unsafe { std::slice::from_raw_parts_mut(hs.0, hs.1) };
-                let r = model.read_layer_into(file, l, dst).map(|_| (l, t.elapsed().as_secs_f64() * 1e3));
+                let r = model.read_layer_into_par(file, l, dst, READERS).map(|_| (l, t.elapsed().as_secs_f64() * 1e3));
                 let failed = r.is_err();
                 if done_tx.send(r).is_err() || failed {
                     break;
@@ -375,7 +416,7 @@ fn run_inner(
         });
         let mut pending = [Some(hs0), Some(hs1)];
         for (l, p) in pending.iter_mut().enumerate().take(n_layer.min(2)) {
-            job_tx.send((l, p.take().expect("slot"))).map_err(|_| eyre!("embed reader exited"))?;
+            job_tx.send((l, p.take().expect("host buffer"))).map_err(|_| eyre!("embed reader exited"))?;
         }
         for l in 0..n_layer {
             let s = l % 2;
@@ -386,21 +427,23 @@ fn run_inner(
             }
             tm.wait_read_ms += tw.elapsed().as_secs_f64() * 1e3;
             tm.read_ms += ms;
-            // Ring slot `s` was last read by layer l - 2.
+            // Ring buffer `s` was last read by layer l - 2.
             if comp_recorded[s] {
                 copy.wait_event(&comp_done[s])?;
             }
-            bufs.ring[s].copy_from_host_async(&host[s].as_slice()[..slot.bytes], copy)?;
+            bufs.ring[s].copy_from_host_async(&host[s].as_slice()[..layout.bytes], copy)?;
             h2d_done[s].record(copy)?;
             compute.wait_event(&h2d_done[s])?;
             let w = bufs.ring[s].slice_view(0, bufs.ring[s].len());
-            layer(k, c, slot, &w, bufs, &starts, inputs, t, compute)?;
+            // GGUF Q8_0 blocks -> the split layout the GEMM reads, in place.
+            k.repack_layer(compute, c, layout, &w)?;
+            layer(k, g, c, layout, &w, bufs, &starts, inputs, t, compute)?;
             comp_done[s].record(compute)?;
             comp_recorded[s] = true;
             if l + 2 < n_layer {
-                // The host slot is free once its H2D is done.
+                // The host buffer is free once its H2D is done.
                 h2d_done[s].synchronize()?;
-                let hs = HostSlot(host[s].as_mut_slice().as_mut_ptr(), slot.bytes);
+                let hs = HostBuf(host[s].as_mut_slice().as_mut_ptr(), layout.bytes);
                 job_tx.send((l + 2, hs)).map_err(|_| eyre!("embed reader exited"))?;
             }
             pet();
@@ -434,8 +477,9 @@ fn run_inner(
 #[allow(clippy::too_many_arguments)]
 fn layer(
     k: &Qwen3EmbedKernels,
+    g: &Q8_0MatvecWmma,
     c: &Qwen3EmbedConfig,
-    slot: &SlotLayout,
+    layout: &LayerLayout,
     w: &DeviceBuffer<u8>,
     bufs: &mut EmbedBuffers,
     starts: &[usize],
@@ -446,16 +490,16 @@ fn layer(
     let d = c.n_embd;
     let (qw, kvw, ff) = (c.q_width(), c.kv_width(), c.n_ff);
     let (ph, pa, pf) = (act_pitch(d), act_pitch(qw), act_pitch(ff));
-    // SAFETY: the slot offsets are SLOT_ALIGN (256 B) aligned and in range.
+    // SAFETY: the layout offsets are LAYOUT_ALIGN (256 B) aligned and in range.
     let f32v = |off: usize, n: usize| unsafe { w.view_as::<f32>(off, n) };
-    let attn_norm = f32v(slot.attn_norm, d);
-    let ffn_norm = f32v(slot.ffn_norm, d);
-    let q_norm = f32v(slot.q_norm, c.head_dim);
-    let k_norm = f32v(slot.k_norm, c.head_dim);
-    let w_qkv = w.slice_view(slot.q, slot.q_bytes + 2 * slot.kv_bytes);
-    let w_o = w.slice_view(slot.o, slot.o_bytes);
-    let w_gu = w.slice_view(slot.gate, 2 * slot.ff_bytes);
-    let w_down = w.slice_view(slot.down, slot.down_bytes);
+    let attn_norm = f32v(layout.attn_norm, d);
+    let ffn_norm = f32v(layout.ffn_norm, d);
+    let q_norm = f32v(layout.q_norm, c.head_dim);
+    let k_norm = f32v(layout.k_norm, c.head_dim);
+    let w_qkv = w.slice_view(layout.q, layout.q_bytes + 2 * layout.kv_bytes);
+    let w_o = w.slice_view(layout.o, layout.o_bytes);
+    let w_gu = w.slice_view(layout.gate, 2 * layout.ff_bytes);
+    let w_down = w.slice_view(layout.down, layout.down_bytes);
     let scale = 1.0 / (c.head_dim as f32).sqrt();
     let sub = bufs.sizing.sub_rows;
     let mut seg = 0usize; // first input that may overlap the sub-batch
@@ -466,7 +510,7 @@ fn layer(
         let mut resid = bufs.resid.slice_view_mut(r0 * d, rows * d);
         // Attention block.
         k.rmsnorm_f16(st, &mut bufs.x16, ph as u32, &resid, &attn_norm, d as u32, c.eps, rows as u32)?;
-        k.gemm(st, &mut bufs.gemm_out, &w_qkv, &bufs.x16, d, c.qkv_rows(), rows, ph)?;
+        gemm(g, st, &mut bufs.gemm_out, &w_qkv, &bufs.x16, d, c.qkv_rows(), rows, ph)?;
         let pos = bufs.pos.slice_view(r0, rows);
         k.qk_norm_rope(st, c, &bufs.gemm_out, &mut bufs.q16, &mut bufs.kc, &mut bufs.vc, &q_norm, &k_norm, &pos, r0 as u32, rows as u32)?;
         while seg < inputs.len() && starts[seg] + inputs[seg].len() <= r0 {
@@ -487,13 +531,13 @@ fn layer(
             s += 1;
         }
         k.cast_f16(st, &mut bufs.x16, pa as u32, &bufs.attn_out, qw as u32, rows as u32)?;
-        k.gemm(st, &mut bufs.gemm_out, &w_o, &bufs.x16, qw, d, rows, pa)?;
+        gemm(g, st, &mut bufs.gemm_out, &w_o, &bufs.x16, qw, d, rows, pa)?;
         k.add(st, &mut resid, &bufs.gemm_out, (rows * d) as u32)?;
         // FFN block.
         k.rmsnorm_f16(st, &mut bufs.x16, ph as u32, &resid, &ffn_norm, d as u32, c.eps, rows as u32)?;
-        k.gemm(st, &mut bufs.gemm_out, &w_gu, &bufs.x16, d, 2 * ff, rows, ph)?;
+        gemm(g, st, &mut bufs.gemm_out, &w_gu, &bufs.x16, d, 2 * ff, rows, ph)?;
         k.swiglu_f16(st, &mut bufs.x16, pf as u32, &bufs.gemm_out, ff as u32, rows as u32)?;
-        k.gemm(st, &mut bufs.gemm_out, &w_down, &bufs.x16, ff, d, rows, pf)?;
+        gemm(g, st, &mut bufs.gemm_out, &w_down, &bufs.x16, ff, d, rows, pf)?;
         k.add(st, &mut resid, &bufs.gemm_out, (rows * d) as u32)?;
         r0 = r1;
     }
@@ -519,11 +563,11 @@ mod tests {
             n_layer: 36, n_embd: 2560, n_ff: 9728, n_head: 32, n_kv_head: 8, head_dim: 128,
             n_vocab: 151_665, rope_theta: 1e6, eps: 1e-6, n_ctx_train: 40960,
         };
-        let slot = SlotLayout::new(&cfg);
+        let layout = LayerLayout::new(&cfg);
         let s = EmbedSizing { phase_tokens: 16384, sub_rows: 1024 };
-        let total = s.total_bytes(&cfg, &slot);
+        let total = s.total_bytes(&cfg, &layout);
         assert!((560_000_000..600_000_000).contains(&total), "{total}");
-        assert_eq!(s.buffer_sizes(&cfg, &slot).len(), BUFFERS.len());
+        assert_eq!(s.buffer_sizes(&cfg, &layout).len(), BUFFERS.len());
     }
 
     #[test]

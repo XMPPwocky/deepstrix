@@ -7,7 +7,7 @@ use super::evtrace::Kind;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Every hub/box-2 kind (added to `evtrace`'s header list).
-pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE];
+pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED];
 
 // ---- hub: step context for per-request records ----
 
@@ -277,3 +277,17 @@ pub static B2_READ: Kind = Kind {
 
 /// One reply written on box 2 (writer thread): `t3` stamp and `write()` end.
 pub static B2_WRITE: Kind = Kind { id: 23, name: "b2_write", fields: &["seq", "t3", "t_written", "bytes"] };
+
+/// One hub embed phase (docs/v41/EMBED_PHASE_DESIGN.md), emitted when it ends.
+/// `wait_ms`: the oldest input's queue time; `rows_ms`: token-embedding rows;
+/// `read_ms`: the weight reader's pread time; `wait_read_ms`: the engine thread
+/// waiting for it; `fwd_ms`: the whole forward; `return_ms` / `verify_ms`: the
+/// loan's return (verify included in return); `pinned_ms`: pinned-slot alloc.
+pub static HUB_EMBED: Kind = Kind {
+    id: 24,
+    name: "hub_embed",
+    fields: &[
+        "t", "jobs", "inputs", "tokens", "loan_bytes", "wait_ms", "rows_ms", "read_ms", "wait_read_ms",
+        "fwd_ms", "return_ms", "verify_ms", "pinned_ms", "total_ms", "live", "prefills", "ok",
+    ],
+};

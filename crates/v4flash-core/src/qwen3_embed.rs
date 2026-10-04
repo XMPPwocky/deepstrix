@@ -4,8 +4,8 @@
 //! oracle for the GPU path.
 //!
 //! The weights are never resident: a phase streams one layer at a time out of
-//! the GGUF ([`Qwen3EmbedModel::read_layer_into`]) into a weight-ring slot laid
-//! out by [`SlotLayout`]. Only `output_norm` (10 KB) is kept in host memory.
+//! the GGUF ([`Qwen3EmbedModel::read_layer_into`]) into a ring buffer laid
+//! out by [`LayerLayout`]. Only `output_norm` (10 KB) is kept in host memory.
 
 use std::collections::HashMap;
 
@@ -19,8 +19,11 @@ use crate::mapped::MappedGguf;
 /// is the embedding (last-token pooling).
 pub const EOS_TEXT: &str = "<|endoftext|>";
 
-/// Alignment of every tensor inside a ring slot (and of slot sizes).
-pub const SLOT_ALIGN: usize = 256;
+/// Alignment of every tensor inside a layer buffer (and of its size).
+pub const LAYOUT_ALIGN: usize = 256;
+
+/// Smallest piece one reader thread preads (`read_layer_into_par`).
+pub const READ_PIECE: usize = 4 << 20;
 
 /// Q8_0: 32 weights in 34 bytes.
 const Q8_0_BLOCK_ELEMS: u64 = 32;
@@ -95,12 +98,12 @@ pub struct LayerLoc {
     pub k_norm: TensorLoc,
 }
 
-/// Byte offsets of one layer inside a weight-ring slot (design §5.2). Q8_0
+/// Byte offsets of one layer inside a ring buffer (design §5.2). Q8_0
 /// rows are independent, so q‖k‖v and gate‖up sit back to back and each pair
 /// (triple) is one GEMM: `qkv` = `q`, with `k` and `v` right after it;
 /// `gate_up` = `gate`, with `up` right after it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SlotLayout {
+pub struct LayerLayout {
     pub q: usize,
     pub k: usize,
     pub v: usize,
@@ -118,7 +121,7 @@ pub struct SlotLayout {
     pub o_bytes: usize,
     pub ff_bytes: usize,
     pub down_bytes: usize,
-    /// The whole slot, a multiple of [`SLOT_ALIGN`].
+    /// The whole layer buffer, a multiple of [`LAYOUT_ALIGN`].
     pub bytes: usize,
 }
 
@@ -130,7 +133,7 @@ fn q8_0_bytes(rows: usize, k: usize) -> usize {
     rows * (k / Q8_0_BLOCK_ELEMS as usize) * Q8_0_BLOCK_BYTES as usize
 }
 
-impl SlotLayout {
+impl LayerLayout {
     pub fn new(cfg: &Qwen3EmbedConfig) -> Self {
         let q_bytes = q8_0_bytes(cfg.q_width(), cfg.n_embd);
         let kv_bytes = q8_0_bytes(cfg.kv_width(), cfg.n_embd);
@@ -142,19 +145,19 @@ impl SlotLayout {
         let q = 0;
         let k = q + q_bytes;
         let v = k + kv_bytes;
-        let o = align_up(v + kv_bytes, SLOT_ALIGN);
-        let gate = align_up(o + o_bytes, SLOT_ALIGN);
+        let o = align_up(v + kv_bytes, LAYOUT_ALIGN);
+        let gate = align_up(o + o_bytes, LAYOUT_ALIGN);
         let up = gate + ff_bytes;
-        let down = align_up(up + ff_bytes, SLOT_ALIGN);
-        let attn_norm = align_up(down + down_bytes, SLOT_ALIGN);
-        let ffn_norm = align_up(attn_norm + cfg.n_embd * 4, SLOT_ALIGN);
-        let q_norm = align_up(ffn_norm + cfg.n_embd * 4, SLOT_ALIGN);
-        let k_norm = align_up(q_norm + cfg.head_dim * 4, SLOT_ALIGN);
-        let bytes = align_up(k_norm + cfg.head_dim * 4, SLOT_ALIGN);
-        SlotLayout { q, k, v, o, gate, up, down, attn_norm, ffn_norm, q_norm, k_norm, q_bytes, kv_bytes, o_bytes, ff_bytes, down_bytes, bytes }
+        let down = align_up(up + ff_bytes, LAYOUT_ALIGN);
+        let attn_norm = align_up(down + down_bytes, LAYOUT_ALIGN);
+        let ffn_norm = align_up(attn_norm + cfg.n_embd * 4, LAYOUT_ALIGN);
+        let q_norm = align_up(ffn_norm + cfg.n_embd * 4, LAYOUT_ALIGN);
+        let k_norm = align_up(q_norm + cfg.head_dim * 4, LAYOUT_ALIGN);
+        let bytes = align_up(k_norm + cfg.head_dim * 4, LAYOUT_ALIGN);
+        LayerLayout { q, k, v, o, gate, up, down, attn_norm, ffn_norm, q_norm, k_norm, q_bytes, kv_bytes, o_bytes, ff_bytes, down_bytes, bytes }
     }
 
-    /// Every tensor of `layer` with its offset in the slot.
+    /// Every tensor of `layer` with its offset in the layer buffer.
     pub fn placements<'a>(&self, layer: &'a LayerLoc) -> [(&'a TensorLoc, usize); 11] {
         [
             (&layer.q, self.q),
@@ -180,7 +183,7 @@ pub struct Qwen3EmbedModel {
     /// Bytes of one `token_embd` row.
     pub token_row_bytes: usize,
     pub output_norm: Vec<f32>,
-    pub slot: SlotLayout,
+    pub layout: LayerLayout,
     /// Id of [`EOS_TEXT`].
     pub eos_id: u32,
 }
@@ -295,26 +298,75 @@ impl Qwen3EmbedModel {
         let eos_id = vocab
             .lookup_token_id(EOS_TEXT)
             .ok_or_else(|| eyre!("qwen3 embed GGUF: vocab has no `{EOS_TEXT}`"))? as u32;
-        let slot = SlotLayout::new(&cfg);
-        Ok(Qwen3EmbedModel { cfg, layers, token_embd, token_row_bytes, output_norm, slot, eos_id })
+        let layout = LayerLayout::new(&cfg);
+        Ok(Qwen3EmbedModel { cfg, layers, token_embd, token_row_bytes, output_norm, layout, eos_id })
     }
 
-    /// Fill `dst` (at least `slot.bytes`) with layer `il`'s tensors at their
-    /// [`SlotLayout`] offsets. Each tensor is one pread (page cache dropped
+    /// Fill `dst` (at least `layout.bytes`) with layer `il`'s tensors at their
+    /// [`LayerLayout`] offsets. Each tensor is one pread (page cache dropped
     /// after, `MappedGguf::read_range_into`).
     pub fn read_layer_into(&self, file: &MappedGguf, il: usize, dst: &mut [u8]) -> eyre::Result<()> {
-        if dst.len() < self.slot.bytes {
-            return Err(eyre!("read_layer_into: slot buffer {} B < {}", dst.len(), self.slot.bytes));
+        self.read_layer_into_par(file, il, dst, 1)
+    }
+
+    /// [`Self::read_layer_into`] with `readers` threads, each tensor split
+    /// into pieces of at least [`READ_PIECE`]. The read is latency-bound
+    /// (dm-crypt): measured in-tree, one pread ~2.4-2.55 GB/s, four readers
+    /// 5.52 GB/s (`mapped.rs`, `het/weights.rs` fast load).
+    pub fn read_layer_into_par(&self, file: &MappedGguf, il: usize, dst: &mut [u8], readers: usize) -> eyre::Result<()> {
+        if dst.len() < self.layout.bytes {
+            return Err(eyre!("read_layer_into: layer buffer {} B < {}", dst.len(), self.layout.bytes));
         }
-        for (t, off) in self.slot.placements(&self.layers[il]) {
-            file.read_range_into(t.shard, t.offset, &mut dst[off..off + t.bytes as usize])?;
+        // (shard, file offset, dst offset, len): disjoint dst ranges.
+        let mut pieces: Vec<(usize, u64, usize, usize)> = Vec::new();
+        for (t, off) in self.layout.placements(&self.layers[il]) {
+            let n = t.bytes as usize;
+            let k = (n / READ_PIECE).clamp(1, readers.max(1));
+            let per = n.div_ceil(k);
+            let mut at = 0;
+            while at < n {
+                let len = per.min(n - at);
+                pieces.push((t.shard, t.offset + at as u64, off + at, len));
+                at += len;
+            }
         }
-        Ok(())
+        if readers <= 1 {
+            for (shard, foff, doff, len) in pieces {
+                file.read_range_into(shard, foff, &mut dst[doff..doff + len])?;
+            }
+            return Ok(());
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let base = dst.as_mut_ptr() as usize;
+        let err: std::sync::Mutex<Option<eyre::Report>> = std::sync::Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..readers {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(shard, foff, doff, len)) = pieces.get(i) else { break };
+                    // SAFETY: pieces are disjoint sub-ranges of `dst` (each
+                    // tensor's placement is disjoint, `LayerLayout`, and each
+                    // piece is a disjoint part of one placement), every piece
+                    // is taken by exactly one thread, and `dst` outlives the scope.
+                    let d = unsafe { std::slice::from_raw_parts_mut((base + doff) as *mut u8, len) };
+                    if let Err(e) = file.read_range_into(shard, foff, d) {
+                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                        break;
+                    }
+                });
+            }
+        });
+        match err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Token-embedding rows of `ids`, dequantized: `[ids.len(), n_embd]` f32.
-    /// Each distinct id is read once; runs of adjacent ids share one pread.
-    pub fn token_rows(&self, file: &MappedGguf, ids: &[u32]) -> eyre::Result<Vec<f32>> {
+    /// Each distinct id is read once; runs of adjacent ids share one pread;
+    /// the runs are read by `readers` threads (each a ~2.7 KB latency-bound
+    /// pread at Q8_0).
+    pub fn token_rows(&self, file: &MappedGguf, ids: &[u32], readers: usize) -> eyre::Result<Vec<f32>> {
         let n_embd = self.cfg.n_embd;
         let mut uniq: Vec<u32> = ids.to_vec();
         uniq.sort_unstable();
@@ -323,24 +375,50 @@ impl Qwen3EmbedModel {
             return Err(eyre!("token id {bad} out of range (vocab {})", self.cfg.n_vocab));
         }
         let rb = self.token_row_bytes;
-        let mut rows: HashMap<u32, usize> = HashMap::with_capacity(uniq.len());
-        let mut deq: Vec<f32> = Vec::with_capacity(uniq.len() * n_embd);
-        let mut buf: Vec<u8> = Vec::new();
+        // Runs of adjacent ids: [i, j) of `uniq`.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
         while i < uniq.len() {
             let mut j = i + 1;
             while j < uniq.len() && uniq[j] == uniq[j - 1] + 1 {
                 j += 1;
             }
-            buf.resize((j - i) * rb, 0);
-            let off = self.token_embd.offset + uniq[i] as u64 * rb as u64;
-            file.read_range_into(self.token_embd.shard, off, &mut buf)?;
-            for (k, id) in uniq[i..j].iter().enumerate() {
-                rows.insert(*id, deq.len() / n_embd);
-                dequant_to_f32(self.token_embd.dtype, &buf[k * rb..(k + 1) * rb], &mut deq)?;
-            }
+            runs.push((i, j));
             i = j;
         }
+        // Each thread dequantizes its runs into its own buffer, at the runs'
+        // positions in `uniq` order.
+        let readers = readers.clamp(1, runs.len().max(1));
+        let per = runs.len().div_ceil(readers);
+        let parts: Vec<eyre::Result<Vec<(usize, Vec<f32>)>>> = std::thread::scope(|s| {
+            let hs: Vec<_> = runs
+                .chunks(per.max(1))
+                .map(|chunk| {
+                    let uniq = &uniq;
+                    s.spawn(move || -> eyre::Result<Vec<(usize, Vec<f32>)>> {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        let mut buf: Vec<u8> = Vec::new();
+                        for &(i, j) in chunk {
+                            buf.resize((j - i) * rb, 0);
+                            let off = self.token_embd.offset + uniq[i] as u64 * rb as u64;
+                            file.read_range_into(self.token_embd.shard, off, &mut buf)?;
+                            let mut deq = Vec::with_capacity((j - i) * n_embd);
+                            dequant_to_f32(self.token_embd.dtype, &buf, &mut deq)?;
+                            out.push((i, deq));
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(eyre!("token row reader panicked")))).collect()
+        });
+        let mut deq = vec![0f32; uniq.len() * n_embd];
+        for p in parts {
+            for (i, rows) in p? {
+                deq[i * n_embd..i * n_embd + rows.len()].copy_from_slice(&rows);
+            }
+        }
+        let rows: HashMap<u32, usize> = uniq.iter().enumerate().map(|(k, id)| (*id, k)).collect();
         let mut out = Vec::with_capacity(ids.len() * n_embd);
         for id in ids {
             let r = rows[id];
@@ -492,7 +570,7 @@ pub fn cpu_forward(model: &Qwen3EmbedModel, file: &MappedGguf, inputs: &[Vec<u32
         starts.push(acc);
         acc += inp.len();
     }
-    let mut resid = model.token_rows(file, &ids)?;
+    let mut resid = model.token_rows(file, &ids, 4)?;
     let mut xn = vec![0f32; t * d];
     let scale = 1.0 / (hd as f32).sqrt();
     let group = c.n_head / c.n_kv_head;
@@ -725,11 +803,11 @@ mod tests {
         assert_eq!(m.cfg, testing::tiny_config());
         assert_eq!(m.eos_id, 256);
         assert_eq!(m.token_row_bytes, 256 / 32 * 34);
-        let s = &m.slot;
+        let s = &m.layout;
         assert_eq!(s.k, s.q + s.q_bytes);
         assert_eq!(s.v, s.k + s.kv_bytes);
         assert_eq!(s.up, s.gate + s.ff_bytes);
-        assert_eq!(s.bytes % SLOT_ALIGN, 0);
+        assert_eq!(s.bytes % LAYOUT_ALIGN, 0);
         // Placements never overlap.
         let mut spans: Vec<(usize, usize)> = s.placements(&m.layers[0]).iter().map(|(t, o)| (*o, o + t.bytes as usize)).collect();
         spans.sort();
@@ -740,32 +818,43 @@ mod tests {
     }
 
     #[test]
-    fn real_model_slot_size_matches_the_design() {
+    fn real_model_layer_size_matches_the_design() {
         let cfg = Qwen3EmbedConfig {
             n_layer: 36, n_embd: 2560, n_ff: 9728, n_head: 32, n_kv_head: 8, head_dim: 128,
             n_vocab: 151_665, rope_theta: 1e6, eps: 1e-6, n_ctx_train: 40960,
         };
-        let s = SlotLayout::new(&cfg);
+        let s = LayerLayout::new(&cfg);
         assert_eq!(s.q_bytes, 11_141_120);
         assert_eq!(s.kv_bytes, 2_785_280);
         assert_eq!(s.o_bytes, 11_141_120);
         assert_eq!(s.ff_bytes, 26_460_160);
         assert_eq!(s.down_bytes, 26_460_160);
         // 107,254,784 B of tensors (design §2) plus alignment padding.
-        assert!(s.bytes >= 107_254_784 && s.bytes < 107_254_784 + 8 * SLOT_ALIGN, "{}", s.bytes);
+        assert!(s.bytes >= 107_254_784 && s.bytes < 107_254_784 + 8 * LAYOUT_ALIGN, "{}", s.bytes);
     }
 
     #[test]
     fn layer_read_places_every_tensor() {
         let dir = tmpdir("read");
         let (f, m) = tiny(&dir, 11);
-        let mut slot = vec![0u8; m.slot.bytes];
-        m.read_layer_into(&f, 1, &mut slot).unwrap();
-        for (t, off) in m.slot.placements(&m.layers[1]) {
+        let mut buf = vec![0u8; m.layout.bytes];
+        m.read_layer_into(&f, 1, &mut buf).unwrap();
+        for (t, off) in m.layout.placements(&m.layers[1]) {
             let mut want = vec![0u8; t.bytes as usize];
             f.read_range_into(t.shard, t.offset, &mut want).unwrap();
-            assert_eq!(&slot[off..off + want.len()], &want[..], "{}", t.name);
+            assert_eq!(&buf[off..off + want.len()], &want[..], "{}", t.name);
         }
+    }
+
+    #[test]
+    fn parallel_layer_read_matches_serial() {
+        let dir = tmpdir("par");
+        let (f, m) = tiny(&dir, 19);
+        let mut a = vec![0u8; m.layout.bytes];
+        let mut b = vec![0u8; m.layout.bytes];
+        m.read_layer_into(&f, 0, &mut a).unwrap();
+        m.read_layer_into_par(&f, 0, &mut b, 4).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -773,7 +862,7 @@ mod tests {
         let dir = tmpdir("rows");
         let (f, m) = tiny(&dir, 13);
         let ids = [5u32, 6, 7, 5, 256, 0, 7];
-        let rows = m.token_rows(&f, &ids).unwrap();
+        let rows = m.token_rows(&f, &ids, 3).unwrap();
         let mut table = vec![0u8; m.token_embd.bytes as usize];
         f.read_range_into(m.token_embd.shard, m.token_embd.offset, &mut table).unwrap();
         let mut all = Vec::new();
@@ -782,7 +871,7 @@ mod tests {
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(&rows[i * d..(i + 1) * d], &all[*id as usize * d..(*id as usize + 1) * d]);
         }
-        assert!(m.token_rows(&f, &[257]).is_err());
+        assert!(m.token_rows(&f, &[257], 1).is_err());
     }
 
     #[test]

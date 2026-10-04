@@ -23,6 +23,7 @@ use v4flash_core::qwen3_embed::{cosine, cpu_forward, testing, Qwen3EmbedModel};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{Device, DeviceBuffer, PinnedBuffer, Stream};
 use v4flash_kernels::dgpu_loan::{Donor, Loan, LoanAlloc};
+use v4flash_kernels::q8_0::Q8_0MatvecWmma;
 use v4flash_kernels::qwen3_embed::{run, EmbedBuffers, EmbedSizing, Qwen3EmbedKernels};
 
 fn dgpu() -> eyre::Result<Device> {
@@ -45,14 +46,15 @@ fn tmp(tag: &str) -> PathBuf {
 fn gpu_embed(dev: Device, model: &Qwen3EmbedModel, file: &MappedGguf, inputs: &[Vec<u32>], sizing: EmbedSizing) -> eyre::Result<Vec<Vec<f32>>> {
     dev.set_current()?;
     let k = Qwen3EmbedKernels::for_arch("gfx1201")?;
-    let total = sizing.total_bytes(&model.cfg, &model.slot);
+    let total = sizing.total_bytes(&model.cfg, &model.layout);
     let backing = DeviceBuffer::<u8>::new(dev.id, total)?;
     let mut alloc = LoanAlloc::over(vec![backing.slice_view(0, total)]);
-    let mut bufs = EmbedBuffers::carve(&mut alloc, sizing, &model.cfg, &model.slot)?;
-    let mut host = [PinnedBuffer::<u8>::new(model.slot.bytes)?, PinnedBuffer::<u8>::new(model.slot.bytes)?];
+    let mut bufs = EmbedBuffers::carve(&mut alloc, sizing, &model.cfg, &model.layout)?;
+    let mut host = [PinnedBuffer::<u8>::new(model.layout.bytes)?, PinnedBuffer::<u8>::new(model.layout.bytes)?];
     let (compute, copy) = (Stream::new(dev.id)?, Stream::new(dev.id)?);
     let refs: Vec<&[u32]> = inputs.iter().map(|v| v.as_slice()).collect();
-    let (last, tm) = run(&k, model, file, &mut bufs, &mut host, &compute, &copy, &refs, &mut || {})?;
+    let g = Q8_0MatvecWmma::for_arch("gfx1201")?;
+    let (last, tm) = run(&k, &g, model, file, &mut bufs, &mut host, &compute, &copy, &refs, &mut || {})?;
     eprintln!("gpu forward: {tm:?}");
     drop(backing);
     Ok(last.iter().map(|r| model.finish(r, None)).collect())
@@ -136,7 +138,7 @@ fn loan_round_trip() -> eyre::Result<()> {
     let file = MappedGguf::open(&p)?;
     let model = Qwen3EmbedModel::from_gguf(&file)?;
     let sizing = EmbedSizing { phase_tokens: 128, sub_rows: 16 };
-    let sizes: Vec<usize> = sizing.buffer_sizes(&model.cfg, &model.slot).iter().map(|(_, b)| *b).collect();
+    let sizes: Vec<usize> = sizing.buffer_sizes(&model.cfg, &model.layout).iter().map(|(_, b)| *b).collect();
     // Two donors with a recognizable pattern; the first is too small for the
     // ring slots, so placement must spill into the second.
     let mk = |n: usize, salt: u8| -> eyre::Result<(DeviceBuffer<u8>, Vec<u8>)> {
@@ -146,24 +148,25 @@ fn loan_round_trip() -> eyre::Result<()> {
         Ok((b, pat))
     };
     let (d0, p0) = mk(64 * 1024, 3)?;
-    let (d1, p1) = mk(sizing.total_bytes(&model.cfg, &model.slot) + (1 << 20), 5)?;
+    let (d1, p1) = mk(sizing.total_bytes(&model.cfg, &model.layout) + (1 << 20), 5)?;
     let donors = vec![
         Donor { name: "d0".into(), view: d0.slice_view(0, d0.len()) },
         Donor { name: "d1".into(), view: d1.slice_view(0, d1.len()) },
     ];
     let image = tmp("loan").join("embed-loan.img");
-    let mut loan = Loan::new(donors, &sizes, image, 1 << 20)?;
+    let mut loan = Loan::new(donors, &sizes, image, 1 << 20, 64 * 1024)?;
     eprintln!("donors {:?}", loan.donor_summary());
     let stream = Stream::new(dev.id)?;
     loan.write_image(&stream)?;
     let mut alloc = loan.allocator()?;
-    let mut bufs = EmbedBuffers::carve(&mut alloc, sizing, &model.cfg, &model.slot)?;
+    let mut bufs = EmbedBuffers::carve(&mut alloc, sizing, &model.cfg, &model.layout)?;
     let k = Qwen3EmbedKernels::for_arch("gfx1201")?;
-    let mut host = [PinnedBuffer::<u8>::new(model.slot.bytes.max(1 << 20))?, PinnedBuffer::<u8>::new(model.slot.bytes.max(1 << 20))?];
+    let mut host = [PinnedBuffer::<u8>::new(model.layout.bytes.max(1 << 20))?, PinnedBuffer::<u8>::new(model.layout.bytes.max(1 << 20))?];
     let (compute, copy) = (Stream::new(dev.id)?, Stream::new(dev.id)?);
     let inputs: Vec<Vec<u32>> = vec![(1..40).chain([model.eos_id]).collect()];
     let refs: Vec<&[u32]> = inputs.iter().map(|v| v.as_slice()).collect();
-    run(&k, &model, &file, &mut bufs, &mut host, &compute, &copy, &refs, &mut || {})?;
+    let g = Q8_0MatvecWmma::for_arch("gfx1201")?;
+    run(&k, &g, &model, &file, &mut bufs, &mut host, &compute, &copy, &refs, &mut || {})?;
     // The forward clobbered the donors ...
     let mut now1 = vec![0u8; d1.len()];
     d1.copy_to_host(&mut now1)?;
@@ -178,5 +181,28 @@ fn loan_round_trip() -> eyre::Result<()> {
     assert_eq!(back0, p0);
     assert_eq!(back1, p1);
     assert_eq!(st.retried, 0);
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn repack_matches_host() -> eyre::Result<()> {
+    let dev = dgpu()?;
+    dev.set_current()?;
+    let k = Qwen3EmbedKernels::for_arch("gfx1201")?;
+    let stream = Stream::new(dev.id)?;
+    // Qwen3-Embedding-4B's row widths: K 2560 / 4096 / 9728.
+    for (rows, blocks) in [(7usize, 80usize), (3, 128), (5, 304)] {
+        let n = rows * blocks * 34;
+        let src: Vec<u8> = (0..n).map(|i| (i as u32).wrapping_mul(2_654_435_761).rotate_left(7) as u8).collect();
+        let want = v4flash_kernels::weights::repack_q8_0(&src, rows, blocks);
+        let mut d = DeviceBuffer::<u8>::new(dev.id, n)?;
+        d.copy_from_host(&src)?;
+        k.repack_q8_0_rows(&stream, &mut d, rows, blocks)?;
+        stream.synchronize()?;
+        let mut got = vec![0u8; n];
+        d.copy_to_host(&mut got)?;
+        assert_eq!(got, want, "rows {rows} blocks {blocks}");
+    }
     Ok(())
 }

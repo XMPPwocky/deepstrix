@@ -114,6 +114,11 @@ impl MappedGguf {
         &self.path
     }
 
+    /// [`Gguf::drop_metadata`] on the parsed header.
+    pub fn drop_metadata(&mut self) {
+        self.gguf.drop_metadata();
+    }
+
     pub fn gguf(&self) -> &Gguf {
         &self.gguf
     }
