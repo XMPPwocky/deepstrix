@@ -10,21 +10,21 @@ drafter	canonical	-	*	drafter / dspark	\b\w*(?:drafter|Drafter|DRAFTER|dspark|Ds
 drafter	alias	distinct	*	mtp	\b\w*(?:mtp|Mtp|MTP)\w*\b
 indexer	canonical	-	*	V41_INDEXER_*	\bV41_INDEXER_\w+
 indexer	alias	distinct	*	V41_INDEX_* / V41_IDX_*	\bV41_(?:INDEX|IDX)_\w+
-raw window	canonical	-	*	raw window	\b\w*(?:raw_window|RawWindow)\w*\b
+raw window	canonical	-	*	RawWindow (the bare `raw_window` is the V4 image window until it is deleted)	\bRawWindow\w*\b
 raw window	alias	distinct	*	decoder ring (a decoder layer's raw window)	\b\w*(?:decoder_rings?|DecoderRings?)\w*\b
 dtype	pending	-	*	GgufType (the dtype enum of a safetensors model)	\bGgufType\b
 # ---- work: request, stream, row, step ----
 request	canonical	-	*	RequestId	\b(?:RequestId|request_id)\b
 stream	canonical	-	*	StreamId	\b(?:StreamId|stream_id)\w*\b
-stream	alias	distinct	kv_arena\.rs|multistream\.rs|ms_dspark\.rs|step_rows\.rs|spec_sample\.rs	slot (as stream id or append row, scheduler/arena files)	\b\w*(?:slot|Slot|SLOT)\w*\b
+stream	alias	distinct	kv_arena\.rs|multistream\.rs|ms_dspark\.rs|step_rows\.rs|spec_sample\.rs	slot outside the pools (stream id, append row, block base, capacity; arena/scheduler files)	\b\w*(?:slot|Slot|SLOT)\w*\b
 step	alias	occ	*	request shape as a literal (b > 16, prefill_shaped)	\bprefill_shaped\b|\bb\s*>\s*16\b
 step	canonical	-	*	RequestShape	\bRequestShape\b
-batched layer	alias	distinct	*	_v2 with no v1	\b\w+_v2\b
+batched layer	alias	distinct	*	_v2 declared (fn/struct/enum/const/static/type)	\b(?:fn|struct|enum|const|static|type)\s+\w+_v2\b
 lane	canonical	-	*	LaneCtl / LanePlan	\b(?:LaneCtl|LanePlan)\b
 lane	alias	distinct	*	lane by letter or t1/t2	\b(?:sync_events_t[12]|bd_[abc])\b
 # ---- placement: which box / device computes a pick ----
 placement	canonical	-	*	advertises / accepts / home / PlacedPicks	\b(?:advertises|accepts|home_of|PlacedPicks)\b
-placement	alias	distinct	*	owns	\b(?:\w+_)?owns(?:_\w+)?\b
+placement	alias	distinct	*	owns	\b(?!(?:lh_owns|_t_owns|owns_ms|owns_index_k)\b)(?:\w+_)?owns(?:_\w+)?\b
 placement	alias	distinct	*	T2 (tier 2 = box 2)	\b(?:V41_T2_\w+|t2_partition\w*|T2_\w+)\b
 placement	alias	distinct	*	partition_box2	\b\w*partition_box2\w*\b
 machines	pending	-	*	het (engine module / types)	\b(?:Het[A-Z]\w*|het::\w+)\b
@@ -43,12 +43,12 @@ history	pending	-	*	v4flash crate names	\bv4flash[_-]\w+
 history	alias	distinct	*	milestone code inside an identifier	\b\w*_(?:M[0-9]{2}|S2|G5[a-z])(?:_\w*)?\b
 # ---- homonyms (reported, never enforced; the glossary says which sense is canonical) ----
 homonyms	homonym	-	*	slot	\b\w*(?:slot|Slot|SLOT)\w*\b
-homonyms	homonym	-	*	stream	\b\w*(?:stream|Stream|STREAM)\w*\b
+homonyms	homonym	-	^(?!crates/v4flash-hip/)	stream (outside the HIP crate)	\b\w*(?:stream|Stream|STREAM)\w*\b
 homonyms	homonym	-	*	seq	\bseq\b
 homonyms	homonym	-	*	ring	\b(?:\w+_)?(?:ring|rings|RING|RINGS)(?:_\w+)?\b|\b\w*Rings?[A-Z]?\w*\b
 homonyms	homonym	-	*	prefill	\b\w*(?:prefill|Prefill|PREFILL)\w*\b
 homonyms	homonym	-	*	phase	\b\w*(?:phase|Phase|PHASE)\w*\b
-homonyms	homonym	-	*	pin	\b(?:\w+_)?(?:pin|pins|pinned|PIN|PINS|PINNED)(?:_\w+)?\b|\b\w*(?:Pin|Pinned)[A-Z]\w*\b
+homonyms	homonym	-	*	pin	\b(?:\w+_)?(?:pin|pins|pinned|PIN|PINS|PINNED)(?:_\w+)?\b|\b\w*(?:Pins?|Pinned)(?:[A-Z]\w*)?\b
 homonyms	homonym	-	*	mirror	\b\w*(?:mirror|Mirror|MIRROR)\w*\b
 homonyms	homonym	-	*	hot	\b(?:\w+_)?(?:hot|HOT)(?:_\w+)?\b|\bHot[A-Z]\w*\b
 homonyms	homonym	-	*	split	\b(?!(?:split|split_at\w*|split_whitespace|split_once|split_off|splitn|rsplit\w*|split_terminator|split_inclusive)\b)\w*(?:split|Split|SPLIT)\w*\b
@@ -58,3 +58,6 @@ homonyms	homonym	-	*	admit	\b\w*(?:admit|Admit|ADMIT)\w*\b
 homonyms	homonym	-	*	restore	\b\w*(?:restore|Restore|RESTORE)\w*\b
 homonyms	homonym	-	*	remote	\b\w*(?:remote|Remote|REMOTE)\w*\b
 homonyms	homonym	-	*	prefetch	\b\w*(?:prefetch|Prefetch|PREFETCH)\w*\b
+homonyms	homonym	-	*	tier	\b\w*(?:tier|Tier|TIER)\w*\b
+homonyms	homonym	-	*	region	\b\w*(?:region|Region|REGION)\w*\b
+homonyms	homonym	-	*	dense	\b\w*(?:dense|Dense|DENSE)\w*\b
