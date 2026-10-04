@@ -5,6 +5,11 @@
 //! TWO slots' rings swapped into one `MtpState` by pointer, as `MsDspark::with_ring` does. Every
 //! drafter output (`h` after `forward`) and both slots' final ring bytes must be bit-identical.
 //!
+//! Second gate (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 5, two speculating streams draft one after
+//! the other through ONE `MtpState`): each slot's script run ALONE (a fresh state, the other
+//! slot's steps skipped) must give that slot's drafter outputs and ring bytes of the interleaved
+//! run bit for bit -- no state of one slot's draft reaches the next slot's.
+//!
 //! Loads the drafter only (iGPU, ~8.7 GB): hub DOWN. Run:
 //! ```text
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels \
@@ -51,8 +56,12 @@ struct Slot {
     pending: bool,
 }
 
-/// One arm: the scripted sequence; returns every drafter output and both rings' bytes.
-fn run(e: &DeviceEngine, w: &MtpWeights, dev: &Device, asynchronous: bool) -> eyre::Result<(Vec<Vec<f32>>, Vec<Vec<u16>>)> {
+/// Every drafter output, tagged with its slot.
+type Outs = Vec<(usize, Vec<f32>)>;
+
+/// One arm: the scripted sequence (only `only`'s steps when set); returns every
+/// drafter output and each slot's ring bytes.
+fn run(e: &DeviceEngine, w: &MtpWeights, dev: &Device, asynchronous: bool, only: Option<usize>) -> eyre::Result<(Outs, Vec<Vec<Vec<u16>>>)> {
     let k = MTP_SRC_LAYERS.len() * v4flash_kernels::config::N_EMBD as usize;
     let rope = mtp_rope();
     let mut st = MtpState::alloc(dev.id)?;
@@ -92,6 +101,9 @@ fn run(e: &DeviceEngine, w: &MtpWeights, dev: &Device, asynchronous: bool) -> ey
         (1, 2, true), (0, 4, true), (1, 7, true), (0, 2, false), (1, 3, false), (0, 5, true), (1, 4, true),
     ];
     for (step, &(si, r, draft)) in script.iter().enumerate() {
+        if only.is_some_and(|o| o != si) {
+            continue;
+        }
         settle(&mut slots)?; // as `keep_rows` does before its blocking upload
         let hidden = rows(100 + step as u64, r, k);
         {
@@ -123,17 +135,19 @@ fn run(e: &DeviceEngine, w: &MtpWeights, dev: &Device, asynchronous: bool) -> ey
             std::mem::swap(&mut st.rings, &mut s.rings);
             let mut h = vec![0f32; st.h.len()];
             st.h.copy_to_host(&mut h)?;
-            outs.push(h);
+            outs.push((si, h));
         }
     }
     settle(&mut slots)?;
     let mut rings = Vec::new();
     for s in &slots {
+        let mut per = Vec::new();
         for r in &s.rings {
             let mut v = vec![0u16; r.len()];
             r.copy_to_host(&mut v)?;
-            rings.push(v);
+            per.push(v);
         }
+        rings.push(per);
     }
     Ok((outs, rings))
 }
@@ -149,13 +163,30 @@ fn async_ring_writes_match_synchronous() -> eyre::Result<()> {
     let arch = dev.properties()?.gcn_arch_name;
     let e = DeviceEngine::for_arch(dev, &arch)?;
     let w = MtpWeights::load(&hf, dev, 40)?;
-    let (h_sync, ring_sync) = run(&e, &w, &dev, false)?;
-    let (h_async, ring_async) = run(&e, &w, &dev, true)?;
-    let h_diff = h_sync.iter().zip(&h_async).filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.to_bits() != y.to_bits())).count();
-    let r_diff = ring_sync.iter().zip(&ring_async).filter(|(a, b)| a != b).count();
-    println!("mtp ring async: {} drafter outputs, {h_diff} differ; {} ring buffers, {r_diff} differ", h_sync.len(), ring_sync.len());
+    let (h_sync, ring_sync) = run(&e, &w, &dev, false, None)?;
+    let (h_async, ring_async) = run(&e, &w, &dev, true, None)?;
+    let same = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    let h_diff = h_sync.iter().zip(&h_async).filter(|(a, b)| a.0 != b.0 || !same(&a.1, &b.1)).count();
+    let r_diff = ring_sync.iter().flatten().zip(ring_async.iter().flatten()).filter(|(a, b)| a != b).count();
+    println!("mtp ring async: {} drafter outputs, {h_diff} differ; {} ring buffers, {r_diff} differ", h_sync.len(), ring_sync.iter().flatten().count());
     if h_diff > 0 || r_diff > 0 {
         return Err(eyre!("async ring writes are not bit-identical to synchronous ones ({h_diff} outputs, {r_diff} rings)"));
+    }
+    // Isolation: each slot alone == its part of the interleaved run.
+    let (mut iso_h, mut iso_r, mut iso_n) = (0usize, 0usize, 0usize);
+    for slot in 0..2 {
+        let (h_alone, ring_alone) = run(&e, &w, &dev, true, Some(slot))?;
+        let mine: Vec<&Vec<f32>> = h_async.iter().filter(|o| o.0 == slot).map(|o| &o.1).collect();
+        if mine.len() != h_alone.len() {
+            return Err(eyre!("slot {slot}: {} drafts interleaved vs {} alone", mine.len(), h_alone.len()));
+        }
+        iso_n += mine.len();
+        iso_h += mine.iter().zip(&h_alone).filter(|(a, b)| !same(a, &b.1)).count();
+        iso_r += ring_async[slot].iter().zip(&ring_alone[slot]).filter(|(a, b)| a != b).count();
+    }
+    println!("mtp drafter isolation: {iso_n} drafts, {iso_h} differ from the slot drafting alone; {iso_r} ring buffers differ");
+    if iso_h > 0 || iso_r > 0 {
+        return Err(eyre!("a slot's draft depends on the other slot's drafts through the shared MtpState ({iso_h} outputs, {iso_r} rings)"));
     }
     Ok(())
 }

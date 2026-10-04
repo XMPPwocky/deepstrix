@@ -284,10 +284,14 @@ fn multi_tables(m: usize) -> LaneTables {
     )
 }
 
+/// The most live streams that may ever draft together (the knob's ceiling;
+/// owner: more than two is not worth it).
+pub const MAX_SPEC_STREAMS: usize = 2;
+
 /// `V41_MS_DSPARK_STREAMS`: the most live streams that may all draft in one
 /// step (1 = a lone stream only, today's rule).
 pub fn spec_streams() -> usize {
-    crate::knobs::MS_DSPARK_STREAMS.usize().clamp(1, 2)
+    crate::knobs::MS_DSPARK_STREAMS.usize().clamp(1, MAX_SPEC_STREAMS)
 }
 
 impl MsDspark {

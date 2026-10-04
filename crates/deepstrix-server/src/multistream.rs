@@ -2292,8 +2292,12 @@ impl Sched {
             // draft-or-not gate took while backing off; the next probe drafted
             // from that stale window, accepted less, and extended the back-off
             // (73% of lone steps plain). `solo` only skips the steps of more
-            // streams than may draft together (`V41_MS_DSPARK_STREAMS`).
-            let write = dsp.ring_all() || self.streams.len() <= spec_max;
+            // streams than may EVER draft together (`MAX_SPEC_STREAMS`, not the
+            // knob's current value): a live flip of `V41_MS_DSPARK_STREAMS`
+            // (the per-turn A/B) must find every stream's ring dense, or the
+            // knob-2 arm would draft from rings with the knob-1 steps missing
+            // (the 10-01 gap bug; review round 2).
+            let write = dsp.ring_all() || self.streams.len() <= ms_dspark::MAX_SPEC_STREAMS;
             for (i, s) in self.streams.iter().enumerate() {
                 if done.iter().any(|&(d, _)| d == i) {
                     continue;

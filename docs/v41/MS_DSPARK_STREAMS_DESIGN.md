@@ -265,7 +265,7 @@ the owner). A stream backing off beside a K = 5 block rides a ~100-120 ms step f
 
 ## 3. Knobs
 
-- `V41_MS_DSPARK_STREAMS` (live, 1..=2, default 1). 1 = today, bit for bit. Rollback of the POLICY
+- `V41_MS_DSPARK_STREAMS` (live, 1..=2, default 1). 1 = today's policy and outputs (under `V41_MS_DSPARK_RING=solo` it also ring-writes on 2-stream steps, async: drafter state only, so a live flip to 2 finds dense rings; review round 2 A1). Rollback of the POLICY
   = 1. Rolling back the StepRows refactor and the route-order fix needs a binary revert (they change
   no numerics: G5a-g gate them bit-exact).
 
@@ -396,3 +396,20 @@ except the route gate, the single MS_STAGGER read and the one-call tables in `_p
 - CR1-5 G5h silent with MS_STREAMS < 2: FIXED -- "G5h NOT RUN" is printed.
 - Also (self-review): exploration never draws a step with no drafts (it would be a plain step
   feeding `PlainLanes`, and its never-fed multi cell would hog the staleness draws).
+
+Code review round 2 (8a9a7ba; reviewer: APPROVE WITH CHANGES; the CR1 fixes confirmed, the
+timestamp-based analysis confirmed unbiased):
+
+- A1 rings under `RING=solo` (production) would leave knob-1 two-stream steps unwritten and bias
+  the A/B against knob 2: FIXED -- rings are written while live <= `MAX_SPEC_STREAMS` (2), the
+  knob's ceiling, in both arms (async, drafter state only).
+- A2 a run spanning a prefill burst: FIXED in the analysis (a run ends at an `ms.phase` line or a
+  gap over 1 s).
+- A3 the drafter-state gate: ADDED -- `mtp_ring_async` runs each slot's script alone and compares
+  that slot's drafter outputs and ring bytes with the interleaved run bit for bit. The exit
+  (head, markov, conf, q) keeps no state across drafts (`q.clear()`, conf reset and the markov rows
+  recomputed per draft, mtp.rs ~1992-2090); not GPU-gated.
+- W1 the e2e test hub would bind the production tailnet address: FIXED (`ADDR2=`).
+- W2 no trap: FIXED (an EXIT / INT / TERM / HUP trap relaunches OLD whenever the hub is down;
+  SIGKILL escalation when a hub does not stop). W3: the e2e is capped at 1500 s. W4: the deploy
+  marker carries the worktree's commit.
