@@ -4087,7 +4087,7 @@ fn finish_decode(
                 // DRAFT_CAP_ROWS rows per lane.
                 assert!(
                     lr < cap,
-                    "dspark accept: lane-local drafter_src row {lr} (global row {r}, lane cut {cut})                      >= MTP_CAP_ROWS {cap}"
+                    "dspark accept: lane-local drafter_src row {lr} (global row {r}, lane cut {cut})                      >= DRAFT_CAP_ROWS {cap}"
                 );
                 (buf, lr)
             };
