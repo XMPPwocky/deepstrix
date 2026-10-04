@@ -1,7 +1,7 @@
 # Arena stage graphs keyed by (stage, rows) only
 
-Status: DESIGN rev 3, 2026-10-04 (review round 1 NEEDS REWORK, round 2 APPROVE WITH CHANGES;
-dispositions in section 7).
+Status: DESIGN rev 3.1, 2026-10-04 -- APPROVED (review round 1 NEEDS REWORK, round 2 APPROVE
+WITH CHANGES, round 3 APPROVE; dispositions in section 7). Next: Step 0 (2.0) on the GPU.
 Branch `worktree-ms-dspark2` (on eb84ebb).
 
 ## 0. Problem
@@ -64,7 +64,9 @@ that replaced 3-5 of them saved 13-20 us per lane-layer (tests/bench_decode_late
    bit-exact and timed, with the canary log compiled in (null log pointer), VGPR/SGPR counts
    compared.
 5. The mechanism: one captured `_ind` graph replayed after storing entry A, then B, reproduces the
-   direct kernel on A, then on B.
+   direct kernel on A, then on B; and a capture of N launches has exactly N nodes (2.5's vetted
+   count assumes one kernel node per launch -- if ROCm added nodes, every capture would taint and
+   the design would silently run all-legacy).
 Go / no-go: per step, the added GPU time plus the host critical-path time <= 1% of `ms.step` p50
 (~80-160 writes per step at <= ~5 us GPU each); neither BLOCKS nor SERIALIZES; coherence clean;
 each twin bit-exact and within max(2%, 0.3 us) of its direct kernel. Otherwise the design stops
@@ -137,6 +139,13 @@ A WHITELIST, enforced at one choke point. During an indirect capture:
 - after `end_capture`, the graph's node count (`Graph::nodes()`, graph.rs:60) must equal the
   vetted count: an unconverted wrapper, a memcpy, a memset (`fill_zero_async`), a
   `write_value32`, a peer copy -- any node not vetted -- taints, without listing APIs.
+Converted wrappers, two rules. (a) Handed `Arg::Ctx` on an arm with no `_ind` twin (b > 8, the
+runtime `q8_0_gemv_bpack_warp8` under `V41_GEMV_TB=0`, `q8_0_quantize_f32` under
+`V41_Q8_QUANT_WAVE=0`), the wrapper launches the DIRECT kernel on the real buffer the `Arg`
+carries, unvetted: the capture taints and runs once, correctly (never `Err`, which would fail the
+step; never the slot address to a direct kernel, which would compute on garbage). (b) A converted
+wrapper whose operands are all whitelisted `Dev` vets and launches its direct kernel (the q_chain
+and output_proj quantizes on `sd`, forward_prefill.rs:5013, 7576).
 A tainted capture is instantiated and launched ONCE (its `_ind` nodes read the entry written
 before `begin_capture`, its direct nodes baked this lane-layer's pointers: this call is correct),
 pushed onto a per-step RETIRE list (dropping a `GraphExec` destroys it at once, graph.rs:164-168,
@@ -255,3 +264,11 @@ Review round 2 (reviewer: APPROVE WITH CHANGES):
 9. Step 0 measurements / thresholds: ACCEPTED (2.0).
 10. Gates for the new paths: ACCEPTED (3).
 11. `attn_meta_fill` precedent: cited (2.2).
+
+Review round 3 (reviewer: APPROVE):
+
+1. Fallback rule for converted wrappers: ADOPTED -- 2.5 rules (a) / (b).
+2. 1:1 launch-to-node mapping: ADOPTED -- Step 0 item 5 asserts it.
+3. `matvec_bpack_ind` ignored `V41_GEMV_TB`: FIXED in code -- routes through rule (a).
+4. Canary not yet in the twin: FIXED in code -- `ARENA_CTX_CANARY` in every twin (one extra
+   `const ArenaCtx* canary` argument, null in production; the log pointer lives in the entry).
