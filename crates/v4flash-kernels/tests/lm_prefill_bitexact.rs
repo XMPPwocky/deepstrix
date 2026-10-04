@@ -279,9 +279,9 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
                 let eng: Vec<Vec<f32>> = rows.iter().map(|r| r[a * ein..z * ein].to_vec()).collect();
                 job.set_chunk_inputs(hcs[a..z].to_vec(), Some(eng));
             }
-            engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, st, &weights, Some(&mut *pg))?;
+            engine.prefill_job_unit(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, st, &weights, Some(&mut *pg))?;
             units += 1;
-            if foreign && !job.checkpoint_ok() {
+            if foreign && job.lm_window_open() {
                 // Mid-window: another sequence's one-token forward on the same lanes.
                 let t = synth_prompt(1000 + x_seq.len() as u64, 1)[0];
                 x_seq.push(t);
@@ -290,7 +290,7 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
                 let mut xj = PrefillJob::new(vec![t], vec![embed(t)?], Some(xr), None, pos as u32, 1024)?;
                 xj.set_layer_major_rows(0)?;
                 while !xj.chunks_done() {
-                    engine.prefill_job_chunk(&mut xj, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut x_state, &weights, Some(&mut *pg))?;
+                    engine.prefill_job_unit(&mut xj, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut x_state, &weights, Some(&mut *pg))?;
                 }
                 engine.prefill_job_finish(&mut xj, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut x_state, &weights, Some(&mut *pg))?;
                 x_state.restore_compressor_lending();

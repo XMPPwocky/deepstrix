@@ -347,7 +347,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             let rows: Vec<Vec<f32>> = rows_all.iter().map(|r| r[pos0 * ein..(pos0 + toks.len()) * ein].to_vec()).collect();
             let mut job = v4flash_kernels::het::forward_prefill::PrefillJob::new(toks.to_vec(), hcs, Some(rows), None, pos0 as u32, chunk)?;
             while !job.chunks_done() {
-                engine.prefill_job_chunk(&mut job, bd_a, bi_a, bd_b, bi_b, sd, si, ds, st, &weights, Some(pg))?;
+                engine.prefill_job_unit(&mut job, bd_a, bi_a, bd_b, bi_b, sd, si, ds, st, &weights, Some(pg))?;
             }
             let l = engine.prefill_job_finish(&mut job, bd_a, bi_a, bd_b, bi_b, sd, si, ds, st, &weights, Some(pg))?;
             st.restore_compressor_lending();
@@ -469,7 +469,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 let mut job = v4flash_kernels::het::forward_prefill::PrefillJob::new(toks.clone(), hcs.clone(), Some(rows.clone()), None, 0, cr)?;
                 let mut n_chunks = 0;
                 while !job.chunks_done() {
-                    engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st2, &weights, Some(&mut pg))?;
+                    engine.prefill_job_unit(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st2, &weights, Some(&mut pg))?;
                     n_chunks += 1;
                 }
                 let l = engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st2, &weights, Some(&mut pg))?;

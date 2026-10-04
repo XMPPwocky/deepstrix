@@ -530,7 +530,7 @@ fn v41_golden_gate() -> eyre::Result<()> {
                 } else {
                     let mut job = PrefillJob::new(prompt.to_vec(), hcs_prompt.clone(), Some(rows_prompt.clone()), None, 0, 1024)?;
                     while !job.chunks_done() {
-                        engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
+                        engine.prefill_job_unit(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
                     }
                     engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?
                 };

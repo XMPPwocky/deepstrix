@@ -139,8 +139,10 @@ struct Prefill {
     slot: u32,
     job: PrefillJob,
     kv: v4flash_kernels::het::HetModelState,
-    /// Tokens already in the scratch state (restored prefix), then the suffix.
-    prefix: Vec<i32>,
+    /// This prefill's tokens: the restored prefix already in the scratch state,
+    /// with the suffix appended once it is planned (`start_prefill`). Not "the
+    /// prefix" after that -- KNOWN_BUGS #42 keyed checkpoints as if it were.
+    tokens: Vec<i32>,
     compressed: Vec<i32>,
     started: Instant,
     /// Tower output for the request's images (empty when none): rows for
@@ -252,7 +254,8 @@ impl EngramAhead {
 struct PrefillDone {
     p: Pending,
     job: PrefillJob,
-    prefix: Vec<i32>,
+    /// The whole prompt (restored prefix + suffix).
+    tokens: Vec<i32>,
     compressed: Vec<i32>,
     started: Instant,
     prefilled_marker: Option<i32>,
@@ -1213,11 +1216,11 @@ impl Sched {
             Ok(v) => v,
             Err(e) => return Err((p, kv, e)),
         };
-        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, prefilled_marker, engram_ahead: EngramAhead::default() };
+        let mut pf = Prefill { p, slot, job, kv, tokens: prefix, compressed, started: t0, vl, prefilled_marker, engram_ahead: EngramAhead::default() };
         if prefilled_marker.is_some() {
             pf.p.trailing_marker = None; // consumed (`admit_stream` reads `prefilled_marker`)
         }
-        pf.prefix.extend_from_slice(&suffix);
+        pf.tokens.extend_from_slice(&suffix);
         Ok(pf)
     }
 
@@ -1232,7 +1235,7 @@ impl Sched {
         // window closes: alternating units between two jobs would make box 2's
         // pool hold both jobs' group unions at once, which is the paging the
         // window exists to avoid. Otherwise round-robin as before.
-        let i = match self.prefills.iter().position(|p| !p.job.checkpoint_ok()) {
+        let i = match self.prefills.iter().position(|p| p.job.lm_window_open()) {
             Some(j) => j,
             None => {
                 let i = self.rr % self.prefills.len();
@@ -1274,7 +1277,7 @@ impl Sched {
                     Err(e) => tracing::warn!(error = %e, "multistream: prefill cancelled; partial snapshot FAILED"),
                 }
             } else {
-                tracing::info!(done, total = pf.job.total(), lm_open = !pf.job.checkpoint_ok(), "multistream: prefill cancelled");
+                tracing::info!(done, total = pf.job.total(), lm_open = pf.job.lm_window_open(), "multistream: prefill cancelled");
             }
             let _ = self.arena.release(pf.slot);
             self.spare_states.push(pf.kv);
@@ -1325,7 +1328,7 @@ impl Sched {
                     }
                     _ => None,
                 };
-                let chunk = engine.prefill_job_chunk(job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut());
+                let chunk = engine.prefill_job_unit(job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut());
                 let gathered = g.map(|(a, z, h)| (a, z, h.join().unwrap_or_else(|_| Err(eyre!("engram look-ahead gather panicked")))));
                 (chunk, gathered)
             });
@@ -1384,7 +1387,7 @@ impl Sched {
         };
         if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), drafter.as_mut()) {
             let t = Instant::now();
-            let last = pf.prefix.len() as u32 - 1;
+            let last = pf.tokens.len() as u32 - 1;
             let seeded = dsp.reset(pf.slot).and_then(|()| {
                 let rows = ms_dspark::prefill_captures(&[&*bd_a, &*bd_b])?;
                 dsp.seed(engine, m, pf.slot, rows, last)
@@ -1401,7 +1404,7 @@ impl Sched {
         // Snapshot the prompt (the legacy path saves here too, before the marker).
         flush_expert_stats(state);
         if pf.prefilled_marker.is_none() {
-            let tokens_saved: Vec<i32> = pf.prefix.clone();
+            let tokens_saved: Vec<i32> = pf.tokens.clone();
             match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
                 state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, pf.p.session_id.as_deref())) {
                 Ok(entry) => {
@@ -1420,7 +1423,7 @@ impl Sched {
     /// that cannot hold even the first step and cannot grow parks the request
     /// (its scratch state stays with it) until a stream finishes.
     fn try_admit(&mut self, state: &mut WorkerState, mut pf: Prefill, logits: Vec<f32>) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
-        let pos = pf.prefix.len() as u32;
+        let pos = pf.tokens.len() as u32;
         let max_new = match effective_max_new(&pf.p.req, pos, state.n_kv_max) {
             Ok(m) => m,
             Err(e) => return Err((Some(pf.kv), e)),
@@ -1444,9 +1447,9 @@ impl Sched {
         }
         if let Err(e) = self.arena.fill_reserved(slot, &pf.kv, pos, &state.engine.dgpu.compute) { return Err((Some(pf.kv), e)); }
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
-        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, prefilled_marker, engram_ahead: _ } = pf;
+        let Prefill { p: pp, slot: _, job, kv: kv_done, tokens, compressed, started, vl: _, prefilled_marker, engram_ahead: _ } = pf;
         self.spare_states.push(kv_done);
-        let pf = PrefillDone { p: pp, job, prefix, compressed, started, prefilled_marker };
+        let pf = PrefillDone { p: pp, job, tokens, compressed, started, prefilled_marker };
         self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
     }
 
@@ -1458,10 +1461,10 @@ impl Sched {
         let mut rng = SamplerRng::new(pf.p.req.seed);
         let draft_rng = SamplerRng::new(pf.p.req.seed ^ 0xD5A9_C3E1_7B24_6F01);
         let mut s = Stream {
-            slot, tx: pf.p.tx.clone(), cancel: pf.p.cancel.clone(), next: 0, seq: pf.prefix.clone(), compressed: pf.compressed.clone(),
+            slot, tx: pf.p.tx.clone(), cancel: pf.p.cancel.clone(), next: 0, seq: pf.tokens.clone(), compressed: pf.compressed.clone(),
             prompt_tokens: pf.p.prompt_tokens, completion_tokens: 0, max_new: pf.p.req.max_new, sample_mode, rng, draft_rng,
             in_think: initial_in_think(pf.p.trailing_marker, pf.prefilled_marker), send_failures: 0, started: pf.started, session_id: pf.p.session_id.clone(),
-            ctx_full: pf.prefix.len() as u32 + pf.p.req.max_new as u32 + 2, stalled_since: None,
+            ctx_full: pf.tokens.len() as u32 + pf.p.req.max_new as u32 + 2, stalled_since: None,
         };
         // Ensure `compressed` covers `seq` (a marker forwarded in the prefill was hashed above).
         if let Some(ec) = state.engram.as_ref() {
@@ -1486,7 +1489,7 @@ impl Sched {
                 }
             }
         }
-        tracing::info!(slot, prompt = pf.prefix.len(), restored = pf.prefix.len() - pf.job.total(), prefill_ms = pf.started.elapsed().as_millis() as u64,
+        tracing::info!(slot, prompt = pf.tokens.len(), restored = pf.tokens.len() - pf.job.total(), prefill_ms = pf.started.elapsed().as_millis() as u64,
             lm_windows = pf.job.lm_windows_run(), reserved = self.arena.reserved_positions(slot), live = self.streams.len() + 1, "multistream: stream admitted");
         self.streams.push(s);
         Ok(())

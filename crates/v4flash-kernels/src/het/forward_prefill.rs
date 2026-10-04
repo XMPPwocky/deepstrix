@@ -866,7 +866,7 @@ pub struct PrefillJob {
     replay: std::collections::VecDeque<ReplayRow>,
     ced: bool,
     started: std::time::Instant,
-    /// Set by `prefill_job_chunk` after the last chunk when CED is off (the head
+    /// Set by `prefill_job_unit` after the last chunk when CED is off (the head
     /// is taken there); `prefill_job_finish` returns it.
     last_logits: Option<Vec<f32>>,
     /// Layer-major window rows (`V41_LM_ROWS` when `V41_LM_PREFILL=1` and CED is
@@ -880,7 +880,7 @@ pub struct PrefillJob {
     /// Layer-major windows this job has completed (tests assert it ran).
     lm_windows: usize,
     /// LAZY inputs: when `input_hcs` is empty the caller supplies the next
-    /// chunk's rows through `set_chunk_inputs` right before `prefill_job_chunk`
+    /// chunk's rows through `set_chunk_inputs` right before `prefill_job_unit`
     /// (embeddings + Engram rows for `next_chunk_range()` only). A 135K-token
     /// prompt's whole-prompt inputs are ~15 GB of host RAM and a 35 s Engram
     /// gather up front; per chunk they are ~60 MB and ~150 ms.
@@ -978,6 +978,10 @@ impl PrefillJob {
     /// its early groups then hold more rows than its late ones, so no prefix
     /// length describes the state. (`done_rows` is the last CLOSED window.)
     pub fn checkpoint_ok(&self) -> bool { self.lm.is_none() }
+    /// Is a layer-major window open (some of its units have run)? The exact
+    /// negation of [`Self::checkpoint_ok`], named for the question the
+    /// scheduler asks ("stick to this job").
+    pub fn lm_window_open(&self) -> bool { self.lm.is_some() }
     /// Is the open layer-major window part-way through a group with MoE layers
     /// (some of the group's sub-chunks run, some left)? The next unit then needs
     /// the box-2 experts the group's earlier units just paged, which a decode
@@ -999,7 +1003,7 @@ impl PrefillJob {
     /// True when `new` got no `input_hcs`: every chunk needs `set_chunk_inputs`.
     pub fn lazy_inputs(&self) -> bool { self.input_hcs.is_empty() }
     /// `[start, end)` token indices (into `tokens()`) of the chunk the next
-    /// `prefill_job_chunk` will run, given the lane capacities it will see.
+    /// `prefill_job_unit` will run, given the lane capacities it will see.
     pub fn next_chunk_range(&self, lane_caps: (usize, usize)) -> eyre::Result<(usize, usize)> {
         // Layer-major: inputs (embeddings, Engram rows) are consumed by the
         // group-0 unit of each sub-chunk only; every other unit takes none.
@@ -1302,7 +1306,7 @@ impl HeterogeneousEngine {
     /// one (group, sub-chunk) unit instead and returns the rows COMPLETED
     /// (non-zero only when a window closes).
     #[allow(clippy::too_many_arguments)]
-    pub fn prefill_job_chunk(
+    pub fn prefill_job_unit(
         &self,
         job: &mut PrefillJob,
         bd_a: &mut BatchDgpuScratch,
@@ -1334,12 +1338,12 @@ impl HeterogeneousEngine {
         let (lazy_hcs, lazy_engram) = match job.chunk_inputs.take() {
             Some((h, e)) => {
                 if h.len() != chunk_b || e.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() != chunk_b * ENGRAM_IN as usize)) {
-                    return Err(eyre!("prefill_job_chunk: chunk inputs for {} rows, chunk is {chunk_b}", h.len()));
+                    return Err(eyre!("prefill_job_unit: chunk inputs for {} rows, chunk is {chunk_b}", h.len()));
                 }
                 (Some(h), e)
             }
             None if job.lazy_inputs() => {
-                return Err(eyre!("prefill_job_chunk: lazy job has no inputs for chunk {} (set_chunk_inputs)", job.chunk_idx));
+                return Err(eyre!("prefill_job_unit: lazy job has no inputs for chunk {} (set_chunk_inputs)", job.chunk_idx));
             }
             None => (None, None),
         };
