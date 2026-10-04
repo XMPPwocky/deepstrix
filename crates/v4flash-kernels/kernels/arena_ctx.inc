@@ -33,10 +33,19 @@ static_assert(__builtin_offsetof(ArenaCanaryLog, rec) == 8, "ArenaCanaryLog::rec
 // pointer argument is the ADDRESS of its context slot (process-static, safe to bake into a
 // graph) and the prologue dereferences it. Thread-uniform, so the loads stay scalar. Resolve every
 // operand before any store.
+// A pointer read from memory has no known address space, so the body's loads and stores through
+// it would compile to FLAT instructions (Step 0, 2026-10-04: every global_load of the tB / mhc
+// bodies became flat_load, waits merged into s_wait_loadcnt_dscnt, gemv b=8 +8%). Every operand is
+// device global memory: the slot is read AS an address_space(1) pointer, so both incoming values of
+// the resolved pointer are casts from global and InferAddressSpaces gives the body the direct
+// kernel's global_* instructions. (Neither a generic -> global -> generic cast round trip, folded
+// away as a no-op pair, nor __builtin_assume(!is_shared / !is_private) survived to the backend.)
+template <typename P> struct ArenaCtxGlobal;
+template <typename U> struct ArenaCtxGlobal<U*> { typedef __attribute__((address_space(1))) U* type; };
 #define ARENA_CTX_DEREF(mask, i, T, ptr)                                                   \
     do {                                                                                   \
         if (((mask) >> (i)) & 1u) {                                                        \
-            (ptr) = *(T const*)(ptr);                                                      \
+            (ptr) = (T)(*(typename ArenaCtxGlobal<T>::type const*)(ptr));                  \
         }                                                                                  \
     } while (0)
 

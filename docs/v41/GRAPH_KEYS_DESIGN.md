@@ -73,6 +73,27 @@ Go / no-go: per step, the added GPU time plus the host critical-path time <= 1% 
 each twin bit-exact and within max(2%, 0.3 us) of its direct kernel. Otherwise the design stops
 and is revised.
 
+#### Step 0 run 1 (2026-10-04 22:07 UTC, 06bae25, hub down 57 s): NO-GO
+
+| item | result |
+|---|---|
+| 1 write cost (per write, amortized) | ctx_store +2.67 us GPU / +1.22 us host; H2D +3.18 / +1.04; WriteValue32 +5.68 / +1.64. Live `ms.step` at 2 rows / 2 lanes ~60 ms: 80-170 writes = 0.5-1% -- passes, not by much |
+| 2 BLOCKS | no (host time flat with the spin) |
+| 2 SERIALIZES | 80 back-to-back launches of ONE 8-node exec: 71.7 / 74.1 us vs distinct 67.0 / 65.5 us (+7% / +13%) -- FAIL as measured; production's pattern (a stage graph recurs every ~8 launches) not measured -> run 2 measures round-robin K = 1, 2, 4, 8, 80 |
+| 3 coherence | 10k rounds: 0 stale outputs, 0 wrong seq, 0 wrong resolved pointers |
+| 4 gemv twin | b=1 -1.6%, b=4 +5.7%, b=8 +8.0% (FAIL), bit-exact |
+| 4 mhc twin | +1.7 / +2.1 / +1.6% (b = 1 / 4 / 8; b=4 0.30 us vs a 0.30 us bar), bit-exact |
+| 5 mechanism, nodes | A then B bit-exact; 4 launches -> 4 nodes |
+
+Cause of item 4: the twins' body loads / stores compiled to FLAT (`flat_load`, waits merged into
+`s_wait_loadcnt_dscnt`; gemv tB8_ind 28 flat_load vs 0, mhc 348 vs 2): a pointer read from memory
+is generic. FIXED in `ARENA_CTX_DEREF` (2.3): the slot is read as an address_space(1) pointer, so
+both incoming values of the resolved pointer are casts from global; offline the twins' bodies now
+use exactly the direct kernels' global_load / global_store counts (tB8 27 / 8, mhc 344 / 48); only
+the canary's cold path stays FLAT. Two attempts that did NOT work (kept here to save the next
+person the time): a generic -> global -> generic cast round trip (folded away as a no-op pair) and
+`__builtin_assume(!is_shared / !is_private)` (gone before the backend). Run 2 re-times the twins.
+
 ### 2.1 Operands: `Arg` and a pointer-only context
 
 Wrappers take operands as `Arg::Dev(&buf)` (direct, today) or `Arg::Ctx(slot, &buf)` (read the

@@ -4,9 +4,10 @@
 //!  1. The context write, AMORTIZED (queue pre-filled behind a spin, N small enough for the AQL
 //!     ring): N x [nop; write; nop] for write = none / H2D from pinned / `arena_ctx_store` by
 //!     value / `hipStreamWriteValue32`; host enqueue time (mean, max) and GPU time per write.
-//!  2. 80 `hipGraphLaunch` of ONE 8-node executable vs 80 distinct executables behind a 5 ms and
-//!     a 50 ms spin. BLOCKS = the host enqueue time grows with the spin; SERIALIZES = GPU time
-//!     per launch of the one executable > 10% above the distinct executables'.
+//!  2. 80 `hipGraphLaunch` round-robin over K executables (K = 1 back to back, 2, 4, 8, 80 all
+//!     distinct), 1- and 8-node graphs, behind a 50 ms spin. BLOCKS = the host enqueue time grows
+//!     with the spin (5 vs 50 ms); SERIALIZES = GPU time per launch at production's pattern (K = 8,
+//!     8 nodes) > 10% above all-distinct.
 //!  3. COHERENCE: `arena_ctx_store` then a captured `_ind` graph reading the slot (operands on
 //!     every 64-B line of the entry), alternating entries, 10k rounds; every output and every
 //!     canary record (the seq and the operand pointers each launch resolved) checked.
@@ -284,51 +285,74 @@ fn graph_keys_step0() -> eyre::Result<()> {
         );
     }
 
-    // ---- 2. one executable re-launched 80x vs 80 executables ---------------------------
-    println!("== 2. 80 launches of an 8-node graph queued behind a 5 ms / 50 ms spin");
+    // ---- 2. re-launching executables that are still in flight ----------------------------
+    // Step 0 run 1 (2026-10-04): 80 BACK-TO-BACK launches of one 8-node executable cost +7..13% GPU
+    // time per launch vs 80 distinct executables. Production replays a stage graph only after the
+    // lane's other stages (~8 launches later), so: round-robin over K executables (K = 1 back to
+    // back ... 80 all distinct), 1- and 8-node graphs, median of 3. The 2.0 bar applies to
+    // production's pattern, K = 8.
+    println!("== 2. 80 launches round-robin over K executables behind a 50 ms spin (GPU us/launch, median [min..max] of 3)");
     let (rows, k) = (1280usize, 5120usize);
     let w = q8_weight(dev.id, rows, k, 1)?;
     let mut xq = up(dev.id, &lcg_bytes(2, 8 * k).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
     let mut xs = up(dev.id, &vec![0.01f32; 8 * (k / 32)])?;
     let mut out = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
-    // Eight kernel nodes, like a real stage (a 1-node graph could take a fast path).
-    let mut gemv = |s: &Stream| -> eyre::Result<()> {
-        for b in 1..=8u32 {
-            e.q8.matvec_bpack(s, &mut out, &w, &xq, &xs, rows as u32, k as u32, b)?;
+    // (host ms for the 80 launches, GPU us per launch, queue drained before the host finished)
+    let run = |execs: &[GraphExec], kk: usize, spin: f64| -> eyre::Result<(f64, f64, bool)> {
+        s.synchronize()?;
+        let (e0, e1) = (Event::new()?, Event::new()?);
+        e.q8.slack_probe_spin(&s, spin_ms(spin))?;
+        e0.record(&s)?;
+        let t = Instant::now();
+        for i in 0..80 {
+            execs[i % kk].launch(&s)?;
         }
-        Ok(())
+        let host_ms = t.elapsed().as_secs_f64() * 1e3;
+        let drained = e0.query()?;
+        e1.record(&s)?;
+        e1.synchronize()?;
+        Ok((host_ms, Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / 80.0, drained))
     };
-    let one = capture(&s, &mut gemv)?.1;
-    let many: Vec<GraphExec> = (0..80).map(|_| capture(&s, &mut gemv).map(|c| c.1)).collect::<eyre::Result<_>>()?;
-    let mut res = std::collections::HashMap::new();
-    for (label, reuse) in [("same exec x80", true), ("80 distinct execs", false)] {
-        for spin in [5.0f64, 50.0] {
-            s.synchronize()?;
-            let (e0, e1) = (Event::new()?, Event::new()?);
-            e.q8.slack_probe_spin(&s, spin_ms(spin))?;
-            e0.record(&s)?;
-            let t = Instant::now();
-            for i in 0..80 {
-                if reuse { one.launch(&s)? } else { many[i].launch(&s)? }
+    for nodes in [1u32, 8] {
+        let mut body = |s: &Stream| -> eyre::Result<()> {
+            for b in 1..=nodes {
+                e.q8.matvec_bpack(s, &mut out, &w, &xq, &xs, rows as u32, k as u32, b)?;
             }
-            let host_ms = t.elapsed().as_secs_f64() * 1e3;
-            e1.record(&s)?;
-            e1.synchronize()?;
-            let gpu_us = Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / 80.0;
-            res.insert((reuse, spin as u32), (host_ms, gpu_us));
-            println!("  {label:>18}, {spin:>2} ms spin: host {host_ms:7.3} ms for 80 launches, GPU {gpu_us:7.2} us/launch");
+            Ok(())
+        };
+        let execs: Vec<GraphExec> = (0..80).map(|_| capture(&s, &mut body).map(|c| c.1)).collect::<eyre::Result<_>>()?;
+        let mut med = std::collections::BTreeMap::new();
+        let mut line = format!("  {nodes} node(s):");
+        let mut any_drained = false;
+        for kk in [1usize, 2, 4, 8, 80] {
+            let mut g = Vec::new();
+            for _ in 0..3 {
+                let (_, gpu, drained) = run(&execs, kk, 50.0)?;
+                any_drained |= drained;
+                g.push(gpu);
+            }
+            g.sort_by(f64::total_cmp);
+            med.insert(kk, g[1]);
+            line += &format!("  K={kk} {:.2} [{:.2}..{:.2}]", g[1], g[0], g[2]);
+        }
+        let base = med[&80];
+        line += &format!("  | vs K=80: K=1 {:+.1}%, K=2 {:+.1}%, K=8 {:+.1}%", (med[&1] / base - 1.0) * 100.0, (med[&2] / base - 1.0) * 100.0, (med[&8] / base - 1.0) * 100.0);
+        println!("{line}{}", if any_drained { "  [a run DRAINED: host-bound]" } else { "" });
+        bar(!any_drained, format!("2:{nodes}n:drained"));
+        if nodes == 8 {
+            let serializes = med[&8] > 1.10 * base;
+            bar(!serializes, "2:SERIALIZES(K=8)".into());
+            println!("  8 nodes, production pattern K=8 vs distinct: {}", if serializes { "SERIALIZES" } else { "does not serialize" });
+            // BLOCKS: the host enqueue time of 80 launches must not grow with the spin ahead.
+            for (label, kk) in [("K=1", 1usize), ("K=80", 80)] {
+                let (h5, _, _) = run(&execs, kk, 5.0)?;
+                let (h50, _, _) = run(&execs, kk, 50.0)?;
+                let blocks = h50 - h5 > 22.5; // half the 45 ms the spin grew by
+                bar(!blocks, format!("2:{label}:BLOCKS"));
+                println!("  {label}: host {h5:.3} ms behind 5 ms, {h50:.3} ms behind 50 ms -> {}", if blocks { "BLOCKS" } else { "does not block" });
+            }
         }
     }
-    for (label, reuse) in [("same exec", true), ("distinct execs", false)] {
-        let grow = res[&(reuse, 50)].0 - res[&(reuse, 5)].0;
-        let blocks = grow > 22.5; // half the 45 ms the spin grew by
-        bar(!blocks, format!("2:{label}:BLOCKS"));
-        println!("  {label}: host time grew {grow:+.3} ms with the spin -> {}", if blocks { "BLOCKS" } else { "does not block" });
-    }
-    let (same, distinct) = (res[&(true, 50)].1, res[&(false, 50)].1);
-    let serializes = same > 1.10 * distinct;
-    bar(!serializes, "2:SERIALIZES".into());
-    println!("  GPU per launch same {same:.2} vs distinct {distinct:.2} us -> {}", if serializes { "SERIALIZES" } else { "does not serialize" });
 
     // ---- 3. coherence: store then a graph that reads the slot, 10k rounds ----------------
     println!("== 3. coherence: arena_ctx_store then a captured _ind gemv (canary on), alternating entries");
