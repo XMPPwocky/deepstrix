@@ -111,8 +111,11 @@ pub const ATTN_SCORES_STRIDE: u32 = 3072;
 /// [`scored_keys_are_gathered`]. (Corrected 2026-09-18: the note here used to say
 /// V4.1's indexer was unported and every V4.1 layer scored densely. S1+S2 landed;
 /// it does not.)
-pub fn indexer_gathers(ratio: u32) -> bool {
-    !true && ratio == 4
+///
+/// Always false since V4-Flash was dropped (2026-09-24): V4.1 has no ratio-4 layers.
+/// Kept until the ratio-4 code paths go (docs/ARCHITECTURE_REVIEW_2026-09-24.md §9).
+pub fn indexer_gathers(_ratio: u32) -> bool {
+    false
 }
 
 /// `V41_INDEX_K=1` — mirror of `het::forward_layer::index_k_enabled`, needed here
@@ -140,10 +143,7 @@ fn v41_index_k_on() -> bool {
 ///
 /// Keep in lockstep with the `use_sparse` / `s2_reuse` gates.
 pub fn scored_keys_are_gathered(ratio: u32) -> bool {
-    if true {
-        return ratio > 0 && v41_index_k_on();
-    }
-    indexer_gathers(ratio)
+    ratio > 0 && v41_index_k_on()
 }
 
 /// Can the CSA indexer fire on ANY layer of this model? False for V4.1
@@ -164,8 +164,7 @@ pub fn scored_keys_are_gathered(ratio: u32) -> bool {
 pub fn indexer_scratch_needed() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         indexer_ever_fires()
-            || (true
-                && matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on")))
+            || matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on"))
     });
     *B
 }
@@ -316,25 +315,6 @@ pub fn attn_scores_stride(
         return Ok(ATTN_SCORES_STRIDE);
     }
     Ok(n_total_max.max(1))
-}
-
-/// Refuse to start when a vision tower is loaded and `n_kv_max` would let
-/// an image row's `n_raw + n_comp` overrun [`ATTN_SCORES_STRIDE`].
-///
-/// NOTE this only guards the *floor* stride. The batched prefill scratch is
-/// sized from `n_kv_max` (`BatchDgpuShared::alloc_rows_ctx`), so a V4.1
-/// engine past 3072 keys is legal — it just costs memory. This check exists
-/// for the models/settings where the floor is also the ceiling.
-pub fn check_vision_ctx_fits(n_kv_max: u32) -> eyre::Result<()> {
-    let raw = crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
-    let need = attn_max_scored_keys(n_kv_max, raw);
-    if need > ATTN_SCORES_STRIDE && !true {
-        return Err(eyre!(
-            "vision + ctx {n_kv_max} needs {need} attention score slots per (row, head)              (image raw window {raw}) but              ATTN_SCORES_STRIDE is {ATTN_SCORES_STRIDE}. Lower --ctx to {} or raise              ATTN_SCORES_STRIDE (and the attn_scores scratch with it).",
-            attn_max_ctx_for_keys(ATTN_SCORES_STRIDE, raw),
-        ));
-    }
-    Ok(())
 }
 
 /// Head-group size for the head-tiled WMMA smwsum kernels. Must match

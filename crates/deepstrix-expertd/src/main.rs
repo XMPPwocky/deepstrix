@@ -152,9 +152,6 @@ fn parse_args() -> eyre::Result<Args> {
 
 fn main() -> eyre::Result<()> {
     install_panic_handler()?;
-    if !true {
-        return Err(eyre!("deepstrix-expertd must be built with --features v41 (V4.1 experts from the HF checkpoint)"));
-    }
     let args = parse_args()?;
     // Every knob resolved and printed once, the live ones watched: the knob
     // file (`V41_KNOBS_FILE`, else `V41_B2_KNOBS` / ~/expertd-knobs.txt) every

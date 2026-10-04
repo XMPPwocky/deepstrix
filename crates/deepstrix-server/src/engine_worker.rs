@@ -5156,23 +5156,16 @@ fn prefill_suffix(
         }
         input_hcs.push(v);
     }
-    // Rebase the request's spans onto absolute KV positions.
-    let spans_abs: Vec<(u32, u32)> =
-        crate::vision_prompt::spans_in_range(&vl.spans, base_idx, base_idx + tokens.len())?
-            .iter()
-            .map(|s| (s.start + pos0, s.len))
-            .collect();
+    // Kept for its check: `spans_in_range` refuses a cut that straddles an
+    // image span. (V4-Flash also rebased the spans onto absolute KV positions.)
+    crate::vision_prompt::spans_in_range(&vl.spans, base_idx, base_idx + tokens.len())?;
     // V4-Flash: the engine widens each image row's raw window to the whole
     // `[START..END]` span (bidirectional inside the image) and keeps every
     // span inside one chunk / lane. V4.1 has no such rule (`model.py` has no
     // `get_image_visible`; image tokens attend causally like text), so it gets
     // NO spans — routing still picks `bias_vl` for image rows off their
     // synthetic ids, and the Engram rows above are already masked.
-    let image_spans = if true {
-        None
-    } else {
-        (!spans_abs.is_empty()).then_some(spans_abs.as_slice())
-    };
+    let image_spans = None;
     // Clone the progress handle into a local so the per-chunk pet
     // closure doesn't co-borrow `state` with state.engine below.
     // WorkerProgress is two Arc clones — effectively free.

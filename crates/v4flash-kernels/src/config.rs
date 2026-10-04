@@ -139,7 +139,7 @@ pub const CANDIDATE_SOURCE_LAYER: i32 = 20;
 pub const CANDIDATE_TOPK_BLOCKS: u32 = 2048;
 pub const CANDIDATE_BLOCK_SIZE: u32 = 8;
 /// Which model this binary was compiled for (see docs/v41/ENGINE_PORT.md §0).
-pub const MODEL_NAME: &str = if true { "DeepSeek-V4.1-Flash" } else { "DeepSeek-V4-Flash" };
+pub const MODEL_NAME: &str = "DeepSeek-V4.1-Flash";
 
 /// First N_HASH_LAYERS layers use the hash router (bootstrap). The rest
 /// use the learned router.
