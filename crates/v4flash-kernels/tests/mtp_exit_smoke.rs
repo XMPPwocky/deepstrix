@@ -9,7 +9,7 @@
 //!     no-op there would silently cost acceptance rate and nothing else;
 //!   * feeding a different accepted token changes the drafts.
 //!
-//!   cargo test -p v4flash-kernels --features v41 --test mtp_exit_smoke \
+//!   cargo test -p v4flash-kernels --features v41 --test drafter_exit_smoke \
 //!     -- --ignored --nocapture
 
 use color_eyre::eyre::{self, eyre};
@@ -17,8 +17,8 @@ use v4flash_core::{V41HfWeights, WeightSrc};
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{HC_DIM, N_VOCAB};
 use v4flash_kernels::het::engine::DeviceEngine;
-use v4flash_kernels::het::mtp::{mtp_rope, MtpExit, MtpState, MTP_BLOCK, MTP_NOISE_TOKEN};
-use v4flash_kernels::het::weights::{MtpExitWeights, MtpWeights};
+use v4flash_kernels::het::drafter::{drafter_rope, DrafterExit, DrafterState, DRAFT_BLOCK, DRAFT_NOISE_TOKEN};
+use v4flash_kernels::het::weights::{DrafterExitWeights, DrafterWeights};
 
 fn pick_igpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -51,10 +51,10 @@ fn exit_emits_valid_drafts() {
     let dev = pick_igpu().expect("igpu");
     let arch = dev.properties().expect("props").gcn_arch_name;
     let e = DeviceEngine::for_arch(dev, &arch).expect("engine");
-    let w = MtpWeights::load(&hf, dev, 40).expect("load drafter");
+    let w = DrafterWeights::load(&hf, dev, 40).expect("load drafter");
     // In production the exit lives on the dGPU beside the tied head; here it
     // shares the iGPU so the test needs one device.
-    let xw = MtpExitWeights::load(&hf, dev).expect("load exit weights");
+    let xw = DrafterExitWeights::load(&hf, dev).expect("load exit weights");
 
     // The drafter's head is TIED to the main model's, so the exit borrows
     // `output.weight`. In production it is already resident on the dGPU; here
@@ -74,14 +74,14 @@ fn exit_emits_valid_drafts() {
     let te_dtype = te.dtype;
     let te_bytes = src.read_tensor(te).expect("read token_embd");
     let mut noise_row = vec![0.0f32; HC_DIM as usize];
-    v4flash_kernels::embed::embed_lookup(&te_bytes, te_dtype, MTP_NOISE_TOKEN, &mut noise_row)
+    v4flash_kernels::embed::embed_lookup(&te_bytes, te_dtype, DRAFT_NOISE_TOKEN, &mut noise_row)
         .expect("embed noise");
 
-    let mut st = MtpState::alloc(dev.id).expect("alloc state");
-    let mut ex = MtpExit::alloc(dev.id).expect("alloc exit");
-    let rope = mtp_rope();
+    let mut st = DrafterState::alloc(dev.id).expect("alloc state");
+    let mut ex = DrafterExit::alloc(dev.id).expect("alloc exit");
+    let rope = drafter_rope();
 
-    let mut seen: Vec<[i32; MTP_BLOCK]> = Vec::new();
+    let mut seen: Vec<[i32; DRAFT_BLOCK]> = Vec::new();
     for tok in [3070i32, 15043i32] {
         let mut token_row = vec![0.0f32; HC_DIM as usize];
         v4flash_kernels::embed::embed_lookup(&te_bytes, te_dtype, tok, &mut token_row)
@@ -104,7 +104,7 @@ fn exit_emits_valid_drafts() {
             .expect("exit forward");
         e.compute.synchronize().expect("sync");
 
-        let mut lg = vec![0.0f32; MTP_BLOCK * N_VOCAB as usize];
+        let mut lg = vec![0.0f32; DRAFT_BLOCK * N_VOCAB as usize];
         ex.logits.copy_to_host(&mut lg).expect("read logits");
         assert!(lg.iter().all(|v| v.is_finite()), "non-finite logits");
         for (i, id) in ids.iter().enumerate() {

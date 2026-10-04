@@ -161,7 +161,7 @@ pub struct HetGlobalWeights {
 ///
 /// 7.9 GB for all three layers, so this is resident and never paged — the
 /// drafter must not contend with the expert pager on the critical path.
-pub struct MtpLayerWeights {
+pub struct DrafterLayerWeights {
     pub hc_attn_fn: DeviceWeight,
     pub hc_attn_scale: DeviceBuffer<f32>,
     pub hc_attn_base: DeviceBuffer<f32>,
@@ -187,12 +187,12 @@ pub struct MtpLayerWeights {
 }
 
 /// The whole drafter: an entry projection, three layers, and the exit heads.
-pub struct MtpWeights {
+pub struct DrafterWeights {
     /// `mtp.0.main_proj` [5120, 15360] — eats the concatenated residuals
     /// entering layers 37/38/39, then `main_norm`.
     pub main_proj: DeviceWeight,
     pub main_norm: DeviceBuffer<f32>,
-    pub layers: Vec<MtpLayerWeights>,
+    pub layers: Vec<DrafterLayerWeights>,
 }
 
 /// The drafter's EXIT weights, loaded separately because they live on a
@@ -203,7 +203,7 @@ pub struct MtpWeights {
 /// the layer stack runs on the iGPU and the exit on the dGPU, with the residual
 /// handed across. Loading these onto the layer device instead would mean either
 /// a second 662 MB copy of the vocab projection or a cross-device matvec.
-pub struct MtpExitWeights {
+pub struct DrafterExitWeights {
     /// `mtp.2.norm.weight` — final norm before the tied head.
     pub norm: DeviceBuffer<f32>,
     /// `mtp.2.markov_head.head.weight` [N_VOCAB, 256] — projects a markov
@@ -218,12 +218,12 @@ pub struct MtpExitWeights {
     pub confidence: DeviceBuffer<f32>,
 }
 
-impl MtpExitWeights {
+impl DrafterExitWeights {
     pub fn load<'a>(gguf: impl Into<WeightSrc<'a>>, device: Device) -> eyre::Result<Self> {
         let gguf: WeightSrc<'a> = gguf.into();
         device.set_current()?;
         let id = device.id;
-        let last = v4flash_core::hf_v41::MTP_STAGES - 1;
+        let last = v4flash_core::hf_v41::DRAFT_STAGES - 1;
         Ok(Self {
             norm: load_f32_weight(gguf, &format!("mtp.{last}.norm.weight"), id, N_EMBD as usize)?,
             markov_head: load_to_device(gguf, &format!("mtp.{last}.markov_head.weight"), id)?,
@@ -231,13 +231,13 @@ impl MtpExitWeights {
                 gguf,
                 &format!("mtp.{last}.confidence.weight"),
                 id,
-                N_EMBD as usize + crate::het::mtp::MTP_MARKOV_RANK,
+                N_EMBD as usize + crate::het::drafter::DRAFT_MARKOV_RANK,
             )?,
         })
     }
 }
 
-impl MtpWeights {
+impl DrafterWeights {
     /// Load all three drafter layers onto `device`. `n_layers` is the MAIN
     /// model's layer count — the drafter is presented as `blk.{n_layers + s}`.
     pub fn load<'a>(
@@ -248,8 +248,8 @@ impl MtpWeights {
         let gguf: WeightSrc<'a> = gguf.into();
         device.set_current()?;
         let device_id = device.id;
-        let n_stages = v4flash_core::hf_v41::MTP_STAGES;
-        let n_exp = v4flash_core::hf_v41::MTP_N_EXPERT as u32;
+        let n_stages = v4flash_core::hf_v41::DRAFT_STAGES;
+        let n_exp = v4flash_core::hf_v41::DRAFT_N_EXPERT as u32;
 
         let main_proj = load_to_device(gguf, "mtp.0.main_proj.weight", device_id)?;
         let main_norm = load_f32_weight(gguf, "mtp.0.main_norm.weight", device_id, N_EMBD as usize)?;
@@ -271,7 +271,7 @@ impl MtpWeights {
                 down_bytes_per_expert: routed.down.buffer.len() / n_exp as usize,
                 ..routed
             };
-            layers.push(MtpLayerWeights {
+            layers.push(DrafterLayerWeights {
                 hc_attn_fn: load_to_device(gguf, &format!("blk.{l}.hc_attn_fn.weight"), device_id)?,
                 hc_attn_scale: load_f32_weight(gguf, &format!("blk.{l}.hc_attn_scale.weight"), device_id, 3)?,
                 hc_attn_base: load_f32_weight(gguf, &format!("blk.{l}.hc_attn_base.weight"), device_id, HC_MIX_DIM as usize)?,

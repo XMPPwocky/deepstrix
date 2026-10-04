@@ -205,7 +205,7 @@ pub fn validate_model(tensors: &[GgufTensor]) -> eyre::Result<()> {
             if is_drafter_layer(&t.name) {
                 for d in dims.iter_mut() {
                     if *d == N_EXPERT as u64 {
-                        *d = v4flash_core::hf_v41::MTP_N_EXPERT as u64;
+                        *d = v4flash_core::hf_v41::DRAFT_N_EXPERT as u64;
                     }
                 }
             }

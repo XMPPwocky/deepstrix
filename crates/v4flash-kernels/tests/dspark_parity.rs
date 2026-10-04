@@ -52,8 +52,8 @@ use v4flash_core::{V41HfWeights, WeightSrc};
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{HC_DIM, N_EMBD};
 use v4flash_kernels::het::engine::DeviceEngine;
-use v4flash_kernels::het::mtp::{mtp_rope, MtpExit, MtpState, MTP_BLOCK, MTP_NOISE_TOKEN, MTP_WINDOW};
-use v4flash_kernels::het::weights::{MtpExitWeights, MtpWeights};
+use v4flash_kernels::het::drafter::{drafter_rope, DrafterExit, DrafterState, DRAFT_BLOCK, DRAFT_NOISE_TOKEN, DRAFT_WINDOW};
+use v4flash_kernels::het::weights::{DrafterExitWeights, DrafterWeights};
 
 const NSRC: usize = 3;
 
@@ -89,25 +89,25 @@ fn env_or(k: &str, d: &str) -> String {
 
 struct RefStep {
     i: usize,
-    drafts: [i32; MTP_BLOCK],
-    greedy: [i32; MTP_BLOCK],
-    conf: [f32; MTP_BLOCK],
+    drafts: [i32; DRAFT_BLOCK],
+    greedy: [i32; DRAFT_BLOCK],
+    conf: [f32; DRAFT_BLOCK],
 }
 
 fn load_ref(dir: &str, name: &str) -> Vec<RefStep> {
     let r = read_i32(&format!("{dir}/ref_{name}.bin"));
     let c = read_f32(&format!("{dir}/ref_{name}_conf.bin"));
-    let w = 1 + 2 * MTP_BLOCK;
+    let w = 1 + 2 * DRAFT_BLOCK;
     assert_eq!(r.len() % w, 0, "ref_{name}.bin: {} ints is not a multiple of {w}", r.len());
     let n = r.len() / w;
-    assert_eq!(c.len(), n * MTP_BLOCK, "ref_{name}_conf.bin length");
+    assert_eq!(c.len(), n * DRAFT_BLOCK, "ref_{name}_conf.bin length");
     (0..n)
         .map(|s| {
             let rec = &r[s * w..(s + 1) * w];
-            let mut st = RefStep { i: rec[0] as usize, drafts: [0; MTP_BLOCK], greedy: [0; MTP_BLOCK], conf: [0.0; MTP_BLOCK] };
-            st.drafts.copy_from_slice(&rec[1..1 + MTP_BLOCK]);
-            st.greedy.copy_from_slice(&rec[1 + MTP_BLOCK..w]);
-            st.conf.copy_from_slice(&c[s * MTP_BLOCK..(s + 1) * MTP_BLOCK]);
+            let mut st = RefStep { i: rec[0] as usize, drafts: [0; DRAFT_BLOCK], greedy: [0; DRAFT_BLOCK], conf: [0.0; DRAFT_BLOCK] };
+            st.drafts.copy_from_slice(&rec[1..1 + DRAFT_BLOCK]);
+            st.greedy.copy_from_slice(&rec[1 + DRAFT_BLOCK..w]);
+            st.conf.copy_from_slice(&c[s * DRAFT_BLOCK..(s + 1) * DRAFT_BLOCK]);
             st
         })
         .collect()
@@ -163,8 +163,8 @@ fn drafter_matches_reference() {
     let dev = pick_igpu().expect("igpu");
     let arch = dev.properties().expect("props").gcn_arch_name;
     let e = DeviceEngine::for_arch(dev, &arch).expect("engine");
-    let w = MtpWeights::load(&hf, dev, 40).expect("load drafter");
-    let xw = MtpExitWeights::load(&hf, dev).expect("load exit weights");
+    let w = DrafterWeights::load(&hf, dev, 40).expect("load drafter");
+    let xw = DrafterExitWeights::load(&hf, dev).expect("load exit weights");
     let head = v4flash_kernels::weights::load_to_device(&hf, "output.weight", dev.id).expect("load tied head");
     let src: WeightSrc = (&hf).into();
     let mk = src.tensor("mtp.2.markov_embd.weight").expect("markov embed tensor");
@@ -174,14 +174,14 @@ fn drafter_matches_reference() {
     let te_dtype = te.dtype;
     let te_bytes = src.read_tensor(te).expect("read token_embd");
     let mut noise_row = vec![0.0f32; HC_DIM as usize];
-    v4flash_kernels::embed::embed_lookup(&te_bytes, te_dtype, MTP_NOISE_TOKEN, &mut noise_row).expect("embed noise");
+    v4flash_kernels::embed::embed_lookup(&te_bytes, te_dtype, DRAFT_NOISE_TOKEN, &mut noise_row).expect("embed noise");
 
-    let mut st = MtpState::alloc(dev.id).expect("alloc state");
-    let mut ex = MtpExit::alloc(dev.id).expect("alloc exit");
-    let rope = mtp_rope();
+    let mut st = DrafterState::alloc(dev.id).expect("alloc state");
+    let mut ex = DrafterExit::alloc(dev.id).expect("alloc exit");
+    let rope = drafter_rope();
 
     if seeded {
-        let win = MTP_WINDOW as usize;
+        let win = DRAFT_WINDOW as usize;
         // PARITY_SEED_ROWS=n (1..=8): seed through the batched writer
         // (`ring_write_rows`, n rows per call, as the arena writes a verify
         // block's kept rows); the drafts must be identical to the per-row seed.
@@ -204,16 +204,16 @@ fn drafter_matches_reference() {
         e.compute.synchronize().expect("sync");
     }
 
-    let mut agree = [0usize; MTP_BLOCK];
-    let mut acc = [0usize; MTP_BLOCK];
-    let mut ref_acc = [0usize; MTP_BLOCK];
-    let mut prefix = [0usize; MTP_BLOCK];
-    let mut ref_prefix = [0usize; MTP_BLOCK];
-    let mut conf_err = [0.0f64; MTP_BLOCK];
+    let mut agree = [0usize; DRAFT_BLOCK];
+    let mut acc = [0usize; DRAFT_BLOCK];
+    let mut ref_acc = [0usize; DRAFT_BLOCK];
+    let mut prefix = [0usize; DRAFT_BLOCK];
+    let mut ref_prefix = [0usize; DRAFT_BLOCK];
+    let mut conf_err = [0.0f64; DRAFT_BLOCK];
     // Paired per-step statistics (89 overlapping blocks are too few for an
     // absolute bar: lag-1 autocorrelation ~0.65, effective n ~19).
-    let mut agree_cond = [0usize; MTP_BLOCK]; // draft k equal GIVEN drafts < k equal
-    let mut agree_cond_n = [0usize; MTP_BLOCK];
+    let mut agree_cond = [0usize; DRAFT_BLOCK]; // draft k equal GIVEN drafts < k equal
+    let mut agree_cond_n = [0usize; DRAFT_BLOCK];
     let mut diff_per_step: Vec<f64> = Vec::with_capacity(refs.len()); // accepted(ours) - accepted(ref)
     let mut csv = String::from("i,d0,d1,d2,d3,d4,p0,p1,p2,p3,p4,c0,c1,c2,c3,c4\n");
     let mut token_row = vec![0.0f32; HC_DIM as usize];
@@ -225,7 +225,7 @@ fn drafter_matches_reference() {
     let (mut t_enq, mut t_dev, mut t_exit) = (Vec::new(), Vec::new(), Vec::new());
     for (n, r) in refs.iter().enumerate() {
         let i = r.i;
-        assert!(i + 1 + MTP_BLOCK < t, "step {i} runs past the transcript");
+        assert!(i + 1 + DRAFT_BLOCK < t, "step {i} runs past the transcript");
         let next = tok[i + 1];
         v4flash_kernels::embed::embed_lookup(&te_bytes, te_dtype, next, &mut token_row).expect("embed token");
         st.inject_main_hidden(&mh[i * row..(i + 1) * row]).expect("inject");
@@ -249,7 +249,7 @@ fn drafter_matches_reference() {
         let (mut ok, mut rok) = (true, true);
         let mut same_so_far = true;
         let (mut n_ours, mut n_ref) = (0usize, 0usize);
-        for k in 0..MTP_BLOCK {
+        for k in 0..DRAFT_BLOCK {
             if same_so_far {
                 agree_cond_n[k] += 1;
                 agree_cond[k] += usize::from(ours[k] == r.drafts[k]);
@@ -302,9 +302,9 @@ fn drafter_matches_reference() {
     );
 
     let n = refs.len() as f64;
-    let e_of = |p: &[usize; MTP_BLOCK]| 1.0 + p.iter().map(|&x| x as f64 / n).sum::<f64>();
+    let e_of = |p: &[usize; DRAFT_BLOCK]| 1.0 + p.iter().map(|&x| x as f64 / n).sum::<f64>();
     println!("\ndepth  draft==ref  ours greedy-acc  ref greedy-acc  ours prefix  ref prefix  |conf-ref|");
-    for k in 0..MTP_BLOCK {
+    for k in 0..DRAFT_BLOCK {
         println!(
             "  d{}     {:.3}         {:.3}           {:.3}          {:.3}        {:.3}      {:.3}",
             k + 1,
@@ -320,7 +320,7 @@ fn drafter_matches_reference() {
     println!("E (K=5): ours {eo:.3}   reference {er:.3}   gap {:.3}", er - eo);
     println!(
         "draft agreement given identical earlier drafts: {}",
-        (0..MTP_BLOCK)
+        (0..DRAFT_BLOCK)
             .map(|k| format!("d{} {:.3} (n={})", k + 1, agree_cond[k] as f64 / agree_cond_n[k].max(1) as f64, agree_cond_n[k]))
             .collect::<Vec<_>>()
             .join("  ")
@@ -363,8 +363,8 @@ fn drafter_matches_reference() {
     match std::fs::read(&json) {
         Ok(bytes) => {
             let v: serde_json::Value = serde_json::from_slice(&bytes).expect("reference json");
-            let want = v["expected_tokens"].get(MTP_BLOCK - 1).and_then(|x| x.as_f64());
-            let want = want.unwrap_or_else(|| panic!("{json}: no expected_tokens[{}]", MTP_BLOCK - 1));
+            let want = v["expected_tokens"].get(DRAFT_BLOCK - 1).and_then(|x| x.as_f64());
+            let want = want.unwrap_or_else(|| panic!("{json}: no expected_tokens[{}]", DRAFT_BLOCK - 1));
             assert!((want - er).abs() < 1e-6, "reference E from records {er:.6} != its JSON {want:.6}");
         }
         Err(e) if asserting => panic!("{json}: {e} (the alignment check needs the reference JSON)"),

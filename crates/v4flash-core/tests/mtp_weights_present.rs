@@ -9,9 +9,9 @@
 //! that failure.
 //!
 //! Run:
-//!   nix develop -c cargo test --release -p v4flash-core --test mtp_weights_present -- --ignored --nocapture
+//!   nix develop -c cargo test --release -p v4flash-core --test drafter_weights_present -- --ignored --nocapture
 
-use v4flash_core::hf_v41::{MTP_N_EXPERT, MTP_STAGES};
+use v4flash_core::hf_v41::{DRAFT_N_EXPERT, DRAFT_STAGES};
 use v4flash_core::V41HfWeights;
 
 fn model() -> String {
@@ -22,10 +22,10 @@ fn model() -> String {
 
 #[test]
 #[ignore = "needs the V4.1 checkpoint"]
-fn mtp_stages_are_presented_and_loaded() {
+fn drafter_stages_are_presented_and_loaded() {
     let hf = V41HfWeights::open(&model(), None).expect("open checkpoint");
 
-    for s in 0..MTP_STAGES {
+    for s in 0..DRAFT_STAGES {
         // --- every tensor the drafter needs resolves, with the right geometry ---
         let expect: &[(&str, &[u64])] = &[
             ("attn_norm.weight", &[5120]),
@@ -33,7 +33,7 @@ fn mtp_stages_are_presented_and_loaded() {
             ("attn_q_a.weight", &[5120, 1280]),
             ("attn_kv.weight", &[5120, 512]),
             ("attn_output_b.weight", &[8192, 5120]),
-            ("ffn_gate_inp.weight", &[5120, MTP_N_EXPERT as u64]),
+            ("ffn_gate_inp.weight", &[5120, DRAFT_N_EXPERT as u64]),
         ];
         for (suffix, dims) in expect {
             let name = format!("blk.{}.{suffix}", 40 + s);
@@ -50,8 +50,8 @@ fn mtp_stages_are_presented_and_loaded() {
         for role in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
             let t = hf.get(&format!("blk.{}.{role}.weight", 40 + s)).expect("expert tensor");
             assert_eq!(
-                t.dims[2], MTP_N_EXPERT as u64,
-                "mtp.{s}.{role}: {} experts, expected {MTP_N_EXPERT}",
+                t.dims[2], DRAFT_N_EXPERT as u64,
+                "mtp.{s}.{role}: {} experts, expected {DRAFT_N_EXPERT}",
                 t.dims[2]
             );
         }
@@ -72,7 +72,7 @@ fn mtp_stages_are_presented_and_loaded() {
              gain (expected ~0.157/0.200/0.241). This is the exact bug that made DSpark \
              acceptance look like 0.44."
         );
-        println!("mtp.{s}: ok, ffn_norm mean {mean:.4}, {MTP_N_EXPERT} experts");
+        println!("mtp.{s}: ok, ffn_norm mean {mean:.4}, {DRAFT_N_EXPERT} experts");
     }
 
     // The three groups are a 3-LAYER stack, not three drafters: the entry layer

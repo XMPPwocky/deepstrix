@@ -3,7 +3,7 @@
 //! The drafter is a 3-layer model (see `docs/v41/DSPARK_DESIGN.md`). It is NOT
 //! autoregressive: `forward_embed` builds
 //! `[real_token, noise, noise, noise, noise]` and ONE pass over the three layers
-//! emits all `MTP_BLOCK` drafts, so every buffer here is `[MTP_BLOCK, ...]`.
+//! emits all `DRAFT_BLOCK` drafts, so every buffer here is `[DRAFT_BLOCK, ...]`.
 //! The only sequential part is the exit's markov head, which is not in this
 //! module.
 //!
@@ -19,7 +19,7 @@
 //!
 //! A drafter layer is structurally the MAIN model's layer — the same mHC
 //! sandwich around an attention and a MoE sub-block — so it reuses the main
-//! model's kernels throughout, at batch `MTP_BLOCK` via the `_batched` variants
+//! model's kernels throughout, at batch `DRAFT_BLOCK` via the `_batched` variants
 //! that the M50 prefill path added.
 
 use color_eyre::eyre::{self, eyre};
@@ -30,7 +30,7 @@ use crate::config::{
     N_EMBD, N_FF_EXP, N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_LORA_Q, N_ROT, OUT_LOW,
     Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWIGLU_CLAMP_EXP, N_VOCAB,
 };
-use v4flash_core::hf_v41::MTP_N_EXPERT;
+use v4flash_core::hf_v41::DRAFT_N_EXPERT;
 
 /// Matches `forward_layer.rs`'s private constant of the same name — the router's
 /// weight floor. Duplicated rather than made public: it is a property of the
@@ -39,7 +39,7 @@ use v4flash_core::hf_v41::MTP_N_EXPERT;
 const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
 use crate::het::engine::DeviceEngine;
 use crate::het::remote_experts::{MIDQ_BYTES_PER_SLOT, SENTINEL_EXPERT, XQ_BYTES_PER_TOKEN};
-use crate::het::weights::{MtpExitWeights, MtpLayerWeights, MtpWeights};
+use crate::het::weights::{DrafterExitWeights, DrafterLayerWeights, DrafterWeights};
 
 // ---------------------------------------------------------------------------
 // Drafter geometry. All from the checkpoint's own config.json (`text_config`)
@@ -49,30 +49,30 @@ use crate::het::weights::{MtpExitWeights, MtpLayerWeights, MtpWeights};
 
 /// `dspark_target_layer_ids` — main-model layers whose ENTERING residual feeds
 /// the drafter, in order.
-pub const MTP_SRC_LAYERS: [i32; 3] = [37, 38, 39];
+pub const DRAFT_SRC_LAYERS: [i32; 3] = [37, 38, 39];
 /// `dspark_block_size` — draft tokens emitted per speculation step, and the
 /// batch every drafter kernel runs at.
-pub const MTP_BLOCK: usize = 5;
+pub const DRAFT_BLOCK: usize = 5;
 /// `sliding_window` — the drafter's KV ring depth. It attends over a window of
 /// main-model-derived KV, never the full context.
-pub const MTP_WINDOW: usize = 128;
+pub const DRAFT_WINDOW: usize = 128;
 /// `dspark_num_experts_per_tok` — top-3 of 128, where the main model is top-6
 /// of 384. `router_topk` takes both at runtime, so no kernel change.
-pub const MTP_TOPK: u32 = 3;
+pub const DRAFT_TOPK: u32 = 3;
 /// `dspark_markov_rank` — the auxiliary n-gram head's hidden width.
-pub const MTP_MARKOV_RANK: usize = 256;
+pub const DRAFT_MARKOV_RANK: usize = 256;
 /// Rotating host-staging slots for the drafter's index uploads. See
-/// `MtpState::stage_slots`.
+/// `DrafterState::stage_slots`.
 const STAGE_N: usize = 64;
 /// Most ring rows one `ring_write_rows` call writes (a verify block keeps at
 /// most `ARENA_ROWS_PER_STREAM` = 8).
 pub const RING_ROWS_MAX: usize = 8;
 /// Entries per staged index vector: the main row + the block's, or a batch of
 /// ring rows.
-const STAGE_W: usize = if MTP_BLOCK + 1 > RING_ROWS_MAX { MTP_BLOCK + 1 } else { RING_ROWS_MAX };
+const STAGE_W: usize = if DRAFT_BLOCK + 1 > RING_ROWS_MAX { DRAFT_BLOCK + 1 } else { RING_ROWS_MAX };
 
 /// `dspark_noise_token_id`.
-pub const MTP_NOISE_TOKEN: i32 = 128799;
+pub const DRAFT_NOISE_TOKEN: i32 = 128799;
 
 /// HOST-side (enqueue) time inside a drafter layer, in microseconds, accumulated
 /// across every `layer()` call and reported by `take_layer_host_us`.
@@ -84,34 +84,34 @@ pub const MTP_NOISE_TOKEN: i32 = 128799;
 /// inflate this engine's per-layer post-MoE time 4.4x and whole-run throughput
 /// 1.40x, so instrumenting an enqueue-cost hunt with HIP events would largely
 /// measure the instrument.
-pub static MTP_H_HCMIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_ATTN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_MOE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_POST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_RMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_HCMIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_ATTN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_MOE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_POST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_RMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Host time in JUST the per-query score/softmax loop (10 launches/layer), split
-/// out of `MTP_H_ATTN` to tell per-launch overhead from something that blocks.
-pub static MTP_H_ATTNQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_ATTNKV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_ATTNQA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_ATTNO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// out of `DRAFT_H_ATTN` to tell per-launch overhead from something that blocks.
+pub static DRAFT_H_ATTNQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_ATTNKV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_ATTNQA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_ATTNO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Per-KERNEL device split of the two blocks that dominate a drafter layer:
-/// the attention output projection (`MTP_H_ATTNO`) and the MoE (`MTP_H_MOE`).
+/// the attention output projection (`DRAFT_H_ATTNO`) and the MoE (`DRAFT_H_MOE`).
 /// Only populated under `V41_DSPARK_LAYER_TIMING=2`; `OQUANT` sums BOTH
 /// `quantize_input_batched` calls, `MGATEUP`/`MDOWN` sum over the B rows.
-pub static MTP_H_OQUANT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_OWA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_OWB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_MROUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_MTOPK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_MQ8K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_MGATEUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MTP_H_MDOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_OQUANT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_OWA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_OWB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_MROUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_MTOPK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_MQ8K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_MGATEUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_MDOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Host us in the two BLOCKING `copy_from_host` calls (slots/poss, 24 bytes each)
 /// at the top of the drafter's KV section. If a 48-byte H2D costs milliseconds it
 /// is not the copy -- a blocking `hipMemcpy` serialises against blocking streams,
 /// so it is draining whatever the verify left queued on the SHARED igpu.compute.
-pub static MTP_H_KVCOPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DRAFT_H_KVCOPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 0 = off, 1 = HOST (enqueue) time, 2 = DEVICE time via sync-and-time.
 ///
@@ -121,7 +121,7 @@ pub static MTP_H_KVCOPY: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// comparable to each other -- but it is the honest way to split device time
 /// here. Perfetto is not: attaching it was MEASURED to inflate this engine's
 /// per-layer post-MoE time 4.4x and whole-run throughput 1.40x.
-pub fn mtp_timing_mode() -> u8 {
+pub fn drafter_timing_mode() -> u8 {
     static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *V.get_or_init(|| match std::env::var("V41_DSPARK_LAYER_TIMING").as_deref() {
         Ok("1") => 1,
@@ -131,8 +131,8 @@ pub fn mtp_timing_mode() -> u8 {
     })
 }
 
-pub fn mtp_host_timing() -> bool {
-    mtp_timing_mode() > 0
+pub fn drafter_host_timing() -> bool {
+    drafter_timing_mode() > 0
 }
 
 struct HostUs<'a>(
@@ -143,12 +143,12 @@ struct HostUs<'a>(
 );
 impl<'a> HostUs<'a> {
     fn start(c: &'static std::sync::atomic::AtomicU64) -> HostUs<'static> {
-        HostUs(c, std::time::Instant::now(), mtp_timing_mode(), None)
+        HostUs(c, std::time::Instant::now(), drafter_timing_mode(), None)
     }
     /// As `start`, but in mode 2 also drains `s` before stopping the clock, so
     /// the figure is DEVICE time for this block.
     fn start_dev(c: &'static std::sync::atomic::AtomicU64, s: &'a Stream) -> Self {
-        let m = mtp_timing_mode();
+        let m = drafter_timing_mode();
         if m == 3 {
             ev_open(c, s);
         }
@@ -316,7 +316,7 @@ fn ev_close(ctr: &'static std::sync::atomic::AtomicU64, s: &Stream) {
 /// MUST be called only after the stream those events were recorded on has been
 /// synchronised, or `hipEventElapsedTime` reports on work still in flight.
 pub fn drain_event_spans() {
-    if mtp_timing_mode() != 3 {
+    if drafter_timing_mode() != 3 {
         return;
     }
     EV.with(|ev| {
@@ -338,11 +338,11 @@ pub fn drain_event_spans() {
 pub fn take_layer_host_us() -> (u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
-        MTP_H_HCMIX.swap(0, Relaxed),
-        MTP_H_RMS.swap(0, Relaxed),
-        MTP_H_ATTN.swap(0, Relaxed),
-        MTP_H_MOE.swap(0, Relaxed),
-        MTP_H_POST.swap(0, Relaxed),
+        DRAFT_H_HCMIX.swap(0, Relaxed),
+        DRAFT_H_RMS.swap(0, Relaxed),
+        DRAFT_H_ATTN.swap(0, Relaxed),
+        DRAFT_H_MOE.swap(0, Relaxed),
+        DRAFT_H_POST.swap(0, Relaxed),
     )
 }
 
@@ -350,10 +350,10 @@ pub fn take_layer_host_us() -> (u64, u64, u64, u64, u64) {
 pub fn take_attn_split_us() -> (u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
-        MTP_H_ATTNQ.swap(0, Relaxed),
-        MTP_H_ATTNKV.swap(0, Relaxed),
-        MTP_H_ATTNQA.swap(0, Relaxed),
-        MTP_H_ATTNO.swap(0, Relaxed),
+        DRAFT_H_ATTNQ.swap(0, Relaxed),
+        DRAFT_H_ATTNKV.swap(0, Relaxed),
+        DRAFT_H_ATTNQA.swap(0, Relaxed),
+        DRAFT_H_ATTNO.swap(0, Relaxed),
     )
 }
 
@@ -361,20 +361,20 @@ pub fn take_attn_split_us() -> (u64, u64, u64, u64) {
 pub fn take_kernel_split_us() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
     [
-        MTP_H_OQUANT.swap(0, Relaxed),
-        MTP_H_OWA.swap(0, Relaxed),
-        MTP_H_OWB.swap(0, Relaxed),
-        MTP_H_MROUT.swap(0, Relaxed),
-        MTP_H_MTOPK.swap(0, Relaxed),
-        MTP_H_MQ8K.swap(0, Relaxed),
-        MTP_H_MGATEUP.swap(0, Relaxed),
-        MTP_H_MDOWN.swap(0, Relaxed),
+        DRAFT_H_OQUANT.swap(0, Relaxed),
+        DRAFT_H_OWA.swap(0, Relaxed),
+        DRAFT_H_OWB.swap(0, Relaxed),
+        DRAFT_H_MROUT.swap(0, Relaxed),
+        DRAFT_H_MTOPK.swap(0, Relaxed),
+        DRAFT_H_MQ8K.swap(0, Relaxed),
+        DRAFT_H_MGATEUP.swap(0, Relaxed),
+        DRAFT_H_MDOWN.swap(0, Relaxed),
     ]
 }
 
 /// Host us in the blocking slots/poss H2D pair.
 pub fn take_kvcopy_us() -> u64 {
-    MTP_H_KVCOPY.swap(0, std::sync::atomic::Ordering::Relaxed)
+    DRAFT_H_KVCOPY.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The drafter's rope parameters.
@@ -383,7 +383,7 @@ pub fn take_kvcopy_us() -> u64 {
 /// the drafter always takes the main model's DENSE-layer arm of
 /// `rope_for_layer`: base 10000, no yarn extension, no scaling. Defined here so
 /// the drafter cannot silently drift onto the compressed-layer parameters.
-pub fn mtp_rope() -> crate::RopeParams {
+pub fn drafter_rope() -> crate::RopeParams {
     crate::RopeParams {
         freq_base: 10000.0,
         freq_scale: 1.0,
@@ -432,7 +432,7 @@ fn kv_quant_legacy_v4() -> bool {
 /// One drafter KV row (ring or block): weighted RMS norm, RoPE of the last
 /// `N_ROT` dims at the position in `pos_dev`, fake quantisation, f16 append
 /// into `ring` at the slot in `slot_dev` (both staged on `s` by
-/// `MtpState::stage_indices`). Device-side position (`rope_tail_pdev`, the
+/// `DrafterState::stage_indices`). Device-side position (`rope_tail_pdev`, the
 /// same math as `rope_tail`): no per-draft scalar reaches a launch, so the
 /// drafter's layers can replay as a HIP graph.
 #[allow(clippy::too_many_arguments)]
@@ -463,7 +463,7 @@ fn kv_post_row(
 /// fixed and every per-draft value is in a device buffer). The eager forward is
 /// launch-bound on gfx1151 (~350 launches per draft at 20-40 us each). Default
 /// off until `tests/dspark_parity.rs` shows eager == graph drafts.
-pub fn mtp_graphs() -> bool {
+pub fn drafter_graphs() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("V41_MTP_GRAPH").as_deref() == Ok("1"))
 }
@@ -474,7 +474,7 @@ pub fn mtp_graphs() -> bool {
 /// of row 0's 3 the noise rows reuse. Prices batching the drafter's routed MoE
 /// by expert (it reads 5 x 3 experts per layer row by row). One 15-int D2D
 /// copy per layer; the readback rides the draft's own sync.
-pub fn mtp_expert_stats() -> bool {
+pub fn drafter_expert_stats() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("V41_MTP_EXPERT_STATS").as_deref() == Ok("1"))
 }
@@ -488,18 +488,18 @@ pub fn mtp_expert_stats() -> bool {
 /// ~1.4 GB per draft on a DEVICE-bound forward (8.7 ms iGPU, 0.4 ms enqueue).
 /// Grouping reads each distinct expert once: ~846 -> ~430 MB per draft.
 /// BIT-IDENTICAL drafts by construction (kernels/mxfp4_pair_matvec.hip and
-/// mxfp4_matvec.hip, `*_grouped`); default off until `tests/mtp_moe_grouped.rs`
+/// mxfp4_matvec.hip, `*_grouped`); default off until `tests/drafter_moe_grouped.rs`
 /// and `tests/dspark_parity.rs` confirm it on the GPU.
-fn mtp_moe_grouped() -> bool {
+fn drafter_moe_grouped() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("V41_MTP_MOE_GROUPED").as_deref() == Ok("1"))
 }
 // The block must fit the grouped kernels as compiled: the down kernel's per-lane
 // `inner[pick]` registers, one member pass per expert (a group never has more
 // members than tokens), and the gate/up's per-member LDS staging.
-const _: () = assert!(MTP_BLOCK * MTP_TOPK as usize <= crate::mxfp4_pair::MXFP4_GROUPED_MAX_PICKS as usize);
-const _: () = assert!(MTP_BLOCK <= crate::mxfp4_pair::MXFP4_GROUPED_MAX_MEMBERS as usize);
-const _: () = assert!(MTP_BLOCK * XQ_BYTES_PER_TOKEN <= 64 * 1024);
+const _: () = assert!(DRAFT_BLOCK * DRAFT_TOPK as usize <= crate::mxfp4_pair::MXFP4_GROUPED_MAX_PICKS as usize);
+const _: () = assert!(DRAFT_BLOCK <= crate::mxfp4_pair::MXFP4_GROUPED_MAX_MEMBERS as usize);
+const _: () = assert!(DRAFT_BLOCK * XQ_BYTES_PER_TOKEN <= 64 * 1024);
 
 #[derive(Default)]
 struct ExpertStats {
@@ -510,10 +510,10 @@ struct ExpertStats {
 }
 
 /// Batch every drafter kernel runs at.
-const B: u32 = MTP_BLOCK as u32;
+const B: u32 = DRAFT_BLOCK as u32;
 /// Ring slots: the window, plus the block's own transient KV packed right after
 /// the valid prefix. See `attn`.
-const RING_SLOTS: usize = MTP_WINDOW + MTP_BLOCK;
+const RING_SLOTS: usize = DRAFT_WINDOW + DRAFT_BLOCK;
 /// `attention_mixed_score` indexes `scores[h * ATTN_MIXED_MAX_KEYS + k]` — the
 /// stride is the kernel's compile-time cap, NOT `n_kv`. Sizing this buffer to
 /// the actual key count (as an earlier draft did) writes ~600x past its end.
@@ -521,7 +521,7 @@ const RING_SLOTS: usize = MTP_WINDOW + MTP_BLOCK;
 const SCORES_ELEMS: usize = N_HEAD as usize * crate::attention::ATTN_MIXED_MAX_KEYS as usize;
 
 /// Per-request drafter state. Allocated once; refilled every token.
-pub struct MtpState {
+pub struct DrafterState {
     /// `cat(mean_over_hc(residual@37), ..@38, ..@39)` — `[3 * N_EMBD]`.
     pub main_x: DeviceBuffer<f32>,
     /// Uniform `1/N_HC`, so `hc_weighted` computes a mean.
@@ -535,9 +535,9 @@ pub struct MtpState {
     /// stream.
     pub proj: DeviceBuffer<f32>,
     pub x: DeviceBuffer<f32>,
-    /// Which of `MTP_SRC_LAYERS` have been captured this token. Guards against
+    /// Which of `DRAFT_SRC_LAYERS` have been captured this token. Guards against
     /// running the entry on a stale or partial `main_x`.
-    captured: [bool; MTP_SRC_LAYERS.len()],
+    captured: [bool; DRAFT_SRC_LAYERS.len()],
     /// How many `main_kv` rows have actually been written into the rings.
     ///
     /// The reference indexes the window by `start_pos % window` and treats
@@ -549,10 +549,10 @@ pub struct MtpState {
     /// prefix, re-based to whenever the drafter started.
     ring_writes: usize,
 
-    /// `mtp_expert_stats`: per layer, the block's `[B x TOPK]` picks.
+    /// `drafter_expert_stats`: per layer, the block's `[B x TOPK]` picks.
     sel_stats: DeviceBuffer<i32>,
     expert_stats: ExpertStats,
-    /// Captured entry + layers (`mtp_graphs`), keyed by the address of the
+    /// Captured entry + layers (`drafter_graphs`), keyed by the address of the
     /// ring in use (`rings` is swapped per stream by the multistream arena).
     graphs: std::collections::HashMap<usize, v4flash_hip::GraphExec>,
 
@@ -621,7 +621,7 @@ pub struct MtpState {
     /// valid and UNMODIFIED until the copy actually runs -- a stack Vec would
     /// drop first, and reusing one buffer would let the next layer overwrite a
     /// copy still in flight. Hence a rotating pool: `STAGE_N` is far above the
-    /// <= (1 + MTP_BLOCK) * 3 `layer()` calls between two stream syncs, so an
+    /// <= (1 + DRAFT_BLOCK) * 3 `layer()` calls between two stream syncs, so an
     /// entry is never revisited while its copy is outstanding.
     stage_slots: Vec<Vec<u32>>,
     stage_poss: Vec<Vec<u32>>,
@@ -647,7 +647,7 @@ pub struct MtpState {
     d_selected: DeviceBuffer<i32>,
     d_ew: DeviceBuffer<f32>,
     /// Identity remap over the drafter's 128 resident experts: `-(e)-1` for
-    /// `e < MTP_N_EXPERT`, 0 (= "not ours") for the sentinel. Built once — the
+    /// `e < DRAFT_N_EXPERT`, 0 (= "not ours") for the sentinel. Built once — the
     /// drafter never pages, so residency never changes.
     remap: DeviceBuffer<i32>,
     mid: DeviceBuffer<f32>,
@@ -662,24 +662,24 @@ pub struct MtpState {
     pub ffn_out: DeviceBuffer<f32>,
 }
 
-impl MtpState {
+impl DrafterState {
     pub fn alloc(device_id: i32) -> eyre::Result<Self> {
-        let k = MTP_SRC_LAYERS.len() * N_EMBD as usize;
+        let k = DRAFT_SRC_LAYERS.len() * N_EMBD as usize;
         let mut hc_mean = DeviceBuffer::<f32>::new(device_id, N_HC as usize)?;
         hc_mean.copy_from_host(&vec![1.0f32 / N_HC as f32; N_HC as usize])?;
         // Every drafter expert is resident, so the remap is a constant identity.
         // Sentinel (and any id past 128) stays 0 = "not ours", which is what makes
         // an unused pick slot a no-op in the MoE kernel.
         let mut remap_host = vec![0i32; SENTINEL_EXPERT as usize + 1];
-        for (e, r) in remap_host.iter_mut().enumerate().take(MTP_N_EXPERT) {
+        for (e, r) in remap_host.iter_mut().enumerate().take(DRAFT_N_EXPERT) {
             *r = -(e as i32) - 1;
         }
         let mut remap = DeviceBuffer::<i32>::new(device_id, remap_host.len())?;
         remap.copy_from_host(&remap_host)?;
         let ne = N_EMBD as usize;
-        let b = MTP_BLOCK;
-        let mut rings = Vec::with_capacity(MTP_SRC_LAYERS.len());
-        for _ in 0..MTP_SRC_LAYERS.len() {
+        let b = DRAFT_BLOCK;
+        let mut rings = Vec::with_capacity(DRAFT_SRC_LAYERS.len());
+        for _ in 0..DRAFT_SRC_LAYERS.len() {
             rings.push(DeviceBuffer::<u16>::new(
                 device_id,
                 RING_SLOTS * N_HEAD_DIM as usize,
@@ -692,10 +692,10 @@ impl MtpState {
             proj_xscale: DeviceBuffer::new(device_id, k.div_ceil(32))?,
             proj: DeviceBuffer::new(device_id, ne)?,
             x: DeviceBuffer::new(device_id, ne)?,
-            captured: [false; MTP_SRC_LAYERS.len()],
+            captured: [false; DRAFT_SRC_LAYERS.len()],
             ring_writes: 0,
             graphs: std::collections::HashMap::new(),
-            sel_stats: DeviceBuffer::new(device_id, 8 * b * MTP_TOPK as usize)?,
+            sel_stats: DeviceBuffer::new(device_id, 8 * b * DRAFT_TOPK as usize)?,
             expert_stats: ExpertStats::default(),
 
             h: DeviceBuffer::new(device_id, b * N_HC as usize * ne)?,
@@ -745,12 +745,12 @@ impl MtpState {
             attn_out: DeviceBuffer::new(device_id, b * ne)?,
 
             ffn_xq: DeviceBuffer::new(device_id, b * XQ_BYTES_PER_TOKEN)?,
-            router_logits: DeviceBuffer::new(device_id, b * MTP_N_EXPERT)?,
-            d_selected: DeviceBuffer::new(device_id, b * MTP_TOPK as usize)?,
-            d_ew: DeviceBuffer::new(device_id, b * MTP_TOPK as usize)?,
+            router_logits: DeviceBuffer::new(device_id, b * DRAFT_N_EXPERT)?,
+            d_selected: DeviceBuffer::new(device_id, b * DRAFT_TOPK as usize)?,
+            d_ew: DeviceBuffer::new(device_id, b * DRAFT_TOPK as usize)?,
             remap,
-            mid: DeviceBuffer::new(device_id, b * MTP_TOPK as usize * N_FF_EXP as usize)?,
-            midq: DeviceBuffer::new(device_id, b * MTP_TOPK as usize * MIDQ_BYTES_PER_SLOT)?,
+            mid: DeviceBuffer::new(device_id, b * DRAFT_TOPK as usize * N_FF_EXP as usize)?,
+            midq: DeviceBuffer::new(device_id, b * DRAFT_TOPK as usize * MIDQ_BYTES_PER_SLOT)?,
             gate_sh: DeviceBuffer::new(device_id, b * N_FF_SHARED as usize)?,
             up_sh: DeviceBuffer::new(device_id, b * N_FF_SHARED as usize)?,
             mid_sh: DeviceBuffer::new(device_id, b * N_FF_SHARED as usize)?,
@@ -763,7 +763,7 @@ impl MtpState {
 
     /// Start a new token: forget last token's captures.
     pub fn begin_token(&mut self) {
-        self.captured = [false; MTP_SRC_LAYERS.len()];
+        self.captured = [false; DRAFT_SRC_LAYERS.len()];
     }
 
     /// Inject `main_x` directly, bypassing capture. For validating `entry`
@@ -771,12 +771,12 @@ impl MtpState {
     /// rather than from a live decode.
     #[doc(hidden)]
     pub fn inject_main_hidden(&mut self, host: &[f32]) -> eyre::Result<()> {
-        let want = MTP_SRC_LAYERS.len() * N_EMBD as usize;
+        let want = DRAFT_SRC_LAYERS.len() * N_EMBD as usize;
         if host.len() != want {
             return Err(eyre!("inject_main_hidden: {} floats, want {want}", host.len()));
         }
         self.main_x.copy_from_host(host)?;
-        self.captured = [true; MTP_SRC_LAYERS.len()];
+        self.captured = [true; DRAFT_SRC_LAYERS.len()];
         Ok(())
     }
 
@@ -790,7 +790,7 @@ impl MtpState {
     /// Slot for `layer` if it feeds the drafter.
     #[inline]
     pub fn src_slot(layer: i32) -> Option<usize> {
-        MTP_SRC_LAYERS.iter().position(|&l| l == layer)
+        DRAFT_SRC_LAYERS.iter().position(|&l| l == layer)
     }
 
     /// Capture the residual ENTERING `layer`, collapsed over the hc copies.
@@ -816,15 +816,15 @@ impl MtpState {
     /// Errors if any source layer was missed: running on a partial `main_x`
     /// would silently draft from a stale residual, which is precisely the class
     /// of bug that made DSpark acceptance read 0.44 for weeks.
-    pub fn entry(&mut self, e: &DeviceEngine, s: &Stream, w: &MtpWeights) -> eyre::Result<()> {
+    pub fn entry(&mut self, e: &DeviceEngine, s: &Stream, w: &DrafterWeights) -> eyre::Result<()> {
         if let Some(i) = self.captured.iter().position(|c| !c) {
             return Err(eyre!(
                 "mtp entry: residual for layer {} was never captured this token",
-                MTP_SRC_LAYERS[i]
+                DRAFT_SRC_LAYERS[i]
             ));
         }
         let _t = e.events.stage("mtp.entry", s)?;
-        let k = (MTP_SRC_LAYERS.len() * N_EMBD as usize) as u32;
+        let k = (DRAFT_SRC_LAYERS.len() * N_EMBD as usize) as u32;
         // `main_proj` is Q8_0, so `dense_matvec` reads the QUANTIZED input, not
         // the f32 one. Skipping this leaves xq/xscale zeroed and the projection
         // silently returns all zeros.
@@ -844,8 +844,8 @@ impl MtpState {
     #[inline]
     fn ring_geom(&self) -> (usize, usize) {
         (
-            MTP_WINDOW.min(self.ring_writes + 1),
-            self.ring_writes % MTP_WINDOW,
+            DRAFT_WINDOW.min(self.ring_writes + 1),
+            self.ring_writes % DRAFT_WINDOW,
         )
     }
 
@@ -856,7 +856,7 @@ impl MtpState {
     /// conversation. The ring is process-lifetime state and was never reset,
     /// so from the SECOND request onward the drafter attended over a 128-row
     /// window still holding the PREVIOUS conversation's positions
-    /// (`ring_geom` reports `n_valid = min(MTP_WINDOW, ring_writes + 1)`, which
+    /// (`ring_geom` reports `n_valid = min(DRAFT_WINDOW, ring_writes + 1)`, which
     /// keeps counting across requests). Measured cost: accept-mode E is
     /// 1.66-1.86 on the first request after a restart and collapses to
     /// 1.11-1.27 on every request after it -- reproducibly, in eight separate
@@ -869,14 +869,14 @@ impl MtpState {
         self.ring_writes = 0;
     }
 
-    /// `mtp_expert_stats`: tally the last draft's per-layer picks (call after
+    /// `drafter_expert_stats`: tally the last draft's per-layer picks (call after
     /// the drafter's stream is synchronized) and log a rollup every 200.
     pub fn tally_expert_stats(&mut self, n_layers: usize) -> eyre::Result<()> {
-        if !mtp_expert_stats() {
+        if !drafter_expert_stats() {
             return Ok(());
         }
-        let tk = MTP_TOPK as usize;
-        let n = MTP_BLOCK * tk;
+        let tk = DRAFT_TOPK as usize;
+        let n = DRAFT_BLOCK * tk;
         let nl = n_layers.min(8);
         let mut h = vec![0i32; nl * n];
         self.sel_stats.slice_view(0, nl * n).copy_to_host(&mut h)?;
@@ -913,11 +913,11 @@ impl MtpState {
 
     /// Ring rows written so far, capped at the window.
     pub fn ring_filled(&self) -> usize {
-        self.ring_writes.min(MTP_WINDOW)
+        self.ring_writes.min(DRAFT_WINDOW)
     }
 
     /// The ring write counter (`ring_writes`). With `set_ring_writes` and a
-    /// swap of `rings`, one `MtpState`'s scratch serves several streams, each
+    /// swap of `rings`, one `DrafterState`'s scratch serves several streams, each
     /// with its own ring (the multistream arena keeps one ring per slot).
     pub fn ring_writes(&self) -> usize {
         self.ring_writes
@@ -955,14 +955,14 @@ impl MtpState {
                 noise_row.len()
             ));
         }
-        let mut host = vec![0.0f32; MTP_BLOCK * hcd];
-        for j in 0..MTP_BLOCK {
+        let mut host = vec![0.0f32; DRAFT_BLOCK * hcd];
+        for j in 0..DRAFT_BLOCK {
             let row = if j == 0 { token_row } else { noise_row };
             host[j * hcd..(j + 1) * hcd].copy_from_slice(row);
         }
         self.h.copy_from_host(&host)?;
-        let mut pre = vec![0.0f32; MTP_BLOCK * HC_MIX_DIM as usize];
-        for j in 0..MTP_BLOCK {
+        let mut pre = vec![0.0f32; DRAFT_BLOCK * HC_MIX_DIM as usize];
+        for j in 0..DRAFT_BLOCK {
             pre[j * HC_MIX_DIM as usize] = 1.0;
         }
         self.pre_carry.copy_from_host(&pre)?;
@@ -990,7 +990,7 @@ impl MtpState {
         // 1..4 as ZEROS and leaves row 4's result sitting in row 0 (see
         // tests/f16_gemm_batched_small_b.rs). Silently, with no error — which
         // fed the drafter constant mHC mixes and a uniform router.
-        for j in 0..MTP_BLOCK {
+        for j in 0..DRAFT_BLOCK {
             let fj = self.flat.slice_view(j * HC_DIM as usize, HC_DIM as usize);
             let mut mj = self
                 .mix
@@ -1035,7 +1035,7 @@ impl MtpState {
         &mut self,
         e: &DeviceEngine,
         s: &Stream,
-        w: &MtpLayerWeights,
+        w: &DrafterLayerWeights,
         li: usize,
         rope: &crate::RopeParams,
     ) -> eyre::Result<()> {
@@ -1050,12 +1050,12 @@ impl MtpState {
         // normal HIP launch. Nothing in the source explains that yet, so measure
         // where inside the layer it accrues before theorising.
         {
-            let _h = HostUs::start_dev(&MTP_H_HCMIX, s);
+            let _h = HostUs::start_dev(&DRAFT_H_HCMIX, s);
             self.hc_mixes(e, s, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base)?;
             self.hc_pre_and_carry(e, s)?;
         }
         {
-            let _h = HostUs::start_dev(&MTP_H_RMS, s);
+            let _h = HostUs::start_dev(&DRAFT_H_RMS, s);
             e.rms_w.launch_weighted_batched(
                 s, &mut self.normed, &self.cur, &w.attn_norm, N_EMBD, RMS_EPS, B,
             )?;
@@ -1064,36 +1064,36 @@ impl MtpState {
             let z = vec![0.0f32; self.attn_out.len()];
             self.attn_out.copy_from_host(&z)?;
         } else {
-            let _h = HostUs::start_dev(&MTP_H_ATTN, s);
+            let _h = HostUs::start_dev(&DRAFT_H_ATTN, s);
             self.attn(e, s, w, li, rope)?;
         }
         {
-            let _h = HostUs::start_dev(&MTP_H_POST, s);
+            let _h = HostUs::start_dev(&DRAFT_H_POST, s);
             self.hc_post(e, s, true)?;
         }
 
         {
-            let _h = HostUs::start_dev(&MTP_H_HCMIX, s);
+            let _h = HostUs::start_dev(&DRAFT_H_HCMIX, s);
             self.hc_mixes(e, s, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base)?;
             self.hc_pre_and_carry(e, s)?;
         }
         {
-            let _h = HostUs::start_dev(&MTP_H_RMS, s);
+            let _h = HostUs::start_dev(&DRAFT_H_RMS, s);
             e.rms_w.launch_weighted_batched(
                 s, &mut self.normed, &self.cur, &w.ffn_norm, N_EMBD, RMS_EPS, B,
             )?;
         }
         {
-            let _h = HostUs::start_dev(&MTP_H_MOE, s);
+            let _h = HostUs::start_dev(&DRAFT_H_MOE, s);
             self.moe(e, s, w)?;
         }
-        if mtp_expert_stats() && li < 8 {
-            let n = MTP_BLOCK * MTP_TOPK as usize;
+        if drafter_expert_stats() && li < 8 {
+            let n = DRAFT_BLOCK * DRAFT_TOPK as usize;
             let mut dst = self.sel_stats.slice_view_mut(li * n, n);
             dst.copy_from_buffer_async(&self.d_selected.slice_view(0, n), s)?;
         }
         {
-            let _h = HostUs::start_dev(&MTP_H_POST, s);
+            let _h = HostUs::start_dev(&DRAFT_H_POST, s);
             self.hc_post(e, s, false)?;
         }
         Ok(())
@@ -1108,7 +1108,7 @@ impl MtpState {
         &mut self,
         e: &DeviceEngine,
         s: &Stream,
-        w: &MtpWeights,
+        w: &DrafterWeights,
         rope: &crate::RopeParams,
         pos: u32,
         token_row: &[f32],
@@ -1122,9 +1122,9 @@ impl MtpState {
         self.embed(s, token_row, noise_row)?;
         self.stage_indices(s, pos, true)?;
         let (n_valid, _) = self.ring_geom();
-        let graph = mtp_graphs()
-            && n_valid == MTP_WINDOW
-            && mtp_timing_mode() == 0
+        let graph = drafter_graphs()
+            && n_valid == DRAFT_WINDOW
+            && drafter_timing_mode() == 0
             && !no_attn()
             && !no_routed()
             && !debug_moe();
@@ -1153,7 +1153,7 @@ impl MtpState {
         Ok(())
     }
 
-    fn entry_and_layers(&mut self, e: &DeviceEngine, s: &Stream, w: &MtpWeights, rope: &crate::RopeParams) -> eyre::Result<()> {
+    fn entry_and_layers(&mut self, e: &DeviceEngine, s: &Stream, w: &DrafterWeights, rope: &crate::RopeParams) -> eyre::Result<()> {
         self.entry(e, s, w)?;
         for li in 0..w.layers.len() {
             self.layer(e, s, &w.layers[li], li, rope)?;
@@ -1177,7 +1177,7 @@ impl MtpState {
             slots[0] = main_slot as u32;
             poss[0] = pos;
             if with_block {
-                for j in 0..MTP_BLOCK {
+                for j in 0..DRAFT_BLOCK {
                     slots[j + 1] = (n_valid + j) as u32;
                     poss[j + 1] = pos + 1 + j as u32;
                 }
@@ -1186,7 +1186,7 @@ impl MtpState {
                 *d = (pos + 1 + j as u32) as i32;
             }
         }
-        let _hc = HostUs::start(&MTP_H_KVCOPY);
+        let _hc = HostUs::start(&DRAFT_H_KVCOPY);
         self.slot_dev.copy_from_host_async(&self.stage_slots[si], s)?;
         self.pos_dev.copy_from_host_async(&self.stage_poss[si], s)?;
         if with_block {
@@ -1205,7 +1205,7 @@ impl MtpState {
         &mut self,
         e: &DeviceEngine,
         s: &Stream,
-        w: &MtpWeights,
+        w: &DrafterWeights,
         rope: &crate::RopeParams,
         pos: u32,
         main_hidden: &[f32],
@@ -1233,7 +1233,7 @@ impl MtpState {
     ///
     ///   * the RING is fed from `main_x` — the main model's residuals, NOT the
     ///     draft stream — roped at the MAIN position and written at
-    ///     `pos % MTP_WINDOW`. One row per accepted token, and the same source
+    ///     `pos % DRAFT_WINDOW`. One row per accepted token, and the same source
     ///     for every layer;
     ///   * the QUERY comes from the draft stream, and so does the block's own
     ///     KV, roped at draft positions `pos+1 ..= pos+B`. That KV is TRANSIENT:
@@ -1254,7 +1254,7 @@ impl MtpState {
     /// nothing else.
     ///
     /// `advance_ring` runs the FULL drafter forward per accepted token — it
-    /// drafts MTP_BLOCK tokens and throws them away — because the ring must be
+    /// drafts DRAFT_BLOCK tokens and throws them away — because the ring must be
     /// dense AND the hyper-connection carry must advance. MEASURED, that costs
     /// 11.0 ms per accepted token (`draft_ms = 16.8 + 11.00*n`), so acceptance
     /// taxes itself: every token DSpark wins costs 11 ms back.
@@ -1272,7 +1272,7 @@ impl MtpState {
         &mut self,
         e: &DeviceEngine,
         s: &Stream,
-        w: &MtpWeights,
+        w: &DrafterWeights,
         rope: &crate::RopeParams,
         pos: u32,
     ) -> eyre::Result<()> {
@@ -1302,12 +1302,12 @@ impl MtpState {
         &mut self,
         e: &DeviceEngine,
         s: &Stream,
-        w: &MtpWeights,
+        w: &DrafterWeights,
         rope: &crate::RopeParams,
         pos0: u32,
         hidden: &[f32],
     ) -> eyre::Result<()> {
-        let k = MTP_SRC_LAYERS.len() * N_EMBD as usize;
+        let k = DRAFT_SRC_LAYERS.len() * N_EMBD as usize;
         let ne = N_EMBD as usize;
         let r = hidden.len() / k;
         if r == 0 || r > RING_ROWS_MAX || hidden.len() != r * k {
@@ -1326,7 +1326,7 @@ impl MtpState {
         let si = self.stage_idx % STAGE_N;
         self.stage_idx = self.stage_idx.wrapping_add(1);
         for j in 0..r {
-            self.stage_slots[si][j] = ((self.ring_writes + j) % MTP_WINDOW) as u32;
+            self.stage_slots[si][j] = ((self.ring_writes + j) % DRAFT_WINDOW) as u32;
             self.stage_poss[si][j] = pos0 + j as u32;
         }
         self.slot_dev.copy_from_host_async(&self.stage_slots[si], s)?;
@@ -1371,7 +1371,7 @@ impl MtpState {
         &mut self,
         e: &DeviceEngine,
         s: &Stream,
-        w: &MtpLayerWeights,
+        w: &DrafterLayerWeights,
         li: usize,
         rope: &crate::RopeParams,
     ) -> eyre::Result<()> {
@@ -1395,13 +1395,13 @@ impl MtpState {
         &mut self,
         e: &DeviceEngine,
         s: &Stream,
-        w: &MtpLayerWeights,
+        w: &DrafterLayerWeights,
         li: usize,
         rope: &crate::RopeParams,
     ) -> eyre::Result<()> {
-        let _hkv = HostUs::start_dev(&MTP_H_ATTNKV, s);
+        let _hkv = HostUs::start_dev(&DRAFT_H_ATTNKV, s);
         let (n_valid, _) = self.ring_geom();
-        let n_kv = (n_valid + MTP_BLOCK) as u32;
+        let n_kv = (n_valid + DRAFT_BLOCK) as u32;
         if n_kv > crate::attention::ATTN_MIXED_MAX_KEYS {
             return Err(eyre!("mtp attn: n_kv={n_kv} exceeds the attention key cap"));
         }
@@ -1416,7 +1416,7 @@ impl MtpState {
         e.q8.matvec_bpack(
             s, &mut self.kv_raw, &w.attn_kv.buffer, &self.xq, &self.xscale, N_HEAD_DIM, N_EMBD, B,
         )?;
-        for j in 0..MTP_BLOCK {
+        for j in 0..DRAFT_BLOCK {
             let row = self.kv_raw.slice_view(j * N_HEAD_DIM as usize, N_HEAD_DIM as usize);
             kv_post_row(
                 e, s, &mut self.kv_normed, &mut self.rings[li], &row, &w.kv_a_norm,
@@ -1427,7 +1427,7 @@ impl MtpState {
         drop(_hkv);
 
         // --- queries ---
-        let _hqa = HostUs::start_dev(&MTP_H_ATTNQA, s);
+        let _hqa = HostUs::start_dev(&DRAFT_H_ATTNQA, s);
         // The comment here used to read "B is 5, so the loop is cheaper than a new
         // kernel". MEASURED, that is false: this block costs 3074 us of DEVICE time
         // per draft (V41_DSPARK_LAYER_TIMING=2), because each of the 5 iterations
@@ -1442,7 +1442,7 @@ impl MtpState {
                 N_LORA_Q, N_EMBD, B,
             )?;
         } else {
-            for j in 0..MTP_BLOCK {
+            for j in 0..DRAFT_BLOCK {
                 let xr = self.normed.slice_view(j * N_EMBD as usize, N_EMBD as usize);
                 let xqr = self.xq.slice_view(j * N_EMBD as usize, N_EMBD as usize);
                 let xsr = self
@@ -1481,8 +1481,8 @@ impl MtpState {
         // out — `out` is left untouched and attention silently returns zeros.
         // `attention_mixed_score` / `attention_mixed_softmax_wsum` carry no arch
         // guard. B is 5, so the loop costs 10 small launches per layer.
-        let _hq = HostUs::start_dev(&MTP_H_ATTNQ, s);
-        for j in 0..MTP_BLOCK {
+        let _hq = HostUs::start_dev(&DRAFT_H_ATTNQ, s);
+        for j in 0..DRAFT_BLOCK {
             let qj = self.q.slice_view(j * Q_FLAT as usize, Q_FLAT as usize);
             e.attn_mixed.launch_score(
                 s, &mut self.scores, &qj, &self.rings[li], None, N_HEAD, N_HEAD_DIM, n_kv, 0,
@@ -1499,15 +1499,15 @@ impl MtpState {
         )?;
 
         // --- output projection: grouped wo_a, then wo_b ---
-        let _ho = HostUs::start_dev(&MTP_H_ATTNO, s);
+        let _ho = HostUs::start_dev(&DRAFT_H_ATTNO, s);
         {
-            let _t = HostUs::start_dev(&MTP_H_OQUANT, s);
+            let _t = HostUs::start_dev(&DRAFT_H_OQUANT, s);
             e.q8.quantize_input_batched(
                 s, &mut self.heads_xq, &mut self.heads_xscale, &self.heads, Q_FLAT, B,
             )?;
         }
         {
-            let _t = HostUs::start_dev(&MTP_H_OWA, s);
+            let _t = HostUs::start_dev(&DRAFT_H_OWA, s);
             // B-packed for the same reason as `owb` below: the batched twin
             // re-read all 35.7 MB of `attn_output_a` once per row (6.05
             // ms/step vs a 0.47 ms single-read roofline).
@@ -1517,13 +1517,13 @@ impl MtpState {
             )?;
         }
         {
-            let _t = HostUs::start_dev(&MTP_H_OQUANT, s);
+            let _t = HostUs::start_dev(&DRAFT_H_OQUANT, s);
             e.q8.quantize_input_batched(
                 s, &mut self.low_xq, &mut self.low_xscale, &self.low, OUT_LOW, B,
             )?;
         }
         {
-            let _t = HostUs::start_dev(&MTP_H_OWB, s);
+            let _t = HostUs::start_dev(&DRAFT_H_OWB, s);
             // B-PACKED: `matvec_batched` launches grid.z = B, so each of the 5
             // rows re-reads all 44.6 MB of `attn_output_b` -- MEASURED 8.79
             // ms/step against a 0.58 ms single-read roofline. `matvec_bpack`
@@ -1545,37 +1545,37 @@ impl MtpState {
     /// `n_used` at runtime, so 128/3 needs no kernel change against the main
     /// model's 384/6.
     ///
-    /// `cap = MTP_TOPK` makes the sentinel path a no-op exactly as it does for
+    /// `cap = DRAFT_TOPK` makes the sentinel path a no-op exactly as it does for
     /// box 2: a resident expert has `remap < 0` so the kernel claims it, and the
     /// sentinel has `remap == 0` with `res_rank < cap` so it is skipped.
-    fn moe(&mut self, e: &DeviceEngine, s: &Stream, w: &MtpLayerWeights) -> eyre::Result<()> {
+    fn moe(&mut self, e: &DeviceEngine, s: &Stream, w: &DrafterLayerWeights) -> eyre::Result<()> {
         // Per-row, for the same reason as `hc_mixes`: at B=5 the batched WMMA
         // GEMM returned a constant, so every token routed to experts [0, 1, 2]
         // with weight 0.5 — a uniform softmax wearing a router's clothes.
         {
-        let _t = HostUs::start_dev(&MTP_H_MROUT, s);
-        for j in 0..MTP_BLOCK {
+        let _t = HostUs::start_dev(&DRAFT_H_MROUT, s);
+        for j in 0..DRAFT_BLOCK {
             let xj = self.normed.slice_view(j * N_EMBD as usize, N_EMBD as usize);
             let mut lj = self
                 .router_logits
-                .slice_view_mut(j * MTP_N_EXPERT, MTP_N_EXPERT);
-            e.f16.matvec(s, &mut lj, &w.ffn_gate_inp.buffer, &xj, MTP_N_EXPERT as u32, N_EMBD)?;
+                .slice_view_mut(j * DRAFT_N_EXPERT, DRAFT_N_EXPERT);
+            e.f16.matvec(s, &mut lj, &w.ffn_gate_inp.buffer, &xj, DRAFT_N_EXPERT as u32, N_EMBD)?;
         }
         }
         {
-        let _t = HostUs::start_dev(&MTP_H_MTOPK, s);
-        for j in 0..MTP_BLOCK {
-            let lg = self.router_logits.slice_view(j * MTP_N_EXPERT, MTP_N_EXPERT);
-            let mut sel = self.d_selected.slice_view_mut(j * MTP_TOPK as usize, MTP_TOPK as usize);
-            let mut ew = self.d_ew.slice_view_mut(j * MTP_TOPK as usize, MTP_TOPK as usize);
+        let _t = HostUs::start_dev(&DRAFT_H_MTOPK, s);
+        for j in 0..DRAFT_BLOCK {
+            let lg = self.router_logits.slice_view(j * DRAFT_N_EXPERT, DRAFT_N_EXPERT);
+            let mut sel = self.d_selected.slice_view_mut(j * DRAFT_TOPK as usize, DRAFT_TOPK as usize);
+            let mut ew = self.d_ew.slice_view_mut(j * DRAFT_TOPK as usize, DRAFT_TOPK as usize);
             e.router_topk.launch(
-                s, &mut sel, &mut ew, &lg, Some(&w.exp_probs_b), MTP_N_EXPERT as u32, MTP_TOPK,
+                s, &mut sel, &mut ew, &lg, Some(&w.exp_probs_b), DRAFT_N_EXPERT as u32, DRAFT_TOPK,
                 EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS,
             )?;
         }
         }
         {
-            let _t = HostUs::start_dev(&MTP_H_MQ8K, s);
+            let _t = HostUs::start_dev(&DRAFT_H_MQ8K, s);
             e.q8k
                 .launch(s, &mut self.ffn_xq, &self.normed, BLOCKS_Q8K_GATE_IN * B)?;
         }
@@ -1584,7 +1584,7 @@ impl MtpState {
         // 2's executor passes N_FF_EXP / N_EMBD there). So the block's rows are
         // a loop, not a batch dimension. Passing B=5 here reached the MXFP4
         // pair kernel as `n_rows=5` and tripped its `% 8` check.
-        let tk = MTP_TOPK as usize;
+        let tk = DRAFT_TOPK as usize;
         let ffe = N_FF_EXP as usize;
         let ne = N_EMBD as usize;
         // GROUPED (`V41_MTP_MOE_GROUPED`): the same three steps once for the
@@ -1594,62 +1594,62 @@ impl MtpState {
         // bytes the 5 per-row launches would. The kernels derive the groups
         // from `d_selected` on the device: no readback, graph-capturable.
         let mxfp4 = v4flash_core::gguf::GgufType::MXFP4;
-        let grouped = mtp_moe_grouped()
+        let grouped = drafter_moe_grouped()
             && !no_routed()
             && w.routed.gate.dtype == mxfp4
             && w.routed.up.dtype == mxfp4
             && w.routed.down.dtype == mxfp4;
         if grouped {
-            let n_picks = B * MTP_TOPK;
+            let n_picks = B * DRAFT_TOPK;
             {
-                let _t = HostUs::start_dev(&MTP_H_MGATEUP, s);
+                let _t = HostUs::start_dev(&DRAFT_H_MGATEUP, s);
                 e.mxfp4pair.launch_fused_swiglu_grouped(
                     s, &mut self.mid, &w.routed.gate.buffer, &w.routed.up.buffer, &self.ffn_xq,
                     &self.d_ew, &self.d_selected, &self.remap,
                     w.routed.gate_bytes_per_expert as u32, w.routed.up_bytes_per_expert as u32,
-                    SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, B, MTP_TOPK,
+                    SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, B, DRAFT_TOPK,
                 )?;
             }
             {
-                let _t = HostUs::start_dev(&MTP_H_MQ8K, s);
+                let _t = HostUs::start_dev(&DRAFT_H_MQ8K, s);
                 e.q8k.launch(s, &mut self.midq, &self.mid, BLOCKS_Q8K_DOWN_IN * n_picks)?;
             }
             {
-                let _t = HostUs::start_dev(&MTP_H_MDOWN, s);
+                let _t = HostUs::start_dev(&DRAFT_H_MDOWN, s);
                 e.mxfp4.launch_grouped(
                     s, &mut self.ffn_out, &w.routed.down.buffer, &self.midq, &self.d_selected,
                     &self.remap, w.routed.down_bytes_per_expert as u32,
-                    MIDQ_BYTES_PER_SLOT as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN, B, MTP_TOPK,
+                    MIDQ_BYTES_PER_SLOT as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN, B, DRAFT_TOPK,
                 )?;
             }
         }
-        for j in 0..(if no_routed() || grouped { 0 } else { MTP_BLOCK }) {
+        for j in 0..(if no_routed() || grouped { 0 } else { DRAFT_BLOCK }) {
             let xq_j = self.ffn_xq.slice_view(j * XQ_BYTES_PER_TOKEN, XQ_BYTES_PER_TOKEN);
             let ew_j = self.d_ew.slice_view(j * tk, tk);
             let sel_j = self.d_selected.slice_view(j * tk, tk);
             let mut mid_j = self.mid.slice_view_mut(j * tk * ffe, tk * ffe);
-            let _tgu = HostUs::start_dev(&MTP_H_MGATEUP, s);
+            let _tgu = HostUs::start_dev(&DRAFT_H_MGATEUP, s);
             crate::het::dispatch::moe_gate_up_batch_hetsplit(
                 e, w.routed.gate.dtype, s, &mut mid_j, &w.routed.gate.buffer,
-                &w.routed.up.buffer, &xq_j, &ew_j, &sel_j, &self.remap, 0, MTP_TOPK,
+                &w.routed.up.buffer, &xq_j, &ew_j, &sel_j, &self.remap, 0, DRAFT_TOPK,
                 w.routed.gate_bytes_per_expert as u32, w.routed.up_bytes_per_expert as u32,
-                MTP_TOPK, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                DRAFT_TOPK, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
             )?;
             drop(_tgu);
             let mut midq_j = self
                 .midq
                 .slice_view_mut(j * tk * MIDQ_BYTES_PER_SLOT, tk * MIDQ_BYTES_PER_SLOT);
             {
-                let _t = HostUs::start_dev(&MTP_H_MQ8K, s);
+                let _t = HostUs::start_dev(&DRAFT_H_MQ8K, s);
                 e.q8k
-                    .launch(s, &mut midq_j, &mid_j, BLOCKS_Q8K_DOWN_IN * MTP_TOPK)?;
+                    .launch(s, &mut midq_j, &mid_j, BLOCKS_Q8K_DOWN_IN * DRAFT_TOPK)?;
             }
             let mut out_j = self.ffn_out.slice_view_mut(j * ne, ne);
-            let _td = HostUs::start_dev(&MTP_H_MDOWN, s);
+            let _td = HostUs::start_dev(&DRAFT_H_MDOWN, s);
             crate::het::dispatch::moe_down_batched_hetsplit(
                 e, w.routed.down.dtype, s, &mut out_j, &w.routed.down.buffer, &midq_j, &sel_j,
-                &self.remap, 0, MTP_TOPK, w.routed.down_bytes_per_expert as u32,
-                MIDQ_BYTES_PER_SLOT as u32, MTP_TOPK, N_EMBD, BLOCKS_Q8K_DOWN_IN,
+                &self.remap, 0, DRAFT_TOPK, w.routed.down_bytes_per_expert as u32,
+                MIDQ_BYTES_PER_SLOT as u32, DRAFT_TOPK, N_EMBD, BLOCKS_Q8K_DOWN_IN,
             )?;
         }
 
@@ -1661,16 +1661,16 @@ impl MtpState {
             && MOE_DBG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6;
         let routed_rms = if dbg {
             s.synchronize()?;
-            let mut sel = vec![0i32; MTP_BLOCK * MTP_TOPK as usize];
+            let mut sel = vec![0i32; DRAFT_BLOCK * DRAFT_TOPK as usize];
             self.d_selected.copy_to_host(&mut sel)?;
-            let mut ew = vec![0.0f32; MTP_BLOCK * MTP_TOPK as usize];
+            let mut ew = vec![0.0f32; DRAFT_BLOCK * DRAFT_TOPK as usize];
             self.d_ew.copy_to_host(&mut ew)?;
             let mut o = vec![0.0f32; self.ffn_out.len()];
             self.ffn_out.copy_to_host(&mut o)?;
             let rms = (o.iter().map(|v| v * v).sum::<f32>() / o.len() as f32).sqrt();
             tracing::info!(
-                selected = ?&sel[..MTP_TOPK as usize * 2],
-                weights = ?&ew[..MTP_TOPK as usize * 2],
+                selected = ?&sel[..DRAFT_TOPK as usize * 2],
+                weights = ?&ew[..DRAFT_TOPK as usize * 2],
                 routed_rms = format!("{rms:.5}"),
                 "mtp.moe.dbg"
             );
@@ -1700,7 +1700,7 @@ impl MtpState {
             e.q8.matvec_bpack(s, &mut self.gate_sh, &w.shared.gate.buffer, &self.xq, &self.xscale, N_FF_SHARED, N_EMBD, B)?;
             e.q8.matvec_bpack(s, &mut self.up_sh, &w.shared.up.buffer, &self.xq, &self.xscale, N_FF_SHARED, N_EMBD, B)?;
         }
-        for j in 0..(if bpack { 0 } else { MTP_BLOCK }) {
+        for j in 0..(if bpack { 0 } else { DRAFT_BLOCK }) {
             let xr = self.normed.slice_view(j * ne, ne);
             let xqr = self.xq.slice_view(j * ne, ne);
             let xsr = self.xscale.slice_view(j * ne.div_ceil(32), ne.div_ceil(32));
@@ -1725,7 +1725,7 @@ impl MtpState {
                 s, &mut self.ffn_shared, &w.shared.down.buffer, &self.mid_sh_xq, &self.mid_sh_xscale, N_EMBD, N_FF_SHARED, B,
             )?;
         }
-        for j in 0..(if bpack { 0 } else { MTP_BLOCK }) {
+        for j in 0..(if bpack { 0 } else { DRAFT_BLOCK }) {
             let nf = N_FF_SHARED as usize;
             let mr = self.mid_sh.slice_view(j * nf, nf);
             let mq = self.mid_sh_xq.slice_view(j * nf, nf);
@@ -1782,7 +1782,7 @@ impl MtpState {
 /// Candidates per draft position in a SAMPLED draft (plan 2.2): the draft is
 /// drawn from the drafter's tempered distribution truncated to its top-M, and
 /// exactly that q is exported to the verifier.
-pub const MTP_DRAFT_TOP_M: usize = 64;
+pub const DRAFT_TOP_M: usize = 64;
 
 /// How the exit draws SAMPLED drafts (DSpark plan 2.2 / M6): at the request's
 /// temperature, min-p and top-p over the drafter's top-`m` biased logits, each
@@ -1797,7 +1797,7 @@ pub struct DraftSampling {
     /// and is always rejected, ending its block (KNOWN_BUGS #50).
     pub min_p_rel: f32,
     pub m: usize,
-    pub u: [f32; MTP_BLOCK],
+    pub u: [f32; DRAFT_BLOCK],
 }
 
 /// The draft distribution of one position and its draw. `ids` / `logits` are
@@ -1846,7 +1846,7 @@ pub fn draft_dist(ids: &[i32], logits: &[f32], temperature: f32, top_p: f32, min
     Ok((q, pick))
 }
 
-pub struct MtpExit {
+pub struct DrafterExit {
     /// The drafter's final residual and carried pre-mix, staged on THIS device.
     /// The layer stack runs on the iGPU and the exit on the dGPU (that is where
     /// the tied head lives), so they are handed across through the host: 410 KB
@@ -1871,8 +1871,8 @@ pub struct MtpExit {
     /// the reference returns it alongside the drafts; it is the drafter's own
     /// estimate of whether draft `i` will survive verification, which is exactly
     /// the signal for deciding HOW MANY drafts to submit.
-    pub conf: [f32; MTP_BLOCK],
-    /// Host copy of the `[1, N_EMBD + MTP_MARKOV_RANK]` projection, read once.
+    pub conf: [f32; DRAFT_BLOCK],
+    /// Host copy of the `[1, N_EMBD + DRAFT_MARKOV_RANK]` projection, read once.
     conf_w: Option<Vec<f32>>,
     /// Sampled drafts (`forward_ex` with a `DraftSampling`): each position's q,
     /// `(token, prob)` over its kept candidates; empty for argmax drafts.
@@ -1885,12 +1885,12 @@ pub struct MtpExit {
     cand: DeviceBuffer<f32>,
 }
 
-impl MtpExit {
+impl DrafterExit {
     pub fn alloc(device_id: i32) -> eyre::Result<Self> {
-        let b = MTP_BLOCK;
+        let b = DRAFT_BLOCK;
         let ne = N_EMBD as usize;
         let nv = N_VOCAB as usize;
-        let mr = MTP_MARKOV_RANK;
+        let mr = DRAFT_MARKOV_RANK;
         Ok(Self {
             h: DeviceBuffer::new(device_id, b * HC_DIM as usize)?,
             pre_carry: DeviceBuffer::new(device_id, b * HC_MIX_DIM as usize)?,
@@ -1904,16 +1904,16 @@ impl MtpExit {
             memb_xscale: DeviceBuffer::new(device_id, mr.div_ceil(32))?,
             bias: DeviceBuffer::new(device_id, nv)?,
             tok_dev: DeviceBuffer::new(device_id, 1)?,
-            conf: [0.0; MTP_BLOCK],
+            conf: [0.0; DRAFT_BLOCK],
             conf_w: None,
             q: Vec::new(),
-            topk_sel: DeviceBuffer::new(device_id, MTP_DRAFT_TOP_M)?,
+            topk_sel: DeviceBuffer::new(device_id, DRAFT_TOP_M)?,
             topk_bits: DeviceBuffer::new(device_id, nv.div_ceil(32))?,
             topk_scratch: DeviceBuffer::new(
                 device_id,
-                crate::indexer::topk_merge_levels(N_VOCAB, MTP_DRAFT_TOP_M as u32).iter().map(|&n| n as usize).sum::<usize>().max(1),
+                crate::indexer::topk_merge_levels(N_VOCAB, DRAFT_TOP_M as u32).iter().map(|&n| n as usize).sum::<usize>().max(1),
             )?,
-            cand: DeviceBuffer::new(device_id, MTP_DRAFT_TOP_M)?,
+            cand: DeviceBuffer::new(device_id, DRAFT_TOP_M)?,
         })
     }
 
@@ -1927,7 +1927,7 @@ impl MtpExit {
         out: &mut [f32],
     ) -> eyre::Result<()> {
         use v4flash_core::gguf::GgufType;
-        let k = MTP_MARKOV_RANK;
+        let k = DRAFT_MARKOV_RANK;
         match dtype {
             GgufType::F16 => {
                 let off = id as usize * k * 2;
@@ -1944,7 +1944,7 @@ impl MtpExit {
         }
     }
 
-    /// Run the exit and return the `MTP_BLOCK` draft tokens.
+    /// Run the exit and return the `DRAFT_BLOCK` draft tokens.
     ///
     /// Greedy (`argmax`) only for now: the end-to-end gate is that speculative
     /// decode reproduces non-speculative output byte for byte, which is a greedy
@@ -1957,12 +1957,12 @@ impl MtpExit {
         s: &Stream,
         h_host: &[f32],
         pre_host: &[f32],
-        w: &MtpExitWeights,
+        w: &DrafterExitWeights,
         head: &crate::weights::DeviceWeight,
         markov_embd: &[u8],
         markov_dtype: v4flash_core::gguf::GgufType,
         first_token: i32,
-    ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
+    ) -> eyre::Result<([i32; DRAFT_BLOCK], [i32; DRAFT_BLOCK])> {
         self.forward_ex(e, s, h_host, pre_host, w, head, markov_embd, markov_dtype, first_token, true, None)
     }
 
@@ -1976,17 +1976,17 @@ impl MtpExit {
         s: &Stream,
         h_host: &[f32],
         pre_host: &[f32],
-        w: &MtpExitWeights,
+        w: &DrafterExitWeights,
         head: &crate::weights::DeviceWeight,
         markov_embd: &[u8],
         markov_dtype: v4flash_core::gguf::GgufType,
         first_token: i32,
         want_plain: bool,
         sampling: Option<&DraftSampling>,
-    ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
+    ) -> eyre::Result<([i32; DRAFT_BLOCK], [i32; DRAFT_BLOCK])> {
         if let Some(ds) = sampling {
-            if ds.m == 0 || ds.m > MTP_DRAFT_TOP_M || !(ds.temperature > 0.0) {
-                return Err(eyre!("mtp exit: sampling m={} temperature={} (m in 1..={MTP_DRAFT_TOP_M}, T > 0)", ds.m, ds.temperature));
+            if ds.m == 0 || ds.m > DRAFT_TOP_M || !(ds.temperature > 0.0) {
+                return Err(eyre!("mtp exit: sampling m={} temperature={} (m in 1..={DRAFT_TOP_M}, T > 0)", ds.m, ds.temperature));
             }
         }
         self.q.clear();
@@ -1996,15 +1996,15 @@ impl MtpExit {
         let _t = e.events.stage("mtp.exit", s)?;
         let ne = N_EMBD as usize;
         let nv = N_VOCAB as usize;
-        if h_host.len() != MTP_BLOCK * HC_DIM as usize
-            || pre_host.len() != MTP_BLOCK * HC_MIX_DIM as usize
+        if h_host.len() != DRAFT_BLOCK * HC_DIM as usize
+            || pre_host.len() != DRAFT_BLOCK * HC_MIX_DIM as usize
         {
             return Err(eyre!(
                 "mtp exit: h {} / pre {} floats, want {} / {}",
                 h_host.len(),
                 pre_host.len(),
-                MTP_BLOCK * HC_DIM as usize,
-                MTP_BLOCK * HC_MIX_DIM as usize
+                DRAFT_BLOCK * HC_DIM as usize,
+                DRAFT_BLOCK * HC_MIX_DIM as usize
             ));
         }
         self.h.copy_from_host(h_host)?;
@@ -2017,7 +2017,7 @@ impl MtpExit {
             .launch_weighted_batched(s, &mut self.xn, &self.x, &w.norm, N_EMBD, RMS_EPS, B)?;
         e.q8
             .quantize_input_batched(s, &mut self.xq, &mut self.xscale, &self.xn, N_EMBD, B)?;
-        // ONE read of the head for all MTP_BLOCK rows.
+        // ONE read of the head for all DRAFT_BLOCK rows.
         //
         // This looped `dense_matvec` per row against the TIED FULL-VOCAB head:
         // N_VOCAB(129280) x N_EMBD(5120) at Q8_0 is ~703 MB, so five rows pulled
@@ -2043,7 +2043,7 @@ impl MtpExit {
                 B,
             )?;
         } else {
-            for j in 0..MTP_BLOCK {
+            for j in 0..DRAFT_BLOCK {
                 let xj = self.xn.slice_view(j * ne, ne);
                 let qj = self.xq.slice_view(j * ne, ne);
                 let sj = self.xscale.slice_view(j * ne.div_ceil(32), ne.div_ceil(32));
@@ -2055,9 +2055,9 @@ impl MtpExit {
         // Transformer-only drafts, before any markov bias. The markov head is
         // the one component with no counterpart in the main model, so scoring
         // both tells us which half is wrong without a second run.
-        let mut plain = [-1i32; MTP_BLOCK];
+        let mut plain = [-1i32; DRAFT_BLOCK];
         let mut got = [0i32; 1];
-        for j in 0..(if want_plain { MTP_BLOCK } else { 0 }) {
+        for j in 0..(if want_plain { DRAFT_BLOCK } else { 0 }) {
             let lj = self.logits.slice_view(j * nv, nv);
             e.sampler.launch_argmax(s, &mut self.tok_dev, &lj, N_VOCAB)?;
             s.synchronize()?;
@@ -2074,19 +2074,19 @@ impl MtpExit {
         // synchronising per position for the argmax readback, so this adds no
         // device work and no extra sync.
         if self.conf_w.is_none() {
-            let n = ne + MTP_MARKOV_RANK;
+            let n = ne + DRAFT_MARKOV_RANK;
             let mut hw = vec![0.0f32; n];
             w.confidence.slice_view(0, n).copy_to_host(&mut hw)?;
             self.conf_w = Some(hw);
         }
-        let mut x_host = vec![0.0f32; MTP_BLOCK * ne];
-        self.x.slice_view(0, MTP_BLOCK * ne).copy_to_host(&mut x_host)?;
-        self.conf = [0.0; MTP_BLOCK];
+        let mut x_host = vec![0.0f32; DRAFT_BLOCK * ne];
+        self.x.slice_view(0, DRAFT_BLOCK * ne).copy_to_host(&mut x_host)?;
+        self.conf = [0.0; DRAFT_BLOCK];
 
-        let mut ids = [0i32; MTP_BLOCK];
+        let mut ids = [0i32; DRAFT_BLOCK];
         let mut prev = first_token;
-        let mut row = vec![0.0f32; MTP_MARKOV_RANK];
-        for i in 0..MTP_BLOCK {
+        let mut row = vec![0.0f32; DRAFT_MARKOV_RANK];
+        for i in 0..DRAFT_BLOCK {
             Self::markov_row(markov_embd, markov_dtype, prev, &mut row)?;
             if let Some(cw) = self.conf_w.as_ref() {
                 let xi = &x_host[i * ne..(i + 1) * ne];
@@ -2094,7 +2094,7 @@ impl MtpExit {
                 for (a, b) in cw[..ne].iter().zip(xi) {
                     acc += (*a as f64) * (*b as f64);
                 }
-                for (a, b) in cw[ne..ne + MTP_MARKOV_RANK].iter().zip(row.iter()) {
+                for (a, b) in cw[ne..ne + DRAFT_MARKOV_RANK].iter().zip(row.iter()) {
                     acc += (*a as f64) * (*b as f64);
                 }
                 self.conf[i] = acc as f32;
@@ -2102,11 +2102,11 @@ impl MtpExit {
             self.memb.copy_from_host(&row)?;
             e.q8.quantize_input(
                 s, &mut self.memb_xq, &mut self.memb_xscale, &self.memb,
-                MTP_MARKOV_RANK as u32,
+                DRAFT_MARKOV_RANK as u32,
             )?;
             crate::het::dispatch::dense_matvec(
                 e, s, &mut self.bias, &w.markov_head, &self.memb, &self.memb_xq,
-                &self.memb_xscale, N_VOCAB, MTP_MARKOV_RANK as u32,
+                &self.memb_xscale, N_VOCAB, DRAFT_MARKOV_RANK as u32,
             )?;
             let mut lj = self.logits.slice_view_mut(i * nv, nv);
             e.vec_add.launch(s, &mut lj, &self.bias, N_VOCAB)?;
@@ -2149,31 +2149,31 @@ impl MtpExit {
 
 /// dGPU-side capture of the residuals the drafter eats.
 ///
-/// `MtpState::capture` collapses the hc copies where the residual already is,
+/// `DrafterState::capture` collapses the hc copies where the residual already is,
 /// which during decode is the dGPU. The drafter itself is iGPU-resident, so the
 /// two are joined by a 60 KB readback rather than by running the entry on the
 /// wrong device. Sized `[3 * N_EMBD]` — the concatenation is free because the
 /// three means are written into adjacent slices of one buffer.
-pub struct MtpCapture {
+pub struct DrafterCapture {
     src: DeviceBuffer<f32>,
     hc_mean: DeviceBuffer<f32>,
-    captured: [bool; MTP_SRC_LAYERS.len()],
+    captured: [bool; DRAFT_SRC_LAYERS.len()],
 }
 
-impl MtpCapture {
+impl DrafterCapture {
     pub fn alloc(device_id: i32) -> eyre::Result<Self> {
         let mut hc_mean = DeviceBuffer::<f32>::new(device_id, N_HC as usize)?;
         hc_mean.copy_from_host(&vec![1.0f32 / N_HC as f32; N_HC as usize])?;
         Ok(Self {
-            src: DeviceBuffer::new(device_id, MTP_SRC_LAYERS.len() * N_EMBD as usize)?,
+            src: DeviceBuffer::new(device_id, DRAFT_SRC_LAYERS.len() * N_EMBD as usize)?,
             hc_mean,
-            captured: [false; MTP_SRC_LAYERS.len()],
+            captured: [false; DRAFT_SRC_LAYERS.len()],
         })
     }
 
     /// Start a token. Call before the layer loop.
     pub fn begin(&mut self) {
-        self.captured = [false; MTP_SRC_LAYERS.len()];
+        self.captured = [false; DRAFT_SRC_LAYERS.len()];
     }
 
     /// Capture the residual ENTERING `layer`. A no-op for layers the drafter
@@ -2185,24 +2185,24 @@ impl MtpCapture {
         layer: i32,
         residual: &DeviceBuffer<f32>,
     ) -> eyre::Result<()> {
-        let Some(slot) = MtpState::src_slot(layer) else { return Ok(()) };
+        let Some(slot) = DrafterState::src_slot(layer) else { return Ok(()) };
         let mut dst = self.src.slice_view_mut(slot * N_EMBD as usize, N_EMBD as usize);
         e.hc_weighted.launch(s, &mut dst, residual, &self.hc_mean, N_EMBD, N_HC)?;
         self.captured[slot] = true;
         Ok(())
     }
 
-    /// Read the concatenated residuals back for `MtpState::inject_main_hidden`.
+    /// Read the concatenated residuals back for `DrafterState::inject_main_hidden`.
     /// Errors if a source layer was missed — drafting from a stale residual is
     /// exactly the failure that read as 0.44 acceptance for weeks.
     pub fn read(&self, out: &mut Vec<f32>) -> eyre::Result<()> {
         if let Some(i) = self.captured.iter().position(|c| !c) {
             return Err(eyre!(
                 "mtp capture: residual for layer {} was never captured this token",
-                MTP_SRC_LAYERS[i]
+                DRAFT_SRC_LAYERS[i]
             ));
         }
-        out.resize(MTP_SRC_LAYERS.len() * N_EMBD as usize, 0.0);
+        out.resize(DRAFT_SRC_LAYERS.len() * N_EMBD as usize, 0.0);
         self.src.copy_to_host(out)?;
         Ok(())
     }

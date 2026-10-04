@@ -312,12 +312,12 @@ impl HetModelState {
             }
         }
         // A slid mark must still fit the oversized cache. If the append pointer
-        // is within MTP_BLOCK of the end, the next verify append would OOB — the
+        // is within DRAFT_BLOCK of the end, the next verify append would OOB — the
         // window needs compacting down, which the caller must do before the next
         // step (decode's own wrap path). Refuse loudly rather than corrupt.
         for (i, (n_raw, raw_off)) in mark.per_layer.iter().copied().enumerate() {
             if mark.slid
-                && (raw_off + n_raw) as usize + crate::het::mtp::MTP_BLOCK > KV_CACHE_ROWS
+                && (raw_off + n_raw) as usize + crate::het::drafter::DRAFT_BLOCK > KV_CACHE_ROWS
             {
                 return Err(eyre!(
                     "rollback_kv: layer {i} slid append pointer {} within MTP_BLOCK of cache \

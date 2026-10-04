@@ -10,18 +10,18 @@
 //!
 //! Generate the reference first:
 //!   nix-shell -p python3Packages.{torch,numpy,safetensors,pillow,transformers} --run \
-//!     "python3 scripts/v41_oracle/dump_mtp_ref.py ~/.cache/deepstrix/v41/agentic/main --pos 200"
+//!     "python3 scripts/v41_oracle/dump_drafter_ref.py ~/.cache/deepstrix/v41/agentic/main --pos 200"
 //! Then:
 //!   HIP_VISIBLE_DEVICES=0,1 nix develop -c cargo test --release \
-//!     -p v4flash-kernels --features v41 --test mtp_entry_parity -- --ignored --nocapture
+//!     -p v4flash-kernels --features v41 --test drafter_entry_parity -- --ignored --nocapture
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::V41HfWeights;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::N_EMBD;
 use v4flash_kernels::het::engine::DeviceEngine;
-use v4flash_kernels::het::mtp::MtpState;
-use v4flash_kernels::het::weights::MtpWeights;
+use v4flash_kernels::het::drafter::DrafterState;
+use v4flash_kernels::het::weights::DrafterWeights;
 
 fn pick_igpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -54,8 +54,8 @@ fn entry_matches_reference() {
     let dev = pick_igpu().expect("igpu");
     let arch = dev.properties().expect("props").gcn_arch_name;
     let e = DeviceEngine::for_arch(dev, &arch).expect("engine");
-    let w = MtpWeights::load(&hf, dev, 40).expect("load drafter");
-    let mut st = MtpState::alloc(dev.id).expect("alloc state");
+    let w = DrafterWeights::load(&hf, dev, 40).expect("load drafter");
+    let mut st = DrafterState::alloc(dev.id).expect("alloc state");
 
     st.inject_main_hidden(&main_hidden).expect("inject");
     st.entry(&e, &e.compute, &w).expect("entry");

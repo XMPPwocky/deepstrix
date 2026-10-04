@@ -2,18 +2,18 @@
 //! `MsDspark::keep_rows` / `settle_writes`): the same sequence of ring writes and drafter forwards
 //! run (a) synchronizing after every write, as before, and (b) async -- an event recorded after
 //! the write and waited on only before the next write or draft (as production settles) -- with
-//! TWO slots' rings swapped into one `MtpState` by pointer, as `MsDspark::with_ring` does. Every
+//! TWO slots' rings swapped into one `DrafterState` by pointer, as `MsDspark::with_ring` does. Every
 //! drafter output (`h` after `forward`) and both slots' final ring bytes must be bit-identical.
 //!
 //! Second gate (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 5, two speculating streams draft one after
-//! the other through ONE `MtpState`): each slot's script run ALONE (a fresh state, the other
+//! the other through ONE `DrafterState`): each slot's script run ALONE (a fresh state, the other
 //! slot's steps skipped) must give that slot's drafter outputs and ring bytes of the interleaved
 //! run bit for bit -- no state of one slot's draft reaches the next slot's.
 //!
 //! Loads the drafter only (iGPU, ~8.7 GB): hub DOWN. Run:
 //! ```text
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels \
-//!   --release --features v41 --test mtp_ring_async -- --ignored --nocapture
+//!   --release --features v41 --test drafter_ring_async -- --ignored --nocapture
 //! ```
 
 use color_eyre::eyre::{self, eyre};
@@ -21,8 +21,8 @@ use v4flash_core::V41HfWeights;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event};
 use v4flash_kernels::config::HC_DIM;
 use v4flash_kernels::het::engine::DeviceEngine;
-use v4flash_kernels::het::mtp::{mtp_rope, MtpState, MTP_SRC_LAYERS};
-use v4flash_kernels::het::weights::MtpWeights;
+use v4flash_kernels::het::drafter::{drafter_rope, DrafterState, DRAFT_SRC_LAYERS};
+use v4flash_kernels::het::weights::DrafterWeights;
 
 const HF_DIR_DEFAULT: &str =
     "/persist/hf_cache/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277";
@@ -60,13 +60,13 @@ type Outs = Vec<(usize, Vec<f32>)>;
 
 /// One arm: the scripted sequence (only `only`'s steps when set); returns every
 /// drafter output and each slot's ring bytes.
-fn run(e: &DeviceEngine, w: &MtpWeights, dev: &Device, asynchronous: bool, only: Option<usize>) -> eyre::Result<(Outs, Vec<Vec<Vec<u16>>>)> {
-    let k = MTP_SRC_LAYERS.len() * v4flash_kernels::config::N_EMBD as usize;
-    let rope = mtp_rope();
-    let mut st = MtpState::alloc(dev.id)?;
+fn run(e: &DeviceEngine, w: &DrafterWeights, dev: &Device, asynchronous: bool, only: Option<usize>) -> eyre::Result<(Outs, Vec<Vec<Vec<u16>>>)> {
+    let k = DRAFT_SRC_LAYERS.len() * v4flash_kernels::config::N_EMBD as usize;
+    let rope = drafter_rope();
+    let mut st = DrafterState::alloc(dev.id)?;
     let mut slots: Vec<Slot> = (0..2)
         .map(|i| -> eyre::Result<Slot> {
-            // Zeroed: most of a ring's MTP_WINDOW slots are never written by
+            // Zeroed: most of a ring's DRAFT_WINDOW slots are never written by
             // the script, and fresh allocations differ there between arms.
             let mut rings: Vec<DeviceBuffer<u16>> = st.rings.iter().map(|r| DeviceBuffer::<u16>::new(dev.id, r.len())).collect::<eyre::Result<_>>()?;
             for r in &mut rings {
@@ -161,7 +161,7 @@ fn async_ring_writes_match_synchronous() -> eyre::Result<()> {
     dev.set_current()?;
     let arch = dev.properties()?.gcn_arch_name;
     let e = DeviceEngine::for_arch(dev, &arch)?;
-    let w = MtpWeights::load(&hf, dev, 40)?;
+    let w = DrafterWeights::load(&hf, dev, 40)?;
     let (h_sync, ring_sync) = run(&e, &w, &dev, false, None)?;
     let (h_async, ring_async) = run(&e, &w, &dev, true, None)?;
     let same = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());

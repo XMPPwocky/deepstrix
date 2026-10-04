@@ -2,14 +2,14 @@
 //!
 //! Run:
 //!   HIP_VISIBLE_DEVICES=0,1 nix develop -c cargo test --release \
-//!     -p v4flash-kernels --features v41 --test mtp_load -- --ignored --nocapture
+//!     -p v4flash-kernels --features v41 --test drafter_load -- --ignored --nocapture
 
 use color_eyre::eyre::{self, eyre};
-use v4flash_core::hf_v41::{MTP_N_EXPERT, MTP_STAGES};
+use v4flash_core::hf_v41::{DRAFT_N_EXPERT, DRAFT_STAGES};
 use v4flash_core::V41HfWeights;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::N_EMBD;
-use v4flash_kernels::het::weights::MtpWeights;
+use v4flash_kernels::het::weights::DrafterWeights;
 
 fn pick_igpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -31,13 +31,13 @@ fn drafter_loads() {
     let dev = pick_igpu().expect("igpu");
 
     let t0 = std::time::Instant::now();
-    let w = MtpWeights::load(&hf, dev, 40).expect("load drafter");
+    let w = DrafterWeights::load(&hf, dev, 40).expect("load drafter");
     let dt = t0.elapsed().as_secs_f64();
 
-    assert_eq!(w.layers.len(), MTP_STAGES, "stage count");
+    assert_eq!(w.layers.len(), DRAFT_STAGES, "stage count");
     let mut total = 0usize;
     for (i, l) in w.layers.iter().enumerate() {
-        assert_eq!(l.routed.n_slots, MTP_N_EXPERT as u32, "layer {i}: expert slots");
+        assert_eq!(l.routed.n_slots, DRAFT_N_EXPERT as u32, "layer {i}: expert slots");
         // Every expert must be the same size, and the buffer an exact multiple.
         for (name, bpe, buf) in [
             ("gate", l.routed.gate_bytes_per_expert, l.routed.gate.buffer.len()),
@@ -46,15 +46,15 @@ fn drafter_loads() {
         ] {
             assert!(bpe > 0, "layer {i} {name}: zero bytes/expert");
             assert_eq!(
-                bpe * MTP_N_EXPERT,
+                bpe * DRAFT_N_EXPERT,
                 buf,
-                "layer {i} {name}: {bpe} x {MTP_N_EXPERT} != buffer {buf}"
+                "layer {i} {name}: {bpe} x {DRAFT_N_EXPERT} != buffer {buf}"
             );
             total += buf;
         }
         assert_eq!(l.attn_norm.len(), N_EMBD as usize, "layer {i}: attn_norm");
         assert_eq!(l.ffn_norm.len(), N_EMBD as usize, "layer {i}: ffn_norm");
-        assert_eq!(l.exp_probs_b.len(), MTP_N_EXPERT, "layer {i}: router bias width");
+        assert_eq!(l.exp_probs_b.len(), DRAFT_N_EXPERT, "layer {i}: router bias width");
         total += l.shared.gate.buffer.len() + l.shared.up.buffer.len() + l.shared.down.buffer.len();
         total += l.attn_q_a.buffer.len() + l.attn_q_b.buffer.len() + l.attn_kv.buffer.len();
         total += l.attn_output_a.buffer.len() + l.attn_output_b.buffer.len();
@@ -62,18 +62,18 @@ fn drafter_loads() {
     assert_eq!(w.main_norm.len(), N_EMBD as usize, "main_norm");
     // The exit lives on the dGPU in production (beside the tied head), so its
     // weights load separately; here they share this device.
-    let xw = v4flash_kernels::het::weights::MtpExitWeights::load(&hf, dev)
+    let xw = v4flash_kernels::het::weights::DrafterExitWeights::load(&hf, dev)
         .expect("load exit weights");
     assert_eq!(xw.norm.len(), N_EMBD as usize, "exit norm");
     assert_eq!(
         xw.confidence.len(),
-        N_EMBD as usize + v4flash_kernels::het::mtp::MTP_MARKOV_RANK,
+        N_EMBD as usize + v4flash_kernels::het::drafter::DRAFT_MARKOV_RANK,
         "confidence head is [1, dim + markov_rank]"
     );
     total += w.main_proj.buffer.len();
 
     println!(
-        "drafter loaded in {dt:.1} s: {} layers, {MTP_N_EXPERT} experts each, {:.2} GB on device",
+        "drafter loaded in {dt:.1} s: {} layers, {DRAFT_N_EXPERT} experts each, {:.2} GB on device",
         w.layers.len(),
         total as f64 / 1e9
     );

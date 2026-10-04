@@ -203,10 +203,10 @@ fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
 /// Rows the DSpark residual capture is sized for. Only speculative verifies
 /// draft, and those are bounded by `V41_SMALL_B_OFFLOAD_MAX` (<= 8).
 /// Rows of main-model residual the batched path can capture for the DSpark
-/// drafter. 128 = `MTP_WINDOW`, the drafter's ring size: prefill seeding wants
+/// drafter. 128 = `DRAFT_WINDOW`, the drafter's ring size: prefill seeding wants
 /// to replay a FULL ring's worth of prompt positions, not just a verify batch.
 /// Costs 3 slots * 128 rows * N_EMBD * 4 B ~= 11 MB.
-pub const MTP_CAP_ROWS: usize = 128;
+pub const DRAFT_CAP_ROWS: usize = 128;
 
 pub struct BatchDgpuScratch {
     /// Row capacity every B-scaled buffer was sized for. Callers must
@@ -269,30 +269,30 @@ pub struct BatchDgpuScratch {
     pub engram_xscale: DeviceBuffer<f32>,
     pub engram_kv: DeviceBuffer<f32>,
     pub engram_rows_ready: bool,
-    /// DSpark: hc-collapsed residual ENTERING each of `MTP_SRC_LAYERS`, for
-    /// every row of the batch — `[MTP_CAP_ROWS, 3 * N_EMBD]`.
+    /// DSpark: hc-collapsed residual ENTERING each of `DRAFT_SRC_LAYERS`, for
+    /// every row of the batch — `[DRAFT_CAP_ROWS, 3 * N_EMBD]`.
     ///
     /// A speculative verify has to hand the drafter the residual of whatever
     /// position ends up being the new head, and which row that is is only known
     /// AFTER the batch has run. So capture every row and select afterwards.
     /// Lives on the scratch rather than behind a new parameter because
     /// `forward_layer_pre_moe_v2` already takes `bd` and has five call sites.
-    /// Off unless `mtp_capture_rows > 0`.
-    pub mtp_src: DeviceBuffer<f32>,
+    /// Off unless `drafter_capture_rows > 0`.
+    pub drafter_src: DeviceBuffer<f32>,
     /// How many rows the last capture wrote, and the ABSOLUTE position of row 0.
     /// Prefill is chunked and two-laned, so the server cannot infer which
-    /// positions `mtp_src` holds -- the capture records it here.
-    pub mtp_captured: usize,
-    pub mtp_captured_pos0: u32,
-    pub mtp_capture_rows: usize,
-    /// Rows `[0, mtp_lane_cut)` of the last batch were in lane A, the rest in
+    /// positions `drafter_src` holds -- the capture records it here.
+    pub drafter_captured: usize,
+    pub drafter_captured_pos0: u32,
+    pub drafter_capture_rows: usize,
+    /// Rows `[0, drafter_lane_cut)` of the last batch were in lane A, the rest in
     /// lane B. The capture is PER LANE and indexed lane-locally, so a caller
     /// that wants global batch row `r` must know where the cut fell. Recorded
     /// on lane A's scratch by the pipelined driver.
-    pub mtp_lane_cut: usize,
+    pub drafter_lane_cut: usize,
     /// Uniform `1/N_HC` weights, so `hc_weighted` computes the mean over the
     /// hyper-connection copies — the drafter's `main_hidden`.
-    pub mtp_hc_mean: DeviceBuffer<f32>,
+    pub drafter_hc_mean: DeviceBuffer<f32>,
     /// `[B, HC_DIM]` — mHC post-attention residual (P7 → P8, P12).
     pub after_attn_hc: DeviceBuffer<f32>,
     /// `[B, N_EMBD]` — FFN input (P8). Peer-pushed by `de.xfer` (P11x),
@@ -1082,20 +1082,20 @@ impl BatchDgpuScratch {
             engram_xscale: DeviceBuffer::new(id, (super::forward_prefill::engram_chunk_rows() * ENGRAM_IN / 32) as usize)?,
             engram_kv: DeviceBuffer::new(id, (super::forward_prefill::engram_chunk_rows() * ENGRAM_OUT) as usize)?,
             engram_rows_ready: false,
-            mtp_src: DeviceBuffer::new(
+            drafter_src: DeviceBuffer::new(
                 id,
-                MTP_CAP_ROWS
-                    * crate::het::mtp::MTP_SRC_LAYERS.len()
+                DRAFT_CAP_ROWS
+                    * crate::het::drafter::DRAFT_SRC_LAYERS.len()
                     * crate::config::N_EMBD as usize,
             )?,
-            mtp_capture_rows: 0,
-            mtp_lane_cut: 0,
-            mtp_captured: 0,
-            mtp_captured_pos0: 0,
-            mtp_hc_mean: {
+            drafter_capture_rows: 0,
+            drafter_lane_cut: 0,
+            drafter_captured: 0,
+            drafter_captured_pos0: 0,
+            drafter_hc_mean: {
                 let nh = crate::config::N_HC as usize;
-                let mut mb = DeviceBuffer::<f32>::new(id, nh * MTP_CAP_ROWS)?;
-                mb.copy_from_host(&vec![1.0f32 / nh as f32; nh * MTP_CAP_ROWS])?;
+                let mut mb = DeviceBuffer::<f32>::new(id, nh * DRAFT_CAP_ROWS)?;
+                mb.copy_from_host(&vec![1.0f32 / nh as f32; nh * DRAFT_CAP_ROWS])?;
                 mb
             },
             after_attn_hc: mk_f32(HC_DIM as usize)?,

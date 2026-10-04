@@ -1,6 +1,6 @@
 //! Does `f16.gemm_batched_wmma` agree with `f16.matvec` at a SMALL batch?
 //!
-//! The DSpark drafter runs every kernel at B = MTP_BLOCK = 5, far below the
+//! The DSpark drafter runs every kernel at B = DRAFT_BLOCK = 5, far below the
 //! B=512 prefill sizes this WMMA GEMM was written for (BM/BN are 64). Its
 //! drafter router came out constant — every token picking experts [0,1,2] with
 //! weight 0.5, which is a uniform softmax — so the question is whether this
@@ -14,7 +14,7 @@ use v4flash_core::V41HfWeights;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer};
 use v4flash_kernels::config::N_EMBD;
 use v4flash_kernels::het::engine::DeviceEngine;
-use v4flash_kernels::het::weights::MtpWeights;
+use v4flash_kernels::het::weights::DrafterWeights;
 
 fn pick_igpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -36,9 +36,9 @@ fn gemm_batched_matches_matvec_at_b5() {
     let dev = pick_igpu().expect("igpu");
     let arch = dev.properties().expect("props").gcn_arch_name;
     let e = DeviceEngine::for_arch(dev, &arch).expect("engine");
-    let w = MtpWeights::load(&hf, dev, 40).expect("load drafter");
+    let w = DrafterWeights::load(&hf, dev, 40).expect("load drafter");
     let gate = &w.layers[0].ffn_gate_inp;
-    let n_exp = v4flash_core::hf_v41::MTP_N_EXPERT as u32;
+    let n_exp = v4flash_core::hf_v41::DRAFT_N_EXPERT as u32;
 
     const B: usize = 5;
     let ne = N_EMBD as usize;

@@ -388,7 +388,7 @@ enum Slot {
     /// A parent stage: busy, and its named field (else `other`).
     Parent { busy: usize, field: usize },
     /// The drafter (`mtp.*`).
-    Mtp(usize),
+    Drafter(usize),
     Skip,
 }
 
@@ -431,13 +431,13 @@ impl Names {
     fn slot(&mut self, label: &'static str, name: &'static str) -> Slot {
         *self.slot.entry((label, name)).or_insert_with(|| {
             let f = Fx::get();
-            let (busy, short, mtp) = match label {
+            let (busy, short, drafter) = match label {
                 "dgpu" => ("dgpu_busy_ms", "d_", "d_mtp"),
                 "igpu" => ("igpu_busy_ms", "i_", "i_mtp"),
                 _ => return Slot::Skip,
             };
             if name.starts_with("mtp.") {
-                return Slot::Mtp(f.i(mtp));
+                return Slot::Drafter(f.i(drafter));
             }
             match name.strip_prefix(label).and_then(|r| r.strip_prefix('.')) {
                 Some(rest) => {
@@ -537,7 +537,7 @@ pub(crate) fn finish<E>(job: &Job<E>, names: &mut Names, lag_ms: f64, cost_us: f
                 add(rec, field, ms);
                 parent_steps.insert(p.ctx.step);
             }
-            Slot::Mtp(i) => add(rec, i, ms),
+            Slot::Drafter(i) => add(rec, i, ms),
             Slot::Skip => {}
         }
         if p.ctx.unit == StageCtx::NO {

@@ -5,7 +5,7 @@
 //! size or choose something once, or were never tested changing under a
 //! running scheduler.
 
-use v4flash_kernels::het::mtp::MTP_BLOCK;
+use v4flash_kernels::het::drafter::DRAFT_BLOCK;
 
 const MAX: u64 = u32::MAX as u64;
 
@@ -147,7 +147,7 @@ v4flash_kernels::knobs! {
     /// `V41_MS_DSPARK_K`: verify exactly this many drafts (unset = the policy).
     pub static MS_DSPARK_K = Knob::text("V41_MS_DSPARK_K");
     /// `V41_MS_DSPARK_KMAX` (default the block size).
-    pub static MS_DSPARK_KMAX = Knob::int("V41_MS_DSPARK_KMAX", MTP_BLOCK as u64, 0, MTP_BLOCK as u64);
+    pub static MS_DSPARK_KMAX = Knob::int("V41_MS_DSPARK_KMAX", DRAFT_BLOCK as u64, 0, DRAFT_BLOCK as u64);
     /// `V41_MS_DSPARK_STREAMS` (live, default 1, at most 2): every live stream
     /// may draft while at most this many are live
     /// (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2.1); 1 = a lone stream only.

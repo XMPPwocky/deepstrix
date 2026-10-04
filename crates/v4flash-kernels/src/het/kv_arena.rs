@@ -46,7 +46,7 @@ use crate::het::step_rows::StepRows;
 use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 
 /// Raw rows per slot beyond the SWA window. The arena only appends DECODE rows
-/// (one per step; a DSpark verify block is `MTP_BLOCK` = 5), never a prefill
+/// (one per step; a DSpark verify block is `DRAFT_BLOCK` = 5), never a prefill
 /// chunk, so it does not need the single-sequence state's `B_MAX` rows of chunk
 /// room (`state::KV_CACHE_ROWS` = 128 + 1024): 1152 -> 256 rows saves ~37 MB of
 /// dGPU per slot (40 layers x 896 rows x 1 KiB). A full region costs one

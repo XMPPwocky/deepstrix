@@ -340,13 +340,13 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     // DSpark on the arena (`V41_MS_DSPARK=accept`): one drafter ring per slot,
     // and every step (and the prefill replay that seeds a ring) captures the
     // drafter's input residuals on its rows.
-    let dsp = match (ms_dspark::enabled(), state.mtp.as_ref()) {
+    let dsp = match (ms_dspark::enabled(), state.drafter.as_ref()) {
         (true, Some(m)) => match MsDspark::alloc(m, state.igpu.id, n_slots) {
             Ok(d) => {
-                let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
-                state.bd_a.mtp_capture_rows = cap;
-                state.bd_b.mtp_capture_rows = cap;
-                state.bd_c.mtp_capture_rows = cap;
+                let cap = v4flash_kernels::het::batch_scratch::DRAFT_CAP_ROWS;
+                state.bd_a.drafter_capture_rows = cap;
+                state.bd_b.drafter_capture_rows = cap;
+                state.bd_c.drafter_capture_rows = cap;
                 tracing::info!(n_slots, ring_all = d.ring_all(), "multistream: DSpark ON (lone stream verifies its drafts in the arena step)");
                 Some(d)
             }
@@ -860,8 +860,8 @@ impl Sched {
         // Images ride the multistream path since 2026-09-21 (tower rows spliced
         // into the chunk inputs); only legacy DSpark (`V41_DSPARK` without
         // `V41_MS_DSPARK`) still needs the serial driver.
-        let mtp_on = state.mtp.is_some() && self.dsp.is_none();
-        let is_legacy = move |_p: &Pending| mtp_on;
+        let drafter_on = state.drafter.is_some() && self.dsp.is_none();
+        let is_legacy = move |_p: &Pending| drafter_on;
         // A legacy (vision / DSpark) request can only run on an empty arena. It
         // must NOT block the requests behind it (2026-09-21: one screenshot
         // request held three normal ones for 20+ min while a single stream kept
@@ -1372,17 +1372,17 @@ impl Sched {
                 return Ok(());
             }
         }
-        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, mtp, .. } = state;
+        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, drafter, .. } = state;
         let kv = &mut pf.kv;
         // The CED replay runs layers 37-39 over the prompt's last window: it
         // captures exactly the rows a drafter ring holds.
-        bd_a.mtp_captured = 0;
-        bd_b.mtp_captured = 0;
+        bd_a.drafter_captured = 0;
+        bd_b.drafter_captured = 0;
         let logits = match engine.prefill_job_finish(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut()) {
             Ok(l) => l,
             Err(e) => return Err((Some(pf.kv), e)),
         };
-        if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), mtp.as_mut()) {
+        if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), drafter.as_mut()) {
             let t = Instant::now();
             let last = pf.prefix.len() as u32 - 1;
             let seeded = dsp.reset(pf.slot).and_then(|()| {
@@ -1616,7 +1616,7 @@ impl Sched {
         // Sampled drafts: each draft's q (plan 2.2); `None` = point mass.
         let mut draft_q: Vec<Option<Vec<Vec<(i32, f64)>>>> = vec![None; self.streams.len()];
         // The lone stream's confidence logits (calibration, `MsDspark::record`).
-        let mut draft_conf = [0f32; v4flash_kernels::het::mtp::MTP_BLOCK];
+        let mut draft_conf = [0f32; v4flash_kernels::het::drafter::DRAFT_BLOCK];
         // The lane rules, ONE snapshot per step (the run-time files can change
         // between reads): the K decision prices blocks by the spec rule and
         // returns the block's lanes (docs/v41/DSPARK_SINGLE_STREAM_PERF.md
@@ -1631,7 +1631,7 @@ impl Sched {
         let mut drafted_k0 = false;
         // Two or more live streams drafted: (stream index, confidence logits)
         // of each that did, whatever its K (`MsDspark::record_multi`).
-        let mut multi_drafted: Vec<(usize, [f32; v4flash_kernels::het::mtp::MTP_BLOCK])> = Vec::new();
+        let mut multi_drafted: Vec<(usize, [f32; v4flash_kernels::het::drafter::DRAFT_BLOCK])> = Vec::new();
         // How many live streams may all draft (`V41_MS_DSPARK_STREAMS`, one read per step).
         let spec_max = ms_dspark::spec_streams();
         // Every draft attempt of this step (failed, empty and K = 0 ones
@@ -1639,8 +1639,8 @@ impl Sched {
         // (`draft_ms`) and a step's full cost is their sum (review round 1).
         let t_draft = Instant::now();
         if self.streams.len() == 1 {
-            if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
-                let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
+            if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.drafter.as_mut()) {
+                let u: [f32; v4flash_kernels::het::drafter::DRAFT_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
                 let s = &self.streams[0];
                 let sampling = ms_dspark::draft_sampling(&s.sample_mode, u);
                 let pos = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
@@ -1679,11 +1679,11 @@ impl Sched {
             // each drafts as the lone stream does (its own gate, KV cap and
             // draft RNG; drafts run one after the other), then ONE joint policy
             // (`MsDspark::ks_for`) picks every stream's K and the lanes.
-            if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
+            if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.drafter.as_mut()) {
                 let mut blocks: Vec<ms_dspark::BlockConf> = Vec::new();
                 let mut got: Vec<(usize, ms_dspark::Drafted)> = Vec::new();
                 for (i, s) in self.streams.iter_mut().enumerate() {
-                    let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| s.draft_rng.next_f32());
+                    let u: [f32; v4flash_kernels::het::drafter::DRAFT_BLOCK] = std::array::from_fn(|_| s.draft_rng.next_f32());
                     let sampling = ms_dspark::draft_sampling(&s.sample_mode, u);
                     let pos = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
                     let remaining = s.max_new.saturating_sub(s.completion_tokens as usize);
@@ -1892,9 +1892,9 @@ impl Sched {
         let mut fwd_only_ms = 0.0f64;
         let n_tables = engram.as_ref().map(|ec| ec.tables.len()).unwrap_or(0);
         if self.dsp.is_some() {
-            bd_a.mtp_captured = 0;
-            bd_b.mtp_captured = 0;
-            bd_c.mtp_captured = 0;
+            bd_a.drafter_captured = 0;
+            bd_b.drafter_captured = 0;
+            bd_c.drafter_captured = 0;
         }
         // Each row's sampling mode (a speculating stream's draft rows share
         // its stream's) and its `head_cands` params.
@@ -2289,7 +2289,7 @@ impl Sched {
             v4flash_kernels::het::b2_mirror::defer_flush(pos_end - keeps[0] as i32, pos_end);
         }
         // Kept rows into the drafter rings; the last one feeds the next draft.
-        if let (Some(dsp), Some(m), Some(caps)) = (self.dsp.as_mut(), state.mtp.as_mut(), caps.as_ref()) {
+        if let (Some(dsp), Some(m), Some(caps)) = (self.dsp.as_mut(), state.drafter.as_mut(), caps.as_ref()) {
             // A LONE stream's ring is written every step, drafted or not: it is
             // the stream that drafts. Writing only on speculating steps
             // (2026-10-01 09:54-10:05) left a gap of every plain step the
@@ -2335,7 +2335,7 @@ impl Sched {
                 let step_ms = t0.elapsed().as_secs_f64() * 1e3;
                 let plain_ms = self.plain_lanes.cost(self.streams.len(), plain_rule);
                 if spec {
-                    let blocks: Vec<(u32, [f32; v4flash_kernels::het::mtp::MTP_BLOCK], usize, usize, usize)> = multi_drafted
+                    let blocks: Vec<(u32, [f32; v4flash_kernels::het::drafter::DRAFT_BLOCK], usize, usize, usize)> = multi_drafted
                         .iter()
                         .map(|&(i, conf)| {
                             let (k, acc, em) = spec_outs[i].unwrap_or((0, 0, keeps[i] as usize));

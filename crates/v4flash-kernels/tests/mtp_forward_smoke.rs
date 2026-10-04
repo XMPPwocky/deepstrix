@@ -1,13 +1,13 @@
 //! Smoke test for the DSpark drafter's full three-layer pass.
 //!
-//! This is NOT a parity gate — `mtp_entry_parity` covers the entry, and the
+//! This is NOT a parity gate — `drafter_entry_parity` covers the entry, and the
 //! real correctness gate for the rest is end-to-end acceptance rate against the
 //! Python oracle's E = 4.94 at K=5. What this catches is the gross failure
 //! modes of a freshly rewritten B=5 path: undersized buffers, kernel launch
 //! failures, NaNs, and a stream that silently collapses to zeros or to a
 //! constant.
 //!
-//!   cargo test -p v4flash-kernels --features v41 --test mtp_forward_smoke \
+//!   cargo test -p v4flash-kernels --features v41 --test drafter_forward_smoke \
 //!     -- --ignored --nocapture
 
 use color_eyre::eyre::{self, eyre};
@@ -15,8 +15,8 @@ use v4flash_core::V41HfWeights;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{HC_DIM, N_EMBD, N_HC};
 use v4flash_kernels::het::engine::DeviceEngine;
-use v4flash_kernels::het::mtp::{mtp_rope, MtpState, MTP_BLOCK};
-use v4flash_kernels::het::weights::MtpWeights;
+use v4flash_kernels::het::drafter::{drafter_rope, DrafterState, DRAFT_BLOCK};
+use v4flash_kernels::het::weights::DrafterWeights;
 
 fn pick_igpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -73,10 +73,10 @@ fn forward_runs_and_stays_finite() {
     let dev = pick_igpu().expect("igpu");
     let arch = dev.properties().expect("props").gcn_arch_name;
     let e = DeviceEngine::for_arch(dev, &arch).expect("engine");
-    let w = MtpWeights::load(&hf, dev, 40).expect("load drafter");
-    let mut st = MtpState::alloc(dev.id).expect("alloc state");
+    let w = DrafterWeights::load(&hf, dev, 40).expect("load drafter");
+    let mut st = DrafterState::alloc(dev.id).expect("alloc state");
 
-    let rope = mtp_rope();
+    let rope = drafter_rope();
 
     let token_row = fake_row(7);
     let noise_row = fake_row(129);
@@ -91,16 +91,16 @@ fn forward_runs_and_stays_finite() {
             .unwrap_or_else(|err| panic!("forward at pos {pos}: {err:?}"));
         e.compute.synchronize().expect("sync");
 
-        let mut h = vec![0.0f32; MTP_BLOCK * hc];
+        let mut h = vec![0.0f32; DRAFT_BLOCK * hc];
         st.h.copy_to_host(&mut h).expect("read h");
         let (mean, std, absmax) = stats(&h);
         println!("pos {pos:4}: h mean {mean:+.6} std {std:.6} absmax {absmax:.4}");
 
-        let mut ao = vec![0.0f32; MTP_BLOCK * N_EMBD as usize];
+        let mut ao = vec![0.0f32; DRAFT_BLOCK * N_EMBD as usize];
         st.attn_out.copy_to_host(&mut ao).expect("read attn_out");
         let (am, asd, aax) = stats(&ao);
         println!("           attn_out mean {am:+.6} std {asd:.6} absmax {aax:.4}");
-        let mut fo = vec![0.0f32; MTP_BLOCK * N_EMBD as usize];
+        let mut fo = vec![0.0f32; DRAFT_BLOCK * N_EMBD as usize];
         st.ffn_out.copy_to_host(&mut fo).expect("read ffn_out");
         let (fm, fsd, fax) = stats(&fo);
         println!("           ffn_out  mean {fm:+.6} std {fsd:.6} absmax {fax:.4}");

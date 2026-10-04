@@ -1389,7 +1389,7 @@ impl HeterogeneousEngine {
                 None, Some(&job.image_spans), pager.as_deref_mut(), chunk_engram.as_deref(),
             )?;
             if is_last_chunk {
-                let b_a = bd_a.mtp_lane_cut.min(chunk_b);
+                let b_a = bd_a.drafter_lane_cut.min(chunk_b);
                 let b_b = chunk_b - b_a;
                 let (src_bd, last_idx) = if b_b > 0 { (&*bd_b, b_b - 1) } else { (&*bd_a, b_a - 1) };
                 job.last_logits = Some(self.head_from_row(head_scratch, src_bd, last_idx, weights)?);
@@ -2281,7 +2281,7 @@ impl HeterogeneousEngine {
             // a caller mapping a global row to a lane reads the wrong buffer --
             // the same stale-residual failure as the lane-capture bug, and it
             // bites exactly the one-row verify used to adjudicate divergence.
-            bd_a.mtp_lane_cut = b;
+            bd_a.drafter_lane_cut = b;
             self.forward_prompt_batch_v2(
                 bd_a, bi_a, sd, si, state, weights, input_hcs, tokens, pos0, stats, image_spans,
                 pager.as_deref_mut(),
@@ -2327,9 +2327,9 @@ impl HeterogeneousEngine {
             "prefill lane split: lane A cut {b_a} exceeds the batch of {b} rows"
         );
         let b_b = b - b_a;
-        // Record where the cut fell. `mtp_src` is captured per lane and indexed
+        // Record where the cut fell. `drafter_src` is captured per lane and indexed
         // lane-locally, so anything selecting a GLOBAL batch row needs this.
-        bd_a.mtp_lane_cut = b_a;
+        bd_a.drafter_lane_cut = b_a;
         if std::env::var("V41_PREFILL_LANE_DEBUG").as_deref() == Ok("1") {
             tracing::warn!(
                 b, b_a, b_b, lo, hi,
@@ -3271,7 +3271,7 @@ impl HeterogeneousEngine {
             // the READBACK was wrong. The CED branch above was already immune --
             // it asserts `cut == b_a` -- which is why this only ever bit the
             // non-CED path.
-            let b_a = bd_a.mtp_lane_cut.min(chunk_b);
+            let b_a = bd_a.drafter_lane_cut.min(chunk_b);
             let b_b = chunk_b - b_a;
 
             if last_only {
@@ -4483,21 +4483,21 @@ impl HeterogeneousEngine {
         // 37/38/39. A batched verify does not know until AFTER it runs which
         // row becomes the next head, so capture EVERY row and select later.
         // Arena rows (multistream DSpark) are captured the same way, indexed
-        // by the row's place in THIS lane's batch (`mtp_captured_pos0` means
+        // by the row's place in THIS lane's batch (`drafter_captured_pos0` means
         // nothing there: the rows belong to different streams).
-        // Stored slot-major, `[3][MTP_CAP_ROWS][N_EMBD]`, because
+        // Stored slot-major, `[3][DRAFT_CAP_ROWS][N_EMBD]`, because
         // `hc_weighted.launch_batched` writes one contiguous `[b, n_embd]`
         // block per call.
-        if bd.mtp_capture_rows > 0 {
-            if let Some(slot) = super::mtp::MtpState::src_slot(layer) {
+        if bd.drafter_capture_rows > 0 {
+            if let Some(slot) = super::drafter::DrafterState::src_slot(layer) {
                 let ne = crate::config::N_EMBD as usize;
-                let rows = bd.mtp_capture_rows.min(super::batch_scratch::MTP_CAP_ROWS);
+                let rows = bd.drafter_capture_rows.min(super::batch_scratch::DRAFT_CAP_ROWS);
                 let n = tokens.len().min(rows);
                 if n > 0 {
                     // `src` below slices `bd.residual` at `skip * nhc * ne` for
                     // `n * nhc * ne` floats, i.e. the WHOLE lane batch has to fit
                     // the lane scratch; `dst` / `wsrc` are sized for
-                    // MTP_CAP_ROWS. Either bound broken reads (or writes) past
+                    // DRAFT_CAP_ROWS. Either bound broken reads (or writes) past
                     // the buffer into whatever scratch follows it.
                     assert!(
                         tokens.len() <= bd.rows,
@@ -4507,16 +4507,16 @@ impl HeterogeneousEngine {
                         bd.rows
                     );
                     assert!(
-                        n <= super::batch_scratch::MTP_CAP_ROWS,
+                        n <= super::batch_scratch::DRAFT_CAP_ROWS,
                         "mtp capture L{layer}: capturing {n} rows > MTP_CAP_ROWS {}; mtp_src and \
                          mtp_hc_mean are only sized for MTP_CAP_ROWS",
-                        super::batch_scratch::MTP_CAP_ROWS
+                        super::batch_scratch::DRAFT_CAP_ROWS
                     );
                     let de = &self.dgpu;
                     self.set_current_cached(de.device)?;
                     // Capture the LAST `n` rows of the batch, not the first.
                     //
-                    // For a VERIFY this is a no-op: `mtp_capture_rows == b`, so
+                    // For a VERIFY this is a no-op: `drafter_capture_rows == b`, so
                     // skip == 0 and the whole batch is taken either way. It
                     // matters for PREFILL SEEDING, where the chunk can be far
                     // longer than the ring and the rows we want are the MOST
@@ -4524,18 +4524,18 @@ impl HeterogeneousEngine {
                     // actually attend over when generation starts.
                     let skip = tokens.len() - n;
                     let nhc = crate::config::N_HC as usize;
-                    let mut dst = bd.mtp_src.slice_view_mut(
-                        slot * super::batch_scratch::MTP_CAP_ROWS * ne,
+                    let mut dst = bd.drafter_src.slice_view_mut(
+                        slot * super::batch_scratch::DRAFT_CAP_ROWS * ne,
                         n * ne,
                     );
                     // Only `x` moves. The kernel indexes both per batch row
                     // (`x + b*n_hc*n_embd`, `weights + b*w_stride`), but
-                    // `mtp_hc_mean` is only `N_HC * MTP_CAP_ROWS` long and is a
+                    // `drafter_hc_mean` is only `N_HC * DRAFT_CAP_ROWS` long and is a
                     // CONSTANT 1/n_hc everywhere, so rows [0,n) are numerically
                     // identical to rows [skip, skip+n) -- and skipping it would
-                    // run off the end for any chunk longer than MTP_CAP_ROWS.
+                    // run off the end for any chunk longer than DRAFT_CAP_ROWS.
                     let src = bd.residual.slice_view(skip * nhc * ne, n * nhc * ne);
-                    let wsrc = bd.mtp_hc_mean.slice_view(0, n * nhc);
+                    let wsrc = bd.drafter_hc_mean.slice_view(0, n * nhc);
                     de.hc_weighted.launch_batched(
                         &de.compute,
                         &mut dst,
@@ -4548,9 +4548,9 @@ impl HeterogeneousEngine {
                     )?;
                     // Which absolute positions these rows are. Both lanes
                     // capture (a two-lane chunk splits its rows between them);
-                    // `seed_mtp_ring` merges the lanes by absolute position.
-                    bd.mtp_captured = n;
-                    bd.mtp_captured_pos0 = pos0 + skip as u32;
+                    // `seed_drafter_ring` merges the lanes by absolute position.
+                    bd.drafter_captured = n;
+                    bd.drafter_captured_pos0 = pos0 + skip as u32;
                 }
             }
         }
@@ -7361,7 +7361,7 @@ impl HeterogeneousEngine {
         // SLACK PROBE site `verify_dgpu`: one stall per layer on the dGPU
         // chain. 40 layers x 2 lanes, so the injected total is 80x the tick
         // count -- divide before taking the slope.
-        if let Some(ticks) = super::mtp::slack_probe_ticks("verify_dgpu") {
+        if let Some(ticks) = super::drafter::slack_probe_ticks("verify_dgpu") {
             de.q8.slack_probe_spin(&de.compute, ticks)?;
         }
         // Decided before the inverse rope (was below): `V41_DEC_FUSE` folds the dp4a
@@ -10557,7 +10557,7 @@ impl HeterogeneousEngine {
             // the step against it gives the box-2 leg's share of the critical
             // path -- the thing an rtt counter cannot tell you, because exposed
             // wait collapses to ~0 whenever box 1 is the slower side.
-            if let Some(ticks) = super::mtp::slack_probe_ticks("remote") {
+            if let Some(ticks) = super::drafter::slack_probe_ticks("remote") {
                 // wall_clock64 ticks are 100 MHz, so ticks/100 = microseconds.
                 std::thread::sleep(std::time::Duration::from_micros(ticks / 100));
             }

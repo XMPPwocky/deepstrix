@@ -300,14 +300,14 @@ static XCHECK_ARM_US: [std::sync::atomic::AtomicU64; XCHECK_ARMS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; XCHECK_ARMS];
 
 /// Everything the DSpark drafter needs, loaded once at startup.
-pub struct MtpCtx {
+pub struct DrafterCtx {
     /// Layers + entry projection, iGPU.
-    pub w: v4flash_kernels::het::weights::MtpWeights,
+    pub w: v4flash_kernels::het::weights::DrafterWeights,
     /// Final norm, markov head, confidence — dGPU, beside the tied head.
-    pub xw: v4flash_kernels::het::weights::MtpExitWeights,
-    pub state: v4flash_kernels::het::mtp::MtpState,
-    pub exit: v4flash_kernels::het::mtp::MtpExit,
-    pub capture: v4flash_kernels::het::mtp::MtpCapture,
+    pub xw: v4flash_kernels::het::weights::DrafterExitWeights,
+    pub state: v4flash_kernels::het::drafter::DrafterState,
+    pub exit: v4flash_kernels::het::drafter::DrafterExit,
+    pub capture: v4flash_kernels::het::drafter::DrafterCapture,
     /// Markov EMBEDDING half, host-side like `token_embd` (M57).
     pub markov_embd: Vec<u8>,
     pub markov_dtype: v4flash_core::gguf::GgufType,
@@ -319,11 +319,11 @@ pub struct MtpCtx {
     /// verify has already confirmed AND ingested into KV (so the decode loop
     /// must not forward them again), and the `main_hidden` of whichever row
     /// became the new head.
-    pub pending: Option<[i32; v4flash_kernels::het::mtp::MTP_BLOCK]>,
+    pub pending: Option<[i32; v4flash_kernels::het::drafter::DRAFT_BLOCK]>,
     /// `DSparkConfidenceHead` score for each pending draft, from the same
     /// drafter pass. Calibrated against actual acceptance by
     /// `dspark_stats::record_conf`; gates `k` once a threshold is set.
-    pub pending_conf: [f32; v4flash_kernels::het::mtp::MTP_BLOCK],
+    pub pending_conf: [f32; v4flash_kernels::het::drafter::DRAFT_BLOCK],
     pub confirmed: std::collections::VecDeque<i32>,
     /// Upcoming tokens (including the current `next`) that a verify already
     /// appended to KV — the decode loop must advance `pos` past them without
@@ -334,9 +334,9 @@ pub struct MtpCtx {
     pub main_hidden: Vec<f32>,
     pub accept_steps: u64,
     pub accept_tokens: u64,
-    pub drafts: Vec<(u32, [i32; v4flash_kernels::het::mtp::MTP_BLOCK])>,
+    pub drafts: Vec<(u32, [i32; v4flash_kernels::het::drafter::DRAFT_BLOCK])>,
     /// Same batches with the markov bias omitted — the ablation.
-    pub drafts_plain: Vec<(u32, [i32; v4flash_kernels::het::mtp::MTP_BLOCK])>,
+    pub drafts_plain: Vec<(u32, [i32; v4flash_kernels::het::drafter::DRAFT_BLOCK])>,
     pub actual: Vec<i32>,
     pub actual_base: u32,
 }
@@ -779,7 +779,7 @@ pub struct WorkerState {
     /// iGPU residency, so it is not loaded unless asked for. The layer stack
     /// and its state live on the iGPU; the exit and the residual capture live
     /// on the dGPU, beside the tied `output` head.
-    pub mtp: Option<MtpCtx>,
+    pub drafter: Option<DrafterCtx>,
     pub byte_decoder: std::collections::HashMap<char, u8>,
 
     /// Vision-Exp ViT + aligner, resident on the iGPU. `None` when the
@@ -928,37 +928,37 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 
     // DSpark drafter (`V41_DSPARK=1`, or `V41_MS_DSPARK=accept` on the
     // multistream arena). 7.93 GB of iGPU residency, so opt-in.
-    let mtp: Option<MtpCtx> = if matches!(
+    let drafter: Option<DrafterCtx> = if matches!(
         std::env::var("V41_DSPARK").as_deref(),
         Ok("1") | Ok("on") | Ok("shadow") | Ok("accept")
     ) || (crate::multistream::enabled() && crate::ms_dspark::enabled()) {
-        use v4flash_kernels::het::mtp::{MtpCapture, MtpExit, MtpState, MTP_NOISE_TOKEN};
-        use v4flash_kernels::het::weights::{MtpExitWeights, MtpWeights};
+        use v4flash_kernels::het::drafter::{DrafterCapture, DrafterExit, DrafterState, DRAFT_NOISE_TOKEN};
+        use v4flash_kernels::het::weights::{DrafterExitWeights, DrafterWeights};
         let t = std::time::Instant::now();
-        let w = MtpWeights::load(src, igpu, v4flash_kernels::config::N_LAYER as usize)?;
-        let xw = MtpExitWeights::load(src, dgpu)?;
+        let w = DrafterWeights::load(src, igpu, v4flash_kernels::config::N_LAYER as usize)?;
+        let xw = DrafterExitWeights::load(src, dgpu)?;
         let mk = src
             .tensor("mtp.2.markov_embd.weight")
             .ok_or_else(|| eyre!("mtp.2.markov_embd.weight not found"))?;
         let markov_dtype = mk.dtype;
         let markov_embd = src.read_tensor(mk)?;
         let mut noise_row = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
-        embed_lookup(&token_embd_bytes, token_embd_dtype, MTP_NOISE_TOKEN, &mut noise_row);
+        embed_lookup(&token_embd_bytes, token_embd_dtype, DRAFT_NOISE_TOKEN, &mut noise_row);
         tracing::info!(
             elapsed_s = t.elapsed().as_secs_f64(),
             "DSpark drafter loaded (layers+entry on iGPU, exit on dGPU)"
         );
-        Some(MtpCtx {
+        Some(DrafterCtx {
             w,
             xw,
-            state: MtpState::alloc(igpu.id)?,
-            exit: MtpExit::alloc(dgpu.id)?,
-            capture: MtpCapture::alloc(dgpu.id)?,
+            state: DrafterState::alloc(igpu.id)?,
+            exit: DrafterExit::alloc(dgpu.id)?,
+            capture: DrafterCapture::alloc(dgpu.id)?,
             markov_embd,
             markov_dtype,
             noise_row,
             pending: None,
-            pending_conf: [0.0; v4flash_kernels::het::mtp::MTP_BLOCK],
+            pending_conf: [0.0; v4flash_kernels::het::drafter::DRAFT_BLOCK],
             confirmed: std::collections::VecDeque::new(),
             ingested: 0,
             next_after: None,
@@ -1037,7 +1037,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // --ctx 368640 (921,600 comp rows x 1,104 B + raw windows) = ~390K arena
     // positions, so allocate a stub; the legacy handler refuses to run on it.
     // DSpark on the arena (`V41_MS_DSPARK`) runs no request on the legacy path either.
-    let legacy_ctx = if crate::multistream::enabled() && (mtp.is_none() || crate::ms_dspark::enabled()) {
+    let legacy_ctx = if crate::multistream::enabled() && (drafter.is_none() || crate::ms_dspark::enabled()) {
         LEGACY_STUB_CTX.min(cfg.n_kv_max)
     } else {
         cfg.n_kv_max
@@ -1210,7 +1210,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         vocab: Arc::new(vocab),
         token_embd_bytes,
         token_embd_dtype,
-        mtp,
+        drafter,
         byte_decoder,
         tower,
         vit_rows: Vec::new(),
@@ -2300,7 +2300,7 @@ pub(crate) fn handle_generate_stream(
                 state.state.reset_in_place(state.dgpu, state.igpu)?;
                 // The drafter's KV ring is process-lifetime state and is NOT part of
                 // `HetModelState`, so resetting the main KV leaves it holding the
-                // previous conversation's positions. See `MtpState::reset_ring`.
+                // previous conversation's positions. See `DrafterState::reset_ring`.
                 reset_drafter_ring(state);
                 // `state.live` no longer describes the KV cache from
                 // here on. Clear it BEFORE the restore + suffix prefill
@@ -2342,7 +2342,7 @@ pub(crate) fn handle_generate_stream(
                         state.state.reset_in_place(state.dgpu, state.igpu)?;
                         // The drafter's KV ring is process-lifetime state and is NOT part of
                         // `HetModelState`, so resetting the main KV leaves it holding the
-                        // previous conversation's positions. See `MtpState::reset_ring`.
+                        // previous conversation's positions. See `DrafterState::reset_ring`.
                         reset_drafter_ring(state);
                         state.live = None;
                         state.snapshot_index.evict(&snap_hash, "restore failed");
@@ -2408,7 +2408,7 @@ pub(crate) fn handle_generate_stream(
                         state.state.reset_in_place(state.dgpu, state.igpu)?;
                         // The drafter's KV ring is process-lifetime state and is NOT part of
                         // `HetModelState`, so resetting the main KV leaves it holding the
-                        // previous conversation's positions. See `MtpState::reset_ring`.
+                        // previous conversation's positions. See `DrafterState::reset_ring`.
                         reset_drafter_ring(state);
                         state.live = None;
                     } else {
@@ -2565,7 +2565,7 @@ pub(crate) fn handle_generate_stream(
         state.state.reset_in_place(state.dgpu, state.igpu)?;
         // The drafter's KV ring is process-lifetime state and is NOT part of
         // `HetModelState`, so resetting the main KV leaves it holding the
-        // previous conversation's positions. See `MtpState::reset_ring`.
+        // previous conversation's positions. See `DrafterState::reset_ring`.
         reset_drafter_ring(state);
         state.live = None;
 
@@ -2847,7 +2847,7 @@ fn save_and_forward_marker(
 /// Write the prompt's last captured positions into the drafter's KV ring so it
 /// is warm when generation starts, as the reference's prefill does
 /// (`DSparkAttention.forward` at `start_pos == 0` writes the window rows of the
-/// whole prompt; only the last `MTP_WINDOW` survive). See the call site in
+/// whole prompt; only the last `DRAFT_WINDOW` survive). See the call site in
 /// `finish_decode`.
 ///
 /// Rows come from BOTH prefill lanes, merged by absolute position. The
@@ -2871,23 +2871,23 @@ fn save_and_forward_marker(
 /// want of its next token.
 ///
 /// `tokens` (the canonical live sequence) is kept for the log line only.
-fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyre::Result<()> {
+fn seed_drafter_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyre::Result<()> {
     use v4flash_kernels::config::N_EMBD;
     let ne = N_EMBD as usize;
-    let nsrc = v4flash_kernels::het::mtp::MTP_SRC_LAYERS.len();
-    let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
-    let win = v4flash_kernels::het::mtp::MTP_WINDOW as u32;
+    let nsrc = v4flash_kernels::het::drafter::DRAFT_SRC_LAYERS.len();
+    let cap = v4flash_kernels::het::batch_scratch::DRAFT_CAP_ROWS;
+    let win = v4flash_kernels::het::drafter::DRAFT_WINDOW as u32;
 
     // Consumed: a capture seeds at most once. A later request whose prompt is
     // restored in full runs no prefill (nothing re-zeroes the counts), and must
     // start cold rather than seed these rows again. Snapshot and clear BEFORE
     // reading, so an error below (a failed copy) cannot leave them set.
     let counts = [
-        (state.bd_a.mtp_captured, state.bd_a.mtp_captured_pos0),
-        (state.bd_b.mtp_captured, state.bd_b.mtp_captured_pos0),
+        (state.bd_a.drafter_captured, state.bd_a.drafter_captured_pos0),
+        (state.bd_b.drafter_captured, state.bd_b.drafter_captured_pos0),
     ];
-    state.bd_a.mtp_captured = 0;
-    state.bd_b.mtp_captured = 0;
+    state.bd_a.drafter_captured = 0;
+    state.bd_b.drafter_captured = 0;
 
     let mut by_pos: std::collections::BTreeMap<u32, Vec<f32>> = std::collections::BTreeMap::new();
     let mut lanes_used = 0usize;
@@ -2908,7 +2908,7 @@ fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyr
         // capture count the driver recorded must fit the buffer it wrote into.
         assert!(n <= cap, "dspark seed: lane {lane_name} recorded {n} captured mtp_src rows but the buffer holds {cap}");
         let mut whole = vec![0.0f32; nsrc * cap * ne];
-        lane.mtp_src.copy_to_host(&mut whole)?;
+        lane.drafter_src.copy_to_host(&mut whole)?;
         for r in 0..n {
             let mut mh = Vec::with_capacity(nsrc * ne);
             for sl in 0..nsrc {
@@ -2928,7 +2928,7 @@ fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyr
     while first > 0 && last - first + 1 < win && by_pos.contains_key(&(first - 1)) {
         first -= 1;
     }
-    let m = state.mtp.as_mut().expect("mtp");
+    let m = state.drafter.as_mut().expect("mtp");
     for p in first..=last {
         state.engine.dspark_ring_write_only(&mut m.state, &m.w, p, &by_pos[&p])?;
     }
@@ -2952,7 +2952,7 @@ fn finish_decode(
 ) -> eyre::Result<()> {
     let mut pos = start_pos;
     // ---- DSpark PREFILL RING SEEDING -----------------------------------
-    // The drafter attends over a MTP_WINDOW(128)-entry KV ring. At the start of
+    // The drafter attends over a DRAFT_WINDOW(128)-entry KV ring. At the start of
     // generation that ring is EMPTY: the only writes come from accepted
     // positions, so it takes ~128 tokens to fill and the drafter spends most of
     // a normal reply attending over a mostly-empty window. That is a large part
@@ -2960,12 +2960,12 @@ fn finish_decode(
     // NOT, as previously assumed, because E had reached its ceiling.
     //
     // The prompt's positions are real context the drafter should already have.
-    // The batched prefill captured the last `mtp_captured` main-model residuals
-    // of each lane (see `MTP_CAP_ROWS`); `seed_mtp_ring` merges both lanes by
+    // The batched prefill captured the last `drafter_captured` main-model residuals
+    // of each lane (see `DRAFT_CAP_ROWS`); `seed_drafter_ring` merges both lanes by
     // position and writes them into the drafter's KV ring with the cheap
     // `ring_write_only` (a ring row depends only on the main residual at its
     // position). `V41_DSPARK_SEED_RING=0` disables.
-    if state.mtp.is_some()
+    if state.drafter.is_some()
         && std::env::var("V41_DSPARK_SEED_RING").as_deref() != Ok("0")
     {
         // `live.tokens` is the CANONICAL sequence backing the KV cache, so its
@@ -2974,7 +2974,7 @@ fn finish_decode(
         // (`lcp_live != lcp_req`) and indexing it by position would seed the
         // ring with the wrong tokens.
         let seq: Vec<i32> = state.live.as_ref().map(|l| l.tokens.clone()).unwrap_or_default();
-        if let Err(e) = seed_mtp_ring(state, &seq, start_pos) {
+        if let Err(e) = seed_drafter_ring(state, &seq, start_pos) {
             // Seeding is a pure accept-rate optimisation: the ring is a cache of
             // the drafter's own attention, and a cold one only costs acceptance.
             // Never fail a request over it.
@@ -3568,7 +3568,7 @@ fn finish_decode(
         // the confirmed tokens one per iteration WITHOUT forwarding them again.
         if dspark_accept
             && state
-                .mtp
+                .drafter
                 .as_ref()
                 .is_some_and(|m| m.ingested == 0 && m.confirmed.is_empty() && m.pending.is_some())
         {
@@ -3577,8 +3577,8 @@ fn finish_decode(
             // which separates "the accept path diverges" from "a batched verify
             // diverges".
             let k = match std::env::var("V41_DSPARK_K").ok().and_then(|v| v.parse::<usize>().ok()) {
-                Some(cap) => cap.min(v4flash_kernels::het::mtp::MTP_BLOCK),
-                None => v4flash_kernels::het::mtp::MTP_BLOCK,
+                Some(cap) => cap.min(v4flash_kernels::het::drafter::DRAFT_BLOCK),
+                None => v4flash_kernels::het::drafter::DRAFT_BLOCK,
             };
             // `V41_DSPARK_CONF_MIN=<f>`: truncate the block at the first draft the
             // drafter itself is unsure of. A rejected draft costs a verify row --
@@ -3586,7 +3586,7 @@ fn finish_decode(
             // routes to -- and buys nothing, since everything after a rejection is
             // discarded too. Calibrate with the `conf` table in `dspark.request`
             // before setting this.
-            let conf = state.mtp.as_ref().unwrap().pending_conf;
+            let conf = state.drafter.as_ref().unwrap().pending_conf;
             let k = match std::env::var("V41_DSPARK_CONF_MIN").ok().and_then(|v| v.parse::<f32>().ok()) {
                 Some(th) => {
                     let cut = (0..k).position(|j| conf[j] < th).unwrap_or(k);
@@ -3606,7 +3606,7 @@ fn finish_decode(
             // overwritten by the next verify (commit-on-accept; rollback = don't
             // commit).
             let _spec = v4flash_kernels::het::forward_prefill::SpeculativeAppend::begin();
-            let drafts = state.mtp.as_ref().unwrap().pending.unwrap();
+            let drafts = state.drafter.as_ref().unwrap().pending.unwrap();
             // INVARIANT: row 0 of this verify is `next`, the token the previous
             // step emitted LAST. If it is not, the KV and the emitted stream
             // have desynchronised -- the cache then holds a prefix the client
@@ -3679,7 +3679,7 @@ fn finish_decode(
             let mark = state.state.mark_kv();
             // One phase per step for the alternating slack probe, set before
             // any site in this step can read it.
-            v4flash_kernels::het::mtp::slack_probe_step_advance();
+            v4flash_kernels::het::drafter::slack_probe_step_advance();
             let t_step = std::time::Instant::now();
             // Verify-step boundary: the previous step's logits were read back,
             // so no MoE kernel can be reading the pool. Admit prefetched experts.
@@ -3725,7 +3725,7 @@ fn finish_decode(
             // Capture on BOTH lanes, and over the WHOLE verify batch.
             //
             // The verify splits into two lanes (`single_lane_max` defaults to
-            // 0, so B=6 becomes 3+3), and `mtp_src` is captured per lane into
+            // 0, so B=6 becomes 3+3), and `drafter_src` is captured per lane into
             // that lane's own buffer, indexed LANE-LOCALLY. Arming only lane A
             // left rows [b_a, b) -- about 29% of accepted heads at the measured
             // n histogram -- reading STALE residuals out of lane A's buffer,
@@ -3738,8 +3738,8 @@ fn finish_decode(
             // every residual by one. That is why forcing single-lane measured
             // WORSE (E 2.26 -> 1.74) instead of better. `toks.len()` makes the
             // skip zero in both configurations.
-            state.bd_a.mtp_capture_rows = toks.len();
-            state.bd_b.mtp_capture_rows = toks.len();
+            state.bd_a.drafter_capture_rows = toks.len();
+            state.bd_b.drafter_capture_rows = toks.len();
             // Only when the decode-path verify did not already produce them:
             // running both would ingest B tokens TWICE and the partial rollback
             // would then keep a doubly-ingested cache.
@@ -3753,10 +3753,10 @@ fn finish_decode(
                     state.pager.as_mut(), engram_chunk.as_deref(),
                 )?
             };
-            state.bd_a.mtp_capture_rows = 0;
-            state.bd_b.mtp_capture_rows = 0;
+            state.bd_a.drafter_capture_rows = 0;
+            state.bd_b.drafter_capture_rows = 0;
             // `V41_VERIFY_DECODE_PATH=1` skips `forward_prefill_pipelined`
-            // entirely, and that call is what captures `mtp_src`. So under this
+            // entirely, and that call is what captures `drafter_src`. So under this
             // flag `main_hidden` and the dense-ring replay both read the
             // PREVIOUS step's residuals, and any acceptance number measured with
             // it is measuring a drafter fed one-step-stale hidden states. Since
@@ -3773,7 +3773,7 @@ fn finish_decode(
                 }
             }
             // Only the batched verify (`forward_prefill_pipelined`) captures this
-            // step's `mtp_src`; the `V41_VERIFY_DECODE_PATH` diagnostic does not
+            // step's `drafter_src`; the `V41_VERIFY_DECODE_PATH` diagnostic does not
             // (warned above), so the lane-capture asserts and the consume-once
             // reset below apply to the batched verify alone.
             let verify_captured = decode_path_logits.is_none();
@@ -4042,56 +4042,56 @@ fn finish_decode(
             // `main_hidden` for the next draft is the row that became the head.
             let row = n; // row n is the last position kept: `next` + n drafts
             let ne = v4flash_kernels::config::N_EMBD as usize;
-            let nsrc = v4flash_kernels::het::mtp::MTP_SRC_LAYERS.len();
-            let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
+            let nsrc = v4flash_kernels::het::drafter::DRAFT_SRC_LAYERS.len();
+            let cap = v4flash_kernels::het::batch_scratch::DRAFT_CAP_ROWS;
             // Global batch row -> (lane, lane-local row). See the capture
-            // comment above: each lane's `mtp_src` is indexed from 0.
-            let cut = state.bd_a.mtp_lane_cut;
+            // comment above: each lane's `drafter_src` is indexed from 0.
+            let cut = state.bd_a.drafter_lane_cut;
             // The cut is the ONLY thing tying a global batch row to the lane
-            // that captured its residual, and each lane's `mtp_src` is indexed
+            // that captured its residual, and each lane's `drafter_src` is indexed
             // from 0. If the cut does not cover the rows each lane actually
             // captured, `main_hidden` is read out of the wrong lane's buffer and
             // is silently STALE -- the failure that looked like "the drafter is
             // degenerate" until it was root-caused to this mapping.
             assert!(
-                !verify_captured || state.bd_a.mtp_captured >= cut.min(toks.len()),
+                !verify_captured || state.bd_a.drafter_captured >= cut.min(toks.len()),
                 "dspark accept: lane A captured {} mtp_src rows, but the recorded lane cut claims                  rows [0,{}) of this {}-row verify came from lane A",
-                state.bd_a.mtp_captured,
+                state.bd_a.drafter_captured,
                 cut.min(toks.len()),
                 toks.len()
             );
             assert!(
-                !verify_captured || cut >= toks.len() || state.bd_b.mtp_captured >= toks.len() - cut,
+                !verify_captured || cut >= toks.len() || state.bd_b.drafter_captured >= toks.len() - cut,
                 "dspark accept: lane B captured {} mtp_src rows, but the recorded lane cut claims                  rows [{cut},{}) of this verify came from lane B",
-                state.bd_b.mtp_captured,
+                state.bd_b.drafter_captured,
                 toks.len()
             );
             let mut whole = vec![0.0f32; nsrc * cap * ne];
             let mut whole_b = vec![0.0f32; nsrc * cap * ne];
-            state.bd_a.mtp_src.copy_to_host(&mut whole)?;
+            state.bd_a.drafter_src.copy_to_host(&mut whole)?;
             if cut < toks.len() {
-                state.bd_b.mtp_src.copy_to_host(&mut whole_b)?;
+                state.bd_b.drafter_src.copy_to_host(&mut whole_b)?;
             }
             // Consumed (the rows now live in `whole`/`whole_b`): clear the
             // counts so nothing later treats them as a capture. Otherwise a
             // later request whose prompt is restored in full runs no prefill,
-            // and `seed_mtp_ring` would seed the drafter ring with THIS verify's
+            // and `seed_drafter_ring` would seed the drafter ring with THIS verify's
             // rows (they pass its "ends at or before start_pos" guard).
             if verify_captured {
-                state.bd_a.mtp_captured = 0;
-                state.bd_b.mtp_captured = 0;
+                state.bd_a.drafter_captured = 0;
+                state.bd_b.drafter_captured = 0;
             }
             let lane_row = |r: usize| -> (&Vec<f32>, usize) {
                 let (buf, lr) = if r < cut { (&whole, r) } else { (&whole_b, r - cut) };
-                // LANE-LOCAL row, never a global one: `mtp_src` holds at most
-                // MTP_CAP_ROWS rows per lane.
+                // LANE-LOCAL row, never a global one: `drafter_src` holds at most
+                // DRAFT_CAP_ROWS rows per lane.
                 assert!(
                     lr < cap,
                     "dspark accept: lane-local mtp_src row {lr} (global row {r}, lane cut {cut})                      >= MTP_CAP_ROWS {cap}"
                 );
                 (buf, lr)
             };
-            let m = state.mtp.as_mut().expect("mtp");
+            let m = state.drafter.as_mut().expect("mtp");
             m.main_hidden.clear();
             #[allow(clippy::needless_range_loop)]
             for sl in 0..nsrc {
@@ -4139,7 +4139,7 @@ fn finish_decode(
             // pos..pos+n-1 never got a ring write and the window goes ~43% sparse
             // — the reason accept E (~1.8) sits far below shadow E (~3.08). Replay
             // the drafter over each accepted position first (its residual is in
-            // mtp_src row r; the token AT p+1 is the accepted draft), so the ring
+            // drafter_src row r; the token AT p+1 is the accepted draft), so the ring
             // is dense like shadow's. The intermediate drafts are discarded.
             //
             // DEFAULT ON since 2026-09-16. Back-to-back at the current defaults
@@ -4161,9 +4161,9 @@ fn finish_decode(
                     let tok_at_p1 = drafts[r];
                     let mut tr = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
                     embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok_at_p1, &mut tr);
-                    let m = state.mtp.as_mut().expect("mtp");
+                    let m = state.drafter.as_mut().expect("mtp");
                     // Correct cheap advance: full layer forward (ring + carry),
-                    // skip the exit. Residual at pos+r is mtp_src row r.
+                    // skip the exit. Residual at pos+r is drafter_src row r.
                     //
                     // `V41_DSPARK_RING_FAST`: the full forward is only needed
                     // for the CARRY; the ring row itself is a projection of the
@@ -4185,7 +4185,7 @@ fn finish_decode(
             // p+1), and here p = pos + n and the token at p+1 is `head`.
             let mut token_row = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, head, &mut token_row);
-            let m = state.mtp.as_mut().expect("mtp");
+            let m = state.drafter.as_mut().expect("mtp");
             let (d2, _) = state.engine.dspark_draft(
                 &mut m.state, &mut m.exit, &m.main_hidden, &m.w, &m.xw, &state.weights,
                 &m.markov_embd, m.markov_dtype, pos + n as u32, &token_row, &m.noise_row, head, true, None,
@@ -4208,7 +4208,7 @@ fn finish_decode(
                     roll_ms = format!("{:.1}", (t_roll - t_argmax).as_secs_f64() * 1e3),
                     draft_ms = format!("{:.1}", (t_step.elapsed() - t_roll).as_secs_f64() * 1e3),
                     step_ms = format!("{:.1}", t_step.elapsed().as_secs_f64() * 1e3),
-                    probe_on = v4flash_kernels::het::mtp::slack_probe_phase() as u8,
+                    probe_on = v4flash_kernels::het::drafter::slack_probe_phase() as u8,
                     "dspark.step"
                 );
             }
@@ -4221,15 +4221,15 @@ fn finish_decode(
             t_embed.elapsed().as_nanos() as u64,
         );
         // Already in KV from the verify above: advance past it, forward nothing.
-        let spec_ingested = state.mtp.as_mut().is_some_and(|m| {
+        let spec_ingested = state.drafter.as_mut().is_some_and(|m| {
             let hit = m.ingested > 0;
             if hit {
                 m.ingested -= 1;
             }
             hit
         });
-        let use_mtp = !spec_ingested && state.mtp.is_some() && state.pager.is_some();
-        if use_mtp {
+        let use_drafter = !spec_ingested && state.drafter.is_some() && state.pager.is_some();
+        if use_drafter {
             {
                 // Same forward, plus the hc-collapsed residual ENTERING layers
                 // 37/38/39 — the drafter's only input from the main model.
@@ -4238,9 +4238,9 @@ fn finish_decode(
                     Some(ec) => Some(ec.rows_for(pg.raw(), next, pos)?),
                     None => None,
                 };
-                let m = state.mtp.as_mut().expect("mtp");
+                let m = state.drafter.as_mut().expect("mtp");
                 m.capture.begin();
-                state.engine.forward_token_paged_mtp(
+                state.engine.forward_token_paged_drafter(
                     &mut state.dgpu_scratch,
                     &mut state.igpu_scratch,
                     &mut state.state,
@@ -4292,7 +4292,7 @@ fn finish_decode(
         // Speculative tokens the verify already confirmed (and ingested) come
         // from the queue; `next_after` is the model's own correction that ends
         // the accepted run and is NOT yet in KV.
-        let spec_next: Option<i32> = state.mtp.as_mut().and_then(|m| {
+        let spec_next: Option<i32> = state.drafter.as_mut().and_then(|m| {
             // By this point in the iteration `ingested` has already been
             // decremented for the token just emitted, so the queue of confirmed
             // drafts and the count of verify rows still sitting in KV must be
@@ -4321,16 +4321,16 @@ fn finish_decode(
             &v4flash_kernels::het::trace::phase::CALLER_SAMPLE_NS,
             t_sample.elapsed().as_nanos() as u64,
         );
-        // DSpark SHADOW: draft the next MTP_BLOCK tokens and record them, but
+        // DSpark SHADOW: draft the next DRAFT_BLOCK tokens and record them, but
         // do not act on them. The loop's output is untouched, so this measures
         // acceptance against the real model without any chance of changing what
         // the server emits — the drafter is the part that had never been run
         // against real residuals, and acceptance is the only number that says
         // whether it is right.
-        if use_mtp && pos >= 1 {
+        if use_drafter && pos >= 1 {
             let mut token_row = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut token_row);
-            let m = state.mtp.as_mut().expect("mtp");
+            let m = state.drafter.as_mut().expect("mtp");
             if m.actual.is_empty() {
                 m.actual_base = pos;
             }
@@ -4524,18 +4524,18 @@ fn finish_decode(
     // what the model actually generated. `E` counts the ingested token too, so
     // it is directly comparable to the Python oracle's 1.93 / 2.77 / 3.57 / 4.94
     // at K = 1 / 2 / 3 / 5 (a per-token acceptance of ~0.92 reproduces all four).
-    if let Some(m) = state.mtp.as_mut() {
-        use v4flash_kernels::het::mtp::MTP_BLOCK;
-        let mut hist = [0usize; MTP_BLOCK + 1];
+    if let Some(m) = state.drafter.as_mut() {
+        use v4flash_kernels::het::drafter::DRAFT_BLOCK;
+        let mut hist = [0usize; DRAFT_BLOCK + 1];
         let (mut batches, mut total) = (0usize, 0usize);
         for (first_pos, d) in &m.drafts {
             let Some(i0) = first_pos.checked_sub(m.actual_base) else { continue };
             let i0 = i0 as usize;
-            if i0 + MTP_BLOCK > m.actual.len() {
+            if i0 + DRAFT_BLOCK > m.actual.len() {
                 continue;
             }
             let mut n = 0usize;
-            while n < MTP_BLOCK && d[n] == m.actual[i0 + n] {
+            while n < DRAFT_BLOCK && d[n] == m.actual[i0 + n] {
                 n += 1;
             }
             hist[n] += 1;
@@ -4550,13 +4550,13 @@ fn finish_decode(
         // (d1 0.562 / E 1.99), so the content of the probe prompt matters as
         // much as the implementation.
         {
-            let mut hit = [0usize; MTP_BLOCK];
+            let mut hit = [0usize; DRAFT_BLOCK];
             let mut tot = 0usize;
             for (first_pos, d) in &m.drafts {
                 let Some(i0) = first_pos.checked_sub(m.actual_base) else { continue };
                 let i0 = i0 as usize;
-                if i0 + MTP_BLOCK > m.actual.len() { continue; }
-                for k in 0..MTP_BLOCK {
+                if i0 + DRAFT_BLOCK > m.actual.len() { continue; }
+                for k in 0..DRAFT_BLOCK {
                     if d[k] == m.actual[i0 + k] { hit[k] += 1; }
                 }
                 tot += 1;
@@ -4575,12 +4575,12 @@ fn finish_decode(
         for (i, (fp, d)) in m.drafts.iter().enumerate().take(6) {
             let Some(i0) = fp.checked_sub(m.actual_base) else { continue };
             let i0 = i0 as usize;
-            if i0 + MTP_BLOCK > m.actual.len() { continue; }
+            if i0 + DRAFT_BLOCK > m.actual.len() { continue; }
             tracing::info!(
                 pos = *fp,
                 drafts = ?d,
                 plain = ?m.drafts_plain.get(i).map(|x| x.1),
-                actual = ?&m.actual[i0..i0 + MTP_BLOCK],
+                actual = ?&m.actual[i0..i0 + DRAFT_BLOCK],
                 "dspark.shadow.sample"
             );
         }
@@ -4590,9 +4590,9 @@ fn finish_decode(
             for (first_pos, d) in &m.drafts_plain {
                 let Some(i0) = first_pos.checked_sub(m.actual_base) else { continue };
                 let i0 = i0 as usize;
-                if i0 + MTP_BLOCK > m.actual.len() { continue; }
+                if i0 + DRAFT_BLOCK > m.actual.len() { continue; }
                 let mut n = 0usize;
-                while n < MTP_BLOCK && d[n] == m.actual[i0 + n] { n += 1; }
+                while n < DRAFT_BLOCK && d[n] == m.actual[i0 + n] { n += 1; }
                 if n > 0 { fh += 1; }
                 t2 += n;
                 b2 += 1;
@@ -4615,12 +4615,12 @@ fn finish_decode(
             for (first_pos, d) in &m.drafts {
                 let Some(base) = (*first_pos as i64 - m.actual_base as i64).checked_add(shift as i64)
                 else { continue };
-                if base < 0 || base as usize + MTP_BLOCK > m.actual.len() {
+                if base < 0 || base as usize + DRAFT_BLOCK > m.actual.len() {
                     continue;
                 }
                 let i0 = base as usize;
                 let mut n = 0usize;
-                while n < MTP_BLOCK && d[n] == m.actual[i0 + n] {
+                while n < DRAFT_BLOCK && d[n] == m.actual[i0 + n] {
                     n += 1;
                 }
                 if n > 0 {
@@ -4650,9 +4650,9 @@ fn finish_decode(
                 .filter(|(i, _)| *i >= 128)
                 .filter_map(|(_, (fp, d))| {
                     let i0 = fp.checked_sub(m.actual_base)? as usize;
-                    if i0 + MTP_BLOCK > m.actual.len() { return None; }
+                    if i0 + DRAFT_BLOCK > m.actual.len() { return None; }
                     let mut n = 0;
-                    while n < MTP_BLOCK && d[n] == m.actual[i0 + n] { n += 1; }
+                    while n < DRAFT_BLOCK && d[n] == m.actual[i0 + n] { n += 1; }
                     Some(n)
                 })
                 .collect();
@@ -4677,7 +4677,7 @@ fn finish_decode(
                         let a = 0.5 * (lo + hi);
                         let mut sum = 0.0;
                         let mut p = 1.0;
-                        for _ in 0..MTP_BLOCK { p *= a; sum += p; }
+                        for _ in 0..DRAFT_BLOCK { p *= a; sum += p; }
                         if sum < mean { lo = a } else { hi = a }
                     }
                     0.5 * (lo + hi)
@@ -5071,21 +5071,21 @@ fn prefill_suffix(
         return Ok(());
     }
     // DSpark prefill ring seeding: have the batched path capture the last
-    // MTP_CAP_ROWS main-model residuals of this prefill so `seed_mtp_ring` can
+    // DRAFT_CAP_ROWS main-model residuals of this prefill so `seed_drafter_ring` can
     // write them into the drafter's ring. Costs one `hc_weighted` launch per MTP
     // source layer per chunk and nothing when no drafter is loaded.
     {
-        let rows = if state.mtp.is_some()
+        let rows = if state.drafter.is_some()
             && std::env::var("V41_DSPARK_SEED_RING").as_deref() != Ok("0")
         {
-            v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS
+            v4flash_kernels::het::batch_scratch::DRAFT_CAP_ROWS
         } else {
             0
         };
-        state.bd_a.mtp_capture_rows = rows;
-        state.bd_b.mtp_capture_rows = rows;
-        state.bd_a.mtp_captured = 0;
-        state.bd_b.mtp_captured = 0;
+        state.bd_a.drafter_capture_rows = rows;
+        state.bd_b.drafter_capture_rows = rows;
+        state.bd_a.drafter_captured = 0;
+        state.bd_b.drafter_captured = 0;
     }
     let n_embd = N_EMBD as usize;
     let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
@@ -5503,8 +5503,8 @@ const _: () = {
 ///
 /// Paired with every `state.state.reset_in_place(..)`: the main model's KV lives
 /// in `HetModelState` and is reset there, but the drafter's ring lives on
-/// `MtpState` for the life of the process and had no reset at all. See
-/// `MtpState::reset_ring` for the measured cost of that omission.
+/// `DrafterState` for the life of the process and had no reset at all. See
+/// `DrafterState::reset_ring` for the measured cost of that omission.
 /// Per-request DSpark statistics, for reading real traffic rather than a fixed
 /// benchmark prompt.
 ///
@@ -5557,7 +5557,7 @@ pub static DSPARK_DESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 mod dspark_stats {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    const MAXB: usize = v4flash_kernels::het::mtp::MTP_BLOCK + 1;
+    const MAXB: usize = v4flash_kernels::het::drafter::DRAFT_BLOCK + 1;
     static HIST: [AtomicU64; MAXB] = [const { AtomicU64::new(0) }; MAXB];
     static REACH: [AtomicU64; MAXB] = [const { AtomicU64::new(0) }; MAXB];
     static ACCEPT: [AtomicU64; MAXB] = [const { AtomicU64::new(0) }; MAXB];
@@ -5636,7 +5636,7 @@ mod dspark_stats {
 }
 
 pub(crate) fn reset_drafter_ring(state: &mut WorkerState) {
-    if let Some(m) = state.mtp.as_mut() {
+    if let Some(m) = state.drafter.as_mut() {
         m.state.reset_ring();
     }
 }

@@ -1,4 +1,4 @@
-//! Every `_batched` kernel the DSpark drafter runs at B = MTP_BLOCK = 5,
+//! Every `_batched` kernel the DSpark drafter runs at B = DRAFT_BLOCK = 5,
 //! checked row-by-row against its known-good B=1 twin.
 //!
 //! Motivation: `f16.gemm_batched_wmma` (BM/BN = 64) silently returns zeros for
@@ -8,7 +8,7 @@
 //! produced fluent-looking drafts. Any other batched kernel written for
 //! prefill-sized batches can do the same, so they all get checked here.
 //!
-//!   cargo test -p v4flash-kernels --features v41 --test mtp_batched_kernels_b5 \
+//!   cargo test -p v4flash-kernels --features v41 --test drafter_batched_kernels_b5 \
 //!     -- --ignored --nocapture
 
 use color_eyre::eyre::{self, eyre};
@@ -19,8 +19,8 @@ use v4flash_kernels::config::{
     Q_FLAT, RANK, RMS_EPS,
 };
 use v4flash_kernels::het::engine::DeviceEngine;
-use v4flash_kernels::het::mtp::mtp_rope;
-use v4flash_kernels::het::weights::MtpWeights;
+use v4flash_kernels::het::drafter::drafter_rope;
+use v4flash_kernels::het::weights::DrafterWeights;
 
 const B: usize = 5;
 
@@ -78,7 +78,7 @@ fn batched_kernels_agree_with_b1_at_block_size() {
     let dev = pick_igpu().expect("igpu");
     let arch = dev.properties().expect("props").gcn_arch_name;
     let e = DeviceEngine::for_arch(dev, &arch).expect("engine");
-    let w = MtpWeights::load(&hf, dev, 40).expect("load drafter");
+    let w = DrafterWeights::load(&hf, dev, 40).expect("load drafter");
     let l = &w.layers[0];
     let s = &e.compute;
     let id = dev.id;
@@ -213,7 +213,7 @@ fn batched_kernels_agree_with_b1_at_block_size() {
     {
         let qf = Q_FLAT as usize;
         let base = noise(B * qf, 5, 1.0);
-        let rope = mtp_rope();
+        let rope = drafter_rope();
         let mut pos_b = DeviceBuffer::<i32>::new(id, B).unwrap();
         let positions: Vec<i32> = (0..B).map(|j| 200 + j as i32).collect();
         pos_b.copy_from_host(&positions).unwrap();

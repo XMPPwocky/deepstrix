@@ -1,6 +1,6 @@
 //! `V41_MTP_MOE_GROUPED`: the drafter's routed MoE grouped by expert
 //! (`mxfp4_pair_matvec_fused_swiglu_grouped` + one q8k + `mxfp4_matvec_par_grouped`)
-//! vs the per-row chain it replaces in `MtpState::moe` (B x [gate/up hetsplit,
+//! vs the per-row chain it replaces in `DrafterState::moe` (B x [gate/up hetsplit,
 //! q8k, down hetsplit]), on synthetic MXFP4 experts at the drafter's shapes (no
 //! model load; ~600 MB of iGPU memory).
 //!
@@ -17,7 +17,7 @@
 //! MALL) -- informational, the bar is the parity run.
 //!
 //! gfx1151 only. Run (hub DOWN): `cargo test --release --features v41 -p
-//! v4flash-kernels --test mtp_moe_grouped -- --ignored --test-threads=1 --nocapture`.
+//! v4flash-kernels --test drafter_moe_grouped -- --ignored --test-threads=1 --nocapture`.
 
 use color_eyre::eyre;
 use v4flash_core::gguf::GgufType;
@@ -25,7 +25,7 @@ use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::config::{BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, N_EMBD, N_FF_EXP, SWIGLU_CLAMP_EXP};
 use v4flash_kernels::het::dispatch;
 use v4flash_kernels::het::engine::DeviceEngine;
-use v4flash_kernels::het::mtp::{MTP_BLOCK, MTP_TOPK};
+use v4flash_kernels::het::drafter::{DRAFT_BLOCK, DRAFT_TOPK};
 use v4flash_kernels::het::remote_experts::{MIDQ_BYTES_PER_SLOT, SENTINEL_EXPERT, XQ_BYTES_PER_TOKEN};
 use v4flash_kernels::mxfp4_tables::SUPER_MXFP4_BYTES;
 use v4flash_kernels::q8_k::BLOCK_Q8_K_BYTES;
@@ -127,7 +127,7 @@ struct Out {
 
 impl Out {
     fn new(id: i32) -> eyre::Result<Self> {
-        let (b, tk) = (MTP_BLOCK, MTP_TOPK as usize);
+        let (b, tk) = (DRAFT_BLOCK, DRAFT_TOPK as usize);
         Ok(Self {
             mid: upload(id, &vec![SENTINEL; b * tk * N_FF_EXP as usize])?,
             midq: upload(id, &vec![0xA5u8; b * tk * MIDQ_BYTES_PER_SLOT])?,
@@ -136,50 +136,50 @@ impl Out {
     }
 }
 
-/// `MtpState::moe`'s per-row chain, verbatim.
+/// `DrafterState::moe`'s per-row chain, verbatim.
 fn per_row(e: &DeviceEngine, s: &Stream, r: &Rig, sel: &DeviceBuffer<i32>, o: &mut Out) -> eyre::Result<()> {
-    let tk = MTP_TOPK as usize;
+    let tk = DRAFT_TOPK as usize;
     let (ffe, ne) = (N_FF_EXP as usize, N_EMBD as usize);
-    for j in 0..MTP_BLOCK {
+    for j in 0..DRAFT_BLOCK {
         let xq_j = r.xq.slice_view(j * XQ_BYTES_PER_TOKEN, XQ_BYTES_PER_TOKEN);
         let ew_j = r.ew.slice_view(j * tk, tk);
         let sel_j = sel.slice_view(j * tk, tk);
         let mut mid_j = o.mid.slice_view_mut(j * tk * ffe, tk * ffe);
         dispatch::moe_gate_up_batch_hetsplit(
-            e, GgufType::MXFP4, s, &mut mid_j, &r.gate, &r.up, &xq_j, &ew_j, &sel_j, &r.remap, 0, MTP_TOPK,
-            r.gbpe, r.gbpe, MTP_TOPK, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            e, GgufType::MXFP4, s, &mut mid_j, &r.gate, &r.up, &xq_j, &ew_j, &sel_j, &r.remap, 0, DRAFT_TOPK,
+            r.gbpe, r.gbpe, DRAFT_TOPK, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
         )?;
         let mut midq_j = o.midq.slice_view_mut(j * tk * MIDQ_BYTES_PER_SLOT, tk * MIDQ_BYTES_PER_SLOT);
-        e.q8k.launch(s, &mut midq_j, &mid_j, BLOCKS_Q8K_DOWN_IN * MTP_TOPK)?;
+        e.q8k.launch(s, &mut midq_j, &mid_j, BLOCKS_Q8K_DOWN_IN * DRAFT_TOPK)?;
         let mut out_j = o.out.slice_view_mut(j * ne, ne);
         dispatch::moe_down_batched_hetsplit(
-            e, GgufType::MXFP4, s, &mut out_j, &r.down, &midq_j, &sel_j, &r.remap, 0, MTP_TOPK, r.dbpe,
-            MIDQ_BYTES_PER_SLOT as u32, MTP_TOPK, N_EMBD, BLOCKS_Q8K_DOWN_IN,
+            e, GgufType::MXFP4, s, &mut out_j, &r.down, &midq_j, &sel_j, &r.remap, 0, DRAFT_TOPK, r.dbpe,
+            MIDQ_BYTES_PER_SLOT as u32, DRAFT_TOPK, N_EMBD, BLOCKS_Q8K_DOWN_IN,
         )?;
     }
     Ok(())
 }
 
-/// The `V41_MTP_MOE_GROUPED` chain, as `MtpState::moe` issues it.
+/// The `V41_MTP_MOE_GROUPED` chain, as `DrafterState::moe` issues it.
 fn grouped(e: &DeviceEngine, s: &Stream, r: &Rig, sel: &DeviceBuffer<i32>, o: &mut Out) -> eyre::Result<()> {
-    let b = MTP_BLOCK as u32;
+    let b = DRAFT_BLOCK as u32;
     e.mxfp4pair.launch_fused_swiglu_grouped(
         s, &mut o.mid, &r.gate, &r.up, &r.xq, &r.ew, sel, &r.remap, r.gbpe, r.gbpe, SWIGLU_CLAMP_EXP,
-        N_FF_EXP, BLOCKS_Q8K_GATE_IN, b, MTP_TOPK,
+        N_FF_EXP, BLOCKS_Q8K_GATE_IN, b, DRAFT_TOPK,
     )?;
-    e.q8k.launch(s, &mut o.midq, &o.mid, BLOCKS_Q8K_DOWN_IN * b * MTP_TOPK)?;
+    e.q8k.launch(s, &mut o.midq, &o.mid, BLOCKS_Q8K_DOWN_IN * b * DRAFT_TOPK)?;
     e.mxfp4.launch_grouped(
         s, &mut o.out, &r.down, &o.midq, sel, &r.remap, r.dbpe, MIDQ_BYTES_PER_SLOT as u32, N_EMBD,
-        BLOCKS_Q8K_DOWN_IN, b, MTP_TOPK,
+        BLOCKS_Q8K_DOWN_IN, b, DRAFT_TOPK,
     )
 }
 
-/// `MTP_BLOCK` tokens x `MTP_TOPK` DISTINCT picks from `pool`, token-major.
+/// `DRAFT_BLOCK` tokens x `DRAFT_TOPK` DISTINCT picks from `pool`, token-major.
 fn picks_from(rng: &mut Lcg, pool: &[i32]) -> Vec<i32> {
     let mut v = Vec::new();
-    for _ in 0..MTP_BLOCK {
+    for _ in 0..DRAFT_BLOCK {
         let mut t: Vec<i32> = Vec::new();
-        while t.len() < MTP_TOPK as usize {
+        while t.len() < DRAFT_TOPK as usize {
             let x = pool[rng.below(pool.len() as u32) as usize];
             if !t.contains(&x) {
                 t.push(x);
@@ -231,18 +231,18 @@ fn grouped_moe_bit_identical_to_per_row() -> eyre::Result<()> {
         gbpe: gbpe as u32,
         dbpe: dbpe as u32,
         remap: upload(id, &remap_h)?,
-        xq: upload(id, &q8k_blocks(&mut rng, MTP_BLOCK * nb_in))?,
-        ew: upload(id, &(0..MTP_BLOCK * MTP_TOPK as usize).map(|_| 0.05 + (rng.next() % 1000) as f32 * 1e-3).collect::<Vec<_>>())?,
+        xq: upload(id, &q8k_blocks(&mut rng, DRAFT_BLOCK * nb_in))?,
+        ew: upload(id, &(0..DRAFT_BLOCK * DRAFT_TOPK as usize).map(|_| 0.05 + (rng.next() % 1000) as f32 * 1e-3).collect::<Vec<_>>())?,
     };
 
     let all: Vec<i32> = (0..N_PHYS as i32).collect();
     let mut cases: Vec<(String, Vec<i32>)> = Vec::new();
-    cases.push(("same 3, same slots".into(), [4, 9, 17].repeat(MTP_BLOCK)));
+    cases.push(("same 3, same slots".into(), [4, 9, 17].repeat(DRAFT_BLOCK)));
     cases.push(("same 3, rotated slots".into(), [4, 9, 17, 9, 17, 4, 17, 4, 9, 4, 17, 9, 9, 4, 17].to_vec()));
     cases.push(("15 distinct".into(), (0..15).map(|x| (x * 2 + 1) % N_PHYS as i32).collect()));
     for t in 0..8 {
         let pool: Vec<i32> = (0..6).map(|_| all[rng.below(N_PHYS as u32) as usize]).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-        if pool.len() >= MTP_TOPK as usize {
+        if pool.len() >= DRAFT_TOPK as usize {
             cases.push((format!("pool6 #{t}"), picks_from(&mut rng, &pool)));
         }
         let mut pool9: Vec<i32> = Vec::new();
@@ -286,9 +286,9 @@ fn grouped_moe_bit_identical_to_per_row() -> eyre::Result<()> {
     let mut o = Out::new(id)?;
     let sel = upload(id, &[0i32; 18])?;
     assert!(e.mxfp4.launch_grouped(&s, &mut o.out, &rig.down, &o.midq, &sel, &rig.remap, rig.dbpe,
-        MIDQ_BYTES_PER_SLOT as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN, 6, MTP_TOPK).is_err(), "18 picks > 16 must be refused");
+        MIDQ_BYTES_PER_SLOT as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN, 6, DRAFT_TOPK).is_err(), "18 picks > 16 must be refused");
     assert!(e.mxfp4.launch_grouped(&s, &mut o.out, &rig.down, &o.midq, &sel, &rig.remap, rig.dbpe,
-        MIDQ_BYTES_PER_SLOT as u32, N_EMBD, 17, MTP_BLOCK as u32, MTP_TOPK).is_err(), "n_blocks_in 17 must be refused");
+        MIDQ_BYTES_PER_SLOT as u32, N_EMBD, 17, DRAFT_BLOCK as u32, DRAFT_TOPK).is_err(), "n_blocks_in 17 must be refused");
 
     // Timing (informational): rotating 9-of-32 pools, ~7.8 distinct of 15.
     const K: usize = 24;

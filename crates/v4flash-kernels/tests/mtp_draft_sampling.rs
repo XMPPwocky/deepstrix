@@ -1,19 +1,19 @@
 //! DSpark sampled drafts (docs/v41/DSPARK_ARENA_PLAN.md M6): the exit's device
 //! half -- the top-M of one position's biased logits (`indexer_topk_bitonic` at
-//! k = MTP_DRAFT_TOP_M over the full 129,280-entry vocabulary; production runs
+//! k = DRAFT_TOP_M over the full 129,280-entry vocabulary; production runs
 //! it at k = 512 over comp rows) and the `gather_f32` of their logits -- against
 //! a host sort. The host half (`draft_dist`: q and the draw) has unit tests in
 //! mtp.rs. No model weights; runs on the dGPU, where the exit lives.
 //!
 //! ```text
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels \
-//!   --release --features v41 --test mtp_draft_sampling -- --ignored --nocapture
+//!   --release --features v41 --test drafter_draft_sampling -- --ignored --nocapture
 //! ```
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::config::N_VOCAB;
-use v4flash_kernels::het::mtp::{draft_dist, MTP_DRAFT_TOP_M};
+use v4flash_kernels::het::drafter::{draft_dist, DRAFT_TOP_M};
 use v4flash_kernels::{IndexerTopkBitonic, VecAddInplace};
 
 fn pick(prefix: &str) -> eyre::Result<Device> {
@@ -36,7 +36,7 @@ fn top_m_and_gather_match_a_host_sort() -> eyre::Result<()> {
     let gather = VecAddInplace::for_arch(&arch)?;
     let s = Stream::new(dev.id)?;
     let nv = N_VOCAB as usize;
-    let m = MTP_DRAFT_TOP_M;
+    let m = DRAFT_TOP_M;
     let mut logits = DeviceBuffer::<f32>::new(dev.id, nv)?;
     let mut sel = DeviceBuffer::<i32>::new(dev.id, m)?;
     let mut bits = DeviceBuffer::<u32>::new(dev.id, nv.div_ceil(32))?;

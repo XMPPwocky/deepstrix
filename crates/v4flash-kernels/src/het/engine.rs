@@ -738,25 +738,25 @@ impl HeterogeneousEngine {
     /// floor, and it sidesteps the peer-copy stream rule entirely.
     ///
     /// `pos` is the reference's `start_pos`: the position of the token whose
-    /// residual `main_hidden` holds (from `MtpCapture::read` on the decode
+    /// residual `main_hidden` holds (from `DrafterCapture::read` on the decode
     /// path, or the batched verify's per-row capture on the accept path). `token_row` is `embed_lookup` of the token
     /// sampled FROM that forward, which sits at `pos + 1`. The returned drafts
-    /// are therefore predictions for positions `pos + 2 ..= pos + 1 + MTP_BLOCK`.
+    /// are therefore predictions for positions `pos + 2 ..= pos + 1 + DRAFT_BLOCK`.
     #[allow(clippy::too_many_arguments)]
-    /// Ring-write-only drafter advance (see `MtpState::advance_ring`): populate
+    /// Ring-write-only drafter advance (see `DrafterState::advance_ring`): populate
     /// the drafter's KV ring at `pos` from `main_hidden` without drafting.
     pub fn dspark_advance_ring(
         &self,
-        mtp_state: &mut super::mtp::MtpState,
-        w: &super::weights::MtpWeights,
+        drafter_state: &mut super::drafter::DrafterState,
+        w: &super::weights::DrafterWeights,
         pos: u32,
         main_hidden: &[f32],
         token_row: &[f32],
         noise_row: &[f32],
     ) -> color_eyre::eyre::Result<()> {
         self.set_current_cached(self.igpu.device)?;
-        mtp_state.advance_ring(
-            &self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos, main_hidden,
+        drafter_state.advance_ring(
+            &self.igpu, &self.igpu.compute, w, &super::drafter::drafter_rope(), pos, main_hidden,
             token_row, noise_row,
         )?;
         self.igpu.compute.synchronize()?;
@@ -764,34 +764,34 @@ impl HeterogeneousEngine {
     }
 
     /// Cheap ring-only advance for an intermediate accepted position. See
-    /// `MtpState::ring_write_only`.
+    /// `DrafterState::ring_write_only`.
     pub fn dspark_ring_write_only(
         &self,
-        mtp_state: &mut super::mtp::MtpState,
-        w: &super::weights::MtpWeights,
+        drafter_state: &mut super::drafter::DrafterState,
+        w: &super::weights::DrafterWeights,
         pos: u32,
         main_hidden: &[f32],
     ) -> color_eyre::eyre::Result<()> {
         self.set_current_cached(self.igpu.device)?;
-        mtp_state.inject_main_hidden(main_hidden)?;
-        mtp_state.ring_write_only(
-            &self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos,
+        drafter_state.inject_main_hidden(main_hidden)?;
+        drafter_state.ring_write_only(
+            &self.igpu, &self.igpu.compute, w, &super::drafter::drafter_rope(), pos,
         )?;
         self.igpu.compute.synchronize()?;
         Ok(())
     }
 
-    /// `MtpState::ring_write_rows` (the kept rows of a verify block, one
+    /// `DrafterState::ring_write_rows` (the kept rows of a verify block, one
     /// upload and one sync) for consecutive positions from `pos0`.
     pub fn dspark_ring_write_rows(
         &self,
-        mtp_state: &mut super::mtp::MtpState,
-        w: &super::weights::MtpWeights,
+        drafter_state: &mut super::drafter::DrafterState,
+        w: &super::weights::DrafterWeights,
         pos0: u32,
         hidden: &[f32],
     ) -> color_eyre::eyre::Result<()> {
         self.set_current_cached(self.igpu.device)?;
-        mtp_state.ring_write_rows(&self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos0, hidden)?;
+        drafter_state.ring_write_rows(&self.igpu, &self.igpu.compute, w, &super::drafter::drafter_rope(), pos0, hidden)?;
         self.igpu.compute.synchronize()?;
         Ok(())
     }
@@ -805,22 +805,22 @@ impl HeterogeneousEngine {
     /// scratch waits for the write.
     pub fn dspark_ring_write_rows_async(
         &self,
-        mtp_state: &mut super::mtp::MtpState,
-        w: &super::weights::MtpWeights,
+        drafter_state: &mut super::drafter::DrafterState,
+        w: &super::weights::DrafterWeights,
         pos0: u32,
         hidden: &[f32],
     ) -> color_eyre::eyre::Result<()> {
         self.set_current_cached(self.igpu.device)?;
-        mtp_state.ring_write_rows(&self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos0, hidden)
+        drafter_state.ring_write_rows(&self.igpu, &self.igpu.compute, w, &super::drafter::drafter_rope(), pos0, hidden)
     }
 
     pub fn dspark_draft(
         &self,
-        mtp_state: &mut super::mtp::MtpState,
-        exit: &mut super::mtp::MtpExit,
+        drafter_state: &mut super::drafter::DrafterState,
+        exit: &mut super::drafter::DrafterExit,
         main_hidden: &[f32],
-        w: &super::weights::MtpWeights,
-        xw: &super::weights::MtpExitWeights,
+        w: &super::weights::DrafterWeights,
+        xw: &super::weights::DrafterExitWeights,
         weights: &super::HetModelWeights,
         markov_embd: &[u8],
         markov_dtype: v4flash_core::gguf::GgufType,
@@ -829,8 +829,8 @@ impl HeterogeneousEngine {
         noise_row: &[f32],
         first_token: i32,
         want_plain: bool,
-        sampling: Option<&super::mtp::DraftSampling>,
-    ) -> color_eyre::eyre::Result<([i32; super::mtp::MTP_BLOCK], [i32; super::mtp::MTP_BLOCK])> {
+        sampling: Option<&super::drafter::DraftSampling>,
+    ) -> color_eyre::eyre::Result<([i32; super::drafter::DRAFT_BLOCK], [i32; super::drafter::DRAFT_BLOCK])> {
         // `V41_DSPARK_DRAFT_TIMING=1`: split the draft into its three parts. The
         // drafter is only 3 layers but costs ~26 ms/step against the 40-layer
         // main model's 68.7 ms/token, and it straddles BOTH GPUs: the layers run
@@ -841,12 +841,12 @@ impl HeterogeneousEngine {
         let dt = std::env::var("V41_DSPARK_DRAFT_TIMING").as_deref() == Ok("1");
         let t0 = std::time::Instant::now();
         self.set_current_cached(self.igpu.device)?;
-        mtp_state.inject_main_hidden(main_hidden)?;
-        mtp_state.forward(
+        drafter_state.inject_main_hidden(main_hidden)?;
+        drafter_state.forward(
             &self.igpu,
             &self.igpu.compute,
             w,
-            &super::mtp::mtp_rope(),
+            &super::drafter::drafter_rope(),
             pos,
             token_row,
             noise_row,
@@ -857,20 +857,20 @@ impl HeterogeneousEngine {
         // which a device-time counter cannot, and which we got wrong once:
         // B-packing attn_q_b removed 8.8 ms/step of drafter device time for
         // zero end-to-end gain.
-        if let Some(ticks) = super::mtp::slack_probe_ticks("draft") {
+        if let Some(ticks) = super::drafter::slack_probe_ticks("draft") {
             self.igpu.q8.slack_probe_spin(&self.igpu.compute, ticks)?;
         }
         let t_enq = std::time::Instant::now();
         self.igpu.compute.synchronize()?;
-        mtp_state.tally_expert_stats(w.layers.len())?;
+        drafter_state.tally_expert_stats(w.layers.len())?;
         // The drafter's whole forward is now complete on the device, so every
         // mode-3 event pair has resolved and can be charged to its counter.
-        super::mtp::drain_event_spans();
+        super::drafter::drain_event_spans();
         let t_sync = std::time::Instant::now();
-        let mut h_host = vec![0.0f32; mtp_state.h.len()];
-        mtp_state.h.copy_to_host(&mut h_host)?;
-        let mut pre_host = vec![0.0f32; mtp_state.pre_carry().len()];
-        mtp_state.pre_carry().copy_to_host(&mut pre_host)?;
+        let mut h_host = vec![0.0f32; drafter_state.h.len()];
+        drafter_state.h.copy_to_host(&mut h_host)?;
+        let mut pre_host = vec![0.0f32; drafter_state.pre_carry().len()];
+        drafter_state.pre_carry().copy_to_host(&mut pre_host)?;
         let t_copy = std::time::Instant::now();
 
         self.set_current_cached(self.dgpu.device)?;
@@ -878,12 +878,12 @@ impl HeterogeneousEngine {
             let ms = |a: std::time::Instant, b: std::time::Instant| {
                 format!("{:.2}", (b - a).as_secs_f64() * 1e3)
             };
-            let (hcmix, rms, attn, moe, post) = super::mtp::take_layer_host_us();
+            let (hcmix, rms, attn, moe, post) = super::drafter::take_layer_host_us();
             tracing::info!(
                 igpu_enqueue_ms = ms(t0, t_enq),
                 igpu_sync_ms = ms(t_enq, t_sync),
                 h2d_copy_ms = ms(t_sync, t_copy),
-                bytes = (mtp_state.h.len() + mtp_state.pre_carry().len()) * 4,
+                bytes = (drafter_state.h.len() + drafter_state.pre_carry().len()) * 4,
                 // Host (enqueue) time INSIDE the 3 layers, summed, us.
                 // `V41_DSPARK_LAYER_TIMING=1` or these are all zero.
                 l_hcmix_us = hcmix,
@@ -892,11 +892,11 @@ impl HeterogeneousEngine {
                 l_moe_us = moe,
                 l_hcpost_us = post,
                 l_attn_split_us = {
-                    let (q, kv, qa, o) = super::mtp::take_attn_split_us();
-                    format!("qloop={q} kv={kv} qa={qa} outproj={o} kvcopy={}", super::mtp::take_kvcopy_us())
+                    let (q, kv, qa, o) = super::drafter::take_attn_split_us();
+                    format!("qloop={q} kv={kv} qa={qa} outproj={o} kvcopy={}", super::drafter::take_kvcopy_us())
                 },
                 l_kernel_split_us = {
-                    let k = super::mtp::take_kernel_split_us();
+                    let k = super::drafter::take_kernel_split_us();
                     format!(
                         "oquant={} owa={} owb={} | mrouter={} mtopk={} mq8k={} mgateup={} mdown={}",
                         k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]
@@ -965,7 +965,7 @@ impl HeterogeneousEngine {
     /// eats (entering layers 37/38/39). Separate entry point so the hot path
     /// keeps its signature; `mtp.begin()` is the caller's to call.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_token_paged_mtp(
+    pub fn forward_token_paged_drafter(
         &self,
         dgpu_scratch: &mut super::DgpuScratch,
         igpu_scratch: &mut super::IgpuScratch,
@@ -976,7 +976,7 @@ impl HeterogeneousEngine {
         token_id: i32,
         pager: &mut super::expert_pager::ExpertPager,
         engram_rows: Option<&[Vec<f32>]>,
-        mtp: &mut super::mtp::MtpCapture,
+        drafter: &mut super::drafter::DrafterCapture,
     ) -> color_eyre::eyre::Result<()> {
         self.remote_set_phase_busy_poll(true);
         self.forward_token_impl(
@@ -989,7 +989,7 @@ impl HeterogeneousEngine {
             token_id,
             Some(pager),
             engram_rows,
-            Some(mtp),
+            Some(drafter),
         )
     }
 
@@ -1005,7 +1005,7 @@ impl HeterogeneousEngine {
         token_id: i32,
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
         engram_rows: Option<&[Vec<f32>]>,
-        mut mtp: Option<&mut super::mtp::MtpCapture>,
+        mut drafter: Option<&mut super::drafter::DrafterCapture>,
     ) -> color_eyre::eyre::Result<()> {
         use crate::config::{HC_DIM, N_EXPERT, N_LAYER};
         use tracing::debug_span;
@@ -1128,7 +1128,7 @@ impl HeterogeneousEngine {
             // DSpark: the drafter eats the residual ENTERING layers 37/38/39,
             // so this must run before the layer does. A no-op for every other
             // layer.
-            if let Some(c) = mtp.as_deref_mut() {
+            if let Some(c) = drafter.as_deref_mut() {
                 c.on_layer(&self.dgpu, &self.dgpu.compute, layer as i32, &dgpu_scratch.residual)?;
             }
             let next_dlw = if layer + 1 < N_LAYER as usize {

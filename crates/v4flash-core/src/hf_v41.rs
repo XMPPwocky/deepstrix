@@ -82,8 +82,8 @@ pub struct V41HfWeights {
 }
 
 /// DSpark drafter: three stages, each a transformer layer with a 128-wide router.
-pub const MTP_STAGES: usize = 3;
-pub const MTP_N_EXPERT: usize = 128;
+pub const DRAFT_STAGES: usize = 3;
+pub const DRAFT_N_EXPERT: usize = 128;
 
 #[inline]
 pub fn bf16_to_f32(bits: u16) -> f32 {
@@ -397,9 +397,9 @@ impl V41HfWeights {
         }
         // DSpark drafter stages, if the checkpoint carries them. Absent on
         // checkpoints without MTP, so this is best-effort by design.
-        for sgi in 0..MTP_STAGES {
+        for sgi in 0..DRAFT_STAGES {
             if self.st.has(&format!("mtp.{sgi}.attn_norm.weight")) {
-                self.build_mtp(sgi)?;
+                self.build_drafter(sgi)?;
             }
         }
         Ok(())
@@ -417,7 +417,7 @@ impl V41HfWeights {
     /// Each layer is otherwise identical to a main layer — MLA attention, mHC, a
     /// routed MoE, a shared expert — except the router is 128-wide instead of
     /// 384. See `docs/v41/DSPARK_DESIGN.md`.
-    fn build_mtp(&mut self, sgi: usize) -> eyre::Result<()> {
+    fn build_drafter(&mut self, sgi: usize) -> eyre::Result<()> {
         let p = format!("mtp.{sgi}.");
         // Presented as `blk.{n_layers + s}` so `DgpuLayerWeights::load` and
         // `IgpuLayerWeights::load` pick the drafter up UNCHANGED — a drafter layer
@@ -479,7 +479,7 @@ impl V41HfWeights {
                 &format!("{b}{dst}.weight"),
                 &format!("{p}ffn.experts."),
                 src,
-                MTP_N_EXPERT,
+                DRAFT_N_EXPERT,
             )?;
         }
         Ok(())

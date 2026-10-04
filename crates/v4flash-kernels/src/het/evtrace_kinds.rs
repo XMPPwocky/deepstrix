@@ -70,7 +70,7 @@ pub static HUB_REQ: Kind = Kind {
 /// The per-step DEVICE fields, shared by `hub_step` and `step_dev` (the
 /// readers sum a step's `step_dev` records into its `hub_step` BY NAME).
 /// Named BY the stage: `dgpu.a.b` -> `d_a_b`, `igpu.a` -> `i_a`; parent stages
-/// (`dgpu.*` / `igpu.*`) only make up `*_busy_ms`; `d_mtp` / `i_mtp` = the
+/// (`dgpu.*` / `igpu.*`) only make up `*_busy_ms`; `d_drafter` / `i_drafter` = the
 /// DSpark drafter and its ring writes (`mtp.*`, not in busy).
 macro_rules! with_dev_fields {
     ($($pre:literal,)* ; $($post:literal,)*) => {

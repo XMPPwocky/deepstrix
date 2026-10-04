@@ -52,7 +52,7 @@ pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine, SampleMode};
 pub use expert_pager::{ExpertPager, PagerCounters};
 pub use remote_experts::{ExpertShard, MoeExecutor, RemoteExpertClient};
 pub use scratch::{DgpuScratch, IgpuScratch};
-pub mod mtp;
+pub mod drafter;
 
 pub use state::{HetCompressorState, HetLayerState, HetModelState, KvMark};
 pub use weights::{

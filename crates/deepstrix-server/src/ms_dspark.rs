@@ -7,9 +7,9 @@
 //! step is a plain multistream step (K = 0), and the rings are kept current
 //! so a stream that becomes the lone one drafts from a dense window.
 //!
-//! What lives here: one drafter ring per arena slot (`MtpState::rings` is the
-//! drafter's only state that persists across drafts; the rest of `MtpState`
-//! is per-draft scratch, so ONE `MtpState` serves every slot by swapping the
+//! What lives here: one drafter ring per arena slot (`DrafterState::rings` is the
+//! drafter's only state that persists across drafts; the rest of `DrafterState`
+//! is per-draft scratch, so ONE `DrafterState` serves every slot by swapping the
 //! ring in), the main-model residual of each stream's last row in KV (the
 //! input of its next draft), seeding from the prefill's capture, and the
 //! confidence-gated K policy (plan section 6).
@@ -28,12 +28,12 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use v4flash_hip::DeviceBuffer;
 use v4flash_kernels::config::N_EMBD;
-use v4flash_kernels::het::batch_scratch::{BatchDgpuScratch, MTP_CAP_ROWS};
-use v4flash_kernels::het::mtp::{DraftSampling, MTP_BLOCK, MTP_DRAFT_TOP_M, MTP_SRC_LAYERS, MTP_WINDOW, RING_ROWS_MAX};
+use v4flash_kernels::het::batch_scratch::{BatchDgpuScratch, DRAFT_CAP_ROWS};
+use v4flash_kernels::het::drafter::{DraftSampling, DRAFT_BLOCK, DRAFT_TOP_M, DRAFT_SRC_LAYERS, DRAFT_WINDOW, RING_ROWS_MAX};
 use v4flash_kernels::het::SampleMode;
 use v4flash_kernels::het::{HetModelWeights, HeterogeneousEngine};
 
-use crate::engine_worker::MtpCtx;
+use crate::engine_worker::DrafterCtx;
 
 /// `V41_MS_DSPARK=accept`: DSpark on the arena path. Loads the drafter
 /// (as `V41_DSPARK` does) and keeps multistream on for every request.
@@ -64,10 +64,10 @@ fn sampled_drafts() -> bool {
 /// How a stream's drafts are drawn: `Some` (sampled, plan 2.2) when its
 /// requests sample and sampled drafts are on, else `None` (point mass). `u`
 /// are the drafter RNG's uniforms for the block's positions.
-pub fn draft_sampling(mode: &SampleMode, u: [f32; MTP_BLOCK]) -> Option<DraftSampling> {
+pub fn draft_sampling(mode: &SampleMode, u: [f32; DRAFT_BLOCK]) -> Option<DraftSampling> {
     match *mode {
         SampleMode::Multinomial { temperature, top_p, min_p_rel } if temperature > 0.0 && sampled_drafts() => {
-            Some(DraftSampling { temperature, top_p, min_p_rel, m: MTP_DRAFT_TOP_M, u })
+            Some(DraftSampling { temperature, top_p, min_p_rel, m: DRAFT_TOP_M, u })
         }
         _ => None,
     }
@@ -75,25 +75,25 @@ pub fn draft_sampling(mode: &SampleMode, u: [f32; MTP_BLOCK]) -> Option<DraftSam
 
 /// One drafted block.
 pub struct Drafted {
-    pub ids: [i32; MTP_BLOCK],
-    /// Confidence logits (`MtpExit::conf`).
-    pub conf: [f32; MTP_BLOCK],
+    pub ids: [i32; DRAFT_BLOCK],
+    /// Confidence logits (`DrafterExit::conf`).
+    pub conf: [f32; DRAFT_BLOCK],
     /// Sampled drafts: each position's q, `(token, prob)`; `None` for argmax.
     pub q: Option<Vec<Vec<(i32, f64)>>>,
 }
 
 /// Floats of one row's drafter input: `cat(mean_hc(resid@37), @38, @39)`.
-pub const HIDDEN: usize = MTP_SRC_LAYERS.len() * N_EMBD as usize;
+pub const HIDDEN: usize = DRAFT_SRC_LAYERS.len() * N_EMBD as usize;
 
 /// One arena slot's drafter memory.
 struct SlotDraft {
-    /// `MtpState::rings` for this slot's stream.
+    /// `DrafterState::rings` for this slot's stream.
     rings: Vec<DeviceBuffer<u16>>,
     /// Its `ring_writes`.
     writes: usize,
     /// Position of the latest ring row (rows go in, in position order).
     last_ring_pos: Option<u32>,
-    /// `(pos, mtp_src of row pos)` for the stream's LAST row in KV: what its
+    /// `(pos, drafter_src of row pos)` for the stream's LAST row in KV: what its
     /// next draft reads.
     hidden: Option<(u32, Vec<f32>)>,
     /// Draft-or-not (plan section 6, stage 1), one gate per regime:
@@ -129,7 +129,7 @@ struct Stats {
     drafts_verified: u64,
     accepted: u64,
     emitted: u64,
-    k_hist: [u64; MTP_BLOCK + 1],
+    k_hist: [u64; DRAFT_BLOCK + 1],
     draft_ms: f64,
     step_ms: f64,
     no_hidden: u64,
@@ -151,7 +151,7 @@ struct Stats {
     /// then a plain step, like `explored_k0`.
     policy_k0: u64,
     /// Exploration draws by K (K = 0 included).
-    explored_hist: [u64; MTP_BLOCK + 1],
+    explored_hist: [u64; DRAFT_BLOCK + 1],
     /// Exploration draws that verified on two lanes.
     explored_two: u64,
     /// Blocks by rows (index rows - 1): on one lane, on two.
@@ -262,7 +262,7 @@ pub struct MsDspark {
 pub const SPEC_ROWS_PER_LANE: usize = 8;
 
 /// The most rows a multi-stream speculating step prices: two streams' blocks.
-const MULTI_ROWS: usize = 2 * (1 + MTP_BLOCK);
+const MULTI_ROWS: usize = 2 * (1 + DRAFT_BLOCK);
 
 /// The multi-stream tables' starting cells (design 2.3), MEASURED 2026-10-04
 /// 00:50-08:33 UTC (hub 9c6f8ea5, `ms.step` p50): one lane, rows 1..=6 =
@@ -312,14 +312,14 @@ pub fn ring_streams(spec_max: usize) -> usize {
 
 impl MsDspark {
     /// One ring per arena slot, shaped like `mtp.state`'s.
-    pub fn alloc(mtp: &MtpCtx, igpu_id: i32, n_slots: u32) -> eyre::Result<Self> {
+    pub fn alloc(drafter: &DrafterCtx, igpu_id: i32, n_slots: u32) -> eyre::Result<Self> {
         let mut slots = Vec::with_capacity(n_slots as usize);
         // The ring-write events live on the iGPU, where the writes run. A
         // SCOPED switch: a bare set_current would leave the engine's cached
         // current-device mirror stale (KNOWN_BUGS #10).
         let _dev = v4flash_hip::Device::new(igpu_id).scoped_current()?;
         for _ in 0..n_slots {
-            let rings = mtp.state.rings.iter().map(|r| DeviceBuffer::<u16>::new(igpu_id, r.len())).collect::<eyre::Result<Vec<_>>>()?;
+            let rings = drafter.state.rings.iter().map(|r| DeviceBuffer::<u16>::new(igpu_id, r.len())).collect::<eyre::Result<Vec<_>>>()?;
             let write_done = v4flash_hip::Event::new_no_timing()?;
             slots.push(SlotDraft {
                 rings, writes: 0, last_ring_pos: None, hidden: None, gates: [Gate::default(); 2], last_draft_ms: 0.0,
@@ -412,7 +412,7 @@ impl MsDspark {
     /// stream whose draft bought no rows (K_s = 0) gets `< 1` and backs off; a
     /// weaker stream beside a deep block is judged on what its own rows bought.
     #[allow(clippy::too_many_arguments)]
-    pub fn record_multi(&mut self, blocks: &[(u32, [f32; MTP_BLOCK], usize, usize, usize)], rows: usize, lanes: usize, rule: LaneRule, step_ms: f64, plain_ms: f64) {
+    pub fn record_multi(&mut self, blocks: &[(u32, [f32; DRAFT_BLOCK], usize, usize, usize)], rows: usize, lanes: usize, rule: LaneRule, step_ms: f64, plain_ms: f64) {
         let draft_of = |d: &Self, slot: u32| d.slots.get(slot as usize).map(|sd| sd.last_draft_ms).unwrap_or(0.0);
         let drafts_ms: f64 = blocks.iter().map(|b| draft_of(self, b.0)).sum();
         let base_rows = rows - blocks.iter().map(|b| b.2).sum::<usize>();
@@ -445,7 +445,7 @@ impl MsDspark {
             s.drafts_verified += k as u64;
             s.accepted += accepted as u64;
             s.emitted += emitted as u64;
-            s.k_hist[k.min(MTP_BLOCK)] += 1;
+            s.k_hist[k.min(DRAFT_BLOCK)] += 1;
             s.step_ms += step_ms / blocks.len() as f64;
         }
         self.maybe_log();
@@ -482,7 +482,7 @@ impl MsDspark {
     /// cheapest lane count `rule` allows it (`LaneTables::best`); the lanes are
     /// then that cheapest count for the chosen rows. `rule` = this step's
     /// snapshot; the step runs what this returns.
-    pub fn k_for(&mut self, conf: &[f32; MTP_BLOCK], cap: usize, sampled: bool, rule: LaneRule) -> (usize, usize) {
+    pub fn k_for(&mut self, conf: &[f32; DRAFT_BLOCK], cap: usize, sampled: bool, rule: LaneRule) -> (usize, usize) {
         if fixed_k().is_none() {
             // Drawn before `conf` is read (block comment at `explore_p`): one
             // (K, lanes) of the rule's, from the time-aged weight of the cost
@@ -541,17 +541,17 @@ impl MsDspark {
     /// copy), and swap it back whatever `f` returns.
     fn with_ring<T>(
         &mut self,
-        mtp: &mut MtpCtx,
+        drafter: &mut DrafterCtx,
         slot: u32,
         rewind: bool,
-        f: impl FnOnce(&mut MtpCtx) -> eyre::Result<T>,
+        f: impl FnOnce(&mut DrafterCtx) -> eyre::Result<T>,
     ) -> eyre::Result<T> {
         let sd = self.slot(slot)?;
-        std::mem::swap(&mut mtp.state.rings, &mut sd.rings);
-        mtp.state.set_ring_writes(sd.writes - usize::from(rewind && sd.writes > 0));
-        let r = f(mtp);
-        sd.writes = mtp.state.ring_writes();
-        std::mem::swap(&mut mtp.state.rings, &mut sd.rings);
+        std::mem::swap(&mut drafter.state.rings, &mut sd.rings);
+        drafter.state.set_ring_writes(sd.writes - usize::from(rewind && sd.writes > 0));
+        let r = f(drafter);
+        sd.writes = drafter.state.ring_writes();
+        std::mem::swap(&mut drafter.state.rings, &mut sd.rings);
         r
     }
 
@@ -615,7 +615,7 @@ impl MsDspark {
     pub fn keep_row(
         &mut self,
         engine: &HeterogeneousEngine,
-        mtp: &mut MtpCtx,
+        drafter: &mut DrafterCtx,
         slot: u32,
         pos: u32,
         hidden: Vec<f32>,
@@ -626,7 +626,7 @@ impl MsDspark {
         }
         let fresh = self.slot(slot)?.last_ring_pos.is_none_or(|p| pos > p);
         if write_ring && fresh {
-            self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_only(&mut m.state, &m.w, pos, &hidden))?;
+            self.with_ring(drafter, slot, false, |m| engine.dspark_ring_write_only(&mut m.state, &m.w, pos, &hidden))?;
             self.slot(slot)?.last_ring_pos = Some(pos);
         }
         self.slot(slot)?.hidden = Some((pos, hidden));
@@ -635,7 +635,7 @@ impl MsDspark {
 
     /// `keep_row` for the consecutive rows `pos0..pos0 + rows.len()` a step
     /// kept: rows not yet in the ring go in with ONE batched write per
-    /// `RING_ROWS_MAX` (`MtpState::ring_write_rows`: one upload, one read of
+    /// `RING_ROWS_MAX` (`DrafterState::ring_write_rows`: one upload, one read of
     /// each projection), and the last row's residual feeds the next draft. The
     /// write is enqueued WITHOUT a sync (`V41_MS_DSPARK_RING_ASYNC`, default
     /// on): it runs under the step's host tail, and the next draft's blocking
@@ -644,7 +644,7 @@ impl MsDspark {
     pub fn keep_rows(
         &mut self,
         engine: &HeterogeneousEngine,
-        mtp: &mut MtpCtx,
+        drafter: &mut DrafterCtx,
         slot: u32,
         pos0: u32,
         mut rows: Vec<Vec<f32>>,
@@ -671,13 +671,13 @@ impl MsDspark {
                 let p = pos0 + (skip + c * RING_ROWS_MAX) as u32;
                 let flat: Vec<f32> = chunk.concat();
                 if asynchronous {
-                    self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows_async(&mut m.state, &m.w, p, &flat))?;
+                    self.with_ring(drafter, slot, false, |m| engine.dspark_ring_write_rows_async(&mut m.state, &m.w, p, &flat))?;
                     // After the write in `igpu.compute` order: its completion.
                     let sd = self.slot(slot)?;
                     sd.write_done.record(&engine.igpu.compute)?;
                     sd.write_pending = true;
                 } else {
-                    self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows(&mut m.state, &m.w, p, &flat))?;
+                    self.with_ring(drafter, slot, false, |m| engine.dspark_ring_write_rows(&mut m.state, &m.w, p, &flat))?;
                 }
             }
             if skip < rows.len() {
@@ -698,7 +698,7 @@ impl MsDspark {
     pub fn seed(
         &mut self,
         engine: &HeterogeneousEngine,
-        mtp: &mut MtpCtx,
+        drafter: &mut DrafterCtx,
         slot: u32,
         mut rows: BTreeMap<u32, Vec<f32>>,
         last: u32,
@@ -706,7 +706,7 @@ impl MsDspark {
         self.settle_writes();
         self.reset(slot)?;
         let mut first = last;
-        while first > 0 && rows.contains_key(&(first - 1)) && (last - first + 1) < MTP_WINDOW as u32 {
+        while first > 0 && rows.contains_key(&(first - 1)) && (last - first + 1) < DRAFT_WINDOW as u32 {
             first -= 1;
         }
         if !rows.contains_key(&last) {
@@ -714,13 +714,13 @@ impl MsDspark {
         }
         let run: Vec<Vec<f32>> = (first..=last).map(|p| rows.remove(&p).expect("contiguous run")).collect();
         let n = run.len();
-        self.keep_rows(engine, mtp, slot, first, run, true)?;
+        self.keep_rows(engine, drafter, slot, first, run, true)?;
         Ok(n)
     }
 
     /// Draft a block for `slot`'s stream: its last row in KV is `pos`, its
     /// next input `next` (at `pos + 1`, embedded in `token_row`). Returns the
-    /// drafts for `pos + 2 ..= pos + 1 + MTP_BLOCK`, their confidence logits
+    /// drafts for `pos + 2 ..= pos + 1 + DRAFT_BLOCK`, their confidence logits
     /// and (sampled drafts) their q, or `None` when the stream has no residual
     /// for `pos` (then it steps without drafts).
     #[allow(clippy::too_many_arguments)]
@@ -728,7 +728,7 @@ impl MsDspark {
         &mut self,
         engine: &HeterogeneousEngine,
         weights: &HetModelWeights,
-        mtp: &mut MtpCtx,
+        drafter: &mut DrafterCtx,
         slot: u32,
         pos: u32,
         next: i32,
@@ -748,8 +748,8 @@ impl MsDspark {
             self.stats.no_hidden += 1;
             return Ok(None);
         };
-        let ids = self.with_ring(mtp, slot, rewind, |m| {
-            let MtpCtx { state, exit, w, xw, markov_embd, markov_dtype, noise_row, .. } = m;
+        let ids = self.with_ring(drafter, slot, rewind, |m| {
+            let DrafterCtx { state, exit, w, xw, markov_embd, markov_dtype, noise_row, .. } = m;
             engine
                 .dspark_draft(state, exit, &hidden, w, xw, weights, markov_embd, *markov_dtype, pos, token_row, noise_row, next, false, sampling)
                 .map(|(ids, _plain)| ids)
@@ -760,8 +760,8 @@ impl MsDspark {
         sd.last_draft_ms = ms;
         self.stats.draft_ms += ms;
         self.lanes.one.observe_draft(ms);
-        let q = sampling.map(|_| std::mem::take(&mut mtp.exit.q));
-        Ok(Some(Drafted { ids, conf: mtp.exit.conf, q }))
+        let q = sampling.map(|_| std::mem::take(&mut drafter.exit.q));
+        Ok(Some(Drafted { ids, conf: drafter.exit.conf, q }))
     }
 
     /// A plain one-row decode step took `ms` (no drafts): the stage-1 baseline.
@@ -777,7 +777,7 @@ impl MsDspark {
     /// block's confidence logits; `lanes` = how many lanes its verify ran on
     /// (the cost fit it feeds).
     #[allow(clippy::too_many_arguments)]
-    pub fn record(&mut self, slot: u32, conf: &[f32; MTP_BLOCK], k: usize, accepted: usize, emitted: usize, step_ms: f64, lanes: usize) {
+    pub fn record(&mut self, slot: u32, conf: &[f32; DRAFT_BLOCK], k: usize, accepted: usize, emitted: usize, step_ms: f64, lanes: usize) {
         let plain_ms = if self.lanes.one.live { self.lanes.one.cost(1) } else { self.plain_ms };
         self.observe(lanes, 1 + k, step_ms);
         if lanes >= 2 {
@@ -796,8 +796,8 @@ impl MsDspark {
         s.drafts_verified += k as u64;
         s.accepted += accepted as u64;
         s.emitted += emitted as u64;
-        s.k_hist[k.min(MTP_BLOCK)] += 1;
-        s.lanes_by_rows[k.min(MTP_BLOCK)][(lanes >= 2) as usize] += 1;
+        s.k_hist[k.min(DRAFT_BLOCK)] += 1;
+        s.lanes_by_rows[k.min(DRAFT_BLOCK)][(lanes >= 2) as usize] += 1;
         s.step_ms += step_ms;
         self.maybe_log();
     }
@@ -882,17 +882,17 @@ impl MsDspark {
 }
 
 /// The residuals a lane's step captured, one `[HIDDEN]` row per lane row
-/// (`mtp_src` is slot-major `[3][MTP_CAP_ROWS][N_EMBD]`). The step must have
+/// (`drafter_src` is slot-major `[3][DRAFT_CAP_ROWS][N_EMBD]`). The step must have
 /// synchronized its stream.
 pub fn lane_captures(bd: &BatchDgpuScratch, n: usize) -> eyre::Result<Vec<Vec<f32>>> {
-    if n > MTP_CAP_ROWS || bd.mtp_captured != n {
-        return Err(eyre!("ms dspark: lane captured {} rows, the step ran {n}", bd.mtp_captured));
+    if n > DRAFT_CAP_ROWS || bd.drafter_captured != n {
+        return Err(eyre!("ms dspark: lane captured {} rows, the step ran {n}", bd.drafter_captured));
     }
     let ne = N_EMBD as usize;
     let mut out = vec![vec![0f32; HIDDEN]; n];
     let mut tmp = vec![0f32; n * ne];
-    for s in 0..MTP_SRC_LAYERS.len() {
-        bd.mtp_src.slice_view(s * MTP_CAP_ROWS * ne, n * ne).copy_to_host(&mut tmp)?;
+    for s in 0..DRAFT_SRC_LAYERS.len() {
+        bd.drafter_src.slice_view(s * DRAFT_CAP_ROWS * ne, n * ne).copy_to_host(&mut tmp)?;
         for (k, row) in out.iter_mut().enumerate() {
             row[s * ne..(s + 1) * ne].copy_from_slice(&tmp[k * ne..(k + 1) * ne]);
         }
@@ -900,17 +900,17 @@ pub fn lane_captures(bd: &BatchDgpuScratch, n: usize) -> eyre::Result<Vec<Vec<f3
     Ok(out)
 }
 
-/// A prefill's captures by absolute position (both lanes; `mtp_captured_pos0`
+/// A prefill's captures by absolute position (both lanes; `drafter_captured_pos0`
 /// is each lane's first captured position).
 pub fn prefill_captures(lanes: &[&BatchDgpuScratch]) -> eyre::Result<BTreeMap<u32, Vec<f32>>> {
     let mut m = BTreeMap::new();
     for bd in lanes {
-        let n = bd.mtp_captured;
+        let n = bd.drafter_captured;
         if n == 0 {
             continue;
         }
         for (k, row) in lane_captures(bd, n)?.into_iter().enumerate() {
-            m.insert(bd.mtp_captured_pos0 + k as u32, row);
+            m.insert(bd.drafter_captured_pos0 + k as u32, row);
         }
     }
     Ok(m)
@@ -1033,7 +1033,7 @@ impl LaneTables {
     /// A drafted block's `(K, lanes)` candidates under `rule`, K in
     /// `0..=cap` (exploration draws one).
     pub fn block_choices(&self, cap: usize, rule: LaneRule) -> Vec<(usize, usize)> {
-        (0..=cap.min(MTP_BLOCK)).flat_map(|k| self.choices(k + 1, rule).iter().map(move |&l| (k, l))).collect()
+        (0..=cap.min(DRAFT_BLOCK)).flat_map(|k| self.choices(k + 1, rule).iter().map(move |&l| (k, l))).collect()
     }
 
     fn table(&self, lanes: usize) -> &StepCost {
@@ -1158,7 +1158,7 @@ fn fit_rows(ks: &mut [usize], base_rows: usize, t: &LaneTables, rule: LaneRule) 
 /// choices for the rows, at most `SPEC_ROWS_PER_LANE` per lane. Reads the
 /// caps only, never a confidence.
 fn multi_choices(t: &LaneTables, blocks: &[BlockConf], base_rows: usize, rule: LaneRule) -> Vec<(Vec<usize>, usize, usize)> {
-    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(MTP_BLOCK)).collect();
+    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(DRAFT_BLOCK)).collect();
     let mut out = Vec::new();
     let mut ks = vec![0usize; blocks.len()];
     loop {
@@ -1349,7 +1349,7 @@ fn ladder_cost(ladder: &[f64], rows: usize) -> f64 {
 }
 
 /// The live fit's prior is the configured ladder's least-squares line over
-/// rows 1..=MTP_BLOCK+1, held with SEPARATE weights: its slope as strongly as
+/// rows 1..=DRAFT_BLOCK+1, held with SEPARATE weights: its slope as strongly as
 /// 24 pseudo-samples spread over those rows (24/6 * sum (x - 3.5)^2 = 70), so
 /// the slope stays put while the data sit at one row count; its level (at the
 /// ladder's centroid) as `level_prior(n)` samples: ~4 while the fit has seen
@@ -1464,9 +1464,9 @@ pub fn explore(rng: &mut impl Rng, n: usize, p: f64, weight: impl Fn(usize) -> f
     Some(n - 1)
 }
 
-/// Rows the per-row cost CELLS cover by default (1 ..= MTP_BLOCK + 1: every
+/// Rows the per-row cost CELLS cover by default (1 ..= DRAFT_BLOCK + 1: every
 /// block's rows; `StepCost::with_rows` for more).
-const CELLS: usize = MTP_BLOCK + 1;
+const CELLS: usize = DRAFT_BLOCK + 1;
 /// A cell starts at its ladder value, weighted as this many samples (it
 /// washes out with the first real ones; bounds a first warm-up stall).
 const CELL_START_W: f64 = 1.0;
@@ -1550,12 +1550,12 @@ impl StepCost {
         Self::with_first_row(ladder, 1, draft_ms, live, memory)
     }
 
-    /// `new` with the prior line fitted over rows `first_row..=MTP_BLOCK+1`
+    /// `new` with the prior line fitted over rows `first_row..=DRAFT_BLOCK+1`
     /// of the ladder only: the two-lane regime never prices fewer rows.
     pub fn with_first_row(ladder: Vec<f64>, first_row: usize, draft_ms: f64, live: bool, memory: f64) -> Self {
         let ladder = if ladder.len() >= 2 { ladder } else { DEFAULT_LADDER.to_vec() };
-        let first_row = first_row.clamp(1, MTP_BLOCK);
-        let pts: Vec<(f64, f64)> = (first_row..=MTP_BLOCK + 1).map(|r| (r as f64, ladder_cost(&ladder, r))).collect();
+        let first_row = first_row.clamp(1, DRAFT_BLOCK);
+        let pts: Vec<(f64, f64)> = (first_row..=DRAFT_BLOCK + 1).map(|r| (r as f64, ladder_cost(&ladder, r))).collect();
         let xc = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
         let yc = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
         let prior_b = pts.iter().map(|&(x, y)| (x - xc) * (y - yc)).sum::<f64>() / pts.iter().map(|&(x, _)| (x - xc) * (x - xc)).sum::<f64>();
@@ -1777,7 +1777,7 @@ fn fixed_k() -> Option<usize> {
 /// the plain-decode control on the same binary), else `V41_MS_DSPARK_KMAX`
 /// (default the block size).
 pub fn k_max() -> usize {
-    fixed_k().unwrap_or(crate::knobs::MS_DSPARK_KMAX.usize()).min(MTP_BLOCK)
+    fixed_k().unwrap_or(crate::knobs::MS_DSPARK_KMAX.usize()).min(DRAFT_BLOCK)
 }
 
 /// K for SAMPLED drafts (plan 2.4 / section 6): a STOPPING rule. Whether draft
@@ -1792,8 +1792,8 @@ pub fn k_max() -> usize {
 /// sequential, the rule can head for a cheap far row count and then stop one
 /// short once conf_{k+1} arrives, on a dearer count than stopping earlier --
 /// inherent to a stopping rule, and bounded.
-pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize, cost: &dyn CostModel) -> usize {
-    let cap = cap.min(MTP_BLOCK);
+pub fn choose_k_stopping(conf: &[f32; DRAFT_BLOCK], cap: usize, cost: &dyn CostModel) -> usize {
+    let cap = cap.min(DRAFT_BLOCK);
     if let Some(k) = fixed_k() {
         return k.min(cap);
     }
@@ -1822,8 +1822,8 @@ pub fn choose_k_stopping(conf: &[f32; MTP_BLOCK], cap: usize, cost: &dyn CostMod
 /// exact, 2.4): maximize expected tokens per ms, `E(K) = 1 + sum_{k<=K}
 /// prod_{j<k} sigmoid(conf_j)` over `cost(1 + K) + draft`, the draft being
 /// paid either way. `V41_MS_DSPARK_K` fixes K (capped like the policy).
-pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize, cost: &dyn CostModel) -> usize {
-    let cap = cap.min(MTP_BLOCK);
+pub fn choose_k(conf: &[f32; DRAFT_BLOCK], cap: usize, cost: &dyn CostModel) -> usize {
+    let cap = cap.min(DRAFT_BLOCK);
     if let Some(k) = fixed_k() {
         return k.min(cap);
     }
@@ -1847,7 +1847,7 @@ pub fn choose_k(conf: &[f32; MTP_BLOCK], cap: usize, cost: &dyn CostModel) -> us
 /// most drafts it may verify.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockConf {
-    pub conf: [f32; MTP_BLOCK],
+    pub conf: [f32; DRAFT_BLOCK],
     pub cap: usize,
 }
 
@@ -1869,7 +1869,7 @@ pub struct BlockConf {
 /// exactly `choose_k_stopping` (the same sums in the same order).
 pub fn choose_ks_stopping(blocks: &[BlockConf], base_rows: usize, cost: &dyn CostModel) -> Vec<usize> {
     let n = blocks.len();
-    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(MTP_BLOCK)).collect();
+    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(DRAFT_BLOCK)).collect();
     if let Some(k) = fixed_k() {
         return caps.iter().map(|&c| k.min(c)).collect();
     }
@@ -1932,7 +1932,7 @@ pub fn choose_ks_stopping(blocks: &[BlockConf], base_rows: usize, cost: &dyn Cos
 /// `base_rows` = 1 gives exactly `choose_k`.
 pub fn choose_ks(blocks: &[BlockConf], base_rows: usize, cost: &dyn CostModel) -> Vec<usize> {
     let n = blocks.len();
-    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(MTP_BLOCK)).collect();
+    let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(DRAFT_BLOCK)).collect();
     if let Some(k) = fixed_k() {
         return caps.iter().map(|&c| k.min(c)).collect();
     }
@@ -1992,17 +1992,17 @@ struct Calib {
     n: [u64; 10],
     pred: [f64; 10],
     acc: [u64; 10],
-    depth_n: [u64; MTP_BLOCK],
-    depth_pred: [f64; MTP_BLOCK],
-    depth_acc: [u64; MTP_BLOCK],
+    depth_n: [u64; DRAFT_BLOCK],
+    depth_pred: [f64; DRAFT_BLOCK],
+    depth_acc: [u64; DRAFT_BLOCK],
 }
 
 const CALIB_EVERY: u64 = 500;
 
 impl Calib {
-    fn observe(&mut self, conf: &[f32; MTP_BLOCK], k: usize, accepted: usize) {
+    fn observe(&mut self, conf: &[f32; DRAFT_BLOCK], k: usize, accepted: usize) {
         self.blocks += 1;
-        for j in 0..k.min(accepted + 1).min(MTP_BLOCK) {
+        for j in 0..k.min(accepted + 1).min(DRAFT_BLOCK) {
             let p = sigmoid(conf[j]);
             let b = ((p * 10.0) as usize).min(9);
             let hit = u64::from(j < accepted);
@@ -2057,13 +2057,13 @@ mod tests {
     fn choose_k_follows_confidence() {
         let c = static_cost();
         // Confident blocks go deep, unconfident ones verify nothing.
-        assert_eq!(choose_k(&[6.0; MTP_BLOCK], MTP_BLOCK, &c), MTP_BLOCK);
-        assert_eq!(choose_k(&[-6.0; MTP_BLOCK], MTP_BLOCK, &c), 0);
+        assert_eq!(choose_k(&[6.0; DRAFT_BLOCK], DRAFT_BLOCK, &c), DRAFT_BLOCK);
+        assert_eq!(choose_k(&[-6.0; DRAFT_BLOCK], DRAFT_BLOCK, &c), 0);
         // The cap binds.
-        assert_eq!(choose_k(&[6.0; MTP_BLOCK], 2, &c), 2);
-        assert_eq!(choose_k(&[6.0; MTP_BLOCK], 0, &c), 0);
+        assert_eq!(choose_k(&[6.0; DRAFT_BLOCK], 2, &c), 2);
+        assert_eq!(choose_k(&[6.0; DRAFT_BLOCK], 0, &c), 0);
         // One confident draft then noise: stop after it.
-        assert_eq!(choose_k(&[6.0, -6.0, -6.0, -6.0, -6.0], MTP_BLOCK, &c), 1);
+        assert_eq!(choose_k(&[6.0, -6.0, -6.0, -6.0, -6.0], DRAFT_BLOCK, &c), 1);
     }
 
     #[test]
@@ -2084,16 +2084,16 @@ mod tests {
                 ((rng >> 33) as f32 / (1u64 << 31) as f32) * 12.0 - 6.0
             };
             for _ in 0..2000 {
-                let conf: [f32; MTP_BLOCK] = std::array::from_fn(|_| next());
-                let k = choose_k_stopping(&conf, MTP_BLOCK, &c);
-                for j in (k + 1)..MTP_BLOCK {
+                let conf: [f32; DRAFT_BLOCK] = std::array::from_fn(|_| next());
+                let k = choose_k_stopping(&conf, DRAFT_BLOCK, &c);
+                for j in (k + 1)..DRAFT_BLOCK {
                     let mut c2 = conf;
                     c2[j] = next();
-                    assert_eq!(choose_k_stopping(&c2, MTP_BLOCK, &c), k, "conf {conf:?}: K moved when conf[{j}] changed");
+                    assert_eq!(choose_k_stopping(&c2, DRAFT_BLOCK, &c), k, "conf {conf:?}: K moved when conf[{j}] changed");
                 }
             }
-            assert_eq!(choose_k_stopping(&[6.0; MTP_BLOCK], MTP_BLOCK, &c), MTP_BLOCK);
-            assert_eq!(choose_k_stopping(&[-6.0; MTP_BLOCK], MTP_BLOCK, &c), 0);
+            assert_eq!(choose_k_stopping(&[6.0; DRAFT_BLOCK], DRAFT_BLOCK, &c), DRAFT_BLOCK);
+            assert_eq!(choose_k_stopping(&[-6.0; DRAFT_BLOCK], DRAFT_BLOCK, &c), 0);
         }
     }
 
@@ -2108,7 +2108,7 @@ mod tests {
         live
     }
 
-    fn random_conf(st: &mut u64) -> [f32; MTP_BLOCK] {
+    fn random_conf(st: &mut u64) -> [f32; DRAFT_BLOCK] {
         std::array::from_fn(|_| (lcg(st) * 6.0) as f32)
     }
 
@@ -2137,11 +2137,11 @@ mod tests {
         let mut st = 12345u64;
         for c in [static_cost(), live_cost(5)] {
             for _ in 0..1500 {
-                let blocks = [BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }];
+                let blocks = [BlockConf { conf: random_conf(&mut st), cap: DRAFT_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: DRAFT_BLOCK }];
                 let base = 2;
                 let ks = choose_ks_stopping(&blocks, base, &c);
                 for s in 0..2 {
-                    for j in (ks[s] + 1)..MTP_BLOCK {
+                    for j in (ks[s] + 1)..DRAFT_BLOCK {
                         let mut b2 = blocks;
                         b2[s].conf[j] = (lcg(&mut st) * 6.0) as f32;
                         assert_eq!(choose_ks_stopping(&b2, base, &c), ks, "blocks {blocks:?}: K moved when stream {s} conf[{j}] changed");
@@ -2149,12 +2149,12 @@ mod tests {
                 }
             }
             // Confident blocks go to their caps, unconfident ones verify nothing.
-            let sure = BlockConf { conf: [6.0; MTP_BLOCK], cap: MTP_BLOCK };
-            let unsure = BlockConf { conf: [-6.0; MTP_BLOCK], cap: MTP_BLOCK };
-            assert_eq!(choose_ks_stopping(&[sure, sure], 2, &c), vec![MTP_BLOCK, MTP_BLOCK]);
+            let sure = BlockConf { conf: [6.0; DRAFT_BLOCK], cap: DRAFT_BLOCK };
+            let unsure = BlockConf { conf: [-6.0; DRAFT_BLOCK], cap: DRAFT_BLOCK };
+            assert_eq!(choose_ks_stopping(&[sure, sure], 2, &c), vec![DRAFT_BLOCK, DRAFT_BLOCK]);
             assert_eq!(choose_ks_stopping(&[unsure, unsure], 2, &c), vec![0, 0]);
-            assert_eq!(choose_ks_stopping(&[sure, unsure], 2, &c), vec![MTP_BLOCK, 0]);
-            assert_eq!(choose_ks_stopping(&[BlockConf { cap: 2, ..sure }, sure], 2, &c), vec![2, MTP_BLOCK]);
+            assert_eq!(choose_ks_stopping(&[sure, unsure], 2, &c), vec![DRAFT_BLOCK, 0]);
+            assert_eq!(choose_ks_stopping(&[BlockConf { cap: 2, ..sure }, sure], 2, &c), vec![2, DRAFT_BLOCK]);
         }
     }
 
@@ -2166,10 +2166,10 @@ mod tests {
         let mut st = 4242u64;
         let c = live_cost(9);
         for _ in 0..2000 {
-            let blocks = [BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }];
+            let blocks = [BlockConf { conf: random_conf(&mut st), cap: DRAFT_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: DRAFT_BLOCK }];
             let ks = choose_ks_stopping(&blocks, 2, &c);
             for s in 0..2 {
-                for m in 0..MTP_BLOCK {
+                for m in 0..DRAFT_BLOCK {
                     let mut b2 = blocks;
                     b2[s].conf[m] = (lcg(&mut st) * 6.0) as f32;
                     let k2 = choose_ks_stopping(&b2, 2, &c);
@@ -2192,7 +2192,7 @@ mod tests {
             d.plain_ms,
         );
         let before = d.multi.two.cell_weight(8);
-        d.record_multi(&[(0, [1.0; MTP_BLOCK], 3, 2, 3), (1, [1.0; MTP_BLOCK], 3, 3, 4)], 8, 2, LaneRule::Learned, 120.0, 62.5);
+        d.record_multi(&[(0, [1.0; DRAFT_BLOCK], 3, 2, 3), (1, [1.0; DRAFT_BLOCK], 3, 3, 4)], 8, 2, LaneRule::Learned, 120.0, 62.5);
         d.record_k0_multi(&[0, 1], 70.0);
         assert_eq!(d.lanes.one.cell_costs(), &one[..]);
         assert_eq!(d.lanes.two.cell_costs(), &two[..]);
@@ -2214,7 +2214,7 @@ mod tests {
         let mut ks = vec![5, 5];
         fit_rows(&mut ks, 2, &t, LaneRule::Learned);
         assert_eq!(ks, vec![5, 5], "two lanes hold 12 rows");
-        let blocks = [BlockConf { conf: [0.0; MTP_BLOCK], cap: MTP_BLOCK }; 2];
+        let blocks = [BlockConf { conf: [0.0; DRAFT_BLOCK], cap: DRAFT_BLOCK }; 2];
         for rule in [LaneRule::Off, LaneRule::Threshold(4), LaneRule::Learned] {
             let cands = multi_choices(&t, &blocks, 2, rule);
             assert!(!cands.is_empty());
@@ -2245,13 +2245,13 @@ mod tests {
         let mut st = 777u64;
         let c = live_cost(11);
         for _ in 0..1500 {
-            let blocks = [BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: MTP_BLOCK }];
+            let blocks = [BlockConf { conf: random_conf(&mut st), cap: DRAFT_BLOCK }, BlockConf { conf: random_conf(&mut st), cap: DRAFT_BLOCK }];
             let rate = |ks: &[usize]| {
                 let e: f64 = 2.0 + (0..2).map(|s| (1..=ks[s]).map(|k| (0..k).map(|j| sigmoid(blocks[s].conf[j])).product::<f64>()).sum::<f64>()).sum::<f64>();
                 e / (c.cost(2 + ks[0] + ks[1]) + c.draft_ms())
             };
             let got = choose_ks(&blocks, 2, &c);
-            let best = (0..=MTP_BLOCK).flat_map(|a| (0..=MTP_BLOCK).map(move |b| [a, b])).map(|k| rate(&k)).fold(f64::MIN, f64::max);
+            let best = (0..=DRAFT_BLOCK).flat_map(|a| (0..=DRAFT_BLOCK).map(move |b| [a, b])).map(|k| rate(&k)).fold(f64::MIN, f64::max);
             assert!(rate(&got) >= best * (1.0 - 1e-12), "{got:?} rate {} < best {best}", rate(&got));
             let capped = Capped(&c, 8);
             assert!(choose_ks(&blocks, 2, &capped).iter().sum::<usize>() + 2 <= 8);
@@ -2339,7 +2339,7 @@ mod tests {
         assert_eq!(off.cost(5), t.one.cost(5));
         // Cheaper deep blocks on two lanes push K deeper for the same confidences.
         let conf = [2.0f32, 1.0, 0.5, 0.2, 0.0];
-        assert!(choose_k_stopping(&conf, MTP_BLOCK, &on) >= choose_k_stopping(&conf, MTP_BLOCK, &off));
+        assert!(choose_k_stopping(&conf, DRAFT_BLOCK, &on) >= choose_k_stopping(&conf, DRAFT_BLOCK, &off));
     }
 
     #[test]
@@ -2385,10 +2385,10 @@ mod tests {
         let (n, p) = (64_000, 1.0 / 32.0);
         // Cells K=0 (w 0, stale), K=1..4 (w 100, well measured), K=5 (w 1).
         let w = [0.0, 100.0, 100.0, 100.0, 100.0, 1.0];
-        let mut hist = [0u32; MTP_BLOCK + 1];
+        let mut hist = [0u32; DRAFT_BLOCK + 1];
         let mut hits = 0;
         for _ in 0..n {
-            if let Some(k) = explore(&mut rng, MTP_BLOCK + 1, p, |k| w[k]) {
+            if let Some(k) = explore(&mut rng, DRAFT_BLOCK + 1, p, |k| w[k]) {
                 hist[k] += 1;
                 hits += 1;
             }
@@ -2413,7 +2413,7 @@ mod tests {
         }
         assert!(h2.iter().all(|&c| (c as f64 - 10_000.0).abs() < 600.0), "{h2:?}");
         assert_eq!(explore(&mut rng, 1, 1.0, |_| 0.0), None);
-        assert_eq!(explore(&mut rng, MTP_BLOCK + 1, 0.0, |_| 0.0), None);
+        assert_eq!(explore(&mut rng, DRAFT_BLOCK + 1, 0.0, |_| 0.0), None);
     }
 
     #[test]
@@ -2598,10 +2598,10 @@ mod tests {
     fn learned_exploration_reaches_every_row_and_lane_cell() {
         let t = cold_tables(4);
         // A block's candidates: (K, lanes), one lane only at K = 0 (one row).
-        let cands = t.block_choices(MTP_BLOCK, LaneRule::Learned);
-        assert_eq!(cands.len(), 1 + 2 * MTP_BLOCK);
+        let cands = t.block_choices(DRAFT_BLOCK, LaneRule::Learned);
+        assert_eq!(cands.len(), 1 + 2 * DRAFT_BLOCK);
         assert_eq!(cands[0], (0, 1));
-        assert_eq!(t.block_choices(MTP_BLOCK, LaneRule::Threshold(4)), [(0, 1), (1, 1), (2, 1), (3, 2), (4, 2), (5, 2)]);
+        assert_eq!(t.block_choices(DRAFT_BLOCK, LaneRule::Threshold(4)), [(0, 1), (1, 1), (2, 1), (3, 2), (4, 2), (5, 2)]);
         assert_eq!(t.block_choices(2, LaneRule::Off), [(0, 1), (1, 1), (2, 1)]);
         // Every pair keeps the uniform floor (half the draws, 1/11 each).
         let mut rng = StdRng::seed_from_u64(3);
@@ -2649,7 +2649,7 @@ mod tests {
         assert_eq!(cal.depth_n, [1, 1, 0, 0, 0]);
         assert_eq!(cal.depth_acc, [1, 0, 0, 0, 0]);
         // All K accepted: every verified draft observed and accepted.
-        cal.observe(&[3.0; MTP_BLOCK], 3, 3);
+        cal.observe(&[3.0; DRAFT_BLOCK], 3, 3);
         assert_eq!(cal.depth_n, [2, 2, 1, 0, 0]);
         assert_eq!(cal.depth_acc, [2, 1, 1, 0, 0]);
         assert_eq!(cal.blocks, 2);
@@ -2663,12 +2663,12 @@ mod tests {
     #[test]
     fn sampled_draft_q_stays_inside_the_targets_min_p_support() {
         let mode = SampleMode::Multinomial { temperature: 1.0, min_p_rel: 0.05, top_p: 0.95 };
-        let ds = draft_sampling(&mode, [0.5; MTP_BLOCK]).expect("sampled drafts by default");
+        let ds = draft_sampling(&mode, [0.5; DRAFT_BLOCK]).expect("sampled drafts by default");
         assert_eq!(ds.min_p_rel, 0.05);
         let logits: Vec<f32> = (0..64).map(|i| -0.15 * i as f32).collect();
         let ids: Vec<i32> = (0..64).collect();
         let target = crate::spec_sample::TargetDist::from_logits(&logits, &mode);
-        let (q, _) = v4flash_kernels::het::mtp::draft_dist(&ids, &logits, ds.temperature, ds.top_p, ds.min_p_rel, 0.5).unwrap();
+        let (q, _) = v4flash_kernels::het::drafter::draft_dist(&ids, &logits, ds.temperature, ds.top_p, ds.min_p_rel, 0.5).unwrap();
         for &(t, _) in &q {
             assert!(target.prob(t) > 0.0, "draft {t} has q > 0 but p = 0");
         }
