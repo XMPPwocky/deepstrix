@@ -3,19 +3,19 @@ drafter / dspark	235	66
 mtp	828	67
 V41_INDEXER_*	4	3
 V41_INDEX_* / V41_IDX_*	8	4
-raw window	28	3
+RawWindow (the bare `raw_window` is the V4 image window until it is deleted)	0	0
 decoder ring (a decoder layer's raw window)	20	2
 GgufType (the dtype enum of a safetensors model)	427	1
 RequestId	0	0
 StreamId	0	0
-slot (as stream id or append row, scheduler/arena files)	406	9
+slot outside the pools (stream id, append row, block base, capacity; arena/scheduler files)	406	9
 request shape as a literal (b > 16, prefill_shaped)	20	2
 RequestShape	0	0
-_v2 with no v1	82	15
+_v2 declared (fn/struct/enum/const/static/type)	6	6
 LaneCtl / LanePlan	0	0
 lane by letter or t1/t2	349	5
 advertises / accepts / home / PlacedPicks	0	0
-owns	98	13
+owns	90	9
 T2 (tier 2 = box 2)	16	3
 partition_box2	19	1
 het (engine module / types)	620	37
@@ -30,12 +30,12 @@ env .is_ok() used as a boolean	35	20
 v4flash crate names	1569	7
 milestone code inside an identifier	0	0
 slot	2197	100
-stream	4230	74
+stream (outside the HIP crate)	4074	53
 seq	227	1
 ring	389	59
 prefill	1191	199
 phase	320	27
-pin	1068	158
+pin	1073	159
 mirror	194	24
 hot	615	93
 split	755	127
@@ -45,3 +45,6 @@ admit	173	42
 restore	297	54
 remote	613	100
 prefetch	250	58
+tier	58	17
+region	109	9
+dense	552	71
