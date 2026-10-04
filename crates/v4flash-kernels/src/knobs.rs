@@ -719,6 +719,10 @@ crate::knobs! {
     /// `V41_LM_PREFETCH_PER_REQ` (default 16, 1..=256; live): its words per
     /// request (`forward_prefill::lm_prefetch_per_req`).
     pub static LM_PREFETCH_PER_REQ = Knob::int("V41_LM_PREFETCH_PER_REQ", 16, 1, 256).live();
+    /// `V41_SUB_DEFER_ACCEPTED` (default off; live): a speculative block's
+    /// cache-prior admissions, pin want counts and hot-set picks wait for its
+    /// accept and only the kept rows' are applied (`b2_mirror::defer_flush`).
+    pub static SUB_DEFER_ACCEPTED = Knob::flag("V41_SUB_DEFER_ACCEPTED", false).live();
 }
 
 #[cfg(test)]

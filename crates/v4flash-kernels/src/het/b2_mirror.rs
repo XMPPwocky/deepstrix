@@ -1004,7 +1004,9 @@ pub fn pin_note_submit(layer: u32, sel: &[i32], wants: Option<&[i32]>, decode_sh
     }
     if let Ok(mut g) = LEDGER.lock() {
         g.note_sent(layer, sel);
-        if decode_shaped {
+        // Under `V41_SUB_DEFER_ACCEPTED` a speculative block's wants wait for
+        // its accept (`defer_flush`); what was SENT is noted now regardless.
+        if decode_shaped && !defer_wants(layer, sel, wants) {
             g.note_decode_picks(layer, sel, wants);
         }
     }
@@ -1270,6 +1272,153 @@ pub fn wants_for_box2(router: &[i32], is_box2: impl Fn(u32) -> bool) -> Vec<i32>
         .iter()
         .map(|&e| if (0..N_EXPERT as i32).contains(&e) && is_box2(e as u32) { e } else { super::remote_experts::NO_PICK })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// DEFERRED, ON-PATH ONLY (`V41_SUB_DEFER_ACCEPTED`, live, default off;
+// 2026-10-04). A speculative block routes every verify row before its accept
+// is known, and the rejected tail -- 24% of verified rows, MEASURED 10-04 --
+// fed three things as if its tokens had happened: box-2 admissions of its
+// displaced picks (40% of pin releases were admissions nothing used, 3.3 per
+// step), the pin ledger's want counts, and box 1's hot-set counts. With the
+// knob on, a speculative step RECORDS those per row position (`defer_*`) and
+// the scheduler flushes only the positions it kept (`defer_flush`), wants and
+// hot picks first, then the admissions (whose gate reads the counts). A plain
+// step is unchanged. Admissions are only consumed at a layer's NEXT `ensure`
+// (the next step), so holding them to the step's end costs no lead.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Deferred {
+    /// `(row position, layer, expert, rank weight)`: a displaced box-2 want.
+    admits: Vec<(i32, u32, u32, u32)>,
+    /// `(row position, layer, expert)`: a router pick for box 1's hot set.
+    hot: Vec<(i32, u32, u32)>,
+    /// `(row position, layer, the row's sent picks, the router's own)`, `[nu]`.
+    wants: Vec<(i32, u32, Vec<i32>, Option<Vec<i32>>)>,
+}
+
+static DEFER_ON: AtomicBool = AtomicBool::new(false);
+static DEFER: std::sync::Mutex<Deferred> = std::sync::Mutex::new(Deferred { admits: Vec::new(), hot: Vec::new(), wants: Vec::new() });
+static DEFER_KEPT: AtomicU64 = AtomicU64::new(0);
+static DEFER_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The positions of the rows of the lane-layer being routed
+    /// (`pre_moe_route`), for `pin_note_submit`'s deferred wants (same thread).
+    static ROW_POS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `V41_SUB_DEFER_ACCEPTED` (live, default off): see the block above.
+pub fn defer_accepted() -> bool {
+    crate::knobs::SUB_DEFER_ACCEPTED.on()
+}
+
+/// Start of every decode step: `on` = this step is a speculative block that
+/// defers (the caller checks `defer_accepted`). Drops whatever an earlier step
+/// recorded and never flushed (an error between its forward and its accept).
+pub fn defer_step(on: bool) {
+    let mut d = DEFER.lock().unwrap_or_else(|p| p.into_inner());
+    d.admits.clear();
+    d.hot.clear();
+    d.wants.clear();
+    DEFER_ON.store(on, Ordering::Relaxed);
+}
+
+/// This step records instead of applying.
+#[inline]
+pub fn defer_on() -> bool {
+    DEFER_ON.load(Ordering::Relaxed)
+}
+
+pub fn defer_admit(pos: i32, layer: u32, e: u32, rank_w: u32) {
+    DEFER.lock().unwrap_or_else(|p| p.into_inner()).admits.push((pos, layer, e, rank_w));
+}
+
+pub fn defer_hot(pos: i32, layer: u32, e: u32) {
+    DEFER.lock().unwrap_or_else(|p| p.into_inner()).hot.push((pos, layer, e));
+}
+
+/// `pre_moe_route`: the lane's row positions for this lane-layer (`&[]` to clear).
+pub fn set_row_positions(pos: &[i32]) {
+    ROW_POS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.clear();
+        r.extend_from_slice(pos);
+    });
+}
+
+/// `pin_note_submit`'s decode wants under deferral: recorded per row (by the
+/// lane's row positions) when deferring and the shape matches; false = apply
+/// them now as before.
+fn defer_wants(layer: u32, sent: &[i32], wants: Option<&[i32]>) -> bool {
+    let nu = crate::config::N_EXPERT_USED;
+    if !defer_on() || sent.len() % nu != 0 {
+        return false;
+    }
+    ROW_POS.with(|r| {
+        let pos = r.borrow();
+        let rows = sent.len() / nu;
+        if pos.len() != rows || wants.is_some_and(|w| w.len() != sent.len()) {
+            return false;
+        }
+        let mut d = DEFER.lock().unwrap_or_else(|p| p.into_inner());
+        for (i, &p) in pos.iter().enumerate() {
+            d.wants.push((p, layer, sent[i * nu..(i + 1) * nu].to_vec(), wants.map(|w| w[i * nu..(i + 1) * nu].to_vec())));
+        }
+        true
+    })
+}
+
+/// Split the recorded entries by whether their row position is in `[lo, hi)`.
+fn defer_take(lo: i32, hi: i32) -> (Deferred, u64) {
+    let mut d = DEFER.lock().unwrap_or_else(|p| p.into_inner());
+    DEFER_ON.store(false, Ordering::Relaxed);
+    let taken = std::mem::take(&mut *d);
+    drop(d);
+    let on = |p: i32| p >= lo && p < hi;
+    let n_all = (taken.admits.len() + taken.hot.len() + taken.wants.len()) as u64;
+    let kept = Deferred {
+        admits: taken.admits.into_iter().filter(|x| on(x.0)).collect(),
+        hot: taken.hot.into_iter().filter(|x| on(x.0)).collect(),
+        wants: taken.wants.into_iter().filter(|x| on(x.0)).collect(),
+    };
+    let n_kept = (kept.admits.len() + kept.hot.len() + kept.wants.len()) as u64;
+    (kept, n_all - n_kept)
+}
+
+/// After a speculative block's accept: apply what the rows at positions
+/// `[lo, hi)` (the rows the stream KEPT) recorded, drop the rest. Wants and
+/// hot picks first, then the admissions through the gate, deduplicated.
+pub fn defer_flush(lo: i32, hi: i32) {
+    let (kept, dropped) = defer_take(lo, hi);
+    DEFER_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+    DEFER_KEPT.fetch_add((kept.admits.len() + kept.hot.len() + kept.wants.len()) as u64, Ordering::Relaxed);
+    if !kept.wants.is_empty() {
+        let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, layer, sent, wants) in &kept.wants {
+            g.note_decode_picks(*layer, sent, wants.as_deref());
+        }
+    }
+    for &(_, layer, e) in &kept.hot {
+        super::expert_pager::hot_set::note_pick(layer as usize, e);
+    }
+    let mut words: Vec<u32> = Vec::new();
+    for &(_, layer, e, rank_w) in &kept.admits {
+        let w = (layer << 16) | e;
+        if !words.contains(&w) && resident(layer as i32, e) == Some(false) && admit_passes(layer, e, rank_w) {
+            words.push(w);
+        }
+    }
+    if !words.is_empty() && super::remote_experts::push_prefetch_words(&words) {
+        note_incoming(&words);
+        note_admits(&words);
+    }
+}
+
+/// `(kept, dropped)` deferred entries since the last call (profile).
+pub fn take_defer_stats() -> (u64, u64) {
+    (DEFER_KEPT.swap(0, Ordering::Relaxed), DEFER_DROPPED.swap(0, Ordering::Relaxed))
 }
 
 /// Background admissions queued (`V41_SUB_ADMIT`, words `layer << 16 | e`),
@@ -2599,5 +2748,44 @@ mod tests {
         assert_eq!((1..4).filter(|&e| g.held(0, e)).count(), 1);
         g.apply_map(0, &map(&[1, 2, 3]), 1);
         assert_eq!((1..4).filter(|&e| g.held(0, e)).count(), 3);
+    }
+
+    /// `V41_SUB_DEFER_ACCEPTED`: a speculative step's recorded admissions, hot
+    /// picks and wants survive only for the rows at the KEPT positions; wants
+    /// split per row by the lane's row positions; a shape mismatch, or a step
+    /// that does not defer, applies at once (records nothing). Row positions
+    /// are thread-local, so other tests' submits never record.
+    #[test]
+    fn deferred_entries_keep_only_the_kept_rows() {
+        let nu = crate::config::N_EXPERT_USED;
+        defer_step(true);
+        // Lane A holds the block's rows at positions 100-101, lane B 102-103.
+        let sent: Vec<i32> = (0..2 * nu as i32).collect();
+        set_row_positions(&[100, 101]);
+        assert!(defer_wants(5, &sent, None));
+        set_row_positions(&[102, 103]);
+        assert!(defer_wants(5, &sent, Some(&sent)));
+        assert!(!defer_wants(5, &sent[..nu], None), "rows vs positions mismatch: applied now");
+        for p in 100..104 {
+            defer_admit(p, 5, 7 + p as u32, 6);
+            defer_hot(p, 5, 9);
+        }
+        set_row_positions(&[]);
+        // The block kept row 0 and one accepted draft: positions 100-101.
+        let (kept, dropped) = defer_take(100, 102);
+        assert!(!defer_on(), "taking ends the recording");
+        assert_eq!(kept.wants.iter().map(|w| w.0).collect::<Vec<_>>(), vec![100, 101]);
+        assert_eq!(kept.wants[1].2, sent[nu..].to_vec(), "row 1's own picks");
+        assert!(kept.wants.iter().all(|w| w.3.is_none()));
+        assert_eq!(kept.admits.iter().map(|a| (a.0, a.2)).collect::<Vec<_>>(), vec![(100, 107), (101, 108)]);
+        assert_eq!(kept.hot.len(), 2);
+        assert_eq!(dropped, 6, "rows 102-103: two wants, two admissions, two hot picks");
+        // A step that does not defer records nothing.
+        defer_step(false);
+        set_row_positions(&[1, 2]);
+        assert!(!defer_wants(5, &sent, None));
+        set_row_positions(&[]);
+        let (none, d) = defer_take(0, i32::MAX);
+        assert!(none.admits.is_empty() && none.hot.is_empty() && none.wants.is_empty() && d == 0);
     }
 }

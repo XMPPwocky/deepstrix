@@ -8351,6 +8351,22 @@ impl HeterogeneousEngine {
         if !c.advance(PreMoePhase::Chained, PreMoePhase::Routed)? { return Ok(()); }
         let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, sub3, prior_on, rb, .. } = *c;
         let _ = (cs_n_embd, split_cap, moe_group_bound);
+        // `V41_SUB_DEFER_ACCEPTED`: in a speculative step this lane's admissions,
+        // hot-set picks and pin wants are recorded by row POSITION and applied
+        // for the rows the block keeps (`b2_mirror::defer_flush`).
+        let defer_pos: Vec<i32> = match rows {
+            RowLayout::Arena { tables, .. } if super::b2_mirror::defer_on() && tables.pos_per.len() >= b as usize => tables.pos_per[..b as usize].to_vec(),
+            _ => Vec::new(),
+        };
+        struct RowPosGuard;
+        impl Drop for RowPosGuard {
+            fn drop(&mut self) {
+                super::b2_mirror::set_row_positions(&[]);
+            }
+        }
+        super::b2_mirror::set_row_positions(&defer_pos);
+        let _row_pos_guard = RowPosGuard;
+        let deferring = !defer_pos.is_empty();
         let _ = &self.dgpu;
         let look_next: Option<&DgpuLayerWeights> = match &rows {
             RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
@@ -8695,7 +8711,11 @@ impl HeterogeneousEngine {
                             // or the admission gate says it would not outlast the
                             // next release (`b2_mirror::admit_passes`).
                             let rank_w = prow.iter().position(|&x| x == f).map_or(1, |p| (cs_n_used - p) as u32);
-                            if !dry
+                            if deferring && !dry && super::b2_mirror::admit_on() && box2_missing(f) && !boosted.contains(&f) {
+                                // Gated at the flush, for a kept row only.
+                                super::b2_mirror::defer_admit(defer_pos[r], layer as u32, f as u32, rank_w);
+                            } else if !deferring
+                                && !dry
                                 && super::b2_mirror::admit_on()
                                 && box2_missing(f)
                                 && !boosted.contains(&f)
@@ -8905,9 +8925,13 @@ impl HeterogeneousEngine {
                     // substituted ones, or substitutes (resident by construction)
                     // would inflate their own rank.
                     let src: &[i32] = if sel_orig.is_empty() { &sel_host } else { &sel_orig };
-                    for &sv in src {
+                    for (i, &sv) in src.iter().enumerate() {
                         if (0..N_EXPERT as i32).contains(&sv) {
-                            super::expert_pager::hot_set::note_pick(layer as usize, sv as u32);
+                            if deferring {
+                                super::b2_mirror::defer_hot(defer_pos[i / cs_n_used], layer as u32, sv as u32);
+                            } else {
+                                super::expert_pager::hot_set::note_pick(layer as usize, sv as u32);
+                            }
                         }
                     }
                 }

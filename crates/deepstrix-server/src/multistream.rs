@@ -1662,6 +1662,20 @@ impl Sched {
             }
         }
         let spec = drafts.iter().any(|d| !d.is_empty());
+        // `V41_SUB_DEFER_ACCEPTED`: a lone stream's speculative block records its
+        // cache-prior admissions / pin wants / hot-set picks by row position and
+        // applies the KEPT rows' after the accept (`b2_mirror::defer_flush`
+        // below). The guard turns recording off however this step ends, so an
+        // error can never leave a later step (or a prefill) recording.
+        let defer = spec && self.streams.len() == 1 && v4flash_kernels::het::b2_mirror::defer_accepted();
+        v4flash_kernels::het::b2_mirror::defer_step(defer);
+        struct DeferGuard;
+        impl Drop for DeferGuard {
+            fn drop(&mut self) {
+                v4flash_kernels::het::b2_mirror::defer_step(false);
+            }
+        }
+        let _defer_guard = DeferGuard;
         // Rows: per stream its next token, then its draft rows (positions
         // pos+1.., consecutive, in one lane: `KvArena::tables`).
         let mut row0: Vec<usize> = Vec::with_capacity(self.streams.len());
@@ -2184,6 +2198,11 @@ impl Sched {
         // Keep each stream's emitted rows (rollback = the counters stop there).
         for (s, &keep) in self.streams.iter().zip(&keeps) {
             self.arena.accept(s.slot, keep, &state.engine.dgpu.compute)?;
+        }
+        if defer {
+            // The lone stream's kept rows are positions [pos_end - keep, pos_end).
+            let pos_end = self.arena.stream(self.streams[0].slot).map(|k| k.pos).unwrap_or(0) as i32;
+            v4flash_kernels::het::b2_mirror::defer_flush(pos_end - keeps[0] as i32, pos_end);
         }
         // Kept rows into the drafter rings; the last one feeds the next draft.
         if let (Some(dsp), Some(m), Some(caps)) = (self.dsp.as_mut(), state.mtp.as_mut(), caps.as_ref()) {
