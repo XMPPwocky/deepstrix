@@ -713,6 +713,12 @@ crate::knobs! {
     /// stream and so holds the host until `de.compute` drains: this lane's
     /// `moe_arrived` wait and the other lane's queued chain included.
     pub static REMOTE_PARTIAL_ASYNC = Knob::flag("V41_REMOTE_PARTIAL_ASYNC", false).live();
+    /// `V41_LM_PREFETCH` (default off; live): layer-major group prefetch
+    /// (`forward_prefill::lm_prefetch_enabled`).
+    pub static LM_PREFETCH = Knob::flag("V41_LM_PREFETCH", false).live();
+    /// `V41_LM_PREFETCH_PER_REQ` (default 16, 1..=256; live): its words per
+    /// request (`forward_prefill::lm_prefetch_per_req`).
+    pub static LM_PREFETCH_PER_REQ = Knob::int("V41_LM_PREFETCH_PER_REQ", 16, 1, 256).live();
 }
 
 #[cfg(test)]

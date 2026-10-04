@@ -737,28 +737,31 @@ pub fn lm_rows() -> usize {
     *V.get_or_init(|| std::env::var("V41_LM_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
 }
 
-/// `V41_LM_PREFETCH=1` (default OFF): while a layer-major group runs, queue box 2
-/// background reads of the NEXT group's experts it owns and (per the residency
-/// mirror, `b2_mirror`) does not hold. They go out as ordinary prefetch words:
-/// speculative class, so under box 2's `route=urgency` they read from the drive
-/// demand reads do not use (the E100, idle during prefill), land in staging sets
-/// and are admitted at the next `ensure`. A window of >= 4096 rows touches ~91%
-/// of a layer's box-2 experts, so the whole non-resident set is (nearly) what
-/// the group will page anyway -- no predictor.
+/// `V41_LM_PREFETCH` (default OFF; live): while a layer-major group runs, queue
+/// box 2 background reads of the NEXT group's experts it owns and (per the
+/// residency mirror, `b2_mirror`) does not hold. They go out as ordinary
+/// prefetch words (speculative class), land PREFILL-class in box 2's pool
+/// (decode evicts them first) and are admitted at the next `ensure`. Under box
+/// 2's `route=split` (since 2026-10-04) a speculative read splits across both
+/// drives and a request that needs one in flight waits for it; under the old
+/// `route=urgency` it read from the primary only and a late copy was read
+/// again and discarded. A window of >= 4096 rows touches ~91% of a layer's
+/// box-2 experts, so the whole non-resident set is (nearly) what the group
+/// will page anyway -- no predictor. Live, so it can be A/B'd per turn.
 pub fn lm_prefetch_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("V41_LM_PREFETCH").as_deref() == Ok("1"))
+    crate::knobs::LM_PREFETCH.on()
 }
 
-/// `V41_LM_PREFETCH_PER_REQ` (default 4): the prefetch words one request carries
-/// while layer-major units run. Box 2 starts a speculative word only into a free
-/// staging set (sets free as its few background readers finish) and DROPS the
-/// rest, so a request should carry about what box 2 can start between two
-/// requests; the words it dropped are re-queued at the next unit from the
-/// residency mirror (still `Some(false)` until they land).
+/// `V41_LM_PREFETCH_PER_REQ` (default 16, 1..=256; live): the prefetch words one
+/// request carries while layer-major units run. Box 2 starts a speculative word
+/// only into a free staging set and DROPS the rest (re-queued at the next unit
+/// from the residency mirror, still `Some(false)` until they land), so a request
+/// should carry about what box 2 can start between two requests. 4 until
+/// 2026-10-04 (few staging sets, the E100); box 2 now runs 16 sets
+/// (`V41_B2_PREFETCH_SETS`) on two fast drives, and a group's ~150 box-2 misses
+/// need more than 4 x ~20 requests.
 pub fn lm_prefetch_per_req() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("V41_LM_PREFETCH_PER_REQ").ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1))
+    crate::knobs::LM_PREFETCH_PER_REQ.usize().max(1)
 }
 
 /// End of a layer-major unit (also on error): restore the per-request word cap

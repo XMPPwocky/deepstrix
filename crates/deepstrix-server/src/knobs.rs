@@ -169,12 +169,13 @@ mod tests {
             assert!(!(k.live && matches!(k.kind, Kind::Text)), "{}: text knobs are static", k.name);
         }
         // Live: the eight 10-01 `_FILE` knobs, the live-trace trigger, Tier
-        // B's device timing (its kill switch) and the box-2 partial upload
-        // (A/B'd per turn).
+        // B's device timing (its kill switch), the box-2 partial upload and the
+        // layer-major group prefetch (A/B'd per turn).
         let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
         live.sort();
         assert_eq!(live, [
-            "V41_B2_PIN_PREFILL_BAND", "V41_EVTRACE_DEV", "V41_LM_PREFILL", "V41_MS_ENGRAM_THREADS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
+            "V41_B2_PIN_PREFILL_BAND", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
+            "V41_MS_ENGRAM_THREADS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
             "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_LAMBDA",
         ]);
