@@ -51,6 +51,45 @@ fn ours(vocab: &BpeVocab, model: &Qwen3EmbedModel, text: &str) -> Vec<u32> {
     vocab.encode_qwen2(text).into_iter().map(|t| t as u32).chain([model.eos_id]).collect()
 }
 
+/// The model card's own example (Qwen/Qwen3-Embedding-4B, transformers):
+/// two instructed queries x two documents, scores
+/// `[[0.7534, 0.1147], [0.0320, 0.6258]]` (vLLM: within 0.002). Needs only
+/// `QWEN3_EMBED_GGUF`: tokenizer + CPU oracle on the real Q8_0 weights vs a
+/// published number. Pre-registered: every score within 0.01 (Q8_0 budget).
+#[test]
+#[ignore]
+fn model_card_scores() {
+    let Ok(gguf) = std::env::var("QWEN3_EMBED_GGUF") else {
+        eprintln!("QWEN3_EMBED_GGUF unset: skipped");
+        return;
+    };
+    let file = MappedGguf::open(&gguf).expect("open gguf");
+    let model = Qwen3EmbedModel::from_gguf(&file).expect("model");
+    let vocab = BpeVocab::from_gguf(file.gguf()).expect("vocab");
+    let task = "Given a web search query, retrieve relevant passages that answer the query";
+    let texts = [
+        format!("Instruct: {task}\nQuery:What is the capital of China?"),
+        format!("Instruct: {task}\nQuery:Explain gravity"),
+        "The capital of China is Beijing.".to_string(),
+        "Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.".to_string(),
+    ];
+    let inputs: Vec<Vec<u32>> = texts.iter().map(|t| ours(&vocab, &model, t)).collect();
+    for (t, ids) in texts.iter().zip(&inputs) {
+        eprintln!("{} tokens: {:?}", ids.len(), t.chars().take(40).collect::<String>());
+    }
+    let t0 = std::time::Instant::now();
+    let e = cpu_forward(&model, &file, &inputs).expect("cpu forward");
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum::<f64>();
+    let got = [[dot(&e[0], &e[2]), dot(&e[0], &e[3])], [dot(&e[1], &e[2]), dot(&e[1], &e[3])]];
+    let want = [[0.7534, 0.1147], [0.0320, 0.6258]];
+    eprintln!("scores {got:?} (model card {want:?}), {:.1} s", t0.elapsed().as_secs_f64());
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!((got[i][j] - want[i][j]).abs() <= 0.01, "score[{i}][{j}] = {:.4}, model card {:.4}", got[i][j], want[i][j]);
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn e0_tokenizer_matches_reference() {
