@@ -1,4 +1,7 @@
-//! Layer-major batched prefill.
+//! The batched layer -- `b` rows through each layer per pass -- and its drivers:
+//! prompt prefill (chunks, and layer-major windows under `V41_LM_PREFILL`) and
+//! the arena's decode / verify steps. (Named for its first caller; see
+//! docs/GLOSSARY.md "batched layer".)
 //!
 //! Two production entry points:
 //!
@@ -260,7 +263,9 @@ fn check_scratch_rows(
 /// ONE sequence whose KV is `ls` (window at `ls.raw_off/n_raw`, store at
 /// `cs.n_comp`), appended and evicted in place. Every existing caller.
 ///
-/// `Arena`: `b` rows of `b` DIFFERENT streams, one position each (K=1), whose
+/// `Arena`: `b` rows of the live streams (`StepRows`): one position per stream
+/// on a plain decode step, a chain of consecutive positions of one stream on a
+/// DSpark verify. Their
 /// KV lives in a `KvArena` handed over as the same `&mut HetLayerState` (the
 /// arena's `state.layers[layer]`, lent through `with_kv_source` like a
 /// sequence's). Bases and counts come from the per-row `tables`
@@ -269,7 +274,8 @@ fn check_scratch_rows(
 /// nothing is evicted or advanced here (`KvArena::advance` after the step,
 /// `compact_raw` before it). The caller has already uploaded `tables.pos_per`
 /// into `bd.pos_per_b[0..b]` (rope), as the contiguous callers do per chunk.
-/// Text-only, `CedMode::Exact`, no MTP capture, no image visibility.
+/// Text-only, `CedMode::Exact`, no image visibility; the drafter's residual
+/// capture runs when `bd.drafter_capture_rows > 0` (verify steps).
 pub enum RowLayout<'a> {
     Contiguous,
     /// `next_router`: the NEXT layer's weights, for look-ahead routing (the
@@ -1934,7 +1940,8 @@ impl HeterogeneousEngine {
         super::route_probe::note(lane, layer, b, &picks, look.as_deref(), act.as_deref())
     }
 
-    /// Layer-major batched prefill using batched kernels.
+    /// Batched prefill using batched kernels: every row through layer L before
+    /// layer L+1 (not the layer-major WINDOW of `V41_LM_PREFILL`).
     ///
     /// Reads `input_hcs[i]` = layer-0 input HC for token `i`, broadcast of
     /// `embed(tokens[i])` to HC_DIM. `tokens[i]` is the token id at
@@ -3700,7 +3707,7 @@ impl HeterogeneousEngine {
         Ok(tables)
     }
 
-    /// Two-lane batched decode step over `slots` (K=1 per stream): lane A =
+    /// Two-lane batched decode step over the step's rows (`StepRows`): lane A =
     /// the first half of the slots in `bd_a`/`bi_a`, lane B = the rest in
     /// `bd_b`/`bi_b`, interleaved per layer exactly as the pipelined prefill
     /// driver does — pre(A,L+1) is issued while box 2 still holds lane A's

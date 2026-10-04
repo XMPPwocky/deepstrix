@@ -21,8 +21,10 @@ v4flash_kernels::knobs! {
     pub static MULTISTREAM = Knob::flag("V41_MULTISTREAM", false);
     /// `V41_MS_SLOTS` (default 8): arena slots.
     pub static MS_SLOTS = Knob::int("V41_MS_SLOTS", 8, 1, 1024);
-    /// `V41_MS_CTX_ROWS`: arena rows per stream; default (`Source::Default`) =
-    /// twice the model's KV maximum.
+    /// `V41_MS_CTX_ROWS`: the arena's context budget in POSITIONS, shared by
+    /// all live streams (each compressed store gets budget / ratio rows; see
+    /// `multistream.rs` "Context budget"); default (`Source::Default`) = twice
+    /// `--ctx`.
     pub static MS_CTX_ROWS = Knob::int("V41_MS_CTX_ROWS", 0, 0, MAX);
     /// `V41_MS_CHUNK_ROWS` (default 1024): prefill chunk rows while streams
     /// decode; also sizes the prefill scratch.

@@ -250,8 +250,10 @@ pub struct ExpertPager {
     /// *** ON EVERY ARENA DECODE STEP, TOO (2026-09-22 audit A3). *** The
     /// multistream driver sets it around its `ensure` (`forward_prefill.rs`,
     /// "Real prefill: count it as prefill") guarded by `!speculative_append()`,
-    /// and `speculative_append()` is only ever true inside DSpark verify, which
-    /// is off (`V41_DSPARK=0`). So every decode miss is booked as prefill, which
+    /// and only the SERIAL DSpark harness (engine_worker.rs) ever sets that
+    /// scope; the arena's decode and verify steps (multistream / ms_dspark, the
+    /// production path) never do. So every arena decode or verify miss is
+    /// booked as prefill, which
     /// makes `decode_hit` structurally 1.0000 and `decode_misses` structurally 0
     /// in `het.token.summary` / the request summary. Those two fields are not
     /// measuring anything; read `prefill_misses` or the `ms.stage` rollup instead.
@@ -451,7 +453,6 @@ fn box2_missed_slot(layer: i32, e: u32) -> Option<(usize, u64)> {
     Some((layer as usize * per + (e as usize) / 64, 1u64 << (e % 64)))
 }
 
-/// Record that box 2 had to page `e` on `layer`.
 /// `V41_PICK_TRACE=<path>`: append every router pick to a text trace, one line
 /// per (phase, layer, row): `D <layer> <ids...>` for a decode token and
 /// `P <layer> <b> <ids...>` for a prefill/verify chunk row. Feeds the offline
@@ -741,6 +742,7 @@ pub fn take_box2_miss_by_layer() -> Vec<u64> {
     BOX2_MISS_BY_LAYER.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)).collect()
 }
 
+/// Record that box 2 had to page `e` on `layer`.
 pub fn mark_box2_miss(layer: i32, e: u32) {
     if let Some(c) = BOX2_MISS_BY_LAYER.get(layer as usize) {
         c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -843,8 +845,6 @@ fn miss_read_threads() -> usize {
     (*N).max(1)
 }
 
-/// Experts read per batch before the device copy. Bounds host staging at
-/// `batch * 18.8 MB`; 32 keeps it under ~600 MB across the three roles.
 /// Should batched prefill page only the chunk's routed union (default) instead
 /// of all `N_EXPERT` experts per layer? `V41_PAGER_UNION=0` restores the old
 /// dense-always behaviour for A/B.
@@ -855,6 +855,8 @@ pub fn pager_union_prefill() -> bool {
     *U
 }
 
+/// Experts read per batch before the device copy. Bounds host staging at
+/// `batch * 18.8 MB`; 32 keeps it under ~600 MB across the three roles.
 fn pager_read_batch() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("V41_PAGER_READ_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
@@ -863,8 +865,17 @@ fn pager_read_batch() -> usize {
 }
 
 
+/// `V41_B1_PAGE_MISSES=1`: box 1 pages the misses of its partition half itself
+/// (batched driver pick loop). Split with `V41_PARTITION_BOX1_SHARE`
+/// (bandwidth-proportional: ~0.5 with today's drives).
+pub fn b1_page_misses() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_B1_PAGE_MISSES").as_deref() == Ok("1"));
+    *B
+}
+
 /// `V41_B1_PREFETCH=1`: box 1 is the FIRST-level expert cache and box 2 the
-/// victim tier. The compute decision stays "resident here -> local, else box 2",
+/// second level. The compute decision stays "resident here -> local, else box 2",
 /// but every box-1 miss is queued to a background thread that reads the expert
 /// from THIS box's disk and hands the bytes back; `drain_prefetched` admits
 /// them into the decode LRU (evicting LRU) at token boundaries, a few per
@@ -876,15 +887,6 @@ fn pager_read_batch() -> usize {
 /// ~21 misses/token x 6.1 ms) while box 1's slots and drive idled. Fed only by
 /// box 1's misses, box 2's LRU converges to what box 1 does NOT hold, so the
 /// pair is exclusive without any hint protocol.
-/// `V41_B1_PAGE_MISSES=1`: box 1 pages the misses of its partition half itself
-/// (batched driver pick loop). Split with `V41_PARTITION_BOX1_SHARE`
-/// (bandwidth-proportional: ~0.5 with today's drives).
-pub fn b1_page_misses() -> bool {
-    static B: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("V41_B1_PAGE_MISSES").as_deref() == Ok("1"));
-    *B
-}
-
 pub fn b1_prefetch() -> bool {
     static B: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_B1_PREFETCH").as_deref() == Ok("1"));

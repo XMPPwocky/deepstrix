@@ -7,7 +7,9 @@ sums for the hub over the USB4 link. This document is the protocol, the code lay
 measurements, and exactly what is left to wire into `forward_layer` / `forward_prefill`.
 
 Status: **built, loopback bit-identical, cross-box measured, clock-synced and traced** (numbers in
-§5). Not yet called from the forward pass (§6 is the proposed call site). Nothing committed.
+§5). *2026-10-04: in production since 2026-09 (the hub's box-2 client and `deepstrix-expertd`);
+the protocol is now version 4 and replies may come out of order. Sections below are the
+original design record; `remote_experts::proto` is authoritative.*
 
 ## 1. Code layout
 
@@ -33,12 +35,12 @@ CARGO_TARGET_DIR=target-v41 nix develop -c cargo build --release -p deepstrix-ex
 ~/b2-dev.sh cargo build --release --offline -p deepstrix-expertd --features v41     # target-b2/
 ```
 
-## 2. Wire protocol (`remote_experts::proto`, version 1)
+## 2. Wire protocol (`remote_experts::proto`; version 1 as designed, 4 today)
 
 Persistent TCP, one connection at a time per daemon, length-prefixed little-endian frames:
 
 ```
-header (16 B):  magic u32 = 0x50585344 "DSXP" | version u16 = 1 | kind u16 | seq u32 | payload_len u32
+header (16 B):  magic u32 = 0x50585344 "DSXP" | version u16 (1 here; 4 today) | kind u16 | seq u32 | payload_len u32
 kind 1 HELLO     daemon → client on connect: n_layer, n_expert, n_used, n_embd, xq_bytes_per_token,
                  max_batch, decode_max_b, n_resident, bytes_per_expert, then n_layer × ceil(n_expert/32)
                  u32 ownership bitsets (which experts of which layer the daemon holds)
@@ -103,9 +105,10 @@ skips the request entirely when no token of the batch has a remote pick (`submit
 Sizes: decode B=1: 5.9 KB out / 10.3 KB back (f32: 20.5 KB). Prefill B=1024: 6.03 MB out /
 10.49 MB back. Header/pick overhead is 48 B/token.
 
-Framing rules: `seq` is echoed; responses are FIFO (the daemon is single-queue), so the client
-may keep several layers in flight; the client rejects a response whose seq/layer/b differ from
-its oldest ticket. Buffers are recycled through channels on both sides (no per-request
+Framing rules: `seq` is echoed; responses were FIFO in version 1 (the daemon was single-queue), so
+the client could keep several layers in flight and rejected a response whose seq/layer/b differed
+from its oldest ticket. (Today a parked request, `REQ_FLAG_OOO`, is answered out of order and
+replies are matched by `seq`.) Buffers are recycled through channels on both sides (no per-request
 allocation once warm). Transport recipe from SECOND_BOX.md: TCP_NODELAY, SO_SNDBUF/RCVBUF 4 MB,
 TCP_QUICKACK re-armed after every receive, SO_BUSY_POLL 500 µs (plus the flake's
 `net.core.busy_read=500`), all applied by `apply_socket_options` (four raw `setsockopt`s,

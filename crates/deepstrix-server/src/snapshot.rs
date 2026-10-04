@@ -1,7 +1,8 @@
 //! On-disk KV-cache snapshots + LRU eviction.
 //!
-//! A snapshot is keyed by BLAKE3 over the token-id sequence it
-//! represents. On disk it lives at
+//! A snapshot is keyed by BLAKE3 over the DECODED BYTES of the token
+//! sequence it represents (since format v2; image spans hash their content).
+//! On disk it lives at
 //! `~/.cache/deepstrix/snapshots/<hex(blake3)>/`:
 //!
 //!   meta.json       — schema-version'd metadata + per-layer counts

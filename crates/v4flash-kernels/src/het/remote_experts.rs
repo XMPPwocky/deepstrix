@@ -403,10 +403,13 @@ pub mod proto {
     /// deployed first.
     pub const REQ_FLAG_RESID: u32 = 64;
     /// Request flag: the hub is in its DECODE phase (small, frequent
-    /// requests, `HetEngine::remote_set_phase_busy_poll(true)`). The daemon
-    /// spins its reader long between such requests (`b2_adapt_busy_poll`) and
-    /// uses its base window otherwise. An older hub never sets it, so the
-    /// daemon keeps the base window.
+    /// requests, `HetEngine::remote_set_phase_busy_poll(true)`). This is the
+    /// hub's DECLARED phase, read twice on box 2: the daemon spins its reader
+    /// long between such requests (`b2_adapt_busy_poll`) and uses its base
+    /// window otherwise; and mode-aware eviction (`V41_B2_MODE_EVICT`) takes
+    /// the phase from it (`set_request_mode`), smoothed by a 16-request
+    /// hysteresis. An older hub never sets it, so the daemon keeps the base
+    /// window and sees every request as prefill.
     pub const REQ_FLAG_DECODE: u32 = 128;
     /// RESPONSE flag: the residency map is appended (see `REQ_FLAG_RESID`).
     /// Bit 15: requests use the low bits and the miss mask the high 16.
@@ -2095,19 +2098,6 @@ pub mod knobs {
     /// out the whole NVMe read: measured 2026-09-23 at 4 rows, ~131 ms/step of
     /// box-2 queueing, ~as much as box 2's own page time.
     pub fn park() -> bool { PARK.on() }
-    /// `route=urgency` (`V41_B2_ROUTE=urgency`; default `split`): which drive
-    /// each expert read uses. `split` = every read split across both drives by
-    /// `mirror_frac`, scales from the primary. `urgency` = reads a request is
-    /// or will soon be waiting on (demand misses, CERTAIN background reads)
-    /// come WHOLLY from the mirror (box 2's SN5000), speculative background
-    /// reads wholly from the primary (the E100, also the OS disk, whose reads
-    /// stall 5-20x under any write burst: evtrace 2026-09-25). The two classes
-    /// then share no drive, so speculative reads neither yield to demand reads
-    /// nor wait behind certain ones; and a request never waits on a
-    /// speculative read already running on the E100 -- it reads the expert
-    /// itself from the SN5000 and the late copy is discarded on landing.
-    /// Needs a usable mirror on EVERY shard (`set_mirror_ok`); otherwise it
-    /// is `split` (a mirror-only read would silently fall back to the primary).
     /// Decode victims one prefill phase may take before it evicts its own
     /// oldest pages (mode-aware eviction, `V41_B2_MODE_EVICT`); read at the
     /// start of each prefill phase. Env `V41_B2_PREFILL_BUDGET`, file key
@@ -2141,6 +2131,19 @@ pub mod knobs {
     /// `encoder_victims_first`, default on (the name predates the sweep rank:
     /// on = rank decode victims by the sweep, off = plain LRU within a tier).
     pub fn encoder_victims_first() -> bool { ENCODER_VICTIMS_FIRST.on() }
+    /// `route=urgency` (`V41_B2_ROUTE=urgency`; default `split`): which drive
+    /// each expert read uses. `split` = every read split across both drives by
+    /// `mirror_frac`, scales from the primary. `urgency` = reads a request is
+    /// or will soon be waiting on (demand misses, CERTAIN background reads)
+    /// come WHOLLY from the mirror (box 2's SN5000), speculative background
+    /// reads wholly from the primary (the E100, also the OS disk, whose reads
+    /// stall 5-20x under any write burst: evtrace 2026-09-25). The two classes
+    /// then share no drive, so speculative reads neither yield to demand reads
+    /// nor wait behind certain ones; and a request never waits on a
+    /// speculative read already running on the E100 -- it reads the expert
+    /// itself from the SN5000 and the late copy is discarded on landing.
+    /// Needs a usable mirror on EVERY shard (`set_mirror_ok`); otherwise it
+    /// is `split` (a mirror-only read would silently fall back to the primary).
     pub fn route_urgency() -> bool {
         ROUTE.pick() == 1 && MIRROR_OK.load(Relaxed)
     }
@@ -4845,11 +4848,6 @@ impl ExpertShard {
         self.layers.iter().flatten().next().is_some_and(|l| l.page.is_some())
     }
 
-    /// Make every id in `ids` resident in `layer`'s region, paging from this box's
-    /// own disk. No-op for a pinned (non-paged) shard. MUST be called before
-    /// `layer_views` for a paged shard: the MoE kernel reads `remap[e]`, and a
-    /// non-resident id still reads 0 = "the other device takes it", which would
-    /// silently drop the expert.
     /// As [`Self::ensure_layer`], additionally appending every expert id it had to
     /// PAGE (i.e. that missed) to `missed`.
     ///
@@ -4873,12 +4871,15 @@ impl ExpertShard {
         self.ensure_layer_inner(layer, ids, None, prefill_shaped)
     }
 
+    /// Make every id in `ids` resident in `layer`'s region, paging from this box's
+    /// own disk. No-op for a static (non-paged) shard. MUST be called before
+    /// `layer_views` for a paged shard: the MoE kernel reads `remap[e]`, and a
+    /// non-resident id still reads 0 = "the other device takes it", which would
+    /// silently drop the expert.
     pub fn ensure_layer(&mut self, layer: u32, ids: &[i32]) -> eyre::Result<()> {
         self.ensure_layer_inner(layer, ids, None, false)
     }
 
-    /// Is `layer` a PAGED layer (catch-all pool)? Hits-first only applies there:
-    /// an unpaged layer is fully resident by construction.
     /// Resident in the paged pool right now (false for unpaged layers).
     pub fn is_resident_pool(&self, layer: u32, e: u32) -> bool {
         self.pool.as_ref().is_some_and(|p| p.slot_of.contains_key(&(layer, e)))
@@ -4894,6 +4895,8 @@ impl ExpertShard {
         self.pool.as_ref().map_or_else(StageCounters::default, |p| p.sc)
     }
 
+    /// Is `layer` a PAGED layer (catch-all pool)? Hits-first only applies there:
+    /// an unpaged layer is fully resident by construction.
     pub fn layer_is_paged(&self, layer: u32) -> bool {
         self.pool.is_some()
             && self.layers.get(layer as usize).and_then(|l| l.as_ref()).is_some_and(|l| l.page.is_some())
@@ -7989,7 +7992,6 @@ fn apply_written(records: &mut Vec<RequestRecord>, rx_written: &mpsc::Receiver<(
 // Hub-side client
 // ---------------------------------------------------------------------------
 
-/// Handle of a request in flight. Responses arrive in submission order.
 /// Box-1's own two thread handoffs per remote call, which `link_us` cannot see.
 ///
 /// A request crosses caller -> writer thread -> wire -> reader thread -> caller.
@@ -8040,6 +8042,8 @@ pub fn take_hop_stats() -> (f64, f64, f64, u64, u64) {
     )
 }
 
+/// Handle of a request in flight. Replies are matched to tickets by `seq`:
+/// box 2 may answer out of submission order (a parked request, `REQ_FLAG_OOO`).
 #[derive(Clone, Copy, Debug)]
 pub struct Ticket {
     pub seq: u32,
@@ -8422,11 +8426,6 @@ impl RemoteExpertClient {
         self.clock.offset_ns()
     }
 
-    /// Enqueue one layer's request. `xq` = `b` Q8_K rows (the hub's
-    /// `d_xq_q8k` bytes), `sel`/`ew` = the router's `b × N_EXPERT_USED` picks
-    /// and weights. Picks the remote does not own are masked out here; if no
-    /// token has a remote pick nothing is sent and `None` is returned. Returns
-    /// as soon as the frame is handed to the writer thread.
     /// Submit WITHOUT the advertised-bitmap mask — the caller has already decided the
     /// partition and the daemon accepts out-of-set experts.
     ///
@@ -8483,6 +8482,11 @@ impl RemoteExpertClient {
         self.submit_inner(layer, b, xq, sel, ew, f, !unmasked, pin)
     }
 
+    /// Enqueue one layer's request, MASKED: `xq` = `b` Q8_K rows (the hub's
+    /// `d_xq_q8k` bytes), `sel`/`ew` = the router's `b × N_EXPERT_USED` picks
+    /// and weights. Picks outside box 2's ADVERTISED set are masked out here; if
+    /// no token has a remote pick nothing is sent and `None` is returned. Returns
+    /// as soon as the frame is handed to the writer thread.
     pub fn submit(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
         self.submit_flags(layer, b, xq, sel, ew, if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 })
     }
