@@ -1,0 +1,535 @@
+//! The hub's EMBED PHASE (docs/v41/EMBED_PHASE_DESIGN.md): Qwen3-Embedding
+//! served from the hub process as a third scheduler phase next to prefill and
+//! decode. A phase runs between scheduler ticks with no other hub work on any
+//! device. It borrows ~0.6 GB of the dGPU IN PLACE from immutable V4.1 weights
+//! (the loan), streams the embedding model's layers from its GGUF, and puts
+//! the borrowed bytes back from the loan image before the next tick. The
+//! embedding model's weights, kernel modules and pinned buffers exist only
+//! during a phase: every resident byte would cost expert hit rate. What does
+//! stay resident (the tokenizer, the tensor directory) is listed in the design
+//! doc §4.5.
+//!
+//! (Not `embed.rs`: that module is V4.1's token-embedding lookup.)
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use color_eyre::eyre::{self, eyre, WrapErr};
+use tokio::sync::oneshot;
+use v4flash_core::qwen3_embed::Qwen3EmbedModel;
+use v4flash_core::tokenizer::BpeVocab;
+use v4flash_core::MappedGguf;
+use v4flash_hip::{Device, PinnedBuffer};
+use v4flash_kernels::dgpu_loan::{Donor, Loan};
+use v4flash_kernels::het::weights::HetModelWeights;
+use v4flash_kernels::het::HeterogeneousEngine;
+use v4flash_kernels::qwen3_embed::{self as fwd, EmbedBuffers, EmbedSizing, Qwen3EmbedKernels};
+
+use crate::engine_worker::{SubmitError, WorkerProgress};
+use crate::knobs;
+
+/// Guard band imaged past each donor's lent bytes (design §4.3).
+const GUARD_BYTES: usize = 1 << 20;
+
+/// What a finished request gets: one embedding per input, in order.
+pub type EmbedReply = Result<Vec<Vec<f32>>, String>;
+
+/// One `/v1/embeddings` request, queued or part-way through.
+pub struct EmbedRequest {
+    /// Token ids per input, `<|endoftext|>` appended.
+    inputs: Vec<Vec<u32>>,
+    tokens: usize,
+    dims: Option<usize>,
+    results: Vec<Option<Vec<f32>>>,
+    /// Inputs `< next` are computed or in the current phase.
+    next: usize,
+    reply: Option<oneshot::Sender<EmbedReply>>,
+    queued: Instant,
+}
+
+impl EmbedRequest {
+    pub fn new(inputs: Vec<Vec<u32>>, dims: Option<usize>, reply: oneshot::Sender<EmbedReply>) -> Self {
+        let n = inputs.len();
+        let tokens = inputs.iter().map(Vec::len).sum();
+        EmbedRequest { inputs, tokens, dims, results: vec![None; n], next: 0, reply: Some(reply), queued: Instant::now() }
+    }
+
+    fn gone(&self) -> bool {
+        self.reply.as_ref().is_none_or(|r| r.is_closed())
+    }
+
+    fn fail(&mut self, msg: &str) {
+        if let Some(tx) = self.reply.take() {
+            let _ = tx.send(Err(msg.to_string()));
+        }
+    }
+}
+
+/// Requests waiting for the worker. Shared by the HTTP handlers and the
+/// engine thread; bounded by queued tokens (`V41_EMBED_QUEUE_TOKENS`).
+pub struct EmbedQueue {
+    reqs: Mutex<VecDeque<EmbedRequest>>,
+    tokens: AtomicUsize,
+    cap_tokens: usize,
+    /// A wake (`EngineRequest::EmbedWake`) is in the engine channel or about
+    /// to be: at most one at a time, so embedding traffic can never fill the
+    /// channel chat submits into.
+    wake_pending: AtomicBool,
+}
+
+impl EmbedQueue {
+    pub fn new(cap_tokens: usize) -> Self {
+        EmbedQueue { reqs: Mutex::new(VecDeque::new()), tokens: AtomicUsize::new(0), cap_tokens, wake_pending: AtomicBool::new(false) }
+    }
+
+    /// Queue a request, or `Busy` when it would pass the cap. An empty queue
+    /// always takes one, so a request larger than the cap is not refused
+    /// forever.
+    pub fn push(&self, r: EmbedRequest) -> Result<(), SubmitError> {
+        let mut q = self.reqs.lock().unwrap_or_else(|e| e.into_inner());
+        if !q.is_empty() && self.tokens.load(Ordering::Relaxed) + r.tokens > self.cap_tokens {
+            return Err(SubmitError::Busy);
+        }
+        self.tokens.fetch_add(r.tokens, Ordering::Relaxed);
+        q.push_back(r);
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reqs.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    fn pop(&self) -> Option<EmbedRequest> {
+        let r = self.reqs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        if let Some(r) = &r {
+            self.tokens.fetch_sub(r.tokens, Ordering::Relaxed);
+        }
+        r
+    }
+
+    /// True when the caller must send a wake (none is pending).
+    pub fn claim_wake(&self) -> bool {
+        !self.wake_pending.swap(true, Ordering::AcqRel)
+    }
+
+    /// The engine got the wake (or is about to block idle, or the send
+    /// failed): the next push sends a new one.
+    pub fn clear_wake(&self) {
+        self.wake_pending.store(false, Ordering::Release);
+    }
+}
+
+/// What the HTTP layer needs (`EngineHandle::embed`).
+pub struct EmbedInfo {
+    pub model_name: String,
+    pub vocab: Arc<BpeVocab>,
+    pub eos_id: u32,
+    pub n_embd: usize,
+    pub n_vocab: usize,
+    pub max_input_tokens: usize,
+    pub max_request_tokens: usize,
+    pub queue: Arc<EmbedQueue>,
+}
+
+/// One phase's numbers (`ms.embed`, evtrace `hub_embed`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PhaseStats {
+    pub requests: usize,
+    pub inputs: usize,
+    pub tokens: usize,
+    pub wait_ms: f64,
+    pub rows_ms: f64,
+    pub read_ms: f64,
+    pub wait_read_ms: f64,
+    pub fwd_ms: f64,
+    pub return_ms: f64,
+    pub verify_ms: f64,
+    pub pinned_ms: f64,
+    pub total_ms: f64,
+    pub nonfinite: usize,
+    pub guard_violations: u32,
+    pub ok: bool,
+}
+
+/// The engine thread's embed state (`WorkerState::embed`).
+pub struct EmbedCtx {
+    info: Arc<EmbedInfo>,
+    file: MappedGguf,
+    model: Qwen3EmbedModel,
+    arch: String,
+    loan: Loan,
+    sizing: EmbedSizing,
+    queue: Arc<EmbedQueue>,
+    /// Requests taken off the queue and not yet replied to (a large request
+    /// spans several phases).
+    active: VecDeque<EmbedRequest>,
+    /// Round-robin start for the next phase's batch.
+    rr: usize,
+    last_end: Option<Instant>,
+    last_dur: Duration,
+}
+
+/// The default loan image path.
+fn default_image() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".cache/deepstrix/embed-loan.img")
+}
+
+/// Donor candidates, best first: the V4.1 LM head (one big contiguous buffer,
+/// read only by the head and the drafter exit, both on the engine thread
+/// inside ticks), then the per-layer attention projections and shared-expert
+/// weights, largest first. All are immutable after load.
+fn donor_candidates(w: &HetModelWeights) -> Vec<Donor> {
+    let view = |name: String, b: &v4flash_hip::DeviceBuffer<u8>| Donor { name, view: b.slice_view(0, b.len()) };
+    let mut out = vec![view("output".into(), &w.global.output.buffer)];
+    let mut rest: Vec<Donor> = Vec::new();
+    for l in &w.dgpu_layers {
+        let i = l.layer_idx;
+        rest.push(view(format!("blk.{i}.attn_q_b"), &l.attn_q_b.buffer));
+        rest.push(view(format!("blk.{i}.attn_output_a"), &l.attn_output_a.buffer));
+        rest.push(view(format!("blk.{i}.attn_output_b"), &l.attn_output_b.buffer));
+        rest.push(view(format!("blk.{i}.shared.gate"), &l.shared.gate.buffer));
+        rest.push(view(format!("blk.{i}.shared.up"), &l.shared.up.buffer));
+        rest.push(view(format!("blk.{i}.shared.down"), &l.shared.down.buffer));
+    }
+    rest.sort_by_key(|d| std::cmp::Reverse(d.view.byte_len()));
+    out.extend(rest);
+    out
+}
+
+/// Aborts the process if dropped while the loan is out (a panic mid-phase):
+/// the V4.1 weights the donors hold would be garbage.
+struct LoanOut;
+
+impl Drop for LoanOut {
+    fn drop(&mut self) {
+        tracing::error!("embed phase: unwound with the dGPU loan out; V4.1 weights are corrupt -- aborting for a supervisor restart");
+        std::thread::sleep(Duration::from_millis(50));
+        std::process::abort();
+    }
+}
+
+impl EmbedCtx {
+    /// Startup (`--embed-gguf`): validate the GGUF, size and place the loan,
+    /// write the loan image (through `engine`'s dGPU transfer stream).
+    /// Allocates nothing on any device. Call after the V4.1 weights are
+    /// loaded and before the scheduler starts.
+    pub fn load(path: &std::path::Path, model_name: String, engine: &HeterogeneousEngine, weights: &HetModelWeights) -> eyre::Result<(EmbedCtx, Arc<EmbedInfo>)> {
+        let t0 = Instant::now();
+        let dgpu = engine.dgpu.device;
+        let mut file = MappedGguf::open(path).wrap_err_with(|| format!("open --embed-gguf {}", path.display()))?;
+        let model = Qwen3EmbedModel::from_gguf(&file).wrap_err_with(|| format!("--embed-gguf {}", path.display()))?;
+        let vocab = BpeVocab::from_gguf(file.gguf())?;
+        if vocab.pre.as_deref() != Some("qwen2") {
+            tracing::warn!(pre = ?vocab.pre, "embed GGUF: tokenizer pre-type is not qwen2; encoding with the qwen2 splitter anyway");
+        }
+        // The tokenizer arrays now live in `vocab`; free the parsed copy.
+        file.drop_metadata();
+        let sizing = EmbedSizing { phase_tokens: knobs::EMBED_PHASE_TOKENS.usize(), sub_rows: knobs::EMBED_SUB_ROWS.usize() };
+        let max_input_tokens = knobs::EMBED_MAX_INPUT_TOKENS.usize().min(model.cfg.n_ctx_train);
+        if max_input_tokens > sizing.phase_tokens {
+            return Err(eyre!(
+                "V41_EMBED_MAX_INPUT_TOKENS ({max_input_tokens}) exceeds V41_EMBED_PHASE_TOKENS ({}): such an input could never run",
+                sizing.phase_tokens
+            ));
+        }
+        dgpu.set_current()?;
+        let arch = dgpu.properties()?.gcn_arch_name;
+        // Fail at startup, not on the first request: the kernels load here
+        // once and are dropped (they load again per phase).
+        drop(Qwen3EmbedKernels::for_arch(&arch)?);
+        let sizes: Vec<usize> = sizing.buffer_sizes(&model.cfg, &model.layout).iter().map(|(_, b)| *b).collect();
+        let image = knobs::EMBED_LOAN_IMAGE.str().map(PathBuf::from).unwrap_or_else(default_image);
+        let mut loan = Loan::new(donor_candidates(weights), &sizes, image, model.layout.bytes, GUARD_BYTES)?;
+        let ti = Instant::now();
+        loan.write_image(&engine.dgpu.xfer)?;
+        tracing::info!(
+            gguf = %path.display(),
+            layers = model.cfg.n_layer,
+            n_embd = model.cfg.n_embd,
+            layer_mib = model.layout.bytes as f64 / (1 << 20) as f64,
+            phase_tokens = sizing.phase_tokens,
+            sub_rows = sizing.sub_rows,
+            lent_mib = loan.lent_bytes() as f64 / (1 << 20) as f64,
+            imaged_mib = loan.total_bytes() as f64 / (1 << 20) as f64,
+            donors = ?loan.donor_summary(),
+            image = %loan.image_path().display(),
+            image_ms = ti.elapsed().as_millis() as u64,
+            load_ms = t0.elapsed().as_millis() as u64,
+            "embed phase ready (weights stream per phase; nothing on the devices between phases)"
+        );
+        let queue = Arc::new(EmbedQueue::new(knobs::EMBED_QUEUE_TOKENS.usize()));
+        let info = Arc::new(EmbedInfo {
+            model_name,
+            eos_id: model.eos_id,
+            n_embd: model.cfg.n_embd,
+            n_vocab: model.cfg.n_vocab,
+            max_input_tokens,
+            max_request_tokens: knobs::EMBED_MAX_REQUEST_TOKENS.usize(),
+            vocab: Arc::new(vocab),
+            queue: queue.clone(),
+        });
+        Ok((
+            EmbedCtx { info: info.clone(), file, model, arch, loan, sizing, queue, active: VecDeque::new(), rr: 0, last_end: None, last_dur: Duration::ZERO },
+            info,
+        ))
+    }
+
+    /// The HTTP layer's view (`EngineHandle::embed`).
+    pub fn info(&self) -> Arc<EmbedInfo> {
+        self.info.clone()
+    }
+
+    /// Work is waiting (queued, or a request part-way through).
+    pub fn has_work(&self) -> bool {
+        !self.active.is_empty() || !self.queue.is_empty()
+    }
+
+    pub fn queue(&self) -> &EmbedQueue {
+        &self.queue
+    }
+
+    /// May a phase start now? With LLM work pending, phases may take at most
+    /// `V41_EMBED_MAX_SHARE` % of wall time: the next starts no earlier than
+    /// `last_dur * (100 / share - 1)` after the last ended.
+    pub fn due(&self, llm_busy: bool) -> bool {
+        if !self.has_work() {
+            return false;
+        }
+        if !llm_busy {
+            return true;
+        }
+        let share = knobs::EMBED_MAX_SHARE.get().clamp(1, 100) as f64;
+        let gap = self.last_dur.mul_f64(100.0 / share - 1.0);
+        self.last_end.is_none_or(|e| e.elapsed() >= gap)
+    }
+
+    /// Reply an error to every queued and active request (shutdown).
+    pub fn fail_all(&mut self, msg: &str) {
+        while let Some(mut r) = self.queue.pop() {
+            r.fail(msg);
+        }
+        for r in self.active.iter_mut() {
+            r.fail(msg);
+        }
+        self.active.clear();
+    }
+
+    /// The next phase's inputs: (index in `active`, input index), round-robin
+    /// across requests (one input from each in turn, starting after the
+    /// last phase's first request) within the token budget. Every input fits
+    /// alone (the handler caps inputs at `max_input_tokens <= phase_tokens`).
+    fn take_batch(&mut self) -> Vec<(usize, usize)> {
+        self.active.retain(|r| !r.gone());
+        while let Some(r) = self.queue.pop() {
+            if !r.gone() {
+                self.active.push_back(r);
+            }
+        }
+        let n = self.active.len();
+        let mut batch = Vec::new();
+        if n == 0 {
+            return batch;
+        }
+        let start = self.rr % n;
+        self.rr = self.rr.wrapping_add(1);
+        let mut tokens = 0usize;
+        loop {
+            let mut took = false;
+            for k in 0..n {
+                let ri = (start + k) % n;
+                let r = &mut self.active[ri];
+                if r.next < r.inputs.len() {
+                    let len = r.inputs[r.next].len();
+                    if tokens + len > self.sizing.phase_tokens {
+                        continue;
+                    }
+                    tokens += len;
+                    batch.push((ri, r.next));
+                    r.next += 1;
+                    took = true;
+                }
+            }
+            if !took {
+                break;
+            }
+        }
+        batch
+    }
+
+    /// One embed phase. On return the loan is back (a failed return aborts
+    /// the process: a hub whose V4.1 weights differ from what it loaded must
+    /// not serve), each request in the phase has its inputs' results or its
+    /// error, finished requests are replied to. Never fails: embedding errors
+    /// go to the requests, never to the LLM streams. `live` / `prefills` are
+    /// for the log only.
+    pub fn run_phase(&mut self, engine: &HeterogeneousEngine, progress: &WorkerProgress, live: usize, prefills: usize) -> PhaseStats {
+        let t0 = Instant::now();
+        let mut st = PhaseStats::default();
+        let batch = self.take_batch();
+        if batch.is_empty() {
+            return st;
+        }
+        st.inputs = batch.len();
+        st.tokens = batch.iter().map(|(ri, ii)| self.active[*ri].inputs[*ii].len()).sum();
+        st.wait_ms = self.active.iter().map(|r| r.queued.elapsed().as_secs_f64() * 1e3).fold(0.0, f64::max);
+        let mut host: Option<[PinnedBuffer<u8>; 2]> = None;
+        let out = LoanOut;
+        let r = self.forward(engine, progress, &batch, &mut host, &mut st);
+        // The loan goes back whatever the forward did.
+        let tr = Instant::now();
+        let verify = knobs::EMBED_VERIFY.on();
+        let back = match host.as_mut() {
+            Some(h) => self.loan.give_back(&engine.dgpu.xfer, h, verify),
+            None => PinnedBuffer::<u8>::new(self.model.layout.bytes)
+                .and_then(|a| Ok([a, PinnedBuffer::<u8>::new(self.model.layout.bytes)?]))
+                .and_then(|mut h| self.loan.give_back(&engine.dgpu.xfer, &mut h, verify)),
+        };
+        match back {
+            Ok(rs) => {
+                std::mem::forget(out);
+                st.return_ms = tr.elapsed().as_secs_f64() * 1e3;
+                st.verify_ms = rs.verify_ms;
+                st.guard_violations = rs.guard_violations;
+                if rs.retried > 0 {
+                    tracing::warn!(retried = rs.retried, "embed phase: loan chunks needed a second return");
+                }
+                if rs.guard_violations > 0 {
+                    tracing::error!(donors = rs.guard_violations, "embed phase: a kernel wrote past its loan (guard band changed; repaired by the return)");
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "embed phase: the dGPU loan could not be returned");
+                drop(out); // aborts
+                unreachable!();
+            }
+        }
+        drop(host);
+        match r {
+            Ok(rows) => {
+                st.ok = true;
+                for ((ri, ii), row) in batch.iter().zip(rows) {
+                    let req = &mut self.active[*ri];
+                    let e = self.model.finish(&row, req.dims);
+                    if e.iter().all(|x| x.is_finite()) {
+                        req.results[*ii] = Some(e);
+                    } else {
+                        st.nonfinite += 1;
+                        req.fail(&format!("embedding of input {ii} is not finite"));
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = format!("embedding failed: {e:#}");
+                tracing::error!(error = %msg, inputs = st.inputs, "embed phase: forward failed; its requests get the error");
+                for (ri, _) in &batch {
+                    self.active[*ri].fail(&msg);
+                }
+            }
+        }
+        let mut reqs: Vec<usize> = batch.iter().map(|(ri, _)| *ri).collect();
+        reqs.sort_unstable();
+        reqs.dedup();
+        st.requests = reqs.len();
+        // Reply to finished requests; drop failed (already replied) ones.
+        self.active.retain_mut(|r| {
+            if r.reply.is_none() {
+                return false;
+            }
+            if r.results.iter().all(Option::is_some) {
+                let out: Vec<Vec<f32>> = r.results.iter_mut().map(|x| x.take().expect("checked")).collect();
+                let _ = r.reply.take().expect("checked").send(Ok(out));
+                return false;
+            }
+            true
+        });
+        st.total_ms = t0.elapsed().as_secs_f64() * 1e3;
+        self.last_end = Some(Instant::now());
+        self.last_dur = t0.elapsed();
+        tracing::info!(
+            requests = st.requests, inputs = st.inputs, tokens = st.tokens, ok = st.ok, live, prefills,
+            wait_ms = st.wait_ms as u64, rows_ms = st.rows_ms as u64, read_ms = st.read_ms as u64,
+            wait_read_ms = st.wait_read_ms as u64, fwd_ms = st.fwd_ms as u64, return_ms = st.return_ms as u64,
+            verify_ms = st.verify_ms as u64, pinned_ms = st.pinned_ms as u64, total_ms = st.total_ms as u64,
+            nonfinite = st.nonfinite, guard_violations = st.guard_violations,
+            lent_mib = self.loan.lent_bytes() >> 20, "ms.embed"
+        );
+        use v4flash_kernels::het::{evtrace, evtrace_kinds};
+        evtrace::emit(&evtrace_kinds::HUB_EMBED, &[
+            evtrace::now(), st.requests as f64, st.inputs as f64, st.tokens as f64, self.loan.lent_bytes() as f64,
+            st.wait_ms, st.rows_ms, st.read_ms, st.wait_read_ms, st.fwd_ms, st.return_ms, st.verify_ms,
+            st.pinned_ms, st.total_ms, live as f64, prefills as f64, f64::from(u8::from(st.ok)),
+            st.nonfinite as f64, f64::from(st.guard_violations),
+        ]);
+        crate::engine_worker::trim_heap_and_log("host heap after embed phase");
+        st
+    }
+
+    /// The forward over `batch`: quiesce the dGPU, load the kernels, carve the
+    /// loan, run. Returns each batch entry's last hidden row. `host` receives
+    /// the phase's pinned buffers (the return reuses them).
+    fn forward(
+        &mut self,
+        engine: &HeterogeneousEngine,
+        progress: &WorkerProgress,
+        batch: &[(usize, usize)],
+        host: &mut Option<[PinnedBuffer<u8>; 2]>,
+        st: &mut PhaseStats,
+    ) -> eyre::Result<Vec<Vec<f32>>> {
+        let dgpu: Device = engine.dgpu.device;
+        dgpu.set_current()?;
+        // L1: nothing queued on the dGPU may still read a donor.
+        dgpu.synchronize()?;
+        let tp = Instant::now();
+        let h = host.insert([PinnedBuffer::<u8>::new(self.model.layout.bytes)?, PinnedBuffer::<u8>::new(self.model.layout.bytes)?]);
+        st.pinned_ms = tp.elapsed().as_secs_f64() * 1e3;
+        let k = Qwen3EmbedKernels::for_arch(&self.arch)?;
+        let mut alloc = self.loan.allocator()?;
+        let mut bufs = EmbedBuffers::carve(&mut alloc, self.sizing, &self.model.cfg, &self.model.layout)?;
+        let inputs: Vec<&[u32]> = batch.iter().map(|(ri, ii)| self.active[*ri].inputs[*ii].as_slice()).collect();
+        let tf = Instant::now();
+        let (rows, tm) = fwd::run(
+            &k, &engine.dgpu.q8_wmma, &self.model, &self.file, &mut bufs, h,
+            &engine.dgpu.compute, &engine.dgpu.xfer, &inputs, &mut || progress.pet(),
+        )?;
+        st.fwd_ms = tf.elapsed().as_secs_f64() * 1e3;
+        st.rows_ms = tm.rows_ms;
+        st.read_ms = tm.read_ms;
+        st.wait_read_ms = tm.wait_read_ms;
+        Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(lens: &[usize]) -> (EmbedRequest, oneshot::Receiver<EmbedReply>) {
+        let (tx, rx) = oneshot::channel();
+        (EmbedRequest::new(lens.iter().map(|&n| vec![1u32; n]).collect(), None, tx), rx)
+    }
+
+    #[test]
+    fn queue_caps_tokens_but_takes_one_into_an_empty_queue() {
+        let q = EmbedQueue::new(10);
+        let (big, _r1) = req(&[50]);
+        assert!(q.push(big).is_ok(), "an empty queue takes anything");
+        let (small, _r2) = req(&[2]);
+        assert!(matches!(q.push(small), Err(SubmitError::Busy)));
+        assert!(q.pop().is_some());
+        let (small, _r3) = req(&[2]);
+        assert!(q.push(small).is_ok());
+    }
+
+    #[test]
+    fn wake_is_edge_triggered() {
+        let q = EmbedQueue::new(10);
+        assert!(q.claim_wake());
+        assert!(!q.claim_wake());
+        q.clear_wake();
+        assert!(q.claim_wake());
+    }
+}

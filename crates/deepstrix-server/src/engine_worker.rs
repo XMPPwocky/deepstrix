@@ -449,6 +449,11 @@ pub enum EngineRequest {
     Shutdown {
         ack: oneshot::Sender<()>,
     },
+    /// `/v1/embeddings` queued work (`EmbedQueue`). Carries nothing: the
+    /// requests wait in the queue, and at most one wake is ever in this
+    /// channel (`EmbedQueue::claim_wake`), so embedding traffic never takes
+    /// the capacity chat submits into.
+    EmbedWake,
 }
 
 /// Maximum number of generation requests queued behind the one
@@ -605,9 +610,29 @@ pub struct EngineHandle {
     /// Changing it DOES change the rendered prompt and invalidates every
     /// cached prefix — see `prompt::from_request_fields_with_default`.
     pub default_reasoning_effort: crate::prompt::ReasoningEffort,
+    /// `/v1/embeddings` (`--embed-gguf`): `None` = the route answers 404.
+    pub embed: Option<Arc<crate::embed_phase::EmbedInfo>>,
 }
 
 impl EngineHandle {
+    /// Queue an embedding request and wake the worker if no wake is pending.
+    /// `Busy` when the embed queue is full (HTTP 503).
+    pub fn submit_embed(&self, r: crate::embed_phase::EmbedRequest) -> Result<(), SubmitError> {
+        let Some(info) = self.embed.as_ref() else { return Err(SubmitError::WorkerDead) };
+        info.queue.push(r)?;
+        if info.queue.claim_wake() {
+            match self.tx.try_send(EngineRequest::EmbedWake) {
+                Ok(()) => {}
+                // A full channel means the worker is busy; it checks the embed
+                // queue every iteration, so no wake is needed. Release the
+                // claim so a later push can wake an idle worker.
+                Err(mpsc::error::TrySendError::Full(_)) => info.queue.clear_wake(),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(SubmitError::WorkerDead),
+            }
+        }
+        Ok(())
+    }
+
     /// Submit a generation request. Returns the worker-event stream
     /// and a cancellation handle the caller can flip to ask the worker
     /// to stop mid-decode.
@@ -691,6 +716,11 @@ pub struct WorkerConfig {
     /// Effort level for requests that omit `reasoning`/`reasoning_effort`
     /// (`--default-reasoning-effort`).
     pub default_reasoning_effort: crate::prompt::ReasoningEffort,
+    /// Qwen3-Embedding Q8_0 GGUF (`--embed-gguf`): `/v1/embeddings` through
+    /// the embed phase. `None` = no embeddings.
+    pub embed_gguf: Option<std::path::PathBuf>,
+    /// The embedding model's name on `/v1/models` and in responses.
+    pub embed_model_name: String,
 }
 
 pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
@@ -721,6 +751,7 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
         vocab,
         model_name,
         vision_enabled,
+        embed,
     } = ready_rx
         .recv()
         .map_err(|_| eyre!("engine thread dropped ready channel"))??;
@@ -737,6 +768,7 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
         image_policy,
         default_top_p,
         default_reasoning_effort,
+        embed,
     })
 }
 
@@ -746,6 +778,8 @@ struct WorkerReady {
     model_name: Arc<String>,
     /// The worker loaded a vision tower.
     vision_enabled: bool,
+    /// The embed phase is ready (`--embed-gguf`).
+    embed: Option<Arc<crate::embed_phase::EmbedInfo>>,
 }
 
 fn worker_main(
@@ -765,10 +799,12 @@ fn worker_main(
     let vocab = state.vocab.clone();
     let model_name = Arc::new(cfg.model_name.clone());
     let vision_enabled = state.tower.is_some();
+    let embed = state.embed.as_ref().map(|e| e.info());
     let _ = ready_tx.send(Ok(WorkerReady {
         vocab,
         model_name,
         vision_enabled,
+        embed,
     }));
 
     worker_loop(state, &mut rx);
@@ -866,6 +902,9 @@ pub struct WorkerState {
     /// emitted decode token and after every completed prefill chunk;
     /// the watchdog thread aborts the process if it goes stale.
     pub progress: WorkerProgress,
+
+    /// The embed phase (`--embed-gguf`, docs/v41/EMBED_PHASE_DESIGN.md).
+    pub embed: Option<crate::embed_phase::EmbedCtx>,
 }
 
 #[derive(Debug, Clone)]
@@ -1211,6 +1250,18 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         }
     };
 
+    // The embed phase (`--embed-gguf`). After the V4.1 weights: its loan
+    // borrows them, and the loan image is written from their loaded bytes.
+    // A bad GGUF or an unwritable image fails startup, as a bad --mmproj does.
+    let embed = match cfg.embed_gguf.as_deref() {
+        None => None,
+        Some(path) => {
+            let (ctx, _info) = crate::embed_phase::EmbedCtx::load(path, cfg.embed_model_name.clone(), &engine, &weights)?;
+            dgpu.set_current()?;
+            Some(ctx)
+        }
+    };
+
     // Compute model fingerprint and load (or create) the snapshot index.
     let fingerprint =
         ModelFingerprint::compute(vocab.vocab_size() as u32, &token_embd_bytes, src.tensors());
@@ -1311,6 +1362,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         // that's shared with EngineHandle + watchdog. Default here so
         // initialize_state stays a self-contained fn.
         progress: WorkerProgress::default(),
+        embed,
     })
 }
 
@@ -1688,13 +1740,46 @@ pub(crate) fn trim_heap_and_log(what: &'static str) {
     );
 }
 
+/// The serial loop's next message. With embed work waiting, a pending message
+/// goes first, else ONE embed phase runs and the loop asks again, so an embed
+/// backlog yields to every arriving request. Before blocking, the embed wake
+/// is released and the queue re-checked (a push in between sends a new wake).
+/// `None` = the channel closed.
+fn serial_next(state: &mut WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) -> Option<EngineRequest> {
+    loop {
+        if let Some(ctx) = state.embed.as_mut() {
+            if ctx.has_work() {
+                match rx.try_recv() {
+                    Ok(m) => return Some(m),
+                    Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                }
+                state.progress.begin();
+                ctx.run_phase(&state.engine, &state.progress, 0, 0);
+                state.progress.end();
+                continue;
+            }
+            ctx.queue().clear_wake();
+            if ctx.has_work() {
+                continue;
+            }
+        }
+        return rx.blocking_recv();
+    }
+}
+
 fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
     #[cfg(feature = "v41")]
     if crate::multistream::enabled() {
         return crate::multistream::worker_loop_ms(state, rx);
     }
-    while let Some(msg) = rx.blocking_recv() {
+    while let Some(msg) = serial_next(&mut state, rx) {
         match msg {
+            EngineRequest::EmbedWake => {
+                if let Some(ctx) = state.embed.as_ref() {
+                    ctx.queue().clear_wake();
+                }
+            }
             EngineRequest::Generate {
                 req,
                 tx,
@@ -1938,6 +2023,9 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
             }
             EngineRequest::Shutdown { ack } => {
                 tracing::info!("worker received shutdown");
+                if let Some(ctx) = state.embed.as_mut() {
+                    ctx.fail_all("server shutting down");
+                }
                 save_live_if_dirty(&mut state);
                 let _ = ack.send(());
                 break;

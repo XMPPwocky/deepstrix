@@ -364,7 +364,9 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         // 1. Intake: never block while there is work; block when idle.
         // Parked requests are work too: blocking here with one parked left it
         // waiting for the NEXT request to arrive before it was retried.
-        let idle = sched.streams.is_empty() && sched.prefills.is_empty() && sched.queue.is_empty() && sched.parked.is_empty();
+        // Embedding work (the embed queue) is work too.
+        let embed_work = state.embed.as_ref().is_some_and(|e| e.has_work());
+        let idle = !sched.has_llm_work() && !embed_work;
         if idle && worked {
             // The serial loop trims after every request; here streams overlap,
             // so trim only when the last one has drained and nothing waits.
@@ -377,14 +379,30 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             // engine 30 min later (DEEPSTRIX_HANG_DEADLINE_MS) -- twice on
             // 2026-09-23, each exactly 30:00 after the last "stream done".
             state.progress.end();
+            // Release the embed wake BEFORE blocking, then re-check: a push
+            // after this sends a new wake (`EmbedQueue::claim_wake`).
+            if let Some(e) = state.embed.as_ref() {
+                e.queue().clear_wake();
+                if e.has_work() {
+                    continue;
+                }
+            }
         }
         let msg = if idle { rx.blocking_recv() } else { match rx.try_recv() { Ok(m) => Some(m), Err(_) => None } };
         match msg {
             Some(EngineRequest::Generate { req, tx, session_id, cancel }) => {
                 sched.enqueue(req, tx, session_id, cancel);
             }
+            Some(EngineRequest::EmbedWake) => {
+                if let Some(e) = state.embed.as_ref() {
+                    e.queue().clear_wake();
+                }
+            }
             Some(EngineRequest::Shutdown { ack }) => {
                 sched.abort_all("server shutting down");
+                if let Some(e) = state.embed.as_mut() {
+                    e.fail_all("server shutting down");
+                }
                 save_live_if_dirty(&mut state);
                 let _ = ack.send(());
                 break;
@@ -392,7 +410,32 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             None if idle => break, // channel closed
             None => {}
         }
-        if sched.streams.is_empty() && sched.prefills.is_empty() && sched.queue.is_empty() && sched.parked.is_empty() {
+        let llm = sched.has_llm_work();
+        // 2. The embed phase (docs/v41/EMBED_PHASE_DESIGN.md §6.2), BETWEEN
+        // ticks: an embedding failure never reaches the step-failure path
+        // below (it fails only its own requests), and a failed loan return
+        // aborts the process inside `run_phase`. Scheduling policy: not in the
+        // middle of a layer-major group (the group's box-2 pages, as for
+        // decode), and at most V41_EMBED_MAX_SHARE % of wall time while the
+        // LLM has work.
+        let mid_group = finish_group() && sched.prefills.iter().any(|p| p.job.lm_mid_group());
+        if let Some(e) = state.embed.as_mut() {
+            if !mid_group && e.due(llm) {
+                state.progress.begin();
+                worked = true;
+                let t = Instant::now();
+                e.run_phase(&state.engine, &state.progress, sched.streams.len(), sched.prefills.len());
+                // The interrupted burst is not charged for the phase.
+                sched.phase_since += t.elapsed();
+                state.engine.invalidate_device_cache();
+                if let Err(err) = state.dgpu.set_current() {
+                    tracing::warn!(error = %err, "embed phase: restoring the dGPU as current failed");
+                }
+                state.progress.pet();
+                continue;
+            }
+        }
+        if !llm {
             state.progress.end();
             continue;
         }
@@ -782,6 +825,11 @@ impl Sched {
             req.tokens.truncate(req.tokens.len() - 1);
         }
         self.queue.push_back(Pending { req, tx, session_id, cancel, trailing_marker, prompt_tokens, queued: Instant::now(), room_wait: None });
+    }
+
+    /// LLM work waits: live streams, prefills, queued or parked requests.
+    fn has_llm_work(&self) -> bool {
+        !(self.streams.is_empty() && self.prefills.is_empty() && self.queue.is_empty() && self.parked.is_empty())
     }
 
     fn abort_all(&mut self, why: &str) {
