@@ -1,42 +1,49 @@
 # Embed phase: Qwen3-Embedding-4B in the hub process
 
-**Status: DRAFT rev 1 (2026-10-04), for review. No code merged.** Branch `worktree-embed-phase`, base `origin/main` c2db000.
+**Status: rev 2 (2026-10-04), for review round 2.** Branch `worktree-embed-phase`, base `origin/main` c2db000. Rev 1 got APPROVE WITH CHANGES (1 blocker, 5 major, 11 minor, 7 nits). §12 maps each finding to its fix. Code is on the branch (host tests pass); nothing has run on a GPU yet.
 
 ## 0. The ask and the constraints
 
 The owner asked (2026-10-04) for the hub to serve [Qwen3-Embedding-4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF) next to DeepSeek V4.1, from the **same process**, behind a standard OpenAI `/v1/embeddings` endpoint. Their constraints:
 
-1. **Computing embeddings may block LLM inference.** Embedding work is a third scheduler phase next to prefill and decode. It runs alone.
-2. **Nothing the embedding model holds may stay resident between phases.** Every byte held outside the phase costs hit rate: in the box-1 pool, in the box-2 pool, or in the box-1 page cache. That is why embedding is a separate phase in the first place.
-3. **If it fits on the dGPU, run it there.** Other dGPU state may be evicted *temporarily* during the phase, to box-1 RAM or NVMe.
-4. **There are no dGPU hot-tier slots to borrow.** The dGPU hot tier is inert under paged experts (glossary). Laguna code is not a template: it was never really tested.
+1. **Computing embeddings may block LLM inference.** Embedding is a third scheduler phase, next to prefill and decode. It runs alone.
+2. **Nothing the embedding model holds may stay resident between phases.** Every resident byte costs hit rate: in the box-1 pool, the box-2 pool, or box 1's page cache. §4.5 lists what stays resident anyway; the owner must sign that list off.
+3. **If it fits on the dGPU, run it there**, evicting other dGPU state *temporarily* during the phase, to box-1 RAM or NVMe.
+4. **There are no dGPU hot-tier slots to borrow.** Laguna code is not a template: it was never really tested.
 
 ## 1. Where things stand (measured 2026-10-04 ~20:20 UTC, hub on the 128 GB box)
 
 | Resource | State |
 |---|---|
-| dGPU (9070 XT, gfx1201) | 16,135 / 16,304 MiB used. V4.1 non-MoE weights are ~9 GiB of it (startup log). V4.1 KV is small (4 KV-source layers; FP8 592 B/row at `n_kv_max/4`). The rest is arena / scratch / lane buffers / graph execs. |
+| dGPU (9070 XT, gfx1201) | 16,135 / 16,304 MiB used. About 9 GiB is V4.1 non-MoE weights (startup log). V4.1 KV is small: only the 4 KV-source layers hold KV, FP8 at 592 B/row for `n_kv_max/4` rows. The rest is arena, scratch, lane buffers and graph execs. |
 | iGPU (gfx1151) | GTT 107 / 127 GB. Box-1 pool `V41_PAGER_POOL_GB=95`, drafter 7.93 GB, vision 0.9 GB. |
-| Box-1 RAM | 124 GB total, ~8 GB available, mostly page cache that serves expert / Engram reads. |
-| dGPU link | OCuLink Gen4 x4 (16 GT/s). |
+| Box-1 RAM | 124 GB total, ~8 GB available. Most of that is page cache serving expert and Engram reads. |
+| dGPU link | OCuLink Gen4 x4. |
+| NVMe reads | Latency-bound on dm-crypt. One pread runs at 2.4–2.55 GB/s; four readers at 5.52 GB/s (`mapped.rs:157-161`, `het/weights.rs` fast load). |
 
-There is no free memory anywhere to park 4 GB permanently. The one large, cheap-to-borrow thing on the dGPU is **immutable V4.1 weights**: they can be overwritten in place and put back byte-exact from a copy, with no write-out at borrow time.
+## 2. The model and its weight format
 
-## 2. The model
+**Shape.** Qwen3 decoder (`general.architecture = qwen3`):
 
-From `config.json` (HF) and the GGUF repo:
+- 36 layers, hidden 2560, 32 Q heads and 8 KV heads (kv_group 4), head_dim 128.
+- Per-head RMSNorm on Q and K before RoPE. RoPE is **NeoX**, θ = 1e6.
+- SwiGLU FFN with intermediate 9728. RMSNorm eps 1e-6. Vocab 151,665.
+- Tied embeddings, so there is no LM head.
+- **Causal** attention.
 
-- Qwen3 decoder (`general.architecture = qwen3`): 36 layers, hidden 2560, 32 Q heads / 8 KV heads, head_dim 128.
-- Per-head RMSNorm on Q and K before RoPE (`attn_q_norm`, `attn_k_norm`). RoPE is **NeoX** (pairs `i`, `i+64`), θ = 1e6.
-- SwiGLU FFN with intermediate 9728. RMSNorm eps 1e-6. Vocab 151,665. Tied embeddings, so there is no LM head to load.
-- **Causal** attention. Output = **last-token** hidden state → `output_norm` → L2 normalize.
-- MRL: any `dimensions` in 32..2560 means truncate, then L2 normalize.
-- Queries are instruction-formatted by the client: `Instruct: {task}\nQuery:{query}`. Documents are not.
-- The reference appends `<|endoftext|>` (151643). **To verify** against the reference tokenizer's ids (gate E0).
+**Output.** The **last** token's hidden state goes through `output_norm`, then L2 normalization. With MRL `dimensions` in 32..2560, the result is truncated to that length and normalized again.
 
-**Weight format: Q8_0 only in v1** (`Qwen3-Embedding-4B-Q8_0.gguf`, 4.28 GB). Every Q8_0 projection runs on the production prefill GEMM `Q8_0MatvecWmma::gemm_f16x` (Q8_0 weights × f16 activations, 128×128 WMMA, bit-exact-tested). Every Qwen3 shape fits its contract (`m % 128 == 0`, `k % 32 == 0`). Other quants are refused at startup.
+**Prompts.** Queries are formatted by the client as `Instruct: {task}\nQuery:{query}`. The reference appends `<|endoftext|>` (151643); gate E0 confirms this from the reference token ids.
 
-Byte sizes at Q8_0 (34 B per 32 weights):
+**Weights: Q8_0 only** (`Qwen3-Embedding-4B-Q8_0.gguf`, 4.28 GB).
+
+- On disk a Q8_0 row is interleaved per block: `[f16 scale | 32 × i8]`.
+- The production prefill GEMM `Q8_0MatvecWmma::gemm_f16x` (Q8_0 weights × f16 activations, 128×128 WMMA) reads the **M18 split layout** instead: per row, all scales, then all quants (`weights::repack_q8_0`; kernel `q8_0_matvec_wmma.hip:605-630`).
+- Each streamed layer is therefore **repacked in place on the dGPU** (§5.2).
+- `gemm_f16x` is tolerance-tested (`rel < 5e-3`, `rms < 1e-3`) at k ∈ {1024, 4096, 8192} (`tests/q8_0_gemm_f16x.rs`). It is not bit-exact. Gate E2 covers all four Qwen (m, k) shapes. Every one meets its contract: m ∈ {6144, 2560, 19456} are multiples of 128, k ∈ {2560, 4096, 9728} are multiples of 32.
+- Other quants are refused at startup.
+
+Byte sizes (Q8_0 = 34 B per 32 weights):
 
 | Tensor (per layer) | Rows × K | Bytes |
 |---|---|---|
@@ -46,268 +53,334 @@ Byte sizes at Q8_0 (34 B per 32 weights):
 | `ffn_gate`, `ffn_up` | 9728 × 2560 each | 26,460,160 each |
 | `ffn_down` | 2560 × 9728 | 26,460,160 |
 | 4 norms (f32) | — | 21,504 |
-| **one layer** | | **107,254,784 (102.3 MiB)** |
+| **one layer** | | **107,254,784** |
 | **36 layers** | | **3.86 GB** |
-| `token_embd` (host-side row gather only) | 151,665 × 2560 | 412,528,800 |
+| `token_embd` (host-side row reads only) | 151,665 × 2560 | 412,528,800 |
 
 ## 3. Design summary
 
-One **embed phase** = one scheduler tick, run between ticks. Nothing else runs on any device while it is open.
+One **embed phase** runs **between scheduler ticks**, in `worker_loop_ms`. It never runs inside `Sched::tick`, so an embedding error cannot reach the step-failure path. During the phase, no other hub work is queued on any device. The Tier B thread may record events on its own stream, and box 2 may finish in-flight work; neither touches the dGPU donors.
 
-1. Take queued embedding inputs up to a token budget.
-2. **Loan**: in-place views over immutable V4.1 dGPU weight buffers (the donors). Pointers do not change. The loan holds about 0.6 GB: a two-layer weight ring plus activations and per-layer K/V.
-3. Gather token-embedding rows on the host (pread + Q8_0 dequant) and upload the f32 residual.
-4. Run the 36 layers **layer-major over every token of the phase**. Weights **stream** from the GGUF on NVMe through a pinned host ring into the dGPU ring, one layer ahead of compute.
-5. Gather each input's last row, then on the host: `output_norm`, L2, MRL.
-6. **Return** the loan: re-upload the donors' bytes from the **loan image** (an on-disk copy written once at startup), synchronize, and optionally verify.
-7. Reply.
+1. **Batch.** Take queued inputs up to the token budget, round-robin across requests.
+2. **Quiesce.** `hipDeviceSynchronize` the dGPU.
+3. **Lend.** Load the phase's kernel modules and allocate two pinned host buffers. Lend about 575 MB of dGPU memory **in place** from immutable V4.1 weights (the donors).
+4. **Embed tokens.** Read the token-embedding rows on the host (4 reader threads, then Q8_0 dequant) and upload the f32 residual.
+5. **Run the layers.** All 36 layers, **layer-major over every token of the phase**. Weights **stream** from the GGUF: 4 reader threads per layer fill a pinned host buffer, one layer ahead of compute. Each layer is copied H2D into a two-buffer dGPU ring, **repacked in place**, then computed.
+6. **Finish.** Gather each input's last row, then on the host: `output_norm`, L2, MRL. A non-finite result fails its request.
+7. **Return the loan**, success or error, from the **loan image** (written once at startup), and verify it. Guard bands catch out-of-loan writes. If the return fails, or the thread unwinds with the loan out, the process aborts.
+8. **Release.** Reply to finished requests; free the pinned buffers and kernel modules; trim the heap.
 
-What it costs: zero residency outside the phase. About 0.6 GB of the dGPU is borrowed during it. A phase's fixed cost is about one NVMe stream of 3.86 GB plus a ~0.7 GB return read (estimated 0.9–1.8 s, not measured), with compute overlapped. The LLM stalls for that long.
+Fixed cost per phase, estimated from the in-tree read rates (not measured):
+
+- layer stream: 3.86 GB at ~5.5 GB/s ≈ 0.70 s, with compute overlapped;
+- loan return: ~0.70 GB single-reader at ~2.4 GB/s ≈ 0.30 s;
+- verify (on by default): +~0.25 s;
+- pinned alloc with zero-fill: ~0.05–0.1 s;
+- token rows: < 0.1 s.
+
+That totals **≈ 1.3–1.5 s** with verify, or **≈ 1.0–1.2 s** without, plus whatever compute does not overlap. The LLM stalls for that long. Gate E7 measures it.
 
 ## 4. The loan (dGPU memory borrowed in place)
 
 ### 4.1 Donors
 
-At startup, with `--embed-gguf` given, the server builds a **donor list** from `state.weights`. Each donor is an immutable dGPU `DeviceWeight` buffer, taken largest first, starting with `global.output` (the V4.1 LM head: 129,280 × 5120, ≥ 0.7 GB). Donors are added until their total covers the **loan size** (§6.3).
+At startup the server builds a candidate list, best first:
 
-A donor must be:
+1. `global.output`, the V4.1 LM head: 129,280 × 5,440 B = 703,283,200 B in the M18 layout (`hf_v41.rs:393`, `weights.rs:170-190`). It is read only by the head and the drafter exit, both on the engine thread inside ticks (`het/engine.rs:908-920`, `forward_head.rs:114,226`).
+2. Then the per-layer `attn_q_b`, `attn_output_a/b` and `shared.{gate,up,down}`, largest first.
 
-- **immutable after load**: no kernel writes it;
-- **read only inside steps / prefill units**: never between ticks, never by a background thread;
-- **not referenced by a pointer that changes when it is overwritten**: in-place views keep every captured HIP graph valid (graphs bake addresses, not contents).
+All are immutable after load. `Loan::new` places the phase's buffers first-fit, in `EmbedSizing::buffer_sizes` order, adding donors until everything fits. `LoanAlloc::take` repeats that placement exactly, because the same sizes are requested in the same order. At the defaults, the head alone holds the whole loan.
 
-`global.output` satisfies all three. It is read by the head kernel and by the drafter exit, both inside ticks. The per-layer weights are fallbacks (`shared` expert, `attn_q_b`, `attn_output_a/b`), with the same property.
+**Never donors:** the KV arena, prefill scratch states, lane scratch, DSpark rings, or anything else whose contents live across ticks.
 
-Each embed buffer is a sub-allocation (256-B aligned, first-fit) inside one donor range. No embed buffer spans two donors. The ring slots (107 MB each) need the big donor.
-
-**Never donors:** the KV arena, prefill scratch states, lane scratch, DSpark rings, and anything else whose contents live across ticks (dirty state). Scratch that happens to be dead at a tick boundary would also cost nothing to borrow. It is deliberately left out of v1: the "dead between ticks" audit is per buffer and easy to get wrong silently, and the weights-only rule needs no audit.
+Dead-between-ticks scratch would also cost nothing to borrow, but it stays out. Its liveness audit is per buffer and easy to get wrong silently. The weights-only rule needs no audit.
 
 ### 4.2 The loan image
 
-At startup (after the V4.1 weights are loaded, before the scheduler starts), the donor ranges are copied D2H through a pinned chunk buffer and written to **`V41_EMBED_LOAN_IMAGE`** (default `$HOME/.cache/deepstrix/embed-loan.img`; one hub per box, overwritten at every start). A blake3 hash is kept per 64 MiB chunk.
+At startup, after the V4.1 weights load and before the scheduler starts:
 
-- Startup cost: about 0.7 GB D2H + write, roughly 0.3 s, against an ~80 s load.
-- A startup failure (disk full, read-only) fails the start, as a bad `--mmproj` does.
+- The donors' imaged ranges are copied D2H in chunks through a pinned buffer and written to `V41_EMBED_LOAN_IMAGE` (default `$HOME/.cache/deepstrix/embed-loan.img`), on the engine's dGPU transfer stream.
+- One 64-bit hash is kept per chunk. Chunks are one layer buffer, 107 MB.
+- The file is opened **without truncating** and taken under `flock(LOCK_EX|LOCK_NB)` *before* any byte changes. It is held for the life of the process, so a second hub (a private-port gate run) fails at startup instead of overwriting production's image.
+- After the write: `fdatasync`, then `FADV_DONTNEED`.
 
-Why an image and not RAM:
+Why an image, and not RAM:
 
-- A RAM copy would sit in box-1 RAM, the page cache's budget, either for the whole process or for the whole phase.
-- The image is read once per phase (pread + `POSIX_FADV_DONTNEED`, as `MappedGguf::read_range_into` does), so it leaves no page-cache residue.
-- The donors are clean. Nothing is written out at borrow time.
+- The donors' bytes are the M18 repack of a checkpoint conversion. A plain read cannot recreate them.
+- A RAM copy would spend box-1 page-cache budget.
+- Reading the image back drops its pages (DONTNEED), and the startup write costs ~0.3 s.
+
+The hash is a 64-bit multiply-xorshift mix (`dgpu_loan::chunk_hash`), not blake3. It guards against accidental corruption, and adding blake3 to the kernels crate would need dependency sign-off. Only the server has blake3 today.
 
 ### 4.3 Return and verification
 
-At the end of every phase, success or error, the loan image is read chunk by chunk into the pinned ring and copied H2D into each donor range, then the device is synchronized.
+`Loan::give_back` runs at the end of every phase.
 
-With **`V41_EMBED_VERIFY`** (default 1 in v1), each chunk is then read back D2H and its blake3 compared with the startup hash.
+1. **Guard check first.** Each donor's **guard band** (up to 1 MiB after its lent bytes, imaged but never lent) is read D2H and hashed. A mismatch means a kernel wrote past its allocation. It logs an ERROR, counts in `guard_violations`, and the return repairs it.
+2. **Return the bytes.** The image is pread chunk by chunk into one of two pinned buffers and copied H2D. Per-buffer events let the next chunk's read overlap the previous copy.
+3. **Verify** (`V41_EMBED_VERIFY`, live, default on):
+   - **Hash-on-read:** each chunk read from disk must match its startup hash. This catches disk or page corruption.
+   - **Read-back:** each chunk is copied back D2H into the other buffer and hashed. This catches DMA corruption. A mismatch is copied once more.
 
-- A mismatch is retried once.
-- A second mismatch logs an error and **aborts the process**: the supervisor restarts it, as the watchdog does. A hub with a corrupt V4.1 head must not serve.
+**Any** error on this path aborts the process, so the supervisor restarts it. That covers a second read-back mismatch, a hash-on-read mismatch, an image read error, an H2D error and a sticky HIP error. A hub whose V4.1 weights differ from what it loaded must not serve.
 
-Verification costs one extra D2H of the loan (~0.12 s at Gen4) plus hashing. The default can drop to 0 once the gates (§10) and a soak have passed.
+`LoanOut`, a drop guard armed for the whole phase, also aborts if the engine thread unwinds with the loan out.
 
-### 4.4 Invariants (the loan is correct iff all hold)
+### 4.4 Invariants
 
-- **L1.** The phase starts only at a tick boundary, after `MsDspark::settle_writes`. It also requires `HeterogeneousEngine` idle: `state.dgpu.synchronize()` is the first thing the phase does. Nothing reads a donor while it is loaned.
-- **L2.** The phase never runs while a layer-major group is half done (`finish_group() && prefills.any(lm_mid_group)`): its checkpoints are valid only between windows.
-- **L3.** Every donor byte is back, and the device synchronized, before `tick` returns. No early return skips the return path; it runs in a guard.
-- **L4.** No allocation or free happens on the dGPU during the phase. The loan uses views only, so `GraphCache::refresh_room` and the layer-major store see the same free memory before and after.
-- **L5.** The image is written from donor bytes before any phase overwrites them, and donors never change afterwards, so the image always equals the live bytes.
+- **L1.** Nothing reads a donor while it is lent. The phase runs between ticks, after the previous tick's `MsDspark::settle_writes`. It starts with `hipDeviceSynchronize`. Every dGPU kernel and copy is enqueued by the engine thread, and other threads touch no donor (review round 1 verified each thread).
+- **L3.** Every donor byte is back, and the transfer stream synchronized, before the next tick. The return runs on every path; failure aborts.
+- **L4.** No device allocation or free happens during the phase. The loan is views only. The pinned buffers are host memory. Kernel modules are code objects that load per phase (~ms) and unload after.
+- **L5.** The image is written from donor bytes before the first loan, and donors never change, so the image always equals the live bytes.
+
+Rev 1's L2, "not mid layer-major group", is **not** a loan invariant. It is a scheduling policy (§6.2).
+
+### 4.5 What stays resident between phases (owner sign-off needed)
+
+| Item | Where | Size | Why |
+|---|---|---|---|
+| Embedding tokenizer (`BpeVocab`: 151,665 tokens + ~151k merges, `Vec` + 2 `HashMap`s) | box-1 host heap | ~20 MB (estimate) | The HTTP handler tokenizes. Rebuilding it per request costs ~100+ ms. A lazy load with an idle drop is possible if the owner wants zero. |
+| GGUF tensor directory + 36 × 11 `TensorLoc` + `output_norm` (10 KB) + open file handle | host heap | < 1 MB | Locating tensors. The parsed metadata (the tokenizer arrays) is **dropped** after load (`MappedGguf::drop_metadata`). |
+| Loan bookkeeping (donor views, hashes) | host heap | < 1 KB | — |
+| Loan image | disk only, page cache dropped | ~0.70 GB | §4.2 |
+
+Allocated **per phase only:**
+
+- kernel modules (`qwen3_embed`, `GqaAttention`);
+- pinned host buffers (2 × 107 MB);
+- the loan views.
+
+Rev 1's `V41_EMBED_KEEP_PINNED` is removed. The GEMM module and the streams are the engine's own, already resident.
 
 ## 5. The forward
 
 ### 5.1 Layout of one phase
 
-The phase takes `T` tokens: `n` inputs of lengths `len_s`, each ending in EOS, packed back to back. `seq_start[s]` = prefix sum. Token `t` of input `s` is row `seq_start[s] + t` at RoPE position `t`.
+The phase holds `T` tokens: `n` inputs of `len_s` tokens each, every one ending in EOS, packed back to back. `seq_start[s]` is the prefix sum. Token `t` of input `s` is row `seq_start[s] + t`, at RoPE position `t`.
 
-| Device buffer (in the loan) | Shape | Bytes |
+| Device buffer, in carve order (`EmbedSizing::buffer_sizes`) | Shape | Bytes |
 |---|---|---|
-| residual | f32 [T, 2560] | 10,240 · T |
-| K, V (current layer only) | f16 [T, 8, 128] each | 4,096 · T |
-| `x16` (GEMM input; normed hidden, attention output, SwiGLU output) | f16 [R, 9728] | 19,456 · R |
-| `gemm_out` | f32 [R, 19456] (gate‖up, largest) | 77,824 · R |
-| `q16` | f16 [R, 32, 128] | 8,192 · R |
+| `resid` | f32 [T, 2560] | 10,240 · T |
+| `ring0`, `ring1` | one layer each (`LayerLayout`) | 107.25 MB each |
+| `gemm_out` | f32 [R, 19456] (gate‖up is widest; also the last-row gather) | 77,824 · R |
+| `kc`, `vc` (current layer) | f16 [T, 8, 128] each | 2,048 · T each |
+| `x16` (GEMM input) | f16 [R, 9728] | 19,456 · R |
 | `attn_out` | f32 [R, 4096] | 16,384 · R |
-| weight ring | 2 × 107,254,784 | 214.5 MB |
-| last rows | f32 [n, 2560] | 10,240 · n |
+| `q16` | f16 [R, 32, 128] | 8,192 · R |
+| `pos`, `idx` | u32 [T] each | 4 · T each |
 
-`R` = sub-batch rows (`V41_EMBED_SUB_ROWS`, default 1024). `T` ≤ `V41_EMBED_PHASE_TOKENS` (default 16384). At the defaults the loan is about 214.5 + 168 + 67 + 125 ≈ **575 MB**.
+`R` = `V41_EMBED_SUB_ROWS` (default 1024); `T` ≤ `V41_EMBED_PHASE_TOKENS` (default 16384). At the defaults that is **575 MB** (unit test `default_loan_is_about_575_mb`).
+
+There is no separate last-rows buffer. The last rows are gathered into `gemm_out` in chunks (up to 7,782 rows of 2560 per chunk) and read back from there. Empty inputs are refused, so every input has at least 2 tokens (content + EOS).
 
 ### 5.2 Per layer
 
-In each ring slot the layer's tensors are laid out so one GEMM covers several of them, because Q8_0 rows are independent:
+Each ring buffer uses `LayerLayout`: `[q‖k‖v]` (6144 rows, one GEMM), `[attn_output]`, `[gate‖up]` (19456 rows, one GEMM), `[down]`, then the norms.
 
-`[q ‖ k ‖ v]` (6144 rows) · `[attn_output]` · `[gate ‖ up]` (19456 rows) · `[down]` · `[norms]`
+1. **Upload.** The copy stream waits for the event of layer `l−2` (the last reader of this ring buffer), copies H2D and records an event. The compute stream waits on it.
+2. **Repack.** `qe_q8_0_repack_rows` runs on the compute stream, once per matrix group (qkv, o, gate‖up, down). It uses one workgroup per row and stages the row in LDS (≤ 480 blocks; the widest Qwen row is 304 blocks = 10,336 B). It writes the M18 layout in place.
+   - Device traffic is ~2 × 107 MB per layer, under 1 ms.
+   - It is never done on the host: the pipeline is read-bound, and a host repack would add straight to it.
+   - GPU test `repack_matches_host` checks it against `weights::repack_q8_0` at all three Qwen row widths.
+3. **Compute.** For each sub-batch of `R` rows, in token order:
+   1. `qe_rmsnorm_f16`: `x16 ← f16(rmsnorm(resid) ⊙ attn_norm)`.
+   2. GEMM qkv.
+   3. `qe_qk_norm_rope`: per (row, head), q/k RMSNorm ⊙ `q_norm`/`k_norm`, then NeoX RoPE with HF numerics (`inv_freq[i] = 1/θ^(2i/128)`, f32). q goes to `q16`; k and v go to `kc`/`vc` at `row`.
+   4. Attention: `prefill_flash_wmma_fa2`, one launch per input segment of the sub-batch.
+      - Settings: `q_offset` = the segment's first position; K/V views start at `seq_start[s]`; `kv_capacity = len_s`; full causal (`swa_window 0`); scale `1/√128`; `kv_first = true`.
+      - Tile loads past `n_kv_total` are guarded and zero-filled (`gqa_attention.hip:979-995`), so stale loan bytes cannot inject NaN.
+      - This is the Laguna-era kernel, kernel-tested at kv_group 6/9 against a CPU reference; E2 covers kv_group 4.
+   5. `qe_cast_f16` (pitch 4104), then GEMM o, then `qe_add`.
+   6. `qe_rmsnorm_f16` (`ffn_norm`), then GEMM gate‖up, then `qe_swiglu_f16`, then GEMM down, then `qe_add`.
+4. **Hand back.** Record the compute event for this ring buffer, then call `after_layer(l)`: the hub resets the watchdog there, and gate E6 injects its fault there.
 
-For each sub-batch of `R` rows, in token order:
+Every f32→f16 cast **saturates** at ±65504 (Qwen-family activations can be large) and keeps NaN. NaN surfaces in the host-side finiteness check: a non-finite embedding fails its request and counts in `nonfinite`.
 
-1. `qe_rmsnorm_f16`: `x16 ← f16(rmsnorm(residual[rows]) ⊙ attn_norm)`.
-2. GEMM qkv: `gemm_out[R, 6144] ← x16 · Wqkv` (k = 2560).
-3. `qe_qk_norm_rope`, per (row, head):
-   - q: per-head RMSNorm ⊙ `q_norm`, then NeoX RoPE at `pos[row]`, written to `q16`;
-   - k: the same with `k_norm`, written to `K[row]`;
-   - v: cast to f16 into `V[row]`.
-4. Attention, once per input segment inside the sub-batch: `GqaAttention::prefill_flash_wmma_fa2` with `q_offset` = the segment's first position, K/V = views starting at `seq_start[s]`, `kv_capacity = len_s`, `swa_window = 0` (full causal), scale `1/√128`. Output goes to `attn_out`.
-5. `qe_cast_f16`: `x16 ← f16(attn_out)` (pitch 4104, off a power of two per the GEMM note).
-6. GEMM o: `gemm_out[R, 2560] ← x16 · Wo` (k = 4096). Then `qe_add`: `residual[rows] += gemm_out`.
-7. `qe_rmsnorm_f16` with `ffn_norm`. GEMM gate‖up: `gemm_out[R, 19456]` (k = 2560).
-8. `qe_swiglu_f16`: `x16 ← f16(silu(g) ⊙ u)`. GEMM down: `gemm_out[R, 2560]` (k = 9728). Then `qe_add`.
+**Causality across sub-batches.** A row's K/V depend only on its own residual, and sub-batches run in token order. So every key an attention launch reads was written by an earlier sub-batch, or the same one, of the same layer.
 
-Causality holds across sub-batches. A row's K/V depend only on its own residual. Sub-batches run in token order, so every key an attention launch needs was written by an earlier or the same sub-batch of the same layer.
+**Launch count.** Attention launches once per input segment: about n × 36 per phase, and 73k at 8-token inputs. Gate E7 measures this. If it costs, a varlen variant (per-row segment start) is the fix.
 
-After layer 35, `qe_gather_rows` copies each input's last row into `last rows`, followed by one D2H. On the host: RMSNorm ⊙ `output_norm`, then L2 normalize; with `dimensions = d`, truncate to `d` and L2 normalize again.
+### 5.3 Streaming
 
-The kernels are **new**, in `kernels/qwen3_embed.hip`: `qe_rmsnorm_f16`, `qe_qk_norm_rope`, `qe_cast_f16`, `qe_swiglu_f16`, `qe_add`, `qe_gather_rows`. They are small and each is tested against a CPU reference. The GEMM and attention are reused production / kernel-tested code.
-
-RoPE follows the HF numerics: `inv_freq[i] = 1 / θ^(2i/128)` and `angle = pos · inv_freq[i]` in f32.
-
-### 5.3 Streaming the weights
-
-A reader thread (scoped to the phase) preads layer `l+1`'s tensors into pinned host buffer `(l+1) % 2` while the GPU computes layer `l`. It uses `MappedGguf::read_range_into`: pread + DONTNEED, so no page-cache residue. One pread per tensor, in ring-slot order.
-
-The engine thread issues the H2D copy into dGPU ring slot `(l+1) % 2` on a **copy stream** and records an event, which the compute stream waits on before layer `l+1`.
-
-A slot is refilled only after the compute stream's event for the layer that last used it. The pinned host buffer is reused only after its H2D event.
-
-Pinned host buffers (2 × 107 MB) are allocated **per phase** and freed at its end (constraint 2). `V41_EMBED_KEEP_PINNED=1` keeps them for the process if their allocation cost shows up in the phase timing.
+- **Reader threads** (scoped to the phase) pread layer `l+1` into pinned host buffer `(l+1) % 2` while the dGPU computes layer `l`. Each tensor is split into ≥ 4 MiB pieces over 4 threads (`read_layer_into_par`), using pread + `FADV_DONTNEED`.
+- **Refill rule.** The engine thread hands a host buffer back to the readers only after that buffer's H2D event completes. A ring buffer is refilled only after the compute event of the layer that last read it.
+- **Errors.** On any error the engine thread returns from the scope. Dropping the job channel ends the reader loop. A reader never waits for a buffer: it only receives jobs. `run` then synchronizes both streams, also on error.
+- **Pinned buffers** (2 × 107 MB) are allocated per phase (`PinnedBuffer::new` zero-fills). The return reuses them.
 
 ### 5.4 Token-embedding rows
 
-The phase's token ids are deduplicated and sorted. Each `token_embd` row (2720 B at Q8_0) is read with one pread; runs of adjacent ids coalesce. Rows are dequantized on the host (`kquants::dequant_to_f32`) into the f32 residual, which goes up in one H2D.
+The phase's ids are deduplicated and sorted, and runs of adjacent ids are coalesced. Four threads pread the runs (Q8_0 rows are 2,720 B each) and dequantize. The f32 residual goes up in one H2D.
 
 ## 6. Scheduler
 
 ### 6.1 Requests reach the worker
 
-- **`EmbedQueue`**: `Arc<Mutex<VecDeque<EmbedJob>>>`, shared by `EngineHandle` and the worker, bounded by `V41_EMBED_QUEUE_INPUTS` (default 4096 queued inputs). Full → HTTP 503 (`SubmitError::Busy`).
-- **`EmbedJob`**:
-  - `inputs: Vec<Vec<u32>>`: token ids, EOS appended by the handler;
-  - `dims: Option<u32>`;
-  - `results: Vec<Option<Vec<f32>>>`;
-  - `next: usize`;
-  - `reply: oneshot::Sender<Result<EmbedOutput, String>>`;
-  - `queued: Instant`.
-  A job whose `reply` is closed (client gone) is dropped before it is computed.
-- **Wake.** After pushing, the handler `try_send`s `EngineRequest::EmbedWake` on the existing channel. The variant carries no payload.
-  - If the channel is full, the wake is dropped. That is harmless: a full channel means the worker is busy, and it checks `EmbedQueue` every loop iteration.
-  - Chat keeps all eight of its slots: embed jobs never sit in the channel.
-- **Idle check.** The multistream loop's idle test (`multistream.rs` `worker_loop_ms`) gains `&& embed_queue.is_empty()`. Without it, a phase that leaves inputs queued (token budget) would block in `blocking_recv`.
+- **`EmbedQueue`.** A mutex-guarded `VecDeque<EmbedRequest>`, bounded by **queued tokens** (`V41_EMBED_QUEUE_TOKENS`, default 1,048,576 = 64 full phases). When full, the handler returns 503 with `Retry-After`. An empty queue always accepts one request.
+- **`EmbedRequest`.** Holds the inputs (EOS appended), `dims`, per-input results, `next`, a `oneshot` reply and the queue time. A request whose client went away (`reply` closed) is dropped before it is computed.
+- **Wake: edge-triggered.**
+  - The handler sends `EngineRequest::EmbedWake` only when `EmbedQueue::claim_wake` flips `wake_pending` from false to true, so at most one wake is ever in the channel.
+  - If that `try_send` fails because the channel is full, the claim is released: the worker is busy and checks the queue every iteration.
+  - The worker clears the flag when it receives the wake. Before it blocks idle, it clears the flag and **re-checks** the queue; a push after the clear sends a new wake.
+  - Chat keeps the whole channel.
+- **One `has_work` predicate** is used at both of `worker_loop_ms`'s idle checks: `Sched::has_llm_work() || embed.has_work()`. In rev 1 only the first was patched, so embed-only work spun forever.
 
-### 6.2 The phase in `Sched::tick`
+### 6.2 Placement: between ticks, in `worker_loop_ms`
 
-The phase runs right after `settle_writes` and the perfetto export, before the cancel sweep. When it is due, the tick runs the embed phase **and nothing else**, then returns.
+After intake and before `sched.tick`, the phase runs when all of these hold:
 
-It is due when all of these hold:
+- the embed queue (or a part-done request) has work;
+- **scheduling policy:** not in the middle of a layer-major group (`finish_group() && prefills.any(lm_mid_group)`). This protects the group's box-2 pages, as for decode;
+- **duty cycle:** with LLM work pending, the next phase starts no earlier than `last_end + last_dur · (100/share − 1)`, where `share` = `V41_EMBED_MAX_SHARE` (live, 1..100, default 50). With no LLM work there is no gap.
 
-- `EmbedQueue` is not empty;
-- **L2** holds (not mid layer-major group);
-- the **duty-cycle gap** has passed. When LLM work exists (streams, prefills, queued or parked requests), the next phase may start no earlier than `last_end + last_dur · (100/share − 1)`, with `share = V41_EMBED_MAX_SHARE` (default 50). With no LLM work there is no gap.
+Then the iteration runs the phase and `continue`s. The tick waits for the next iteration, so intake runs between a phase and the next tick.
 
-The gap is the only throttle. With a 1 s fixed cost, an indexing client sending one small request at a time would otherwise take the engine.
+`run_phase` cannot fail. Its errors go to its own requests, and only a failed return aborts.
 
 Accounting:
 
-- `self.phase` is not changed. Prefill / decode bursts resume where they were.
-- `phase_since` is advanced by the phase's duration, so the interrupted burst is not charged.
-- Box-2 pin hooks do not fire: box 2 sees no requests during the phase.
-- `state.progress.pet()` runs after every layer (the 120 s watchdog).
-- After the phase: `state.engine.invalidate_device_cache()` and `state.dgpu.set_current()`, as after a vision encode.
+- `self.phase` is unchanged, so bursts resume.
+- `phase_since` is advanced by the phase's duration, so the interrupted burst is not charged for it.
+- No box-2 pin hooks fire.
+- `progress` is reset after every layer.
+- Afterwards: `invalidate_device_cache` and `dgpu.set_current`.
+
+**Watchdog.** The deadline is `--hang-deadline-ms` (default 60 s; the prod env has 120 s). It is reset after every layer, and a layer takes tens of ms.
 
 ### 6.3 Batching
 
-The phase takes **inputs**, not whole jobs, FIFO across jobs, until the next input would push `T` past `V41_EMBED_PHASE_TOKENS`. A job finishes, and is replied to, when its last input is done, so a large request spans several phases.
+- **Round-robin.** One input from each active request in turn, starting one request later each phase, until the next input would push `T` past `V41_EMBED_PHASE_TOKENS`. A request replies when its last input is done, so a big request spans phases without starving a small one behind it.
+- **Limits** are enforced in the handler, as 400s:
+  - each input ≤ `V41_EMBED_MAX_INPUT_TOKENS` (default 8192, clamped to `n_ctx_train`; startup checks it ≤ the phase tokens);
+  - ≤ 2048 inputs per request;
+  - ≤ `V41_EMBED_MAX_REQUEST_TOKENS` (default 262,144) tokens per request;
+  - no empty strings or empty token arrays.
+- **Bigger inputs** (up to the model's 32K) need `V41_EMBED_PHASE_TOKENS ≥ 32768`. That loan is ~1.0 GB: past the head, so the startup placement adds per-layer donors or fails with a clear error.
 
-Limits, enforced in the handler as HTTP 400 so the worker never sees an impossible input:
+### 6.4 Serial loop
 
-- each input ≤ `V41_EMBED_MAX_INPUT_TOKENS` (default 8192, Qwen's own example; max 32768). Startup checks it ≤ `V41_EMBED_PHASE_TOKENS`;
-- inputs per request ≤ 2048;
-- tokens per request ≤ `V41_EMBED_MAX_REQUEST_TOKENS` (default 262144).
+`serial_next`: with embed work waiting, a pending channel message goes first; otherwise exactly **one** phase runs and the loop asks again, so an embed backlog yields to every arriving request. Before blocking, it uses the same clear-then-recheck wake protocol.
 
-The loan size is computed at startup from `V41_EMBED_PHASE_TOKENS` and `V41_EMBED_SUB_ROWS` (§5.1). Both are **static** knobs, because the donor list is fixed then.
+### 6.5 Shutdown
 
-### 6.4 The serial loop
-
-The non-multistream `worker_loop` runs pending embed work after each request and on `EmbedWake`. Production runs multistream; this keeps tests and the fallback honest.
+`Shutdown` fails every queued and active embedding request ("server shutting down") before the engine exits. `abort_all` (a failed LLM step) leaves embedding requests alone: they are independent of the streams.
 
 ## 7. HTTP: `POST /v1/embeddings`
 
 Request (OpenAI):
 
-- `input`: one string, an array of strings, an array of token ids, or an array of arrays of token ids;
-- `model` (accepted and echoed; not routed on);
-- `encoding_format`: `float` (default) or `base64` (little-endian f32, hand-rolled encoder, no new crate);
-- `dimensions` (32..2560);
-- `user` (ignored).
+- `input`: a string, an array of strings, an array of token ids, or an array of arrays of token ids;
+- `model`: accepted, not routed on;
+- `encoding_format`: `float` (default) or `base64` (little-endian f32, hand-rolled RFC 4648 encoder, no new crate);
+- `dimensions`: 32..`n_embd`;
+- `user`: ignored.
 
-Token-id inputs are checked `< vocab`. Empty strings are refused (400), as OpenAI does.
+Token ids must be `< vocab`.
 
-Response: `{object:"list", data:[{object:"embedding", index, embedding}], model, usage:{prompt_tokens, total_tokens}}`. `prompt_tokens` counts the EOS.
+**Body limit.** 64 MiB for this route. axum's default is 2 MiB, and 262,144 ids as JSON is ~1.8 MB, while 2048 texts easily exceed 2 MiB.
 
-Tokenization happens in the handler with the **embedding model's own vocab** (`BpeVocab::from_gguf` of the embed GGUF): `encode_qwen2`, then `<|endoftext|>` appended.
+**Tokenization** runs in `spawn_blocking`, with the **embedding model's** vocab (`encode_qwen2`, then `<|endoftext|>` appended).
 
-Without `--embed-gguf`, the route answers 404 with a JSON error ("embeddings are not enabled on this server"). `/v1/models` lists the embedding model (`--embed-model-name`, default `qwen3-embedding-4b`) next to the chat model.
+**Response:** `{object:"list", data:[{object:"embedding", index, embedding}], model: <the embedding model's name>, usage:{prompt_tokens, total_tokens}}`. `prompt_tokens` counts the EOS.
+
+Without `--embed-gguf`, the route answers 404 (`embeddings_disabled`). `/v1/models` lists the chat model **first**, then the embedding model (`type: embeddings`, `embedding_dimensions`).
 
 ## 8. Tokenizer
 
-`pre = qwen2` is Laguna's `laguna_qwen2_split` (a port of llama.cpp's `unicode_regex_split_custom_qwen2`) over the whole text, **without** Laguna's newline pre-split. New: `qwen2_pre_tokenize`, `BpeVocab::encode_qwen2`, and an `encode_auto` arm for `"qwen2"`. `"laguna"` and the joyai default are unchanged.
+`pre = qwen2` is `laguna_qwen2_split` (a port of llama.cpp's `unicode_regex_split_custom_qwen2`) run over the whole text, without Laguna's newline pre-split. New: `qwen2_pre_tokenize`, `BpeVocab::encode_qwen2` (no BOS), and an `encode_auto` arm.
 
 Known divergences from HF:
 
-- **No NFC normalization.** It needs a Unicode-tables crate, which is a sign-off question.
-- **Special-token text in the input is not split out.** `<|endoftext|>` typed by a client is byte-pair encoded as text.
-- `\p{L}` / `\p{N}` are approximated by `char::is_alphabetic` / `is_numeric`, as Laguna does.
+- **No NFC.** It needs a Unicode-tables crate, which is a sign-off question.
+- **Special-token text in the input is encoded as text.**
+- **`\p{L}` / `\p{N}` are approximated** by `char::is_alphabetic` / `is_numeric`. `is_alphabetic` includes Other_Alphabetic combining marks, which `\p{L}` excludes: Indic and Thai vowel signs are the likely divergence.
 
-Gate E0 measures the damage on the fixture corpus.
+The E0 corpus covers each of these.
 
 ## 9. Code layout
 
 | Where | What |
 |---|---|
-| `v4flash-core/src/tokenizer.rs` | `qwen2_pre_tokenize`, `encode_qwen2`, `encode_auto` arm |
-| `v4flash-core/src/qwen3_embed.rs` | `Qwen3EmbedConfig` + tensor layout from GGUF metadata and dims (validates arch, shapes, Q8_0), ring-slot layout, host pooling (`output_norm`, L2, MRL), and a layer-streamed **f32 CPU reference forward** (the oracle). Host tests on a synthetic tiny Qwen3 GGUF written with `gguf_write`. |
-| `v4flash-kernels/kernels/qwen3_embed.hip` + `src/qwen3_embed.rs` | The six kernels, `Qwen3EmbedKernels`, `EmbedForward` (one phase's forward over a `Loan`) |
-| `v4flash-kernels/src/dgpu_loan.rs` | `Loan`: donor ranges, sub-allocation, image write at startup, return + verify. Generic over `DeviceBuffer<u8>` ranges; it knows nothing about Qwen. |
-| `deepstrix-server/src/embed_phase.rs` | `EmbedQueue`, `EmbedJob`, startup (`EmbedCtx`: GGUF, vocab, config, kernels, loan), `run_embed_phase` (the tick body), duty-cycle state. Not `embed.rs`: that module is the token-embedding lookup. |
-| `deepstrix-server/src/openai/embeddings.rs` | Types + handler |
-| `main.rs`, `engine_worker.rs`, `multistream.rs` | `--embed-gguf`, `--embed-model-name`; `EngineRequest::EmbedWake`; `EngineHandle.embed`; the tick hook; the idle check |
-| `deepstrix-server/src/knobs.rs` | `V41_EMBED_*` (below) |
-| `het/evtrace_kinds.rs` | `HUB_EMBED` (id 24) |
+| `v4flash-core/src/tokenizer.rs` | `qwen2_pre_tokenize`, `encode_qwen2`, the `encode_auto` arm |
+| `v4flash-core/src/qwen3_embed.rs` | `Qwen3EmbedModel::from_gguf` (validation, tensor locations); `LayerLayout`; `read_layer_into_par`; threaded `token_rows`; `finish_embedding`; `cpu_forward` (the f32 oracle); `testing::write_synthetic` (a tiny random Qwen3 GGUF) |
+| `v4flash-core/src/{gguf,mapped}.rs` | `drop_metadata` |
+| `v4flash-kernels/kernels/qwen3_embed.hip` | `qe_q8_0_repack_rows`, `qe_rmsnorm_f16`, `qe_qk_norm_rope`, `qe_cast_f16`, `qe_swiglu_f16`, `qe_add`, `qe_gather_rows` |
+| `v4flash-kernels/src/qwen3_embed.rs` | `Qwen3EmbedKernels` (per phase), `EmbedSizing`, `EmbedBuffers`, `run` |
+| `v4flash-kernels/src/dgpu_loan.rs` | `Loan` (placement, image + `flock`, guard bands, `give_back`), `LoanAlloc`, `chunk_hash`. Generic: it knows device ranges, not what they hold. |
+| `v4flash-kernels/tests/qwen3_embed_gpu.rs` | GPU gates: `tiny_gpu_matches_cpu`, `real_gpu_matches_cpu` (E2), `loan_round_trip`, `repack_matches_host` |
+| `deepstrix-server/src/embed_phase.rs` | `EmbedQueue`, `EmbedRequest`, `EmbedInfo`, `EmbedCtx` (`load`, `due`, `run_phase`, `fail_all`), `LoanOut` |
+| `deepstrix-server/src/openai/embeddings.rs` | Types, handler, `base64` |
+| `multistream.rs`, `engine_worker.rs`, `main.rs`, `handler.rs` | The between-ticks hook and the idle predicate; `EmbedWake` and `submit_embed`; `serial_next`; `--embed-gguf` / `--embed-model-name`; the route and body limit; `/v1/models` |
+| `knobs.rs` | `V41_EMBED_*` |
+| `het/evtrace_kinds.rs` | `HUB_EMBED`, id **14** (hub band 10..19). `scripts/evtrace.py` reads kinds from the trace header, so it needs no change. |
 
-Knobs. All are static except `V41_EMBED_MAX_SHARE` and `V41_EMBED_VERIFY`, which are live: a change between two phases is safe.
+**Knobs.** `MAX_SHARE` and `VERIFY` are live; the rest are static.
 
 | Knob | Default | Meaning |
 |---|---|---|
 | `V41_EMBED_PHASE_TOKENS` | 16384 | max tokens per phase (sizes the loan) |
 | `V41_EMBED_SUB_ROWS` | 1024 | rows per sub-batch (sizes the loan) |
-| `V41_EMBED_MAX_INPUT_TOKENS` | 8192 | per input (≤ phase tokens) |
+| `V41_EMBED_MAX_INPUT_TOKENS` | 8192 | per input, at most the phase tokens |
 | `V41_EMBED_MAX_REQUEST_TOKENS` | 262144 | per request |
-| `V41_EMBED_QUEUE_INPUTS` | 4096 | queued inputs before 503 |
-| `V41_EMBED_MAX_SHARE` | 50 | % of wall time embed phases may take while the LLM has work |
-| `V41_EMBED_VERIFY` | 1 | verify the return against the image hashes |
-| `V41_EMBED_KEEP_PINNED` | 0 | keep the pinned ring across phases |
+| `V41_EMBED_QUEUE_TOKENS` | 1048576 | queued tokens before 503 |
+| `V41_EMBED_MAX_SHARE` | 50 | % of wall time while the LLM has work (1..100) |
+| `V41_EMBED_VERIFY` | 1 | hash-on-read + read-back on return |
 | `V41_EMBED_LOAN_IMAGE` | `$HOME/.cache/deepstrix/embed-loan.img` | image path |
+| `V41_EMBED_FAULT_LAYER` | off | gates only: fail every forward after this layer |
 
-**Telemetry.** One `ms.embed` info line and one `hub_embed` evtrace record per phase. Fields: `t`, `jobs`, `inputs`, `tokens`, `loan_bytes`, `wait_ms` (oldest input's queue time), `rows_ms` (token-embedding rows), `stream_ms` (reader busy), `compute_ms`, `return_ms`, `verify_ms`, `total_ms`, `live`, `prefills`, `pinned_ms` (pinned alloc).
+**Telemetry.** One `ms.embed` line and one `hub_embed` record per phase. Fields: `requests`, `inputs`, `tokens`, `lent_bytes`, `wait_ms`, `rows_ms`, `read_ms`, `wait_read_ms`, `fwd_ms`, `return_ms`, `verify_ms`, `pinned_ms`, `total_ms`, `live`, `prefills`, `ok`, `nonfinite`, `guard_violations`.
 
 ## 10. Gates
 
-All thresholds are pre-registered here. Each reports the **minimum** cosine over inputs, not the mean.
+All thresholds are pre-registered. Every cosine gate reports the **minimum** over inputs, not the mean.
 
 | Gate | What | Pass |
 |---|---|---|
-| **E0** tokenizer | `encode_qwen2` + EOS vs HF `AutoTokenizer` ids on the fixture corpus (~64 inputs: queries with instruction, documents, code, CJK, emoji, mixed whitespace, long) | identical ids on every input, or each divergence explained by §8 |
-| **E1** CPU oracle | Rust CPU reference on the real Q8_0 GGUF vs HF bf16 reference embeddings (`scripts/qwen3_embed/ref_embed.py`) | min cos ≥ 0.998 (Q8_0 quantization budget; revisit with the measured distribution) |
-| **E2** GPU forward | `EmbedForward` on the real GGUF vs the CPU oracle, same inputs | min cos ≥ 0.9999. Plus each kernel vs CPU at our shapes (32/8 heads, hd 128, `q_offset > 0`, multi-segment sub-batches). |
-| **E3** loan integrity | Hub with `V41_EMBED_VERIFY=1`: decode oracle tokens with embed phases interleaved vs without (temp 0, private port) | bit-identical tokens; zero verify mismatches |
-| **E4** e2e | `/v1/embeddings` on a private port: shapes, `dimensions`, `base64`, 503 on full queue, concurrent chat; phase timing logged | correct responses; `ms.embed` timings recorded |
+| **E0** tokenizer | `encode_qwen2` + EOS vs HF `AutoTokenizer` ids on the fixture corpus: queries with instruction; documents; code; CJK, **Indic and Thai** (combining marks); emoji; **uppercase contractions** (`IT'S`, `WE'LL`); **digit runs**; **CRLF runs**; **trailing and mixed whitespace**; long (8K) | identical ids on every input, or each divergence explained by §8 and signed off |
+| **E1** CPU oracle | `cpu_forward` on the real Q8_0 GGUF vs HF bf16 reference embeddings (`scripts/qwen3_embed/ref_embed.py`) | min cos ≥ 0.998 (Q8_0 budget; revisit against the measured distribution) |
+| **E2** GPU forward | `real_gpu_matches_cpu`: `run` on the real GGUF vs the CPU oracle, covering all four Qwen GEMM shapes, kv_group 4, multi-segment sub-batches, long inputs (4K+) and adversarial ones (repetition, extreme punctuation runs). Also `repack_matches_host` and `tiny_gpu_matches_cpu`. | min cos ≥ 0.9999; repack byte-identical; `nonfinite` = 0 |
+| **E3** loan integrity | (a) **A/A control first**: the decode oracle twice with no phases, under pinned settings (`V41_SUB_DRY=1` or λ = 0, one stream, a fixed lane rule), must be identical, or E3 cannot be judged. (b) The same with embed phases interleaved. (c) A test build hashes **all** immutable dGPU weights (~9 GiB) before and after 100 phases. (d) `loan_round_trip`. | (a) identical; (b) identical; (c) all hashes equal; (d) passes; zero verify retries and zero `guard_violations` |
+| **E4** e2e | `/v1/embeddings` on a private port (own `V41_EMBED_LOAN_IMAGE`): every input shape, `dimensions`, `base64`, 503 on a full queue, a request spanning several phases, concurrent chat | correct responses; chat output unchanged |
+| **E5** residency (constraint 2) | After a phase: `fincore` on the embed GGUF and the image shows 0 pages; RSS (after trim), pinned memory and dGPU free are back at the pre-phase baseline ± noise. With `--embed-gguf` and no embedding traffic over a 2 h window: decode tok/s and box-1 hit rate equal to the same window without it (`feedback_box2_warming_dominates_ab`: warm first). | all at baseline |
+| **E6** failure injection | `V41_EMBED_FAULT_LAYER=k` (k = 0, 17, 35) with chat streams live; a client cancelling mid-phase; shutdown with requests queued | the faulted requests get errors; the loan returns (verify clean); chat streams continue unharmed; cancelled and shut-down requests get errors or are dropped; no abort |
+| **E7** performance | Phase fixed cost (one 16-token input) and per-token cost (slope over 1K..16K tokens; `feedback_per_token_cost_is_a_slope`); attention launch overhead at 8-token inputs; chat ITL p50/p99 with embedding traffic at share 50 vs none | recorded; fixed cost within 2× of §3's estimate, or the estimate is revised |
 
-E2–E4 need a GPU window (the hub down: today the dGPU has ~170 MiB free) and the weights. E0–E1 need only the weights. The synthetic-GGUF host tests run anywhere.
+E2–E7 need a GPU window (the hub down) and the weights. E0–E1 need only the weights. The host tests run anywhere: core 11, kernels 4, server 161.
 
 ## 11. Risks and open questions
 
-1. **Phase cost is not measured.** NVMe read rate on box 1 and pinned-alloc cost decide it. Q4_K_M would halve the stream but needs the quantized GEMM's K ≤ 4096 cap lifted and costs quality: a later lever.
-2. **The head donor's size.** If `global.output` is smaller than the loan, the per-layer fallbacks join, with one more image range each. Startup logs the donor list.
-3. **Duty-cycle default.** 50% is a guess. The owner may want a lower share or a minimum gap.
-4. **Verify cost** (~0.2–0.3 s per phase) while `V41_EMBED_VERIFY=1`.
-5. **NFC.** If E0 shows divergence on real inputs, NFC needs a crate (sign-off).
-6. **Instruction format** is the client's job, as with vLLM / llama-server. A server-side `instruction` extension is possible, but it is not OpenAI.
+1. **Phase cost is unmeasured** (E7). Possible levers: parallel image reads in `give_back` (today a single reader), verify off after a soak, Q4_K_M (half the stream, but needs the K ≤ 4096 cap of the quantized GEMM lifted, and costs quality).
+2. **§4.5 residency needs owner sign-off**, mainly the ~20 MB tokenizer.
+3. **The duty-cycle default** (50%) is a guess.
+4. **NFC** (§8), if E0 shows divergence on real inputs.
+5. **Instructions** are the client's job, as with vLLM and llama-server.
+6. **Attention launch count** for many short inputs (E7). The fix is a varlen variant.
+7. **E3(a) may show V4.1 is not deterministic** run to run even under pinned settings. Then E3 rests on (c) and (d).
+
+## 12. Rev 1 review → rev 2
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | BLOCKER: `gemm_f16x` reads the M18 split layout | `qe_q8_0_repack_rows` in place after each H2D (§5.2); GPU test vs `weights::repack_q8_0`; §2 corrected (tolerance-tested, k coverage) |
+| 2 | Embed-only work spins | One `has_llm_work() \|\| embed.has_work()` predicate at both idle checks (§6.1) |
+| 3 | An embedding failure kills chat streams | Phase moved out of `tick` into `worker_loop_ms`; `run_phase` is infallible; any return-path failure or unwind aborts (§4.3, §6.2) |
+| 4 | `EmbedWake` can fill the channel | Edge-triggered `wake_pending`; full channel releases the claim; clear-then-recheck before blocking (§6.1) |
+| 5 | "Zero residency" was not true | §4.5 lists what stays, for sign-off; metadata dropped; kernels per phase; engine streams and `q8_wmma` reused; `KEEP_PINNED` removed; heap trimmed after each phase |
+| 6 | Gates insufficient | E3 A/A control + whole-weights hash; E5 residency; E6 fault injection (`V41_EMBED_FAULT_LAYER`, through the now-fallible `after_layer`); E7 performance |
+| 7 | Cost estimate ignored measured read rates | 4-reader layer reads, threaded token rows; §3 restated from 2.4 / 5.5 GB/s |
+| 8 | Attention is Laguna code | Relabelled (§5.2); launch count in E7 |
+| 9 | `last rows` unaccounted | No such buffer: gathered through `gemm_out`; empty inputs refused (§5.1) |
+| 10 | L2's reason was wrong | Now a scheduling policy, not an invariant (§4.4, §6.2) |
+| 11 | Verification checked the wrong things | Hash-on-read + read-back + guard bands (§4.3); hash choice documented (§4.2) |
+| 12 | Tokenizer corner cases | E0 corpus extended (§10); combining marks named (§8) |
+| 13 | f16 overflow | Saturating casts; host finiteness check fails the request; `nonfinite` telemetry; adversarial inputs in E2 |
+| 14 | Image write left page cache; no lock | fdatasync + DONTNEED; `flock` before any write, no truncate (§4.2) |
+| 15 | HTTP and queue gaps | 64 MiB body limit; `spawn_blocking`; Shutdown fails requests; token-bounded queue; round-robin (§6, §7) |
+| 16 | Serial loop backlog | One phase per iteration, channel first (§6.4) |
+| 17 | Reader thread on errors | The job channel drops on scope exit; readers never wait on buffers (§5.3) |
+| 18 | Watchdog default | 60 s default, 120 s in prod (§6.2) |
+| 19 | Evtrace id band | id 14 (hub band) |
+| 20 | Glossary | `SlotLayout` → `LayerLayout`, ring/host "slots" → buffers, "job" → `EmbedRequest`; GLOSSARY.md gains embed phase, loan, donor, loan image, guard band |
+| 21 | "Nothing else runs" overstated | Qualified (§3) |
+| 22 | Tile and `kv_first` | `Base` tile for v1 (variants are bit-identical; T256x128 fits 6144 / 19456, a later perf lever); `kv_first = true` explicit |
+| 23 | Share = 0; unreachable max | Knob range 1..100; §6.3 states what >8K inputs need |
+| 24 | `/v1/models` order; echoed name | Chat model first; responses carry the embedding model's name |

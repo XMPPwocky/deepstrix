@@ -493,7 +493,15 @@ impl EmbedCtx {
         let tf = Instant::now();
         let (rows, tm) = fwd::run(
             &k, &engine.dgpu.q8_wmma, &self.model, &self.file, &mut bufs, h,
-            &engine.dgpu.compute, &engine.dgpu.xfer, &inputs, &mut || progress.pet(),
+            &engine.dgpu.compute, &engine.dgpu.xfer, &inputs,
+            &mut |l| {
+                progress.pet();
+                // Gate E6's fault injection: fail the forward at this layer.
+                if knobs::EMBED_FAULT_LAYER.get() == l as u64 {
+                    return Err(eyre!("injected fault at layer {l} (V41_EMBED_FAULT_LAYER)"));
+                }
+                Ok(())
+            },
         )?;
         st.fwd_ms = tf.elapsed().as_secs_f64() * 1e3;
         st.rows_ms = tm.rows_ms;

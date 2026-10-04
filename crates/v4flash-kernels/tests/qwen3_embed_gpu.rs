@@ -54,7 +54,7 @@ fn gpu_embed(dev: Device, model: &Qwen3EmbedModel, file: &MappedGguf, inputs: &[
     let (compute, copy) = (Stream::new(dev.id)?, Stream::new(dev.id)?);
     let refs: Vec<&[u32]> = inputs.iter().map(|v| v.as_slice()).collect();
     let g = Q8_0MatvecWmma::for_arch("gfx1201")?;
-    let (last, tm) = run(&k, &g, model, file, &mut bufs, &mut host, &compute, &copy, &refs, &mut || {})?;
+    let (last, tm) = run(&k, &g, model, file, &mut bufs, &mut host, &compute, &copy, &refs, &mut |_| Ok(()))?;
     eprintln!("gpu forward: {tm:?}");
     drop(backing);
     Ok(last.iter().map(|r| model.finish(r, None)).collect())
@@ -166,7 +166,7 @@ fn loan_round_trip() -> eyre::Result<()> {
     let inputs: Vec<Vec<u32>> = vec![(1..40).chain([model.eos_id]).collect()];
     let refs: Vec<&[u32]> = inputs.iter().map(|v| v.as_slice()).collect();
     let g = Q8_0MatvecWmma::for_arch("gfx1201")?;
-    run(&k, &g, &model, &file, &mut bufs, &mut host, &compute, &copy, &refs, &mut || {})?;
+    run(&k, &g, &model, &file, &mut bufs, &mut host, &compute, &copy, &refs, &mut |_| Ok(()))?;
     // The forward clobbered the donors ...
     let mut now1 = vec![0u8; d1.len()];
     d1.copy_to_host(&mut now1)?;

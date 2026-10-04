@@ -313,9 +313,10 @@ unsafe impl Send for HostBuf {}
 ///
 /// `g` = the GEMM module (the hub passes its engine's resident `q8_wmma`).
 /// `host` = two pinned buffers of at least `layout.bytes`. `compute` and `copy`
-/// are streams on the dGPU. `pet` runs after every layer (the hub's watchdog).
-/// On return every queued device operation has completed, also on error, and
-/// the reader threads have exited.
+/// are streams on the dGPU. `after_layer(l)` runs once layer `l` is queued
+/// (the hub pets its watchdog there); an `Err` stops the forward (fault
+/// injection, cancellation). On return every queued device operation has
+/// completed, also on error, and the reader threads have exited.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     k: &Qwen3EmbedKernels,
@@ -327,9 +328,9 @@ pub fn run(
     compute: &Stream,
     copy: &Stream,
     inputs: &[&[u32]],
-    pet: &mut dyn FnMut(),
+    after_layer: &mut dyn FnMut(usize) -> eyre::Result<()>,
 ) -> eyre::Result<(Vec<Vec<f32>>, EmbedTimings)> {
-    let r = run_inner(k, g, model, file, bufs, host, compute, copy, inputs, pet);
+    let r = run_inner(k, g, model, file, bufs, host, compute, copy, inputs, after_layer);
     // Nothing may still be reading the host buffers or writing the loan.
     let s1 = compute.synchronize();
     let s2 = copy.synchronize();
@@ -350,7 +351,7 @@ fn run_inner(
     compute: &Stream,
     copy: &Stream,
     inputs: &[&[u32]],
-    pet: &mut dyn FnMut(),
+    after_layer: &mut dyn FnMut(usize) -> eyre::Result<()>,
 ) -> eyre::Result<(Vec<Vec<f32>>, EmbedTimings)> {
     let t0 = Instant::now();
     let c = &model.cfg;
@@ -446,7 +447,7 @@ fn run_inner(
                 let hs = HostBuf(host[s].as_mut_slice().as_mut_ptr(), layout.bytes);
                 job_tx.send((l + 2, hs)).map_err(|_| eyre!("embed reader exited"))?;
             }
-            pet();
+            after_layer(l)?;
         }
         drop(job_tx);
         Ok(())

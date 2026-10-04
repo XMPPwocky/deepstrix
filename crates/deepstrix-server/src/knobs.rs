@@ -176,6 +176,9 @@ v4flash_kernels::knobs! {
     /// `V41_EMBED_LOAN_IMAGE` (default `$HOME/.cache/deepstrix/embed-loan.img`):
     /// where the loaned dGPU bytes are copied at startup.
     pub static EMBED_LOAN_IMAGE = Knob::text("V41_EMBED_LOAN_IMAGE");
+    /// `V41_EMBED_FAULT_LAYER` (gates only; default off): every embed phase's
+    /// forward fails after this layer (design §10, gate E6).
+    pub static EMBED_FAULT_LAYER = Knob::int("V41_EMBED_FAULT_LAYER", MAX, 0, MAX);
 }
 
 #[cfg(test)]
