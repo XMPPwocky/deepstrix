@@ -886,13 +886,15 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             let mut t = vec![0usize; pair.len()];
             let mut blk = 0usize;
             while (0..pair.len()).any(|k| t[k] < n_steps) {
-                // (stream, rows, keep) of each block still running, offset schedules.
+                // (stream, rows, keep) of each block still running; the second
+                // stream's schedule is offset by ONE block, which covers every
+                // two-lane cut kind from MS_STEPS=4 up (offline walk, review).
                 let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
                 for (k, &s) in pair.iter().enumerate() {
                     if t[k] >= n_steps {
                         continue;
                     }
-                    let (r_want, k_want) = schedule[(blk + 3 * k) % schedule.len()];
+                    let (r_want, k_want) = schedule[(blk + k) % schedule.len()];
                     let keep = k_want.min(n_steps - t[k]);
                     let (r, keep) = if mode == H::One { (r_want.max(keep).min(4), keep.min(4)) } else { (r_want.max(keep), keep) };
                     blocks.push((k, r, keep));
@@ -1015,6 +1017,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         .collect();
     let mean_h = kls_g5h.iter().sum::<f64>() / kls_g5h.len().max(1) as f64;
     let max_h = kls_g5h.iter().cloned().fold(0.0, f64::max);
+    if n_streams < 2 {
+        eprintln!("G5h NOT RUN: two blocks per step need MS_STREAMS >= 2 (the arms ran one block per step, i.e. G5f / G5g again)");
+    }
     eprintln!(
         "G5h: two blocks per step, rows differing from alone: one lane {g5h_one}, two lanes {g5h_two}, forced-overtake {g5h_hold} \
          (Chain waits {waits_h2_hold}, unforced {waits_h2}); UNORDERED control differs on {g5h_unord} of {} rows (want > 0); \

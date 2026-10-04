@@ -381,3 +381,18 @@ Review round 2 (reviewer: APPROVE WITH CHANGES):
 
 Review round 3 (reviewer: APPROVE): R3-1 the fairness window (steps with two live streams, every
 stream's emitted tokens logged) ADOPTED (2.6); R3-2 three doc lines FIXED.
+
+Code review round 1 (4c139ae; reviewer: APPROVE WITH CHANGES; knob-1 paths confirmed unchanged
+except the route gate, the single MS_STAGGER read and the one-call tables in `_pipelined` /
+`_lanes`, all gated by G5a-g):
+
+- CR1-1 draft time outside `step_ms`: ADOPTED -- `ms.step` logs `draft_ms` (every draft attempt of
+  the step). The pre-registered rates already use log timestamps, which include it.
+- CR1-2 a mixed exploration draw fed a K = 0 stream's gate: FIXED (explored K = 0 blocks feed no
+  sample).
+- CR1-3 `record_multi` priced the ridden step after its own sample: FIXED (priced first).
+- CR1-4 G5h missed the "between" cut at MS_STEPS=6: FIXED -- the second stream's schedule offset
+  is one block (an offline walk covers every cut kind from MS_STEPS=4 up).
+- CR1-5 G5h silent with MS_STREAMS < 2: FIXED -- "G5h NOT RUN" is printed.
+- Also (self-review): exploration never draws a step with no drafts (it would be a plain step
+  feeding `PlainLanes`, and its never-fed multi cell would hog the staleness draws).

@@ -1634,6 +1634,10 @@ impl Sched {
         let mut multi_drafted: Vec<(usize, [f32; v4flash_kernels::het::mtp::MTP_BLOCK])> = Vec::new();
         // How many live streams may all draft (`V41_MS_DSPARK_STREAMS`, one read per step).
         let spec_max = ms_dspark::spec_streams();
+        // Every draft attempt of this step (failed, empty and K = 0 ones
+        // included): `step_ms` starts after it, so `ms.step` logs it apart
+        // (`draft_ms`) and a step's full cost is their sum (review round 1).
+        let t_draft = Instant::now();
         if self.streams.len() == 1 {
             if let (Some(dsp), Some(m)) = (self.dsp.as_mut(), state.mtp.as_mut()) {
                 let u: [f32; v4flash_kernels::het::mtp::MTP_BLOCK] = std::array::from_fn(|_| self.streams[0].draft_rng.next_f32());
@@ -1716,6 +1720,7 @@ impl Sched {
                 }
             }
         }
+        let draft_wall_ms = t_draft.elapsed().as_secs_f64() * 1e3;
         let spec = drafts.iter().any(|d| !d.is_empty());
         // `V41_SUB_DEFER_ACCEPTED`: a lone stream's speculative block records its
         // cache-prior admissions / pin wants / hot-set picks by row position and
@@ -2358,7 +2363,7 @@ impl Sched {
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
             head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff,
             chain_waits, chain_wait_us, ring_settle_ms = format!("{ring_settle_ms:.2}"),
-            engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, "ms.step");
+            engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, draft_ms = format!("{draft_wall_ms:.1}"), "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),

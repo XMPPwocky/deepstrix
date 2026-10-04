@@ -250,6 +250,9 @@ pub struct MsDspark {
     /// neither the lone blocks' (one KV stream, an ordered cut at every split)
     /// nor the plain steps' (one row per stream) -- aged by those steps.
     multi: LaneTables,
+    /// The last `ks_for` result was an exploration draw: its K = 0 blocks
+    /// were not the policy's choice and feed no stage-1 sample.
+    multi_explored_last: bool,
 }
 
 /// Most rows of a speculating step per lane: kernel families switch regime
@@ -315,7 +318,7 @@ impl MsDspark {
     fn with_slots(slots: Vec<SlotDraft>, lanes: LaneTables, m: usize) -> Self {
         Self {
             slots, plain_ms: lanes.one.cost(1), lanes, switches: Switches::default(), calib: Calib::default(), stats: Stats::default(),
-            since: Instant::now(), rng: explore_rng(), k0_explored: false, multi: multi_tables(m),
+            since: Instant::now(), rng: explore_rng(), k0_explored: false, multi: multi_tables(m), multi_explored_last: false,
         }
     }
 
@@ -351,10 +354,12 @@ impl MsDspark {
                 let mut these: Vec<&(Vec<usize>, usize, usize)> = cands.iter().filter(|c| (c.1, c.2) == cells[i]).collect();
                 let pick = these.swap_remove(self.rng.gen_range(0..these.len()));
                 self.k0_explored = pick.0.iter().all(|&k| k == 0);
+                self.multi_explored_last = true;
                 return (pick.0.clone(), pick.2);
             }
         }
         self.k0_explored = false;
+        self.multi_explored_last = false;
         let cost = MultiPriced { t: &self.multi, rule, draft };
         let mut ks = if sampled { choose_ks_stopping(blocks, base_rows, &cost) } else { choose_ks(blocks, base_rows, &cost) };
         if fixed_k().is_some() {
@@ -388,22 +393,31 @@ impl MsDspark {
     /// weaker stream beside a deep block is judged on what its own rows bought.
     #[allow(clippy::too_many_arguments)]
     pub fn record_multi(&mut self, blocks: &[(u32, [f32; MTP_BLOCK], usize, usize, usize)], rows: usize, lanes: usize, rule: LaneRule, step_ms: f64, plain_ms: f64) {
-        self.multi.observe(rows, lanes, step_ms);
-        self.stats.multi_spec_steps += 1;
         let draft_of = |d: &Self, slot: u32| d.slots.get(slot as usize).map(|sd| sd.last_draft_ms).unwrap_or(0.0);
         let drafts_ms: f64 = blocks.iter().map(|b| draft_of(self, b.0)).sum();
         let base_rows = rows - blocks.iter().map(|b| b.2).sum::<usize>();
-        for &(slot, conf, k, accepted, emitted) in blocks {
+        // Each block's ridden step, priced BEFORE this step's own sample lands.
+        let rode: Vec<f64> = blocks
+            .iter()
+            .map(|b| if rows - b.2 == base_rows { plain_ms } else { multi_best(&self.multi, rows - b.2, rule).map(|c| c.0).unwrap_or(plain_ms) })
+            .collect();
+        self.multi.observe(rows, lanes, step_ms);
+        self.stats.multi_spec_steps += 1;
+        let explored = self.multi_explored_last;
+        for (&(slot, conf, k, accepted, emitted), &rode) in blocks.iter().zip(&rode) {
             if k > 0 {
                 self.calib.observe(&conf, k, accepted);
                 if self.calib.blocks % CALIB_EVERY == 0 {
                     self.calib.log();
                 }
             }
-            let rode = if rows - k == base_rows { plain_ms } else { multi_best(&self.multi, rows - k, rule).map(|b| b.0).unwrap_or(plain_ms) };
+            // An exploration draw's K = 0 was not the policy's choice: no
+            // sample (as `record_k0`).
             let d_s = draft_of(self, slot);
-            if let Ok(sd) = self.slot(slot) {
-                sd.gates[MULTI].update(emitted as f64 * (rode + drafts_ms - d_s) / (step_ms + drafts_ms).max(1.0));
+            if !(explored && k == 0) {
+                if let Ok(sd) = self.slot(slot) {
+                    sd.gates[MULTI].update(emitted as f64 * (rode + drafts_ms - d_s) / (step_ms + drafts_ms).max(1.0));
+                }
             }
             let s = &mut self.stats;
             s.blocks += 1;
@@ -1117,9 +1131,12 @@ fn fit_rows(ks: &mut [usize], base_rows: usize, t: &LaneTables, rule: LaneRule) 
 }
 
 /// Every `(K per stream, rows, lanes)` a multi-stream speculating step may
-/// run under `rule` (exploration draws one): K_s in `0..=cap_s`, lanes among
-/// the rule's choices for the rows, at most `SPEC_ROWS_PER_LANE` per lane.
-/// Reads the caps only, never a confidence.
+/// run under `rule` (exploration draws one): K_s in `0..=cap_s` with at least
+/// one draft (a step with none is a PLAIN step: it feeds `PlainLanes`, never
+/// a multi cell, so a multi cell for it would stay stale and draw the
+/// staleness half of the exploration for good), lanes among the rule's
+/// choices for the rows, at most `SPEC_ROWS_PER_LANE` per lane. Reads the
+/// caps only, never a confidence.
 fn multi_choices(t: &LaneTables, blocks: &[BlockConf], base_rows: usize, rule: LaneRule) -> Vec<(Vec<usize>, usize, usize)> {
     let caps: Vec<usize> = blocks.iter().map(|b| b.cap.min(MTP_BLOCK)).collect();
     let mut out = Vec::new();
@@ -1127,7 +1144,7 @@ fn multi_choices(t: &LaneTables, blocks: &[BlockConf], base_rows: usize, rule: L
     loop {
         let rows = base_rows + ks.iter().sum::<usize>();
         for &l in t.choices(rows, rule) {
-            if rows <= l * SPEC_ROWS_PER_LANE {
+            if rows > base_rows && rows <= l * SPEC_ROWS_PER_LANE {
                 out.push((ks.clone(), rows, l));
             }
         }
@@ -2183,6 +2200,7 @@ mod tests {
             assert!(!cands.is_empty());
             for (ks, rows, lanes) in cands {
                 assert_eq!(rows, 2 + ks.iter().sum::<usize>());
+                assert!(rows > 2, "a candidate without drafts is a plain step, not a multi cell");
                 assert!(rows <= lanes * SPEC_ROWS_PER_LANE, "{rule:?}: {rows} rows on {lanes} lanes");
                 assert!(t.choices(rows, rule).contains(&lanes));
             }
