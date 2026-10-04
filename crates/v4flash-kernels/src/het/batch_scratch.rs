@@ -204,7 +204,8 @@ fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
 /// each, ffn_input_norm / ffn_shared / ffn_moe_recv / hot_ffn_moe_dgpu
 /// 8 MiB each, the rest < 100 KiB.
 /// Rows the DSpark residual capture is sized for. Only speculative verifies
-/// draft, and those are bounded by `V41_SMALL_B_OFFLOAD_MAX` (<= 8).
+/// draft, and those are bounded by `V41_SMALL_B_CATCHALL_MAX` (<= 8; formerly
+/// `V41_SMALL_B_OFFLOAD_MAX`).
 /// Rows of main-model residual the batched path can capture for the DSpark
 /// drafter. 128 = `MTP_WINDOW`, the drafter's ring size: prefill seeding wants
 /// to replay a FULL ring's worth of prompt positions, not just a verify batch.
@@ -238,9 +239,11 @@ pub struct BatchDgpuScratch {
     /// consumed by the SAME lane's post-MoE (`u64::MAX` = none). Per lane: a
     /// process-wide static let the other lane's chain retag it in between.
     pub dump_layer_pos: u64,
-    /// Store group the saved selection belongs to
-    /// (`kv_source_of(layer).unwrap_or(layer)`), or -1 for none. Guards against a
-    /// selection leaking across a kv-source boundary.
+    /// Index source the saved selection belongs to
+    /// (`config::index_source_of(layer)`), or -1 for none. Guards against a
+    /// selection leaking to a reuse layer of a different index source (layers
+    /// 20/24/28/32/36 share KV source 20, so a kv-source key could not tell
+    /// which source published it).
     pub indexer_saved_store: i32,
     /// ARCH_SPEC §1.5: the candidate blocks layer 20 publishes, per ROW, consumed
     /// by index sources 24/28/32/36. `[rows, ceil(MAX_KEYS / CANDIDATE_BLOCK_SIZE)]`,

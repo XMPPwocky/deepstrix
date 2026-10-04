@@ -440,10 +440,11 @@ pub struct HeterogeneousEngine {
     /// share the compressed store, the GATHERED buffer is reusable as-is — no rescore,
     /// no regather, just point attention at it.
     ///
-    /// `src` is the store group `kv_source_of(layer).unwrap_or(layer)` the cached gather
-    /// belongs to, or -1 for "none this token"; `rows` is its valid row count. Guarding
-    /// on the store group is what stops a selection leaking across a kv-source boundary
-    /// (e.g. layer 8 starts a new store, so layer 2's selection must not carry into it).
+    /// `src` is the INDEX source `config::index_source_of(layer)` that published the
+    /// cached gather, or -1 for "none this token"; `rows` is its valid row count.
+    /// Guarding on the index source is what stops a selection leaking to a reuse layer
+    /// of another source (layers 20/24/28/32/36 share KV source 20, so a kv-source key
+    /// could not say which of them published).
     pub last_idx_gather_src: std::sync::atomic::AtomicI32,
     pub last_idx_gather_rows: std::sync::atomic::AtomicU32,
 

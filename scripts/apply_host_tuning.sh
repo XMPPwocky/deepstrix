@@ -49,7 +49,9 @@ apply_host() {                     # runs on EACH box; hostname decides the CCX
   echo "  governor = $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
   # 4. Busy-poll cap: an unprivileged socket may not ask for SO_BUSY_POLL above
   #    net.core.busy_read. The server asks for 3000 us during decode
-  #    (HetEngine::remote_set_phase_busy_poll); the daemon stays at 500.
+  #    (HetEngine::remote_set_phase_busy_poll; V41_DECODE_BUSY_POLL_US, production
+  #    5000); box 2 adapts its reader per request (V41_B2_DECODE_BUSY_POLL_US,
+  #    default 5000 on decode requests). Persisted in the lumi flake since 2026-09-20.
   $S sysctl -q -w net.core.busy_read=5000 net.core.busy_poll=5000
   echo "  sysctl busy_read=$(sysctl -n net.core.busy_read) busy_poll=$(sysctl -n net.core.busy_poll)"
   # 2026-09-21: the SENDER's TSO/GSO defers the second segment of any link reply

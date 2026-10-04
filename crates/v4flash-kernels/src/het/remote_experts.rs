@@ -12,8 +12,9 @@
 //!   sending those bytes makes the remote partial bit-identical to a local
 //!   computation by construction (no second rounding), and it is smaller than
 //!   f16 (10240 B). The reply is the weighted f16 partial sum `[B × N_EMBD]`
-//!   (`REQ_FLAG_RESP_F32` asks for f32 instead; used by the bit-identity tests
-//!   and cheap enough at decode sizes). Rows with no remote pick come back as
+//!   (`REQ_FLAG_RESP_F32` asks for f32 instead; production decode asks for it,
+//!   prefill stays f16 while `V41_PREFILL_F16_REPLIES` is on, and it is cheap at
+//!   decode sizes). Rows with no remote pick come back as
 //!   zeros — the response is always dense, the CLIENT skips the request when no
 //!   token of the batch has a remote pick.
 //! * [`ExpertShard`] + [`MoeExecutor`] — the daemon side: a packed iGPU pool
@@ -233,7 +234,8 @@ pub fn apply_socket_options(s: &TcpStream, o: &SocketOptions) -> eyre::Result<()
     }
     if o.busy_poll_us > 0 && !set_opt_i32(s, SOL_SOCKET, SO_BUSY_POLL, o.busy_poll_us as i32) {
         // Unprivileged processes may only lower it below net.core.busy_read;
-        // the sysctl default (500 on both boxes) still applies.
+        // net.core.busy_read still applies (5000 on both boxes, set by the lumi
+        // flake's modules/interconnect.nix).
         eprintln!("remote_experts: SO_BUSY_POLL={} refused (needs CAP_NET_ADMIN above busy_read)", o.busy_poll_us);
     }
     quickack(s, o);
@@ -354,10 +356,11 @@ pub mod proto {
     ///
     /// Why here and not a new field: the response's 8 u32s are all used and the
     /// clock triple after them must stay 8-aligned, so adding one u32 would
-    /// misalign it. `flags` is the request's flags echoed back, and requests only
-    /// ever set bits 0-1, so the high half is free.
+    /// misalign it. `flags` is the request's flags echoed back, and request flags
+    /// use bits 0-10 (`REQ_FLAG_*`), so the high half is free.
     ///
-    /// Emitted for b==1 (decode) only. A prefill batch's sel is up to 1024x6 and
+    /// Emitted for b==1 only (the decode chain, and since a7799a7 the hits-first
+    /// two-pass path a batched B=1 takes). A prefill batch's sel is up to 1024x6 and
     /// nothing consumes a miss mask for it.
     pub const RESP_MISS_SHIFT: u32 = 16;
     pub const RESP_MISS_BITS: usize = 16;
@@ -3437,7 +3440,8 @@ pub fn b2_global_pool() -> bool {
 }
 
 /// Fraction of its own region a layer is guaranteed to keep, even when a decode
-/// request is evicting globally (`V41_B2_POOL_FLOOR`, default 0.90).
+/// request is evicting globally (`V41_B2_POOL_FLOOR`, default 0 since
+/// 2026-09-16; it was 0.90).
 ///
 /// **An earlier note here called floor 0 numerically unsound. THAT WAS WRONG and
 /// is retracted.** Floor 0 did produce non-deterministic output, but bisection
@@ -3542,9 +3546,10 @@ pub fn remote_batched_b1() -> bool {
     *B
 }
 
-/// Zero-copy O_DIRECT expert reads on box 2. **OFF by default — MEASURED LOSS.**
-/// `V41_B2_ODIRECT=1` enables it. Requires `b2_gpu_repack`, since only the
-/// HF-layout reader can land bytes straight in staging.
+/// HISTORY (2026-09-14), superseded by the doc-comment on `b2_odirect` below:
+/// the zero-copy page-in has been ON by default since 2026-09-15. Requires
+/// `b2_gpu_repack`, since only the HF-layout reader can land bytes straight in
+/// staging. The measurement that once kept it off:
 ///
 /// This is the THIRD independent rejection of O_DIRECT on this path:
 ///

@@ -618,7 +618,9 @@ struct ReplayRow {
 /// `V41_PREFILL_F16_REPLIES` (default ON since 2026-10-01; `0` = f32): box 2
 /// returns a PREFILL request's MoE partial as f16 -- half the bytes on the box-2
 /// link (10.49 -> 5.24 MB per 512-row request; the link was ~46 ms of a ~70 ms
-/// no-paging round trip on 2.5 GbE, estimated ~-15% on long prefills) -- and the
+/// no-paging round trip on the temporary 2.5 GbE link of 2026-10-01, estimated
+/// ~-15% on long prefills; box 2 is back on USB4 / thunderbolt0 since the
+/// 2026-10-03 hardware move, not re-measured) -- and the
 /// hub widens it to f32 (`widen_f16`) before the unchanged f32 add. Decode
 /// (arena rows) stays f32.
 ///
@@ -1531,8 +1533,8 @@ impl HeterogeneousEngine {
 /// lane-layer. Default ON: at 1-8 rows the batched driver is host-launch-bound
 /// (~40 kernels per lane-layer at 20-40 us each for a few us of GPU work), and
 /// a captured stage replays as one launch.
-/// `V41_LOOKAHEAD_PREFETCH=0` disables look-ahead routing prefetch (see the
-/// router stage of `forward_layer_pre_moe_v2`).
+/// `V41_LOOKAHEAD_PREFETCH=1` enables look-ahead routing prefetch (default off;
+/// see the router stage of `forward_layer_pre_moe_v2`).
 /// `V41_LOOKAHEAD_DEPTH`: layers of routing lead sent as prefetch words
 /// (1 = layer+1 only, 2 = also layer+2; default 2).
 pub fn lookahead_depth() -> usize {
@@ -1805,7 +1807,8 @@ pub fn router_alts() -> u32 {
 
 /// Is box-2 miss substitution (`het::b2_mirror`) live for this lane-layer?
 /// Decode rows only (`RowLayout::Arena`: prefill chunks, the CED replay and the
-/// DSpark verify are `Contiguous`), with the box split under the T2 partition
+/// LEGACY DSpark verify are `Contiguous`; arena DSpark verify rows are part of
+/// the arena step and ARE `Arena`), with the box split under the T2 partition
 /// (the only ownership mode it predicts), and router alternatives present.
 /// Fidelity/determinism runs must leave `V41_SUB` unset.
 fn substitution_active(rows: &RowLayout<'_>, remote_split_on: bool, n_alt: usize) -> bool {
@@ -7881,7 +7884,7 @@ impl HeterogeneousEngine {
         // rows keep exp_probs_b / tid2eid, bit-identical to before.
         }
         cap.end()?;
-        // Look-ahead routing (arena only, `V41_LOOKAHEAD_PREFETCH=0` off): the
+        // Look-ahead routing (arena only, opt-in `V41_LOOKAHEAD_PREFETCH=1`): the
         // NEXT layer's router on THIS layer's router input, read back with the
         // picks below and sent to box 2 as prefetch words. MEASURED 2026-09-22
         // on live agent traffic: 62% (encoder) / 75% (decoder) of next-layer
@@ -9319,10 +9322,11 @@ impl HeterogeneousEngine {
                             // PREFILL rows ask for f16 (`prefill_f16_replies`, UNTESTED
                             // fidelity -- see there): the consumer widens it on the host
                             // (`widen_f16`). Decode (arena rows) keeps f32. At B=512 an
-                            // f32 partial is 512*5120*4 = 10.49 MB/request; on the 2.5 GbE
-                            // box-2 link (293 MB/s, MEASURED 2026-10-01) that is ~46 ms of
-                            // a ~70 ms no-paging round trip, and the round trip is on a
-                            // long prefill's critical path in every window.
+                            // f32 partial is 512*5120*4 = 10.49 MB/request; on the
+                            // temporary 2.5 GbE box-2 link (293 MB/s, MEASURED 2026-10-01;
+                            // the link is USB4 / thunderbolt0 again since 2026-10-03) that
+                            // was ~46 ms of a ~70 ms no-paging round trip, and the round
+                            // trip is on a long prefill's critical path in every window.
                             // MASKED vs UNMASKED. `submit` filters the picks down to what
                             // box 2 ADVERTISED it owns, leaving the rest for box 1. Under
                             // the small-B offload box 1 computes nothing, so a masked

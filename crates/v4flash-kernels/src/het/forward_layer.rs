@@ -79,8 +79,9 @@ use super::sync::{peer_push_f32, peer_push_i32};
 ///
 /// Default ON since the A/B above; `V41_DECODE_PRESUBMIT=0` rolls back.
 /// `V41_INDEX_K=1`: compute the V4.1 CSA2 index keys during the compressor step.
-/// Default OFF. Inert while on — nothing reads `HetCompressorState::index_k` until S1
-/// flips the sparse gate — so it is safe to enable for numerical validation.
+/// Default OFF; production sets it. Since S1/S2 landed (40d1201) the sparse gate
+/// READS `HetCompressorState::index_k`, so turning it on changes attention at long
+/// context (see `attention::scored_keys_are_gathered`). It is no longer inert.
 /// Mirror of `het::weights::is_index_source` (private there).
 #[cfg(feature = "v41")]
 pub(crate) fn is_index_source_layer(layer: i32) -> bool {

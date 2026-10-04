@@ -13,7 +13,7 @@ tracing = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# PENDING USER SIGN-OFF — see the note in the workspace Cargo.toml.
+# Approved (user sign-off 2026-10-04) — see the note in the workspace Cargo.toml.
 image = { workspace = true }
 v4flash-core = { path = "../v4flash-core" }
 v4flash-hip = { path = "../v4flash-hip" }

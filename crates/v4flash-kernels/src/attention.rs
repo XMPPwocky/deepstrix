@@ -53,7 +53,9 @@ pub const ATTN_SWA_BATCHED_MAX_KV: u32 = 512;
 /// PER-MODEL, and the derivation is NOT "ctx / 4". The old value was read as
 /// "320K / 4 + 256" because V4-Flash's smallest *ungathered* contribution is a
 /// ratio-4 layer gathered to INDEXER_TOP_K and its ratio-128 layers give
-/// n_kv/128 — nothing ever reaches n_kv/1. V4.1 has no indexer and its layers
+/// n_kv/128 — nothing ever reaches n_kv/1. [Written before the V4.1 indexer
+/// port; under `v41` the cap is `V41_MAX_CTX + IMAGE_RAW_WINDOW_MAX`, below.]
+/// V4.1 then had no indexer and its layers
 /// 20-39 are ratio 1, so decode scores `n_raw + n_kv` keys and the cap is a
 /// context limit one-for-one: 82176 made decode fail past ~82K while the
 /// server happily accepted `--ctx 328704`. Sized here for a 128K V4.1 context
@@ -129,8 +131,10 @@ pub const ATTN_MIXED_MAX_KEYS: u32 =
 ///
 /// -> 3072 covers 320K with vision and ~377K text-only.
 ///
-/// V4.1 breaks every term of that: no indexer is ported (ENGINE_PORT M5), so
-/// NO layer is gathered, and `COMPRESS_RATIOS` are 2 (layers 2-19) and 1
+/// V4.1 breaks every term of that [as first written, before the indexer port;
+/// with `V41_INDEX_K=1`, which production sets, every compressed V4.1 layer is
+/// gathered — see [`scored_keys_are_gathered`]]: no indexer was ported, so
+/// NO layer was gathered, and `COMPRESS_RATIOS` are 2 (layers 2-19) and 1
 /// (layers 20-39). The worst-case ungathered contribution is therefore
 /// n_kv/1, not n_kv/128 — 3072 capped the CED decoder replay at 2944 prompt
 /// tokens and the ratio-2 encoder at 5888. [`attn_max_scored_keys`] is the
@@ -185,9 +189,6 @@ pub fn scored_keys_are_gathered(ratio: u32) -> bool {
     indexer_gathers(ratio)
 }
 
-/// Can the CSA indexer fire on ANY layer of this model? False for V4.1
-/// (unported indexer), which makes every per-token indexer scratch buffer
-/// dead weight — see `het::batch_scratch::indexer_scratch_keys`.
 /// Can the indexer fire in THIS PROCESS? `indexer_ever_fires()` is a static property
 /// of the model (V4-Flash ratio-4 only); this additionally returns true when V4.1's
 /// ported indexer is switched on with `V41_INDEX_K=1`, which is what decides whether the
@@ -209,6 +210,9 @@ pub fn indexer_scratch_needed() -> bool {
     *B
 }
 
+/// Can the V4-Flash ratio-4 indexer fire on ANY layer of this model? Always
+/// false for V4.1, whose (ported) indexer is switched on per process with
+/// `V41_INDEX_K` — [`indexer_scratch_needed`] covers both.
 pub fn indexer_ever_fires() -> bool {
     crate::config::COMPRESS_RATIOS.iter().any(|&r| indexer_gathers(r))
 }

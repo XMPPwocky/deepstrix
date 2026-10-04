@@ -260,7 +260,9 @@ macro_rules! forward_one {
     };
 }
 
-/// Verify-vs-decode argmax agreement (see `V41_DSPARK_XCHECK`).
+/// Verify-vs-decode argmax agreement. Runs with the batched verify probe
+/// (`V41_VERIFY_PROBE` + `V41_VERIFY_BATCHED=1`); there is no
+/// `V41_DSPARK_XCHECK` switch (it was only ever named in a commit message).
 #[cfg(feature = "v41")]
 static XCHECK_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "v41")]

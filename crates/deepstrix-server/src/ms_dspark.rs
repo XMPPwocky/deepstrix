@@ -1,11 +1,15 @@
-//! DSpark on the multistream arena (docs/v41/DSPARK_ARENA_PLAN.md), the
-//! single-stream build: when exactly one stream is live it verifies the
-//! drafter's block in the SAME arena step as its next token (rows `[next, d_0
-//! .. d_{K-1}]`, `KvArena::tables`), rejection-samples the rows against the
-//! drafts (`spec_sample::verify_block`, point-mass tests) and keeps the KV of
-//! the rows it emitted (`KvArena::accept`). With several live streams every
-//! step is a plain multistream step (K = 0), and the rings are kept current
-//! so a stream that becomes the lone one drafts from a dense window.
+//! DSpark on the multistream arena (docs/v41/DSPARK_ARENA_PLAN.md): while at
+//! most `V41_MS_DSPARK_STREAMS` streams are live (default 1 = a lone stream;
+//! 2 per docs/v41/MS_DSPARK_STREAMS_DESIGN.md), each verifies the drafter's
+//! block in the SAME arena step as its next token (rows `[next, d_0 ..
+//! d_{K-1}]`, `KvArena::tables`), rejection-samples the rows against the drafts
+//! (`spec_sample::verify_block`: min(1, p/q) tests against the sampled draft
+//! distribution under `V41_MS_DSPARK_DRAFTS=sampled`, the default; point-mass
+//! tests under `argmax`) and keeps the KV of the rows it emitted
+//! (`KvArena::accept`). With more live streams every step is a plain
+//! multistream step (K = 0), and under `V41_MS_DSPARK_RING=all` (the default)
+//! the rings are kept current so a stream that may speculate again drafts from
+//! a dense window.
 //!
 //! What lives here: one drafter ring per arena slot (`MtpState::rings` is the
 //! drafter's only state that persists across drafts; the rest of `MtpState`

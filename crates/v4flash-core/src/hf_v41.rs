@@ -9,18 +9,22 @@
 //! against this reader tensor by tensor).
 //!
 //! Per-role formats:
-//!   routed experts   MXFP4 stacked `[n_expert, out, in]` in ggml's 17-byte
-//!                    blocks (`e8m0 | 16 B: elems 0..15 low nibbles, 16..31
-//!                    high`), repacked from HF's packed-nibble `[out, in/2]`
-//!                    + e8m0 scale `[out, in/32]`. Scale bytes copy verbatim:
-//!                    ggml's doubled k-values and its 2^(e-128) scale cancel.
+//!   routed experts   MXFP4 stacked `[n_expert, out, in]` in the engine's
+//!                    SUPER-BLOCK v2 layout (136 B = 8 x 16 B nibbles + 8 B
+//!                    scales; `MXFP4_LAYOUT_VERSION` = 2, see the repack below
+//!                    and `mxfp4_repack.hip`), repacked from HF's packed-nibble
+//!                    `[out, in/2]` + e8m0 scale `[out, in/32]`. NOT ggml's
+//!                    17-byte block (that was layout v1); box 1 and box 2 must
+//!                    agree on the version.
 //!   token_embd       F16 (the engine's host-side embed path has no Q8_0 arm)
 //!   fp8 projections  e4m3 with 32x32 e8m0 block scales → dequantised → Q8_0
 //!                    (bit-exact with gguf-py / ggml `quantize_row_q8_0_ref`).
 //!   bf16 tensors     F32 / F16 / raw BF16 per the contract's role.
 //!   Engram tables    98 GiB of fp8 rows, NOT presented (they are gathered
 //!                    per token, never loaded whole) — use [`V41HfWeights::raw`].
-//!   DSpark (`mtp.*`), vision, aligner: not presented yet.
+//!   DSpark (`mtp.*`)  presented: `build_mtp` maps the three stages to
+//!                    `blk.{n_layers+s}.*` plus their own heads (128-expert
+//!                    router). Vision / aligner are read by `v4flash-vision`.
 
 use std::collections::HashMap;
 use std::path::Path;

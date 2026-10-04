@@ -57,9 +57,12 @@ pub enum TargetDist {
 impl TargetDist {
     /// The distribution the arena sampler draws from for logit row `r`.
     ///
-    /// Same chain as `top_p_min_p_threshold` (temperature, top-p over the
-    /// tempered weights, then min-p), but without a 129K-entry f64 exp + full
-    /// sort per row. The weight is `exp(logit/T - gmax)` in (0, 1]; entries
+    /// Temperature, then min-p (survivors within `min_p_rel` of the top
+    /// weight), then top-p over the SURVIVORS, threshold `max(top-p cut,
+    /// min_p_rel)` -- the order the drafter's q follows (KNOWN_BUGS #50),
+    /// without a 129K-entry f64 exp + full sort per row. (Corrected 2026-10-04:
+    /// this said "same chain as `top_p_min_p_threshold`", which takes its top-p
+    /// cut over ALL tempered weights.) The weight is `exp(logit/T - gmax)` in (0, 1]; entries
     /// below FLOOR cannot move a top-p cutoff by more than `N_VOCAB * FLOOR` of
     /// the mass (< 1e-5 of the total, which is >= 1), so only the survivors are
     /// sorted -- typically a few hundred.

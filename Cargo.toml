@@ -46,7 +46,7 @@ uuid = { version = "1.23.2", features = ["v7"] }
 # Combinators on tokio mpsc / futures Streams used by SSE handler.
 futures-util = "0.3"
 
-# *** PENDING USER SIGN-OFF (vision-exp, 2026-09-03) ***
+# Approved (user sign-off 2026-10-04; requested 2026-09-03 for vision-exp).
 #   image: PNG/JPEG decoding for the DeepSeek-V4-Flash-Vision-Exp image
 #   preprocessor (crates/v4flash-vision). Only `decode -> RGB8` is used;
 #   resizing/padding/normalisation are implemented in-crate (PIL semantics).
