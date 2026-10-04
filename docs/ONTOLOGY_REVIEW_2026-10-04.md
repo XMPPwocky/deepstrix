@@ -1,6 +1,6 @@
 # DeepStrix ontology review
 
-*Scope: every crate at `origin/main` `128f7e6`, which is 227 commits after `f38679e`, the commit the 09-24 architecture review covered. The unmerged branches `worktree-ms-dspark2` (which contains `worktree-lm-prefill-prod`), `worktree-kv-prefix-store` and `worktree-architecture-review` were also checked for the vocabulary they add. Production has run `worktree-ms-dspark2` `988c53a` since 2026-10-04 19:28 UTC, so main is not what is deployed. Nothing was built, run or renamed.*
+*Scope: every crate at `origin/main` `128f7e6`, which is 227 commits after `f38679e`, the commit the 09-24 architecture review covered. The unmerged branches `worktree-ms-dspark2` (which contains `worktree-lm-prefill-prod`), `worktree-kv-prefix-store` and `worktree-architecture-review` were also checked for the vocabulary they add. Production has run `worktree-ms-dspark2` `988c53a` since 2026-10-04 19:28 UTC: the live hub binary's md5 is `363fc1ec`, which is that build according to the deploy record. Main is therefore not what is deployed. Nothing was built, run or renamed.*
 
 *Method: two subsystem maps (request → step → KV state; expert residency → placement → wire) plus the model, knob, crate and telemetry vocabulary, all checked against the code, then checked claim by claim by an adversarial reviewer (about 45 claims; its corrections are folded in). Every count in this document was produced by `scripts/ontology_census.py` (comments stripped, string literals kept) or by a grep quoted next to it. Line numbers refer to `128f7e6`. The proposed vocabulary is `docs/GLOSSARY.md`.*
 
@@ -38,7 +38,7 @@ Counts are occurrences / distinct identifiers in code, `f38679e` → `128f7e6`. 
 | Name | f38679e | 128f7e6 | What happened |
 |---|---|---|---|
 | `mtp` (→ drafter) | 551 / 56 | 828 / 67 | The new DSpark code imports `mtp::{MTP_BLOCK, …}` and names its own types `MsDspark`/`SlotDraft`. Both vocabularies now coexist. |
-| `slot` as a stream id, in arena/scheduler files | 127 / 6 | 406 / 9 | Lines containing "slot" (`grep -ci`) went from 90 to 223 in `kv_arena.rs` and from 0 to 63 in `ms_dspark.rs`. The `StepRows` branch adds 132 more. |
+| `slot` as a stream id, in arena/scheduler files | 127 / 6 | 406 / 9 | Lines containing "slot" (`grep -ci`) went from 90 to 223 in `kv_arena.rs` and from 0 to 65 in `ms_dspark.rs`. The `StepRows` branch adds 132 more. |
 | `owns` (→ advertised / accepts / placement; timing fields and `owns_index_k` excluded) | 70 / 7 | 90 / 9 | It gained `owns_remote_some`, `remote_owns_layer` and `partition_masks_by_owns_eff`. |
 | decoder ring (→ raw window) | 3 / 1 | 20 / 2 | It gained `decoder_rings_empty`. KB #42 is a decoder-ring bug. |
 | `partition_box2`, `T2` | 16 / 4 | 35 / 4 | — |
@@ -355,8 +355,13 @@ Merge it first. Every rename in those files waits for that merge.
 2. **S8 renames.** `Prefill.prefix` → `tokens` + `restored`; `prefill_job_chunk` → `run_unit`; `checkpoint_ok` → `window_open`.
 3. **`StreamId`.** Use stream id instead of `slot` in `KvArena`, `Sched`, `MsDspark`, `StepRows` and `spec_sample`. The evtrace `slot` field of `b2_read` really is a pool slot, and stays.
 4. **Arena operations.** `KvArena::admit` → `carve`; `KvArena::accept` → `commit`.
-5. **"Decoder rings" → decoder-layer raw window**, in identifiers. An on-disk meta key keeps its spelling.
-6. **`mtp` → `drafter`** in identifiers, if §10 Q2 says so. About 830 occurrences. `"mtp."` stays in the loader; `d_mtp`/`i_mtp` move in the schema commit.
+5. **"Decoder rings" → decoder-layer raw window**, in identifiers. No snapshot meta key is involved: `decoder_rings_empty` infers its answer from the window fields.
+6. **`mtp` → `drafter`** in identifiers, if §10 Q2 says so. About 830 occurrences. Three things stay:
+   - `"mtp."` in the loader;
+   - `d_mtp`/`i_mtp`, which move in the schema commit;
+   - the `V41_MTP_*` env names (`het/mtp.rs:429, 468, 479, 495`), which move in Phase 2.4.
+
+   The census `mtp` row will therefore keep at least four distinct identifiers after this step, and that is expected.
 7. **Evict-protect → protect.** `parked_pins`, `ExtraPins`, `cur_pins`, and `ExpertShard::pinned` (`remote_experts.rs:2151`). The last is a manual rename: the census regex cannot tell it apart from pinned memory.
 
 **Phase 2: behaviour or interface changes.**
@@ -367,7 +372,7 @@ Merge it first. Every rename in those files waits for that merge.
    - Add an env-name alias to the registry.
    - Convert per `KNOB_AUDIT_2026-10-04.md`.
    - Add per-process unknown-knob rejection (S12).
-   - Only then rename, with aliases: `V41_T2_PARTITION` → `V41_HOME_SPLIT`; `V41_T2_CATCHALL` → `V41_MISS_FALLBACK` (three-valued); `V41_INDEX_*`/`V41_IDX_*` → `V41_INDEXER_*`; `*_COALESCE` → span read; batch-size `*_B1` → `*_BS1`.
+   - Only then rename, with aliases: `V41_T2_PARTITION` → `V41_HOME_SPLIT`; `V41_T2_CATCHALL` → `V41_MISS_FALLBACK` (three-valued); `V41_INDEX_*`/`V41_IDX_*` → `V41_INDEXER_*`; `V41_MTP_*` → `V41_DRAFTER_*` (if §10 Q2 picks drafter); `*_COALESCE` → span read; batch-size `*_B1` → `*_BS1`.
    - Today these are all raw `env::var` reads. Renaming `V41_T2_PARTITION` without an alias would change production placement at the next restart if a deploy script lags.
 5. **S11.** `LanePlan`.
 6. **S10.** `PickStats`.
