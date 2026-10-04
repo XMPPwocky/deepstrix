@@ -125,6 +125,23 @@ change (2.8): production twins carry NO canary code; each twin has an `_canary` 
 dereference macro + the canary) that the wrappers pick when the canary is on (tests,
 `V41_MS_CTX_CHECK=1`).
 
+#### Step 0 run 3 (2026-10-04 22:48 UTC, 1d9af45, hub down 53 s): NO-GO, narrowly
+
+| item | result |
+|---|---|
+| 1 write cost | ctx_store +2.90 us GPU / +0.83 us host: 80 writes = 298 us / step |
+| 2 relaunch, K = 8 vs 80 (21 pairs, warm-up) | 1-node GPU +0.25 us (ub +0.91, 11/21 > 0), 8-node -0.05 (ub +0.12); host ~0. No penalty |
+| 3 coherence, 5 mechanism / nodes | clean |
+| 4 gemv twin (no canary code) | b=1 +0.18 us (+0.7%), b=4 +0.69 (+1.8%), b=8 +1.60 (+2.4%; run 2: +4.05) |
+| 4 mhc twin | +0.08 / +0.47 / +0.51 us |
+| budget, medians (upper bounds) | b=1 1.03% (1.47%) MARGINAL; b=4 1.08% (1.55%); b=8 1.23% (1.47%) -> NO-GO |
+
+The residual twin cost is the indirection itself: one more dependent scalar load round per
+workgroup (kernel argument -> slot -> body), exposed once per workgroup round, so it grows with the
+gemv's workgroup rounds (b=8: ~4 workgroups resident per CU, 64 per CU). Of the b=8 total, 896 us is
+the 7 small twins per lane-layer charged at the q_b gemv's delta (an assumption, not a
+measurement); measured items alone: b=1 0.85%, b=4 0.77%, b=8 0.77%, plus the small twins.
+
 ### 2.1 Operands: `Arg` and a pointer-only context
 
 Wrappers take operands as `Arg::Dev(&buf)` (direct, today) or `Arg::Ctx(slot, &buf)` (read the
