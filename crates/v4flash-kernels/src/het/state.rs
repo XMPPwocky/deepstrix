@@ -320,7 +320,7 @@ impl HetModelState {
                 && (raw_off + n_raw) as usize + crate::het::drafter::DRAFT_BLOCK > KV_CACHE_ROWS
             {
                 return Err(eyre!(
-                    "rollback_kv: layer {i} slid append pointer {} within MTP_BLOCK of cache \
+                    "rollback_kv: layer {i} slid append pointer {} within DRAFT_BLOCK of cache \
                      capacity {KV_CACHE_ROWS} — needs compaction (not yet wired for accept)",
                     raw_off + n_raw
                 ));

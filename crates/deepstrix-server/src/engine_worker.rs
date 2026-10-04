@@ -2906,7 +2906,7 @@ fn seed_drafter_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) ->
         }
         // `whole` is read at `sl * cap * ne + r * ne` for r in [0, n), so the
         // capture count the driver recorded must fit the buffer it wrote into.
-        assert!(n <= cap, "dspark seed: lane {lane_name} recorded {n} captured mtp_src rows but the buffer holds {cap}");
+        assert!(n <= cap, "dspark seed: lane {lane_name} recorded {n} captured drafter_src rows but the buffer holds {cap}");
         let mut whole = vec![0.0f32; nsrc * cap * ne];
         lane.drafter_src.copy_to_host(&mut whole)?;
         for r in 0..n {
@@ -3768,7 +3768,7 @@ fn finish_decode(
                     std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tracing::warn!(
-                        "V41_VERIFY_DECODE_PATH: mtp_src is NOT captured on this path;                          main_hidden and the ring replay use the previous step's residuals.                          Acceptance/E from this flag is NOT a valid drafter measurement."
+                        "V41_VERIFY_DECODE_PATH: drafter_src is NOT captured on this path;                          main_hidden and the ring replay use the previous step's residuals.                          Acceptance/E from this flag is NOT a valid drafter measurement."
                     );
                 }
             }
@@ -4055,14 +4055,14 @@ fn finish_decode(
             // degenerate" until it was root-caused to this mapping.
             assert!(
                 !verify_captured || state.bd_a.drafter_captured >= cut.min(toks.len()),
-                "dspark accept: lane A captured {} mtp_src rows, but the recorded lane cut claims                  rows [0,{}) of this {}-row verify came from lane A",
+                "dspark accept: lane A captured {} drafter_src rows, but the recorded lane cut claims                  rows [0,{}) of this {}-row verify came from lane A",
                 state.bd_a.drafter_captured,
                 cut.min(toks.len()),
                 toks.len()
             );
             assert!(
                 !verify_captured || cut >= toks.len() || state.bd_b.drafter_captured >= toks.len() - cut,
-                "dspark accept: lane B captured {} mtp_src rows, but the recorded lane cut claims                  rows [{cut},{}) of this verify came from lane B",
+                "dspark accept: lane B captured {} drafter_src rows, but the recorded lane cut claims                  rows [{cut},{}) of this verify came from lane B",
                 state.bd_b.drafter_captured,
                 toks.len()
             );
@@ -4087,7 +4087,7 @@ fn finish_decode(
                 // DRAFT_CAP_ROWS rows per lane.
                 assert!(
                     lr < cap,
-                    "dspark accept: lane-local mtp_src row {lr} (global row {r}, lane cut {cut})                      >= MTP_CAP_ROWS {cap}"
+                    "dspark accept: lane-local drafter_src row {lr} (global row {r}, lane cut {cut})                      >= MTP_CAP_ROWS {cap}"
                 );
                 (buf, lr)
             };

@@ -185,7 +185,7 @@ fn async_ring_writes_match_synchronous() -> eyre::Result<()> {
     }
     println!("mtp drafter isolation: {iso_n} drafts, {iso_h} differ from the slot drafting alone; {iso_r} ring buffers differ");
     if iso_h > 0 || iso_r > 0 {
-        return Err(eyre!("a slot's draft depends on the other slot's drafts through the shared MtpState ({iso_h} outputs, {iso_r} rings)"));
+        return Err(eyre!("a slot's draft depends on the other slot's drafts through the shared DrafterState ({iso_h} outputs, {iso_r} rings)"));
     }
     Ok(())
 }

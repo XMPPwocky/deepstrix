@@ -4508,8 +4508,8 @@ impl HeterogeneousEngine {
                     );
                     assert!(
                         n <= super::batch_scratch::DRAFT_CAP_ROWS,
-                        "mtp capture L{layer}: capturing {n} rows > MTP_CAP_ROWS {}; mtp_src and \
-                         mtp_hc_mean are only sized for MTP_CAP_ROWS",
+                        "drafter capture L{layer}: capturing {n} rows > DRAFT_CAP_ROWS {}; drafter_src and \
+                         drafter_hc_mean are only sized for DRAFT_CAP_ROWS",
                         super::batch_scratch::DRAFT_CAP_ROWS
                     );
                     let de = &self.dgpu;
