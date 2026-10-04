@@ -234,6 +234,7 @@ unsafe extern "C" {
 
     pub fn hipMalloc(ptr: *mut hipDeviceptr_t, size: usize) -> hipError_t;
     pub fn hipFree(ptr: hipDeviceptr_t) -> hipError_t;
+    pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
     pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> hipError_t;
     pub fn hipHostFree(ptr: *mut c_void) -> hipError_t;
     pub fn hipMemcpy(

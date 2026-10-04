@@ -30,6 +30,13 @@ impl Device {
         Ok((0..n).map(Device::new).collect())
     }
 
+    /// `(free, total)` bytes of the CURRENT device's memory (`hipMemGetInfo`).
+    pub fn mem_info_current() -> eyre::Result<(usize, usize)> {
+        let (mut free, mut total) = (0usize, 0usize);
+        check_eyre(unsafe { sys::hipMemGetInfo(&mut free, &mut total) }, "hipMemGetInfo")?;
+        Ok((free, total))
+    }
+
     /// Make this device the current device for the calling thread.
     pub fn set_current(&self) -> eyre::Result<()> {
         check_eyre(unsafe { sys::hipSetDevice(self.id) }, "hipSetDevice")

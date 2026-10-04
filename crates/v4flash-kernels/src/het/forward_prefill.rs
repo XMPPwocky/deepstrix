@@ -1923,6 +1923,11 @@ impl HeterogeneousEngine {
             exec.launch(stream)?;
             return Ok(StageCap { skip: true, capturing: false, name, key, de, stream, graphs });
         }
+        // A NEW shape below the memory reserve runs uncaptured this time
+        // (`GraphCache::refresh_room`): every graph holds device memory for good.
+        if !graphs.has_room() {
+            return Ok(StageCap { skip: false, capturing: false, name, key: 0, de, stream, graphs });
+        }
         stream.begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         de.events.set_capturing(true);
         Ok(StageCap { skip: false, capturing: true, name, key, de, stream, graphs })
@@ -3702,6 +3707,8 @@ impl HeterogeneousEngine {
         check_scratch_rows("forward_step_arena", b, bd, bi, sd, si)?;
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
+        // dGPU current, no capture open: the graph cache's memory check.
+        self.dgpu_graphs.refresh_room();
         arena.state.restore_compressor_lending();
 
         // A full raw region moves its window down before the tables are
@@ -3800,6 +3807,8 @@ impl HeterogeneousEngine {
         check_scratch_rows("forward_step_arena_pipelined", b_b, bd_b, bi_b, sd, si)?;
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
+        // dGPU current, no capture open: the graph cache's memory check.
+        self.dgpu_graphs.refresh_room();
         arena.state.restore_compressor_lending();
         arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         let (tokens_a, tokens_b) = tokens.split_at(b_a);
@@ -3997,6 +4006,8 @@ impl HeterogeneousEngine {
         }
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
+        // dGPU current, no capture open: the graph cache's memory check.
+        self.dgpu_graphs.refresh_room();
         arena.state.restore_compressor_lending();
         arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         // ONE tables call split by lane; no row depends across a cut (checked
@@ -4146,6 +4157,8 @@ impl HeterogeneousEngine {
         }
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
+        // dGPU current, no capture open: the graph cache's memory check.
+        self.dgpu_graphs.refresh_room();
         arena.state.restore_compressor_lending();
         arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         // ONE tables call for the step, split by row range: a lane that cuts
