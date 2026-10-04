@@ -75,7 +75,7 @@ export V41_CED=${V41_CED:-1}
 #     pool 52, floor 0.90   1.78 tok/s   ensure_ms 837   misses 17196/31276
 #     pool 78, floor 0      2.27 tok/s   ensure_ms 130   misses  3387/31276
 # 86 GB OOMs (hipErrorOutOfMemory) on this 93 GB box, so 78 is near the ceiling.
-export V41_PAGER_POOL_GB=${V41_PAGER_POOL_GB:-78}
+export V41_PAGER_POOL_GB=${V41_PAGER_POOL_GB:-95}
 
 # Dense prefill windows. The `V41_PAGER_DECODE_FRAC` default (0.75) gives prefill
 # only 1 window, which was correct when decode was miss-bound at 11 misses/token.
@@ -143,7 +143,7 @@ export V41_PAGER_MISS_THREADS=${V41_PAGER_MISS_THREADS:-3}
 # without it silently runs the serial driver (a different code path).
 export V41_MULTISTREAM=${V41_MULTISTREAM:-1}
 # KV arena rows: 2.75x --ctx fits three ~269K agents (3x left 190 MiB dGPU).
-export V41_MS_CTX_ROWS=${V41_MS_CTX_ROWS:-844800}
+export V41_MS_CTX_ROWS=${V41_MS_CTX_ROWS:-1300000}
 export V41_MS_PREFILL_JOBS=${V41_MS_PREFILL_JOBS:-1}
 export V41_MS_PIPELINE_MIN_ROWS=${V41_MS_PIPELINE_MIN_ROWS:-4}
 export V41_MS_STAGGER=${V41_MS_STAGGER:-2}
@@ -192,8 +192,61 @@ export V41_DSPARK=${V41_DSPARK:-0}
 #                        >=170 decoder slots/layer, which costs more encoder
 #                        capacity than the replay is worth at 124 GB.
 
-export DEEPSTRIX_HANG_DEADLINE_MS=1800000
+export DEEPSTRIX_HANG_DEADLINE_MS=${DEEPSTRIX_HANG_DEADLINE_MS:-120000}
 export GLIBC_TUNABLES=${GLIBC_TUNABLES:-glibc.malloc.arena_max=2}
+
+# ---- added 2026-09-24 .. 2026-10-04 --------------------------------------
+# Captured from the running hub's environment on 2026-10-04 (hub binary
+# 363fc1ec = worktree-ms-dspark2 988c53a, deployed 19:28 UTC). Until then these
+# lived only in the inline env of the ~/scratch-ms/deploy_*.sh launches.
+# Live overrides are in V41_KNOBS_FILE (/dev/shm/deepstrix-knobs.txt; on
+# 2026-10-04: V41_LM_PREFETCH=1, V41_SUB_LAMBDA=0.15, V41_SUB_DEFER_ACCEPTED=0,
+# V41_MS_DSPARK_STREAMS=1). That file is the live A/B channel: this script
+# never writes it, and it does not survive a reboot.
+export V41_KNOBS_FILE=${V41_KNOBS_FILE:-/dev/shm/deepstrix-knobs.txt}
+# Layer-major prefill + its look-ahead paging.
+export V41_LM_PREFILL=${V41_LM_PREFILL:-1}
+export V41_LM_PREFETCH=${V41_LM_PREFETCH:-1}
+# Box-1 home set: refresh hysteresis and churn cap.
+export V41_B1_HOT_HYST=${V41_B1_HOT_HYST:-100}
+export V41_B1_HOT_MAX_CHANGE=${V41_B1_HOT_MAX_CHANGE:-3}
+# Box-2 pin protocol.
+export V41_B2_PIN=${V41_B2_PIN:-1}
+export V41_B2_PIN_PREFILL_BAND=${V41_B2_PIN_PREFILL_BAND:-4096}
+# Miss substitution: cache prior (V41_SUB=3) with the admission filter.
+export V41_SUB=${V41_SUB:-3}
+export V41_SUB_LAMBDA=${V41_SUB_LAMBDA:-0.25}
+export V41_SUB_PENDING=${V41_SUB_PENDING:-0}
+export V41_SUB_PROTECT=${V41_SUB_PROTECT:-1}
+export V41_SUB_ADMIT_GATE=${V41_SUB_ADMIT_GATE:-1}
+# Box-2 partial upload off the null stream; dGPU->iGPU Q8_K push.
+export V41_REMOTE_PARTIAL_ASYNC=${V41_REMOTE_PARTIAL_ASYNC:-1}
+export V41_PUSH_XQ=${V41_PUSH_XQ:-1}
+export V41_DECODE_BUSY_POLL_US=${V41_DECODE_BUSY_POLL_US:-5000}
+# DSpark on the arena (drafter, accept mode) and lane choice.
+export V41_MS_DSPARK=${V41_MS_DSPARK:-accept}
+export V41_MS_DSPARK_COST=${V41_MS_DSPARK_COST:-68.3,83.4,98.5,113.6,128.7,143.8,158.9,174.0}
+export V41_MS_DSPARK_DRAFT_MS=${V41_MS_DSPARK_DRAFT_MS:-12}
+export V41_MS_DSPARK_RING=${V41_MS_DSPARK_RING:-solo}
+export V41_MTP_EXPERT_STATS=${V41_MTP_EXPERT_STATS:-1}
+export V41_MTP_MOE_GROUPED=${V41_MTP_MOE_GROUPED:-1}
+export V41_MS_LANES_LEARNED=${V41_MS_LANES_LEARNED:-1}
+export V41_MS_MHC_SPLIT=${V41_MS_MHC_SPLIT:-0}
+# Event trace: on, with the device-timing tier off (it regressed decode, 10-02).
+export V41_EVTRACE_DIR=${V41_EVTRACE_DIR:-$HOME/logs/evtrace}
+export V41_EVTRACE_DEV=${V41_EVTRACE_DEV:-0}
+export V41_PERFETTO_DIR=${V41_PERFETTO_DIR:-$HOME/traces}
+# Pick trace (scripts/split_sim input); one file per launch.
+export V41_PICK_TRACE=${V41_PICK_TRACE:-$HOME/logs/picks-sub-$(date -u +%Y%m%d-%H%M).trace}
+# Legacy one-value knob files (the A/B scripts' 10-01 channel; absent files are ignored).
+export V41_B2_PIN_PREFILL_BAND_FILE=${V41_B2_PIN_PREFILL_BAND_FILE:-/dev/shm/pin_band.txt}
+export V41_MS_ENGRAM_THREADS_FILE=${V41_MS_ENGRAM_THREADS_FILE:-/dev/shm/engram_threads.txt}
+export V41_MS_HEAD_CANDS_FILE=${V41_MS_HEAD_CANDS_FILE:-/dev/shm/head_cands.txt}
+export V41_MS_LANES_LEARNED_FILE=${V41_MS_LANES_LEARNED_FILE:-/dev/shm/lanes_learned.txt}
+export V41_MS_LM_FILE=${V41_MS_LM_FILE:-/dev/shm/lm_prefill.txt}
+export V41_MS_PIPELINE_MIN_ROWS_FILE=${V41_MS_PIPELINE_MIN_ROWS_FILE:-/dev/shm/pipeline_min_rows.txt}
+export V41_MS_SPEC_LANES_FILE=${V41_MS_SPEC_LANES_FILE:-/dev/shm/spec_lanes.txt}
+export V41_SUB_LAMBDA_FILE=${V41_SUB_LAMBDA_FILE:-/dev/shm/sub_lambda.txt}
 # External listen address: the script's only argument (IP, interface name or
 # hostname; see Usage above), served on port 18080 beside loopback. It is
 # resolved to an IPv4 address here because --addr takes a socket address.
