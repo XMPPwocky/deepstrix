@@ -80,6 +80,17 @@
 //!        every cut kind seen, hold waits > 0, unord differs. Needs
 //!        MS_STREAMS >= 2 and prompts on one side of `need_mask` (512
 //!        compressed rows) for the bit-exact arms.
+//!   G6   (STAGE, ROWS)-KEYED GRAPHS (docs/v41/GRAPH_KEYS_DESIGN.md 3), in this
+//!        process after the legacy arms (`V41_MS_GRAPH_KEYS` flipped between
+//!        steps): the ready-first driver under `stage_b` == legacy bit for bit
+//!        on three schedules (every stream; streams 0-1 = 1 row per lane; every
+//!        stream x4 = 2n rows per lane, the shared expert's b >= 6 path), plus
+//!        stage_b with the carrier off, the canary on (records checked every
+//!        step), a changed `sd` fingerprint (caches cleared), and the taint
+//!        probe (q_chain must taint, still bit-exact). Counters: the four
+//!        single-launch stages ran direct once per lane-layer, the carrier wrote
+//!        once per lane-layer (standalone writes with the carrier off), every
+//!        multi-node stage captured or replayed each lane-layer, none tainted.
 //!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
@@ -93,6 +104,7 @@
 #![cfg(feature = "v41")]
 
 use std::path::Path;
+use v4flash_kernels::het::arena_ctx::{C_CAPTURED_B, C_DIRECT, C_REPLAYED, C_TAINTED, C_UNCAPTURED};
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::{EngramHash, EngramTable, V41HfWeights, WeightSrc};
@@ -320,6 +332,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let mut sd = BatchDgpuShared::alloc_rows_ctx(dgpu, lane_rows, n_kv_max)?;
+    // G6: the operands (stage, rows)-keyed graphs may bake (GRAPH_KEYS_DESIGN.md 2.5); without it
+    // every stage_b capture taints (fail closed) -- G6 asserts none does.
+    sd.register_static();
     let mut si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     let mut pg = ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, 0)?;
     let hasher = EngramHash::load(Path::new(&engram_dir))?;
@@ -400,6 +415,39 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // G5h's four arms (one lane, two lanes, forced overtake, unordered).
     let mut arena_h: Vec<KvArena> = (0..4).map(|_| KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)).collect::<eyre::Result<_>>()?;
     let mut slots_h: Vec<Vec<u32>> = vec![Vec::new(); 4];
+    // G6 (GRAPH_KEYS_DESIGN.md 3): (stage, rows)-keyed arena graphs. Ready-first two-lane steps
+    // over three schedules -- every stream once (b = n/2 per lane), streams 0 and 1 (b = 1 per
+    // lane), every stream four times (b = 2n per lane: the shared expert's b >= 6 path) -- under
+    // `legacy` and `stage_b`, bit for bit; plus stage_b variants on the first schedule (carrier off,
+    // canary, sd fingerprint change, taint probe), each against the legacy G5e logits.
+    let g6_sched: Vec<(&str, Vec<usize>)> = vec![
+        ("all", (0..n_streams).collect()),
+        ("b1", (0..n_streams.min(2)).collect()),
+        ("x4", (0..n_streams).flat_map(|s| [s; 4]).collect()),
+    ];
+    // (arm, schedule index, mode)
+    let g6_arms: Vec<(&str, usize)> = vec![
+        ("stage_b", 0),
+        ("carrier_off", 0),
+        ("canary", 0),
+        ("fingerprint", 0),
+        ("b1_legacy", 1),
+        ("b1_stage_b", 1),
+        ("x4_legacy", 2),
+        ("x4_stage_b", 2),
+        ("taint", 0),
+    ];
+    let mut arena_g6: Vec<KvArena> = g6_arms
+        .iter()
+        .map(|(_, si)| {
+            let n = g6_sched[*si].1.len() as u32;
+            KvArena::alloc(dgpu, n, n * (max_len as u32 + n_steps as u32 + 64))
+        })
+        .collect::<eyre::Result<_>>()?;
+    let mut slots_g6: Vec<Vec<u32>> = vec![Vec::new(); g6_arms.len()];
+    let g6_rows_max = 4 * n_streams as u32;
+    let mut dev_g6 = RowTablesDev::alloc(dgpu, g6_rows_max, KV_SOURCE_LAYERS.len())?;
+    let mut dev_g6_b = RowTablesDev::alloc(dgpu, g6_rows_max, KV_SOURCE_LAYERS.len())?;
     let mut dev_spec = RowTablesDev::alloc(dgpu, ARENA_ROWS_PER_STREAM, KV_SOURCE_LAYERS.len())?;
     let mut dev_spec_b = RowTablesDev::alloc(dgpu, ARENA_ROWS_PER_STREAM, KV_SOURCE_LAYERS.len())?;
     let mut dev_b = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
@@ -448,6 +496,14 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         // after it and failed "source windows 17/17 rows at pos 5").
         for (a, sl) in arena_h.iter_mut().zip(slots_h.iter_mut()) {
             sl.push(a.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
+        }
+        // G6: every row of every schedule that runs stream s (a stream admitted k times = k rows).
+        for (i, (_, si)) in g6_arms.iter().enumerate() {
+            for &row_s in &g6_sched[*si].1 {
+                if row_s == s {
+                    slots_g6[i].push(arena_g6[i].admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
+                }
+            }
         }
         engine.dgpu.compute.synchronize()?;
         first_tok.push(if s == 0 { forced.as_ref().map(|f| *f.last().unwrap()) } else { None }.unwrap_or(argmax(&logits) as i32));
@@ -1192,6 +1248,139 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
 
     drop(spec_guard);
 
+    // 4e. G6 -- (stage, rows)-keyed arena graphs (GRAPH_KEYS_DESIGN.md 3; the arenas above). Runs in
+    // THIS process after the legacy arms (the knob flips between steps, legacy graphs exist).
+    let mut g6_fail: Vec<String> = Vec::new();
+    {
+        use v4flash_kernels::knobs::{MS_CTX_CARRIER, MS_CTX_CHECK, MS_GRAPH_KEYS, MS_TAINT_PROBE};
+        let mut g6_logits: Vec<Vec<Vec<Vec<f32>>>> = Vec::new();
+        for (i, (arm, sch)) in g6_arms.iter().enumerate() {
+            let rows_s = &g6_sched[*sch].1;
+            let n_rows = rows_s.len();
+            let stage_b = !arm.ends_with("legacy");
+            MS_GRAPH_KEYS.set(if stage_b { "stage_b" } else { "legacy" });
+            MS_CTX_CARRIER.set(if *arm == "carrier_off" { "0" } else { "1" });
+            MS_CTX_CHECK.set(if *arm == "canary" { "1" } else { "0" });
+            MS_TAINT_PROBE.set(if *arm == "taint" { "1" } else { "0" });
+            if *arm == "fingerprint" {
+                // A different process-static set: every cached stage graph is stale (design 2.7).
+                let mut r = sd.static_ranges();
+                r.push((1u64 << 46, 4096));
+                v4flash_kernels::het::arena_ctx::register_static_ranges(r);
+            }
+            engine.stage_b.reset_counters();
+            let mut logits: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_rows];
+            let mut seqs: Vec<Vec<i32>> = rows_s.iter().map(|&s| prompts[s].clone()).collect();
+            let (mut canary_bad, mut canary_recs) = (None::<String>, 0usize);
+            for t in 0..n_steps {
+                let toks: Vec<i32> = rows_s.iter().map(|&s| cont[s][t]).collect();
+                let mut rows_b = vec![vec![0f32; n_rows * ein]; ENGRAM_LAYERS.len()];
+                let mut hcs = Vec::with_capacity(n_rows);
+                for j in 0..n_rows {
+                    let pos = seqs[j].len();
+                    seqs[j].push(toks[j]);
+                    let rows = engram.rows_at(pg.raw(), &seqs[j], pos)?;
+                    for (li, r) in rows.iter().enumerate() {
+                        rows_b[li][j * ein..(j + 1) * ein].copy_from_slice(r);
+                    }
+                    hcs.push(embed(toks[j])?);
+                }
+                {
+                    let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev); 2] =
+                        [(&mut bd_a, &mut bi_a, &mut dev_g6), (&mut bd_b, &mut bi_b, &mut dev_g6_b)];
+                    engine.forward_step_arena_ready_first(
+                        &mut lanes, &mut sd, &mut si, &mut arena_g6[i], &StepRows::plain(&slots_g6[i])?, &weights,
+                        &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b)), Some(&mut pg),
+                    )?;
+                }
+                for &sl in &slots_g6[i] {
+                    arena_g6[i].accept(sl, 1, &engine.dgpu.compute)?;
+                }
+                let b_a = v4flash_kernels::het::forward_prefill::lane_rows(n_rows, 2)[0];
+                let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
+                all.extend(engine.head_rows(&mut ds, &bd_b, n_rows - b_a, &weights)?);
+                for j in 0..n_rows {
+                    logits[j].push(all[j * nv..(j + 1) * nv].to_vec());
+                }
+                if *arm == "canary" {
+                    engine.dgpu.compute.synchronize()?;
+                    if let Some((recs, _, bad)) = engine.stage_b.canary_check()? {
+                        canary_recs += recs;
+                        if canary_bad.is_none() {
+                            canary_bad = bad.map(|m| format!("step {t}: {m}"));
+                        }
+                    }
+                }
+            }
+            if *arm == "fingerprint" {
+                sd.register_static();
+            }
+            // Bit for bit against the legacy run of the same rows.
+            let reference: &Vec<Vec<Vec<f32>>> = match *arm {
+                "b1_legacy" | "x4_legacy" => &logits,
+                "b1_stage_b" => &g6_logits[4],
+                "x4_stage_b" => &g6_logits[6],
+                _ => &logits_rf,
+            };
+            let mut differ = 0;
+            for j in 0..n_rows {
+                // schedule 0 rows are stream j; the legacy reference of the others is indexed by row
+                let rref = if *sch == 0 { &reference[rows_s[j]] } else { &reference[j] };
+                for t in 0..n_steps {
+                    if max_abs_diff(&logits[j][t], &rref[t]) != 0.0 {
+                        differ += 1;
+                    }
+                }
+            }
+            let (c, carrier, standalone) = engine.stage_b.counters();
+            let get = |stage: &str, k: usize| c.get(stage).map_or(0, |v| v[k]);
+            let lane_layers = get("g.mhc_pre_attn", C_DIRECT);
+            eprintln!(
+                "G6 {arm}: {n_rows} rows x {n_steps} steps, {differ} differ from legacy; lane-layers {lane_layers}, carrier writes {carrier}, standalone {standalone}; \
+                 q_chain/kv_chain/output_proj/shared captured+replayed+tainted+uncaptured {:?}{}",
+                ["g.q_chain", "g.kv_chain", "g.output_proj", "g.shared_expert"]
+                    .map(|st| (get(st, C_CAPTURED_B), get(st, C_REPLAYED), get(st, C_TAINTED), get(st, C_UNCAPTURED))),
+                if *arm == "canary" { format!("; canary {canary_recs} records, {}", canary_bad.as_deref().unwrap_or("clean")) } else { String::new() }
+            );
+            if differ != 0 {
+                g6_fail.push(format!("{arm}: {differ} (row, step) logits differ from legacy"));
+            }
+            if stage_b {
+                if lane_layers == 0 {
+                    g6_fail.push(format!("{arm}: stage_b never took the direct single-launch path (counters empty)"));
+                }
+                for st in ["g.mhc_pre_ffn", "g.router_matvec", "g.mhc_mix_ffn_late"] {
+                    if get(st, C_DIRECT) != lane_layers {
+                        g6_fail.push(format!("{arm}: {st} ran direct {} times, mhc_pre_attn {lane_layers}", get(st, C_DIRECT)));
+                    }
+                }
+                let carrier_on = *arm != "carrier_off";
+                if (carrier_on && (carrier != lane_layers || standalone != 0)) || (!carrier_on && (carrier != 0 || standalone != lane_layers)) {
+                    g6_fail.push(format!("{arm}: context writes carrier {carrier} / standalone {standalone} for {lane_layers} lane-layers"));
+                }
+                for st in ["g.q_chain", "g.kv_chain", "g.output_proj", "g.shared_expert"] {
+                    let (cb, rp, tn, un) = (get(st, C_CAPTURED_B), get(st, C_REPLAYED), get(st, C_TAINTED), get(st, C_UNCAPTURED));
+                    let want_taint = *arm == "taint" && st == "g.q_chain";
+                    if want_taint {
+                        if tn == 0 {
+                            g6_fail.push(format!("{arm}: the taint probe did not taint {st}"));
+                        }
+                    } else if tn != 0 || un != 0 || cb == 0 || cb + rp != lane_layers {
+                        g6_fail.push(format!("{arm}: {st} captured {cb} replayed {rp} tainted {tn} uncaptured {un} for {lane_layers} lane-layers"));
+                    }
+                }
+                if *arm == "canary" && (canary_bad.is_some() || canary_recs == 0) {
+                    g6_fail.push(format!("canary: {} ({canary_recs} records)", canary_bad.as_deref().unwrap_or("no records")));
+                }
+            }
+            g6_logits.push(logits);
+        }
+        MS_GRAPH_KEYS.set("legacy");
+        MS_CTX_CARRIER.set("1");
+        MS_CTX_CHECK.set("0");
+        MS_TAINT_PROBE.set("0");
+    }
+
     // 5. Compare.
     let mut g5a_fail = 0;
     let mut g5c_fail = 0;
@@ -1355,6 +1544,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     }
     if mean_s > kld_mean_bar || max_s > kld_max_bar {
         return Err(eyre!("G5d failed: staggered KL mean {mean_s:.5} / max {max_s:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
+    }
+    if !g6_fail.is_empty() {
+        return Err(eyre!("G6 failed ((stage, rows)-keyed graphs): {}", g6_fail.join("; ")));
     }
     Ok(())
 }
