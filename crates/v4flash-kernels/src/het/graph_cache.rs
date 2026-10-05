@@ -133,9 +133,13 @@ impl GraphCache {
     }
 
     /// Drop every graph. The caller has synchronized the device (a queued launch of a dropped
-    /// executable must have finished: dropping a `GraphExec` destroys it at once).
+    /// executable must have finished: dropping a `GraphExec` destroys it at once). The next
+    /// `refresh_room` re-reads the device: the memory just freed would otherwise stay PAUSED for
+    /// up to `ROOM_EVERY` steps (each legacy graph holds ~2 MB; G6 2026-10-05 saw 4 and 9 such
+    /// steps run uncaptured after a clear).
     pub fn clear(&self) {
         self.entries.lock().unwrap().clear();
+        self.calls.store(0, Ordering::Relaxed);
     }
 
     pub fn run<F>(

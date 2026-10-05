@@ -5,7 +5,15 @@ Step 0b: GO (2026-10-05 13:07 UTC; 0.44 / 0.29 / 0.39% of the step at b = 1 / 4 
 BUILT (2026-10-05, each slice review-approved): slice A twins + canary variants (fb9357a, 277d9fa),
 slice B host plumbing behind `V41_MS_GRAPH_KEYS=stage_b`, default legacy = production unchanged
 (4177d13, e41f84f), slice C gate G6 in tests/multistream_step.rs (0b99acc; review fixes f14c85d,
-then the one-lane probes and b = 1..8 schedules, section 3 "G6 as built"). Next: the GPU gate
+then the one-lane probes and b = 1..8 schedules, section 3 "G6 as built").
+Gate run 1 (2026-10-05 21:13 UTC, hub down 18 min, 1035 s test): EVERY bit-exactness check passed
+(G5a-h; all 15 G6 arms 0 rows differ from legacy; final state 0 of 69; one-lane stage_b probes 0;
+canary 11520 records clean; carrier off = 960 replays of carrier-written graphs; room 480
+uncaptured then replayed; taint q_chain tainted, bit-exact). FAILED on counters only: `stage_b`
+(first arm) 320 and the one-lane pass 360 lane-layers UNCAPTURED -- the room flag stayed PAUSED
+after a cache clear (legacy graphs ~2 MB each: G5's / pass 1's shapes went under the 400 MB
+reserve; `refresh_room` re-reads every 16 calls). Fix: `GraphCache::clear` makes the next
+`refresh_room` re-read the device (also right for production's generation-change clear). Next: the GPU gate
 window (~/scratch-ms/window_graph_keys_gates.sh), then deploy with legacy default and A/B the knob. Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
 review-APPROVED (2 rounds); Step 0 runs 1-3 were NO-GO (run 3 narrowly: 1.03 / 1.08 / 1.23% of the
 step at b = 1 / 4 / 8). Owner 2026-10-05: revise first (rev 4 = section 2.11), then merge the
