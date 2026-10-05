@@ -270,7 +270,11 @@ __device__ __forceinline__ static void kv_rms_rope_fp8_body(
     ARENA_CTX_F32X2(rope01, theta_scale, freq_scale);                                           \
     ARENA_CTX_F32X2(rope23, ext_factor, mscale_eff);                                            \
     ARENA_CTX_F32X2(rope45, corr_low, corr_high);
-#define ROPE_IND_XOR (ARENA_CTX_SLOT_U64(rope01) ^ ARENA_CTX_SLOT_U64(rope23) ^ ARENA_CTX_SLOT_U64(rope45))
+// The canary's rope term: the bit patterns of the six values the kernel USES, repacked as the
+// host packs the slots (low | high << 32), so a record shows what the launch computed with.
+#define ROPE_IND_PAIR(lo, hi) ((uint64_t)__float_as_uint(lo) | ((uint64_t)__float_as_uint(hi) << 32))
+#define ROPE_IND_XOR (ROPE_IND_PAIR(theta_scale, freq_scale) ^ ROPE_IND_PAIR(ext_factor, mscale_eff) ^ \
+                      ROPE_IND_PAIR(corr_low, corr_high))
 
 // operands: 0 out, 1 x, 2 weight, 3 pos_per_b
 template <bool CANARY>

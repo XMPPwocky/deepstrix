@@ -248,7 +248,10 @@ step; never the slot address to a direct kernel, which would compute on garbage)
 wrapper whose operands are all whitelisted `Dev` vets and launches its direct kernel (the q_chain
 and output_proj quantizes on `sd`, forward_prefill.rs:5013, 7576). Conversion happens at the
 DISPATCHING entry (`matvec_batched`, not `matvec_bpack`), so `Dev` and `Ctx` always take the same
-arm under every knob (`V41_GEMV_BPACK=0` sends both to `q8_0_gemv_batched_warp8`).
+arm under every knob (`V41_GEMV_BPACK=0` sends both to `q8_0_gemv_batched_warp8`). Intended: the
+dense gemv has twins for the compile-time batch arm only, so under the rollback knobs
+`V41_GEMV_TB=0` / `V41_GEMV_BPACK=0` the four multi-node stages taint and run legacy graphs (correct,
+slower; the grouped gemv's runtime arm has a twin because it is production's b = 1 arm).
 A tainted capture is instantiated and launched ONCE (its `_ind` nodes read the entry written
 before `begin_capture`, its direct nodes baked this lane-layer's pointers: this call is correct),
 pushed onto a per-step RETIRE list (dropping a `GraphExec` destroys it at once, graph.rs:164-168,
@@ -570,3 +573,9 @@ Code review of Step 0b 2e42893 (reviewer: APPROVE WITH CHANGES):
 4. Rope value slots: AGREED, recorded in 2.1 (Ctx-only, canary XOR folds them, computed at load).
 5. Identity gate wording: 2.3 now says "modulo PC-relative literal offsets".
 6. Env-read diagnostic names fixed; LazyLock caching is a build checklist item (2.11 R1).
+
+Code review of build slice A fb9357a (reviewer: APPROVE): every production arm of the four
+multi-node stages at b <= 8 has a twin or reads only process-static `sd`; NITs applied (the rope
+canary XOR folds the bit patterns of the six values the kernel used; 2.5 notes the gemv rollback
+knobs run legacy). For slice B: convert at the dispatching entries; the `sd` whitelist must cover
+every buffer the vetted direct launches touch (else every stage taints -- the gate counters catch it).
