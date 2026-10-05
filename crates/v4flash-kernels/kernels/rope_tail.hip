@@ -227,57 +227,7 @@ extern "C" __global__ __launch_bounds__(256) void kv_rms_rope_fp8(
         float* __restrict__ out, const float* __restrict__ x, const float* __restrict__ weight, float eps,
         const int* __restrict__ pos_per_b, float theta_scale, float freq_scale, float ext_factor,
         float mscale_eff, float corr_low, float corr_high) {
-    __shared__ float sdata[256];
-    const unsigned b = blockIdx.x, tid = threadIdx.x;
-    const float* xb = x + (size_t)b * 512u;
-    // rms_w_fast<2> (rms_norm.hip), verbatim up to the output expression
-    float xv[2], wv[2], v[2];
-    #pragma unroll
-    for (unsigned j = 0; j < 2; ++j) xv[j] = xb[tid + 256u * j];
-    #pragma unroll
-    for (unsigned j = 0; j < 2; ++j) wv[j] = weight[tid + 256u * j];
-    double partial = 0.0;
-    #pragma unroll
-    for (unsigned j = 0; j < 2; ++j) {
-        const float xx = xv[j];
-        partial += (double)xx * (double)xx;
-    }
-    sdata[tid] = (float)partial;
-    __syncthreads();
-    for (unsigned int stride = 128u; stride > 0; stride >>= 1) {
-        if (tid < stride) sdata[tid] += sdata[tid + stride];
-        __syncthreads();
-    }
-    const float mean_sq = sdata[0] / (float)512u;
-    const float scale = rsqrtf(mean_sq + eps);
-    #pragma unroll
-    for (unsigned j = 0; j < 2; ++j) v[j] = xv[j] * scale * wv[j];
-    // rope_tail_batched on elements 448..511 (waves 6-7 are fully active here)
-    if (tid >= 192u) {
-        const unsigned e = tid + 256u;
-        v[1] = rf_rot_pair(v[1], e, pos_per_b[b], (e - 448u) >> 1, 1.0f, theta_scale, freq_scale, ext_factor,
-                           mscale_eff, corr_low, corr_high);
-    }
-    // fp8_act_quant_inplace (fp4_kv_quant.hip) on every 32-block
-    float* ob = out + (size_t)b * 512u;
-    #pragma unroll
-    for (unsigned j = 0; j < 2; ++j) {
-        float a = fabsf(v[j]);
-        a = fmaxf(a, __shfl_xor_sync(RF_FULL_WARP_MASK, a, 1));
-        a = fmaxf(a, __shfl_xor_sync(RF_FULL_WARP_MASK, a, 2));
-        a = fmaxf(a, __shfl_xor_sync(RF_FULL_WARP_MASK, a, 4));
-        a = fmaxf(a, __shfl_xor_sync(RF_FULL_WARP_MASK, a, 8));
-        a = fmaxf(a, __shfl_xor_sync(RF_FULL_WARP_MASK, a, 16));
-        const float amax = fmaxf(a, 1.0e-4f);
-        const float t = amax / 448.0f;
-        int ex;
-        const float m = frexpf(t, &ex);
-        const int cexp = (m == 0.5f) ? ex - 1 : ex;
-        const float sc = ldexpf(1.0f, cexp);
-        float q = v[j] / sc;
-        q = fminf(fmaxf(q, -448.0f), 448.0f);
-        ob[tid + 256u * j] = dsv4_e4m3fn_dequant(q) * sc;
-    }
+#include "kv_rms_rope_fp8_body.inc"
 }
 
 // rope_tail_batched_copy — the decode `q_normed := q` D2D copy + rope_tail_batched(q_normed)
@@ -288,24 +238,7 @@ extern "C" __global__ __launch_bounds__(128) void rope_tail_batched_copy(
         unsigned int n_head, unsigned int head_dim, unsigned int n_rot, float theta_scale,
         float freq_scale, float ext_factor, float mscale_eff, float corr_low, float corr_high,
         int inverse) {
-    const unsigned head = blockIdx.x, b = blockIdx.z, tid = threadIdx.x;
-    if (head >= n_head) return;
-    const unsigned n_nope = head_dim - n_rot;
-    const size_t base = (size_t)b * n_head * head_dim + (size_t)head * head_dim;
-    const float4* s4 = reinterpret_cast<const float4*>(src + base);
-    float4* d4 = reinterpret_cast<float4*>(dst + base);
-    for (unsigned i = tid; i < n_nope / 4u; i += blockDim.x) d4[i] = s4[i];
-    if (tid < 32u && 2u * tid < n_rot) {
-        const unsigned lane = tid, i = 2u * lane;
-        const float theta = rf_theta(pos_per_b[b], lane, theta_scale, freq_scale, ext_factor, corr_low, corr_high);
-        const float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
-        const float c = cosf(theta) * mscale_eff;
-        const float s = sin_sign * sinf(theta) * mscale_eff;
-        const float x0 = src[base + n_nope + i + 0];
-        const float x1 = src[base + n_nope + i + 1];
-        dst[base + n_nope + i + 0] = x0 * c - x1 * s;
-        dst[base + n_nope + i + 1] = x0 * s + x1 * c;
-    }
+#include "rope_tail_batched_copy_body.inc"
 }
 
 // rope_inv_quant_q8 — the output projection's rope_tail_batched INVERSE on heads (64 x 512,
@@ -332,4 +265,63 @@ extern "C" __global__ __launch_bounds__(128) void rope_inv_quant_q8(
         const size_t k = (size_t)head * 16u + blk;
         rf_q8_block(v, lane, xq + row + 32u * k, xscale + (size_t)b * 1024u + k);
     }
+}
+
+// ---- `_ind` twins (GRAPH_KEYS_DESIGN.md 2.3, 2.11) ---------------------------------------------
+// Pointer operands resolve through the arena context when their `ind_mask` bit is set; the six
+// per-layer rope arguments come from three context slots holding f32 pairs (theta_scale |
+// freq_scale, ext_factor | mscale_eff, corr_low | corr_high: `rope::arena_ctx_rope_words`) -- the
+// `rope*` arguments are those slots' addresses, always. Production twins (no canary code, 2.8).
+#include "arena_ctx.inc"
+
+__device__ __forceinline__ static void kv_rms_rope_fp8_body(
+        float* __restrict__ out, const float* __restrict__ x, const float* __restrict__ weight, float eps,
+        const int* __restrict__ pos_per_b, float theta_scale, float freq_scale, float ext_factor,
+        float mscale_eff, float corr_low, float corr_high) {
+#include "kv_rms_rope_fp8_body.inc"
+}
+
+// operands: 0 out, 1 x, 2 weight, 3 pos_per_b
+extern "C" __global__ __launch_bounds__(256) void kv_rms_rope_fp8_ind(
+        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out, const float* x,
+        const float* weight, float eps, const int* pos_per_b, const uint64_t* rope01, const uint64_t* rope23,
+        const uint64_t* rope45) {
+    (void)canary;
+    (void)canary_tag;
+    ARENA_CTX_DEREF(ind_mask, 0, float*, out);
+    ARENA_CTX_DEREF(ind_mask, 1, const float*, x);
+    ARENA_CTX_DEREF(ind_mask, 2, const float*, weight);
+    ARENA_CTX_DEREF(ind_mask, 3, const int*, pos_per_b);
+    float theta_scale, freq_scale, ext_factor, mscale_eff, corr_low, corr_high;
+    ARENA_CTX_F32X2(rope01, theta_scale, freq_scale);
+    ARENA_CTX_F32X2(rope23, ext_factor, mscale_eff);
+    ARENA_CTX_F32X2(rope45, corr_low, corr_high);
+    kv_rms_rope_fp8_body(out, x, weight, eps, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
+                         corr_low, corr_high);
+}
+
+__device__ __forceinline__ static void rope_tail_batched_copy_body(
+        float* __restrict__ dst, const float* __restrict__ src, const int* __restrict__ pos_per_b,
+        unsigned int n_head, unsigned int head_dim, unsigned int n_rot, float theta_scale,
+        float freq_scale, float ext_factor, float mscale_eff, float corr_low, float corr_high,
+        int inverse) {
+#include "rope_tail_batched_copy_body.inc"
+}
+
+// operands: 0 dst, 1 src, 2 pos_per_b
+extern "C" __global__ __launch_bounds__(128) void rope_tail_batched_copy_ind(
+        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* dst, const float* src,
+        const int* pos_per_b, unsigned int n_head, unsigned int head_dim, unsigned int n_rot,
+        const uint64_t* rope01, const uint64_t* rope23, const uint64_t* rope45, int inverse) {
+    (void)canary;
+    (void)canary_tag;
+    ARENA_CTX_DEREF(ind_mask, 0, float*, dst);
+    ARENA_CTX_DEREF(ind_mask, 1, const float*, src);
+    ARENA_CTX_DEREF(ind_mask, 2, const int*, pos_per_b);
+    float theta_scale, freq_scale, ext_factor, mscale_eff, corr_low, corr_high;
+    ARENA_CTX_F32X2(rope01, theta_scale, freq_scale);
+    ARENA_CTX_F32X2(rope23, ext_factor, mscale_eff);
+    ARENA_CTX_F32X2(rope45, corr_low, corr_high);
+    rope_tail_batched_copy_body(dst, src, pos_per_b, n_head, head_dim, n_rot, theta_scale, freq_scale,
+                                ext_factor, mscale_eff, corr_low, corr_high, inverse);
 }

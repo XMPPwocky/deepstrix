@@ -80,3 +80,14 @@ template <typename U> struct ArenaCtxGlobal<U*> { typedef __attribute__((address
 
 // The XOR of resolved operand pointers ARENA_CTX_CANARY_LOAD records.
 #define ARENA_CTX_U64(ptr) ((uint64_t)(uintptr_t)(ptr))
+
+// A context slot holding two f32 VALUES (low word, high word) rather than a pointer: the per-layer
+// rope arguments ride in the entry itself (three slots), so a rope twin reads them in the same
+// dependent round as its pointer operands (a pointer to a per-layer struct would add a round).
+// `slotp` is the slot's address (a kernel argument), read as global memory (scalar load).
+#define ARENA_CTX_F32X2(slotp, lo, hi)                                                     \
+    do {                                                                                   \
+        const uint64_t v_ = *(const __attribute__((address_space(1))) uint64_t*)(slotp);   \
+        (lo) = __uint_as_float((uint32_t)v_);                                              \
+        (hi) = __uint_as_float((uint32_t)(v_ >> 32));                                      \
+    } while (0)

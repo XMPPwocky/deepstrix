@@ -80,6 +80,12 @@ impl Ind {
         self
     }
 
+    /// The device address of context slot `slot` (a value slot's argument, e.g. the rope pairs).
+    pub fn slot_addr(&self, slot: usize) -> u64 {
+        assert!(slot < ARENA_CTX_SLOTS);
+        self.ctx + 8 * slot as u64
+    }
+
     /// The kernel's `ind_mask`.
     pub fn mask(&self) -> u32 {
         self.slots.iter().enumerate().filter(|(_, s)| s.is_some()).fold(0, |m, (i, _)| m | (1 << i))

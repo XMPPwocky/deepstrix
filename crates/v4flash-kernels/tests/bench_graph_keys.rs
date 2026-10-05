@@ -897,3 +897,661 @@ fn delta_upper_bound_order_statistic() {
         assert_eq!(d.pos, n);
     }
 }
+
+/// Paired host enqueue cost per launch (us) of `a` vs `b`: `n` launches per run, each run
+/// behind `spin` (so the queue never fills), the order alternating pair to pair.
+fn host_ab(
+    s: &Stream,
+    n: usize,
+    pairs: usize,
+    spin: &dyn Fn(&Stream) -> eyre::Result<()>,
+    a: &mut dyn FnMut() -> eyre::Result<()>,
+    b: &mut dyn FnMut() -> eyre::Result<()>,
+) -> eyre::Result<(Stat, Stat, Delta)> {
+    a()?;
+    b()?;
+    let mut run = |use_b: bool| -> eyre::Result<f64> {
+        s.synchronize()?;
+        spin(s)?;
+        let t = Instant::now();
+        for _ in 0..n {
+            if use_b {
+                b()?
+            } else {
+                a()?
+            }
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        s.synchronize()?;
+        Ok(us)
+    };
+    let (mut ta, mut tb) = (Vec::new(), Vec::new());
+    for i in 0..pairs {
+        if i % 2 == 0 {
+            ta.push(run(false)?);
+            tb.push(run(true)?);
+        } else {
+            tb.push(run(true)?);
+            ta.push(run(false)?);
+        }
+    }
+    Ok((Stat::of(&ta), Stat::of(&tb), Delta::of(&ta, &tb)))
+}
+
+/// Step 0b of docs/v41/GRAPH_KEYS_DESIGN.md (2.11, rev 4.1): dGPU only, hub DOWN.
+///  1. Every twin at its call site's REAL shape, b = 1 / 4 / 8, bit-exact, 21 paired runs: the
+///     bpack gemv at q_a / q_b / kv / wo_b / shared down, the grouped wo_a, and the small twins
+///     `rms_quant_q8_1280_batched`, `kv_rms_rope_fp8`, `rope_tail_batched_copy` (rope arguments
+///     from context slots).
+///  2. The carrier (`mhc_fast_batched_ctx`) vs the direct `mhc_fast_batched`: bit-exact, the slot
+///     holding the entry afterwards, 1000 carrier -> `_ind_canary` reader rounds, paired GPU and
+///     host cost.
+///  3. R1: a direct `launch_fast` vs a replay of its captured 1-node graph, paired GPU and host;
+///     the uncached env reads a stage body makes today (diagnostic).
+///  4. Relaunch, K = 8 vs 80 (8-node graphs), 21 pairs.
+///  The per-point budget (2.11): carrier + R1 + relaunch + the twins of a lane-layer at their
+///  measured deltas, vs 1% of ms.step at b = 1 / 4 / 8. Last line STEP0B: GO / MARGINAL / NO-GO.
+///
+/// HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release \
+///   --features v41 -p v4flash-kernels --test bench_graph_keys graph_keys_step0b -- --ignored --nocapture
+#[test]
+#[ignore]
+fn graph_keys_step0b() -> eyre::Result<()> {
+    use std::collections::BTreeMap;
+    use v4flash_kernels::{RopeParams, RopeTail};
+    color_eyre::install().ok();
+    let (dev, arch) = pick_dgpu()?;
+    dev.set_current()?;
+    let e = DeviceEngine::for_arch(dev, &arch)?;
+    let ctxk = ArenaCtxKernels::for_arch(&arch)?;
+    let arena = MhcArena::for_arch(&arch)?;
+    let s = Stream::new(dev.id)?;
+    let mut slot = DeviceBuffer::<u64>::new(dev.id, ARENA_CTX_WORDS)?;
+    let ctx = slot.raw() as u64;
+    let mut exact = true;
+    let mut nogo: Vec<String> = Vec::new();
+    let mut bar = |ok: bool, item: String| {
+        if !ok {
+            nogo.push(item);
+        }
+    };
+    let tpm = {
+        e.q8.slack_probe_spin(&s, 1000)?;
+        s.synchronize()?;
+        let (e0, e1) = (Event::new()?, Event::new()?);
+        e0.record(&s)?;
+        e.q8.slack_probe_spin(&s, 2_000_000)?;
+        e1.record(&s)?;
+        e1.synchronize()?;
+        2_000_000.0 / Event::elapsed_ms(&e0, &e1)? as f64
+    };
+    let spin_ms = |ms: f64| (ms * tpm) as u64;
+    let prefill = |s: &Stream| e.q8.slack_probe_spin(s, spin_ms(1.5));
+    let bs = [1u32, 4, 8];
+    // (family, b) -> _ind - direct
+    let mut twin: BTreeMap<(String, u32), Delta> = BTreeMap::new();
+    let report = |name: &str, b: u32, sd_: Stat, si_: Stat, dt: Delta, diff: usize, retries: usize, drained: usize| {
+        println!(
+            "  {name:>12} b={b}: direct {sd_}, _ind {si_} ({:+.1}%); _ind - direct {dt}; differing outputs {diff}{}{}",
+            (si_.med / sd_.med - 1.0) * 100.0,
+            if retries > 0 { format!("; {retries} pairs re-run") } else { String::new() },
+            if drained > 0 { format!("; {drained} pairs still DRAINED, FAILS") } else { String::new() }
+        );
+    };
+
+    // ---- 1a. the bpack gemv twin at every call site's shape --------------------------------
+    println!("== 1. twins at the real shapes (21 pairs; 1.5 ms spin + warm-up)");
+    for (name, rows, k) in [
+        ("q_a", 1280usize, 5120usize),
+        ("q_b", 32768, 1280),
+        ("kv", 512, 5120),
+        ("wo_b", 5120, 8192),
+        ("shared_down", 5120, 2304),
+    ] {
+        let w = q8_weight(dev.id, rows, k, 31)?;
+        let xq = up(dev.id, &lcg_bytes(32, 8 * k).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
+        let xs = up(dev.id, &(0..8 * (k / 32)).map(|i| 0.002 + (i % 7) as f32 * 0.001).collect::<Vec<_>>())?;
+        let mut out_d = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
+        let mut out_i = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
+        let mut out_x = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
+        let mut ent = ArenaCtx::default();
+        ent.p[..4].copy_from_slice(&[out_i.raw() as u64, w.raw() as u64, xq.raw() as u64, xs.raw() as u64]);
+        ctxk.store(&s, &ent, &mut slot)?;
+        let ind = Ind::new(ctx).with(0, 0).with(1, 1).with(2, 2).with(3, 3);
+        for b in bs {
+            out_i.fill_zero()?;
+            let (sd_, si_, dt, drained, retries) = time_ab(
+                &s,
+                200,
+                21,
+                &prefill,
+                &mut || e.q8.matvec_bpack(&s, &mut out_d, &w, &xq, &xs, rows as u32, k as u32, b),
+                &mut || e.q8.matvec_bpack_ind(&s, ind, &mut out_x, &w, &xq, &xs, rows as u32, k as u32, b),
+            )?;
+            s.synchronize()?;
+            let n = b as usize * rows;
+            let diff = down(&out_d, n)?.iter().zip(down(&out_i, n)?).filter(|(a, c)| **a != *c).count();
+            exact &= diff == 0;
+            bar(diff == 0, format!("1:{name}:b{b}:bitexact"));
+            bar(drained == 0, format!("1:{name}:b{b}:drained"));
+            report(name, b, sd_, si_, dt, diff, retries, drained);
+            twin.insert((name.to_string(), b), dt);
+        }
+    }
+
+    // ---- 1b. the grouped wo_a twin (8 groups x 1024 rows x 4096) ------------------------------
+    {
+        let (group_dim, rank, n_groups) = (4096usize, 1024usize, 8usize);
+        let out_dim = rank * n_groups;
+        let w = q8_weight(dev.id, out_dim, group_dim, 33)?;
+        let kin = n_groups * group_dim;
+        let xq = up(dev.id, &lcg_bytes(34, 8 * kin).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
+        let xs = up(dev.id, &(0..8 * (kin / 32)).map(|i| 0.002 + (i % 5) as f32 * 0.001).collect::<Vec<_>>())?;
+        let mut out_d = DeviceBuffer::<f32>::new(dev.id, 8 * out_dim)?;
+        let mut out_i = DeviceBuffer::<f32>::new(dev.id, 8 * out_dim)?;
+        let mut out_x = DeviceBuffer::<f32>::new(dev.id, 8 * out_dim)?;
+        let mut ent = ArenaCtx::default();
+        ent.p[..4].copy_from_slice(&[out_i.raw() as u64, w.raw() as u64, xq.raw() as u64, xs.raw() as u64]);
+        ctxk.store(&s, &ent, &mut slot)?;
+        let ind = Ind::new(ctx).with(0, 0).with(1, 1).with(2, 2).with(3, 3);
+        let g = &e.q8_grouped;
+        for b in bs {
+            out_i.fill_zero()?;
+            let (gd, rk, ng) = (group_dim as u32, rank as u32, n_groups as u32);
+            let (sd_, si_, dt, drained, retries) = time_ab(
+                &s,
+                200,
+                21,
+                &prefill,
+                &mut || g.matvec_grouped_bpack(&s, &mut out_d, &w, &xq, &xs, gd, rk, ng, b),
+                &mut || g.matvec_grouped_bpack_ind(&s, ind, &mut out_x, &w, &xq, &xs, gd, rk, ng, b),
+            )?;
+            s.synchronize()?;
+            // b = 1 has no twin (the runtime kernel): the wrapper ran the direct kernel on out_x.
+            let got = if b == 1 { &out_x } else { &out_i };
+            let n = b as usize * out_dim;
+            let diff = down(&out_d, n)?.iter().zip(down(got, n)?).filter(|(a, c)| **a != *c).count();
+            exact &= diff == 0;
+            bar(diff == 0, format!("1:wo_a:b{b}:bitexact"));
+            bar(drained == 0, format!("1:wo_a:b{b}:drained"));
+            report("wo_a", b, sd_, si_, dt, diff, retries, drained);
+            twin.insert(("wo_a".to_string(), b), dt);
+        }
+    }
+
+    // ---- 1c. small twins ----------------------------------------------------------------------
+    let rope = RopeParams {
+        freq_base: 10000.0,
+        freq_scale: 0.025,
+        ext_factor: 1.0,
+        attn_factor: 1.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        n_ctx_orig: 65536,
+    };
+    let rope_words = RopeTail::arena_ctx_rope_words(&rope, 64);
+    const RS: [usize; 3] = [20, 21, 22];
+    let pos = up(dev.id, &[17i32, 4096, 65000, 3, 123456, 9, 31337, 77])?;
+    {
+        // rms_quant_q8_1280_batched
+        let x = up(dev.id, &lcg_f32(41, 8 * 1280, -3.0, 3.0))?;
+        let wt = up(dev.id, &lcg_f32(42, 1280, 0.5, 1.5))?;
+        let mk_f = |n: usize| DeviceBuffer::<f32>::new(dev.id, n);
+        let (mut od, mut oi, mut ox) = (mk_f(8 * 1280)?, mk_f(8 * 1280)?, mk_f(8 * 1280)?);
+        let (mut sdd, mut sdi, mut sdx) = (mk_f(8 * 40)?, mk_f(8 * 40)?, mk_f(8 * 40)?);
+        let mk_i = |n: usize| DeviceBuffer::<i8>::new(dev.id, n);
+        let (mut qd, mut qi, mut qx) = (mk_i(8 * 1280)?, mk_i(8 * 1280)?, mk_i(8 * 1280)?);
+        let mut ent = ArenaCtx::default();
+        ent.p[..5].copy_from_slice(&[
+            oi.raw() as u64,
+            qi.raw() as u64,
+            sdi.raw() as u64,
+            x.raw() as u64,
+            wt.raw() as u64,
+        ]);
+        ctxk.store(&s, &ent, &mut slot)?;
+        let ind = (0..5).fold(Ind::new(ctx), |ind, i| ind.with(i, i));
+        for b in bs {
+            oi.fill_zero()?;
+            sdi.fill_zero()?;
+            qi.fill_zero()?;
+            let (sd_, si_, dt, drained, retries) = time_ab(
+                &s,
+                200,
+                21,
+                &prefill,
+                &mut || e.rms_w.launch_weighted_quant_q8_1280(&s, &mut od, &mut qd, &mut sdd, &x, &wt, RMS_EPS, b),
+                &mut || {
+                    e.rms_w.launch_weighted_quant_q8_1280_ind(&s, ind, &mut ox, &mut qx, &mut sdx, &x, &wt, RMS_EPS, b)
+                },
+            )?;
+            s.synchronize()?;
+            let n = b as usize * 1280;
+            let mut diff = down(&od, n)?.iter().zip(down(&oi, n)?).filter(|(a, c)| **a != *c).count();
+            diff += down(&sdd, b as usize * 40)?
+                .iter()
+                .zip(down(&sdi, b as usize * 40)?)
+                .filter(|(a, c)| **a != *c)
+                .count();
+            let (mut hq, mut hqi) = (vec![0i8; 8 * 1280], vec![0i8; 8 * 1280]);
+            qd.copy_to_host(&mut hq)?;
+            qi.copy_to_host(&mut hqi)?;
+            diff += hq[..n].iter().zip(&hqi[..n]).filter(|(a, c)| a != c).count();
+            exact &= diff == 0;
+            bar(diff == 0, format!("1:rms_quant:b{b}:bitexact"));
+            bar(drained == 0, format!("1:rms_quant:b{b}:drained"));
+            report("rms_quant", b, sd_, si_, dt, diff, retries, drained);
+            twin.insert(("rms_quant".to_string(), b), dt);
+        }
+    }
+    {
+        // kv_rms_rope_fp8
+        let x = up(dev.id, &lcg_f32(43, 8 * 512, -3.0, 3.0))?;
+        let wt = up(dev.id, &lcg_f32(44, 512, 0.5, 1.5))?;
+        let (mut od, mut oi, mut ox) = (
+            DeviceBuffer::<f32>::new(dev.id, 8 * 512)?,
+            DeviceBuffer::<f32>::new(dev.id, 8 * 512)?,
+            DeviceBuffer::<f32>::new(dev.id, 8 * 512)?,
+        );
+        let mut ent = ArenaCtx::default();
+        ent.p[..4].copy_from_slice(&[oi.raw() as u64, x.raw() as u64, wt.raw() as u64, pos.raw() as u64]);
+        for (j, sl) in RS.iter().enumerate() {
+            ent.p[*sl] = rope_words[j];
+        }
+        ctxk.store(&s, &ent, &mut slot)?;
+        let ind = (0..4).fold(Ind::new(ctx), |ind, i| ind.with(i, i));
+        for b in bs {
+            oi.fill_zero()?;
+            let (sd_, si_, dt, drained, retries) = time_ab(
+                &s,
+                200,
+                21,
+                &prefill,
+                &mut || e.rope.launch_kv_rms_rope_fp8(&s, &mut od, &x, &wt, RMS_EPS, &pos, 64, b, &rope),
+                &mut || e.rope.launch_kv_rms_rope_fp8_ind(&s, ind, RS, &mut ox, &x, &wt, RMS_EPS, &pos, 64, b),
+            )?;
+            s.synchronize()?;
+            let n = b as usize * 512;
+            let diff = down(&od, n)?.iter().zip(down(&oi, n)?).filter(|(a, c)| **a != *c).count();
+            exact &= diff == 0;
+            bar(diff == 0, format!("1:kv_rms_rope:b{b}:bitexact"));
+            bar(drained == 0, format!("1:kv_rms_rope:b{b}:drained"));
+            report("kv_rms_rope", b, sd_, si_, dt, diff, retries, drained);
+            twin.insert(("kv_rms_rope".to_string(), b), dt);
+        }
+    }
+    {
+        // rope_tail_batched_copy (q: 64 heads x 512, n_rot 64)
+        let n_all = 8 * 64 * 512;
+        let src = up(dev.id, &lcg_f32(45, n_all, -2.0, 2.0))?;
+        let (mut dd, mut di, mut dx) = (
+            DeviceBuffer::<f32>::new(dev.id, n_all)?,
+            DeviceBuffer::<f32>::new(dev.id, n_all)?,
+            DeviceBuffer::<f32>::new(dev.id, n_all)?,
+        );
+        let mut ent = ArenaCtx::default();
+        ent.p[..3].copy_from_slice(&[di.raw() as u64, src.raw() as u64, pos.raw() as u64]);
+        for (j, sl) in RS.iter().enumerate() {
+            ent.p[*sl] = rope_words[j];
+        }
+        ctxk.store(&s, &ent, &mut slot)?;
+        let ind = (0..3).fold(Ind::new(ctx), |ind, i| ind.with(i, i));
+        for b in bs {
+            di.fill_zero()?;
+            let (sd_, si_, dt, drained, retries) = time_ab(
+                &s,
+                200,
+                21,
+                &prefill,
+                &mut || e.rope.launch_forward_batched_copy(&s, &mut dd, &src, &pos, 64, 512, 64, b, &rope),
+                &mut || e.rope.launch_forward_batched_copy_ind(&s, ind, RS, &mut dx, &src, &pos, 64, 512, 64, b),
+            )?;
+            s.synchronize()?;
+            let n = b as usize * 64 * 512;
+            let diff = down(&dd, n)?.iter().zip(down(&di, n)?).filter(|(a, c)| **a != *c).count();
+            exact &= diff == 0;
+            bar(diff == 0, format!("1:rope_copy:b{b}:bitexact"));
+            bar(drained == 0, format!("1:rope_copy:b{b}:drained"));
+            report("rope_copy", b, sd_, si_, dt, diff, retries, drained);
+            twin.insert(("rope_copy".to_string(), b), dt);
+        }
+    }
+
+    // ---- 2. the carrier --------------------------------------------------------------------------
+    println!("== 2. carrier mhc_fast_batched_ctx (pre_attn) vs direct mhc_fast_batched");
+    let (hcd, m, ne, bmax) = (HC_DIM as usize, HC_MIX_DIM as usize, N_EMBD as usize, 8usize);
+    let w_bits: Vec<u8> = lcg_bytes(11, 2 * m * hcd)
+        .chunks(2)
+        .flat_map(|c| {
+            ((((c[0] >> 7) as u16) << 15)
+                | ((10 + (c[0] as u16 % 5)) << 10)
+                | (((c[0] as u16) << 8 | c[1] as u16) & 0x3ff))
+                .to_le_bytes()
+        })
+        .collect();
+    let mw = up(dev.id, &w_bits)?;
+    let mx = up(dev.id, &lcg_f32(12, bmax * hcd, -2.0, 2.0))?;
+    let msc = up(dev.id, &[0.8f32, 1.3, 0.6])?;
+    let mbase = up(dev.id, &lcg_f32(13, m, -1.0, 1.0))?;
+    let mnw = up(dev.id, &lcg_f32(14, ne, 0.5, 1.5))?;
+    let carry0: Vec<f32> = lcg_f32(15, bmax * m, 0.0, 1.0)
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| if i % m < 4 { 0.1 + 0.5 * v } else { v - 0.5 })
+        .collect();
+    let (mut sd, mut sc) = (MhcSet::new(dev.id, bmax, &carry0)?, MhcSet::new(dev.id, bmax, &carry0)?);
+    // None = the direct kernel; Some(entry) = the carrier writing `entry`.
+    let go = |set: &mut MhcSet, carrier: Option<&ArenaCtx>, slot: &mut DeviceBuffer<u64>, b: u32| -> eyre::Result<()> {
+        let mix = FastMix {
+            weight: &mw,
+            x: &mx,
+            scale: &msc,
+            base: &mbase,
+            mode: MIX_PRE_SCALED,
+            split_out: &mut set.split,
+            mix_out: &mut set.mix,
+            counters: &mut set.cnt,
+            inv_rows: &mut set.inv,
+        };
+        let col = FastCollapse { x: &mx, cur_out: &mut set.cur, norm_out: &mut set.norm, norm_w: &mnw };
+        match carrier {
+            None => arena.launch_fast(
+                &s,
+                Some(mix),
+                Some(col),
+                &mut set.carry,
+                true,
+                HC_DIM,
+                RMS_EPS,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+                b,
+            ),
+            Some(ent) => arena.launch_fast_carrier(
+                &s,
+                ent,
+                slot,
+                Some(mix),
+                Some(col),
+                &mut set.carry,
+                true,
+                HC_DIM,
+                RMS_EPS,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+                b,
+            ),
+        }
+    };
+    let mut probe = ArenaCtx::default();
+    for (i, p) in probe.p.iter_mut().enumerate() {
+        *p = 0xC0DE_0000 + 16 * i as u64;
+    }
+    probe.seq = 0x5EED;
+    let mut carrier_d = BTreeMap::new();
+    for b in bs {
+        sd.reset(&carry0)?;
+        sc.reset(&carry0)?;
+        slot.fill_zero()?;
+        go(&mut sd, None, &mut slot, b)?;
+        go(&mut sc, Some(&probe), &mut slot, b)?;
+        s.synchronize()?;
+        let (rd, rc) = (sd.dump(b as usize)?, sc.dump(b as usize)?);
+        let diff: usize = rd.iter().zip(&rc).map(|(a, c)| a.iter().zip(c).filter(|(x, y)| x != y).count()).sum();
+        let mut hs = vec![0u64; ARENA_CTX_WORDS];
+        slot.copy_to_host(&mut hs)?;
+        let slot_ok = hs[..32] == probe.p[..] && hs[32] == probe.seq && hs[33] == probe.log;
+        exact &= diff == 0 && slot_ok;
+        bar(diff == 0, format!("2:carrier:b{b}:bitexact"));
+        bar(slot_ok, format!("2:carrier:b{b}:slot"));
+        let (mut d1, mut d2) = (MhcSet::new(dev.id, bmax, &carry0)?, MhcSet::new(dev.id, bmax, &carry0)?);
+        let mut slot2 = DeviceBuffer::<u64>::new(dev.id, ARENA_CTX_WORDS)?;
+        let mut unused = DeviceBuffer::<u64>::new(dev.id, ARENA_CTX_WORDS)?; // the direct arm writes no slot
+        let (sd_, si_, dt, drained, retries) =
+            time_ab(&s, 200, 21, &prefill, &mut || go(&mut d1, None, &mut unused, b), &mut || {
+                go(&mut d2, Some(&probe), &mut slot2, b)
+            })?;
+        bar(drained == 0, format!("2:carrier:b{b}:drained"));
+        let (hd, hc, dh) = host_ab(
+            &s,
+            100,
+            21,
+            &|s: &Stream| e.q8.slack_probe_spin(s, spin_ms(5.0)),
+            &mut || go(&mut d1, None, &mut unused, b),
+            &mut || go(&mut d2, Some(&probe), &mut slot2, b),
+        )?;
+        println!(
+            "  b={b}: GPU direct {sd_}, carrier {si_}; carrier - direct {dt}{}; host direct {hd}, carrier {hc}, delta {dh}; outputs differing {diff}, slot {}",
+            if retries > 0 { format!(" ({retries} pairs re-run)") } else { String::new() },
+            if slot_ok { "holds the entry" } else { "WRONG" }
+        );
+        carrier_d.insert(b, (dt, dh));
+    }
+    // Carrier -> reader coherence: the carrier writes round i's entry, a captured `_ind_canary` gemv
+    // graph reads it (outputs and canary records checked).
+    {
+        let (rows_c, k_c, rounds) = (64usize, 256usize, 1000usize);
+        let w0 = q8_weight(dev.id, rows_c, k_c, 7)?;
+        let w1 = q8_weight(dev.id, rows_c, k_c, 8)?;
+        let xq_c = up(dev.id, &lcg_bytes(9, k_c).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
+        let xs_c = up(dev.id, &vec![0.01f32; k_c / 32])?;
+        let mut tmp = DeviceBuffer::<f32>::new(dev.id, rows_c)?;
+        let mut refs = Vec::new();
+        for wj in [&w0, &w1] {
+            e.q8.matvec_bpack(&s, &mut tmp, wj, &xq_c, &xs_c, rows_c as u32, k_c as u32, 1)?;
+            s.synchronize()?;
+            refs.push(down(&tmp, rows_c)?);
+        }
+        let outs = DeviceBuffer::<f32>::new(dev.id, rounds * rows_c)?;
+        let log = CanaryLog::new(dev.id, rounds as u32)?;
+        const SL: [usize; 4] = [0, 9, 18, 27];
+        let ind = Ind::new(ctx).with(0, SL[0]).with(1, SL[1]).with(2, SL[2]).with(3, SL[3]).with_canary(7);
+        let (_, exec) = capture(&s, &mut |s| {
+            e.q8.matvec_bpack_ind(s, ind, &mut tmp, &w0, &xq_c, &xs_c, rows_c as u32, k_c as u32, 1)
+        })?;
+        let mut cset = MhcSet::new(dev.id, bmax, &carry0)?;
+        for i in 0..rounds {
+            let mut ent = ArenaCtx::default();
+            ent.p[SL[0]] = outs.raw() as u64 + (i * rows_c * 4) as u64;
+            ent.p[SL[1]] = [&w0, &w1][i % 2].raw() as u64;
+            ent.p[SL[2]] = xq_c.raw() as u64;
+            ent.p[SL[3]] = xs_c.raw() as u64;
+            ent.seq = i as u64;
+            ent.log = log.buf.raw() as u64;
+            go(&mut cset, Some(&ent), &mut slot, 1)?;
+            exec.launch(&s)?;
+        }
+        s.synchronize()?;
+        let host = down(&outs, rounds * rows_c)?;
+        let bad = (0..rounds).filter(|&i| host[i * rows_c..(i + 1) * rows_c] != refs[i % 2][..]).count();
+        let (cursor, recs) = log.read()?;
+        let want_xor = |i: usize| {
+            (outs.raw() as u64 + (i * rows_c * 4) as u64)
+                ^ [&w0, &w1][i % 2].raw() as u64
+                ^ xq_c.raw() as u64
+                ^ xs_c.raw() as u64
+        };
+        let bad_rec = recs
+            .iter()
+            .enumerate()
+            .filter(|&(i, r)| r.seq != i as u64 || r.tag != 7 || r.ptr_xor != want_xor(i))
+            .count();
+        let ok = bad == 0 && cursor as usize == rounds && bad_rec == 0;
+        exact &= ok;
+        bar(ok, "2:carrier:coherence".into());
+        println!("  carrier -> reader, {rounds} rounds: {bad} stale outputs; canary {cursor} records, {bad_rec} wrong");
+    }
+
+    // ---- 3. R1: direct launch vs a 1-node graph replay -----------------------------------------
+    println!("== 3. R1: direct launch_fast vs replay of its captured 1-node graph (b = 4, pre_attn)");
+    let r1 = {
+        let b = 4u32;
+        let mut d1 = MhcSet::new(dev.id, bmax, &carry0)?;
+        let mut d2 = MhcSet::new(dev.id, bmax, &carry0)?;
+        let mut slot2 = DeviceBuffer::<u64>::new(dev.id, ARENA_CTX_WORDS)?;
+        let (nodes, g1) = capture(&s, &mut |_s| go(&mut d2, None, &mut slot2, b))?;
+        let (gg, gd, dg, drained, _) =
+            time_ab(&s, 200, 21, &prefill, &mut || g1.launch(&s), &mut || go(&mut d1, None, &mut slot2, b))?;
+        bar(drained == 0, "3:r1:drained".into());
+        let (hg, hd, dh) = host_ab(
+            &s,
+            100,
+            21,
+            &|s: &Stream| e.q8.slack_probe_spin(s, spin_ms(5.0)),
+            &mut || g1.launch(&s),
+            &mut || go(&mut d1, None, &mut slot2, b),
+        )?;
+        println!("  graph ({nodes} node) GPU {gg}, direct {gd}; direct - graph {dg}");
+        println!("  host per launch: graph {hg}, direct {hd}; direct - graph {dh}");
+        // Diagnostic: the env reads the four stage bodies make per call today (become LazyLock).
+        let t = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..1000 {
+            for k in ["V41_MHC_PRE_SCALED_MAX", "V41_MHC_NARROW_FALLBACK", "V41_ROUTER_WMMA", "V41_MHC_PRE_SCALED_MAX"]
+            {
+                sink += std::env::var(k).map(|v| v.len()).unwrap_or(0);
+            }
+        }
+        println!(
+            "  4 uncached env reads: {:.2} us per lane-layer (removed by LazyLock) [{sink}]",
+            t.elapsed().as_secs_f64() * 1e6 / 1000.0
+        );
+        (dg, dh)
+    };
+
+    // ---- 4. relaunch, K = 8 vs 80, 8-node graphs --------------------------------------------------
+    println!("== 4. relaunch: 80 launches round-robin over K = 8 vs 80 8-node executables, 21 pairs");
+    let relaunch = {
+        let (rows, k) = (1280usize, 5120usize);
+        let w = q8_weight(dev.id, rows, k, 1)?;
+        let xq = up(dev.id, &lcg_bytes(2, 8 * k).iter().map(|&b| b as i8).collect::<Vec<_>>())?;
+        let xs = up(dev.id, &vec![0.01f32; 8 * (k / 32)])?;
+        let mut out = DeviceBuffer::<f32>::new(dev.id, 8 * rows)?;
+        let mut body = |s: &Stream| -> eyre::Result<()> {
+            for b in 1..=8u32 {
+                e.q8.matvec_bpack(s, &mut out, &w, &xq, &xs, rows as u32, k as u32, b)?;
+            }
+            Ok(())
+        };
+        let execs: Vec<GraphExec> =
+            (0..90).map(|_| capture(&s, &mut body).map(|c| c.1)).collect::<eyre::Result<_>>()?;
+        let run = |kk: usize| -> eyre::Result<(f64, f64, bool)> {
+            s.synchronize()?;
+            let (e0, e1) = (Event::new()?, Event::new()?);
+            e.q8.slack_probe_spin(&s, spin_ms(1.0))?;
+            for x in &execs[80..90] {
+                x.launch(&s)?;
+            }
+            e0.record(&s)?;
+            let t = Instant::now();
+            for i in 0..80 {
+                execs[i % kk].launch(&s)?;
+            }
+            let host_us = t.elapsed().as_secs_f64() * 1e6 / 80.0;
+            let drained = e0.query()?;
+            e1.record(&s)?;
+            e1.synchronize()?;
+            Ok((host_us, Event::elapsed_ms(&e0, &e1)? as f64 * 1e3 / 80.0, drained))
+        };
+        let (mut g8, mut g80, mut h8, mut h80) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut any_drained = false;
+        for i in 0..21 {
+            for attempt in 0..4 {
+                let order = if i % 2 == 0 { [8usize, 80] } else { [80, 8] };
+                let r0 = run(order[0])?;
+                let r1_ = run(order[1])?;
+                if (r0.2 || r1_.2) && attempt < 3 {
+                    continue;
+                }
+                any_drained |= r0.2 || r1_.2;
+                let (r8, r80) = if order[0] == 8 { (r0, r1_) } else { (r1_, r0) };
+                g8.push(r8.1);
+                h8.push(r8.0);
+                g80.push(r80.1);
+                h80.push(r80.0);
+                break;
+            }
+        }
+        bar(!any_drained, "4:relaunch:drained".into());
+        let (dg, dh) = (Delta::of(&g80, &g8), Delta::of(&h80, &h8));
+        println!("  K=8 {} vs K=80 {}; GPU {dg}; host {dh}", Stat::of(&g8), Stat::of(&g80));
+        (dg, dh)
+    };
+
+    // ---- the per-point budget (2.11, rev 4.1) ----------------------------------------------------
+    // Per lane-layer: the carrier's delta (instead of a standalone write); R1's direct - graph delta
+    // x 4 single-launch stages; 4 multi-node graph launches at the relaunch delta; the twins at their
+    // measured deltas -- q_a, q_b, kv, wo_b, shared_down, wo_a measured, the shared gate/up charged
+    // at the largest gemv delta, rms_quant / kv_rms_rope / rope_copy measured and 4 more small
+    // families at the largest small delta. 80 lane-layers (2 lanes x 40 layers) at b = 1 / 4 / 8
+    // per lane, ms.step 60 / 121.6 / 196.8 ms (GK_STEP_MS_B{1,4,8}).
+    let lane_layers = 80.0;
+    let env_ms = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let points = [
+        (1u32, env_ms("GK_STEP_MS_B1", 60.0)),
+        (4, env_ms("GK_STEP_MS_B4", 121.6)),
+        (8, env_ms("GK_STEP_MS_B8", 196.8)),
+    ];
+    let ch = |d: &Delta, ub: bool| if ub { d.charge_ub() } else { d.charge() };
+    let gemv_sites = ["q_a", "q_b", "kv", "wo_b", "shared_down"];
+    let small = ["rms_quant", "kv_rms_rope", "rope_copy"];
+    // (GPU, host) us per step at b
+    let cost = |b: u32, ub: bool| -> (f64, f64) {
+        let t = |name: &str| ch(&twin[&(name.to_string(), b)], ub);
+        let gemv_max = gemv_sites.iter().map(|n| t(n)).fold(0.0, f64::max);
+        let small_max = small.iter().map(|n| t(n)).fold(0.0, f64::max);
+        let twins = gemv_sites.iter().map(|n| t(n)).sum::<f64>()
+            + gemv_max
+            + t("wo_a")
+            + small.iter().map(|n| t(n)).sum::<f64>()
+            + 4.0 * small_max;
+        let (cg, chh) = &carrier_d[&b];
+        let gpu = lane_layers * (ch(cg, ub) + 4.0 * ch(&r1.0, ub) + 4.0 * ch(&relaunch.0, ub) + twins);
+        let host = lane_layers * (ch(chh, ub) + 4.0 * ch(&r1.1, ub) + 4.0 * ch(&relaunch.1, ub));
+        (gpu, host)
+    };
+    println!("== per-step budget (rev 4.1), 2 lanes x 40 layers:");
+    let mut verdicts = Vec::new();
+    for &(b, step_ms) in &points {
+        let budget = 0.01 * step_ms * 1e3;
+        let pct = |us: f64| us / (step_ms * 1e3) * 100.0;
+        let (g_med, h_med) = cost(b, false);
+        let (g_ub, h_ub) = cost(b, true);
+        let (med, ub) = (g_med + h_med, g_ub + h_ub);
+        let v = if med <= budget && ub <= budget {
+            "GO"
+        } else if med <= budget || (g_med <= budget && h_med <= budget) {
+            "MARGINAL"
+        } else {
+            "NO-GO"
+        };
+        println!(
+            "  b={b} at {step_ms:.1} ms (1% = {budget:.0} us): total {med:.0} us = {:.2}% (GPU {:.2}%, host {:.2}%), upper bounds {:.2}% -> {v}",
+            pct(med),
+            pct(g_med),
+            pct(h_med),
+            pct(ub)
+        );
+        verdicts.push((b, v, pct(med), pct(ub)));
+    }
+    let budget_verdict = if verdicts.iter().any(|v| v.1 == "NO-GO") {
+        "NO-GO"
+    } else if verdicts.iter().all(|v| v.1 == "GO") {
+        "GO"
+    } else {
+        "MARGINAL"
+    };
+    let summary =
+        verdicts.iter().map(|(b, v, m, u)| format!("b{b} {v} {m:.2}%/{u:.2}%")).collect::<Vec<_>>().join(", ");
+    if !nogo.is_empty() {
+        println!("STEP0B: NO-GO ({})", nogo.join(", "));
+    } else if budget_verdict == "GO" {
+        println!("STEP0B: GO ({summary})");
+    } else {
+        println!("STEP0B: {budget_verdict} (budget per point, medians/upper bounds: {summary})");
+    }
+    if !exact {
+        return Err(eyre!("graph_keys step 0b: a bit-exactness, slot or coherence check failed"));
+    }
+    Ok(())
+}

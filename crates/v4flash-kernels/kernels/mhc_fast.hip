@@ -299,3 +299,46 @@ extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ind_cana
     MHC_FAST_IND_BODY
     ARENA_CTX_CANARY_STORE(canary_tag);
 }
+
+// The CARRIER (GRAPH_KEYS_DESIGN.md 2.11 R2): the direct kernel plus the lane-layer's context write.
+// Grid x + 1: the LAST x workgroup copies `ctx_entry` into the slot (z = 0) and returns before the
+// body for every z; every other workgroup runs the direct body (`n_part` comes from the arguments,
+// so the extra workgroup is never counted). The entry and the slot are the LAST arguments, so every
+// original argument keeps its kernarg offset.
+extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ctx(
+        float          *              split_out,   // [B, 24]            (mix)
+        float          *              mix_out,     // [B, 24]            (mix; read back by the tail)
+        unsigned int   *              counters,    // [B], zero between launches (mix)
+        float          *              inv_rows,    // [B] pre-scaled RMS scalar (mode 0 + mix)
+        const __half   * __restrict__ weight,      // [24, K]            (mix)
+        const float    * __restrict__ x,           // [B, K] mix input
+        const float    * __restrict__ scale,       // [3]
+        const float    * __restrict__ base,        // [24]
+        float          *              carry,       // [B, 24]: read by the collapse, written by the tail if write_carry
+        const float    * __restrict__ cx,          // [B, K] collapse input (4 copies x n_embd)
+        float          * __restrict__ cur_out,     // [B, n_embd] hc_weighted_sum output
+        float          * __restrict__ norm_out,    // [B, n_embd] rms_norm_weighted output
+        const float    * __restrict__ norm_w,      // [n_embd]
+        unsigned int     k,                        // == MF_K (runtime, as the replaced kernels divide by it)
+        unsigned int     ne,                       // == MF_NE (idem)
+        unsigned int     n_mix,                    // 24 or 0
+        unsigned int     do_collapse,              // 0 / 1
+        unsigned int     write_carry,              // 0 / 1
+        unsigned int     mode,                     // 0 pre-scaled, 1 normed
+        float            rms_eps,
+        unsigned int     n_hc,
+        unsigned int     iters,
+        float            eps,
+        ArenaCtx         ctx_entry,                // the lane-layer's entry, by value (LAST)
+        ArenaCtx       * __restrict__ ctx_dst) { // the context slot
+    if (blockIdx.x == gridDim.x - 1u) {
+        if (blockIdx.z == 0u) {
+            const uint32_t t = threadIdx.x;
+            if (t < ARENA_CTX_SLOTS) ctx_dst->p[t] = ctx_entry.p[t];
+            if (t == 0) ctx_dst->seq = ctx_entry.seq;
+            if (t == 1) ctx_dst->log = ctx_entry.log;
+        }
+        return;
+    }
+#include "mhc_fast_body.inc"
+}
