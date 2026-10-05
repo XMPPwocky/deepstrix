@@ -1,8 +1,9 @@
 # Arena stage graphs keyed by (stage, rows) only
 
-Status: DESIGN rev 3.1, 2026-10-04 -- APPROVED (review round 1 NEEDS REWORK, round 2 APPROVE
-WITH CHANGES, round 3 APPROVE; dispositions in section 7). Step 0 code (2.0) review-APPROVED
-(2 rounds); next: Step 0 on the GPU (hub-only window).
+Status: DESIGN rev 4 (2026-10-05), for review. Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
+review-APPROVED (2 rounds); Step 0 runs 1-3 were NO-GO (run 3 narrowly: 1.03 / 1.08 / 1.23% of the
+step at b = 1 / 4 / 8). Owner 2026-10-05: revise first (rev 4 = section 2.11), then merge the
+production build (worktree-embed-phase, hub ce52ee3c).
 Branch `worktree-ms-dspark2` (on eb84ebb).
 
 ## 0. Problem
@@ -273,9 +274,85 @@ proves memory contents, not what the kernels read.)
 ### 2.9 Graph count, memory, cost
 
 Indirect: 8 stages x distinct b (1..8; rows 9-16 per lane fall back to legacy) x topo classes (1) =
-~64 graphs per process, whatever the stream mix. Cost per lane-layer: one `ctx_store` launch
+~64 graphs per process, whatever the stream mix (rev 4: 4 multi-node stages, ~32; the single-launch
+stages run direct, 2.11). Cost per lane-layer: one `ctx_store` launch
 (skipped when the entry is unchanged) plus one uniform load per operand per kernel; Step 0 gates
 both. The eb84ebb reserve stays.
+
+### 2.11 Revision 4: single-launch stages run direct; the context write rides along
+
+Step 0 run 3 priced what is left after the FLAT and canary fixes: the indirection itself, one more
+dependent scalar load round per workgroup (kernel argument -> slot -> real pointer), +0.1..1.6 us
+per twin launch, plus the separate `ctx_store` dispatch at 2.90 us GPU + 0.83 us host per
+lane-layer (298 us / step, the largest fixed item). Rev 4 removes the indirection where it buys
+nothing and the separate write.
+
+R1. Single-launch stages run DIRECT. On the production path (`V41_MS_MHC_SPLIT=0`, `V41_MHC_FAST`,
+`V41_MHC_ARENA_FUSED`, `V41_MHC_FFN_LATE` on; b <= 8) four of the eight stage graphs of a
+lane-layer hold exactly one kernel: `g.mhc_pre_attn` (`mhc_fast_batched`, forward_prefill.rs
+4785), `g.mhc_pre_ffn` (`mhc_fast_batched`, collapse only, 7671), `g.router_matvec`
+(`matvec_batched_router`, 7821) and `g.mhc_mix_ffn_late` (`mhc_fast_batched`, 8220). A one-node
+graph saves no launch: in `stage_b` mode these four run uncaptured, with their direct kernels and
+direct operands (no twin, no context read, no graph). A stage takes this path only when its body
+is that single launch (the fast-path conditions it already tests); any other body (mHC split, a
+non-fast mHC, b > 8) keeps today's legacy capture. Twin families drop `mhc_fast_batched` and the
+router's f16 matvec; graphs per process drop to 4 stages (q_chain, kv_chain, output_proj, the shared
+expert) x b x topo ~ 32.
+
+R2. The context write rides along the first stage. In `stage_b` mode `mhc_pre_attn`'s direct launch
+carries the lane-layer's entry BY VALUE (272 B; the launch's kernel arguments grow ~160 -> ~440 B,
+well under 4 KB) and a twin of its kernel, `mhc_fast_batched_ctx`, runs ONE extra workgroup (grid
+x + 1; z = 0 only) that copies the entry into the slot and returns before the body; every other
+workgroup runs the body. The kernel keeps the direct kernel's signature plus two arguments and
+`#include`s `mhc_fast_body.inc` after the early-return branch, so its body is the direct body
+(checked offline, 2.3's disassembly gate) and no store precedes the body's loads on any path. The
+Sinkhorn tail's workgroup count (`n_part`) excludes the extra workgroup. `ensure_ctx` sets its
+shadow to the carried entry, so the next stages see no change and enqueue nothing. Ordering: the
+same stream, so q_chain's graph reads the slot after the carrier kernel completes. One write per
+lane-layer holds in every arena driver (`_pipelined`, `_lanes`, `_ready_first`): each captured
+stage of a lane-layer, the shared expert included (issued inside `pre_moe_chain` unless
+`V41_PREFILL_PRESUBMIT`, forward_prefill.rs 8209-8212), runs inside ONE `pre_moe_chain` call; the
+drivers interleave lanes only between the chain and the route / prep / launch phases, which read no
+context (under presubmit the deferred shared expert, 9678, re-writes through `ensure_ctx`). Whenever the
+carrier does not run (mHC split, the non-fast mHC path, a layer whose first captured stage is
+another one), `ensure_ctx` falls back to the standalone `arena_ctx_store` (2.2) -- correctness never
+depends on the carrier.
+
+R3. Measure, do not assume (Step 0b, below): every twin at its call site's real shape, the grouped
+`wo_a` twin and three small twins built for it, the carrier's cost, and a direct launch vs a 1-node
+graph (R1's host and GPU cost).
+
+R4. Fallback if b = 8 stays over after R1-R3 (design sketch only, not built unless needed): make the
+slot address static so its loads issue WITH the kernel-argument loads instead of after them -- one
+`__device__ ArenaCtx` per module that holds twins (the carrier writes each, ~6 x 272 B from one
+workgroup) and compile-time slot indices per call site (template parameters), so each slot load is
+PC-relative and independent of the kernel arguments. That removes the dependent round, the residual
+cost of R1-R3.
+
+Budget with R1-R2 on run 3's numbers, every remaining twin still charged at the q_b gemv's delta
+(conservative): writes ~0 (the carrier adds one workgroup and 272 B of kernel arguments; host ~0.2
+us), relaunch 320 multi-node launches at -0.05 us (ub 0.12), twins 80 x 14 (8 gemv-like + ~6
+small): b = 1 0.36% (ub 0.45%), b = 4 0.64% (ub 0.91%), b = 8 0.91% (ub 1.03%). R3's real shapes
+decide b = 8.
+
+#### Step 0b (one hub-only window, tests/bench_graph_keys.rs extended)
+
+1. Twins at the real shapes, b = 1 / 4 / 8, 21 paired runs each, bit-exact: the bpack gemv twin at
+   q_a (1280 x 5120), q_b (32768 x 1280), the kv projection, wo_b (5120 x 8192) and the shared
+   down (5120 x 2304) shapes; the grouped `wo_a` twin (8 x 1024 x 4096); `rms_quant_q8_1280_batched`,
+   `rope_tail_batched_copy` and `kv_rms_rope_fp8` twins (built for this; the remaining small
+   families are charged at the largest small-twin delta measured).
+2. The carrier: `mhc_fast_batched_ctx` (entry by value, extra workgroup) vs the direct
+   `mhc_fast_batched`, paired (GPU and host), bit-exact, and the slot holding the entry afterwards
+   (a following `_ind` launch reads it: coherence with the canary variant).
+3. R1: a direct `launch_fast` vs a captured 1-node graph of it, paired, host and GPU per launch.
+4. Sections 2 (relaunch, K = 8 vs 80, multi-node graphs only), 3 and 5 as in run 3.
+
+Budget (2.0) recomputed: no standalone writes on the carrier path (the carrier's measured delta per
+lane-layer instead); 320 graph launches (4 multi-node stages x 80) at the multi-node relaunch delta;
+R1's direct-vs-graph delta x 320; per lane-layer the measured twin deltas of the q_chain, kv_chain,
+output_proj and shared-expert kernels at their own shapes, unmeasured small families at the largest
+measured small-twin delta. Same points (b = 1 / 4 / 8 at 60 / 121.6 / 196.8 ms), same verdicts.
 
 ### 2.10 Alternatives considered
 
