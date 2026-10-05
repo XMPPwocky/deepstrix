@@ -96,10 +96,10 @@
 //!        lane-layer (standalone writes with the carrier off), every multi-node
 //!        stage captured, replayed or (paused) ran uncaptured each lane-layer,
 //!        none tainted. Then a final-state probe (one more row, not accepted,
-//!        legacy keys) from every stage_b arena == from its legacy arena; and the
-//!        same probes again under stage_b (the one-lane driver, b = 1, plus every
-//!        stream of G5e's arena in one lane, b = n) == their legacy run, with the
-//!        counters checked as above.
+//!        legacy keys; every arena's rows in one lane, chunks of <= 8) from every
+//!        stage_b arena == from its legacy arena; and the same probes again under
+//!        stage_b (the one-lane driver; plus each stream of G5e's arena alone,
+//!        b = 1) == their legacy run, with the counters checked as above.
 //!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
@@ -1436,8 +1436,10 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         MS_TAINT_PROBE.set("0");
 
         // The state each arm LEFT (as G5g): one more step (not accepted: the same step can run
-        // again) from every row of every arena, one lane, b = 1; and every stream of G5e's
-        // arena_rf in one lane (b = n). Run under legacy keys, then again under stage_b.
+        // again) over every row of every arena in ONE lane, in chunks of <= 8 rows (the gated b;
+        // the same rows and tokens on two arenas = the same batch), plus every stream of G5e's
+        // arena_rf alone (b = 1). Under legacy keys, then again under stage_b (the one-lane
+        // driver). Batched: a gate step costs ~1.4 s whatever its rows (10-04 log).
         let mut probe = |arena: &mut KvArena, slots: &[u32], toks: &[i32]| -> eyre::Result<Vec<f32>> {
             let hcs = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<Vec<_>>>()?;
             engine.forward_step_arena(
@@ -1447,19 +1449,41 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             engine.head_rows(&mut ds, &bd_a, slots.len(), &weights)
         };
         let toks0: Vec<i32> = (0..n_streams).map(|s| cont[s][0]).collect();
-        let mut probe_all = || -> eyre::Result<(Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>, Option<Vec<f32>>)> {
-            let rf = (0..n_streams).map(|s| probe(&mut arena_rf, &[slots_rf[s]], &[toks0[s]])).collect::<eyre::Result<_>>()?;
+        let chunks = |n: usize| -> Vec<std::ops::Range<usize>> { (0..n).step_by(8).map(|c| c..(c + 8).min(n)).collect() };
+        // (each stream of arena_rf alone, arena_rf's rows, every G6 arena's rows): row-major logits
+        let mut probe_all = || -> eyre::Result<(Vec<Vec<f32>>, Vec<f32>, Vec<Vec<f32>>)> {
+            let alone = (0..n_streams).map(|s| probe(&mut arena_rf, &[slots_rf[s]], &[toks0[s]])).collect::<eyre::Result<_>>()?;
+            let rf = chunks(n_streams).into_iter().map(|r| probe(&mut arena_rf, &slots_rf[r.clone()], &toks0[r])).collect::<eyre::Result<Vec<_>>>()?.concat();
             let mut g6 = Vec::new();
             for (i, (_, sch)) in g6_arms.iter().enumerate() {
-                let rows_s = &g6_sched[*sch].1;
-                g6.push((0..rows_s.len()).map(|j| probe(&mut arena_g6[i], &[slots_g6[i][j]], &[toks0[rows_s[j]]])).collect::<eyre::Result<_>>()?);
+                let toks: Vec<i32> = g6_sched[*sch].1.iter().map(|&s| toks0[s]).collect();
+                g6.push(chunks(toks.len()).into_iter().map(|r| probe(&mut arena_g6[i], &slots_g6[i][r.clone()], &toks[r])).collect::<eyre::Result<Vec<_>>>()?.concat());
             }
-            let all = if n_streams <= 8 { Some(probe(&mut arena_rf, &slots_rf, &toks0)?) } else { None };
-            Ok((rf, g6, all))
+            Ok((alone, rf, g6))
+        };
+        let row = |v: &[f32], j: usize| v[j * nv..(j + 1) * nv].to_vec();
+        // Rows of `b` differing from `a` (same layout).
+        let rows_differ = |a: &[f32], b: &[f32]| -> Vec<usize> { (0..a.len() / nv).filter(|&j| max_abs_diff(&row(a, j), &row(b, j)) != 0.0).collect() };
+        let compare = |x: &(Vec<Vec<f32>>, Vec<f32>, Vec<Vec<f32>>), y: &(Vec<Vec<f32>>, Vec<f32>, Vec<Vec<f32>>)| -> Vec<String> {
+            let mut bad = Vec::new();
+            for s in 0..n_streams {
+                if max_abs_diff(&x.0[s], &y.0[s]) != 0.0 {
+                    bad.push(format!("arena_rf stream {s} alone"));
+                }
+            }
+            for j in rows_differ(&x.1, &y.1) {
+                bad.push(format!("arena_rf row {j}"));
+            }
+            for (i, (arm, _)) in g6_arms.iter().enumerate() {
+                for j in rows_differ(&x.2[i], &y.2[i]) {
+                    bad.push(format!("{arm} row {j}"));
+                }
+            }
+            bad
         };
         engine.dgpu.compute.synchronize()?;
         engine.dgpu_graphs.clear();
-        let (probe_rf, probe_g6, all_rf) = probe_all()?;
+        let pass_legacy = probe_all()?;
         // The one-lane driver (`forward_step_arena`) under stage_b: the same probes, bit for bit.
         // The taint arm's legacy marks go first (its (stage, rows) would otherwise run legacy).
         engine.stage_b.clear_legacy_marks();
@@ -1467,26 +1491,16 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         engine.dgpu_graphs.clear();
         MS_GRAPH_KEYS.set("stage_b");
         engine.stage_b.reset_counters();
-        let probes_b = probe_all();
+        let pass_b = probe_all();
         MS_GRAPH_KEYS.set("legacy");
-        let (probe_rf_b, probe_g6_b, all_rf_b) = probes_b?;
-        let mut one_bad: Vec<String> = Vec::new();
-        for s in 0..n_streams {
-            if max_abs_diff(&probe_rf_b[s], &probe_rf[s]) != 0.0 {
-                one_bad.push(format!("arena_rf row {s}"));
-            }
-        }
-        for (i, (arm, _)) in g6_arms.iter().enumerate() {
-            for j in 0..probe_g6[i].len() {
-                if max_abs_diff(&probe_g6_b[i][j], &probe_g6[i][j]) != 0.0 {
-                    one_bad.push(format!("{arm} row {j}"));
-                }
-            }
-        }
-        if let (Some(a), Some(b)) = (&all_rf, &all_rf_b) {
-            if max_abs_diff(b, a) != 0.0 {
-                one_bad.push(format!("arena_rf, {n_streams} rows in one lane"));
-            }
+        let pass_b = pass_b?;
+        let mut one_bad = compare(&pass_b, &pass_legacy);
+        if !one_bad.is_empty() {
+            // Diagnostic: does the legacy pass even reproduce itself? (probe nondeterminism vs a
+            // stage_b fault)
+            let again = probe_all()?;
+            let self_bad = compare(&again, &pass_legacy);
+            eprintln!("G6 one-lane: legacy probes re-run: {} differ from the first legacy pass {:?}", self_bad.len(), self_bad);
         }
         {
             let (c, carrier, standalone) = engine.stage_b.counters();
@@ -1495,7 +1509,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             let multi = ["g.q_chain", "g.kv_chain", "g.output_proj", "g.shared_expert"]
                 .map(|st| (get(st, C_CAPTURED_B), get(st, C_REPLAYED), get(st, C_TAINTED), get(st, C_UNCAPTURED)));
             eprintln!(
-                "G6 one-lane: {} stage_b probes differ from legacy; lane-layers {lane_layers}, carrier writes {carrier}, standalone {standalone}; \
+                "G6 one-lane: {} stage_b probe rows differ from legacy; lane-layers {lane_layers}, carrier writes {carrier}, standalone {standalone}; \
                  q_chain/kv_chain/output_proj/shared captured+replayed+tainted+uncaptured {multi:?}",
                 one_bad.len()
             );
@@ -1517,23 +1531,24 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         if !one_bad.is_empty() {
             g6_fail.push(format!("one-lane stage_b probes: {}", one_bad.join(", ")));
         }
+        // Each stage_b arena's state == its legacy arena's (schedule 0: arena_rf, same rows).
         let (mut state_bad, mut state_n) = (Vec::new(), 0usize);
         for (i, (arm, sch)) in g6_arms.iter().enumerate() {
             if arm.ends_with("legacy") {
                 continue;
             }
-            let rows_s = &g6_sched[*sch].1;
-            let k = g6_arms[..i].iter().position(|(a, s)| s == sch && a.ends_with("legacy"));
-            for j in 0..rows_s.len() {
-                let base = if *sch == 0 { &probe_rf[rows_s[j]] } else { &probe_g6[k.expect("legacy arm first")][j] };
-                state_n += 1;
-                if max_abs_diff(&probe_g6[i][j], base) != 0.0 {
-                    state_bad.push(format!("{arm} row {j}"));
-                }
+            let base = if *sch == 0 {
+                &pass_legacy.1
+            } else {
+                &pass_legacy.2[g6_arms[..i].iter().position(|(a, s)| s == sch && a.ends_with("legacy")).expect("legacy arm first")]
+            };
+            state_n += g6_sched[*sch].1.len();
+            for j in rows_differ(&pass_legacy.2[i], base) {
+                state_bad.push(format!("{arm} row {j}"));
             }
         }
         eprintln!(
-            "G6: final-state probes differing from the legacy arena {} of {state_n} (want 0){}",
+            "G6: final-state probe rows differing from the legacy arena {} of {state_n} (want 0){}",
             state_bad.len(),
             if state_bad.is_empty() { String::new() } else { format!(": {}", state_bad.join(", ")) }
         );
