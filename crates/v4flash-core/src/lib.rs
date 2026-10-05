@@ -4,6 +4,7 @@
 //! term, this crate grows to hold the tensor inventory, tokenizer, and
 //! anything else that doesn't directly touch the GPU.
 
+pub mod direct_io;
 pub mod engram_hash;
 pub mod engram_table;
 pub mod gguf;

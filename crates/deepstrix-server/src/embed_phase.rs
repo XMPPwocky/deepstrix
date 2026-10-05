@@ -21,6 +21,7 @@ use color_eyre::eyre::{self, eyre, WrapErr};
 use tokio::sync::oneshot;
 use v4flash_core::qwen3_embed::Qwen3EmbedModel;
 use v4flash_core::tokenizer::BpeVocab;
+use v4flash_core::direct_io::DirectFiles;
 use v4flash_core::MappedGguf;
 use v4flash_hip::{Device, PinnedBuffer};
 use v4flash_kernels::dgpu_loan::{Donor, Loan};
@@ -166,7 +167,16 @@ pub struct PhaseStats {
 /// The engine thread's embed state (`WorkerState::embed`).
 pub struct EmbedCtx {
     info: Arc<EmbedInfo>,
+    /// The GGUF for the token-embedding rows (buffered, page cache dropped
+    /// after every phase).
     file: MappedGguf,
+    /// The GGUF and its replicas on other drives, O_DIRECT: the layer stream.
+    direct: DirectFiles,
+    /// O_DIRECT reader threads (`V41_EMBED_READERS`).
+    readers: usize,
+    /// Bytes of each pinned host buffer: a layer's aligned span or a loan
+    /// image chunk, whichever is larger.
+    host_bytes: usize,
     model: Qwen3EmbedModel,
     arch: String,
     loan: Loan,
@@ -182,6 +192,11 @@ pub struct EmbedCtx {
 }
 
 /// The default loan image path.
+/// A `:`-separated path list knob's paths (empty entries dropped).
+fn split_paths(v: Option<&str>) -> Vec<PathBuf> {
+    v.map(|s| s.split(':').filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default()
+}
+
 fn default_image() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".cache/deepstrix/embed-loan.img")
@@ -256,9 +271,24 @@ impl EmbedCtx {
         // Fail at startup, not on the first request: the kernels load here
         // once and are dropped (they load again per phase).
         drop(Qwen3EmbedKernels::for_arch(&arch)?);
+        // The layer stream: the GGUF plus its replicas on other drives,
+        // O_DIRECT, pieces spread over all of them (design §5.3).
+        let mut gguf_paths = vec![path.to_path_buf()];
+        gguf_paths.extend(split_paths(knobs::EMBED_GGUF_REPLICAS.str()));
+        let direct = DirectFiles::open(&gguf_paths).wrap_err("the embed GGUF's O_DIRECT readers (V41_EMBED_GGUF_REPLICAS)")?;
+        if direct.size() != file.gguf().file_size {
+            return Err(eyre!("V41_EMBED_GGUF_REPLICAS: a replica is not the same file as --embed-gguf"));
+        }
+        let readers = knobs::EMBED_READERS.usize();
         let sizes: Vec<usize> = sizing.buffer_sizes(&model.cfg, &model.layout).iter().map(|(_, b)| *b).collect();
-        let image = knobs::EMBED_LOAN_IMAGE.str().map(PathBuf::from).unwrap_or_else(default_image);
-        let mut loan = Loan::new(donor_candidates(weights), &sizes, image, model.layout.bytes, GUARD_BYTES)?;
+        let mut images = split_paths(knobs::EMBED_LOAN_IMAGE.str());
+        if images.is_empty() {
+            images.push(default_image());
+        }
+        // Image chunks are O_DIRECT units: a multiple of the alignment.
+        let chunk = v4flash_core::direct_io::align_up(model.layout.bytes as u64) as usize;
+        let host_bytes = fwd::host_bytes(&model)?.max(chunk);
+        let mut loan = Loan::new(donor_candidates(weights), &sizes, images, chunk, GUARD_BYTES)?;
         let ti = Instant::now();
         loan.write_image(&engine.dgpu.xfer)?;
         tracing::info!(
@@ -271,7 +301,9 @@ impl EmbedCtx {
             lent_mib = loan.lent_bytes() as f64 / (1 << 20) as f64,
             imaged_mib = loan.total_bytes() as f64 / (1 << 20) as f64,
             donors = ?loan.donor_summary(),
-            image = %loan.image_path().display(),
+            gguf_readers = ?direct.describe(),
+            image_readers = ?loan.image_readers(),
+            readers,
             image_ms = ti.elapsed().as_millis() as u64,
             load_ms = t0.elapsed().as_millis() as u64,
             "embed phase ready (weights stream per phase; nothing on the devices between phases)"
@@ -294,7 +326,10 @@ impl EmbedCtx {
             queue: queue.clone(),
         });
         Ok((
-            EmbedCtx { info: info.clone(), file, model, arch, loan, sizing, queue, active: VecDeque::new(), rr: 0, last_end: None, last_dur: Duration::ZERO },
+            EmbedCtx {
+                info: info.clone(), file, direct, readers, host_bytes, model, arch, loan, sizing, queue,
+                active: VecDeque::new(), rr: 0, last_end: None, last_dur: Duration::ZERO,
+            },
             info,
         ))
     }
@@ -418,8 +453,8 @@ impl EmbedCtx {
         // pressure) touches nothing on the device, so it fails the batch's
         // requests, not the hub.
         let tp = Instant::now();
-        let mut host = match PinnedBuffer::<u8>::new(self.model.layout.bytes)
-            .and_then(|a| Ok([a, PinnedBuffer::<u8>::new(self.model.layout.bytes)?]))
+        let mut host = match PinnedBuffer::<u8>::new(self.host_bytes)
+            .and_then(|a| Ok([a, PinnedBuffer::<u8>::new(self.host_bytes)?]))
         {
             Ok(h) => h,
             Err(e) => {
@@ -437,7 +472,7 @@ impl EmbedCtx {
         let r = self.forward(engine, progress, &batch, &mut host, &mut st);
         // The loan goes back whatever the forward did.
         let tr = Instant::now();
-        match self.loan.give_back(&engine.dgpu.xfer, &mut host, knobs::EMBED_VERIFY.on()) {
+        match self.loan.give_back(&engine.dgpu.xfer, &mut host, knobs::EMBED_VERIFY.on(), self.readers) {
             Ok(rs) => {
                 std::mem::forget(out);
                 st.return_ms = tr.elapsed().as_secs_f64() * 1e3;
@@ -542,7 +577,7 @@ impl EmbedCtx {
         let inputs: Vec<&[u32]> = batch.iter().map(|(ri, ii)| self.active[*ri].inputs[*ii].as_slice()).collect();
         let tf = Instant::now();
         let (rows, tm) = fwd::run(
-            &k, &engine.dgpu.q8_wmma, &self.model, &self.file, &mut bufs, h,
+            &k, &engine.dgpu.q8_wmma, &self.model, &self.file, &self.direct, self.readers, &mut bufs, h,
             &engine.dgpu.compute, &engine.dgpu.xfer, &inputs,
             &mut |l| {
                 progress.pet();

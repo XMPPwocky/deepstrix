@@ -19,10 +19,11 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use color_eyre::eyre::{self, eyre, WrapErr};
+use v4flash_core::direct_io::{align_up, DirectFiles, DIRECT_ALIGN};
 use v4flash_hip::{DeviceBuffer, Event, PinnedBuffer, Stream};
 
 /// Alignment of every lent buffer.
@@ -111,16 +112,21 @@ pub struct Loan {
     /// Canary regions: (donor, offset, len), everything imaged but not lent.
     canaries: Vec<(usize, usize, usize)>,
     canary_hash: Vec<u64>,
-    image: PathBuf,
-    /// Image layout: donor `d`'s imaged prefix starts at `image_off[d]`.
+    /// Identical copies of the image, one per drive: a return reads its
+    /// chunks O_DIRECT over all of them in parallel.
+    images: Vec<PathBuf>,
+    /// Image layout: donor `d`'s imaged prefix starts at `image_off[d]`
+    /// (`DIRECT_ALIGN`-aligned).
     image_off: Vec<u64>,
     /// `hashes[d][c]` = hash of donor `d`'s chunk `c` (`chunk` bytes, the last
     /// one shorter).
     hashes: Vec<Vec<u64>>,
     chunk: usize,
-    /// The image, open and `flock`ed for the life of the process: a second
-    /// hub on the same path fails at startup instead of overwriting it.
-    lock: Option<File>,
+    /// Every image replica, open and `flock`ed for the life of the process: a
+    /// second hub on the same path fails at startup instead of overwriting it.
+    locks: Vec<File>,
+    /// O_DIRECT readers over the replicas (after `write_image`).
+    reader: Option<DirectFiles>,
 }
 
 impl Loan {
@@ -128,10 +134,14 @@ impl Loan {
     /// over the donors, taken in the given order as needed, with
     /// [`CANARY_BYTES`] canaries and a `guard`-byte band after each donor's
     /// last buffer. Errors when the donors run out. `chunk` (the image's I/O
-    /// and hash unit) must hold the largest canary.
-    pub fn new(candidates: Vec<Donor>, sizes: &[usize], image: PathBuf, chunk: usize, guard: usize) -> eyre::Result<Self> {
-        if chunk == 0 || chunk % LOAN_ALIGN != 0 {
-            return Err(eyre!("loan chunk {chunk} must be a non-zero multiple of {LOAN_ALIGN}"));
+    /// and hash unit, a multiple of `DIRECT_ALIGN`) must hold the largest
+    /// canary. `images`: one path per drive (at least one).
+    pub fn new(candidates: Vec<Donor>, sizes: &[usize], images: Vec<PathBuf>, chunk: usize, guard: usize) -> eyre::Result<Self> {
+        if chunk == 0 || chunk % DIRECT_ALIGN != 0 {
+            return Err(eyre!("loan chunk {chunk} must be a non-zero multiple of {DIRECT_ALIGN}"));
+        }
+        if images.is_empty() {
+            return Err(eyre!("dGPU loan: no image path"));
         }
         let canary = CANARY_BYTES.min(chunk);
         let guard = guard.max(canary).min(chunk) / LOAN_ALIGN * LOAN_ALIGN;
@@ -170,9 +180,17 @@ impl Loan {
         let mut off = 0u64;
         for u in &used {
             image_off.push(off);
-            off += *u as u64;
+            off = align_up(off + *u as u64);
         }
-        Ok(Loan { donors, plan, used, canaries, canary_hash: Vec::new(), image, image_off, hashes: Vec::new(), chunk, lock: None })
+        Ok(Loan {
+            donors, plan, used, canaries, canary_hash: Vec::new(), images, image_off, hashes: Vec::new(), chunk,
+            locks: Vec::new(), reader: None,
+        })
+    }
+
+    /// The image file's size: every donor region, each starting aligned.
+    fn image_bytes(&self) -> u64 {
+        self.image_off.last().map_or(0, |o| align_up(o + *self.used.last().expect("donors") as u64))
     }
 
     /// Bytes lent (the job's buffers).
@@ -190,34 +208,44 @@ impl Loan {
         self.donors.iter().zip(&self.used).map(|(d, u)| (d.name.clone(), *u)).collect()
     }
 
-    pub fn image_path(&self) -> &Path {
-        &self.image
+    pub fn image_paths(&self) -> &[PathBuf] {
+        &self.images
     }
 
-    /// Copy every donor's imaged bytes into the image file and record their
-    /// hashes (chunks and canaries). Call once, before the first loan, while
-    /// the donors hold their loaded contents. `stream` = a stream on the
-    /// donors' device. Takes an exclusive `flock` on the file first (held
-    /// until the process exits). The file's page cache is dropped after.
+    /// `(path, O_DIRECT?)` per image replica, for the startup log.
+    pub fn image_readers(&self) -> Vec<(String, bool)> {
+        self.reader.as_ref().map(|r| r.describe()).unwrap_or_default()
+    }
+
+    /// Copy every donor's imaged bytes into every image replica and record
+    /// their hashes (chunks and canaries). Call once, before the first loan,
+    /// while the donors hold their loaded contents. `stream` = a stream on
+    /// the donors' device. Takes an exclusive `flock` on each replica first
+    /// (held until the process exits). The files' page cache is dropped
+    /// after; returns read them O_DIRECT.
     pub fn write_image(&mut self, stream: &Stream) -> eyre::Result<()> {
-        if let Some(dir) = self.image.parent() {
-            std::fs::create_dir_all(dir).wrap_err_with(|| format!("create {}", dir.display()))?;
+        let mut files = Vec::with_capacity(self.images.len());
+        for p in &self.images {
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir).wrap_err_with(|| format!("create {}", dir.display()))?;
+            }
+            // Open WITHOUT truncating: the lock must be ours before a byte changes.
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(p)
+                .wrap_err_with(|| format!("open loan image {}", p.display()))?;
+            if !try_lock_exclusive(&f) {
+                return Err(eyre!(
+                    "loan image {} is locked by another process (another hub?); set V41_EMBED_LOAN_IMAGE to private paths",
+                    p.display()
+                ));
+            }
+            f.set_len(self.image_bytes()).wrap_err("size loan image")?;
+            files.push(f);
         }
-        // Open WITHOUT truncating: the lock must be ours before a byte changes.
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.image)
-            .wrap_err_with(|| format!("open loan image {}", self.image.display()))?;
-        if !try_lock_exclusive(&f) {
-            return Err(eyre!(
-                "loan image {} is locked by another process (another hub?); set V41_EMBED_LOAN_IMAGE to a private path",
-                self.image.display()
-            ));
-        }
-        f.set_len(self.total_bytes() as u64).wrap_err("size loan image")?;
         let mut host = PinnedBuffer::<u8>::new(self.chunk)?;
         self.hashes.clear();
         for (d, donor) in self.donors.iter().enumerate() {
@@ -229,8 +257,10 @@ impl Loan {
                 stream.synchronize()?;
                 let bytes = &host.as_slice()[..n];
                 hs.push(chunk_hash(bytes));
-                f.write_all_at(bytes, self.image_off[d] + at as u64)
-                    .wrap_err_with(|| format!("write loan image {}", self.image.display()))?;
+                for (f, p) in files.iter().zip(&self.images) {
+                    f.write_all_at(bytes, self.image_off[d] + at as u64)
+                        .wrap_err_with(|| format!("write loan image {}", p.display()))?;
+                }
                 at += n;
             }
             self.hashes.push(hs);
@@ -241,16 +271,19 @@ impl Loan {
             stream.synchronize()?;
             self.canary_hash.push(chunk_hash(&host.as_slice()[..len]));
         }
-        f.sync_data().wrap_err("sync loan image")?;
-        drop_page_cache(&f);
-        self.lock = Some(f);
+        for f in &files {
+            f.sync_data().wrap_err("sync loan image")?;
+            drop_page_cache(f);
+        }
+        self.locks = files;
+        self.reader = Some(DirectFiles::open(&self.images)?);
         Ok(())
     }
 
     /// The planned buffers, in plan order. Errors until the image exists:
     /// lending before it would lose the bytes.
     pub fn allocator(&self) -> eyre::Result<LoanAlloc> {
-        if self.lock.is_none() {
+        if self.reader.is_none() {
             return Err(eyre!("dGPU loan: the image was never written; refusing to lend"));
         }
         Ok(LoanAlloc {
@@ -273,20 +306,21 @@ impl Loan {
         Ok(bad)
     }
 
-    /// Put every donor back from the image: pread a chunk into one of the two
-    /// pinned `host` buffers (each at least `chunk` bytes), check it against
-    /// its startup hash (disk / page corruption; always), and H2D it on
-    /// `stream`; the next chunk's read overlaps that copy. With `verify`, each
-    /// chunk is also read back into the other buffer and hashed, and a
-    /// mismatched chunk is copied once more. Canaries are checked before
-    /// anything is overwritten. Returns only when the device holds the
-    /// image's bytes (`stream` synchronized).
-    pub fn give_back(&self, stream: &Stream, host: &mut [PinnedBuffer<u8>; 2], verify: bool) -> eyre::Result<ReturnStats> {
+    /// Put every donor back from the image: read a chunk into one of the two
+    /// pinned `host` buffers (each at least `chunk` bytes) with `readers`
+    /// O_DIRECT threads over the image replicas, check it against its startup
+    /// hash (disk corruption; always), and H2D it on `stream`; the next
+    /// chunk's read overlaps that copy. With `verify`, each chunk is also
+    /// read back into the other buffer and hashed, and a mismatched chunk is
+    /// copied once more. Canaries are checked before anything is
+    /// overwritten. Returns only when the device holds the image's bytes
+    /// (`stream` synchronized).
+    pub fn give_back(&self, stream: &Stream, host: &mut [PinnedBuffer<u8>; 2], verify: bool, readers: usize) -> eyre::Result<ReturnStats> {
         let t0 = Instant::now();
         if host.iter().any(|h| h.len() < self.chunk) {
             return Err(eyre!("give_back: need two pinned buffers of >= {} B", self.chunk));
         }
-        let f = self.lock.as_ref().ok_or_else(|| eyre!("give_back: the image was never written"))?;
+        let rd = self.reader.as_ref().ok_or_else(|| eyre!("give_back: the image was never written"))?;
         let mut st = ReturnStats::default();
         st.guard_violations = self.canary_violations(stream, &mut host[1])?;
         let copied = [Event::new_no_timing()?, Event::new_no_timing()?];
@@ -304,13 +338,17 @@ impl Loan {
                     pending[b] = false;
                 }
                 let tr = Instant::now();
-                f.read_exact_at(&mut host[b].as_mut_slice()[..n], self.image_off[d] + at as u64)
-                    .wrap_err_with(|| format!("read loan image {}", self.image.display()))?;
+                // Chunks start aligned (aligned donor regions, chunk a
+                // multiple of DIRECT_ALIGN): the bytes land at offset 0.
+                let head = rd.read_span(self.image_off[d] + at as u64, n, host[b].as_mut_slice(), readers)?;
+                if head != 0 {
+                    return Err(eyre!("loan image chunk at {} is not aligned", self.image_off[d] + at as u64));
+                }
                 st.read_ms += tr.elapsed().as_secs_f64() * 1e3;
                 if chunk_hash(&host[b].as_slice()[..n]) != self.hashes[d][c] {
                     return Err(eyre!(
-                        "loan image {} bytes for donor {} [{at}, {}) do not match their startup hash (disk corruption?)",
-                        self.image.display(),
+                        "loan image {:?} bytes for donor {} [{at}, {}) do not match their startup hash (disk corruption?)",
+                        self.images,
                         donor.name,
                         at + n
                     ));
@@ -349,7 +387,11 @@ impl Loan {
             }
         }
         stream.synchronize()?;
-        drop_page_cache(f);
+        // O_DIRECT reads leave nothing cached; a buffered fallback replica
+        // (a filesystem without O_DIRECT) would.
+        for f in &self.locks {
+            drop_page_cache(f);
+        }
         st.total_ms = t0.elapsed().as_secs_f64() * 1e3;
         Ok(st)
     }

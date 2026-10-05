@@ -362,6 +362,36 @@ impl Qwen3EmbedModel {
         }
     }
 
+    /// Layer `il`'s byte span in the file `(offset, len)`: from its first
+    /// tensor to the end of its last. A GGUF writes a block's tensors back to
+    /// back, so the span is the tensors plus alignment padding; one aligned
+    /// read of it (`direct_io::DirectFiles::read_span`) fetches the layer.
+    /// Errors if the tensors are scattered (span far beyond their sum).
+    pub fn layer_span(&self, il: usize) -> eyre::Result<(u64, usize)> {
+        let ts = self.layout.placements(&self.layers[il]);
+        let shard = ts[0].0.shard;
+        if ts.iter().any(|(t, _)| t.shard != shard) {
+            return Err(eyre!("layer {il} spans GGUF shards"));
+        }
+        let lo = ts.iter().map(|(t, _)| t.offset).min().expect("tensors");
+        let hi = ts.iter().map(|(t, _)| t.offset + t.bytes).max().expect("tensors");
+        let sum: u64 = ts.iter().map(|(t, _)| t.bytes).sum();
+        if hi - lo > sum + 64 * 1024 {
+            return Err(eyre!("layer {il}'s tensors are scattered ({} B span for {sum} B)", hi - lo));
+        }
+        Ok((lo, (hi - lo) as usize))
+    }
+
+    /// Host bytes one layer's aligned span needs (the largest over layers).
+    pub fn max_layer_span_bytes(&self) -> eyre::Result<usize> {
+        let mut m = 0;
+        for il in 0..self.cfg.n_layer {
+            let (off, len) = self.layer_span(il)?;
+            m = m.max(crate::direct_io::DirectFiles::span_bytes(off, len));
+        }
+        Ok(m)
+    }
+
     /// Token-embedding rows of `ids`, dequantized: `[ids.len(), n_embd]` f32.
     /// Each distinct id is read once; runs of adjacent ids share one pread;
     /// the runs are read by `readers` threads (each a ~2.7 KB latency-bound

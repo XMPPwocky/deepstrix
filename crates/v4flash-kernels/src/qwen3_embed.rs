@@ -20,6 +20,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use color_eyre::eyre::{self, eyre};
+use v4flash_core::direct_io::DirectFiles;
 use v4flash_core::qwen3_embed::{Qwen3EmbedConfig, Qwen3EmbedModel, LayerLayout};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{launch_kernel, DeviceBuffer, Event, LaunchConfig, Module, PinnedBuffer, Stream};
@@ -312,17 +313,22 @@ unsafe impl Send for HostBuf {}
 /// `Qwen3EmbedModel::finish` and the request's `dimensions`).
 ///
 /// `g` = the GEMM module (the hub passes its engine's resident `q8_wmma`).
-/// `host` = two pinned buffers of at least `layout.bytes`. `compute` and `copy`
-/// are streams on the dGPU. `after_layer(l)` runs once layer `l` is queued
-/// (the hub pets its watchdog there); an `Err` stops the forward (fault
-/// injection, cancellation). On return every queued device operation has
-/// completed, also on error, and the reader threads have exited.
+/// `file` serves the token-embedding rows; `direct` (the GGUF and its replicas
+/// on other drives, O_DIRECT) streams the layers, each as one aligned span
+/// read by `readers` threads. `host` = two pinned buffers of at least
+/// [`host_bytes`]. `compute` and `copy` are streams on the dGPU.
+/// `after_layer(l)` runs once layer `l` is queued (the hub pets its watchdog
+/// there); an `Err` stops the forward (fault injection, cancellation). On
+/// return every queued device operation has completed, also on error, and
+/// the reader threads have exited.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     k: &Qwen3EmbedKernels,
     g: &Q8_0MatvecWmma,
     model: &Qwen3EmbedModel,
     file: &MappedGguf,
+    direct: &DirectFiles,
+    readers: usize,
     bufs: &mut EmbedBuffers,
     host: &mut [PinnedBuffer<u8>; 2],
     compute: &Stream,
@@ -336,7 +342,7 @@ pub fn run(
         h2d_done: [Event::new_no_timing()?, Event::new_no_timing()?],
         comp_done: [Event::new_no_timing()?, Event::new_no_timing()?],
     };
-    let r = run_inner(k, g, model, file, bufs, host, compute, copy, inputs, after_layer, &ev);
+    let r = run_inner(k, g, model, file, direct, readers, bufs, host, compute, copy, inputs, after_layer, &ev);
     // Nothing may still be reading the host buffers or writing the loan.
     let s1 = compute.synchronize();
     let s2 = copy.synchronize();
@@ -354,12 +360,20 @@ struct Events {
     comp_done: [Event; 2],
 }
 
+/// Bytes each of `run`'s two pinned host buffers must hold: the largest
+/// layer's aligned O_DIRECT span.
+pub fn host_bytes(model: &Qwen3EmbedModel) -> eyre::Result<usize> {
+    model.max_layer_span_bytes()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
     k: &Qwen3EmbedKernels,
     g: &Q8_0MatvecWmma,
     model: &Qwen3EmbedModel,
     file: &MappedGguf,
+    direct: &DirectFiles,
+    readers: usize,
     bufs: &mut EmbedBuffers,
     host: &mut [PinnedBuffer<u8>; 2],
     compute: &Stream,
@@ -377,8 +391,12 @@ fn run_inner(
     if inputs.is_empty() {
         return Ok((Vec::new(), tm));
     }
-    if host.iter().any(|h| h.len() < layout.bytes) {
-        return Err(eyre!("embed forward: pinned buffers must hold {} B", layout.bytes));
+    let span_cap = host_bytes(model)?;
+    if host.iter().any(|h| h.len() < span_cap) {
+        return Err(eyre!("embed forward: pinned buffers must hold {span_cap} B"));
+    }
+    if direct.size() != file.gguf().file_size {
+        return Err(eyre!("embed forward: the direct reader's file ({} B) is not the GGUF ({} B)", direct.size(), file.gguf().file_size));
     }
     // Pack the inputs.
     let mut starts = Vec::with_capacity(inputs.len());
@@ -408,15 +426,16 @@ fn run_inner(
 
     let n_layer = c.n_layer;
     let host_bufs: [HostBuf; 2] = [
-        HostBuf(host[0].as_mut_slice().as_mut_ptr(), layout.bytes),
-        HostBuf(host[1].as_mut_slice().as_mut_ptr(), layout.bytes),
+        HostBuf(host[0].as_mut_slice().as_mut_ptr(), host[0].len()),
+        HostBuf(host[1].as_mut_slice().as_mut_ptr(), host[1].len()),
     ];
     let [hs0, hs1] = host_bufs;
     let mut comp_recorded = [false, false];
 
     std::thread::scope(|scope| -> eyre::Result<()> {
         let (job_tx, job_rx) = mpsc::channel::<(usize, HostBuf)>();
-        let (done_tx, done_rx) = mpsc::channel::<eyre::Result<(usize, f64)>>();
+        // (layer, where its span starts in the host buffer, read ms)
+        let (done_tx, done_rx) = mpsc::channel::<eyre::Result<(usize, usize, f64)>>();
         scope.spawn(move || {
             for (l, hs) in job_rx {
                 let t = Instant::now();
@@ -424,9 +443,12 @@ fn run_inner(
                 let dst = unsafe { std::slice::from_raw_parts_mut(hs.0, hs.1) };
                 // A reader panic becomes an error here, not a re-panic at the
                 // end of the scope (which would unwind with the loan out).
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.read_layer_into_par(file, l, dst, READERS)))
-                    .unwrap_or_else(|_| Err(eyre!("embed reader panicked reading layer {l}")))
-                    .map(|_| (l, t.elapsed().as_secs_f64() * 1e3));
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let (off, len) = model.layer_span(l)?;
+                    direct.read_span(off, len, dst, readers)
+                }))
+                .unwrap_or_else(|_| Err(eyre!("embed reader panicked reading layer {l}")))
+                .map(|head| (l, head, t.elapsed().as_secs_f64() * 1e3));
                 let failed = r.is_err();
                 if done_tx.send(r).is_err() || failed {
                     break;
@@ -440,7 +462,7 @@ fn run_inner(
         for l in 0..n_layer {
             let s = l % 2;
             let tw = Instant::now();
-            let (got, ms) = done_rx.recv().map_err(|_| eyre!("embed reader exited"))??;
+            let (got, head, ms) = done_rx.recv().map_err(|_| eyre!("embed reader exited"))??;
             if got != l {
                 return Err(eyre!("embed reader returned layer {got}, expected {l}"));
             }
@@ -450,7 +472,13 @@ fn run_inner(
             if comp_recorded[s] {
                 copy.wait_event(&comp_done[s])?;
             }
-            bufs.ring[s].copy_from_host_async(&host[s].as_slice()[..layout.bytes], copy)?;
+            // Each tensor from its place in the file span to its LayerLayout slot.
+            let (off, _) = model.layer_span(l)?;
+            for (tl, at) in layout.placements(&model.layers[l]) {
+                let src = head + (tl.offset - off) as usize;
+                let n = tl.bytes as usize;
+                bufs.ring[s].slice_view_mut(at, n).copy_from_host_async(&host[s].as_slice()[src..src + n], copy)?;
+            }
             h2d_done[s].record(copy)?;
             compute.wait_event(&h2d_done[s])?;
             let w = bufs.ring[s].slice_view(0, bufs.ring[s].len());
@@ -462,7 +490,7 @@ fn run_inner(
             if l + 2 < n_layer {
                 // The host buffer is free once its H2D is done.
                 h2d_done[s].synchronize()?;
-                let hs = HostBuf(host[s].as_mut_slice().as_mut_ptr(), layout.bytes);
+                let hs = HostBuf(host[s].as_mut_slice().as_mut_ptr(), host[s].len());
                 job_tx.send((l + 2, hs)).map_err(|_| eyre!("embed reader exited"))?;
             }
             after_layer(l)?;

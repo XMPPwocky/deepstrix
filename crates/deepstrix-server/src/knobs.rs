@@ -174,8 +174,16 @@ v4flash_kernels::knobs! {
     /// back and compare it with the image's hash.
     pub static EMBED_VERIFY = Knob::flag("V41_EMBED_VERIFY", true).live();
     /// `V41_EMBED_LOAN_IMAGE` (default `$HOME/.cache/deepstrix/embed-loan.img`):
-    /// where the loaned dGPU bytes are copied at startup.
+    /// where the loaned dGPU bytes are copied at startup; a `:`-separated list
+    /// puts one copy on each drive and returns read all of them in parallel.
     pub static EMBED_LOAN_IMAGE = Knob::text("V41_EMBED_LOAN_IMAGE");
+    /// `V41_EMBED_GGUF_REPLICAS` (`:`-separated): identical copies of
+    /// `--embed-gguf` on other drives; the layer stream reads all of them.
+    pub static EMBED_GGUF_REPLICAS = Knob::text("V41_EMBED_GGUF_REPLICAS");
+    /// `V41_EMBED_READERS` (default 32): O_DIRECT reader threads per span.
+    /// MEASURED 2026-10-05 (embed_read_bench, 3.86 GB, YMTC + E100): 8 -> 5.27,
+    /// 16 -> 5.66, 32 -> 6.47, 48 -> 6.26 GB/s (buffered x4: 1.65).
+    pub static EMBED_READERS = Knob::int("V41_EMBED_READERS", 32, 1, 256);
     /// `V41_EMBED_FAULT_LAYER` (gates only, live; default off): every embed phase's
     /// forward fails after this layer (design §10, gate E6).
     pub static EMBED_FAULT_LAYER = Knob::int("V41_EMBED_FAULT_LAYER", MAX, 0, MAX).live();

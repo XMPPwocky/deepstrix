@@ -19,12 +19,13 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
+use v4flash_core::direct_io::DirectFiles;
 use v4flash_core::qwen3_embed::{cosine, cpu_forward, testing, Qwen3EmbedModel};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{Device, DeviceBuffer, PinnedBuffer, Stream};
 use v4flash_kernels::dgpu_loan::{Donor, Loan, LoanAlloc};
 use v4flash_kernels::q8_0::Q8_0MatvecWmma;
-use v4flash_kernels::qwen3_embed::{run, EmbedBuffers, EmbedSizing, Qwen3EmbedKernels};
+use v4flash_kernels::qwen3_embed::{host_bytes, run, EmbedBuffers, EmbedSizing, Qwen3EmbedKernels};
 
 fn dgpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -54,11 +55,13 @@ fn gpu_embed(dev: Device, model: &Qwen3EmbedModel, file: &MappedGguf, inputs: &[
         .collect::<eyre::Result<_>>()?;
     let mut alloc = LoanAlloc::over(backing.iter().map(|b| b.slice_view(0, b.len())).collect());
     let mut bufs = EmbedBuffers::carve(&mut alloc, sizing, &model.cfg, &model.layout)?;
-    let mut host = [PinnedBuffer::<u8>::new(model.layout.bytes)?, PinnedBuffer::<u8>::new(model.layout.bytes)?];
+    let hb = host_bytes(model)?;
+    let mut host = [PinnedBuffer::<u8>::new(hb)?, PinnedBuffer::<u8>::new(hb)?];
     let (compute, copy) = (Stream::new(dev.id)?, Stream::new(dev.id)?);
     let refs: Vec<&[u32]> = inputs.iter().map(|v| v.as_slice()).collect();
     let g = Q8_0MatvecWmma::for_arch("gfx1201")?;
-    let (last, tm) = run(&k, &g, model, file, &mut bufs, &mut host, &compute, &copy, &refs, &mut |_| Ok(()))?;
+    let direct = DirectFiles::open(&[file.path().to_path_buf()])?;
+    let (last, tm) = run(&k, &g, model, file, &direct, 8, &mut bufs, &mut host, &compute, &copy, &refs, &mut |_| Ok(()))?;
     eprintln!("gpu forward: {tm:?}");
     drop(backing);
     Ok(last.iter().map(|r| model.finish(r, None)).collect())
@@ -181,25 +184,29 @@ fn loan_round_trip() -> eyre::Result<()> {
         Donor { name: "d1".into(), view: d1.slice_view(0, d1.len()) },
     ];
     let image = tmp("loan").join("embed-loan.img");
-    let mut loan = Loan::new(donors, &sizes, image, 1 << 20, 64 * 1024)?;
+    // Two replicas of the image (the hub puts one on each drive).
+    let image2 = tmp("loan").join("embed-loan-2.img");
+    let mut loan = Loan::new(donors, &sizes, vec![image, image2], 1 << 20, 64 * 1024)?;
     eprintln!("donors {:?}", loan.donor_summary());
     let stream = Stream::new(dev.id)?;
     loan.write_image(&stream)?;
     let mut alloc = loan.allocator()?;
     let mut bufs = EmbedBuffers::carve(&mut alloc, sizing, &model.cfg, &model.layout)?;
     let k = Qwen3EmbedKernels::for_arch("gfx1201")?;
-    let mut host = [PinnedBuffer::<u8>::new(model.layout.bytes.max(1 << 20))?, PinnedBuffer::<u8>::new(model.layout.bytes.max(1 << 20))?];
+    let hb = host_bytes(&model)?.max(1 << 20);
+    let mut host = [PinnedBuffer::<u8>::new(hb)?, PinnedBuffer::<u8>::new(hb)?];
     let (compute, copy) = (Stream::new(dev.id)?, Stream::new(dev.id)?);
     let inputs: Vec<Vec<u32>> = vec![(1..40).chain([model.eos_id]).collect()];
     let refs: Vec<&[u32]> = inputs.iter().map(|v| v.as_slice()).collect();
     let g = Q8_0MatvecWmma::for_arch("gfx1201")?;
-    run(&k, &g, &model, &file, &mut bufs, &mut host, &compute, &copy, &refs, &mut |_| Ok(()))?;
+    let direct = DirectFiles::open(&[file.path().to_path_buf()])?;
+    run(&k, &g, &model, &file, &direct, 8, &mut bufs, &mut host, &compute, &copy, &refs, &mut |_| Ok(()))?;
     // The forward clobbered the donors ...
     let mut now1 = vec![0u8; d1.len()];
     d1.copy_to_host(&mut now1)?;
     assert_ne!(now1, p1, "the forward never touched the donor");
     // ... and the return puts back every byte.
-    let st = loan.give_back(&stream, &mut host, true)?;
+    let st = loan.give_back(&stream, &mut host, true, 4)?;
     eprintln!("return: {st:?}");
     let mut back0 = vec![0u8; d0.len()];
     let mut back1 = vec![0u8; d1.len()];
