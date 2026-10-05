@@ -1,7 +1,11 @@
 # Arena stage graphs keyed by (stage, rows) only
 
 Status: DESIGN rev 4.1 (2026-10-05), rev 4 review round: APPROVE WITH CHANGES (applied, section 7).
-Step 0b: GO (2026-10-05 13:07 UTC; 0.44 / 0.29 / 0.39% of the step at b = 1 / 4 / 8). Next: the build. Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
+Step 0b: GO (2026-10-05 13:07 UTC; 0.44 / 0.29 / 0.39% of the step at b = 1 / 4 / 8).
+BUILT (2026-10-05, each slice review-approved): slice A twins + canary variants (fb9357a, 277d9fa),
+slice B host plumbing behind `V41_MS_GRAPH_KEYS=stage_b`, default legacy = production unchanged
+(4177d13, e41f84f), slice C gate G6 in tests/multistream_step.rs (0b99acc). Next: the GPU gate
+window (~/scratch-ms/window_graph_keys_gates.sh), then deploy with legacy default and A/B the knob. Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
 review-APPROVED (2 rounds); Step 0 runs 1-3 were NO-GO (run 3 narrowly: 1.03 / 1.08 / 1.23% of the
 step at b = 1 / 4 / 8). Owner 2026-10-05: revise first (rev 4 = section 2.11), then merge the
 production build (worktree-embed-phase, hub ce52ee3c).
