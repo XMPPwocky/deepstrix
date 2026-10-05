@@ -116,7 +116,7 @@ impl MhcArena {
         &self,
         stream: &Stream,
         entry: &crate::het::arena_ctx::ArenaCtx,
-        slot: &mut DeviceBuffer<u64>,
+        slot: u64,
         mix: Option<FastMix<'_>>,
         collapse: Option<FastCollapse<'_>>,
         carry: &mut DeviceBuffer<f32>,
@@ -127,13 +127,33 @@ impl MhcArena {
         sinkhorn_eps: f32,
         batch: u32,
     ) -> eyre::Result<()> {
-        if slot.len() < crate::het::arena_ctx::ARENA_CTX_WORDS {
-            return Err(eyre!("mhc_fast carrier: slot buffer of {} u64", slot.len()));
-        }
         self.launch_fast_impl(
-            FastVia::Carrier(*entry, slot.raw() as u64),
+            FastVia::Carrier(*entry, slot),
             stream, mix, collapse, carry, write_carry, k, rms_eps, sinkhorn_iters, sinkhorn_eps, batch,
         )
+    }
+
+    /// `launch_fast`, or its carrier when `carrier` = (the entry, the context slot's address).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fast_via(
+        &self,
+        carrier: Option<(&crate::het::arena_ctx::ArenaCtx, u64)>,
+        stream: &Stream,
+        mix: Option<FastMix<'_>>,
+        collapse: Option<FastCollapse<'_>>,
+        carry: &mut DeviceBuffer<f32>,
+        write_carry: bool,
+        k: u32,
+        rms_eps: f32,
+        sinkhorn_iters: u32,
+        sinkhorn_eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        let via = match carrier {
+            Some((e, slot)) => FastVia::Carrier(*e, slot),
+            None => FastVia::Direct,
+        };
+        self.launch_fast_impl(via, stream, mix, collapse, carry, write_carry, k, rms_eps, sinkhorn_iters, sinkhorn_eps, batch)
     }
 
     /// `launch_fast` through its `_ind` twin `mhc_fast_batched_ind`
@@ -275,6 +295,7 @@ impl MhcArena {
         // Production twin without canary code; the canary (design 2.8) has its own symbol.
         let function =
             self.fast.get_function(if ind.canary != 0 { "mhc_fast_batched_ind_canary" } else { "mhc_fast_batched_ind" })?;
+        crate::het::arena_ctx::vet_ind(&ind, &direct.map(|p| p as u64));
         launch_kernel!(function, cfg, stream, [
             ind.mask(), ind.canary, ind.tag,
             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12],

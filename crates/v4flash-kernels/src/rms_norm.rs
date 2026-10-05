@@ -257,6 +257,7 @@ impl RmsNorm {
         let cfg = LaunchConfig { grid: (batch, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
         let p: [u64; 5] = [out.raw() as u64, xq.raw() as u64, xscale.raw() as u64, x.raw() as u64, weight.raw() as u64];
         let q: [u64; 5] = std::array::from_fn(|i| ind.ptr(i, p[i]));
+        crate::het::arena_ctx::vet_ind(&ind, &p);
         launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, q[0], q[1], q[2], q[3], q[4], eps])
     }
 }

@@ -1183,6 +1183,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         );
     }
     let sd = BatchDgpuShared::alloc_rows_ctx(dgpu, lane_rows, cfg.n_kv_max)?;
+    // The process-static operands (arena) stage graphs may bake (docs/v41/GRAPH_KEYS_DESIGN.md 2.5, 2.7).
+    sd.register_static();
     let si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     tracing::info!(n_kv_max = cfg.n_kv_max, "KV cache allocated");
 

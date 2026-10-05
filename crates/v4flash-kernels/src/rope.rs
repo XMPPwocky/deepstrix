@@ -359,6 +359,7 @@ impl RopeTail {
         let (p_out, p_x, p_w, p_pos) =
             (ind.ptr(0, out.raw() as u64), ind.ptr(1, x.raw() as u64), ind.ptr(2, weight.raw() as u64), ind.ptr(3, pos_per_b.raw() as u64));
         let r: [u64; 3] = rope_slots.map(|s| ind.slot_addr(s));
+        crate::het::arena_ctx::vet_ind(&ind, &[out.raw() as u64, x.raw() as u64, weight.raw() as u64, pos_per_b.raw() as u64]);
         launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, p_out, p_x, p_w, eps, p_pos, r[0], r[1], r[2]])
     }
 
@@ -395,6 +396,7 @@ impl RopeTail {
         let inverse_i: i32 = 0;
         let (p_dst, p_src, p_pos) = (ind.ptr(0, dst.raw() as u64), ind.ptr(1, src.raw() as u64), ind.ptr(2, pos_per_b.raw() as u64));
         let r: [u64; 3] = rope_slots.map(|s| ind.slot_addr(s));
+        crate::het::arena_ctx::vet_ind(&ind, &[dst.raw() as u64, src.raw() as u64, pos_per_b.raw() as u64]);
         launch_kernel!(function, cfg, stream, [
             ind.mask(), ind.canary, ind.tag, p_dst, p_src, p_pos, n_head, head_dim, n_rot, r[0], r[1], r[2], inverse_i
         ])
@@ -434,6 +436,7 @@ impl RopeTail {
         let p: [u64; 4] = [heads.raw() as u64, xq.raw() as u64, xscale.raw() as u64, pos_per_b.raw() as u64];
         let q: [u64; 4] = std::array::from_fn(|i| ind.ptr(i, p[i]));
         let r: [u64; 3] = rope_slots.map(|s| ind.slot_addr(s));
+        crate::het::arena_ctx::vet_ind(&ind, &p);
         launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, q[0], q[1], q[2], q[3], r[0], r[1], r[2]])
     }
 

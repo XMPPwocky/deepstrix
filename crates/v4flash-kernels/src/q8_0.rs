@@ -390,6 +390,7 @@ impl Q8_0Matvec {
         // As the direct launch: one idle workgroup (`q8_quant_grid_pad`).
         let cfg = LaunchConfig { grid: (blocks.div_ceil(8) + q8_quant_grid_pad(), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
         let (p_xq, p_xs, p_x) = (ind.ptr(0, xq.raw() as u64), ind.ptr(1, xscale.raw() as u64), ind.ptr(2, x.raw() as u64));
+        crate::het::arena_ctx::vet_ind(&ind, &[xq.raw() as u64, xscale.raw() as u64, x.raw() as u64]);
         launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, p_xq, p_xs, p_x, blocks])
     }
 
@@ -483,6 +484,29 @@ impl Q8_0Matvec {
     /// W independently). A v1 kernel will pack multiple batch elements
     /// per WG to amortize W reads.
     #[allow(clippy::too_many_arguments)]
+    /// `matvec_batched` reading the operands `ind` marks from the arena context
+    /// (docs/v41/GRAPH_KEYS_DESIGN.md 2.5: converted at the DISPATCHING entry, so `Ctx` and `Dev`
+    /// take the same arm under every knob). The bpack arm has twins (`matvec_bpack_ind`); every
+    /// other arm launches the direct kernel on the real buffers (unvetted: a capture taints).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_batched_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch > 0 && bpack_ok(batch) {
+            return self.matvec_bpack_ind(stream, ind, out, weight, xq, xscale, n_rows, k, batch);
+        }
+        self.matvec_batched(stream, out, weight, xq, xscale, n_rows, k, batch)
+    }
+
     pub fn matvec_batched(
         &self,
         stream: &Stream,
@@ -692,6 +716,7 @@ impl Q8_0Matvec {
             ind.ptr(2, xq.raw() as u64),
             ind.ptr(3, xscale.raw() as u64),
         );
+        crate::het::arena_ctx::vet_ind(&ind, &[out.raw() as u64, weight.raw() as u64, xq.raw() as u64, xscale.raw() as u64]);
         launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, p_out, p_w, p_xq, p_xs, k, n_rows, blocks, batch])
     }
 
@@ -1301,10 +1326,34 @@ impl Q8_0GroupedMatvec {
             ind.ptr(2, xq.raw() as u64),
             ind.ptr(3, xscale.raw() as u64),
         );
+        crate::het::arena_ctx::vet_ind(&ind, &[out.raw() as u64, weight.raw() as u64, xq.raw() as u64, xscale.raw() as u64]);
         launch_kernel!(function, cfg, stream, [
             ind.mask(), ind.canary, ind.tag, p_out, p_w, p_xq, p_xs,
             group_dim, rank, blocks_per_group, n_groups, batch
         ])
+    }
+
+    /// `matvec_grouped_batched` reading the operands `ind` marks from the arena context
+    /// (design 2.5: converted at the dispatching entry). The bpack arm has twins
+    /// (`matvec_grouped_bpack_ind`, runtime and tB); every other arm launches the direct kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_grouped_batched_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        group_dim: u32,
+        rank: u32,
+        n_groups: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch > 0 && bpack_ok(batch) {
+            return self.matvec_grouped_bpack_ind(stream, ind, out, weight, xq, xscale, group_dim, rank, n_groups, batch);
+        }
+        self.matvec_grouped_batched(stream, out, weight, xq, xscale, group_dim, rank, n_groups, batch)
     }
 
     pub fn matvec_grouped_batched(
@@ -1606,6 +1655,7 @@ impl SharedExpertFused {
             xscale.raw() as u64,
         ];
         let q: [u64; 6] = std::array::from_fn(|i| ind.ptr(i, p[i]));
+        crate::het::arena_ctx::vet_ind(&ind, &p);
         launch_kernel!(function, cfg, stream, [
             ind.mask(), ind.canary, ind.tag, q[0], q[1], q[2], q[3], q[4], q[5], k, n_ff, blocks, clamp
         ])

@@ -94,6 +94,37 @@ impl LaunchConfig {
     }
 }
 
+thread_local! {
+    /// The launch audit behind the graph-keys taint guard (docs/v41/GRAPH_KEYS_DESIGN.md 2.5):
+    /// (kernel launches on this thread, VETTED ones among them, the next launch is vetted).
+    static LAUNCH_AUDIT: std::cell::Cell<(u64, u64, bool)> = const { std::cell::Cell::new((0, 0, false)) };
+}
+
+/// Mark this thread's next kernel launch VETTED: a converted wrapper whose operands are all either
+/// read through the arena context or process-static (design 2.5) calls it right before launching.
+pub fn vet_next_launch() {
+    LAUNCH_AUDIT.with(|c| {
+        let (l, v, _) = c.get();
+        c.set((l, v, true));
+    });
+}
+
+/// Drop a pending vetted mark (a capture starts: a mark set before it must not vet a launch in it).
+pub fn vet_clear() {
+    LAUNCH_AUDIT.with(|c| {
+        let (l, v, _) = c.get();
+        c.set((l, v, false));
+    });
+}
+
+/// (kernel launches, vetted launches) on this thread so far.
+pub fn launch_audit() -> (u64, u64) {
+    LAUNCH_AUDIT.with(|c| {
+        let (l, v, _) = c.get();
+        (l, v)
+    })
+}
+
 impl<'m> Function<'m> {
     /// Launch with raw kernel-argument pointers. Caller supplies a slice
     /// of `*mut c_void` where each entry points to a single argument
@@ -109,6 +140,11 @@ impl<'m> Function<'m> {
         args: &mut [*mut c_void],
     ) -> eyre::Result<()> {
         let extra: *mut *mut c_void = ptr::null_mut();
+        // The launch audit (design 2.5): every launch counts; the vetted mark is consumed.
+        LAUNCH_AUDIT.with(|c| {
+            let (l, v, vet) = c.get();
+            c.set((l + 1, v + u64::from(vet), false));
+        });
         check_eyre(
             unsafe {
                 sys::hipModuleLaunchKernel(

@@ -123,6 +123,12 @@ impl GraphCache {
         self.entries.lock().unwrap().len()
     }
 
+    /// Drop every graph. The caller has synchronized the device (a queued launch of a dropped
+    /// executable must have finished: dropping a `GraphExec` destroys it at once).
+    pub fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
+
     pub fn run<F>(
         &self,
         stage: &'static str,

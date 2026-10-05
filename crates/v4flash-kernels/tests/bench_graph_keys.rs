@@ -1270,7 +1270,7 @@ fn graph_keys_step0b() -> eyre::Result<()> {
             Some(ent) => arena.launch_fast_carrier(
                 &s,
                 ent,
-                slot,
+                slot.raw() as u64,
                 Some(mix),
                 Some(col),
                 &mut set.carry,
