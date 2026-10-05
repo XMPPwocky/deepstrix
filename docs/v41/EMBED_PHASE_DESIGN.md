@@ -429,3 +429,48 @@ E2–E7 need a GPU window (the hub down) and the weights. E0–E1 need only the 
 | 3 | Donors kept with no placement | `Loan::new` drops them and renumbers the plan |
 | 4 | GGUF header cached until the first phase | Whole-file `drop_page_cache` at the end of `EmbedCtx::load` |
 | — | E0 found the Thai divergence predicted in §8 | Exact Unicode classes for the Qwen2 splitter (§8); E0 22/22 |
+
+## 15. GPU window results (2026-10-05 00:40:49–00:54:17 UTC; production back on 363fc1ec, env identical)
+
+Branch binary d962366b (03dc301). Window script and logs are in the job's tmp dir: `window_embed.sh`, `window/g_*.log`.
+
+| Gate | Result |
+|---|---|
+| `repack_matches_host` | **PASS**: the device repack is byte-identical to `weights::repack_q8_0` at K 2560/4096/9728 |
+| `tiny_gpu_matches_cpu` | **PASS**: min cos 0.9999999; alone == packed |
+| `loan_round_trip` | **PASS**: two donors lent (`d0` 512 KiB, `d1` 2.4 MB), clobbered by the forward, every byte back; 0 retries |
+| **E2** | **PASS**: min cos 0.9999958 at production sizing (T 16384, R 1024) and 0.9999994 with 64-row sub-batches. Inputs of 27 … 5,503 tokens, including a 2,002-token repetition and a punctuation run. The CPU oracle took 482 s. |
+| **E1** | **Waived by the owner** (no HF bf16). Replaced by llama.cpp `llama-server --embedding --pooling last` on the **same Q8_0 GGUF** (`scripts/qwen3_embed/llama_ref.py`). llama.cpp's tokenization is identical to HF on 22/22 cases. The served `/v1/embeddings` (tokenizer + GPU forward) vs llama.cpp over the whole corpus, including the 2,403- and 7,002-token inputs: **min cos 0.999671** (the punctuation case), pass ≥ 0.998. |
+| **E4** | **PASS**: e2e smoke, 0 failures (input shapes, `dimensions`, base64, 400s, usage, `/v1/models`) |
+| **E6** | **PASS**: a fault at layer 0 / 17 / 35 fails that request (500, the injected error). The next embedding is identical (the loan is returned), and chat answers. |
+| **E3** | **PASS** (a) and (b): the A/A greedy completions were identical, and the completion with embed phases interleaved was identical, as was the one after them (`V41_SUB_LAMBDA=0`, `V41_MS_LANES_LEARNED=0`). (c), the whole-weights hash across 100 phases, was not built or run. |
+| **E5** | Mostly: see below |
+| **E7** | Measured: see below. The fixed cost is ~2.5× the §3 estimate, so the estimate is revised. |
+
+29 phases, 0 canary violations, 0 non-finite outputs.
+
+**E5 (residency):**
+
+- The loan image had 0 cached pages after the phases.
+- The test hub's RSS fell from 2,194 to 1,568 MiB over the session.
+- dGPU VRAM used was +291 MiB at the end of the test-hub session. That session also served chat for E3/E6/E7, whose stage-graph captures allocate. The embed phase allocates no device memory by construction (§4.4 L4), so the delta cannot be pinned on it from this run. A clean re-check needs embed-only traffic.
+- **The GGUF's per-file residency cannot be observed by a non-owner.** Since Linux 5.0 `mincore` reports every page resident for a file the caller can neither write nor own, and `cachestat` (fincore) is refused. The mechanism was verified instead: a whole-file `FADV_DONTNEED` from the non-owner hub user evicted the pages, with global `Cached` −1,020 MiB right after a 1 GiB read of the GGUF. A future E5 must measure through the global `Cached` delta around a phase, or run as the owner.
+
+**E7 (cost), from `ms.embed`:**
+
+| Phase | total | fwd (= weight stream) | stream rate | return (incl. verify 0.24) | pinned |
+|---|---|---|---|---|---|
+| 1 input, 2–35 tokens | **3.4–3.6 s** | 2.15–2.28 s | ~1.8 GB/s | 1.21–1.28 s | 13 ms |
+| 12,635 tokens (32 × ~400) | **3.50 s** | 2.23 s | | 1.24 s | 14 ms |
+| 9,481 tokens incl. a 7K input | 5.34 s | 4.09 s | | 1.23 s | 13 ms |
+
+- **Compute is fully hidden behind the weight stream** up to ~12.6K tokens of ordinary inputs. Only long inputs, with their quadratic attention, show compute beyond the stream.
+- Cost model: about 3.5 s per phase, so ~3.6K tokens/s while batched. With a 50% share, a chat stream stalls up to ~3.5 s per phase.
+- The ITL p99 metric in `window_checks.py e7` is too coarse: only 3 embedding requests fell inside a 160-token completion, and a stall shows as one gap. Measure the max gap next time.
+
+**Levers, cheapest first:**
+
+1. Read the image in parallel in `give_back`. It is a single reader today: 0.58 GB in ~1 s.
+2. More layer readers, or larger pieces: 1.8 GB/s against the 5.5 GB/s measured elsewhere on this box.
+3. `V41_EMBED_VERIFY=0` after a soak: −0.24 s.
+4. Q4_K_M weights: half the stream, at a quality cost.
