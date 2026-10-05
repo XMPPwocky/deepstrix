@@ -1,6 +1,6 @@
 # Arena stage graphs keyed by (stage, rows) only
 
-Status: DESIGN rev 4 (2026-10-05), for review. Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
+Status: DESIGN rev 4.1 (2026-10-05), rev 4 review round: APPROVE WITH CHANGES (applied, section 7). Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
 review-APPROVED (2 rounds); Step 0 runs 1-3 were NO-GO (run 3 narrowly: 1.03 / 1.08 / 1.23% of the
 step at b = 1 / 4 / 8). Owner 2026-10-05: revise first (rev 4 = section 2.11), then merge the
 production build (worktree-embed-phase, hub ce52ee3c).
@@ -297,13 +297,26 @@ direct operands (no twin, no context read, no graph). A stage takes this path on
 is that single launch (the fast-path conditions it already tests); any other body (mHC split, a
 non-fast mHC, b > 8) keeps today's legacy capture. Twin families drop `mhc_fast_batched` and the
 router's f16 matvec; graphs per process drop to 4 stages (q_chain, kv_chain, output_proj, the shared
-expert) x b x topo ~ 32.
+expert) x b x topo ~ 32. Verified per stage at every b <= 8 under the hub env (review): mhc_pre_attn
+= `launch_fast` (`mhc_pre_scaled_for(b)` holds for b <= 8, counters = lane rows); mhc_pre_ffn = a
+collapse-only `launch_fast` (`ffn_mix_late` on); router = one `matvec_batched_sym` h20 launch
+(`router_wmma` off for b <= 64, z16 only above b = 48); mix_ffn_late = one `launch_fast`. A wrong
+predicate here costs performance only (direct operands are always correct). `cap_ok` keeps its
+meaning (`ffn_mix_late` reads it, 7670): R1 changes how a stage runs, not `cap_ok`. Running direct
+puts the stage body's HOST code back on every lane-layer (a replay skips it): the env predicates it
+reads per call -- `mhc_pre_scaled_for` (4794, 4843), `mhc_narrow_fallback_for` (7669),
+`V41_ROUTER_WMMA` (7850) -- become LazyLock (process-static, as KNOB_AUDIT already lists them), and
+Step 0b times the whole stage body against a graph replay.
 
 R2. The context write rides along the first stage. In `stage_b` mode `mhc_pre_attn`'s direct launch
 carries the lane-layer's entry BY VALUE (272 B; the launch's kernel arguments grow ~160 -> ~440 B,
 well under 4 KB) and a twin of its kernel, `mhc_fast_batched_ctx`, runs ONE extra workgroup (grid
-x + 1; z = 0 only) that copies the entry into the slot and returns before the body; every other
-workgroup runs the body. The kernel keeps the direct kernel's signature plus two arguments and
+x + 1) that copies the entry into the slot and returns before the body; every other workgroup runs
+the body. The entry and the slot pointer are the LAST kernel arguments (every original argument
+keeps its kernarg offset, so the body's argument loads do not move), and the branch is
+`if (blockIdx.x == carrier_x) { if (blockIdx.z == 0) copy; return; }` for every z, so the extra
+workgroup never reaches the body's role dispatch or the counters (`n_part` comes from the
+arguments, not `gridDim`). The kernel keeps the direct kernel's signature plus two arguments and
 `#include`s `mhc_fast_body.inc` after the early-return branch, so its body is the direct body
 (checked offline, 2.3's disassembly gate) and no store precedes the body's loads on any path. The
 Sinkhorn tail's workgroup count (`n_part`) excludes the extra workgroup. `ensure_ctx` sets its
@@ -327,7 +340,9 @@ slot address static so its loads issue WITH the kernel-argument loads instead of
 `__device__ ArenaCtx` per module that holds twins (the carrier writes each, ~6 x 272 B from one
 workgroup) and compile-time slot indices per call site (template parameters), so each slot load is
 PC-relative and independent of the kernel arguments. That removes the dependent round, the residual
-cost of R1-R3.
+cost of R1-R3. Prerequisite: the carrier lives in the mhc_fast module, so the other modules' slot
+addresses come from `hipModuleGetGlobal` at load and reach the carrier as process-static arguments;
+compile-time slot indices multiply symbols per call site (~14, acceptable).
 
 Budget with R1-R2 on run 3's numbers, every remaining twin still charged at the q_b gemv's delta
 (conservative): writes ~0 (the carrier adds one workgroup and 272 B of kernel arguments; host ~0.2
@@ -339,13 +354,18 @@ decide b = 8.
 
 1. Twins at the real shapes, b = 1 / 4 / 8, 21 paired runs each, bit-exact: the bpack gemv twin at
    q_a (1280 x 5120), q_b (32768 x 1280), the kv projection, wo_b (5120 x 8192) and the shared
-   down (5120 x 2304) shapes; the grouped `wo_a` twin (8 x 1024 x 4096); `rms_quant_q8_1280_batched`,
-   `rope_tail_batched_copy` and `kv_rms_rope_fp8` twins (built for this; the remaining small
-   families are charged at the largest small-twin delta measured).
+   down (5120 x 2304) shapes; the grouped `wo_a` twin (8 x 1024 x 4096); the shared gate/up twin
+   (`shared_gateup_swiglu_q8_tB{b}_r1`, 2 x 2304 x 5120: gemv-sized, charged as a gemv when not
+   measured); `rms_quant_q8_1280_batched`, `rope_tail_batched_copy` and `kv_rms_rope_fp8` twins
+   (built for this; the remaining small families are charged at the largest small-twin delta
+   measured). Offline before the window (done for tB1..8 and mhc, 2026-10-05): every production
+   twin has no FLAT op and its body matches the direct kernel's plus the dereference prologue
+   (84-98% of instructions in order; the rest prologue and scheduling).
 2. The carrier: `mhc_fast_batched_ctx` (entry by value, extra workgroup) vs the direct
    `mhc_fast_batched`, paired (GPU and host), bit-exact, and the slot holding the entry afterwards
    (a following `_ind` launch reads it: coherence with the canary variant).
-3. R1: a direct `launch_fast` vs a captured 1-node graph of it, paired, host and GPU per launch.
+3. R1: each single-launch stage's WHOLE body run direct (host code, cached predicates, wrapper,
+   `events.stage`) vs a replay of its captured 1-node graph, paired, host and GPU per stage.
 4. Sections 2 (relaunch, K = 8 vs 80, multi-node graphs only), 3 and 5 as in run 3.
 
 Budget (2.0) recomputed: no standalone writes on the carrier path (the carrier's measured delta per
@@ -378,6 +398,12 @@ measured small-twin delta. Same points (b = 1 / 4 / 8 at 60 / 121.6 / 196.8 ms),
   replayed for >= 2 layers and >= 2 lanes; no silent startup disable); a 3-lane case; every b in
   1..8; `has_room()` forced false mid-run (direct fallback interleaved with indirect replays); a
   knob flip between steps; the canary (2.8) clean.
+- Rev 4 counters (review of rev 4): per stage, direct / replayed / captured `stage_b` / captured
+  legacy; writes, carrier vs standalone. At b <= 8 the `stage_b` arm asserts direct = 4 x
+  lane-layers, `stage_b` captures <= 4 stages x distinct b, carrier writes = lane-layers,
+  standalone writes = 0 (= lane-layers under presubmit). An arm with the carrier forced off (test
+  hook) proves the standalone fallback bit-exact; the canary arm checks the carrier stamps `seq`
+  exactly as `ensure_ctx` does.
 - Presubmit: an arm with `V41_PREFILL_PRESUBMIT=1 V41_REMOTE_SPLIT=1` if it runs with box 2, else a
   unit test that interleaves `chain(B)` between `chain(A)` and `prep(A)`.
 - `V41_SLACK_PROBE` armed sets `cap_ok = false` (its alternating mode would be baked).
@@ -491,3 +517,14 @@ Review of 752a3c3 (reviewer: APPROVE WITH CHANGES):
    process-static or in the key; gate arms run canary-off, the canary its own arm.
 3. One OS stall would hard-fail the window: FIXED -- drained runs / pairs re-run up to 3 times.
 4. Clock state: FIXED -- warm-up with real work before every timed run; per-arm SPREAD flag.
+
+Design review round 4, rev 4 (reviewer: APPROVE WITH CHANGES):
+
+1. Carrier entry first would shift the body's kernarg offsets: ADOPTED -- entry and slot pointer
+   last; the carrier branch returns for every z (2.11 R2).
+2. Step 0b item 3 measured the wrong host path: ADOPTED -- the env predicates the four stage bodies
+   read per call become LazyLock; Step 0b times the whole stage body direct vs a graph replay.
+3. Shared gate/up twin is gemv-sized: ADOPTED -- measured or charged as a gemv.
+4. Gate counters for R1 / R2 and a carrier-off arm: ADOPTED (3).
+5. R4 prerequisite: recorded.
+6. All-B disassembly check (carried over): DONE offline for tB1..8 and mhc (2.11 Step 0b item 1).
