@@ -79,13 +79,18 @@ def main():
         if st != 200:
             continue
         for c, d in zip(chunk, r["data"]):
-            cs = cos(d["embedding"], c["embedding"])
-            if cs < worst[0]:
-                worst = (cs, c["kind"])
+            check(all(math.isfinite(x) for x in d["embedding"]) and abs(norm(d["embedding"]) - 1) < 1e-3, f"{c['kind']}: finite unit vector")
+            if c["embedding"]:
+                cs = cos(d["embedding"], c["embedding"])
+                if cs < worst[0]:
+                    worst = (cs, c["kind"])
         want_tokens = sum(len(c["ids"]) for c in chunk)
         check(r["usage"]["prompt_tokens"] == want_tokens, f"usage.prompt_tokens {r['usage']['prompt_tokens']} == ref ids {want_tokens} (EOS counted)")
-    print(f"corpus served in {time.time() - t0:.1f} s; min cosine vs HF {worst[0]:.6f} ({worst[1]})")
-    check(worst[0] >= 0.998, f"min cosine vs reference {worst[0]:.6f} >= 0.998")
+    if worst[1] is None:
+        print(f"corpus served in {time.time() - t0:.1f} s; the reference has no embeddings (--tokens-only dump): HF cosine not checked")
+    else:
+        print(f"corpus served in {time.time() - t0:.1f} s; min cosine vs HF {worst[0]:.6f} ({worst[1]})")
+        check(worst[0] >= 0.998, f"min cosine vs reference {worst[0]:.6f} >= 0.998")
 
     text = cases[0]["text"]
     st, a = post(emb_url, {"input": text})
@@ -112,7 +117,7 @@ def main():
 
 
 def ref_dim(ref):
-    return len(ref["cases"][0]["embedding"])
+    return len(ref["cases"][0]["embedding"]) or 2560
 
 
 if __name__ == "__main__":
