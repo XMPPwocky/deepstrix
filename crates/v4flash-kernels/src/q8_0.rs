@@ -1230,9 +1230,10 @@ impl Q8_0GroupedMatvec {
 
     /// `matvec_grouped_bpack` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md 2.3):
     /// operands 0..3 (out, weight, xq, xscale) marked in `ind` come from the arena context at
-    /// run time; the buffers passed are the real ones (checked as for a direct launch). Twins
-    /// exist for the compile-time batch kernels b = 2..8; any other arm launches the direct
-    /// kernel on those real buffers (design 2.5 rule (a)). No canary variant yet.
+    /// run time; the buffers passed are the real ones (checked as for a direct launch). Every
+    /// arm of the direct launch has a twin -- `grouped_bpack_symbol(batch)` + `_ind`: the
+    /// compile-time batch kernels (b = 2..8) and the runtime-batch kernel (production's b = 1,
+    /// and every b under `V41_GEMV_TB=0`). No canary variant yet.
     #[allow(clippy::too_many_arguments)]
     pub fn matvec_grouped_bpack_ind(
         &self,
@@ -1247,7 +1248,7 @@ impl Q8_0GroupedMatvec {
         n_groups: u32,
         batch: u32,
     ) -> eyre::Result<()> {
-        if !(2..=8).contains(&batch) || grouped_bpack_symbol(batch) == "q8_0_grouped_gemv_bpack" {
+        if batch == 0 || batch > GEMV_BPACK_MAX {
             return self.matvec_grouped_bpack(stream, out, weight, xq, xscale, group_dim, rank, n_groups, batch);
         }
         if ind.canary != 0 {
@@ -1268,12 +1269,7 @@ impl Q8_0GroupedMatvec {
         {
             return Err(eyre!("q8_0 matvec_grouped_bpack_ind: operand sizes do not fit batch={batch}"));
         }
-        const IND_SYMBOLS: [&str; 7] = [
-            "q8_0_grouped_gemv_bpack_tB2_ind", "q8_0_grouped_gemv_bpack_tB3_ind", "q8_0_grouped_gemv_bpack_tB4_ind",
-            "q8_0_grouped_gemv_bpack_tB5_ind", "q8_0_grouped_gemv_bpack_tB6_ind", "q8_0_grouped_gemv_bpack_tB7_ind",
-            "q8_0_grouped_gemv_bpack_tB8_ind",
-        ];
-        let function = self.module.get_function(IND_SYMBOLS[(batch - 2) as usize])?;
+        let function = self.module.get_function(&format!("{}_ind", grouped_bpack_symbol(batch)))?;
         let cfg = LaunchConfig {
             grid: (out_dim.div_ceil(GEMV_ROWS_PER_BLOCK), 1, 1),
             block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),

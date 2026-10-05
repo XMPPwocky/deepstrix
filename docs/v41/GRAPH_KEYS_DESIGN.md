@@ -154,7 +154,13 @@ arguments the host derives today, `RopeTail::device_args(params, N_ROT)` (rope.r
 theta_scale, freq_scale, ext_factor, mscale_eff, corr_low, corr_high) -- never `RopeParams`' raw
 floats (recomputing powf / ln / corr_dims on the device is not bit-exact). One entry per layer
 suffices because all three rope kernels use n_rot 64 (asserted at load). The context carries a
-POINTER to the layer's entry.
+POINTER to the layer's entry. REV 4.1 (Step 0b): instead the six values ride IN the entry, three
+VALUE slots of f32 pairs (theta_scale | freq_scale, ext_factor | mscale_eff, corr_low | corr_high,
+`RopeTail::arena_ctx_rope_words` from the same `device_args` output: bit-exact), so a rope twin
+reads them in the same dependent round as its pointers (a pointer to `rope_dev[layer]` adds a
+round). Value slots are Ctx-only (2.5's whitelist covers `Dev` pointer operands, not values); the
+canary variants fold the three rope words into their XOR (a stale rope slot is detectable); the
+words are computed once per layer at load into the entry's static per-layer part.
 
 ### 2.2 The context write is tied to the capture (`ensure_ctx`)
 
@@ -182,8 +188,10 @@ around its existing `__device__ __forceinline__` body: the twin takes the usual 
 argument, the address of its context slot (`ctx_dev + 8 x slot`, process-static, safe to bake),
 and the prologue dereferences it, before any store: `p_i = (ind_mask >> i) & 1 ? *(T* const*)p_i :
 p_i` (thread-uniform, scalar loads). No slot table or slot ids in HIP. The canary's `seq` and log
-pointer (2.8) come the same way, read in the same prologue load sequence. Direct kernels are untouched (prefill, single-token decode, uncaptured paths) -- INSTRUCTION-identical, checked offline
-against the pre-twin build by disassembly: calling an inlined body from the direct kernel is NOT
+pointer (2.8) come the same way, read in the same prologue load sequence. Direct kernels are untouched (prefill, single-token decode, uncaptured paths) -- INSTRUCTION-identical modulo
+PC-relative literal offsets (twin code added between a kernel and its constant data moves them;
+`s_add_co_u32 sN, sN, 0xffff....` after `s_getpc_b64`, normalised by
+scratch-ms/graph_keys_cmp_direct2.sh), checked offline against the pre-twin build by disassembly: calling an inlined body from the direct kernel is NOT
 enough (the kernel-argument noalias becomes scoped metadata and the schedule moves; Step 0's
 `mhc_fast_batched`), so a kernel whose body is not already a device function keeps its original
 signature and `#include`s its body file, which the twin's device function includes too
@@ -305,8 +313,9 @@ predicate here costs performance only (direct operands are always correct). `cap
 meaning (`ffn_mix_late` reads it, 7670): R1 changes how a stage runs, not `cap_ok`. Running direct
 puts the stage body's HOST code back on every lane-layer (a replay skips it): the env predicates it
 reads per call -- `mhc_pre_scaled_for` (4794, 4843), `mhc_narrow_fallback_for` (7669),
-`V41_ROUTER_WMMA` (7850) -- become LazyLock (process-static, as KNOB_AUDIT already lists them), and
-Step 0b times the whole stage body against a graph replay.
+`V41_ROUTER_WMMA` (7850) -- become LazyLock (process-static, as KNOB_AUDIT already lists them; a
+BUILD CHECKLIST item: the budget assumes it), and Step 0b times the direct launch against a graph
+replay (with `launch_fast` as the router stage's proxy: conservative, review of 2e42893).
 
 R2. The context write rides along the first stage. In `stage_b` mode `mhc_pre_attn`'s direct launch
 carries the lane-layer's entry BY VALUE (272 B; the launch's kernel arguments grow ~160 -> ~440 B,
@@ -332,7 +341,9 @@ another one), `ensure_ctx` falls back to the standalone `arena_ctx_store` (2.2) 
 depends on the carrier.
 
 R3. Measure, do not assume (Step 0b, below): every twin at its call site's real shape, the grouped
-`wo_a` twin and three small twins built for it, the carrier's cost, and a direct launch vs a 1-node
+`wo_a` twins (the tB2..8 kernels AND the runtime-batch kernel, production's b = 1 arm and every b
+under `V41_GEMV_TB=0`: a converted wrapper must have a twin for every arm the direct launch can
+take at b <= 8, or that stage taints at that b) and three small twins built for it, the carrier's cost, and a direct launch vs a 1-node
 graph (R1's host and GPU cost).
 
 R4. Fallback if b = 8 stays over after R1-R3 (design sketch only, not built unless needed): make the
@@ -528,3 +539,17 @@ Design review round 4, rev 4 (reviewer: APPROVE WITH CHANGES):
 4. Gate counters for R1 / R2 and a carrier-off arm: ADOPTED (3).
 5. R4 prerequisite: recorded.
 6. All-B disassembly check (carried over): DONE offline for tB1..8 and mhc (2.11 Step 0b item 1).
+
+Code review of Step 0b 2e42893 (reviewer: APPROVE WITH CHANGES):
+
+1. The grouped wo_a twin was missing at b = 1 (production's arm is the runtime-batch kernel): FIXED
+   -- `q8_0_grouped_gemv_bpack_ind` (include-body pattern; direct kernel IDENTICAL; twin: same VGPR /
+   SGPR, no FLAT, body 90.7% in order); the wrapper maps every arm to `grouped_bpack_symbol(b)` +
+   `_ind`; Step 0b measures it at b = 1.
+2. Shared gate / up are two launches at b = 6..8: FIXED in the budget (2 x the gemv delta); the
+   unmeasured small families are 2 (rope_inv_quant_q8, the shared input quantize).
+3. Carrier checks: ADDED -- VGPR 202 / SGPR 42 = the direct kernel's, scratch 0, no spills; the extra
+   workgroup's x is an argument (`ctx_wg`, no gridDim derivation).
+4. Rope value slots: AGREED, recorded in 2.1 (Ctx-only, canary XOR folds them, computed at load).
+5. Identity gate wording: 2.3 now says "modulo PC-relative literal offsets".
+6. Env-read diagnostic names fixed; LazyLock caching is a build checklist item (2.11 R1).

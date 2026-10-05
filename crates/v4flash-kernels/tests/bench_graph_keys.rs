@@ -1067,8 +1067,8 @@ fn graph_keys_step0b() -> eyre::Result<()> {
                 &mut || g.matvec_grouped_bpack_ind(&s, ind, &mut out_x, &w, &xq, &xs, gd, rk, ng, b),
             )?;
             s.synchronize()?;
-            // b = 1 has no twin (the runtime kernel): the wrapper ran the direct kernel on out_x.
-            let got = if b == 1 { &out_x } else { &out_i };
+            // b = 1: the runtime-batch kernel's twin (production's arm); 2..8: the tB twins.
+            let got = &out_i;
             let n = b as usize * out_dim;
             let diff = down(&out_d, n)?.iter().zip(down(got, n)?).filter(|(a, c)| **a != *c).count();
             exact &= diff == 0;
@@ -1407,8 +1407,7 @@ fn graph_keys_step0b() -> eyre::Result<()> {
         let t = Instant::now();
         let mut sink = 0usize;
         for _ in 0..1000 {
-            for k in ["V41_MHC_PRE_SCALED_MAX", "V41_MHC_NARROW_FALLBACK", "V41_ROUTER_WMMA", "V41_MHC_PRE_SCALED_MAX"]
-            {
+            for k in ["V41_MHC_PRE_SCALED", "V41_MHC_NARROW", "V41_ROUTER_WMMA", "V41_MHC_PRE_SCALED"] {
                 sink += std::env::var(k).map(|v| v.len()).unwrap_or(0);
             }
         }
@@ -1482,8 +1481,9 @@ fn graph_keys_step0b() -> eyre::Result<()> {
     // Per lane-layer: the carrier's delta (instead of a standalone write); R1's direct - graph delta
     // x 4 single-launch stages; 4 multi-node graph launches at the relaunch delta; the twins at their
     // measured deltas -- q_a, q_b, kv, wo_b, shared_down, wo_a measured, the shared gate/up charged
-    // at the largest gemv delta, rms_quant / kv_rms_rope / rope_copy measured and 4 more small
-    // families at the largest small delta. 80 lane-layers (2 lanes x 40 layers) at b = 1 / 4 / 8
+    // at the largest gemv delta (twice at b >= 6: two launches), rms_quant / kv_rms_rope / rope_copy
+    // measured and the 2 unmeasured small families (rope_inv_quant_q8, the shared input quantize)
+    // at the largest small delta. 80 lane-layers (2 lanes x 40 layers) at b = 1 / 4 / 8
     // per lane, ms.step 60 / 121.6 / 196.8 ms (GK_STEP_MS_B{1,4,8}).
     let lane_layers = 80.0;
     let env_ms = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
@@ -1500,11 +1500,15 @@ fn graph_keys_step0b() -> eyre::Result<()> {
         let t = |name: &str| ch(&twin[&(name.to_string(), b)], ub);
         let gemv_max = gemv_sites.iter().map(|n| t(n)).fold(0.0, f64::max);
         let small_max = small.iter().map(|n| t(n)).fold(0.0, f64::max);
+        // shared gate / up: one fused twin at b <= 5, two gemv twins at b = 6..8 (charged at the
+        // largest gemv delta); the unmeasured small families: rope_inv_quant_q8 and the shared
+        // input quantize (2, at the largest small delta).
+        let gateup = if b <= 5 { 1.0 } else { 2.0 };
         let twins = gemv_sites.iter().map(|n| t(n)).sum::<f64>()
-            + gemv_max
+            + gateup * gemv_max
             + t("wo_a")
             + small.iter().map(|n| t(n)).sum::<f64>()
-            + 4.0 * small_max;
+            + 2.0 * small_max;
         let (cg, chh) = &carrier_d[&b];
         let gpu = lane_layers * (ch(cg, ub) + 4.0 * ch(&r1.0, ub) + 4.0 * ch(&relaunch.0, ub) + twins);
         let host = lane_layers * (ch(chh, ub) + 4.0 * ch(&r1.1, ub) + 4.0 * ch(&relaunch.1, ub));

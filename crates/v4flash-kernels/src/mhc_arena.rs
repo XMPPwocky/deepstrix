@@ -253,13 +253,14 @@ impl MhcArena {
             }
             FastVia::Carrier(entry, slot) => {
                 // One more x workgroup: it writes the entry and returns before the body.
+                let ctx_wg = cfg.grid.0;
                 let cfg = LaunchConfig { grid: (cfg.grid.0 + 1, cfg.grid.1, cfg.grid.2), ..cfg };
                 let function = self.fast.get_function("mhc_fast_batched_ctx")?;
                 return launch_kernel!(function, cfg, stream, [
                     split_p, mix_p, cnt_p, inv_p, w_p, x_p, scale_p, base_p, carry.raw(),
                     cx_p, cur_p, norm_p, nw_p,
                     k, ne, n_mix, do_collapse, write_carry as u32, mode, rms_eps,
-                    N_HC, sinkhorn_iters, sinkhorn_eps, entry, slot
+                    N_HC, sinkhorn_iters, sinkhorn_eps, entry, slot, ctx_wg
                 ]);
             }
             FastVia::Ind(ind) => ind,

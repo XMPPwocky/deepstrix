@@ -301,8 +301,8 @@ extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ind_cana
 }
 
 // The CARRIER (GRAPH_KEYS_DESIGN.md 2.11 R2): the direct kernel plus the lane-layer's context write.
-// Grid x + 1: the LAST x workgroup copies `ctx_entry` into the slot (z = 0) and returns before the
-// body for every z; every other workgroup runs the direct body (`n_part` comes from the arguments,
+// Grid x + 1: the LAST x workgroup (`ctx_wg`, passed: no gridDim derivation) copies `ctx_entry`
+// into the slot (z = 0) and returns before the body for every z; every other workgroup runs the direct body (`n_part` comes from the arguments,
 // so the extra workgroup is never counted). The entry and the slot are the LAST arguments, so every
 // original argument keeps its kernarg offset.
 extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ctx(
@@ -330,8 +330,9 @@ extern "C" __global__ __launch_bounds__(MF_BLOCK) void mhc_fast_batched_ctx(
         unsigned int     iters,
         float            eps,
         ArenaCtx         ctx_entry,                // the lane-layer's entry, by value (LAST)
-        ArenaCtx       * __restrict__ ctx_dst) { // the context slot
-    if (blockIdx.x == gridDim.x - 1u) {
+        ArenaCtx       * __restrict__ ctx_dst,   // the context slot
+        unsigned int     ctx_wg) {                 // the extra workgroup's x (= the direct grid's x)
+    if (blockIdx.x == ctx_wg) {
         if (blockIdx.z == 0u) {
             const uint32_t t = threadIdx.x;
             if (t < ARENA_CTX_SLOTS) ctx_dst->p[t] = ctx_entry.p[t];
