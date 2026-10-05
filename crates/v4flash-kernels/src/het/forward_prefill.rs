@@ -2087,11 +2087,11 @@ impl HeterogeneousEngine {
         })
     }
 
-    /// Start of an arena step (every driver, design 2.4 / 2.7): read `V41_MS_GRAPH_KEYS` once for the
-    /// step; under `stage_b`, a changed process-static set (`sd`) makes every cached stage graph
-    /// stale -- synchronize, then clear both caches before any replay.
-    pub fn graph_step_begin(&self) -> eyre::Result<super::arena_ctx::GraphMode> {
-        let mode = self.stage_b.begin_step();
+    /// Start of an arena step of `lanes` lanes (every driver, design 2.4 / 2.7): read
+    /// `V41_MS_GRAPH_KEYS` once for the step; under `stage_b`, a changed process-static set (`sd`)
+    /// makes every cached stage graph stale -- synchronize, then clear both caches before any replay.
+    pub fn graph_step_begin(&self, lanes: usize) -> eyre::Result<super::arena_ctx::GraphMode> {
+        let mode = self.stage_b.begin_step(lanes);
         if mode == super::arena_ctx::GraphMode::StageB && self.stage_b.generation_changed() {
             self.dgpu.compute.synchronize()?;
             self.dgpu_graphs.clear();
@@ -3040,6 +3040,7 @@ impl HeterogeneousEngine {
         layer: usize,
         pos0: u32,
         graphs_ok: bool,
+        deferred: bool,
     ) -> eyre::Result<()> {
         let de = &self.dgpu;
         // ========================================================
@@ -3048,8 +3049,13 @@ impl HeterogeneousEngine {
         // ========================================================
         let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
         // GRAPH_KEYS_DESIGN.md 2.4: under `stage_b` the lane-layer's entry (the same one
-        // pre_moe_chain built: the slot already holds it unless presubmit interleaved another lane).
-        let ctx_entry = (graphs_ok && self.stage_b.mode() == super::arena_ctx::GraphMode::StageB)
+        // pre_moe_chain built). Deferred past the remote submit (`V41_PREFILL_PRESUBMIT=1`, ungated
+        // by G6) it keeps the legacy keys.
+        if deferred && self.stage_b.mode() == super::arena_ctx::GraphMode::StageB {
+            static NOTED: std::sync::Once = std::sync::Once::new();
+            NOTED.call_once(|| tracing::warn!("stage_b: V41_PREFILL_PRESUBMIT defers the shared expert; it runs legacy graph keys (ungated)"));
+        }
+        let ctx_entry = (graphs_ok && !deferred && self.stage_b.mode() == super::arena_ctx::GraphMode::StageB)
             .then(|| self.arena_ctx_entry(dlw, bd));
         let ctx = ctx_entry.as_ref().map(|(e, t)| (e, *t));
         let cap = self.stage_cap_ctx(de, "g.shared_expert", layer, b, bd.residual.raw() as usize, graphs_ok, ctx)?;
@@ -3987,7 +3993,7 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         // dGPU current, no capture open: the graph cache's memory check.
         self.dgpu_graphs.refresh_room();
-        self.graph_step_begin()?;
+        self.graph_step_begin(1)?;
         arena.state.restore_compressor_lending();
 
         // A full raw region moves its window down before the tables are
@@ -4088,7 +4094,7 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         // dGPU current, no capture open: the graph cache's memory check.
         self.dgpu_graphs.refresh_room();
-        self.graph_step_begin()?;
+        self.graph_step_begin(2)?;
         arena.state.restore_compressor_lending();
         arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         let (tokens_a, tokens_b) = tokens.split_at(b_a);
@@ -4288,7 +4294,7 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         // dGPU current, no capture open: the graph cache's memory check.
         self.dgpu_graphs.refresh_room();
-        self.graph_step_begin()?;
+        self.graph_step_begin(n)?;
         arena.state.restore_compressor_lending();
         arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         // ONE tables call split by lane; no row depends across a cut (checked
@@ -4440,7 +4446,7 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         // dGPU current, no capture open: the graph cache's memory check.
         self.dgpu_graphs.refresh_room();
-        self.graph_step_begin()?;
+        self.graph_step_begin(n)?;
         arena.state.restore_compressor_lending();
         arena.compact_for_step(rows, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
         // ONE tables call for the step, split by row range: a lane that cuts
@@ -8628,7 +8634,7 @@ impl HeterogeneousEngine {
         // inside the box-2 RPC window. See `issue_shared_expert_prefill`.
         let defer_shared = prefill_presubmit() && remote_split_active();
         if !defer_shared {
-            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok)?;
+            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok, false)?;
         }
 
         // `mhc_ffn_late`: the pre-ffn mixes, off the router path (their `split`
@@ -10100,7 +10106,7 @@ impl HeterogeneousEngine {
         // shared expert entirely in that case, so without this the layer would add
         // a stale `ffn_shared` and be silently wrong.
         if defer_shared {
-            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok)?;
+            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok, true)?;
         }
         let pager_window;
         let (routed_src, moe_remap, moe_packed): (

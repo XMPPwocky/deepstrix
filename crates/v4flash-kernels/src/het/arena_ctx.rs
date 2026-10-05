@@ -380,9 +380,15 @@ impl StageB {
     }
 
     /// Read `V41_MS_GRAPH_KEYS` for this step (design 2.4: once per step, carried down) and forget
-    /// the shadow (the next lane-layer writes its entry for sure).
-    pub fn begin_step(&self) -> GraphMode {
-        let mode = if crate::knobs::MS_GRAPH_KEYS.pick() == 1 && cfg!(feature = "v41") { GraphMode::StageB } else { GraphMode::Legacy };
+    /// the shadow (the next lane-layer writes its entry for sure). A step of more than two lanes
+    /// runs legacy: G6 gates one and two (the ready-first and pipelined drivers), not three.
+    pub fn begin_step(&self, lanes: usize) -> GraphMode {
+        let mut mode = if crate::knobs::MS_GRAPH_KEYS.pick() == 1 && cfg!(feature = "v41") { GraphMode::StageB } else { GraphMode::Legacy };
+        if mode == GraphMode::StageB && lanes > 2 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(lanes, "stage_b: a step of more than two lanes runs legacy graph keys (ungated)"));
+            mode = GraphMode::Legacy;
+        }
         self.mode.store(mode as u8, Ordering::Relaxed);
         self.canary_on.store(crate::knobs::MS_CTX_CHECK.on(), Ordering::Relaxed);
         *self.shadow.lock().unwrap() = None;

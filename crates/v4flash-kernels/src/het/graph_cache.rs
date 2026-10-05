@@ -53,6 +53,8 @@ pub struct GraphCache {
     /// New captures allowed (free device memory above the reserve at the last
     /// `refresh_room`).
     room: AtomicBool,
+    /// `pause_captures` (gates): no new capture whatever the device memory.
+    paused: AtomicBool,
     calls: AtomicU64,
 }
 
@@ -67,13 +69,20 @@ impl GraphCache {
         Self {
             entries: Mutex::new(HashMap::new()),
             room: AtomicBool::new(true),
+            paused: AtomicBool::new(false),
             calls: AtomicU64::new(0),
         }
     }
 
-    /// Whether a NEW graph may be captured (`refresh_room`).
+    /// Whether a NEW graph may be captured (`refresh_room`, `pause_captures`).
     pub fn has_room(&self) -> bool {
-        self.room.load(Ordering::Relaxed)
+        self.room.load(Ordering::Relaxed) && !self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Gate hook: while `on`, `has_room` says no (the below-reserve path: new shapes run
+    /// uncaptured, cached shapes replay) whatever `refresh_room` finds.
+    pub fn pause_captures(&self, on: bool) {
+        self.paused.store(on, Ordering::Relaxed);
     }
 
     /// Re-read the CURRENT device's free memory (every `ROOM_EVERY` calls; the
