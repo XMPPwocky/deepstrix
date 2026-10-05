@@ -13,7 +13,14 @@ uncaptured then replayed; taint q_chain tainted, bit-exact). FAILED on counters 
 (first arm) 320 and the one-lane pass 360 lane-layers UNCAPTURED -- the room flag stayed PAUSED
 after a cache clear (legacy graphs ~2 MB each: G5's / pass 1's shapes went under the 400 MB
 reserve; `refresh_room` re-reads every 16 calls). Fix: `GraphCache::clear` makes the next
-`refresh_room` re-read the device (also right for production's generation-change clear). Next: the GPU gate
+`refresh_room` re-read the device (also right for production's generation-change clear). Owner: "call
+that a pass". DEPLOYED 2026-10-05 21:41 UTC (hub 3eccfdf9 = 5d3ce67, knob legacy); per-turn A/B
+21:42-22:42 UTC, 44 turns, 21765 steps: step-weighted ms.step p50 stage_b / legacy = 0.985, every
+(rows, spec, lanes) cell <= 1.0 (plain 1-row -5.6%, DSpark verify -2.3..-3.0%, plain 2-lane ~0).
+`stage_b` LIVE in the knob file from 22:43 UTC. Seen live: the legacy cache filled the dGPU 2.5 min
+after the restart (1280 graphs, free 0 MB; new captures PAUSED) and again 14 s after the first
+stage_b clear (2560 graphs): legacy holds every (rows, lane) shape for good, ~2 MB a graph.
+(Original plan:) the GPU gate
 window (~/scratch-ms/window_graph_keys_gates.sh), then deploy with legacy default and A/B the knob. Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
 review-APPROVED (2 rounds); Step 0 runs 1-3 were NO-GO (run 3 narrowly: 1.03 / 1.08 / 1.23% of the
 step at b = 1 / 4 / 8). Owner 2026-10-05: revise first (rev 4 = section 2.11), then merge the
