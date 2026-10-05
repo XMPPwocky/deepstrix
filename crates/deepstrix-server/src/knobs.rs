@@ -176,9 +176,9 @@ v4flash_kernels::knobs! {
     /// `V41_EMBED_LOAN_IMAGE` (default `$HOME/.cache/deepstrix/embed-loan.img`):
     /// where the loaned dGPU bytes are copied at startup.
     pub static EMBED_LOAN_IMAGE = Knob::text("V41_EMBED_LOAN_IMAGE");
-    /// `V41_EMBED_FAULT_LAYER` (gates only; default off): every embed phase's
+    /// `V41_EMBED_FAULT_LAYER` (gates only, live; default off): every embed phase's
     /// forward fails after this layer (design §10, gate E6).
-    pub static EMBED_FAULT_LAYER = Knob::int("V41_EMBED_FAULT_LAYER", MAX, 0, MAX);
+    pub static EMBED_FAULT_LAYER = Knob::int("V41_EMBED_FAULT_LAYER", MAX, 0, MAX).live();
 }
 
 #[cfg(test)]
@@ -207,7 +207,7 @@ mod tests {
         let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
         live.sort();
         assert_eq!(live, [
-            "V41_B2_PIN_PREFILL_BAND", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
+            "V41_B2_PIN_PREFILL_BAND", "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
             "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
             "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA",
