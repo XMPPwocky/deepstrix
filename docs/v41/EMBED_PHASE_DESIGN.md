@@ -546,3 +546,5 @@ Branch binary ce52ee3c (21b43bf). Script and logs in the job's tmp dir: `window2
 1. **Pinned host allocation** is 14–252 ms per phase (13 ms in window 1); the cause is not isolated. Overlap it with the first layer's read, or find what grew.
 2. `V41_EMBED_VERIFY=0` after a soak: −0.24 s of the 0.4 s return.
 3. Long batches are compute-bound now: the forward, not I/O, is the lever above ~4K tokens per phase.
+
+**Deployed 2026-10-05 01:43 UTC** (hub-only, owner-approved): hub ce52ee3c from this branch (code 21b43bf), box 2 untouched. The launcher passes `--embed-gguf "$EMBED_GGUF"` from the production env file, only to a binary that has the flag. Post-deploy check: `/v1/models` lists both models; a live embedding vs llama.cpp cos 0.999677 (27 tokens), phase 1.64 s; chat answers.
