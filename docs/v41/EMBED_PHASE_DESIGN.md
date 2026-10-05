@@ -474,3 +474,39 @@ Branch binary d962366b (03dc301). Window script and logs are in the job's tmp di
 2. More layer readers, or larger pieces: 1.8 GB/s against the 5.5 GB/s measured elsewhere on this box.
 3. `V41_EMBED_VERIFY=0` after a soak: −0.24 s.
 4. Q4_K_M weights: half the stream, at a quality cost.
+
+## 16. Read path rev 4: O_DIRECT over two drives (2026-10-05, after the window)
+
+E7 showed the phase is I/O-bound: the 3.86 GB layer stream ran at ~1.8 GB/s, and the loan return read its image with a single reader.
+
+**The cause.** Four buffered readers each issued a DONTNEED after every piece, which evicts the other readers' readahead. That is the failure `het/weights.rs` (`expert_read_threads`) recorded for the V4.1 weight loader.
+
+**Rev 4:**
+
+- **Layer stream: one aligned O_DIRECT span per layer** (`direct_io::DirectFiles::read_span`).
+  - A GGUF block's tensors are contiguous (`Qwen3EmbedModel::layer_span`).
+  - The span is cut into 4 MiB pieces over `V41_EMBED_READERS` threads (default 32), round-robin over identical replicas of the GGUF on different drives (`V41_EMBED_GGUF_REPLICAS`).
+  - Each tensor is copied H2D from its place in the span to its `LayerLayout` slot: 11 copies per layer, and no host-side copy.
+  - O_DIRECT bypasses the page cache, so no DONTNEED is needed and no reader can evict another's readahead. The phase still ends with a whole-file drop, for the buffered token-row reads.
+- **Loan image: one replica per drive** (`V41_EMBED_LOAN_IMAGE=a:b`).
+  - Donor regions are 4 KiB-aligned, and each chunk is read O_DIRECT in parallel over the replicas.
+  - Every replica is `flock`ed.
+- **Box 1's second drive.** The Crucial E100 (box 2's old boot/weights drive, wiped with the owner's OK) is now `/weights2`: plaintext ext4, as on box 2, in lumi-flake d5af80c. It holds `/weights2/qwen3-embedding/Qwen3-Embedding-4B-Q8_0.gguf`, a byte-identical copy (verified by hash over O_DIRECT reads), and the second loan image.
+
+**Measured** (`v4flash-core/tests/embed_read_bench.rs`, CPU and disk only, the hub serving at the same time, 3.86 GB per pass):
+
+| Reader | Rate |
+|---|---|
+| Buffered ×4 (rev 3) | 1.44–1.65 GB/s |
+| O_DIRECT, YMTC only, ×4 / ×8 / ×16 / ×32 | 1.75 / 2.86 / 3.41 / 3.63 GB/s |
+| O_DIRECT, YMTC + E100, ×8 / ×16 / ×32 / ×48 | 5.27 / 5.66 / **6.47** / 6.26 GB/s |
+
+Expected phase cost:
+
+- the layer stream drops from ~2.2 s to ~0.6 s;
+- the image return (0.58 GB) drops from ~1.0 s to ~0.1 s, plus verify (0.24 s);
+- about **1.0–1.2 s per phase**, against 3.5 s.
+
+**Not yet measured on the GPU.** The per-tensor H2D path is new code. It needs a GPU window to rerun `tiny_gpu_matches_cpu`, `loan_round_trip` (now with two image replicas) and E2, and to take E7 again before deploy.
+
+Deploy env: `V41_EMBED_GGUF_REPLICAS=/weights2/qwen3-embedding/Qwen3-Embedding-4B-Q8_0.gguf` and `V41_EMBED_LOAN_IMAGE=/home/claude-code/.cache/deepstrix/embed-loan.img:/weights2/qwen3-embedding/embed-loan.img`.
