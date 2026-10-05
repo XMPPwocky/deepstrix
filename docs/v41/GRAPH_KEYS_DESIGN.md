@@ -1,6 +1,7 @@
 # Arena stage graphs keyed by (stage, rows) only
 
-Status: DESIGN rev 4.1 (2026-10-05), rev 4 review round: APPROVE WITH CHANGES (applied, section 7). Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
+Status: DESIGN rev 4.1 (2026-10-05), rev 4 review round: APPROVE WITH CHANGES (applied, section 7).
+Step 0b: GO (2026-10-05 13:07 UTC; 0.44 / 0.29 / 0.39% of the step at b = 1 / 4 / 8). Next: the build. Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
 review-APPROVED (2 rounds); Step 0 runs 1-3 were NO-GO (run 3 narrowly: 1.03 / 1.08 / 1.23% of the
 step at b = 1 / 4 / 8). Owner 2026-10-05: revise first (rev 4 = section 2.11), then merge the
 production build (worktree-embed-phase, hub ce52ee3c).
@@ -142,6 +143,22 @@ workgroup (kernel argument -> slot -> body), exposed once per workgroup round, s
 gemv's workgroup rounds (b=8: ~4 workgroups resident per CU, 64 per CU). Of the b=8 total, 896 us is
 the 7 small twins per lane-layer charged at the q_b gemv's delta (an assumption, not a
 measurement); measured items alone: b=1 0.85%, b=4 0.77%, b=8 0.77%, plus the small twins.
+
+#### Step 0b (2026-10-05 13:07 UTC, f782e2f, hub down 76 s on ce52ee3c): GO
+
+| item | result |
+|---|---|
+| twins at the real shapes (21 pairs, all bit-exact) | q_a +0.15 / +0.24 / +0.01 us; q_b +0.19 / +0.59 / +1.75; kv +0.18 / +0.19 / -0.03; wo_b +0.20 / +0.23 / +1.39; shared_down +0.28 / +0.34 / +0.44; wo_a (b=1 the runtime twin) +0.15 / +0.16 / +0.37; rms_quant +0.25 / +0.21 / +0.29; kv_rms_rope -0.00 / -0.08 / +0.03; rope_copy +0.17 each (b = 1 / 4 / 8) |
+| carrier vs direct mhc_fast | GPU +0.89 / +1.23 / +1.09 us, host +0.07 us (vs ctx_store 2.90 + 0.83); bit-exact, slot holds the entry, 1000 carrier -> reader rounds clean |
+| R1: direct vs 1-node graph replay | direct is CHEAPER: GPU -6.73 us (20.24 -> 13.52 us), host -0.92 us per stage (21/21 pairs) |
+| relaunch K = 8 vs 80 (8-node) | GPU -0.02 us (ub +0.03), host -0.03 us |
+| budget, medians (upper bounds) | b=1 0.44% (0.56%), b=4 0.29% (0.42%), b=8 0.39% (0.54%) -> GO |
+
+Side finding (R1): a replay of a 1-node graph costs ~6.7 us more GPU time than the direct launch
+of its kernel (and ~0.9 us more host), so the four single-launch stages running direct is a SAVING
+(charged 0 in the budget: negative deltas earn no credit). If production's per-launch graph
+overhead is the same, today's legacy path spends ~4 x 6.7 us per lane-layer on those four stages
+(~2 ms per step at 2 lanes x 40 layers) -- worth a live check independent of the rest of the design.
 
 ### 2.1 Operands: `Arg` and a pointer-only context
 
