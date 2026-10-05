@@ -507,6 +507,42 @@ Expected phase cost:
 - the image return (0.58 GB) drops from ~1.0 s to ~0.1 s, plus verify (0.24 s);
 - about **1.0–1.2 s per phase**, against 3.5 s.
 
-**Not yet measured on the GPU.** The per-tensor H2D path is new code. It needs a GPU window to rerun `tiny_gpu_matches_cpu`, `loan_round_trip` (now with two image replicas) and E2, and to take E7 again before deploy.
+Measured on the GPU in the second window (§17): ~1.2–1.4 s per phase.
 
 Deploy env: `V41_EMBED_GGUF_REPLICAS=/weights2/qwen3-embedding/Qwen3-Embedding-4B-Q8_0.gguf` and `V41_EMBED_LOAN_IMAGE=/home/claude-code/.cache/deepstrix/embed-loan.img:/weights2/qwen3-embedding/embed-loan.img`.
+
+## 17. Second GPU window: the rev 4 read path (2026-10-05 01:30:29–01:34:02 UTC; production back on 363fc1ec, env identical)
+
+Branch binary ce52ee3c (21b43bf). Script and logs in the job's tmp dir: `window2_embed.sh`, `window2/g_*.log`, `window2/testhub.log`. The test hub read the GGUF over both replicas (YMTC `/persist`, E100 `/weights2`) and returned the loan from two image replicas, one per drive.
+
+| Gate | Result |
+|---|---|
+| `repack_matches_host`, `tiny_gpu_matches_cpu`, `loan_round_trip` (2 donors, **2 image replicas**) | **PASS** (the per-tensor H2D copies out of a layer span, and the parallel O_DIRECT image return) |
+| E2 | Not rerun: the forward math is unchanged; E4 against llama.cpp covers the new read path end to end |
+| **E4** | **PASS**: 0 failures; served corpus vs llama.cpp on the same GGUF **min cos 0.999671** (the punctuation case), identical to window 1; 22 cases incl. the 7,002-token input in 7.7 s |
+| **E6** | **PASS**: faults at layers 0 / 17 / 35 fail only that request; the next embedding is unchanged; chat answers |
+| **E3** | **PASS** (a) and (b): A/A identical; the completion with phases interleaved and the one after them identical |
+| E5 | The owned GGUF replica and both loan images: **0 cached pages** after 26 phases (O_DIRECT). Global `Cached` grew 3.7 → 10.2 GB over the session, which is the test hub's chat traffic (box-1 expert reads; the snapshot dir holds 2.2 MB), not attributable to the phase. dGPU VRAM +332 MiB at the end, the same chat-graph pattern as window 1 (+291). |
+
+26 phases, 0 canary violations, 0 non-finite outputs.
+
+**E7 (cost), from `ms.embed`:**
+
+| Phase | total | stream (`read_ms`) | return (incl. verify 0.24) | pinned | window 1 |
+|---|---|---|---|---|---|
+| 1 input, 2–35 tokens | **1.14–1.36 s** | 0.62–0.86 s (4.5–6.3 GB/s) | 0.39–0.44 s | 28–149 ms | 3.4–3.6 s |
+| 8 inputs, 3,536 tokens | 1.28–1.43 s | 0.64–0.81 s | 0.40–0.42 s | 124–173 ms | |
+| 32 inputs, 12,608 tokens | **2.13 s** | 0.79 s (fwd 1.67 s) | 0.43 s | 14 ms | 3.50 s |
+| 6 inputs, 9,481 tokens incl. a 7K input | 4.56 s | 0.59 s (fwd 4.07 s) | 0.41 s | 70 ms | 5.34 s |
+| faulted (E6) | 0.63–1.22 s | | 0.41–0.44 s | | |
+
+- The layer stream now runs at the bench rate (§16), and the image return dropped from 1.2 s to 0.4 s, most of it the 0.24 s verify.
+- **Compute is now visible** past a few thousand tokens: at 12.6K tokens the forward (1.67 s) is twice the stream. Up to ~3.5K tokens it stays hidden.
+- **Chat ITL** (`window_checks.py e7`, 160-token greedy stream, now with the max gap): alone p99 329 ms, max 358 ms; with embedding traffic (4 requests in the stream) p99 1,325 ms, **max 1,451 ms**. A chat stream stalls about one phase, ~1.3–1.45 s, against ~3.5 s in window 1.
+- Batched throughput: ~5.9K tokens/s at 12.6K tokens per phase.
+
+**Levers left, cheapest first:**
+
+1. **Pinned host allocation** is 14–252 ms per phase (13 ms in window 1); the cause is not isolated. Overlap it with the first layer's read, or find what grew.
+2. `V41_EMBED_VERIFY=0` after a soak: −0.24 s of the 0.4 s return.
+3. Long batches are compute-bound now: the forward, not I/O, is the lever above ~4K tokens per phase.

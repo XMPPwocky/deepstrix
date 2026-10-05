@@ -196,8 +196,8 @@ def e7(base, log):
     with Hammer(base, ["Interleaved embedding traffic during a streamed completion. " * 20] * 4, pause_s=0.2) as h:
         loaded = chat_stream_itl(base, 160)
     q = lambda xs, p: sorted(xs)[min(len(xs) - 1, int(p * len(xs)))] if xs else float("nan")
-    print(f"  chat ITL alone : p50 {q(alone, .5):.0f} ms  p99 {q(alone, .99):.0f} ms  ({len(alone)} gaps)")
-    print(f"  chat ITL loaded: p50 {q(loaded, .5):.0f} ms  p99 {q(loaded, .99):.0f} ms  ({len(loaded)} gaps, {h.ok} embed requests)")
+    print(f"  chat ITL alone : p50 {q(alone, .5):.0f} ms  p99 {q(alone, .99):.0f} ms  max {max(alone, default=0):.0f} ms  ({len(alone)} gaps)")
+    print(f"  chat ITL loaded: p50 {q(loaded, .5):.0f} ms  p99 {q(loaded, .99):.0f} ms  max {max(loaded, default=0):.0f} ms  ({len(loaded)} gaps, {h.ok} embed requests)")
     check(bool(alone) and bool(loaded), "E7 chat ITL measured with and without embedding traffic")
 
 
