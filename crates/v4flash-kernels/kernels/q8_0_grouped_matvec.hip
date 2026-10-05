@@ -356,21 +356,30 @@ Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB8, 8)
 // through the arena context when their `ind_mask` bit is set; same body. Production twins only
 // (no canary code, 2.8); `canary` / `canary_tag` are ignored.
 #include "arena_ctx.inc"
+#define Q8_0_GROUPED_IND_PARAMS                                                            \
+    uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out,            \
+    const unsigned char* w, const int8_t* xq, const float* xscale, unsigned group_dim,     \
+    unsigned rank, unsigned bpg, unsigned n_groups, unsigned batch
+#define Q8_0_GROUPED_IND_DEREF                                                             \
+    ARENA_CTX_DEREF(ind_mask, 0, float*, out);                                             \
+    ARENA_CTX_DEREF(ind_mask, 1, const unsigned char*, w);                                 \
+    ARENA_CTX_DEREF(ind_mask, 2, const int8_t*, xq);                                       \
+    ARENA_CTX_DEREF(ind_mask, 3, const float*, xscale);
+#define Q8_0_GROUPED_IND_XOR (ARENA_CTX_U64(out) ^ ARENA_CTX_U64(w) ^ ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale))
 #define Q8_0_GROUPED_GEMV_BPACK_TB_IND(NAME, B)                                            \
-    extern "C" __global__ void NAME(uint32_t ind_mask, const ArenaCtx* canary,             \
-                                    uint32_t canary_tag, float* out,                       \
-                                    const unsigned char* w, const int8_t* xq,              \
-                                    const float* xscale, unsigned group_dim,               \
-                                    unsigned rank, unsigned bpg, unsigned n_groups,        \
-                                    unsigned batch) {                                      \
+    extern "C" __global__ void NAME(Q8_0_GROUPED_IND_PARAMS) {                             \
         (void)batch;                                                                       \
         (void)canary;                                                                      \
         (void)canary_tag;                                                                  \
-        ARENA_CTX_DEREF(ind_mask, 0, float*, out);                                         \
-        ARENA_CTX_DEREF(ind_mask, 1, const unsigned char*, w);                             \
-        ARENA_CTX_DEREF(ind_mask, 2, const int8_t*, xq);                                   \
-        ARENA_CTX_DEREF(ind_mask, 3, const float*, xscale);                                \
+        Q8_0_GROUPED_IND_DEREF                                                             \
         q8_0_grouped_gemv_bpack_tb_body<B>(out, w, xq, xscale, group_dim, rank, bpg, n_groups); \
+    }                                                                                      \
+    extern "C" __global__ void NAME##_canary(Q8_0_GROUPED_IND_PARAMS) {                    \
+        (void)batch;                                                                       \
+        Q8_0_GROUPED_IND_DEREF                                                             \
+        ARENA_CTX_CANARY_LOAD(canary, Q8_0_GROUPED_IND_XOR);                               \
+        q8_0_grouped_gemv_bpack_tb_body<B>(out, w, xq, xscale, group_dim, rank, bpg, n_groups); \
+        ARENA_CTX_CANARY_STORE(canary_tag);                                                \
     }
 Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB2_ind, 2)
 Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB3_ind, 3)
@@ -395,17 +404,15 @@ __device__ __forceinline__ static void q8_0_grouped_gemv_bpack_rt_body(
         unsigned int   batch) {
 #include "q8_0_grouped_gemv_bpack_body.inc"
 }
-extern "C" __global__ void q8_0_grouped_gemv_bpack_ind(uint32_t ind_mask, const ArenaCtx* canary,
-                                                       uint32_t canary_tag, float* out,
-                                                       const unsigned char* w, const int8_t* xq,
-                                                       const float* xscale, unsigned group_dim,
-                                                       unsigned rank, unsigned bpg, unsigned n_groups,
-                                                       unsigned batch) {
+extern "C" __global__ void q8_0_grouped_gemv_bpack_ind(Q8_0_GROUPED_IND_PARAMS) {
     (void)canary;
     (void)canary_tag;
-    ARENA_CTX_DEREF(ind_mask, 0, float*, out);
-    ARENA_CTX_DEREF(ind_mask, 1, const unsigned char*, w);
-    ARENA_CTX_DEREF(ind_mask, 2, const int8_t*, xq);
-    ARENA_CTX_DEREF(ind_mask, 3, const float*, xscale);
+    Q8_0_GROUPED_IND_DEREF
     q8_0_grouped_gemv_bpack_rt_body(out, w, xq, xscale, group_dim, rank, bpg, n_groups, batch);
+}
+extern "C" __global__ void q8_0_grouped_gemv_bpack_ind_canary(Q8_0_GROUPED_IND_PARAMS) {
+    Q8_0_GROUPED_IND_DEREF
+    ARENA_CTX_CANARY_LOAD(canary, Q8_0_GROUPED_IND_XOR);
+    q8_0_grouped_gemv_bpack_rt_body(out, w, xq, xscale, group_dim, rank, bpg, n_groups, batch);
+    ARENA_CTX_CANARY_STORE(canary_tag);
 }

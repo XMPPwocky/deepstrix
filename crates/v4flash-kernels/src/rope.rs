@@ -330,7 +330,7 @@ impl RopeTail {
 
     /// `launch_kv_rms_rope_fp8` through its `_ind` twin: operands 0..3 (out, x, weight,
     /// pos_per_b) marked in `ind` come from the arena context; the rope arguments from the
-    /// context slots `rope_slots` (`arena_ctx_rope_words`). No canary variant yet.
+    /// context slots `rope_slots` (`arena_ctx_rope_words`).
     #[allow(clippy::too_many_arguments)]
     pub fn launch_kv_rms_rope_fp8_ind(
         &self,
@@ -351,13 +351,10 @@ impl RopeTail {
         if b == 0 {
             return Ok(());
         }
-        if ind.canary != 0 {
-            return Err(eyre!("kv_rms_rope_fp8_ind: no canary variant (Step 0b)"));
-        }
         if x.len() < (b as usize) * 512 || out.len() < (b as usize) * 512 || weight.len() < 512 {
             return Err(eyre!("kv_rms_rope_fp8_ind: buffers too small for b={b}"));
         }
-        let function = self.module.get_function("kv_rms_rope_fp8_ind")?;
+        let function = self.module.get_function(&ind.symbol("kv_rms_rope_fp8"))?;
         let cfg = LaunchConfig { grid: (b, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
         let (p_out, p_x, p_w, p_pos) =
             (ind.ptr(0, out.raw() as u64), ind.ptr(1, x.raw() as u64), ind.ptr(2, weight.raw() as u64), ind.ptr(3, pos_per_b.raw() as u64));
@@ -367,7 +364,7 @@ impl RopeTail {
 
     /// `launch_forward_batched_copy` through its `_ind` twin: operands 0..2 (dst, src,
     /// pos_per_b) marked in `ind` come from the arena context; the rope arguments from the
-    /// context slots `rope_slots`. No canary variant yet.
+    /// context slots `rope_slots`.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_forward_batched_copy_ind(
         &self,
@@ -388,14 +385,11 @@ impl RopeTail {
         if b == 0 {
             return Ok(());
         }
-        if ind.canary != 0 {
-            return Err(eyre!("rope_tail_batched_copy_ind: no canary variant (Step 0b)"));
-        }
         let n = (b as usize) * (n_head as usize) * (head_dim as usize);
         if src.len() < n || dst.len() < n {
             return Err(eyre!("rope_tail_batched_copy_ind: buffers too small"));
         }
-        let function = self.module.get_function("rope_tail_batched_copy_ind")?;
+        let function = self.module.get_function(&ind.symbol("rope_tail_batched_copy"))?;
         // `V41_GRID_PAD`: as the direct launch.
         let cfg = LaunchConfig { grid: (n_head + crate::grid_pad(), 1, b), block: (128, 1, 1), shared_mem_bytes: 0 };
         let inverse_i: i32 = 0;
@@ -404,6 +398,43 @@ impl RopeTail {
         launch_kernel!(function, cfg, stream, [
             ind.mask(), ind.canary, ind.tag, p_dst, p_src, p_pos, n_head, head_dim, n_rot, r[0], r[1], r[2], inverse_i
         ])
+    }
+
+    /// `launch_inverse_quant_q8` through its `_ind` twin: operands 0..3 (heads, xq, xscale,
+    /// pos_per_b) marked in `ind` come from the arena context; the rope arguments from the
+    /// context slots `rope_slots`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_inverse_quant_q8_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        rope_slots: [usize; 3],
+        heads: &mut DeviceBuffer<f32>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+    ) -> eyre::Result<()> {
+        if n_head != 64 || head_dim != 512 || n_rot != 64 {
+            return Err(eyre!("rope_inv_quant_q8_ind: written for 64 x 512 heads, n_rot 64"));
+        }
+        if b == 0 {
+            return Ok(());
+        }
+        let n = (b as usize) * 32768;
+        if heads.len() < n || xq.len() < n || xscale.len() < n / 32 {
+            return Err(eyre!("rope_inv_quant_q8_ind: buffers too small for b={b}"));
+        }
+        let function = self.module.get_function(&ind.symbol("rope_inv_quant_q8"))?;
+        // `V41_GRID_PAD`: as the direct launch.
+        let cfg = LaunchConfig { grid: (64 + crate::grid_pad(), b, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
+        let p: [u64; 4] = [heads.raw() as u64, xq.raw() as u64, xscale.raw() as u64, pos_per_b.raw() as u64];
+        let q: [u64; 4] = std::array::from_fn(|i| ind.ptr(i, p[i]));
+        let r: [u64; 3] = rope_slots.map(|s| ind.slot_addr(s));
+        launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, q[0], q[1], q[2], q[3], r[0], r[1], r[2]])
     }
 
     /// `rope_tail_batched_copy` (2026-09-27 round 2, `V41_DEC_FUSE`): `dst := src` then

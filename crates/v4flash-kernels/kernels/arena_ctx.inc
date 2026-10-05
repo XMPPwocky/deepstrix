@@ -91,3 +91,7 @@ template <typename U> struct ArenaCtxGlobal<U*> { typedef __attribute__((address
         (lo) = __uint_as_float((uint32_t)v_);                                              \
         (hi) = __uint_as_float((uint32_t)(v_ >> 32));                                      \
     } while (0)
+
+// The u64 a VALUE slot holds (`slotp` = the slot's address): the canary variants fold value slots
+// (the rope pairs) into their XOR, so a stale value slot is as visible as a stale pointer.
+#define ARENA_CTX_SLOT_U64(slotp) (*(const __attribute__((address_space(1))) uint64_t*)(slotp))

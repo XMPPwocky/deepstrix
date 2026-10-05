@@ -86,6 +86,12 @@ impl Ind {
         self.ctx + 8 * slot as u64
     }
 
+    /// The twin symbol for `base` (e.g. "q8_0_gemv_bpack_tB4"): `base_ind`, or `base_ind_canary`
+    /// when the canary is on (production twins carry no canary code, design 2.8).
+    pub fn symbol(&self, base: &str) -> String {
+        if self.canary != 0 { format!("{base}_ind_canary") } else { format!("{base}_ind") }
+    }
+
     /// The kernel's `ind_mask`.
     pub fn mask(&self) -> u32 {
         self.slots.iter().enumerate().filter(|(_, s)| s.is_some()).fold(0, |m, (i, _)| m | (1 << i))

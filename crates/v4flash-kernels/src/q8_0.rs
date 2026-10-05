@@ -360,6 +360,39 @@ impl Q8_0Matvec {
     /// `B × n` contiguous elements. The kernel has no batch concept — it
     /// just processes `B × blocks` blocks. Buffers must be at least
     /// `B × n` (xq), `B × n/32` (xscale), `B × n` (x).
+    /// `quantize_input_batched` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md 2.3):
+    /// operands 0..2 (xq, xscale, x) marked in `ind` come from the arena context; the buffers
+    /// passed are the real ones (checked). The wave kernel has twins; the `V41_Q8_QUANT_WAVE=0`
+    /// arm launches the direct kernel on the real buffers (design 2.5 rule (a)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_input_batched_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        n: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || !q8_quant_wave() {
+            return self.quantize_input_batched(stream, xq, xscale, x, n, batch);
+        }
+        if n % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 quantize_batched_ind: n={n} not %32"));
+        }
+        let blocks = (n / Q8_0_BLOCK_ELEMS) * batch;
+        let total_n = (n as usize) * (batch as usize);
+        if x.len() < total_n || xq.len() < total_n || xscale.len() < blocks as usize {
+            return Err(eyre!("q8_0 quantize_batched_ind: buffer too small (n*B={total_n})"));
+        }
+        let function = self.module.get_function(&ind.symbol("q8_0_quantize_f32_wave"))?;
+        // As the direct launch: one idle workgroup (`q8_quant_grid_pad`).
+        let cfg = LaunchConfig { grid: (blocks.div_ceil(8) + q8_quant_grid_pad(), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        let (p_xq, p_xs, p_x) = (ind.ptr(0, xq.raw() as u64), ind.ptr(1, xscale.raw() as u64), ind.ptr(2, x.raw() as u64));
+        launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, p_xq, p_xs, p_x, blocks])
+    }
+
     pub fn quantize_input_batched(
         &self,
         stream: &Stream,
@@ -647,17 +680,7 @@ impl Q8_0Matvec {
             return Err(eyre!("q8_0 matvec_bpack_ind: operand sizes do not fit n_rows={n_rows} k={k} batch={batch}"));
         }
         // Production twins carry no canary code; the canary (design 2.8) has its own symbols.
-        const IND_SYMBOLS: [&str; 8] = [
-            "q8_0_gemv_bpack_tB1_ind", "q8_0_gemv_bpack_tB2_ind", "q8_0_gemv_bpack_tB3_ind", "q8_0_gemv_bpack_tB4_ind",
-            "q8_0_gemv_bpack_tB5_ind", "q8_0_gemv_bpack_tB6_ind", "q8_0_gemv_bpack_tB7_ind", "q8_0_gemv_bpack_tB8_ind",
-        ];
-        const IND_CANARY_SYMBOLS: [&str; 8] = [
-            "q8_0_gemv_bpack_tB1_ind_canary", "q8_0_gemv_bpack_tB2_ind_canary", "q8_0_gemv_bpack_tB3_ind_canary",
-            "q8_0_gemv_bpack_tB4_ind_canary", "q8_0_gemv_bpack_tB5_ind_canary", "q8_0_gemv_bpack_tB6_ind_canary",
-            "q8_0_gemv_bpack_tB7_ind_canary", "q8_0_gemv_bpack_tB8_ind_canary",
-        ];
-        let symbols = if ind.canary != 0 { &IND_CANARY_SYMBOLS } else { &IND_SYMBOLS };
-        let function = self.module.get_function(symbols[(batch - 1) as usize])?;
+        let function = self.module.get_function(&ind.symbol(gemv_bpack_symbol(batch)))?;
         let cfg = LaunchConfig {
             grid: (n_rows.div_ceil(GEMV_ROWS_PER_BLOCK), 1, 1),
             block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
@@ -1251,9 +1274,6 @@ impl Q8_0GroupedMatvec {
         if batch == 0 || batch > GEMV_BPACK_MAX {
             return self.matvec_grouped_bpack(stream, out, weight, xq, xscale, group_dim, rank, n_groups, batch);
         }
-        if ind.canary != 0 {
-            return Err(eyre!("q8_0 matvec_grouped_bpack_ind: no canary variant (Step 0b)"));
-        }
         if group_dim % Q8_0_BLOCK_ELEMS != 0 {
             return Err(eyre!("q8_0 matvec_grouped_bpack_ind: group_dim={group_dim} not %32"));
         }
@@ -1269,7 +1289,7 @@ impl Q8_0GroupedMatvec {
         {
             return Err(eyre!("q8_0 matvec_grouped_bpack_ind: operand sizes do not fit batch={batch}"));
         }
-        let function = self.module.get_function(&format!("{}_ind", grouped_bpack_symbol(batch)))?;
+        let function = self.module.get_function(&ind.symbol(grouped_bpack_symbol(batch)))?;
         let cfg = LaunchConfig {
             grid: (out_dim.div_ceil(GEMV_ROWS_PER_BLOCK), 1, 1),
             block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
@@ -1538,6 +1558,56 @@ impl SharedExpertFused {
         launch_kernel!(function, cfg, stream, [
             mid_xq.raw(), mid_xscale.raw(), gate_w.raw(), up_w.raw(), xq.raw(), xscale.raw(),
             k, n_ff, blocks, clamp
+        ])
+    }
+
+    /// `launch` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md 2.3): operands 0..5 (mid_xq,
+    /// mid_xscale, gate_w, up_w, xq, xscale) marked in `ind` come from the arena context; the
+    /// buffers passed are the real ones (checked by `launch`'s rules). Twins exist for b = 1..8;
+    /// any other batch launches the direct kernel (design 2.5 rule (a)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        mid_xq: &mut DeviceBuffer<i8>,
+        mid_xscale: &mut DeviceBuffer<f32>,
+        gate_w: &DeviceBuffer<u8>,
+        up_w: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        k: u32,
+        n_ff: u32,
+        batch: u32,
+        clamp: f32,
+    ) -> eyre::Result<()> {
+        if !(1..=8).contains(&batch) {
+            return self.launch(stream, mid_xq, mid_xscale, gate_w, up_w, xq, xscale, k, n_ff, batch, clamp);
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 || n_ff % 32 != 0 || n_ff == 0 {
+            return Err(eyre!("shared_expert_fused_ind: k={k} and n_ff={n_ff} must be multiples of 32"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let expected = (n_ff as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        let b = batch as usize;
+        if gate_w.byte_len() != expected
+            || up_w.byte_len() != expected
+            || xq.len() < b * (k as usize)
+            || xscale.len() < b * (blocks as usize)
+            || mid_xq.len() < b * (n_ff as usize)
+            || mid_xscale.len() < b * (n_ff as usize / 32)
+        {
+            return Err(eyre!("shared_expert_fused_ind: operand sizes do not fit batch={batch}"));
+        }
+        let function = self.module.get_function(&ind.symbol(SHARED_FUSED_SYMBOLS[b - 1]))?;
+        let cfg = LaunchConfig { grid: (n_ff / 32, 1, 1), block: (1024, 1, 1), shared_mem_bytes: 0 };
+        let p: [u64; 6] = [
+            mid_xq.raw() as u64, mid_xscale.raw() as u64, gate_w.raw() as u64, up_w.raw() as u64, xq.raw() as u64,
+            xscale.raw() as u64,
+        ];
+        let q: [u64; 6] = std::array::from_fn(|i| ind.ptr(i, p[i]));
+        launch_kernel!(function, cfg, stream, [
+            ind.mask(), ind.canary, ind.tag, q[0], q[1], q[2], q[3], q[4], q[5], k, n_ff, blocks, clamp
         ])
     }
 }

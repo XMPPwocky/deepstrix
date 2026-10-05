@@ -248,23 +248,7 @@ extern "C" __global__ __launch_bounds__(128) void rope_inv_quant_q8(
         float* __restrict__ heads, int8_t* __restrict__ xq, float* __restrict__ xscale,
         const int* __restrict__ pos_per_b, float theta_scale, float freq_scale, float ext_factor,
         float mscale_eff, float corr_low, float corr_high) {
-    const unsigned head = blockIdx.x, b = blockIdx.y, tid = threadIdx.x, lane = tid & 31u, w = tid >> 5;
-    if (head >= 64u) return;  // idle grid-pad column
-    const size_t row = (size_t)b * 32768u;
-    float* hb = heads + row + (size_t)head * 512u;
-    #pragma unroll
-    for (unsigned t = 0; t < 4; ++t) {
-        const unsigned blk = 4u * w + t;          // 0..15 within the head
-        const unsigned e = 32u * blk + lane;      // 0..511 within the head
-        float v = hb[e];
-        if (blk >= 14u) {                         // 448..511: the rope tail (wave-uniform branch)
-            v = rf_rot_pair(v, e, pos_per_b[b], (e - 448u) >> 1, -1.0f, theta_scale, freq_scale, ext_factor,
-                            mscale_eff, corr_low, corr_high);
-            hb[e] = v;
-        }
-        const size_t k = (size_t)head * 16u + blk;
-        rf_q8_block(v, lane, xq + row + 32u * k, xscale + (size_t)b * 1024u + k);
-    }
+#include "rope_inv_quant_q8_body.inc"
 }
 
 // ---- `_ind` twins (GRAPH_KEYS_DESIGN.md 2.3, 2.11) ---------------------------------------------
@@ -281,24 +265,47 @@ __device__ __forceinline__ static void kv_rms_rope_fp8_body(
 #include "kv_rms_rope_fp8_body.inc"
 }
 
+#define ROPE_IND_VALUES                                                                         \
+    float theta_scale, freq_scale, ext_factor, mscale_eff, corr_low, corr_high;                  \
+    ARENA_CTX_F32X2(rope01, theta_scale, freq_scale);                                           \
+    ARENA_CTX_F32X2(rope23, ext_factor, mscale_eff);                                            \
+    ARENA_CTX_F32X2(rope45, corr_low, corr_high);
+#define ROPE_IND_XOR (ARENA_CTX_SLOT_U64(rope01) ^ ARENA_CTX_SLOT_U64(rope23) ^ ARENA_CTX_SLOT_U64(rope45))
+
 // operands: 0 out, 1 x, 2 weight, 3 pos_per_b
-extern "C" __global__ __launch_bounds__(256) void kv_rms_rope_fp8_ind(
+template <bool CANARY>
+__device__ __forceinline__ static void kv_rms_rope_fp8_ind_impl(
         uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out, const float* x,
         const float* weight, float eps, const int* pos_per_b, const uint64_t* rope01, const uint64_t* rope23,
         const uint64_t* rope45) {
-    (void)canary;
-    (void)canary_tag;
     ARENA_CTX_DEREF(ind_mask, 0, float*, out);
     ARENA_CTX_DEREF(ind_mask, 1, const float*, x);
     ARENA_CTX_DEREF(ind_mask, 2, const float*, weight);
     ARENA_CTX_DEREF(ind_mask, 3, const int*, pos_per_b);
-    float theta_scale, freq_scale, ext_factor, mscale_eff, corr_low, corr_high;
-    ARENA_CTX_F32X2(rope01, theta_scale, freq_scale);
-    ARENA_CTX_F32X2(rope23, ext_factor, mscale_eff);
-    ARENA_CTX_F32X2(rope45, corr_low, corr_high);
-    kv_rms_rope_fp8_body(out, x, weight, eps, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
-                         corr_low, corr_high);
+    ROPE_IND_VALUES
+    if constexpr (CANARY) {
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(out) ^ ARENA_CTX_U64(x) ^ ARENA_CTX_U64(weight) ^
+                                          ARENA_CTX_U64(pos_per_b) ^ ROPE_IND_XOR);
+        kv_rms_rope_fp8_body(out, x, weight, eps, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
+                             corr_low, corr_high);
+        ARENA_CTX_CANARY_STORE(canary_tag);
+    } else {
+        (void)canary;
+        (void)canary_tag;
+        kv_rms_rope_fp8_body(out, x, weight, eps, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
+                             corr_low, corr_high);
+    }
 }
+#define KV_RMS_ROPE_IND_KERNEL(NAME, CANARY)                                                   \
+    extern "C" __global__ __launch_bounds__(256) void NAME(                                    \
+            uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out,        \
+            const float* x, const float* weight, float eps, const int* pos_per_b,              \
+            const uint64_t* rope01, const uint64_t* rope23, const uint64_t* rope45) {          \
+        kv_rms_rope_fp8_ind_impl<CANARY>(ind_mask, canary, canary_tag, out, x, weight, eps,    \
+                                         pos_per_b, rope01, rope23, rope45);                   \
+    }
+KV_RMS_ROPE_IND_KERNEL(kv_rms_rope_fp8_ind, false)
+KV_RMS_ROPE_IND_KERNEL(kv_rms_rope_fp8_ind_canary, true)
 
 __device__ __forceinline__ static void rope_tail_batched_copy_body(
         float* __restrict__ dst, const float* __restrict__ src, const int* __restrict__ pos_per_b,
@@ -309,19 +316,78 @@ __device__ __forceinline__ static void rope_tail_batched_copy_body(
 }
 
 // operands: 0 dst, 1 src, 2 pos_per_b
-extern "C" __global__ __launch_bounds__(128) void rope_tail_batched_copy_ind(
+template <bool CANARY>
+__device__ __forceinline__ static void rope_tail_batched_copy_ind_impl(
         uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* dst, const float* src,
         const int* pos_per_b, unsigned int n_head, unsigned int head_dim, unsigned int n_rot,
         const uint64_t* rope01, const uint64_t* rope23, const uint64_t* rope45, int inverse) {
-    (void)canary;
-    (void)canary_tag;
     ARENA_CTX_DEREF(ind_mask, 0, float*, dst);
     ARENA_CTX_DEREF(ind_mask, 1, const float*, src);
     ARENA_CTX_DEREF(ind_mask, 2, const int*, pos_per_b);
-    float theta_scale, freq_scale, ext_factor, mscale_eff, corr_low, corr_high;
-    ARENA_CTX_F32X2(rope01, theta_scale, freq_scale);
-    ARENA_CTX_F32X2(rope23, ext_factor, mscale_eff);
-    ARENA_CTX_F32X2(rope45, corr_low, corr_high);
-    rope_tail_batched_copy_body(dst, src, pos_per_b, n_head, head_dim, n_rot, theta_scale, freq_scale,
-                                ext_factor, mscale_eff, corr_low, corr_high, inverse);
+    ROPE_IND_VALUES
+    if constexpr (CANARY) {
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(dst) ^ ARENA_CTX_U64(src) ^ ARENA_CTX_U64(pos_per_b) ^ ROPE_IND_XOR);
+        rope_tail_batched_copy_body(dst, src, pos_per_b, n_head, head_dim, n_rot, theta_scale, freq_scale,
+                                    ext_factor, mscale_eff, corr_low, corr_high, inverse);
+        ARENA_CTX_CANARY_STORE(canary_tag);
+    } else {
+        (void)canary;
+        (void)canary_tag;
+        rope_tail_batched_copy_body(dst, src, pos_per_b, n_head, head_dim, n_rot, theta_scale, freq_scale,
+                                    ext_factor, mscale_eff, corr_low, corr_high, inverse);
+    }
 }
+#define ROPE_COPY_IND_KERNEL(NAME, CANARY)                                                     \
+    extern "C" __global__ __launch_bounds__(128) void NAME(                                    \
+            uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* dst,        \
+            const float* src, const int* pos_per_b, unsigned int n_head, unsigned int head_dim, \
+            unsigned int n_rot, const uint64_t* rope01, const uint64_t* rope23,                \
+            const uint64_t* rope45, int inverse) {                                             \
+        rope_tail_batched_copy_ind_impl<CANARY>(ind_mask, canary, canary_tag, dst, src,        \
+                                                pos_per_b, n_head, head_dim, n_rot, rope01,    \
+                                                rope23, rope45, inverse);                      \
+    }
+ROPE_COPY_IND_KERNEL(rope_tail_batched_copy_ind, false)
+ROPE_COPY_IND_KERNEL(rope_tail_batched_copy_ind_canary, true)
+
+__device__ __forceinline__ static void rope_inv_quant_q8_body(
+        float* __restrict__ heads, int8_t* __restrict__ xq, float* __restrict__ xscale,
+        const int* __restrict__ pos_per_b, float theta_scale, float freq_scale, float ext_factor,
+        float mscale_eff, float corr_low, float corr_high) {
+#include "rope_inv_quant_q8_body.inc"
+}
+
+// operands: 0 heads, 1 xq, 2 xscale, 3 pos_per_b
+template <bool CANARY>
+__device__ __forceinline__ static void rope_inv_quant_q8_ind_impl(
+        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* heads, int8_t* xq,
+        float* xscale, const int* pos_per_b, const uint64_t* rope01, const uint64_t* rope23,
+        const uint64_t* rope45) {
+    ARENA_CTX_DEREF(ind_mask, 0, float*, heads);
+    ARENA_CTX_DEREF(ind_mask, 1, int8_t*, xq);
+    ARENA_CTX_DEREF(ind_mask, 2, float*, xscale);
+    ARENA_CTX_DEREF(ind_mask, 3, const int*, pos_per_b);
+    ROPE_IND_VALUES
+    if constexpr (CANARY) {
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(heads) ^ ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale) ^
+                                          ARENA_CTX_U64(pos_per_b) ^ ROPE_IND_XOR);
+        rope_inv_quant_q8_body(heads, xq, xscale, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
+                               corr_low, corr_high);
+        ARENA_CTX_CANARY_STORE(canary_tag);
+    } else {
+        (void)canary;
+        (void)canary_tag;
+        rope_inv_quant_q8_body(heads, xq, xscale, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
+                               corr_low, corr_high);
+    }
+}
+#define ROPE_INV_QUANT_IND_KERNEL(NAME, CANARY)                                                \
+    extern "C" __global__ __launch_bounds__(128) void NAME(                                    \
+            uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* heads,      \
+            int8_t* xq, float* xscale, const int* pos_per_b, const uint64_t* rope01,           \
+            const uint64_t* rope23, const uint64_t* rope45) {                                  \
+        rope_inv_quant_q8_ind_impl<CANARY>(ind_mask, canary, canary_tag, heads, xq, xscale,    \
+                                           pos_per_b, rope01, rope23, rope45);                 \
+    }
+ROPE_INV_QUANT_IND_KERNEL(rope_inv_quant_q8_ind, false)
+ROPE_INV_QUANT_IND_KERNEL(rope_inv_quant_q8_ind_canary, true)

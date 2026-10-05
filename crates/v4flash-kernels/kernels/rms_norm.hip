@@ -251,18 +251,36 @@ __device__ __forceinline__ static void rms_quant_q8_1280_body(
 #include "rms_quant_q8_1280_body.inc"
 }
 
-// `_ind` twin (GRAPH_KEYS_DESIGN.md 2.3): operands 0..4 (out, xq, xscale, x, weight) resolve through
-// the arena context when their `ind_mask` bit is set. Production twin (no canary code, 2.8).
+// `_ind` twins (GRAPH_KEYS_DESIGN.md 2.3): operands 0..4 (out, xq, xscale, x, weight) resolve through
+// the arena context when their `ind_mask` bit is set. `_ind` = production (no canary code, 2.8),
+// `_ind_canary` = the same dereferences plus the canary record.
 #include "arena_ctx.inc"
-extern "C" __global__ __launch_bounds__(256) void rms_quant_q8_1280_batched_ind(
+template <bool CANARY>
+__device__ __forceinline__ static void rms_quant_q8_1280_ind_impl(
         uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out, signed char* xq,
         float* xscale, const float* x, const float* weight, float eps) {
-    (void)canary;
-    (void)canary_tag;
     ARENA_CTX_DEREF(ind_mask, 0, float*, out);
     ARENA_CTX_DEREF(ind_mask, 1, signed char*, xq);
     ARENA_CTX_DEREF(ind_mask, 2, float*, xscale);
     ARENA_CTX_DEREF(ind_mask, 3, const float*, x);
     ARENA_CTX_DEREF(ind_mask, 4, const float*, weight);
-    rms_quant_q8_1280_body(out, xq, xscale, x, weight, eps);
+    if constexpr (CANARY) {
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(out) ^ ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale) ^
+                                          ARENA_CTX_U64(x) ^ ARENA_CTX_U64(weight));
+        rms_quant_q8_1280_body(out, xq, xscale, x, weight, eps);
+        ARENA_CTX_CANARY_STORE(canary_tag);
+    } else {
+        (void)canary;
+        (void)canary_tag;
+        rms_quant_q8_1280_body(out, xq, xscale, x, weight, eps);
+    }
 }
+#define RMS_QUANT_IND_KERNEL(NAME, CANARY)                                                     \
+    extern "C" __global__ __launch_bounds__(256) void NAME(                                    \
+            uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out,        \
+            signed char* xq, float* xscale, const float* x, const float* weight, float eps) {  \
+        rms_quant_q8_1280_ind_impl<CANARY>(ind_mask, canary, canary_tag, out, xq, xscale, x,  \
+                                           weight, eps);                                       \
+    }
+RMS_QUANT_IND_KERNEL(rms_quant_q8_1280_batched_ind, false)
+RMS_QUANT_IND_KERNEL(rms_quant_q8_1280_batched_ind_canary, true)

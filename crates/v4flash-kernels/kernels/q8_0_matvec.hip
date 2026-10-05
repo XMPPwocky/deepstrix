@@ -466,6 +466,41 @@ Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB6_ind, 6)
 Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB7_ind, 7)
 Q8_0_GEMV_BPACK_TB_IND(q8_0_gemv_bpack_tB8_ind, 8)
 
+// The wave quantize's twins: operands 0..2 (xq, xscale, x). `_ind` production, `_ind_canary` with
+// the canary record (2.8). Same body as a device function (scoped noalias on the resolved pointers).
+__device__ __forceinline__ static void q8_0_quantize_f32_wave_body(
+    int8_t* __restrict__ xq, float* __restrict__ xscale, const float* __restrict__ x, uint32_t blocks)
+{
+#include "q8_0_quantize_f32_wave_body.inc"
+}
+template <bool CANARY>
+__device__ __forceinline__ static void q8_0_quantize_f32_wave_ind_impl(
+        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, int8_t* xq, float* xscale,
+        const float* x, uint32_t blocks) {
+    ARENA_CTX_DEREF(ind_mask, 0, int8_t*, xq);
+    ARENA_CTX_DEREF(ind_mask, 1, float*, xscale);
+    ARENA_CTX_DEREF(ind_mask, 2, const float*, x);
+    if constexpr (CANARY) {
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale) ^ ARENA_CTX_U64(x));
+        q8_0_quantize_f32_wave_body(xq, xscale, x, blocks);
+        ARENA_CTX_CANARY_STORE(canary_tag);
+    } else {
+        (void)canary;
+        (void)canary_tag;
+        q8_0_quantize_f32_wave_body(xq, xscale, x, blocks);
+    }
+}
+extern "C" __global__ void q8_0_quantize_f32_wave_ind(uint32_t ind_mask, const ArenaCtx* canary,
+                                                      uint32_t canary_tag, int8_t* xq, float* xscale,
+                                                      const float* x, uint32_t blocks) {
+    q8_0_quantize_f32_wave_ind_impl<false>(ind_mask, canary, canary_tag, xq, xscale, x, blocks);
+}
+extern "C" __global__ void q8_0_quantize_f32_wave_ind_canary(uint32_t ind_mask, const ArenaCtx* canary,
+                                                             uint32_t canary_tag, int8_t* xq, float* xscale,
+                                                             const float* x, uint32_t blocks) {
+    q8_0_quantize_f32_wave_ind_impl<true>(ind_mask, canary, canary_tag, xq, xscale, x, blocks);
+}
+
 // Quantize, one WAVE per 32-element block (lane i owns element i; amax via shfl_xor
 // fmaxf, which is order-free so d/id are bit-identical), 8 blocks per 256-thread WG:
 // grid = ceil(blocks/8) x 256. `q8_0_quantize_f32` above launches one 32-thread WG per
@@ -486,19 +521,7 @@ extern "C" __global__ void q8_0_quantize_f32_wave(
     const float* __restrict__ x,
     uint32_t blocks)
 {
-    uint32_t b = blockIdx.x * 8u + (threadIdx.x >> 5u);
-    uint32_t lane = threadIdx.x & 31u;
-    if (b >= blocks) return;
-    float v = x[(size_t)b * 32u + lane];
-    float amax = fabsf(v);
-    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(FULL_WARP_MASK, amax, off));
-    float d = amax / 127.0f;
-    float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (lane == 0) xscale[b] = d;
-    int q = (int)lrintf(v * id);
-    if (q > 127) q = 127;
-    if (q < -128) q = -128;
-    xq[(size_t)b * 32u + lane] = (int8_t)q;
+#include "q8_0_quantize_f32_wave_body.inc"
 }
 
 extern "C" __global__ void q8_0_gemv_batched_warp8(
