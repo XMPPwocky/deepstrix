@@ -462,23 +462,35 @@ pub async fn chat_completions(
 pub async fn list_models(State(engine): State<EngineHandle>) -> Json<serde_json::Value> {
     let id = engine.model_name.as_str().to_string();
     let ctx = engine.n_kv_max as u64;
-    Json(serde_json::json!({
-        "object": "list",
-        "data": [{
-            "id": id,
+    let mut data = vec![serde_json::json!({
+        "id": id,
+        "object": "model",
+        "type": "llm",
+        "created": 0,
+        "owned_by": "deepstrix",
+        "max_context_length": ctx,
+        "loaded_context_length": ctx,
+        "context_window": ctx,
+        "context_length": ctx,
+        "max_completion_tokens": DEFAULT_MAX_NEW as u64,
+        "max_output_tokens": DEFAULT_MAX_NEW as u64,
+        "state": "loaded"
+    })];
+    // The chat model stays first: clients that take `data[0]` keep working.
+    if let Some(e) = engine.embed.as_ref() {
+        data.push(serde_json::json!({
+            "id": e.model_name,
             "object": "model",
-            "type": "llm",
+            "type": "embeddings",
             "created": 0,
             "owned_by": "deepstrix",
-            "max_context_length": ctx,
-            "loaded_context_length": ctx,
-            "context_window": ctx,
-            "context_length": ctx,
-            "max_completion_tokens": DEFAULT_MAX_NEW as u64,
-            "max_output_tokens": DEFAULT_MAX_NEW as u64,
+            "max_context_length": e.max_input_tokens as u64,
+            "context_length": e.max_input_tokens as u64,
+            "embedding_dimensions": e.n_embd as u64,
             "state": "loaded"
-        }]
-    }))
+        }));
+    }
+    Json(serde_json::json!({ "object": "list", "data": data }))
 }
 
 /// GET /api/v1/models — LM Studio-compatible model listing.

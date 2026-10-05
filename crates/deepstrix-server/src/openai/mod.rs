@@ -1,3 +1,4 @@
+pub mod embeddings;
 pub mod error;
 pub mod handler;
 pub mod sse;

@@ -7,7 +7,7 @@ use super::evtrace::Kind;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Every hub/box-2 kind (added to `evtrace`'s header list).
-pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE];
+pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED];
 
 // ---- hub: step context for per-request records ----
 
@@ -277,3 +277,21 @@ pub static B2_READ: Kind = Kind {
 
 /// One reply written on box 2 (writer thread): `t3` stamp and `write()` end.
 pub static B2_WRITE: Kind = Kind { id: 23, name: "b2_write", fields: &["seq", "t3", "t_written", "bytes"] };
+
+/// One hub embed phase (docs/v41/EMBED_PHASE_DESIGN.md), emitted when it ends.
+/// A hub kind (ids 10..19; box 2's are 20..). `wait_ms`: the longest queue time
+/// among the phase's requests; `rows_ms`: token-embedding rows; `read_ms`: the
+/// weight readers' pread time; `wait_read_ms`: the engine thread waiting for
+/// them; `fwd_ms`: the whole forward; `return_ms` / `verify_ms`: the loan's
+/// return (verify included in return); `pinned_ms`: pinned-buffer alloc;
+/// `nonfinite`: inputs whose embedding was not finite (failed);
+/// `guard_violations`: donors whose guard band a kernel overwrote.
+pub static HUB_EMBED: Kind = Kind {
+    id: 14,
+    name: "hub_embed",
+    fields: &[
+        "t", "requests", "inputs", "tokens", "lent_bytes", "wait_ms", "rows_ms", "read_ms", "wait_read_ms",
+        "fwd_ms", "return_ms", "verify_ms", "pinned_ms", "total_ms", "live", "prefills", "ok", "nonfinite",
+        "guard_violations",
+    ],
+};

@@ -1,0 +1,28 @@
+{
+  "_doc": "Embed-phase fixture corpus (docs/v41/EMBED_PHASE_DESIGN.md §10, gates E0/E1/E2). Each case is one input text; `kind` says what it exercises. ref_embed.py turns it into reference token ids + embeddings.",
+  "task": "Given a web search query, retrieve relevant passages that answer the query",
+  "cases": [
+    {"kind": "query", "text": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:What is the capital of China?"},
+    {"kind": "query", "text": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:Explain gravity"},
+    {"kind": "document", "text": "The capital of China is Beijing."},
+    {"kind": "document", "text": "Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun."},
+    {"kind": "code", "text": "def add(a, b):\n    return a + b\n\nprint(add(2, 3))\n"},
+    {"kind": "code", "text": "fn main() {\n\tlet v: Vec<u32> = (0..10).collect();\n\tprintln!(\"{:?}\", v);\n}\n"},
+    {"kind": "cjk", "text": "日本の首都は東京です。北京是中国的首都。서울은 한국의 수도입니다."},
+    {"kind": "indic", "text": "भारत की राजधानी नई दिल्ली है। हिन्दी में स्वागत है।"},
+    {"kind": "indic", "text": "தமிழ் ஒரு பழமையான மொழி. বাংলা ভাষা সুন্দর।"},
+    {"kind": "thai", "text": "ประเทศไทยมีเมืองหลวงชื่อกรุงเทพมหานคร ภาษาไทยสวยงาม"},
+    {"kind": "emoji", "text": "I love this 🙂🙂🙂 so much 🎉🚀 — truly ❤️ (really!)"},
+    {"kind": "contractions", "text": "IT'S fine, WE'LL see, THEY'RE here, I'M sure, YOU'VE won, HE'D go, SHE'S right; it's, we'll, they're."},
+    {"kind": "digits", "text": "Call 1-800-555-0199 or 2026-10-04T20:20:00Z, pi = 3.14159265358979, 1234567890 1,000,000"},
+    {"kind": "whitespace", "text": "line one\r\nline two\r\n\r\n\r\n   indented    with   runs   \t\ttabs\n\n\nend   "},
+    {"kind": "whitespace", "text": "   leading spaces and trailing spaces   "},
+    {"kind": "punctuation", "text": "!!!???...,,,;;;:::---___===+++***&&&%%%$$$###@@@"},
+    {"kind": "mixed", "text": "Ünïcödé àccents, Ελληνικά, кириллица, עברית, العربية — mixed scripts in one line."},
+    {"kind": "short", "text": "a"},
+    {"kind": "short", "text": "Hello"},
+    {"kind": "repetition", "text": "the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the"},
+    {"kind": "long", "repeat": 160, "text": "Retrieval-augmented generation pairs a search index with a language model. "},
+    {"kind": "long", "repeat": 700, "text": "The quick brown fox jumps over the lazy dog. "}
+  ]
+}
