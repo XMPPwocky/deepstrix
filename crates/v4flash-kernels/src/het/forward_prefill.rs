@@ -584,12 +584,22 @@ fn mhc_narrow_fallback_for(b: u32) -> bool {
     V.unwrap_or(b <= 64)
 }
 
-/// Under a `stage_b` capture (`src` = `Ctx`), vet the next direct launch whose operands are all
-/// process-static (`sd`; GRAPH_KEYS_DESIGN.md 2.5 rule (b)). Direct mode: nothing.
-fn vet_sd(src: &super::arena_ctx::StageSrc, ptrs: &[u64]) {
-    if src.ind().is_some() {
-        super::arena_ctx::vet_static(ptrs);
+/// Under a `stage_b` capture (`src` = `Ctx`), run `launch` -- a direct wrapper launching ONE kernel
+/// whose operands `ptrs` are all process-static (`sd`; GRAPH_KEYS_DESIGN.md 2.5 rule (b)) -- with
+/// its launch vetted. The mark is scoped to this call: cleared after it, so a wrapper that launched
+/// nothing cannot vet a later launch (fail closed). Direct mode: just `launch`.
+fn vetted_sd<T>(
+    src: &super::arena_ctx::StageSrc,
+    ptrs: &[u64],
+    launch: impl FnOnce() -> eyre::Result<T>,
+) -> eyre::Result<T> {
+    if src.ind().is_none() {
+        return launch();
     }
+    super::arena_ctx::vet_static(ptrs);
+    let r = launch();
+    v4flash_hip::vet_clear();
+    r
 }
 
 /// `V41_ROUTER_WMMA` (`1` forces the WMMA gate GEMM, `0` the fp32 matvec; default: WMMA only
@@ -1902,9 +1912,12 @@ impl<'a> StageCap<'a> {
                 // The taint guard (design 2.5): every node must be a VETTED kernel launch -- its
                 // per-lane-layer operands read through the context, the rest process-static.
                 let (l1, v1) = v4flash_hip::launch_audit();
+                // A mark still pending = a vet whose launch never came (fail closed).
+                let dangling = v4flash_hip::vet_pending();
+                v4flash_hip::vet_clear();
                 let nodes = graph.nodes()?.len() as u64;
                 let exec = std::sync::Arc::new(graph.instantiate()?);
-                if nodes == v1 - v0 && nodes == l1 - l0 {
+                if !dangling && nodes == v1 - v0 && nodes == l1 - l0 {
                     self.graphs.insert(self.name, self.key, exec.clone());
                     self.stage_b.count(self.name, super::arena_ctx::C_CAPTURED_B);
                 } else {
@@ -1917,6 +1930,7 @@ impl<'a> StageCap<'a> {
                         nodes,
                         launches = l1 - l0,
                         vetted = v1 - v0,
+                        dangling,
                         "stage_b capture TAINTED (a node that is not a vetted launch): runs once, legacy graphs from now on"
                     );
                     self.stage_b.taint(self.name, b, topo, exec.clone());
@@ -2028,7 +2042,9 @@ impl HeterogeneousEngine {
         }
         let stream = &de.compute;
         let graphs = &sb.graphs;
-        let key = (b as u64) | ((topo as u64) << 16);
+        // (rows, topology class, canary): canary graphs launch the `_canary` twins, never replayed
+        // by a production step (design 2.8).
+        let key = (b as u64) | ((topo as u64) << 16) | ((sb.canary_on() as u64) << 24);
         let base = StageCap {
             skip: false,
             capturing: false,
@@ -2080,7 +2096,7 @@ impl HeterogeneousEngine {
             self.dgpu.compute.synchronize()?;
             self.dgpu_graphs.clear();
             self.stage_b.graphs.clear();
-            tracing::info!("stage_b: process-static operand set changed: arena stage graphs cleared");
+            tracing::info!("stage_b: first stage_b step, or the process-static operand set (sd) changed: arena stage graphs cleared");
         }
         Ok(mode)
     }
@@ -2126,6 +2142,22 @@ impl HeterogeneousEngine {
             }
             (e, fp)
         });
+        // The cache is keyed by layer index: the weights must not have moved (an in-process reload
+        // would otherwise feed stale pointers -- the legacy graphs bake them the same way).
+        debug_assert!(
+            e.p[slot::Q_A] == dlw.attn_q_a.buffer.raw() as u64
+                && e.p[slot::Q_A_NORM] == dlw.q_a_norm.raw() as u64
+                && e.p[slot::Q_B] == dlw.attn_q_b.buffer.raw() as u64
+                && e.p[slot::KV] == dlw.attn_kv.buffer.raw() as u64
+                && e.p[slot::KV_NORM] == dlw.kv_a_norm.raw() as u64
+                && e.p[slot::WO_A] == dlw.attn_output_a.buffer.raw() as u64
+                && e.p[slot::WO_B] == dlw.attn_output_b.buffer.raw() as u64
+                && e.p[slot::SH_GATE] == dlw.shared.gate.buffer.raw() as u64
+                && e.p[slot::SH_UP] == dlw.shared.up.buffer.raw() as u64
+                && e.p[slot::SH_DOWN] == dlw.shared.down.buffer.raw() as u64,
+            "arena_ctx_entry: layer {}'s cached weight pointers no longer match its weights",
+            dlw.layer_idx
+        );
         e.p[slot::POS] = bd.pos_per_b.raw() as u64;
         e.p[slot::FFN_IN] = bd.ffn_input_norm.raw() as u64;
         e.p[slot::FFN_SHARED] = bd.ffn_shared.raw() as u64;
@@ -3124,26 +3156,24 @@ impl HeterogeneousEngine {
                 // swiglu — elementwise; stretch n to B * N_FF_SHARED.
                 // ds4 5bc1e6d: shared experts use the same swiglu_limit clamp
                 // as routed experts (official V4-Flash graph).
-                vet_sd(&cap.src, &[sd.mid_sh.raw() as u64, sd.gate_sh.raw() as u64, sd.up_sh.raw() as u64]);
-                de.swiglu.launch_clamped(
+                vetted_sd(&cap.src, &[sd.mid_sh.raw() as u64, sd.gate_sh.raw() as u64, sd.up_sh.raw() as u64], || de.swiglu.launch_clamped(
                     &de.compute,
                     &mut sd.mid_sh,
                     &sd.gate_sh,
                     &sd.up_sh,
                     b * N_FF_SHARED,
                     crate::config::SWIGLU_CLAMP_EXP,
-                )?;
+                ))?;
             }
             {
                 let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
                 if super::dispatch::any_q8(&[&dlw.shared.down]) {
                     // Same fork as the gate/up input above, for `down`'s activation.
                     if super::dispatch::small_b_dense_dp4a(b) {
-                        vet_sd(&cap.src, &[sd.mid_sh_xq.raw() as u64, sd.mid_sh_xscale.raw() as u64, sd.mid_sh.raw() as u64]);
-                        de.q8.quantize_input_batched(
+                        vetted_sd(&cap.src, &[sd.mid_sh_xq.raw() as u64, sd.mid_sh_xscale.raw() as u64, sd.mid_sh.raw() as u64], || de.q8.quantize_input_batched(
                             &de.compute, &mut sd.mid_sh_xq, &mut sd.mid_sh_xscale,
                             &sd.mid_sh, N_FF_SHARED, b,
-                        )?;
+                        ))?;
                     } else {
                         de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.mid_sh16, &sd.mid_sh,
                             b, N_FF_SHARED, super::batch_scratch::f16_pitch(N_FF_SHARED))?;
@@ -5071,7 +5101,7 @@ impl HeterogeneousEngine {
                 Some((e, _)) if r1_attn && crate::knobs::MS_CTX_CARRIER.on() => self.stage_b.carry(e),
                 _ => None,
             };
-            de.mhc_arena.launch_fast_via(
+            let carried_launch = de.mhc_arena.launch_fast_via(
                 carried.as_ref().map(|e| (e, self.stage_b.slot_addr())),
                 &de.compute,
                 Some(crate::mhc_arena::FastMix {
@@ -5098,7 +5128,12 @@ impl HeterogeneousEngine {
                 SINKHORN_ITERS,
                 SINKHORN_EPS,
                 b,
-            )?;
+            );
+            // `carry` stamped the shadow before the launch: a failed launch leaves it untrusted.
+            if carried_launch.is_err() && carried.is_some() {
+                self.stage_b.forget();
+            }
+            carried_launch?;
             if super::engine::subtensor_dump_armed(layer as usize) {
                 de.compute.synchronize()?;
                 super::engine::maybe_dump_subtensor_f32_view(
@@ -5287,10 +5322,13 @@ impl HeterogeneousEngine {
             if dlw.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0
                 && super::dispatch::small_b_dense_dp4a(b)
             {
-                vet_sd(&cap.src, &[sd.xq_n_embd.raw() as u64, sd.xscale_n_embd.raw() as u64, sd.attn_input_norm.raw() as u64]);
-                de.q8.quantize_input_batched(
-                    &de.compute, &mut sd.xq_n_embd, &mut sd.xscale_n_embd,
-                    &sd.attn_input_norm, N_EMBD, b,
+                // `V41_MS_TAINT_PROBE` (gate hook): launched unvetted, so this capture taints.
+                let probe = crate::knobs::MS_TAINT_PROBE.on();
+                let no_vet = super::arena_ctx::StageSrc::Direct;
+                vetted_sd(
+                    if probe { &no_vet } else { &cap.src },
+                    &[sd.xq_n_embd.raw() as u64, sd.xscale_n_embd.raw() as u64, sd.attn_input_norm.raw() as u64],
+                    || de.q8.quantize_input_batched(&de.compute, &mut sd.xq_n_embd, &mut sd.xscale_n_embd, &sd.attn_input_norm, N_EMBD, b),
                 )?;
             }
         }
@@ -5553,11 +5591,10 @@ impl HeterogeneousEngine {
                 let q_chain_quantized_input = dlw.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0
                     && super::dispatch::small_b_dense_dp4a(b);
                 if !(dec_skip_dead() && q_chain_quantized_input) {
-                vet_sd(&cap.src, &[sd.xq_n_embd.raw() as u64, sd.xscale_n_embd.raw() as u64, sd.attn_input_norm.raw() as u64]);
-                de.q8.quantize_input_batched(
+                vetted_sd(&cap.src, &[sd.xq_n_embd.raw() as u64, sd.xscale_n_embd.raw() as u64, sd.attn_input_norm.raw() as u64], || de.q8.quantize_input_batched(
                     &de.compute, &mut sd.xq_n_embd, &mut sd.xscale_n_embd,
                     &sd.attn_input_norm, N_EMBD, b,
-                )?;
+                ))?;
                 }
                 let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
                 match cap.src.ind() {
@@ -7944,8 +7981,7 @@ impl HeterogeneousEngine {
             // `V41_REPLAY_F16X` (prefill_f32_matvec_qb_wo): f16x above 16 rows, not 64.
             // (`out_variant` is decided above the low16 cast.)
             if out_variant != "f16x" {
-                vet_sd(&cap.src, &[sd.low_xq.raw() as u64, sd.low_xscale.raw() as u64, sd.low.raw() as u64]);
-                de.q8.quantize_input_batched(&de.compute, &mut sd.low_xq, &mut sd.low_xscale, &sd.low, OUT_LOW, b)?;
+                vetted_sd(&cap.src, &[sd.low_xq.raw() as u64, sd.low_xscale.raw() as u64, sd.low.raw() as u64], || de.q8.quantize_input_batched(&de.compute, &mut sd.low_xq, &mut sd.low_xscale, &sd.low, OUT_LOW, b))?;
             }
             if out_variant == "f16x" {
                 de.q8_wmma.gemm_f16x(&de.compute, &mut sd.attn_out, &dlw.attn_output_b.buffer, &sd.low16,

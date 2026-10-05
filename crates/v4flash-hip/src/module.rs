@@ -117,6 +117,11 @@ pub fn vet_clear() {
     });
 }
 
+/// Whether a vetted mark is pending (set, not yet consumed by a launch).
+pub fn vet_pending() -> bool {
+    LAUNCH_AUDIT.with(|c| c.get().2)
+}
+
 /// (kernel launches, vetted launches) on this thread so far.
 pub fn launch_audit() -> (u64, u64) {
     LAUNCH_AUDIT.with(|c| {

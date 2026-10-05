@@ -285,9 +285,11 @@ pub struct StageB {
     writes: [AtomicU64; 2],
     /// `ranges_generation()` the cached stage graphs were captured under
     generation: AtomicU64,
-    /// `V41_MS_CTX_CHECK`: the canary log the `_ind_canary` twins append to, and the (seq, stage
-    /// tag) of every context-reading graph launch in enqueue order (design 2.8).
+    /// The canary log the `_ind_canary` twins append to, and the (seq, stage tag) of every
+    /// context-reading graph launch in enqueue order (design 2.8); used while `canary_on`.
     canary: Option<(Mutex<CanaryLog>, Mutex<Vec<(u64, u16)>>)>,
+    /// `V41_MS_CTX_CHECK` for this step (`begin_step`).
+    canary_on: std::sync::atomic::AtomicBool,
 }
 
 impl StageB {
@@ -309,12 +311,16 @@ impl StageB {
             counters: Mutex::new(BTreeMap::new()),
             writes: [AtomicU64::new(0), AtomicU64::new(0)],
             generation: AtomicU64::new(0),
-            canary: if crate::knobs::MS_CTX_CHECK.on() {
-                Some((Mutex::new(CanaryLog::new(device, 1 << 16)?), Mutex::new(Vec::new())))
-            } else {
-                None
-            },
+            // 1 MiB on the device; entries always carry its address (a constant), the twins read
+            // it only in their `_canary` variants.
+            canary: Some((Mutex::new(CanaryLog::new(device, 1 << 16)?), Mutex::new(Vec::new()))),
+            canary_on: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Whether this step runs the canary (`V41_MS_CTX_CHECK`, read by `begin_step`).
+    pub fn canary_on(&self) -> bool {
+        self.canary_on.load(Ordering::Relaxed)
     }
 
     /// The canary log's device address (0 = off): every entry carries it (`ArenaCtx::log`).
@@ -324,6 +330,9 @@ impl StageB {
 
     /// A context-reading graph launch was enqueued for stage `tag` under the current entry.
     pub fn canary_expect(&self, tag: u16) {
+        if !self.canary_on() {
+            return;
+        }
         if let Some((_, exp)) = &self.canary {
             let seq = self.shadow.lock().unwrap().map_or(0, |e| e.seq);
             exp.lock().unwrap().push((seq, tag));
@@ -375,6 +384,7 @@ impl StageB {
     pub fn begin_step(&self) -> GraphMode {
         let mode = if crate::knobs::MS_GRAPH_KEYS.pick() == 1 && cfg!(feature = "v41") { GraphMode::StageB } else { GraphMode::Legacy };
         self.mode.store(mode as u8, Ordering::Relaxed);
+        self.canary_on.store(crate::knobs::MS_CTX_CHECK.on(), Ordering::Relaxed);
         *self.shadow.lock().unwrap() = None;
         mode
     }
@@ -383,10 +393,10 @@ impl StageB {
         if self.mode.load(Ordering::Relaxed) == GraphMode::StageB as u8 { GraphMode::StageB } else { GraphMode::Legacy }
     }
 
-    /// The `Ind` template of this process (slot address; canary per `V41_MS_CTX_CHECK`).
+    /// The `Ind` template of this step (slot address; the canary per `canary_on`).
     pub fn ind(&self, tag: u16) -> Ind {
         let i = Ind::new(self.slot_addr());
-        if crate::knobs::MS_CTX_CHECK.on() { i.with_canary(tag) } else { i }
+        if self.canary_on() { i.with_canary(tag) } else { i }
     }
 
     fn same_payload(a: &ArenaCtx, b: &ArenaCtx) -> bool {

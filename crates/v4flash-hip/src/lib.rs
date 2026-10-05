@@ -31,7 +31,7 @@ pub use device::{Device, DeviceProperties};
 pub use error::{HipError, check, check_eyre};
 pub use event::Event;
 pub use graph::{kernel_node_params, Graph, GraphExec};
-pub use module::{launch_audit, vet_clear, vet_next_launch, Function, LaunchConfig, Module};
+pub use module::{launch_audit, vet_clear, vet_next_launch, vet_pending, Function, LaunchConfig, Module};
 pub use stream::Stream;
 
 /// Block until all work on the *current* device finishes. Stronger than

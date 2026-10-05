@@ -728,9 +728,14 @@ crate::knobs! {
     /// topology class) with the per-layer / per-lane operands read through the arena context
     /// (docs/v41/GRAPH_KEYS_DESIGN.md).
     pub static MS_GRAPH_KEYS = Knob::choice("V41_MS_GRAPH_KEYS", 0, &[&["legacy"], &["stage_b"]]).live();
-    /// `V41_MS_CTX_CHECK` (default off; process-static): `stage_b` launches the `_ind_canary` twins
-    /// and checks every step's canary records (design 2.8). Tests and diagnosis only.
-    pub static MS_CTX_CHECK = Knob::flag("V41_MS_CTX_CHECK", false);
+    /// `V41_MS_CTX_CHECK` (default off; read once per arena step): `stage_b` launches the
+    /// `_ind_canary` twins and logs what they read (design 2.8; `StageB::canary_check`). The canary
+    /// bit is part of the stage graphs' key, so canary and production graphs never replay each
+    /// other. Tests and diagnosis only.
+    pub static MS_CTX_CHECK = Knob::flag("V41_MS_CTX_CHECK", false).live();
+    /// `V41_MS_TAINT_PROBE` (default off; live): a GATE HOOK -- q_chain's sd-only quantize is
+    /// launched unvetted under `stage_b`, so its capture must taint (design 3, the taint path).
+    pub static MS_TAINT_PROBE = Knob::flag("V41_MS_TAINT_PROBE", false).live();
     /// `V41_MS_CTX_CARRIER` (default on; process-static): `mhc_pre_attn`'s direct launch carries the
     /// lane-layer's context entry (design 2.11 R2); `0` = the standalone `arena_ctx_store` (a gate arm).
     pub static MS_CTX_CARRIER = Knob::flag("V41_MS_CTX_CARRIER", true);
