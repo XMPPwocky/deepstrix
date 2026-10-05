@@ -459,6 +459,12 @@ impl StageB {
         self.legacy.lock().unwrap().contains(&(stage, b, topo))
     }
 
+    /// Gate hook: forget the legacy marks (a taint probe's), so the next capture of those
+    /// (stage, rows, topo) is vetted again. The retired executables stay.
+    pub fn clear_legacy_marks(&self) {
+        self.legacy.lock().unwrap().clear();
+    }
+
     /// A tainted capture (design 2.5): keep its executable alive (its one launch may be queued)
     /// and send (stage, b, topo) to legacy keys from now on.
     pub fn taint(&self, stage: &'static str, b: u32, topo: u8, exec: Arc<GraphExec>) {

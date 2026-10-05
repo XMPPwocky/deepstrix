@@ -4,7 +4,8 @@ Status: DESIGN rev 4.1 (2026-10-05), rev 4 review round: APPROVE WITH CHANGES (a
 Step 0b: GO (2026-10-05 13:07 UTC; 0.44 / 0.29 / 0.39% of the step at b = 1 / 4 / 8).
 BUILT (2026-10-05, each slice review-approved): slice A twins + canary variants (fb9357a, 277d9fa),
 slice B host plumbing behind `V41_MS_GRAPH_KEYS=stage_b`, default legacy = production unchanged
-(4177d13, e41f84f), slice C gate G6 in tests/multistream_step.rs (0b99acc). Next: the GPU gate
+(4177d13, e41f84f), slice C gate G6 in tests/multistream_step.rs (0b99acc; review fixes f14c85d,
+then the one-lane probes and b = 1..8 schedules, section 3 "G6 as built"). Next: the GPU gate
 window (~/scratch-ms/window_graph_keys_gates.sh), then deploy with legacy default and A/B the knob. Rev 3.1 was APPROVED (3 rounds) and its Step 0 code
 review-APPROVED (2 rounds); Step 0 runs 1-3 were NO-GO (run 3 narrowly: 1.03 / 1.08 / 1.23% of the
 step at b = 1 / 4 / 8). Owner 2026-10-05: revise first (rev 4 = section 2.11), then merge the
@@ -447,6 +448,28 @@ measured small-twin delta. Same points (b = 1 / 4 / 8 at 60 / 121.6 / 196.8 ms),
   list.
 - The fingerprint mismatch: a second `sd` in one process clears the cache before any replay.
 - Rollout bar (section 4's A/B): `ms.step` p50 regression <= 1%, graphs ~64.
+
+G6 as built (tests/multistream_step.rs, after G5a-h in one process; ready-first, two lanes):
+- Schedules: every stream (b = n/2 per lane), streams 0-1 (b = 1), every stream x4 interleaved
+  (b = 2n = 8 at n = 4; skipped above 4 streams), and for 4 steps 5 / 9 / 13 rows = (3, 2) /
+  (5, 4) / (7, 6) per lane: every b in 1..8 end to end. Each `stage_b` arm bit for bit against
+  `legacy` on the same rows (schedule 0: G5e's ready-first logits).
+- Arms on schedule 0: `stage_b`; carrier off (replays `stage_b`'s carrier-written graphs: captured
+  0, replayed every lane-layer); canary (records checked every step); fingerprint (a changed `sd`
+  set must clear the cached graphs: captured > 0); room (`GraphCache::pause_captures` for the
+  first half from an empty stage cache: uncaptured, then captured and replayed); taint
+  (`V41_MS_TAINT_PROBE`: q_chain taints, still bit-exact).
+- Counters per arm: the four single-launch stages direct once per lane-layer; carrier writes =
+  lane-layers (standalone with the carrier off); each multi-node stage captured + replayed (+
+  uncaptured under room) = lane-layers, none tainted.
+- Final state: one more step (not accepted) per row of every arena, legacy keys, == its legacy
+  arena; the same probes again under `stage_b` through the ONE-lane driver (b = 1, and every
+  stream of G5e's arena in one lane, b = n) == their legacy run, with the counters.
+- Each arm starts with the legacy cache cleared (every new shape holds ~400 executables; below
+  `V41_MS_GRAPH_RESERVE_MB` a stage would run uncaptured and fail the counters); the log prints
+  free dGPU memory and both caches' sizes per arm.
+- Not gated, so guarded instead: a step of more than two lanes runs legacy keys (warns once); the
+  shared expert deferred by `V41_PREFILL_PRESUBMIT=1` keeps legacy keys (warns once).
 
 ## 4. Rollout
 
