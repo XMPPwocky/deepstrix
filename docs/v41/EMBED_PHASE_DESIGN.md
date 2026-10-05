@@ -1,6 +1,6 @@
 # Embed phase: Qwen3-Embedding-4B in the hub process
 
-**Status: rev 3 (2026-10-04), for review round 3.** Branch `worktree-embed-phase`, base `origin/main` c2db000. Rev 1 and rev 2 each got APPROVE WITH CHANGES; §12 maps round 1's findings and §13 round 2's. Code is on the branch (host tests pass). The CPU oracle has run on the real Q8_0 GGUF and reproduces the model card's scores (§10, `model_card_scores`). Nothing has run on a GPU yet.
+**Status: rev 3, APPROVED (review round 3, 2026-10-05).** Branch `worktree-embed-phase`, base `origin/main` c2db000. §12–§14 map the three review rounds. Code is on the branch (host tests pass). On the real weights, CPU-only: E0 tokenizer parity passed (22/22) and E1a, the model card's scores, passed. E1 (HF bf16 reference) and E2–E7 need the GPU window: running the HF reference needs 8–16 GB of RAM, more than box 1 has free beside the running hub.
 
 ## 0. The ask and the constraints
 
@@ -296,15 +296,18 @@ Without `--embed-gguf`, the route answers 404 (`embeddings_disabled`). `/v1/mode
 
 ## 8. Tokenizer
 
-`pre = qwen2` is `laguna_qwen2_split` (a port of llama.cpp's `unicode_regex_split_custom_qwen2`) run over the whole text, without Laguna's newline pre-split. New: `qwen2_pre_tokenize`, `BpeVocab::encode_qwen2` (no BOS), and an `encode_auto` arm.
+`pre = qwen2` uses the Qwen2 splitter, a port of llama.cpp's `unicode_regex_split_custom_qwen2` shared with Laguna, run over the whole text without Laguna's newline pre-split. New: `qwen2_pre_tokenize`, `BpeVocab::encode_qwen2` (no BOS), and an `encode_auto` arm.
 
-Known divergences from HF:
+**Unicode classes are exact (rev 3).** `\p{L}`, `\p{N}` and `\s` come from `joyai_ucd`, the tables `scripts/gen_joyai_ucd.py` generated from the Oniguruma bundled in HF tokenizers 0.23.2. That is the reference's own regex engine, so these are the classes the reference uses.
 
-- **No NFC.** It needs a Unicode-tables crate, which is a sign-off question.
+Before rev 3 the splitter used `char::is_alphabetic`, which counts combining marks as letters. E0 caught it on Thai: 17 ids vs the reference's 21. Laguna keeps its old predicates (`laguna_qwen2_split`), unchanged.
+
+**E0 passed 2026-10-05: 22 of 22 corpus cases are id-identical to HF `AutoTokenizer`.** The corpus covers Thai, Devanagari, Tamil and Bengali, CJK, emoji, uppercase contractions, digit runs, CRLF runs, trailing whitespace, and long inputs. The reference appends `<|endoftext|>` (151643) to every input, as the design assumes.
+
+Remaining known divergences, none hit by the corpus:
+
+- **No NFC.** The reference normalizes to NFC; this needs a Unicode-normalization crate, which is a sign-off question. Input that is already NFC, which is typical, is unaffected.
 - **Special-token text in the input is encoded as text.**
-- **`\p{L}` / `\p{N}` are approximated** by `char::is_alphabetic` / `is_numeric`. `is_alphabetic` includes Other_Alphabetic combining marks, which `\p{L}` excludes: Indic and Thai vowel signs are the likely divergence.
-
-The E0 corpus covers each of these.
 
 ## 9. Code layout
 
@@ -416,3 +419,13 @@ E2–E7 need a GPU window (the hub down) and the weights. E0–E1 need only the 
 | 14 | CPU oracle attention single-threaded | Threaded over rows |
 | 15 | Tiny gate's unaligned scale sections | Tiny `n_ff` 384 → 512 (every K a multiple of 256) |
 | 16 | Reader panic re-panicked with the loan out | `catch_unwind` in the reader; the panic becomes an error |
+
+## 14. Rev 3 review (APPROVE) → follow-ups
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | MINOR: E1's default skipped the long corpus cases; gates passed silently on unset env | E1 default cap 10,000 tokens (the whole corpus); E0, E1 and E1a panic on unset env vars |
+| 2 | `loan_round_trip` lent from one donor | First donor 512 KiB: it holds `resid`, `pos` and `idx` |
+| 3 | Donors kept with no placement | `Loan::new` drops them and renumbers the plan |
+| 4 | GGUF header cached until the first phase | Whole-file `drop_page_cache` at the end of `EmbedCtx::load` |
+| — | E0 found the Thai divergence predicted in §8 | Exact Unicode classes for the Qwen2 splitter (§8); E0 22/22 |

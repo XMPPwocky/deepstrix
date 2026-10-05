@@ -276,6 +276,12 @@ impl EmbedCtx {
             load_ms = t0.elapsed().as_millis() as u64,
             "embed phase ready (weights stream per phase; nothing on the devices between phases)"
         );
+        // Opening and validating read the GGUF's header (the tokenizer arrays,
+        // ~5 MB) through the page cache before FADV_RANDOM was set: drop it,
+        // so nothing of the file is cached from startup on (gate E5).
+        if let Err(e) = file.drop_page_cache() {
+            tracing::warn!(error = %e, "embed GGUF: dropping its page cache failed");
+        }
         let queue = Arc::new(EmbedQueue::new(knobs::EMBED_QUEUE_TOKENS.usize()));
         let info = Arc::new(EmbedInfo {
             model_name,

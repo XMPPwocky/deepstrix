@@ -136,9 +136,23 @@ impl Loan {
         let canary = CANARY_BYTES.min(chunk);
         let guard = guard.max(canary).min(chunk) / LOAN_ALIGN * LOAN_ALIGN;
         let caps: Vec<usize> = candidates.iter().map(|d| d.view.byte_len() / LOAN_ALIGN * LOAN_ALIGN).collect();
-        let (plan, used) = plan(&caps, sizes, canary, guard)?;
-        let mut donors = candidates;
-        donors.truncate(used.len());
+        let (mut plan, used) = plan(&caps, sizes, canary, guard)?;
+        // Keep only donors that hold a buffer (one taken while a big buffer
+        // looked for room may end up holding nothing), renumbering the plan.
+        let mut keep: Vec<Option<usize>> = vec![None; used.len()];
+        let mut donors = Vec::new();
+        let mut kept_used = Vec::new();
+        for (d, cand) in candidates.into_iter().take(used.len()).enumerate() {
+            if plan.iter().any(|p| p.donor == d) {
+                keep[d] = Some(donors.len());
+                donors.push(cand);
+                kept_used.push(used[d]);
+            }
+        }
+        for p in plan.iter_mut() {
+            p.donor = keep[p.donor].expect("a placement's donor is kept");
+        }
+        let used = kept_used;
         let mut canaries = Vec::new();
         for (d, &u) in used.iter().enumerate() {
             let mut at = 0;

@@ -8,9 +8,11 @@
 //!   nix develop -c cargo test --release -p v4flash-core --test qwen3_embed_ref -- --ignored --nocapture
 //! ```
 //!
-//! The reference comes from `scripts/qwen3_embed/ref_embed.py`.
-//! `QWEN3_EMBED_E1_MAX_TOKENS` (default 600) bounds which inputs E1 runs: the
-//! oracle is f32 on the CPU, ~7.3 GFLOP per token.
+//! The reference comes from `scripts/qwen3_embed/ref_embed.py` (E0 needs only
+//! its `--tokens-only` dump). `QWEN3_EMBED_E1_MAX_TOKENS` (default 10000:
+//! the whole fixture corpus) bounds which inputs E1 runs: the oracle is f32
+//! on the CPU, ~7.3 GFLOP per token, minutes for the ~7K-token case.
+//! An unset env var is a FAILURE, not a skip: a gate run must run.
 
 use v4flash_core::qwen3_embed::{cosine, cpu_forward, Qwen3EmbedModel};
 use v4flash_core::tokenizer::BpeVocab;
@@ -23,11 +25,12 @@ struct Case {
     embedding: Vec<f32>,
 }
 
+fn env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("this gate needs {name} (see the module docs)"))
+}
+
 fn load() -> Option<(MappedGguf, Qwen3EmbedModel, BpeVocab, Vec<Case>, bool)> {
-    let (Ok(gguf), Ok(refp)) = (std::env::var("QWEN3_EMBED_GGUF"), std::env::var("QWEN3_EMBED_REF")) else {
-        eprintln!("QWEN3_EMBED_GGUF / QWEN3_EMBED_REF unset: skipped");
-        return None;
-    };
+    let (gguf, refp) = (env("QWEN3_EMBED_GGUF"), env("QWEN3_EMBED_REF"));
     let file = MappedGguf::open(&gguf).expect("open gguf");
     let model = Qwen3EmbedModel::from_gguf(&file).expect("model");
     let vocab = BpeVocab::from_gguf(file.gguf()).expect("vocab");
@@ -59,10 +62,7 @@ fn ours(vocab: &BpeVocab, model: &Qwen3EmbedModel, text: &str) -> Vec<u32> {
 #[test]
 #[ignore]
 fn model_card_scores() {
-    let Ok(gguf) = std::env::var("QWEN3_EMBED_GGUF") else {
-        eprintln!("QWEN3_EMBED_GGUF unset: skipped");
-        return;
-    };
+    let gguf = env("QWEN3_EMBED_GGUF");
     let file = MappedGguf::open(&gguf).expect("open gguf");
     let model = Qwen3EmbedModel::from_gguf(&file).expect("model");
     let vocab = BpeVocab::from_gguf(file.gguf()).expect("vocab");
@@ -122,7 +122,7 @@ fn e0_tokenizer_matches_reference() {
 #[ignore]
 fn e1_cpu_oracle_matches_reference() {
     let Some((file, model, _vocab, cases, _)) = load() else { return };
-    let max: usize = std::env::var("QWEN3_EMBED_E1_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let max: usize = std::env::var("QWEN3_EMBED_E1_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
     let picked: Vec<&Case> = cases.iter().filter(|c| c.ids.len() <= max).collect();
     // The reference's own ids: E1 isolates the forward from the tokenizer.
     let inputs: Vec<Vec<u32>> = picked.iter().map(|c| c.ids.clone()).collect();

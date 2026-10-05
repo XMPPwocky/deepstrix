@@ -166,15 +166,15 @@ fn loan_round_trip() -> eyre::Result<()> {
     let model = Qwen3EmbedModel::from_gguf(&file)?;
     let sizing = EmbedSizing { phase_tokens: 128, sub_rows: 16 };
     let sizes: Vec<usize> = sizing.buffer_sizes(&model.cfg, &model.layout).iter().map(|(_, b)| *b).collect();
-    // Two donors with a recognizable pattern; the first is too small for the
-    // ring slots, so placement must spill into the second.
+    // Two donors with a recognizable pattern. The first (512 KiB) is too small
+    // for the layer buffers but holds others (resid, pos, idx), so both are lent.
     let mk = |n: usize, salt: u8| -> eyre::Result<(DeviceBuffer<u8>, Vec<u8>)> {
         let mut b = DeviceBuffer::<u8>::new(dev.id, n)?;
         let pat: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(salt)).collect();
         b.copy_from_host(&pat)?;
         Ok((b, pat))
     };
-    let (d0, p0) = mk(64 * 1024, 3)?;
+    let (d0, p0) = mk(512 * 1024, 3)?;
     let (d1, p1) = mk(sizing.total_bytes(&model.cfg, &model.layout) + (1 << 20), 5)?;
     let donors = vec![
         Donor { name: "d0".into(), view: d0.slice_view(0, d0.len()) },
