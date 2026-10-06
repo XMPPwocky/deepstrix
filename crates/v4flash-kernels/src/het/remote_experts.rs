@@ -3695,6 +3695,56 @@ pub fn push_prefetch_words(words: &[u32]) -> bool {
     }
 }
 
+/// Words waiting in `PREFETCH_WORDS` (the per-step speculative budget's view).
+pub fn prefetch_words_queued() -> usize {
+    PREFETCH_WORDS.lock().unwrap().len()
+}
+
+/// PREDICTED-MISS HINT WORDS (`het::lookahead`,
+/// docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 2.3): layer L+1's filtered
+/// look-ahead picks, queued at layer L's Route and step-tagged, drained by the
+/// next decode `submit_inner` of ANY lane ahead of admissions and restores. Its
+/// own queue, not `PREFETCH_WORDS`: a hint never waits behind an admission or
+/// restore burst, and the `dry` knob never touches `PREFETCH_WORDS`. SLICE A:
+/// drained and counted (`lh2_dry_words`), never put on a frame.
+static MISS_HINT_WORDS: std::sync::LazyLock<std::sync::Mutex<super::lookahead::HintQueue>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(super::lookahead::HintQueue::new()));
+
+/// Filter layer `target`'s classified look-ahead picks into hint words and
+/// queue them (`lookahead::hint_words`: rank `<= rank`, non-resident, not
+/// hinted this step, at most `cap`); returns `(queued, dropped by the cap)`.
+pub fn queue_hint_words(step: u32, target: i32, preds: &[super::lookahead::Pred], rank: u8, cap: usize) -> (usize, u32) {
+    let mut q = MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner());
+    let (words, dropped) = super::lookahead::hint_words(preds, target, rank, cap, |w| q.hinted(w));
+    (q.push(step, &words), dropped)
+}
+
+/// The drain hook of a decode submit for `layer` at `step` (design 2.3): the
+/// fresh words, oldest first, up to `max`; stale ones (an earlier step, or a
+/// layer `<= layer`) are dropped and counted (`lh2_stale`).
+pub fn take_hint_words(step: u32, layer: i32, max: usize) -> Vec<u32> {
+    let (words, stale) = MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).take(step, layer, max);
+    super::lookahead::bump(super::lookahead::Stat::Stale, u64::from(stale));
+    words
+}
+
+/// A new decode step (`lookahead::begin_step`): the earlier step's words are
+/// dropped and the dedup set forgotten; returns how many were dropped.
+pub fn hint_queue_begin_step(step: u32) -> u32 {
+    MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).begin_step(step)
+}
+
+/// The decode -> prefill switch (`multistream`, beside `pin_enter_prefill`):
+/// nothing queued may ride a prefill chunk. Returns how many were dropped.
+pub fn clear_hint_words() -> usize {
+    MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).clear()
+}
+
+/// Hint words waiting.
+pub fn hint_words_queued() -> usize {
+    MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).len()
+}
+
 /// RESTORE words (`b2_mirror::pin_enter_decode`): experts released to open a
 /// prefill band, sent back to box 2 as admission words when decode resumes.
 /// A separate queue from `PREFETCH_WORDS` so they never go ahead of the cache
@@ -3720,6 +3770,11 @@ pub fn take_restore_words(max: usize) -> Vec<u32> {
     let mut g = RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner());
     let n = g.len().min(max);
     g.drain(..n).collect()
+}
+
+/// Restore words waiting (the per-step speculative budget's view).
+pub fn restore_words_queued() -> usize {
+    RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner()).len()
 }
 
 /// The pin ledger's view of one request (`b2_mirror::pin_note_submit`).
@@ -7987,6 +8042,9 @@ pub struct Ticket {
     pub flags: u32,
     pub n_hints: u32,
     pub n_pf_words: u32,
+    /// Predicted-miss hint words among `n_pf_words` (`het::lookahead`; 0
+    /// until slice B puts them on the wire).
+    pub n_hint_words: u32,
     /// Pin mode (`REQ_FLAG_PIN`): the sent picks the mirror HELD at submit
     /// (bit e = expert e of `layer`), for the surprise check on the reply.
     pub held: [u32; proto::RESID_WORDS],
@@ -8507,14 +8565,54 @@ impl RemoteExpertClient {
         // actually sent (the surprise check on the reply).
         let pin_req = flags & proto::REQ_FLAG_PIN != 0;
         let rel = if pin_req { super::b2_mirror::take_release_words(128) } else { Vec::new() };
-        let mut pf = take_prefetch_words(128);
-        // RESTORE words fill the room the admission / look-ahead words leave,
-        // a few per request, and only once every release is on the wire: box
-        // 2 applies a request's releases before its prefetch grants, so a
-        // restore can never reach it before the release it undoes.
-        if pin_req && pf.len() < 128 && super::b2_mirror::releases_queued() == 0 {
-            pf.extend(take_restore_words((128 - pf.len()).min(super::b2_mirror::pin_restore_per_request())));
-        }
+        // PREDICTED-MISS HINT WORDS (`het::lookahead`, design 2.3): a decode
+        // request drains the hint queue first; the stale rule is applied there.
+        // SLICE A: the fresh words are counted (`lh2_dry_words`) and go no
+        // further -- `Mode::wire` is false until slice B (k1/k2 and the
+        // daemon's `RESP_FLAG_NURSERY`), when they lead `pf` under the budget.
+        let lh2 = super::lookahead::cfg();
+        let hints: Vec<u32> = if self.decode_phase && lh2.mode.on() {
+            let h = take_hint_words(lh2.step, layer as i32, 128);
+            super::lookahead::bump(super::lookahead::Stat::DryWords, h.len() as u64);
+            if lh2.mode.wire() { h } else { Vec::new() }
+        } else {
+            Vec::new()
+        };
+        let mut n_hint_words = 0u32;
+        let pf = if lh2.spec_budget == 0 || !self.decode_phase {
+            // Today's rule (`V41_B2_SPEC_BUDGET=0`; and every prefill request:
+            // the budget is a decode-step quantity, and the layer-major group
+            // prefetch paces its own words through `PREFETCH_TAKE_CAP`).
+            let mut pf = take_prefetch_words(128);
+            // RESTORE words fill the room the admission / look-ahead words leave,
+            // a few per request, and only once every release is on the wire: box
+            // 2 applies a request's releases before its prefetch grants, so a
+            // restore can never reach it before the release it undoes.
+            if pin_req && pf.len() < 128 && super::b2_mirror::releases_queued() == 0 {
+                pf.extend(take_restore_words((128 - pf.len()).min(super::b2_mirror::pin_restore_per_request())));
+            }
+            pf
+        } else {
+            // PER-STEP SPECULATIVE BUDGET (design 2.4, `lookahead::SpecBudget`):
+            // hints, then admissions, then restores (~1 per request, a floor of
+            // 16 per step), at most `V41_B2_SPEC_BUDGET` words per step in all.
+            // What the budget holds back stays queued (`lh2_budget_deferred`);
+            // the release-before-restore rule above still holds. A hint past
+            // the budget is dropped here (slice B decides whether to re-queue).
+            let restores_ok = pin_req && super::b2_mirror::releases_queued() == 0;
+            let t = super::lookahead::budget_plan(
+                hints.len(), prefetch_words_queued(), if restores_ok { restore_words_queued() } else { 0 },
+                128, restores_ok, super::b2_mirror::pin_restore_per_request(),
+            );
+            let mut pf: Vec<u32> = hints.iter().copied().take(t.hints).collect();
+            pf.extend(take_prefetch_words(t.admissions));
+            if restores_ok {
+                pf.extend(take_restore_words(t.restores));
+            }
+            super::lookahead::budget_commit(&t);
+            n_hint_words = t.hints as u32;
+            pf
+        };
         let flags = if pf.is_empty() { flags } else { flags | proto::REQ_FLAG_PREFETCH };
         let (held, n_held) = if pin_req {
             let decode_shaped = b as u32 <= proto::PIN_DECODE_MAX_ROWS && pin.decode.unwrap_or(true);
@@ -8538,7 +8636,7 @@ impl RemoteExpertClient {
         );
         let ticket = Ticket {
             seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now(),
-            flags, n_hints: (ha.len() + he.len()) as u32, n_pf_words: pf.len() as u32,
+            flags, n_hints: (ha.len() + he.len()) as u32, n_pf_words: pf.len() as u32, n_hint_words,
             held, n_held,
         };
         let sent = match self.tx_req.as_ref() {

@@ -286,6 +286,12 @@ pub fn begin_step() {
     pin_begin_step();
 }
 
+/// The step clock's value now (the tag on predicted-miss hint words,
+/// `het::lookahead`).
+pub fn step() -> u32 {
+    STEP.load(Ordering::Relaxed)
+}
+
 /// A prefill-shaped pass begins (every prefill entry calls this after
 /// switching the link to batch phase): end every live mark. A chunk pulls ~100
 /// experts per layer through box 2's pool, so what was on its way before it is

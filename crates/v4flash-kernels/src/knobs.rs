@@ -740,6 +740,24 @@ crate::knobs! {
     /// `V41_MS_CTX_CARRIER` (default on; process-static): `mhc_pre_attn`'s direct launch carries the
     /// lane-layer's context entry (design 2.11 R2); `0` = the standalone `arena_ctx_store` (a gate arm).
     pub static MS_CTX_CARRIER = Knob::flag("V41_MS_CTX_CARRIER", true);
+    /// `V41_B2_MISS_PREFETCH` (`off` default | `dry` | `k1` | `k2`; live, read once per decode step
+    /// into `het::lookahead::Cfg`): predicted-miss look-ahead prefetch of box-2 picks
+    /// (docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 5). `dry` runs layer L+1's router at layer
+    /// L, filters and counts (`hub_lh2`), sends nothing; `k1`/`k2` = hints live with one/two
+    /// layers of lead -- SLICE B: until it is built they behave as `dry` and warn once.
+    pub static B2_MISS_PREFETCH = Knob::choice("V41_B2_MISS_PREFETCH", 0, &[&["off", "0"], &["dry"], &["k1"], &["k2"]]).live();
+    /// `V41_B2_MISS_PREFETCH_RANK` (default 1, 1..=3; live): predicted-rank cut R of the hints
+    /// (`dry` counts R = 1, 2, 3 at once regardless).
+    pub static B2_MISS_PREFETCH_RANK = Knob::int("V41_B2_MISS_PREFETCH_RANK", 1, 1, 3).live();
+    /// `V41_B2_MISS_PREFETCH_CAP` (default 8, 0..=64; live): hint words per lane-layer and target layer.
+    pub static B2_MISS_PREFETCH_CAP = Knob::int("V41_B2_MISS_PREFETCH_CAP", 8, 0, 64).live();
+    /// `V41_B2_SPEC_BUDGET` (default 60, 0..=65535; live, read once per decode step): speculative
+    /// words -- hints + cache-prior admissions + pin restores -- a decode step sends box 2 in all
+    /// (design 2.4; `het::lookahead::SpecBudget`: hints first, restores paced at ~1 per request
+    /// with a floor of 16 per step). `0` = today's rule: up to 128 admission words plus
+    /// `V41_B2_PIN_RESTORE_PER_REQ` restores per REQUEST, which bursts 1,280 restores per step
+    /// after a phase switch and loses what finds no free staging set on box 2.
+    pub static B2_SPEC_BUDGET = Knob::int("V41_B2_SPEC_BUDGET", 60, 0, 65535).live();
 }
 
 #[cfg(test)]
