@@ -377,6 +377,15 @@ lane-layers), `V41_B2_NURSERY_PRIOR` 0, `V41_B2_SPEC_BUDGET` 0. Daemon (`~/exper
 `nursery` 32 (STARTUP ONLY; 0 = off), `nursery_lanes` 2 (live), `likely_pause_for_certain` 1 (live, the
 A/B knob; SIGUSR2).
 
+11.4a **Hub-only relaunch for dry run 2 (before slice D).** The hub binary is slice-B-capable but
+inert: `Mode::wire` needs `RESP_FLAG_NURSERY`, which the live daemon cannot send. `k1` on the live box 2
+= `dry` + a probe flag (bit 11) on every decode request -- safe: the old daemon uses the flags only for
+frame lengths (no unknown-bit check) and echoes the bit; the hub logs "does not support the nursery" once
+and stays dry. Keep `V41_B2_SPEC_BUDGET=0` for that run. Code review of B+C (APPROVE WITH CHANGES,
+`b2_prefetch_2026-10-06/`-era `review_sliceBC.md`) folded 10-06: nursery entries an ARRIVED frame relies
+on are protected from recycling until it is served (`nursery_protect`), the bars count the words that go
+and a tripped step takes nothing more, the restore pump's throttle sees the general sets only.
+
 11.5 **Slice D checklist.** (1) Build expertd ON box 2 (clock skew: `project_v41_box2_build_clock_skew`),
 `nursery=32` in its knob file, `V41_B2_PREFETCH_SETS` as today (+2 reserved sets, +113 MB pinned). (2)
 Server-down window with box 2 attached: `tests/remote_experts_nursery_loopback` and
