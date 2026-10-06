@@ -202,55 +202,7 @@ extern "C" __global__ void q8_0_grouped_gemv_bpack(
         unsigned int   n_groups,
         unsigned int   batch)                    // B <= GGEMV_BPACK_MAX
 {
-    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
-    uint32_t lane = threadIdx.x & 31u;
-    uint32_t out_dim = n_groups * rank;
-    if (row >= out_dim) return;
-    if (batch > GGEMV_BPACK_MAX) return;   // caller guards; belt and braces
-
-    uint32_t g = row / rank;
-    const unsigned char* wr = w + (size_t)row * (size_t)blocks_per_group * 34u;
-    const __half* scales = (const __half*)wr;
-    const int8_t* quants = (const int8_t*)(wr + (size_t)blocks_per_group * 2u);
-
-    // Per-batch bases into the activation, which IS per-b (only w is shared).
-    const uint32_t xq_stride = n_groups * group_dim;
-    const uint32_t xs_stride = n_groups * blocks_per_group;
-
-    float acc[GGEMV_BPACK_MAX];
-    for (uint32_t b = 0; b < batch; ++b) acc[b] = 0.0f;
-
-    for (uint32_t bl = lane; bl < blocks_per_group; bl += WARP_LANES) {
-        const int8_t* qs = quants + (size_t)bl * 32u;
-        uint4 av0, av1;
-        __builtin_memcpy(&av0, qs, 16);
-        __builtin_memcpy(&av1, qs + 16, 16);
-        const float ws = __half2float(scales[bl]);
-
-        for (uint32_t b = 0; b < batch; ++b) {
-            const int8_t* xqb = xq + (size_t)b * xq_stride
-                                   + (size_t)g * group_dim + (size_t)bl * 32u;
-            uint4 bv0, bv1;
-            __builtin_memcpy(&bv0, xqb, 16);
-            __builtin_memcpy(&bv1, xqb + 16, 16);
-            int32_t dot = 0;
-            dot = gdp4a_sudot((int32_t)av0.x, (int32_t)bv0.x, dot);
-            dot = gdp4a_sudot((int32_t)av0.y, (int32_t)bv0.y, dot);
-            dot = gdp4a_sudot((int32_t)av0.z, (int32_t)bv0.z, dot);
-            dot = gdp4a_sudot((int32_t)av0.w, (int32_t)bv0.w, dot);
-            dot = gdp4a_sudot((int32_t)av1.x, (int32_t)bv1.x, dot);
-            dot = gdp4a_sudot((int32_t)av1.y, (int32_t)bv1.y, dot);
-            dot = gdp4a_sudot((int32_t)av1.z, (int32_t)bv1.z, dot);
-            dot = gdp4a_sudot((int32_t)av1.w, (int32_t)bv1.w, dot);
-            acc[b] += ws * xscale[(size_t)b * xs_stride
-                                  + (size_t)g * blocks_per_group + bl] * (float)dot;
-        }
-    }
-
-    for (uint32_t b = 0; b < batch; ++b) {
-        float a = gwarp_sum_f32(acc[b]);
-        if (lane == 0) out[(size_t)b * (size_t)out_dim + row] = a;
-    }
+#include "q8_0_grouped_gemv_bpack_body.inc"
 }
 
 // q8_0_grouped_gemv_bpack_z16 — the q8_0_grouped_gemv_bpack body above with the
@@ -399,3 +351,68 @@ Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB5, 5)
 Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB6, 6)
 Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB7, 7)
 Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB8, 8)
+
+// `_ind` twins (docs/v41/GRAPH_KEYS_DESIGN.md 2.3): operands 0..3 (out, w, xq, xscale) resolve
+// through the arena context when their `ind_mask` bit is set; same body. Production twins only
+// (no canary code, 2.8); `canary` / `canary_tag` are ignored.
+#include "arena_ctx.inc"
+#define Q8_0_GROUPED_IND_PARAMS                                                            \
+    uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out,            \
+    const unsigned char* w, const int8_t* xq, const float* xscale, unsigned group_dim,     \
+    unsigned rank, unsigned bpg, unsigned n_groups, unsigned batch
+#define Q8_0_GROUPED_IND_DEREF                                                             \
+    ARENA_CTX_DEREF(ind_mask, 0, float*, out);                                             \
+    ARENA_CTX_DEREF(ind_mask, 1, const unsigned char*, w);                                 \
+    ARENA_CTX_DEREF(ind_mask, 2, const int8_t*, xq);                                       \
+    ARENA_CTX_DEREF(ind_mask, 3, const float*, xscale);
+#define Q8_0_GROUPED_IND_XOR (ARENA_CTX_U64(out) ^ ARENA_CTX_U64(w) ^ ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale))
+#define Q8_0_GROUPED_GEMV_BPACK_TB_IND(NAME, B)                                            \
+    extern "C" __global__ void NAME(Q8_0_GROUPED_IND_PARAMS) {                             \
+        (void)batch;                                                                       \
+        (void)canary;                                                                      \
+        (void)canary_tag;                                                                  \
+        Q8_0_GROUPED_IND_DEREF                                                             \
+        q8_0_grouped_gemv_bpack_tb_body<B>(out, w, xq, xscale, group_dim, rank, bpg, n_groups); \
+    }                                                                                      \
+    extern "C" __global__ void NAME##_canary(Q8_0_GROUPED_IND_PARAMS) {                    \
+        (void)batch;                                                                       \
+        Q8_0_GROUPED_IND_DEREF                                                             \
+        ARENA_CTX_CANARY_LOAD(canary, Q8_0_GROUPED_IND_XOR);                               \
+        q8_0_grouped_gemv_bpack_tb_body<B>(out, w, xq, xscale, group_dim, rank, bpg, n_groups); \
+        ARENA_CTX_CANARY_STORE(canary_tag);                                                \
+    }
+Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB2_ind, 2)
+Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB3_ind, 3)
+Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB4_ind, 4)
+Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB5_ind, 5)
+Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB6_ind, 6)
+Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB7_ind, 7)
+Q8_0_GROUPED_GEMV_BPACK_TB_IND(q8_0_grouped_gemv_bpack_tB8_ind, 8)
+
+// The runtime-batch kernel's twin: production's b = 1 arm (`grouped_bpack_symbol`: tB1 measured
+// slower) and every b under `V41_GEMV_TB=0`. Same body as a device function (inlined: the
+// __restrict__ parameters become scoped-noalias metadata on the resolved pointers).
+__device__ __forceinline__ static void q8_0_grouped_gemv_bpack_rt_body(
+        float        * __restrict__ out,
+        const unsigned char * __restrict__ w,
+        const int8_t * __restrict__ xq,
+        const float  * __restrict__ xscale,
+        unsigned int   group_dim,
+        unsigned int   rank,
+        unsigned int   blocks_per_group,
+        unsigned int   n_groups,
+        unsigned int   batch) {
+#include "q8_0_grouped_gemv_bpack_body.inc"
+}
+extern "C" __global__ void q8_0_grouped_gemv_bpack_ind(Q8_0_GROUPED_IND_PARAMS) {
+    (void)canary;
+    (void)canary_tag;
+    Q8_0_GROUPED_IND_DEREF
+    q8_0_grouped_gemv_bpack_rt_body(out, w, xq, xscale, group_dim, rank, bpg, n_groups, batch);
+}
+extern "C" __global__ void q8_0_grouped_gemv_bpack_ind_canary(Q8_0_GROUPED_IND_PARAMS) {
+    Q8_0_GROUPED_IND_DEREF
+    ARENA_CTX_CANARY_LOAD(canary, Q8_0_GROUPED_IND_XOR);
+    q8_0_grouped_gemv_bpack_rt_body(out, w, xq, xscale, group_dim, rank, bpg, n_groups, batch);
+    ARENA_CTX_CANARY_STORE(canary_tag);
+}

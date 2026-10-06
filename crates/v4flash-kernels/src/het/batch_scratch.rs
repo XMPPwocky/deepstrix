@@ -1378,6 +1378,94 @@ pub fn attn_scores_capacity_keys(rows: usize, n_kv_max: u32) -> usize {
 }
 
 impl BatchDgpuShared {
+    /// Every device buffer of this scratch, (base, bytes): the process-static operands a
+    /// (stage, rows)-keyed arena graph may bake (docs/v41/GRAPH_KEYS_DESIGN.md 2.5, 2.7).
+    pub fn static_ranges(&self) -> Vec<(u64, u64)> {
+        vec![
+            (self.r1_arena.raw() as u64, self.r1_arena.byte_len() as u64),
+            (self.r3_arena.raw() as u64, self.r3_arena.byte_len() as u64),
+            (self.flat.raw() as u64, self.flat.byte_len() as u64),
+            (self.mhc_inv_scalar.raw() as u64, self.mhc_inv_scalar.byte_len() as u64),
+            (self.mhc_rms_partials.raw() as u64, self.mhc_rms_partials.byte_len() as u64),
+            (self.mix.raw() as u64, self.mix.byte_len() as u64),
+            (self.mhc_flat_hc.raw() as u64, self.mhc_flat_hc.byte_len() as u64),
+            (self.mhc_counters.raw() as u64, self.mhc_counters.byte_len() as u64),
+            (self.mhc_inv_rows.raw() as u64, self.mhc_inv_rows.byte_len() as u64),
+            (self.attn_cur.raw() as u64, self.attn_cur.byte_len() as u64),
+            (self.attn_input_norm.raw() as u64, self.attn_input_norm.byte_len() as u64),
+            (self.ffn_cur.raw() as u64, self.ffn_cur.byte_len() as u64),
+            (self.kq_attn_q8k.raw() as u64, self.kq_attn_q8k.byte_len() as u64),
+            (self.kq_ffn_q8k.raw() as u64, self.kq_ffn_q8k.byte_len() as u64),
+            (self.kq_mid_q8k.raw() as u64, self.kq_mid_q8k.byte_len() as u64),
+            (self.xq_n_embd.raw() as u64, self.xq_n_embd.byte_len() as u64),
+            (self.x16_n_embd.raw() as u64, self.x16_n_embd.byte_len() as u64),
+            (self.qr16.raw() as u64, self.qr16.byte_len() as u64),
+            (self.heads16.raw() as u64, self.heads16.byte_len() as u64),
+            (self.low16.raw() as u64, self.low16.byte_len() as u64),
+            (self.mid_sh16.raw() as u64, self.mid_sh16.byte_len() as u64),
+            (self.xscale_n_embd.raw() as u64, self.xscale_n_embd.byte_len() as u64),
+            (self.qr.raw() as u64, self.qr.byte_len() as u64),
+            (self.qr_normed.raw() as u64, self.qr_normed.byte_len() as u64),
+            (self.qr_xq.raw() as u64, self.qr_xq.byte_len() as u64),
+            (self.qr_xscale.raw() as u64, self.qr_xscale.byte_len() as u64),
+            (self.q.raw() as u64, self.q.byte_len() as u64),
+            (self.q_normed.raw() as u64, self.q_normed.byte_len() as u64),
+            (self.kv_raw.raw() as u64, self.kv_raw.byte_len() as u64),
+            (self.kv_normed.raw() as u64, self.kv_normed.byte_len() as u64),
+            (self.kv_ring_scratch.raw() as u64, self.kv_ring_scratch.byte_len() as u64),
+            (self.kv_cur.raw() as u64, self.kv_cur.byte_len() as u64),
+            (self.sc_cur.raw() as u64, self.sc_cur.byte_len() as u64),
+            (self.row_per_b.raw() as u64, self.row_per_b.byte_len() as u64),
+            (self.pos_mod_per_b.raw() as u64, self.pos_mod_per_b.byte_len() as u64),
+            (self.n_raw_per.raw() as u64, self.n_raw_per.byte_len() as u64),
+            (self.n_raw_offset_per.raw() as u64, self.n_raw_offset_per.byte_len() as u64),
+            (self.n_comp_per.raw() as u64, self.n_comp_per.byte_len() as u64),
+            (self.heads.raw() as u64, self.heads.byte_len() as u64),
+            (self.attn_scores.raw() as u64, self.attn_scores.byte_len() as u64),
+            (self.verify_scores.raw() as u64, self.verify_scores.byte_len() as u64),
+            (self.verify_inv.raw() as u64, self.verify_inv.byte_len() as u64),
+            (self.verify_partials.raw() as u64, self.verify_partials.byte_len() as u64),
+            (self.indexer_q.raw() as u64, self.indexer_q.byte_len() as u64),
+            (self.indexer_q16.raw() as u64, self.indexer_q16.byte_len() as u64),
+            (self.indexer_topk_done.raw() as u64, self.indexer_topk_done.byte_len() as u64),
+            (self.indexer_head_weights.raw() as u64, self.indexer_head_weights.byte_len() as u64),
+            (self.indexer_scores.raw() as u64, self.indexer_scores.byte_len() as u64),
+            (self.indexer_selected.raw() as u64, self.indexer_selected.byte_len() as u64),
+            (self.indexer_topk_scratch.raw() as u64, self.indexer_topk_scratch.byte_len() as u64),
+            (self.n_index_comp_per_b.raw() as u64, self.n_index_comp_per_b.byte_len() as u64),
+            (self.attn_active_comp_kv.raw() as u64, self.attn_active_comp_kv.byte_len() as u64),
+            (self.comp_state_kv_snapshots.raw() as u64, self.comp_state_kv_snapshots.byte_len() as u64),
+            (self.comp_state_score_snapshots.raw() as u64, self.comp_state_score_snapshots.byte_len() as u64),
+            (self.comp_pooled_batched.raw() as u64, self.comp_pooled_batched.byte_len() as u64),
+            (self.comp_rows_batched.raw() as u64, self.comp_rows_batched.byte_len() as u64),
+            (self.index_k_rows_batched.raw() as u64, self.index_k_rows_batched.byte_len() as u64),
+            (self.index_k_normed_batched.raw() as u64, self.index_k_normed_batched.byte_len() as u64),
+            (self.comp_pos_per_boundary.raw() as u64, self.comp_pos_per_boundary.byte_len() as u64),
+            (self.low.raw() as u64, self.low.byte_len() as u64),
+            (self.heads_xq.raw() as u64, self.heads_xq.byte_len() as u64),
+            (self.heads_xscale.raw() as u64, self.heads_xscale.byte_len() as u64),
+            (self.low_xq.raw() as u64, self.low_xq.byte_len() as u64),
+            (self.low_xscale.raw() as u64, self.low_xscale.byte_len() as u64),
+            (self.attn_out.raw() as u64, self.attn_out.byte_len() as u64),
+            (self.router_logits.raw() as u64, self.router_logits.byte_len() as u64),
+            (self.look_sel.raw() as u64, self.look_sel.byte_len() as u64),
+            (self.look_ew.raw() as u64, self.look_ew.byte_len() as u64),
+            (self.look_sel2.raw() as u64, self.look_sel2.byte_len() as u64),
+            (self.look_ew2.raw() as u64, self.look_ew2.byte_len() as u64),
+            (self.gate_sh.raw() as u64, self.gate_sh.byte_len() as u64),
+            (self.up_sh.raw() as u64, self.up_sh.byte_len() as u64),
+            (self.mid_sh.raw() as u64, self.mid_sh.byte_len() as u64),
+            (self.mid_sh_xq.raw() as u64, self.mid_sh_xq.byte_len() as u64),
+            (self.mid_sh_xscale.raw() as u64, self.mid_sh_xscale.byte_len() as u64),
+        ]
+    }
+
+    /// Register this scratch as THE process-static operand set (`arena_ctx::register_static_ranges`):
+    /// call once after allocating it. A different set later makes every cached stage graph stale.
+    pub fn register_static(&self) {
+        crate::het::arena_ctx::register_static_ranges(self.static_ranges());
+    }
+
     /// Score slots (keys) `attn_scores` actually holds, in the units the
     /// kernels index it with (f16 slots on the production `_f16s` pair).
     pub fn attn_scores_capacity_keys(&self) -> usize {

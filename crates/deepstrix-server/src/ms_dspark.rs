@@ -296,7 +296,7 @@ pub const MAX_SPEC_STREAMS: usize = 2;
 static MULTI_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `V41_MS_DSPARK_STREAMS`: the most live streams that may all draft in one
-/// step (1 = a lone stream only, today's rule).
+/// step (default 2; 1 = a lone stream only, the rule before 2026-10-06).
 pub fn spec_streams() -> usize {
     let n = crate::knobs::MS_DSPARK_STREAMS.usize().clamp(1, MAX_SPEC_STREAMS);
     if n > 1 {

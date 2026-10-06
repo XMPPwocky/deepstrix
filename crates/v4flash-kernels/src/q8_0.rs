@@ -360,6 +360,40 @@ impl Q8_0Matvec {
     /// `B × n` contiguous elements. The kernel has no batch concept — it
     /// just processes `B × blocks` blocks. Buffers must be at least
     /// `B × n` (xq), `B × n/32` (xscale), `B × n` (x).
+    /// `quantize_input_batched` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md 2.3):
+    /// operands 0..2 (xq, xscale, x) marked in `ind` come from the arena context; the buffers
+    /// passed are the real ones (checked). The wave kernel has twins; the `V41_Q8_QUANT_WAVE=0`
+    /// arm launches the direct kernel on the real buffers (design 2.5 rule (a)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_input_batched_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        n: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || !q8_quant_wave() {
+            return self.quantize_input_batched(stream, xq, xscale, x, n, batch);
+        }
+        if n % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 quantize_batched_ind: n={n} not %32"));
+        }
+        let blocks = (n / Q8_0_BLOCK_ELEMS) * batch;
+        let total_n = (n as usize) * (batch as usize);
+        if x.len() < total_n || xq.len() < total_n || xscale.len() < blocks as usize {
+            return Err(eyre!("q8_0 quantize_batched_ind: buffer too small (n*B={total_n})"));
+        }
+        let function = self.module.get_function(&ind.symbol("q8_0_quantize_f32_wave"))?;
+        // As the direct launch: one idle workgroup (`q8_quant_grid_pad`).
+        let cfg = LaunchConfig { grid: (blocks.div_ceil(8) + q8_quant_grid_pad(), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        let (p_xq, p_xs, p_x) = (ind.ptr(0, xq.raw() as u64), ind.ptr(1, xscale.raw() as u64), ind.ptr(2, x.raw() as u64));
+        crate::het::arena_ctx::vet_ind(&ind, &[xq.raw() as u64, xscale.raw() as u64, x.raw() as u64]);
+        launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, p_xq, p_xs, p_x, blocks])
+    }
+
     pub fn quantize_input_batched(
         &self,
         stream: &Stream,
@@ -450,6 +484,29 @@ impl Q8_0Matvec {
     /// W independently). A v1 kernel will pack multiple batch elements
     /// per WG to amortize W reads.
     #[allow(clippy::too_many_arguments)]
+    /// `matvec_batched` reading the operands `ind` marks from the arena context
+    /// (docs/v41/GRAPH_KEYS_DESIGN.md 2.5: converted at the DISPATCHING entry, so `Ctx` and `Dev`
+    /// take the same arm under every knob). The bpack arm has twins (`matvec_bpack_ind`); every
+    /// other arm launches the direct kernel on the real buffers (unvetted: a capture taints).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_batched_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch > 0 && bpack_ok(batch) {
+            return self.matvec_bpack_ind(stream, ind, out, weight, xq, xscale, n_rows, k, batch);
+        }
+        self.matvec_batched(stream, out, weight, xq, xscale, n_rows, k, batch)
+    }
+
     pub fn matvec_batched(
         &self,
         stream: &Stream,
@@ -609,6 +666,58 @@ impl Q8_0Matvec {
         launch_kernel!(function, cfg, stream, [
             out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, blocks, batch
         ])
+    }
+
+    /// `matvec_bpack` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md 2.3):
+    /// operands 0..3 (out, weight, xq, xscale) marked in `ind` are read from the arena
+    /// context slot at run time; the buffers passed here are still the real ones (their
+    /// sizes are checked, and they are what a direct launch would use). Twins exist for
+    /// the compile-time batch kernels b = 1..8 (same body, bit-identical); any other arm
+    /// launches the direct kernel on those real buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_bpack_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        // No twin on this arm (b > 8, or the runtime kernel under V41_GEMV_TB=0): the DIRECT
+        // kernel on the real buffers (design 2.5's fallback rule; unvetted, so a capture taints).
+        if !(1..=8).contains(&batch) || !gemv_tb_on() {
+            return self.matvec_bpack(stream, out, weight, xq, xscale, n_rows, k, batch);
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 matvec_bpack_ind: k={k} not a multiple of 32"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        if weight.byte_len() != (n_rows as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize)
+            || out.len() < (batch as usize) * (n_rows as usize)
+            || xq.len() < (batch as usize) * (k as usize)
+            || xscale.len() < (batch as usize) * (blocks as usize)
+        {
+            return Err(eyre!("q8_0 matvec_bpack_ind: operand sizes do not fit n_rows={n_rows} k={k} batch={batch}"));
+        }
+        // Production twins carry no canary code; the canary (design 2.8) has its own symbols.
+        let function = self.module.get_function(&ind.symbol(gemv_bpack_symbol(batch)))?;
+        let cfg = LaunchConfig {
+            grid: (n_rows.div_ceil(GEMV_ROWS_PER_BLOCK), 1, 1),
+            block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (p_out, p_w, p_xq, p_xs) = (
+            ind.ptr(0, out.raw() as u64),
+            ind.ptr(1, weight.raw() as u64),
+            ind.ptr(2, xq.raw() as u64),
+            ind.ptr(3, xscale.raw() as u64),
+        );
+        crate::het::arena_ctx::vet_ind(&ind, &[out.raw() as u64, weight.raw() as u64, xq.raw() as u64, xscale.raw() as u64]);
+        launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, p_out, p_w, p_xq, p_xs, k, n_rows, blocks, batch])
     }
 
     /// M40-P4.5: 2-wide pair GEMV. Same as `matvec` but processes TWO input
@@ -1167,6 +1276,86 @@ impl Q8_0GroupedMatvec {
         ])
     }
 
+    /// `matvec_grouped_bpack` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md 2.3):
+    /// operands 0..3 (out, weight, xq, xscale) marked in `ind` come from the arena context at
+    /// run time; the buffers passed are the real ones (checked as for a direct launch). Every
+    /// arm of the direct launch has a twin -- `grouped_bpack_symbol(batch)` + `_ind`: the
+    /// compile-time batch kernels (b = 2..8) and the runtime-batch kernel (production's b = 1,
+    /// and every b under `V41_GEMV_TB=0`). No canary variant yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_grouped_bpack_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        group_dim: u32,
+        rank: u32,
+        n_groups: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || batch > GEMV_BPACK_MAX {
+            return self.matvec_grouped_bpack(stream, out, weight, xq, xscale, group_dim, rank, n_groups, batch);
+        }
+        if group_dim % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 matvec_grouped_bpack_ind: group_dim={group_dim} not %32"));
+        }
+        let blocks_per_group = group_dim / Q8_0_BLOCK_ELEMS;
+        let out_dim = n_groups * rank;
+        let expected_weight_bytes = (out_dim as usize) * (blocks_per_group as usize) * (Q8_0_BLOCK_BYTES as usize);
+        let per_batch_in = (n_groups as usize) * (group_dim as usize);
+        let per_batch_scales = (n_groups as usize) * (blocks_per_group as usize);
+        if weight.byte_len() != expected_weight_bytes
+            || xq.len() < (batch as usize) * per_batch_in
+            || xscale.len() < (batch as usize) * per_batch_scales
+            || out.len() < (batch as usize) * (out_dim as usize)
+        {
+            return Err(eyre!("q8_0 matvec_grouped_bpack_ind: operand sizes do not fit batch={batch}"));
+        }
+        let function = self.module.get_function(&ind.symbol(grouped_bpack_symbol(batch)))?;
+        let cfg = LaunchConfig {
+            grid: (out_dim.div_ceil(GEMV_ROWS_PER_BLOCK), 1, 1),
+            block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (p_out, p_w, p_xq, p_xs) = (
+            ind.ptr(0, out.raw() as u64),
+            ind.ptr(1, weight.raw() as u64),
+            ind.ptr(2, xq.raw() as u64),
+            ind.ptr(3, xscale.raw() as u64),
+        );
+        crate::het::arena_ctx::vet_ind(&ind, &[out.raw() as u64, weight.raw() as u64, xq.raw() as u64, xscale.raw() as u64]);
+        launch_kernel!(function, cfg, stream, [
+            ind.mask(), ind.canary, ind.tag, p_out, p_w, p_xq, p_xs,
+            group_dim, rank, blocks_per_group, n_groups, batch
+        ])
+    }
+
+    /// `matvec_grouped_batched` reading the operands `ind` marks from the arena context
+    /// (design 2.5: converted at the dispatching entry). The bpack arm has twins
+    /// (`matvec_grouped_bpack_ind`, runtime and tB); every other arm launches the direct kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_grouped_batched_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        group_dim: u32,
+        rank: u32,
+        n_groups: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch > 0 && bpack_ok(batch) {
+            return self.matvec_grouped_bpack_ind(stream, ind, out, weight, xq, xscale, group_dim, rank, n_groups, batch);
+        }
+        self.matvec_grouped_batched(stream, out, weight, xq, xscale, group_dim, rank, n_groups, batch)
+    }
+
     pub fn matvec_grouped_batched(
         &self,
         stream: &Stream,
@@ -1418,6 +1607,57 @@ impl SharedExpertFused {
         launch_kernel!(function, cfg, stream, [
             mid_xq.raw(), mid_xscale.raw(), gate_w.raw(), up_w.raw(), xq.raw(), xscale.raw(),
             k, n_ff, blocks, clamp
+        ])
+    }
+
+    /// `launch` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md 2.3): operands 0..5 (mid_xq,
+    /// mid_xscale, gate_w, up_w, xq, xscale) marked in `ind` come from the arena context; the
+    /// buffers passed are the real ones (checked by `launch`'s rules). Twins exist for b = 1..8;
+    /// any other batch launches the direct kernel (design 2.5 rule (a)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        mid_xq: &mut DeviceBuffer<i8>,
+        mid_xscale: &mut DeviceBuffer<f32>,
+        gate_w: &DeviceBuffer<u8>,
+        up_w: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        k: u32,
+        n_ff: u32,
+        batch: u32,
+        clamp: f32,
+    ) -> eyre::Result<()> {
+        if !(1..=8).contains(&batch) {
+            return self.launch(stream, mid_xq, mid_xscale, gate_w, up_w, xq, xscale, k, n_ff, batch, clamp);
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 || n_ff % 32 != 0 || n_ff == 0 {
+            return Err(eyre!("shared_expert_fused_ind: k={k} and n_ff={n_ff} must be multiples of 32"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let expected = (n_ff as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        let b = batch as usize;
+        if gate_w.byte_len() != expected
+            || up_w.byte_len() != expected
+            || xq.len() < b * (k as usize)
+            || xscale.len() < b * (blocks as usize)
+            || mid_xq.len() < b * (n_ff as usize)
+            || mid_xscale.len() < b * (n_ff as usize / 32)
+        {
+            return Err(eyre!("shared_expert_fused_ind: operand sizes do not fit batch={batch}"));
+        }
+        let function = self.module.get_function(&ind.symbol(SHARED_FUSED_SYMBOLS[b - 1]))?;
+        let cfg = LaunchConfig { grid: (n_ff / 32, 1, 1), block: (1024, 1, 1), shared_mem_bytes: 0 };
+        let p: [u64; 6] = [
+            mid_xq.raw() as u64, mid_xscale.raw() as u64, gate_w.raw() as u64, up_w.raw() as u64, xq.raw() as u64,
+            xscale.raw() as u64,
+        ];
+        let q: [u64; 6] = std::array::from_fn(|i| ind.ptr(i, p[i]));
+        crate::het::arena_ctx::vet_ind(&ind, &p);
+        launch_kernel!(function, cfg, stream, [
+            ind.mask(), ind.canary, ind.tag, q[0], q[1], q[2], q[3], q[4], q[5], k, n_ff, blocks, clamp
         ])
     }
 }

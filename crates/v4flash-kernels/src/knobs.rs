@@ -723,6 +723,23 @@ crate::knobs! {
     /// cache-prior admissions, pin want counts and hot-set picks wait for its
     /// accept and only the kept rows' are applied (`b2_mirror::defer_flush`).
     pub static SUB_DEFER_ACCEPTED = Knob::flag("V41_SUB_DEFER_ACCEPTED", false).live();
+    /// `V41_MS_GRAPH_KEYS` (`stage_b` default since 2026-10-06 | `legacy`; live, read once per arena
+    /// step): the arena stage graphs' key -- `legacy` = (stage, layer, rows, lane buffer), `stage_b` =
+    /// (stage, rows, topology class) with the per-layer / per-lane operands read through the arena
+    /// context (docs/v41/GRAPH_KEYS_DESIGN.md; gate G6 + production A/B 2026-10-05: ms.step p50
+    /// 0.985x; legacy holds ~2 MB of dGPU per graph for every (rows, lane) shape, for good).
+    pub static MS_GRAPH_KEYS = Knob::choice("V41_MS_GRAPH_KEYS", 1, &[&["legacy"], &["stage_b"]]).live();
+    /// `V41_MS_CTX_CHECK` (default off; read once per arena step): `stage_b` launches the
+    /// `_ind_canary` twins and logs what they read (design 2.8; `StageB::canary_check`). The canary
+    /// bit is part of the stage graphs' key, so canary and production graphs never replay each
+    /// other. Tests and diagnosis only.
+    pub static MS_CTX_CHECK = Knob::flag("V41_MS_CTX_CHECK", false).live();
+    /// `V41_MS_TAINT_PROBE` (default off; live): a GATE HOOK -- q_chain's sd-only quantize is
+    /// launched unvetted under `stage_b`, so its capture must taint (design 3, the taint path).
+    pub static MS_TAINT_PROBE = Knob::flag("V41_MS_TAINT_PROBE", false).live();
+    /// `V41_MS_CTX_CARRIER` (default on; process-static): `mhc_pre_attn`'s direct launch carries the
+    /// lane-layer's context entry (design 2.11 R2); `0` = the standalone `arena_ctx_store` (a gate arm).
+    pub static MS_CTX_CARRIER = Knob::flag("V41_MS_CTX_CARRIER", true);
 }
 
 #[cfg(test)]

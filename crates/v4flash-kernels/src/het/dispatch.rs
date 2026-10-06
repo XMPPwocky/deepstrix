@@ -264,6 +264,31 @@ pub fn small_b_dense_dp4a(b: u32) -> bool {
     b <= max
 }
 
+/// `dense_gemm_prefill` reading the operands `ind` marks from the arena context
+/// (docs/v41/GRAPH_KEYS_DESIGN.md 2.5: converted at the dispatching entry). The Q8_0 small-b dp4a arm
+/// -- the arena decode path -- goes through `matvec_batched_ind`; every other arm runs the direct
+/// launch on the real buffers (unvetted: a capture taints).
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_prefill_ind(
+    e: &DeviceEngine,
+    s: &Stream,
+    ind: crate::het::arena_ctx::Ind,
+    out: &mut DeviceBuffer<f32>,
+    w: &DeviceWeight,
+    xq_i8: &DeviceBuffer<i8>,
+    xscale: &DeviceBuffer<f32>,
+    xq_q8k: &DeviceBuffer<u8>,
+    x16: Option<(&DeviceBuffer<u16>, u32)>,
+    b: u32,
+    n_rows: u32,
+    k: u32,
+) -> eyre::Result<()> {
+    if w.dtype == GgufType::Q8_0 && small_b_dense_dp4a(b) {
+        return e.q8.matvec_batched_ind(s, ind, out, &w.buffer, xq_i8, xscale, n_rows, k, b);
+    }
+    dense_gemm_prefill(e, s, out, w, xq_i8, xscale, xq_q8k, x16, b, n_rows, k)
+}
+
 pub fn dense_gemm_prefill(
     e: &DeviceEngine,
     s: &Stream,

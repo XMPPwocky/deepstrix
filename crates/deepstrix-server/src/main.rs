@@ -21,6 +21,7 @@ use v4flash_hip::install_panic_handler;
 
 use deepstrix_server::engine_worker::{run_watchdog, spawn, WorkerConfig};
 use deepstrix_server::openai::error::log_error_responses;
+use deepstrix_server::openai::embeddings::{embeddings, EMBEDDINGS_BODY_LIMIT};
 use deepstrix_server::openai::handler::{chat_completions, healthz, list_models, lmstudio_models, readyz};
 
 #[derive(Parser, Debug)]
@@ -103,6 +104,16 @@ struct Args {
     /// re-prefilled. Opt in deliberately.
     #[arg(long = "default-reasoning-effort", default_value = "low")]
     default_reasoning_effort: String,
+    /// Qwen3-Embedding Q8_0 GGUF: serves `POST /v1/embeddings` from this
+    /// process as an exclusive embed phase between scheduler ticks
+    /// (docs/v41/EMBED_PHASE_DESIGN.md). Its weights are never resident: each
+    /// phase streams them from this file into dGPU memory lent by the V4.1
+    /// weights. Without it, `/v1/embeddings` answers 404.
+    #[arg(long = "embed-gguf")]
+    embed_gguf: Option<PathBuf>,
+    /// The embedding model's id on `/v1/models` and in responses.
+    #[arg(long = "embed-model-name", default_value = "qwen3-embedding-4b")]
+    embed_model_name: String,
 }
 
 fn default_snapshot_dir() -> eyre::Result<PathBuf> {
@@ -186,6 +197,8 @@ async fn main() -> eyre::Result<()> {
         allow_image_dirs,
         default_top_p: args.default_top_p,
         default_reasoning_effort,
+        embed_gguf: args.embed_gguf,
+        embed_model_name: args.embed_model_name,
     })?;
 
     // Forward-progress watchdog. Env override > CLI flag > default.
@@ -214,6 +227,12 @@ async fn main() -> eyre::Result<()> {
             post(chat_completions).layer(axum::extract::DefaultBodyLimit::max(
                 deepstrix_server::vision_prompt::MAX_REQUEST_BODY_BYTES,
             )),
+        )
+        // A full request (2048 inputs, or 262144 token ids as JSON) passes
+        // axum's 2 MiB default; the handler enforces the real limits.
+        .route(
+            "/v1/embeddings",
+            post(embeddings).layer(axum::extract::DefaultBodyLimit::max(EMBEDDINGS_BODY_LIMIT)),
         )
         .route("/v1/models", get(list_models))
         .route("/api/v1/models", get(lmstudio_models))

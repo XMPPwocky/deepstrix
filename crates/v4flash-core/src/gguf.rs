@@ -194,6 +194,14 @@ impl Gguf {
         })
     }
 
+    /// Free the parsed metadata (a tokenizer's token and merge arrays are
+    /// tens of MB) once everything needed from it has been extracted. The
+    /// tensor directory stays.
+    pub fn drop_metadata(&mut self) {
+        self.metadata = HashMap::new();
+        self.kv_order = Vec::new();
+    }
+
     pub fn metadata(&self, key: &str) -> Option<&GgufValue> {
         self.metadata.get(key)
     }

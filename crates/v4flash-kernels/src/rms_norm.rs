@@ -229,6 +229,37 @@ impl RmsNorm {
         let cfg = LaunchConfig { grid: (batch, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [out.raw(), xq.raw(), xscale.raw(), x.raw(), weight.raw(), eps])
     }
+
+    /// `launch_weighted_quant_q8_1280` through its `_ind` twin (docs/v41/GRAPH_KEYS_DESIGN.md
+    /// 2.3): operands 0..4 (out, xq, xscale, x, weight) marked in `ind` come from the arena
+    /// context; the buffers passed are the real ones (checked). `_canary` when `ind.canary` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_weighted_quant_q8_1280_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        out: &mut DeviceBuffer<f32>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let needed = (batch as usize) * 1280;
+        if out.len() < needed || x.len() < needed || xq.len() < needed || xscale.len() < needed / 32 || weight.len() != 1280 {
+            return Err(eyre!("rms_quant_q8_1280_batched_ind: buffer sizes (need {needed})"));
+        }
+        let function = self.module.get_function(&ind.symbol("rms_quant_q8_1280_batched"))?;
+        let cfg = LaunchConfig { grid: (batch, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        let p: [u64; 5] = [out.raw() as u64, xq.raw() as u64, xscale.raw() as u64, x.raw() as u64, weight.raw() as u64];
+        let q: [u64; 5] = std::array::from_fn(|i| ind.ptr(i, p[i]));
+        crate::het::arena_ctx::vet_ind(&ind, &p);
+        launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, q[0], q[1], q[2], q[3], q[4], eps])
+    }
 }
 
 /// No-weight RMSNorm — mirrors ds4.c `rms_norm_no_weight`. Operates on

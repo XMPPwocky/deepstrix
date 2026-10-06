@@ -419,6 +419,8 @@ pub struct HeterogeneousEngine {
     /// Same as `dgpu_graphs` for the iGPU routed-MoE sub-pipeline
     /// (`routed_moe`).
     pub igpu_graphs: GraphCache,
+    /// The (stage, rows)-keyed arena graphs' state (docs/v41/GRAPH_KEYS_DESIGN.md).
+    pub stage_b: super::arena_ctx::StageB,
 
     /// Thread-local cache of the currently-bound HIP device, so
     /// `set_current_cached()` can skip the driver call when the device
@@ -1755,6 +1757,7 @@ impl HeterogeneousEngine {
             perfetto: None,
             dgpu_graphs: GraphCache::new(),
             igpu_graphs: GraphCache::new(),
+            stage_b: super::arena_ctx::StageB::new(dgpu_device.id, dgpu_arch)?,
             current_device: std::sync::atomic::AtomicI32::new(-1),
             last_host_us: std::sync::atomic::AtomicU64::new(0),
             last_sync_us: std::sync::atomic::AtomicU64::new(0),

@@ -148,10 +148,46 @@ v4flash_kernels::knobs! {
     pub static MS_DSPARK_K = Knob::text("V41_MS_DSPARK_K");
     /// `V41_MS_DSPARK_KMAX` (default the block size).
     pub static MS_DSPARK_KMAX = Knob::int("V41_MS_DSPARK_KMAX", MTP_BLOCK as u64, 0, MTP_BLOCK as u64);
-    /// `V41_MS_DSPARK_STREAMS` (live, default 1, at most 2): every live stream
-    /// may draft while at most this many are live
-    /// (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2.1); 1 = a lone stream only.
-    pub static MS_DSPARK_STREAMS = Knob::int("V41_MS_DSPARK_STREAMS", 1, 1, 2).live();
+    /// `V41_MS_DSPARK_STREAMS` (live, default 2 since 2026-10-06, at most 2): every
+    /// live stream may draft while at most this many are live
+    /// (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2.1; production A/B 2026-10-06: slower
+    /// stream 1.033x, aggregate +22.6%); 1 = a lone stream only.
+    pub static MS_DSPARK_STREAMS = Knob::int("V41_MS_DSPARK_STREAMS", 2, 1, 2).live();
+
+    // ---- embed phase (docs/v41/EMBED_PHASE_DESIGN.md; static unless marked)
+    /// `V41_EMBED_PHASE_TOKENS` (default 16384): max tokens in one embed
+    /// phase. Sizes the dGPU loan.
+    pub static EMBED_PHASE_TOKENS = Knob::int("V41_EMBED_PHASE_TOKENS", 16384, 64, 1 << 20);
+    /// `V41_EMBED_SUB_ROWS` (default 1024): rows per sub-batch. Sizes the loan.
+    pub static EMBED_SUB_ROWS = Knob::int("V41_EMBED_SUB_ROWS", 1024, 16, 65_535);
+    /// `V41_EMBED_MAX_INPUT_TOKENS` (default 8192): tokens per input (EOS
+    /// included); at most the phase's tokens.
+    pub static EMBED_MAX_INPUT_TOKENS = Knob::int("V41_EMBED_MAX_INPUT_TOKENS", 8192, 2, 1 << 20);
+    /// `V41_EMBED_MAX_REQUEST_TOKENS` (default 262144): tokens per request.
+    pub static EMBED_MAX_REQUEST_TOKENS = Knob::int("V41_EMBED_MAX_REQUEST_TOKENS", 262_144, 2, MAX);
+    /// `V41_EMBED_QUEUE_TOKENS` (default 1048576 = 64 full phases): queued
+    /// tokens before a 503 (an empty queue always takes one request).
+    pub static EMBED_QUEUE_TOKENS = Knob::int("V41_EMBED_QUEUE_TOKENS", 1 << 20, 1, MAX);
+    /// `V41_EMBED_MAX_SHARE` (live, default 50): percent of wall time embed
+    /// phases may take while the LLM has work (100 = no gap).
+    pub static EMBED_MAX_SHARE = Knob::int("V41_EMBED_MAX_SHARE", 50, 1, 100).live();
+    /// `V41_EMBED_VERIFY` (live, default on): read every returned loan chunk
+    /// back and compare it with the image's hash.
+    pub static EMBED_VERIFY = Knob::flag("V41_EMBED_VERIFY", true).live();
+    /// `V41_EMBED_LOAN_IMAGE` (default `$HOME/.cache/deepstrix/embed-loan.img`):
+    /// where the loaned dGPU bytes are copied at startup; a `:`-separated list
+    /// puts one copy on each drive and returns read all of them in parallel.
+    pub static EMBED_LOAN_IMAGE = Knob::text("V41_EMBED_LOAN_IMAGE");
+    /// `V41_EMBED_GGUF_REPLICAS` (`:`-separated): identical copies of
+    /// `--embed-gguf` on other drives; the layer stream reads all of them.
+    pub static EMBED_GGUF_REPLICAS = Knob::text("V41_EMBED_GGUF_REPLICAS");
+    /// `V41_EMBED_READERS` (default 32): O_DIRECT reader threads per span.
+    /// MEASURED 2026-10-05 (embed_read_bench, 3.86 GB, YMTC + E100): 8 -> 5.27,
+    /// 16 -> 5.66, 32 -> 6.47, 48 -> 6.26 GB/s (buffered x4: 1.65).
+    pub static EMBED_READERS = Knob::int("V41_EMBED_READERS", 32, 1, 256);
+    /// `V41_EMBED_FAULT_LAYER` (gates only, live; default off): every embed phase's
+    /// forward fails after this layer (design §10, gate E6).
+    pub static EMBED_FAULT_LAYER = Knob::int("V41_EMBED_FAULT_LAYER", MAX, 0, MAX).live();
 }
 
 #[cfg(test)]
@@ -175,13 +211,15 @@ mod tests {
         // Live: the eight 10-01 `_FILE` knobs, the live-trace trigger, Tier
         // B's device timing (its kill switch), the box-2 partial upload and the
         // layer-major group prefetch and the speculating-streams count (A/B'd
-        // per turn).
+        // per turn), the embed phase's share and return verification (read
+        // between phases), and the arena graph keys with their canary and
+        // taint-probe gate hook (read once per arena step).
         let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
         live.sort();
         assert_eq!(live, [
-            "V41_B2_PIN_PREFILL_BAND", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
-            "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
-            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
+            "V41_B2_PIN_PREFILL_BAND", "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
+            "V41_MS_CTX_CHECK", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
+            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA",
         ]);
         // The parses these knobs had before.

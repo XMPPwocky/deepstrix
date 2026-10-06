@@ -158,3 +158,42 @@ SHARED_GATEUP_SWIGLU_Q8(shared_gateup_swiglu_q8_tB7_r1, 7)
 SHARED_GATEUP_SWIGLU_Q8(shared_gateup_swiglu_q8_tB8_r1, 8)
 SHARED_GATEUP_SWIGLU_Q8(shared_gateup_swiglu_q8_tB9_r1, 9)
 SHARED_GATEUP_SWIGLU_Q8(shared_gateup_swiglu_q8_tB10_r1, 10)
+
+// `_ind` twins (GRAPH_KEYS_DESIGN.md 2.3): operands 0..5 (mid_xq, mid_xs, wg, wu, xq, xscale) resolve
+// through the arena context when their `ind_mask` bit is set; `_ind` production (no canary code,
+// 2.8), `_ind_canary` with the canary record. The same body.
+#include "arena_ctx.inc"
+#define SHARED_GATEUP_IND_PARAMS                                                               \
+    uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, int8_t* mid_xq,            \
+    float* mid_xs, const unsigned char* wg, const unsigned char* wu, const int8_t* xq,         \
+    const float* xscale, uint32_t in_dim, uint32_t n_ff, uint32_t blocks, float clamp
+#define SHARED_GATEUP_IND_DEREF                                                                \
+    ARENA_CTX_DEREF(ind_mask, 0, int8_t*, mid_xq);                                             \
+    ARENA_CTX_DEREF(ind_mask, 1, float*, mid_xs);                                              \
+    ARENA_CTX_DEREF(ind_mask, 2, const unsigned char*, wg);                                    \
+    ARENA_CTX_DEREF(ind_mask, 3, const unsigned char*, wu);                                    \
+    ARENA_CTX_DEREF(ind_mask, 4, const int8_t*, xq);                                           \
+    ARENA_CTX_DEREF(ind_mask, 5, const float*, xscale);
+#define SHARED_GATEUP_SWIGLU_Q8_IND(NAME, B)                                                   \
+    extern "C" __global__ void __launch_bounds__(1024) NAME(SHARED_GATEUP_IND_PARAMS) {        \
+        (void)canary;                                                                          \
+        (void)canary_tag;                                                                      \
+        SHARED_GATEUP_IND_DEREF                                                                \
+        shared_gateup_swiglu_q8_body<B>(mid_xq, mid_xs, wg, wu, xq, xscale, in_dim, n_ff, blocks, clamp); \
+    }                                                                                          \
+    extern "C" __global__ void __launch_bounds__(1024) NAME##_canary(SHARED_GATEUP_IND_PARAMS) { \
+        SHARED_GATEUP_IND_DEREF                                                                \
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(mid_xq) ^ ARENA_CTX_U64(mid_xs) ^          \
+                                          ARENA_CTX_U64(wg) ^ ARENA_CTX_U64(wu) ^              \
+                                          ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale));          \
+        shared_gateup_swiglu_q8_body<B>(mid_xq, mid_xs, wg, wu, xq, xscale, in_dim, n_ff, blocks, clamp); \
+        ARENA_CTX_CANARY_STORE(canary_tag);                                                    \
+    }
+SHARED_GATEUP_SWIGLU_Q8_IND(shared_gateup_swiglu_q8_tB1_r1_ind, 1)
+SHARED_GATEUP_SWIGLU_Q8_IND(shared_gateup_swiglu_q8_tB2_r1_ind, 2)
+SHARED_GATEUP_SWIGLU_Q8_IND(shared_gateup_swiglu_q8_tB3_r1_ind, 3)
+SHARED_GATEUP_SWIGLU_Q8_IND(shared_gateup_swiglu_q8_tB4_r1_ind, 4)
+SHARED_GATEUP_SWIGLU_Q8_IND(shared_gateup_swiglu_q8_tB5_r1_ind, 5)
+SHARED_GATEUP_SWIGLU_Q8_IND(shared_gateup_swiglu_q8_tB6_r1_ind, 6)
+SHARED_GATEUP_SWIGLU_Q8_IND(shared_gateup_swiglu_q8_tB7_r1_ind, 7)
+SHARED_GATEUP_SWIGLU_Q8_IND(shared_gateup_swiglu_q8_tB8_r1_ind, 8)

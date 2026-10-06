@@ -266,12 +266,29 @@ impl BpeVocab {
         out
     }
 
+    /// Encode with the Qwen2 pre-tokenizer (llama.cpp `QWEN2` pre-type: the
+    /// Qwen2 GPT-2-style splitter over the whole text, no newline pre-split),
+    /// GPT-2 byte encoding + BPE merge. Never prepends BOS: Qwen models do not
+    /// use one (the embedding caller appends `<|endoftext|>` itself).
+    ///
+    /// Differences from the HF tokenizer: no NFC normalization, and special-
+    /// token text in the input is byte-pair encoded as text, not split out.
+    pub fn encode_qwen2(&self, text: &str) -> Vec<i32> {
+        let mut out = Vec::new();
+        for (a, b) in qwen2_pre_tokenize(text) {
+            self.bpe_emit_piece(&text.as_bytes()[a..b], &mut out);
+        }
+        out
+    }
+
     /// Dispatch on the GGUF `tokenizer.ggml.pre` value: "laguna" uses the
-    /// Laguna path (with its `add_bos`), anything else keeps the legacy
-    /// ds4/joyai `encode` (no implicit BOS, unchanged behavior).
+    /// Laguna path (with its `add_bos`), "qwen2" the Qwen2 path (no BOS),
+    /// anything else keeps the legacy ds4/joyai `encode` (no implicit BOS,
+    /// unchanged behavior).
     pub fn encode_auto(&self, text: &str) -> Vec<i32> {
         match self.pre.as_deref() {
             Some("laguna") => self.encode_laguna(text),
+            Some("qwen2") => self.encode_qwen2(text),
             _ => self.encode(text),
         }
     }
@@ -447,7 +464,7 @@ fn gpt2_byte_to_codepoint(b: u8) -> u32 {
 }
 
 /// Encode raw bytes into a printable-UTF-8 string per GPT-2 convention.
-fn byte_encode(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn byte_encode(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len() * 4);
     for &b in raw {
         utf8_put(&mut out, gpt2_byte_to_codepoint(b));
@@ -770,18 +787,66 @@ pub fn laguna_pre_tokenize(text: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// Qwen2 pre-tokenize `text` (llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN2`: the one
+/// Qwen2 regex, `unicode_regex_split_custom_qwen2`, over the whole text) into
+/// byte sub-ranges `[start, end)` of `text.as_bytes()`. Laguna's splitter
+/// minus its newline pre-split, with the reference engine's exact Unicode classes.
+pub fn qwen2_pre_tokenize(text: &str) -> Vec<(usize, usize)> {
+    let cps: Vec<char> = text.chars().collect();
+    let mut boff: Vec<usize> = Vec::with_capacity(cps.len() + 1);
+    let mut b = 0usize;
+    for c in &cps {
+        boff.push(b);
+        b += c.len_utf8();
+    }
+    boff.push(text.len());
+    let mut bounds: Vec<usize> = Vec::new();
+    qwen2_split_exact(&cps, 0, cps.len(), &mut bounds);
+    let mut out = Vec::with_capacity(bounds.len());
+    let mut prev = 0usize;
+    for &e in &bounds {
+        if e > prev {
+            out.push((boff[prev], boff[e]));
+        }
+        prev = e;
+    }
+    out
+}
+
 /// Port of `unicode_regex_split_custom_qwen2` for a single segment
 /// `[ini, end)` of `cps`. Pushes absolute char-index token ends onto
 /// `bounds` (contiguous, covering the whole segment).
 fn laguna_qwen2_split(cps: &[char], ini: usize, end: usize, bounds: &mut Vec<usize>) {
+    // \p{N} ~ Nd|Nl|No; \p{L} ~ alphabetic minus the Nl overlap (Laguna's
+    // approximation: it counts Other_Alphabetic combining marks as letters).
+    qwen2_split_with(cps, ini, end, bounds, |c| c.is_alphabetic() && !c.is_numeric(), |c| c.is_numeric(), |c| c.is_whitespace());
+}
+
+/// The Qwen2 splitter with EXACT classes: the reference tokenizer engine's own
+/// \p{L} / \p{N} / \s (`joyai_ucd`, generated from HF tokenizers' Oniguruma).
+/// `char::is_alphabetic` also takes combining marks (Thai, Indic vowel signs)
+/// as letters, which merges pieces the reference keeps apart.
+fn qwen2_split_exact(cps: &[char], ini: usize, end: usize, bounds: &mut Vec<usize>) {
+    qwen2_split_with(cps, ini, end, bounds, |c| joyai_class(c) == L, |c| joyai_class(c) == N, |c| joyai_class(c) == WS);
+}
+
+/// Port of `unicode_regex_split_custom_qwen2` over `[ini, end)` with the
+/// given \p{L} / \p{N} / \s predicates.
+fn qwen2_split_with(
+    cps: &[char],
+    ini: usize,
+    end: usize,
+    bounds: &mut Vec<usize>,
+    letter: impl Fn(char) -> bool,
+    number: impl Fn(char) -> bool,
+    space: impl Fn(char) -> bool,
+) {
     let cpt = |p: usize| -> Option<char> {
         if ini <= p && p < end { Some(cps[p]) } else { None }
     };
-    // \p{N}: Nd|Nl|No
-    let is_number = |p: usize| cpt(p).map_or(false, |c| c.is_numeric());
-    // \p{L}: guarded elsewhere by !is_number, so exclude Nl overlap here.
-    let is_letter = |p: usize| cpt(p).map_or(false, |c| c.is_alphabetic() && !c.is_numeric());
-    let is_ws = |p: usize| cpt(p).map_or(false, |c| c.is_whitespace());
+    let is_number = |p: usize| cpt(p).map_or(false, |c| number(c));
+    let is_letter = |p: usize| cpt(p).map_or(false, |c| letter(c));
+    let is_ws = |p: usize| cpt(p).map_or(false, |c| space(c));
     // flags.as_uint() != 0  <=>  codepoint present (in range).
     let has_flags = |p: usize| cpt(p).is_some();
 
@@ -1098,5 +1163,41 @@ mod tests {
         let t = std::time::Instant::now();
         let ids = vocab.encode(&"\u{2500}".repeat(4000));
         eprintln!("{checked} pieces identical; 4,000 x U+2500 now {:.2} ms ({} ids)", t.elapsed().as_secs_f64() * 1e3, ids.len());
+    }
+
+    fn qwen2_pieces(text: &str) -> Vec<&str> {
+        qwen2_pre_tokenize(text).into_iter().map(|(a, b)| &text[a..b]).collect()
+    }
+
+    #[test]
+    fn qwen2_words_digits_contractions() {
+        assert_eq!(qwen2_pieces("Hello world"), ["Hello", " world"]);
+        // \p{N}: one digit per piece.
+        assert_eq!(qwen2_pieces("ab12"), ["ab", "1", "2"]);
+        assert_eq!(qwen2_pieces("it's"), ["it", "'s"]);
+        assert_eq!(qwen2_pieces("Query:{x}"), ["Query", ":{", "x", "}"]);
+    }
+
+    #[test]
+    fn qwen2_has_no_newline_pre_split() {
+        // `\s*[\r\n]+` spans the spaces before a newline. Laguna splits on
+        // newline runs first, so the same text differs there.
+        assert_eq!(qwen2_pieces("x  \n y"), ["x", "  \n", " y"]);
+        let laguna: Vec<&str> = laguna_pre_tokenize("x  \n y").into_iter().map(|(a, b)| &"x  \n y"[a..b]).collect();
+        assert_eq!(laguna, ["x", "  ", "\n", " y"]);
+    }
+
+    #[test]
+    fn qwen2_pieces_cover_the_text() {
+        for text in ["", "a", "Instruct: Given a query\nQuery:what is up?", "  lead\t\ttabs \r\n\r\nend  ", "日本語のテキスト 123", "emoji 🙂🙂 done"] {
+            let pieces = qwen2_pre_tokenize(text);
+            let mut prev = 0;
+            for &(a, b) in &pieces {
+                assert_eq!(a, prev, "gap in {text:?}");
+                assert!(b > a);
+                prev = b;
+            }
+            assert_eq!(prev, text.len(), "pieces of {text:?} do not reach the end");
+        }
     }
 }

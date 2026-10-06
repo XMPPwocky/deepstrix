@@ -114,6 +114,24 @@ impl MappedGguf {
         &self.path
     }
 
+    /// [`Gguf::drop_metadata`] on the parsed header.
+    pub fn drop_metadata(&mut self) {
+        self.gguf.drop_metadata();
+    }
+
+    /// `POSIX_FADV_RANDOM` on every shard: no kernel readahead around
+    /// `read_range_into`'s ranges, so a reader that drops what it read
+    /// leaves nothing behind but partial edge pages (drop those with
+    /// [`Self::drop_page_cache`]).
+    pub fn advise_random(&self) {
+        use std::os::unix::io::AsRawFd;
+        for file in &self.files {
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+            }
+        }
+    }
+
     pub fn gguf(&self) -> &Gguf {
         &self.gguf
     }

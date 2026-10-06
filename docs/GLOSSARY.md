@@ -118,6 +118,7 @@ There is one process per box, so `b1_`/`b2_` name the machine *and* the state of
 |---|---|---|---|
 | phase | The hub's alternation between prefill and decode. The hub **declares** it to box 2 on every request (`REQ_FLAG_DECODE`). | `Phase`, `hub_phase`, `REQ_FLAG_DECODE` (documented today as a busy-poll hint only) | lane "phases" (→ waits), `PreMoePhase` (→ stage), link busy-poll "phase" (→ link mode); a row count standing in for phase |
 | smoothed phase | Mode-evict's 16-request hysteresis over the declared phase | `prefill_phase` | "inferred" (box 2 is told the phase; it does not guess it) |
+| embed phase | An exclusive run of the embedding model (`/v1/embeddings`) **between** two scheduler ticks. It is not one of the alternating phases: `Phase` and the burst do not change, and it is never declared to box 2 (`docs/v41/EMBED_PHASE_DESIGN.md`). | `embed_phase`, `EmbedCtx::run_phase`, `ms.embed`, `hub_embed` | — |
 | burst | One contiguous run of a phase | `V41_MS_*_BURST_MS` | — |
 | lane | One sub-batch of a step's or chunk's rows, with its own buffers, control state and events. Index 0..`MAX_LANES`. The lane cuts and schedule for one step form the **`LanePlan`**. | `lane`, `MAX_LANES` | `bd_a/b/c`, `sync_events_t1/_t2`, `stagger2` |
 | stage | A numbered section of the layer body (Stages 1–12) and its timing range | `ms.stage`, `dgpu.*`/`igpu.*` | DSpark's "stage-1 gate" → **draft gate** |
@@ -146,6 +147,8 @@ There is one process per box, so `b1_`/`b2_` name the machine *and* the state of
 | mark | An in-memory rollback point | `KvMark`, `CompMark`, `CompStateMark` | "comp snapshot" |
 | snapshot | On-disk KV, with an explicit kind: `Prompt`, `Checkpoint` or `Switch` | `snapshot::save` | checkpoint *inferred* from empty decoder-layer windows; "partial snapshot" in logs |
 | restore | Disk → GPU. Only this. | `snapshot::restore*` | arena rollback, "pin restore", "delta restore" |
+| loan / donor / return | Device memory lent IN PLACE to a short exclusive job (the embed phase) by immutable buffers (the **donors**: V4.1 dGPU weights), and put back byte-exact afterwards (the **return**). No allocation, no pointer change. | `dgpu_loan::{Loan, Donor, LoanAlloc}`, `Loan::give_back` | "restore" for the return; "evict" (nothing leaves the device's address space) |
+| loan image / guard band | The donors' bytes on disk, written once at startup and read back at every return / the imaged-but-never-lent bytes after each donor's lent range, checked at every return | `V41_EMBED_LOAN_IMAGE`, `ReturnStats::guard_violations` | "snapshot" (on-disk KV only) |
 
 ## Configuration and telemetry
 

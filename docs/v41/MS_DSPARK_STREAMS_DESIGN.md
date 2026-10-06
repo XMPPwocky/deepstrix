@@ -1,6 +1,10 @@
 # Two speculating streams on one row abstraction (StepRows)
 
 Status: DESIGN rev 3, APPROVED 2026-10-04 (review rounds 1-2 APPROVE WITH CHANGES, round 3 APPROVE; dispositions in section 8).
+A/B (2.6, pre-registered rule) 2026-10-05 23:38 - 10-06 01:38 UTC under `V41_MS_GRAPH_KEYS=stage_b` (the 10-04 run stopped on
+legacy graph VRAM growth): 99 turns, 1006 steps with two streams speculating; runs arm 1 / 2 = 12 / 10; slower stream median
+15.16 / 15.66 tok/s = 1.033 (PASS >= 0.9); aggregate 30.31 / 37.16 tok/s = +22.6%; VRAM flat, no capture pause.
+`V41_MS_DSPARK_STREAMS=2` LIVE in the knob file from 2026-10-06 01:39 UTC.
 Branch `worktree-ms-dspark2` (base = production `worktree-lm-prefill-prod` 9762c6f, hub 9c6f8ea5).
 
 ## 0. What and why

@@ -240,42 +240,47 @@ extern "C" __global__ void rms_norm_weighted_quantize_q8(
 extern "C" __global__ __launch_bounds__(256) void rms_quant_q8_1280_batched(
         float* __restrict__ out, signed char* __restrict__ xq, float* __restrict__ xscale,
         const float* __restrict__ x, const float* __restrict__ weight, float eps) {
-    __shared__ float sdata[256];
-    const unsigned int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31u, w = tid >> 5;
-    const float* xb = x + (size_t)b * 1280u;
-    float xv[5], wv[5];
-    #pragma unroll
-    for (unsigned j = 0; j < 5; ++j) xv[j] = xb[tid + 256u * j];
-    #pragma unroll
-    for (unsigned j = 0; j < 5; ++j) wv[j] = weight[tid + 256u * j];
-    double partial = 0.0;
-    #pragma unroll
-    for (unsigned j = 0; j < 5; ++j) {
-        const float v = xv[j];
-        partial += (double)v * (double)v;
-    }
-    sdata[tid] = (float)partial;
-    __syncthreads();
-    for (unsigned int stride = 128u; stride > 0; stride >>= 1) {
-        if (tid < stride) sdata[tid] += sdata[tid + stride];
-        __syncthreads();
-    }
-    const float mean_sq = sdata[0] / (float)1280u;
-    const float scale = rsqrtf(mean_sq + eps);
-    float* ob = out + (size_t)b * 1280u;
-    #pragma unroll
-    for (unsigned j = 0; j < 5; ++j) {
-        const float v = xv[j] * scale * wv[j];
-        ob[tid + 256u * j] = v;
-        const unsigned k = 8u * j + w;
-        float amax = fabsf(v);
-        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, amax, off));
-        float d = amax / 127.0f;
-        float id = d != 0.0f ? 1.0f / d : 0.0f;
-        if (lane == 0) xscale[(size_t)b * 40u + k] = d;
-        int q = (int)lrintf(v * id);
-        if (q > 127) q = 127;
-        if (q < -128) q = -128;
-        xq[(size_t)b * 1280u + 32u * k + lane] = (signed char)q;
+#include "rms_quant_q8_1280_body.inc"
+}
+
+// The same body as a device function for the `_ind` twin (inlined: its __restrict__ parameters
+// become scoped-noalias metadata on the resolved pointers).
+__device__ __forceinline__ static void rms_quant_q8_1280_body(
+        float* __restrict__ out, signed char* __restrict__ xq, float* __restrict__ xscale,
+        const float* __restrict__ x, const float* __restrict__ weight, float eps) {
+#include "rms_quant_q8_1280_body.inc"
+}
+
+// `_ind` twins (GRAPH_KEYS_DESIGN.md 2.3): operands 0..4 (out, xq, xscale, x, weight) resolve through
+// the arena context when their `ind_mask` bit is set. `_ind` = production (no canary code, 2.8),
+// `_ind_canary` = the same dereferences plus the canary record.
+#include "arena_ctx.inc"
+template <bool CANARY>
+__device__ __forceinline__ static void rms_quant_q8_1280_ind_impl(
+        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out, signed char* xq,
+        float* xscale, const float* x, const float* weight, float eps) {
+    ARENA_CTX_DEREF(ind_mask, 0, float*, out);
+    ARENA_CTX_DEREF(ind_mask, 1, signed char*, xq);
+    ARENA_CTX_DEREF(ind_mask, 2, float*, xscale);
+    ARENA_CTX_DEREF(ind_mask, 3, const float*, x);
+    ARENA_CTX_DEREF(ind_mask, 4, const float*, weight);
+    if constexpr (CANARY) {
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(out) ^ ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale) ^
+                                          ARENA_CTX_U64(x) ^ ARENA_CTX_U64(weight));
+        rms_quant_q8_1280_body(out, xq, xscale, x, weight, eps);
+        ARENA_CTX_CANARY_STORE(canary_tag);
+    } else {
+        (void)canary;
+        (void)canary_tag;
+        rms_quant_q8_1280_body(out, xq, xscale, x, weight, eps);
     }
 }
+#define RMS_QUANT_IND_KERNEL(NAME, CANARY)                                                     \
+    extern "C" __global__ __launch_bounds__(256) void NAME(                                    \
+            uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* out,        \
+            signed char* xq, float* xscale, const float* x, const float* weight, float eps) {  \
+        rms_quant_q8_1280_ind_impl<CANARY>(ind_mask, canary, canary_tag, out, xq, xscale, x,  \
+                                           weight, eps);                                       \
+    }
+RMS_QUANT_IND_KERNEL(rms_quant_q8_1280_batched_ind, false)
+RMS_QUANT_IND_KERNEL(rms_quant_q8_1280_batched_ind_canary, true)

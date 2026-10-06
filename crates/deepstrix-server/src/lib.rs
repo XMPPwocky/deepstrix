@@ -4,6 +4,7 @@
 
 pub mod dsml;
 pub mod embed;
+pub mod embed_phase;
 pub mod engine_worker;
 pub mod knobs;
 #[cfg(feature = "v41")]
