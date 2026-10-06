@@ -1441,6 +1441,8 @@ struct PfDone {
     prefill: bool,
     /// `PfJob::restore`.
     restore: u64,
+    /// `PfJob::likely`: lands in the nursery.
+    likely: bool,
     offs: [Option<(usize, usize, u32, u32)>; 3],
     coalesced: bool,
     /// Hint sent -> a reader picked it up (queueing behind other reads).
@@ -1478,6 +1480,12 @@ struct PfJob {
     /// Delta restore (`V41_B2_RESTORE`): the decode stamp the expert had when a
     /// prefill phase evicted it (0 = not a restore read).
     restore: u64,
+    /// LIKELY (design 3.2): the hub's predicted-miss hint (`REQ_FLAG_LIKELY`
+    /// word). Class `Certain > Likely > Spec`: queued behind certain jobs and
+    /// ahead of speculative ones, counts against the speculative reader cap,
+    /// pops regardless of running certain jobs (no yield), lands in the
+    /// NURSERY. Cleared when `promote` makes it certain.
+    likely: bool,
     t_hint: std::time::Instant,
 }
 
@@ -1488,6 +1496,14 @@ struct PfJob {
 /// deduped onto that job and waited out the whole queue ahead of it, plus the
 /// job's own yield to demand reads (2026-09-25: `box2.page_ms` 37 ms/step of
 /// parked waits with ~0 demand misses).
+///
+/// LIKELY jobs (`PfJob::likely`; design 3.2, review round 3 findings 1-2) sit
+/// between the two: behind every certain job, ahead of every speculative one;
+/// `running_likely + running_spec < max_spec` (the reserved reader stays the
+/// certain reserve), handed out whether or not a certain job runs; speculative
+/// chunks pause for a running LIKELY read (`background_should_wait`), a LIKELY
+/// read's chunks pause for certain reads only (and only under
+/// `knobs::likely_pause_for_certain`), never for speculative ones.
 struct PfQueue {
     inner: std::sync::Mutex<PfQueueInner>,
     cv: std::sync::Condvar,
@@ -1500,9 +1516,10 @@ struct PfQueueInner {
     /// (`admit_prefetched`), since urgency only means something while the key
     /// is pending.
     urgent: std::collections::HashSet<(u32, u32)>,
-    /// Readers currently holding a speculative / a certain job.
+    /// Readers currently holding a speculative / a certain / a LIKELY job.
     running_spec: usize,
     running_certain: usize,
+    running_likely: usize,
     /// At most this many speculative jobs run at once: the rest of the readers
     /// (`V41_B2_PREFETCH_RESERVE`) are kept for certain ones.
     max_spec: usize,
@@ -1528,6 +1545,7 @@ impl PfQueue {
                 urgent: Default::default(),
                 running_spec: 0,
                 running_certain: 0,
+                running_likely: 0,
                 max_spec: max_spec.max(1),
                 n_readers: n_readers.max(1),
                 closed: false,
@@ -1538,11 +1556,15 @@ impl PfQueue {
     }
 
     /// Urgent jobs go behind the other urgent ones and ahead of every
-    /// speculative one; speculative jobs go to the back.
+    /// speculative one; LIKELY jobs behind the certain and LIKELY ones, ahead
+    /// of every speculative one; speculative jobs go to the back.
     fn push(&self, job: PfJob) {
         let mut g = self.inner.lock().unwrap();
         if job.certain {
             let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
+            g.jobs.insert(at, job);
+        } else if job.likely {
+            let at = g.jobs.iter().position(|j| !j.certain && !j.likely).unwrap_or(g.jobs.len());
             g.jobs.insert(at, job);
         } else {
             g.jobs.push_back(job);
@@ -1561,8 +1583,10 @@ impl PfQueue {
         let changed = match g.jobs.iter().position(|j| j.layer == layer && j.e == e) {
             Some(i) if g.jobs[i].certain => false,
             Some(i) => {
+                // Spec -> Certain and Likely -> Certain alike (round 3, finding 2).
                 let mut job = g.jobs.remove(i).expect("index from position");
                 job.certain = true;
+                job.likely = false;
                 let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
                 g.jobs.insert(at, job);
                 true
@@ -1588,23 +1612,46 @@ impl PfQueue {
     /// and with no reader free, pausing the readers it is waiting for would
     /// only idle the drives. One lock per check.
     fn background_should_wait(&self, layer: u32, e: u32) -> bool {
+        self.background_should_wait_cls(layer, e, false)
+    }
+
+    /// `background_should_wait` by class: a SPECULATIVE read also holds off
+    /// while a LIKELY read runs (design 3.2: speculative pauses for LIKELY);
+    /// a LIKELY read (`likely`) holds off for certain reads only, never for
+    /// speculative or other LIKELY ones.
+    fn background_should_wait_cls(&self, layer: u32, e: u32, likely: bool) -> bool {
         let g = self.inner.lock().unwrap();
         if g.urgent.contains(&(layer, e)) {
             return false;
         }
-        g.running_certain > 0 || !g.urgent.is_empty()
+        g.running_certain > 0 || !g.urgent.is_empty() || (!likely && g.running_likely > 0)
     }
 
     fn is_urgent(&self, layer: u32, e: u32) -> bool {
         self.inner.lock().unwrap().urgent.contains(&(layer, e))
     }
 
+    /// `pause_token` carries the class and the key (tests).
+    #[cfg(test)]
+    fn pause_token_roundtrip(&self) -> bool {
+        let t = pause_token(39, 383, true);
+        let (l, e) = (((t >> 16) & 0xFFFF) as u32, (t & 0xFFFF) as u32);
+        (l, e) == (39, 383) && t & PAUSE_TOKEN_LIKELY != 0 && pause_token(39, 383, false) & PAUSE_TOKEN_LIKELY == 0
+    }
+
     /// `evtrace`: running certain, running speculative, queued certain,
-    /// queued speculative.
+    /// queued speculative (LIKELY jobs are in `counts_likely`, not here).
     fn counts(&self) -> [f64; 4] {
         let g = self.inner.lock().unwrap();
         let qc = g.jobs.iter().filter(|j| j.certain).count();
-        [g.running_certain as f64, g.running_spec as f64, qc as f64, (g.jobs.len() - qc) as f64]
+        let ql = g.jobs.iter().filter(|j| j.likely).count();
+        [g.running_certain as f64, g.running_spec as f64, qc as f64, (g.jobs.len() - qc - ql) as f64]
+    }
+
+    /// `evtrace`: running LIKELY, queued LIKELY.
+    fn counts_likely(&self) -> [f64; 2] {
+        let g = self.inner.lock().unwrap();
+        [g.running_likely as f64, g.jobs.iter().filter(|j| j.likely).count() as f64]
     }
 
     fn clear_urgent(&self, layer: u32, e: u32) {
@@ -1632,15 +1679,28 @@ impl PfQueue {
             if g.closed {
                 // Shutdown drains everything, ungated.
                 let j = g.jobs.pop_front()?;
-                if j.certain { g.running_certain += 1 } else { g.running_spec += 1 }
+                if j.certain { g.running_certain += 1 } else if j.likely { g.running_likely += 1 } else { g.running_spec += 1 }
                 return Some(j);
             }
+            // LIKELY and speculative jobs share the speculative reader cap
+            // (round 3, finding 2: LIKELY must never occupy the certain reserve).
+            let below_cap = g.running_spec + g.running_likely < Self::spec_cap(&g, urgency);
             match g.jobs.front() {
                 Some(j) if j.certain => {
                     g.running_certain += 1;
                     return g.jobs.pop_front();
                 }
-                Some(_) if g.running_spec < Self::spec_cap(&g, urgency) && (urgency || g.running_certain == 0) => {
+                // A LIKELY job pops whether or not a certain one runs (it does
+                // not yield; its chunks may pause instead).
+                Some(j) if j.likely && below_cap => {
+                    g.running_likely += 1;
+                    let j = g.jobs.pop_front()?;
+                    if urgency {
+                        g.spec_keys.insert((j.layer, j.e));
+                    }
+                    return Some(j);
+                }
+                Some(j) if !j.likely && below_cap && (urgency || g.running_certain == 0) => {
                     g.running_spec += 1;
                     let j = g.jobs.pop_front()?;
                     if urgency {
@@ -1670,20 +1730,33 @@ impl PfQueue {
         self.inner.lock().unwrap().spec_keys.clone()
     }
 
-    /// A job popped as speculative turned out to be needed (`urgent`) before
-    /// its read started: count it as certain from now on, so the gate keeps
-    /// new speculative reads off the drives while it runs.
-    fn reclassify_certain(&self) {
+    /// A job popped as speculative (or LIKELY: `from_likely`) turned out to
+    /// be needed (`urgent`) before its read started: count it as certain from
+    /// now on, so the gate keeps new speculative reads off the drives while it
+    /// runs.
+    fn reclassify_certain(&self, from_likely: bool) {
         let mut g = self.inner.lock().unwrap();
-        g.running_spec = g.running_spec.saturating_sub(1);
+        if from_likely {
+            g.running_likely = g.running_likely.saturating_sub(1);
+        } else {
+            g.running_spec = g.running_spec.saturating_sub(1);
+        }
         g.running_certain += 1;
     }
 
     /// A reader finished a job it popped as `certain` (or not).
+    #[cfg(test)]
     fn finished(&self, certain: bool) {
+        self.finished_cls(certain, false)
+    }
+
+    /// A reader finished a job of the given class (`certain` wins).
+    fn finished_cls(&self, certain: bool, likely: bool) {
         let mut g = self.inner.lock().unwrap();
         if certain {
             g.running_certain = g.running_certain.saturating_sub(1);
+        } else if likely {
+            g.running_likely = g.running_likely.saturating_sub(1);
         } else {
             g.running_spec = g.running_spec.saturating_sub(1);
         }
@@ -1711,15 +1784,25 @@ fn b2_spec_chunk_bytes() -> usize {
     std::env::var("V41_B2_SPEC_CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024).saturating_mul(1024)
 }
 
+/// The io_throttle token of a background read: `layer << 16 | e`, plus this
+/// bit for a LIKELY read (design 3.2: its chunks pause for certain reads only).
+const PAUSE_TOKEN_LIKELY: u64 = 1 << 40;
+
+fn pause_token(layer: u32, e: u32, likely: bool) -> u64 {
+    ((layer as u64) << 16) | e as u64 | if likely { PAUSE_TOKEN_LIKELY } else { 0 }
+}
+
 /// Before each chunk of a background read: wait while a demand read runs or an
-/// urgent (certain) read is active, unless this very expert has become
-/// urgent; at most 20 ms per chunk.
+/// urgent (certain) read is active -- and, for a SPECULATIVE read, while a
+/// LIKELY read runs -- unless this very expert has become urgent; at most
+/// 20 ms per chunk.
 fn b2_background_pause(token: u64) {
-    let (layer, e) = ((token >> 16) as u32, (token & 0xFFFF) as u32);
+    let (layer, e) = (((token >> 16) & 0xFFFF) as u32, (token & 0xFFFF) as u32);
+    let likely = token & PAUSE_TOKEN_LIKELY != 0;
     let Some(q) = PF_QUEUE.get() else { return };
     let t = std::time::Instant::now();
     let mut slept = false;
-    while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || q.background_should_wait(layer, e))
+    while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || q.background_should_wait_cls(layer, e, likely))
         && !q.is_urgent(layer, e)
         && t.elapsed() < std::time::Duration::from_millis(20)
     {
@@ -1782,6 +1865,7 @@ fn push_parked_pins(pins: &mut Vec<(u32, u32)>, layer: u32, sel: &[i32]) -> usiz
 struct PfFinish<'a> {
     q: &'a PfQueue,
     certain: bool,
+    likely: bool,
     /// A speculative key `pop_mode(true)` recorded, released with the job.
     spec_key: Option<(u32, u32)>,
 }
@@ -1791,8 +1875,27 @@ impl Drop for PfFinish<'_> {
         if let Some((l, e)) = self.spec_key {
             self.q.finish_spec_key(l, e);
         }
-        self.q.finished(self.certain);
+        self.q.finished_cls(self.certain, self.likely);
     }
+}
+
+/// Which staging set a background read takes (`prefetch_words_core`): a
+/// LIKELY word takes one of the RESERVED pair first (`free_likely`; design
+/// 3.2: two sets of its own, so hints never contend with restores and
+/// admissions for the general sets), then a general set under the
+/// speculative rule; a speculative word never takes one of the last
+/// `2 * reserve` general sets (kept for certain words); a certain word takes
+/// any general set. `None` = dropped.
+fn pick_set(free: &mut Vec<usize>, free_likely: &mut Vec<usize>, certain: bool, likely: bool, reserve: usize) -> Option<usize> {
+    if likely && !certain {
+        if let Some(s) = free_likely.pop() {
+            return Some(s);
+        }
+    }
+    if !certain && free.len() <= 2 * reserve {
+        return None;
+    }
+    free.pop()
 }
 
 struct B2Prefetch {
@@ -1802,7 +1905,11 @@ struct B2Prefetch {
     /// them before the staging is freed.
     readers: Vec<std::thread::JoinHandle<()>>,
     stages: Vec<[PinnedBuffer<u8>; 3]>,
+    /// Free GENERAL sets (indices `< n_general`).
     free: Vec<usize>,
+    /// Free sets of the RESERVED pair for LIKELY words (indices `>= n_general`).
+    free_likely: Vec<usize>,
+    n_general: usize,
     pending: std::collections::HashSet<(u32, u32)>,
     pub hinted: u64,
     pub admitted: u64,
@@ -1816,6 +1923,17 @@ struct B2Prefetch {
     pub queue_ns: u64,
     pub read_ns: u64,
     pub n_read: u64,
+}
+
+impl B2Prefetch {
+    /// A read is done with `set`: back to the list it came from.
+    fn release_set(&mut self, set: usize) {
+        if set >= self.n_general {
+            self.free_likely.push(set);
+        } else {
+            self.free.push(set);
+        }
+    }
 }
 
 impl Drop for B2Prefetch {
@@ -2170,6 +2288,11 @@ fn b2_prefetch_reserve() -> usize {
     });
     *R
 }
+
+/// Staging sets reserved for LIKELY (hint) reads when the nursery is on
+/// (design 3.2: a reserved pair, so hints never contend with restores and
+/// admissions for the general sets).
+const B2_LIKELY_SETS: usize = 2;
 
 /// `V41_B2_PREFETCH_SETS`: staging sets = max prefetch reads in flight (default 8).
 fn b2_prefetch_sets() -> usize {
@@ -4403,9 +4526,15 @@ impl ExpertShard {
             PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
             PinnedBuffer::<u8>::new_with_flags(bpe3[2] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
         ]); }
-        // Look-ahead prefetch staging + reader thread (see `B2Prefetch`).
+        // Look-ahead prefetch staging + reader thread (see `B2Prefetch`). With
+        // the nursery on, TWO more sets are reserved for the hub's LIKELY words
+        // (design 3.2: ~113 MB of pinned memory; the general sets are sized by
+        // `V41_B2_PREFETCH_SETS` and `miss_par` caps demand concurrency at
+        // `min(knob, stages.len())`, so taking two of those would change it).
+        // The reserved pair is the LAST two sets (`B2Prefetch::n_general`).
         let mut pf_stages: Vec<[PinnedBuffer<u8>; 3]> = Vec::new();
-        for _ in 0..b2_prefetch_sets() {
+        let n_likely_sets = if knobs::nursery() > 0 { B2_LIKELY_SETS } else { 0 };
+        for _ in 0..b2_prefetch_sets() + n_likely_sets {
             pf_stages.push([
                 PinnedBuffer::<u8>::new_with_flags(3 * bpe3[0] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
                 PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
@@ -4500,17 +4629,30 @@ impl ExpertShard {
     }
 
     fn prefetch_words_full(&mut self, words: &[u32], certain: bool, stage: bool, prefill: bool) {
-        let _ = self.prefetch_words_core(words, &[], certain, stage, prefill);
+        let _ = self.prefetch_words_core(words, &[], certain, stage, prefill, false);
+    }
+
+    /// The hub's predicted-miss hints (`REQ_FLAG_LIKELY`; design 3.2): LIKELY
+    /// reads into the NURSERY. No pin grant, no admit gate, no ledger entry;
+    /// a word for a key already resident (nursery or main) or in flight is
+    /// skipped. Plain speculative words when the nursery is off (the hub only
+    /// sends them after seeing `RESP_FLAG_NURSERY`, so that is a defence).
+    /// Returns how many were queued.
+    pub fn prefetch_words_likely(&mut self, words: &[u32]) -> usize {
+        let dropped = self.prefetch_words_core(words, &[], false, false, false, true);
+        words.len() - dropped.len()
     }
 
     /// `prefetch_words_full`, with an optional restore stamp per word
-    /// (`stamps` empty, or one per word: `PfJob::restore`). Returns the words
-    /// DROPPED for want of a free staging set (the delta restore re-queues them).
-    fn prefetch_words_core(&mut self, words: &[u32], stamps: &[u64], certain: bool, stage: bool, prefill: bool) -> Vec<u32> {
+    /// (`stamps` empty, or one per word: `PfJob::restore`) and the LIKELY
+    /// class (`likely`). Returns the words DROPPED for want of a free staging
+    /// set (the delta restore re-queues them; a LIKELY drop is `nursery_drops`).
+    fn prefetch_words_core(&mut self, words: &[u32], stamps: &[u64], certain: bool, stage: bool, prefill: bool, likely: bool) -> Vec<u32> {
         let mut dropped_words = Vec::new();
         if words.is_empty() || self.pool.is_none() {
             return dropped_words;
         }
+        let likely = likely && !certain && self.pool.as_ref().is_some_and(|p| p.nursery_target > 0);
         // Mode-aware eviction: a prefill request's own early-page / park reads
         // land PREFILL-class even with staging off (they used to land
         // decode-class and search the global minimum = prefill's own pages).
@@ -4548,14 +4690,23 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let urgency = knobs::route_urgency();
-                    let Some(PfJob { layer, e, set, certain, stage, own_prefill, prefill, restore, t_hint }) = queue_r.pop_mode(urgency) else { break };
+                    let Some(PfJob { layer, e, set, certain, stage, own_prefill, prefill, restore, likely, t_hint }) = queue_r.pop_mode(urgency) else { break };
                     let ev_on = super::evtrace::enabled();
                     let ev_t_pop = if ev_on { super::evtrace::now() } else { f64::NAN };
                     let mut ev_yield_ns = 0u64;
-                    let mut done = PfFinish { q: &queue_r, certain, spec_key: (urgency && !certain).then_some((layer, e)) };
+                    let mut done = PfFinish { q: &queue_r, certain, likely, spec_key: (urgency && !certain).then_some((layer, e)) };
+                    // A LIKELY job never yields (design 3.2: it pops regardless
+                    // of running certain reads; its chunks may pause instead),
+                    // but a promotion that landed after its pop still turns it
+                    // certain here, like a yielding speculative job's.
+                    if likely && !certain && queue_r.is_urgent(layer, e) {
+                        queue_r.reclassify_certain(true);
+                        done.certain = true;
+                        done.likely = false;
+                    }
                     // Urgency routing: a speculative read goes to the OTHER
                     // drive from demand reads, so it neither yields nor chunks.
-                    if !certain && !urgency {
+                    if !certain && !likely && !urgency {
                         // Yield the drives to demand misses (bounded: a hint that
                         // waits longer than a layer is late anyway) -- unless a
                         // request needs this very expert, in which case it IS the
@@ -4569,7 +4720,7 @@ impl ExpertShard {
                         }
                         ev_yield_ns = t.elapsed().as_nanos() as u64;
                         if queue_r.is_urgent(layer, e) {
-                            queue_r.reclassify_certain();
+                            queue_r.reclassify_certain(false);
                             done.certain = true;
                         }
                     }
@@ -4588,8 +4739,13 @@ impl ExpertShard {
                     let queue_ns = (t_read - t_hint).as_nanos() as u64;
                     // A job still speculative at read start reads in chunks and
                     // yields to urgent reads (io_throttle); certain ones do not.
+                    // A LIKELY job reads in chunks too (an isolated chunked wall
+                    // = a certain wall, design 3.2) and its chunks pause for
+                    // CERTAIN reads only, under `knobs::likely_pause_for_certain`
+                    // (off: unchunked -- nothing to pause for); never for
+                    // speculative ones (`PAUSE_TOKEN_LIKELY`).
                     // Under urgency routing: certain -> the mirror, speculative
-                    // -> the primary, and neither is throttled; a PREFILL
+                    // and LIKELY -> the primary, and none is throttled; a PREFILL
                     // chunk's own reads (`own_prefill`, staged or not) are
                     // striped across both drives like its demand reads
                     // (`knobs::prefill_route_split`).
@@ -4598,14 +4754,16 @@ impl ExpertShard {
                         (true, true, false) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
                         (true, false, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
                     };
-                    v4flash_core::io_throttle::set_background((!done.certain && !urgency).then_some(((layer as u64) << 16) | e as u64));
+                    let tok = pause_token(layer, e, done.likely);
+                    let chunked = !done.certain && !urgency && (!done.likely || knobs::likely_pause_for_certain());
+                    v4flash_core::io_throttle::set_background(chunked.then_some(tok));
                     let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route);
                     v4flash_core::io_throttle::set_background(None);
                     let read_ns = t_read.elapsed().as_nanos() as u64;
                     let mut ev = [f64::NAN; 18];
                     if ev_on {
                         let roles = EV_ROLES.with(|c| c.replace([f64::NAN; 6]));
-                        let pause = EV_PAUSE.lock().unwrap().remove(&(((layer as u64) << 16) | e as u64)).unwrap_or(0);
+                        let pause = EV_PAUSE.lock().unwrap().remove(&tok).unwrap_or(0);
                         ev[..11].copy_from_slice(&[
                             super::evtrace::inst_to_raw(t_hint), ev_t_pop, ev_t_read, super::evtrace::now(),
                             ev_yield_ns as f64, pause as f64, f64::from(u8::from(certain)), f64::from(u8::from(done.certain)),
@@ -4614,9 +4772,11 @@ impl ExpertShard {
                         ev[11..17].copy_from_slice(&roles);
                         ev[17] = route.code();
                     }
+                    // Still LIKELY at the end (not made certain): lands in the nursery.
+                    let likely_done = done.likely;
                     drop(done);
                     let msg = match r {
-                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, prefill, restore, offs, coalesced, queue_ns, read_ns, ev }),
+                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, prefill, restore, likely: likely_done, offs, coalesced, queue_ns, read_ns, ev }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
                     };
                     if tx_done.send(msg).is_err() {
@@ -4626,11 +4786,17 @@ impl ExpertShard {
             }).expect("spawn b2-prefetch"));
             }
             let n = stages.len();
-            self.prefetch = Some(B2Prefetch { queue, rx_done, readers, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, promoted: 0, queue_ns: 0, read_ns: 0, n_read: 0 });
-            eprintln!("expertd: look-ahead prefetch ON ({n} staging sets, {n_par} readers)");
+            // The reserved LIKELY pair (if any) is the LAST sets (`load`).
+            let n_general = if self.pool.as_ref().is_some_and(|p| p.nursery_target > 0) { n.saturating_sub(B2_LIKELY_SETS).max(1) } else { n };
+            self.prefetch = Some(B2Prefetch {
+                queue, rx_done, readers, stages, free: (0..n_general).collect(), free_likely: (n_general..n).collect(), n_general,
+                pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, promoted: 0, queue_ns: 0, read_ns: 0, n_read: 0,
+            });
+            eprintln!("expertd: look-ahead prefetch ON ({n_general} staging sets + {} reserved for LIKELY reads, {n_par} readers)", n - n_general);
         }
-        let pool = self.pool.as_ref().unwrap();
+        let pool = self.pool.as_mut().unwrap();
         let pf = self.prefetch.as_mut().unwrap();
+        let reserve = b2_prefetch_reserve();
         for (i, &w) in words.iter().enumerate() {
             let restore = stamps.get(i).copied().unwrap_or(0);
             let key = ((w >> 16) as u32, (w & 0xFFFF) as u32);
@@ -4651,20 +4817,19 @@ impl ExpertShard {
             }
             // Keep sets free for certain words: a speculative word that would
             // take one of the last reserved sets is dropped (it is retried by
-            // whoever wants it next); a certain word may use any set.
-            if !certain && pf.free.len() <= 2 * b2_prefetch_reserve() {
+            // whoever wants it next); a certain word may use any set; a LIKELY
+            // word takes its reserved pair first (`pick_set`).
+            let Some(set) = pick_set(&mut pf.free, &mut pf.free_likely, certain, likely, reserve) else {
                 pf.dropped += 1;
-                dropped_words.push(w);
-                continue;
-            }
-            let Some(set) = pf.free.pop() else {
-                pf.dropped += 1;
+                if likely {
+                    pool.nc.drops += 1;
+                }
                 dropped_words.push(w);
                 continue;
             };
             pf.pending.insert(key);
             pf.hinted += 1;
-            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, own_prefill, prefill, restore, t_hint: std::time::Instant::now() });
+            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, own_prefill, prefill, restore, likely, t_hint: std::time::Instant::now() });
         }
         dropped_words
     }
@@ -4700,7 +4865,7 @@ impl ExpertShard {
         }
         let words: Vec<u32> = batch.iter().map(|&(l, e, _)| (l << 16) | e).collect();
         let stamps: Vec<u64> = batch.iter().map(|&(_, _, t)| t).collect();
-        let dropped = self.prefetch_words_core(&words, &stamps, false, false, false);
+        let dropped = self.prefetch_words_core(&words, &stamps, false, false, false, false);
         let pool = self.pool.as_mut().expect("checked above");
         for ent in &batch {
             if !dropped.contains(&((ent.0 << 16) | ent.1)) {
@@ -4779,7 +4944,8 @@ impl ExpertShard {
         // `b2_read` for a background read the compute thread just handled.
         #[allow(clippy::too_many_arguments)]
         let ev_read = |d: &PfDone, slot: f64, victim: Option<(u32, u32)>, t_recv: f64, t_land0: f64, wanted: bool, blocked: bool, scan_ns: f64, repack_ns: f64, already: bool| {
-            let src = if d.ev[6] == 1.0 { 1.0 } else if d.ev[7] == 1.0 { 2.0 } else { 3.0 };
+            // `src`: 1 certain at pop, 2 made certain before the read, 4 LIKELY, 3 speculative.
+            let src = if d.ev[6] == 1.0 { 1.0 } else if d.ev[7] == 1.0 { 2.0 } else if d.likely { 4.0 } else { 3.0 };
             let (vl, ve) = victim.map_or((f64::NAN, f64::NAN), |(l, e)| (f64::from(l), f64::from(e)));
             let mut v = vec![
                 src, ev_cur_seq(), f64::from(d.layer), f64::from(d.e), slot, vl, ve, d.set as f64,
@@ -4833,7 +4999,7 @@ impl ExpertShard {
                     pool.me.restore_inflight.remove(&(layer, e));
                     pf.pending.remove(&(layer, e));
                     pf.queue.clear_urgent(layer, e);
-                    pf.free.push(set);
+                    pf.release_set(set);
                     continue;
                 }
                 Err(_) => break,
@@ -4848,12 +5014,48 @@ impl ExpertShard {
                 if ev_on {
                     ev_read(&d, f64::NAN, None, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this, f64::NAN, f64::NAN, true);
                 }
-                pf.free.push(d.set);
+                pf.release_set(d.set);
                 continue;
             }
-            let Some(l) = self.layers.get(d.layer as usize).and_then(|l| l.as_ref()) else { pf.free.push(d.set); continue };
+            let Some(l) = self.layers.get(d.layer as usize).and_then(|l| l.as_ref()) else { pf.release_set(d.set); continue };
             let region = (l.base_slot as u32, l.base_slot as u32 + l.ids.len() as u32);
             let ev_t_scan = std::time::Instant::now();
+            // NURSERY LANDING (design 3.2): a LIKELY read lands in a nursery
+            // slot -- free first, then an unused entry, then the oldest, never
+            // one the pass being served wants (`want`, `pinned`) -- at this
+            // `ensure` only (in-flight passes read the slots otherwise). The
+            // occupant it recycles was never pinned (`on_evict` false). A hint
+            // the CURRENT pass wants skips the nursery: it is a decode landing
+            // into main below, counted as a land and a (direct) hit.
+            if d.likely && pool.nursery_target > 0 && !ev_wanted_this {
+                let Some(victim) = pool.nursery_victim(cur_layer, want, &pinned, knobs::nursery_lanes()) else {
+                    pool.nc.drops += 1;
+                    pf.release_set(d.set);
+                    continue;
+                };
+                let ev_scan_ns = ev_t_scan.elapsed().as_nanos() as f64;
+                let ev_victim = pool.evict(victim, cur_layer);
+                let ev_t_repack = std::time::Instant::now();
+                let landed: eyre::Result<()> = match (repack, repack_stream) {
+                    (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced).map(|_| ()),
+                    _ => (0..3).try_for_each(|i| {
+                        let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
+                        buf.slice_view_mut(victim as usize * bpe[i], bpe[i]).copy_from_host(&pf.stages[d.set][i].as_slice()[..bpe[i]])
+                    }),
+                };
+                if let Err(err) = landed {
+                    pf.release_set(d.set);
+                    return Err(err);
+                }
+                pool.land_nursery(victim, key);
+                pool.nursery_refill_free();
+                pf.admitted += 1;
+                pf.release_set(d.set);
+                if ev_on {
+                    ev_read(&d, f64::from(victim), ev_victim, ev_t_recv, ev_t_recv, false, false, ev_scan_ns, ev_t_repack.elapsed().as_nanos() as f64, false);
+                }
+                continue;
+            }
             // Never a hub-pinned victim: a background landing is optional, so
             // with every candidate pinned it is DROPPED (whoever needs the
             // expert demand-reads it; the pin reserve covers that claim). A
@@ -4871,7 +5073,7 @@ impl ExpertShard {
             if restore_stamp != 0 && (!pool.me.on || pool.me.prefill_phase) {
                 pool.me.restore.push_front((d.layer, d.e, restore_stamp));
                 pool.me.rc.requeued += 1;
-                pf.free.push(d.set);
+                pf.release_set(d.set);
                 continue;
             }
             let victim = if restore_stamp != 0 {
@@ -4880,7 +5082,7 @@ impl ExpertShard {
                     None => {
                         pool.me.rc.stopped += 1;
                         pool.me.restore.clear();
-                        pf.free.push(d.set);
+                        pf.release_set(d.set);
                         continue;
                     }
                 }
@@ -4893,7 +5095,7 @@ impl ExpertShard {
                 } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, true, prefill_landing).is_some() {
                     pool.pins.c.no_victim_drops += 1;
                 }
-                pf.free.push(d.set);
+                pf.release_set(d.set);
                 continue;
             };
             let ev_scan_ns = ev_t_scan.elapsed().as_nanos() as f64;
@@ -4912,7 +5114,7 @@ impl ExpertShard {
             if let Err(err) = landed {
                 // The victim is already detached (free, unowned); give the set
                 // back rather than leak it, then report.
-                pf.free.push(d.set);
+                pf.release_set(d.set);
                 return Err(err);
             }
             if restore_stamp != 0 {
@@ -4920,9 +5122,14 @@ impl ExpertShard {
                 pool.me.rc.landed += 1;
             } else {
                 pool.land(victim, key, d.stage || d.prefill);
+                if d.likely && pool.nursery_target > 0 {
+                    // A wanted hint, landed straight into main: a land and a hit.
+                    pool.nc.lands += 1;
+                    pool.nc.hits += 1;
+                }
             }
             pf.admitted += 1;
-            pf.free.push(d.set);
+            pf.release_set(d.set);
             if ev_on {
                 ev_read(&d, f64::from(victim), ev_victim, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this,
                     ev_scan_ns, ev_t_repack.elapsed().as_nanos() as f64, false);
@@ -9301,7 +9508,7 @@ mod tests {
     fn prefetch_queue_priority_and_reservation() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, likely: false, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, false));
         q.push(job(2, false));
@@ -9341,6 +9548,133 @@ mod tests {
         drained.sort();
         assert_eq!(drained, vec![7, 8, 9]);
         assert!(q.pop().is_none());
+    }
+
+    /// The LIKELY class (design 3.2; review round 3, findings 1-2): queued
+    /// behind certain and ahead of speculative jobs; `running_likely +
+    /// running_spec < max_spec` (the certain reserve is never a LIKELY
+    /// reader); handed out while a certain job runs; speculative chunks pause
+    /// for a running LIKELY read, a LIKELY read's chunks pause for certain
+    /// reads only; `promote` / `reclassify_certain` turn Likely into Certain.
+    #[test]
+    fn likely_queue_order_cap_and_pause_rules() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let job = |e: u32, certain: bool, likely: bool| PfJob { layer: 4, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, likely, t_hint: Instant::now() };
+        // max_spec 2, 3 readers (one reserved for certain jobs).
+        let q = Arc::new(PfQueue::new(2));
+        q.push(job(1, false, false)); // spec
+        q.push(job(2, false, true)); // likely
+        q.push(job(3, true, false)); // certain
+        q.push(job(4, false, true)); // likely
+        q.push(job(5, false, false)); // spec
+        {
+            let g = q.inner.lock().unwrap();
+            let order: Vec<u32> = g.jobs.iter().map(|j| j.e).collect();
+            assert_eq!(order, vec![3, 2, 4, 1, 5], "certain, then LIKELY in push order, then speculative");
+        }
+        assert_eq!(q.counts(), [0.0, 0.0, 1.0, 2.0], "`counts` leaves LIKELY out");
+        assert_eq!(q.counts_likely(), [0.0, 2.0]);
+        // Certain first; then a LIKELY job pops ALTHOUGH a certain one runs
+        // (split mode), up to the cap, which it shares with speculative jobs.
+        let a = q.pop().unwrap();
+        assert_eq!((a.e, a.certain), (3, true));
+        let b = q.pop().unwrap();
+        assert_eq!((b.e, b.likely, b.certain), (2, true, false));
+        let c = q.pop().unwrap();
+        assert_eq!((c.e, c.likely), (4, true));
+        assert_eq!(q.counts_likely(), [2.0, 0.0]);
+        // Cap: 2 LIKELY running = max_spec -> the speculative job waits (and
+        // would even without the certain one).
+        let q2 = Arc::clone(&q);
+        let h = std::thread::spawn(move || q2.pop().map(|j| j.e));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "a speculative job ran past max_spec beside two LIKELY ones");
+        // Pause rules while a LIKELY read runs and no certain one does.
+        q.finished(true);
+        assert!(q.background_should_wait(4, 1), "speculative pauses for a running LIKELY read");
+        assert!(!q.background_should_wait_cls(4, 2, true), "LIKELY never pauses for LIKELY");
+        assert!(q.pause_token_roundtrip());
+        // One LIKELY finishes: the speculative job goes (no certain running).
+        q.finished_cls(false, true);
+        assert_eq!(h.join().unwrap(), Some(1));
+        assert_eq!((q.counts()[1], q.counts_likely()[0]), (1.0, 1.0));
+        // A certain job running: both classes' chunks pause, and a new
+        // speculative job waits while a new LIKELY one (cap allowing) does not.
+        q.push(job(6, true, false));
+        let _cert = q.pop().unwrap();
+        assert!(q.background_should_wait_cls(4, 4, true), "LIKELY pauses for a certain read");
+        assert!(q.background_should_wait(4, 1));
+        q.finished_cls(false, true); // LIKELY 4 done: running spec 1, likely 0
+        q.push(job(7, false, true));
+        let d = q.pop().unwrap();
+        assert_eq!((d.e, d.likely), (7, true), "LIKELY pops beside a running certain job");
+        let q3 = Arc::clone(&q);
+        let h = std::thread::spawn(move || q3.pop().map(|j| j.e));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "speculative 5 must wait for the certain job (and the cap)");
+        q.finished(true);
+        q.finished_cls(false, true);
+        assert_eq!(h.join().unwrap(), Some(5));
+        q.finished(false);
+        q.finished(false);
+        // promote: a queued LIKELY job becomes certain and moves to the front.
+        q.push(job(8, false, false));
+        q.push(job(9, false, true));
+        assert!(q.promote(4, 9));
+        let p = q.pop().unwrap();
+        assert_eq!((p.e, p.certain, p.likely), (9, true, false));
+        q.finished(true);
+        // reclassify from LIKELY moves the counters.
+        let l = q.pop().unwrap();
+        assert_eq!((l.e, l.likely), (8, false), "8 was speculative");
+        q.push(job(10, false, true));
+        let l = q.pop().unwrap();
+        assert!(l.likely);
+        q.reclassify_certain(true);
+        assert_eq!((q.counts()[0], q.counts_likely()[0]), (1.0, 0.0));
+        q.finished(true);
+        q.finished(false);
+        // Urgency routing: a LIKELY job records its key like a speculative one.
+        q.push(job(11, false, true));
+        let u = q.pop_mode(true).unwrap();
+        assert!(u.likely && q.spec_keys_snapshot().contains(&(4, 11)));
+        {
+            let _f = PfFinish { q: &q, certain: false, likely: true, spec_key: Some((4, 11)) };
+        }
+        assert!(q.spec_keys_snapshot().is_empty());
+        assert_eq!(q.counts_likely()[0], 0.0, "PfFinish released the LIKELY reader slot");
+        // Close drains LIKELY jobs too.
+        q.push(job(12, false, true));
+        q.close();
+        assert_eq!(q.pop().map(|j| j.e), Some(12));
+        assert!(q.pop().is_none());
+    }
+
+    /// The reserved staging-set pair (design 3.2): a LIKELY word takes one of
+    /// its own sets first, then a general set under the speculative rule;
+    /// speculative words never touch the pair; a certain word takes any
+    /// general set; `release_set` returns each set to its own list.
+    #[test]
+    fn likely_words_use_the_reserved_set_pair() {
+        let (mut free, mut likely) = (vec![0usize, 1, 2, 3], vec![4usize, 5]);
+        // reserve 1: speculative words leave the last 2 general sets.
+        assert_eq!(pick_set(&mut free, &mut likely, false, true, 1), Some(5));
+        assert_eq!(pick_set(&mut free, &mut likely, false, true, 1), Some(4));
+        assert_eq!(pick_set(&mut free, &mut likely, false, true, 1), Some(3), "pair busy: a general set under the speculative rule");
+        assert_eq!(pick_set(&mut free, &mut likely, false, false, 1), Some(2), "speculative: 3 general sets left > the 2 reserved");
+        assert_eq!(pick_set(&mut free, &mut likely, false, false, 1), None, "speculative: 2 left = the reserve");
+        assert_eq!(pick_set(&mut free, &mut likely, false, true, 1), None, "LIKELY too");
+        assert_eq!(pick_set(&mut free, &mut likely, true, false, 1), Some(1), "certain: any general set");
+        assert_eq!(pick_set(&mut free, &mut likely, true, true, 1), Some(0), "certain wins over likely");
+        likely.push(4);
+        free.push(9);
+        assert_eq!(pick_set(&mut free, &mut likely, false, false, 1), None, "speculative never takes the pair");
+        assert_eq!((free.clone(), likely.clone()), (vec![9], vec![4]));
+        // With the nursery off (no pair), a LIKELY word is a speculative one.
+        let mut none = Vec::new();
+        let mut g = vec![0usize, 1, 2];
+        assert_eq!(pick_set(&mut g, &mut none, false, true, 0), Some(2));
     }
 
     /// The wait decisions under urgency routing, as pure functions.
@@ -9390,21 +9724,21 @@ mod tests {
     fn prefetch_finish_releases_spec_key() {
         use std::time::Instant;
         let q = PfQueue::with_readers(2, 3);
-        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() });
+        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, likely: false, t_hint: Instant::now() });
         let j = q.pop_mode(true).unwrap();
         assert!(q.spec_keys_snapshot().contains(&(6, 1)));
         assert!(!q.promote(6, 1), "a running speculative key must not be promoted/urgent");
         assert!(!q.is_urgent(6, 1));
         assert_eq!(q.counts()[1], 1.0, "one speculative job running");
         {
-            let _f = PfFinish { q: &q, certain: j.certain, spec_key: Some((j.layer, j.e)) };
+            let _f = PfFinish { q: &q, certain: j.certain, likely: false, spec_key: Some((j.layer, j.e)) };
         }
         assert!(q.spec_keys_snapshot().is_empty());
         assert_eq!(q.counts()[1], 0.0, "PfFinish released the reader slot");
         // Urgency cap: max_spec 2 but 3 readers -> 2 may run; with 2 readers -> 1.
         let q2 = PfQueue::with_readers(2, 2);
         for e in 0..3 {
-            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() });
+            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, likely: false, t_hint: Instant::now() });
         }
         let _a = q2.pop_mode(true).unwrap();
         let g = q2.inner.lock().unwrap();
@@ -9420,7 +9754,7 @@ mod tests {
     fn prefetch_queue_urgency_routing() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, likely: false, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, true));
         q.push(job(2, false));
