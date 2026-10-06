@@ -54,6 +54,7 @@ production values as of 2026-10-04.
 | `v41/EVTRACE_REBUILD_PLAN.md` | P0, P1, P3 built |
 | `ONTOLOGY_REVIEW_2026-10-04.md` | glossary adopted; renames pending |
 | `v41/HOT_SPLIT_SIM.md` | simulator + its recommendations (`scripts/split_sim`) |
+| `v41/DECODE_IDEAS_SWEEP_2026-10-06.md` | ranked decode levers after two-stream DSpark (hot split > box-2 reply tail > Engram join > dGPU bundle), the step's dependency graph + calibrated pipeline sim (`v41/decode_ideas_2026-10-06/`), 20 refuted ideas, workflow |
 
 ## History
 
