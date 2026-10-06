@@ -39,7 +39,7 @@ use v4flash_kernels::config::{BLOCKS_Q8K_GATE_IN, N_EMBD, N_EXPERT_USED};
 use v4flash_kernels::het::b2_mirror;
 use v4flash_kernels::het::lookahead::{self, Pred};
 use v4flash_kernels::het::remote_experts::{
-    queue_hint_words, serve_connection, Assignment, ExpertShard, MoeExecutor, NurseryCounters, PinCounters,
+    queue_hint_words, serve_connection, Assignment, ExpertShard, MoeExecutor, NurseryCounters, PartialCounters, PinCounters,
     RemoteExpertClient, ServeOptions, SocketOptions, NO_PICK, XQ_BYTES_PER_TOKEN,
 };
 
@@ -282,8 +282,11 @@ fn remote_experts_nursery_loopback() -> eyre::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?.to_string();
     let (tx_ready, rx_ready) = mpsc::channel::<eyre::Result<()>>();
-    // Per connection: the pin counters and the nursery counters + occupied level.
-    let (tx_stats, rx_stats) = mpsc::channel::<(Option<(PinCounters, u32, u32, u32)>, (NurseryCounters, u32), bool)>();
+    // Per connection: the pin counters, the nursery counters + occupied level,
+    // and the two-phase landing stats (`[gate/up, down]` wait ns, partial
+    // counters, partial slots now).
+    #[allow(clippy::type_complexity)]
+    let (tx_stats, rx_stats) = mpsc::channel::<(Option<(PinCounters, u32, u32, u32)>, (NurseryCounters, u32), bool, ([u64; 2], PartialCounters, u32))>();
     let daemon = std::thread::spawn(move || -> eyre::Result<()> {
         let setup = (|| -> eyre::Result<(ExpertShard, MoeExecutor)> {
             let hf = V41HfWeights::open(&dir, None)?;
@@ -305,10 +308,15 @@ fn remote_experts_nursery_loopback() -> eyre::Result<()> {
             }
         };
         let opts = ServeOptions { socket: SocketOptions::default(), verbose: false, log_every: 0, keep_warm_us: 250, re_anchor_every: 512 };
-        for _ in 0..2 {
+        for run in 0..3 {
+            // Run 3: the two-phase landing with gate/up-only hints (design 3.4);
+            // the knobs are live, flipped in-process before the connection.
+            let two_phase = run == 2;
+            v4flash_kernels::het::remote_experts::knobs::LAND_TWO_PHASE.set(if two_phase { "1" } else { "0" });
+            v4flash_kernels::het::remote_experts::knobs::LIKELY_GATEUP_ONLY.set(if two_phase { "1" } else { "0" });
             let (stream, _) = listener.accept()?;
             serve_connection(stream, &mut shard, &mut exec, &opts, None)?;
-            tx_stats.send((shard.pin_counters(), shard.nursery_counters(), shard.nursery_on())).unwrap();
+            tx_stats.send((shard.pin_counters(), shard.nursery_counters(), shard.nursery_on(), shard.two_phase_stats())).unwrap();
         }
         Ok(())
     });
@@ -317,13 +325,18 @@ fn remote_experts_nursery_loopback() -> eyre::Result<()> {
     let stream = gen_stream(0x5eed_0002_b2b2_0002);
     let n_req: usize = stream.iter().map(|s| 2 * s.len()).sum();
     let off = run(&addr, &stream, false)?;
-    let (pins_off, (nc_off, occ_off), nursery_on) = rx_stats.recv()?;
+    let (pins_off, (nc_off, occ_off), nursery_on, _) = rx_stats.recv()?;
     let supported_before = b2_mirror::nursery_supported();
     let on = run(&addr, &stream, true)?;
-    let (pins_on, (nc_on, occ_on), _) = rx_stats.recv()?;
+    let (pins_on, (nc_on, occ_on), _, tp_on) = rx_stats.recv()?;
     let supported_after = b2_mirror::nursery_supported();
+    // Run 3: two-phase landing + gate/up-only hints (design 3.4).
+    let two = run(&addr, &stream, true)?;
+    let (pins_two, (nc_two, _), _, tp_two) = rx_stats.recv()?;
     daemon.join().map_err(|_| eyre!("daemon panicked"))??;
     let _ = tx_done.send(());
+    eprintln!("two-phase: pins {pins_two:?}; nursery {nc_two:?}; partial {:?} waits gate/up {:.1} ms down {:.1} ms; paged {} surprises {}",
+        tp_two.1, tp_two.0[0] as f64 / 1e6, tp_two.0[1] as f64 / 1e6, two.paged, two.surprises);
 
     eprintln!("hints OFF: pins {pins_off:?}; nursery {nc_off:?} occupied {occ_off}; paged {} surprises {}", off.paged, off.surprises);
     eprintln!(
@@ -357,5 +370,18 @@ fn remote_experts_nursery_loopback() -> eyre::Result<()> {
     assert_eq!(budget, 24 - 6 - 6 - NURSERY as u32);
     assert_eq!((on.surprises, off.surprises), (0, 0));
     assert_eq!((c.pinned_evictions, c.revokes), (0, 0), "{c:?}");
+    // Two-phase landing (I1 again): every partial bit-identical to the plain
+    // run; gate/up-only hints landed PARTIAL and were promoted + completed by
+    // the pass; no partial slot left dangling; the pin contract held.
+    assert_eq!(tp_on.1, PartialCounters::default(), "run 2 made no partial entry");
+    let mismatched = off.partials.iter().zip(&two.partials).filter(|(a, b)| a != b).count();
+    assert_eq!(mismatched, 0, "the two-phase landing changed {mismatched} of {n_req} partials (I1)");
+    let pc = tp_two.1;
+    assert!(pc.partial_lands > 10 && pc.partial_promotions > 0, "{pc:?}");
+    assert!(pc.partial_promotions <= pc.partial_lands && pc.completions + pc.partial_evicted <= pc.partial_lands, "{pc:?}");
+    assert_eq!(two.surprises, 0);
+    let c2 = pins_two.ok_or_else(|| eyre!("pinning never turned on"))?.0;
+    assert_eq!((c2.pinned_evictions, c2.revokes), (0, 0), "{c2:?}");
+    assert!(tp_two.0[1] > 0, "the down phase ran (its wait is accounted)");
     Ok(())
 }

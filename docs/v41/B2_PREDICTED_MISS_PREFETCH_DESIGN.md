@@ -194,6 +194,37 @@ pinned"; `residency_words` 4841-4858 = `remap_hosts != 0`.
   resident is not re-read; promotion is a decode landing (no restore stamp). Nothing a hint does touches
   the TinyLFU watermark, `released_unused`, or a pin until the pick itself pins it.
 
+3.4 **Two-phase landing + gate/up-only hints (owner 10-06 ~1:40 PM PDT: "what if we just prefetched
+gate/up? could we finish down while waiting for gate/up compute?"). BUILT as a slice-C extension behind
+daemon knobs `land_two_phase` (default 0) and `likely_gateup_only` (default 0).** Scoped against the
+daemon: an expert's three roles are three SEPARATE per-role device buffers (`routed.gate / up / down`,
+stride `bpe[i]` per slot: 6.3 MB each, 18.8 MB in all), read concurrently one thread per role
+(`read_miss_into`; the 2-pread coalesced span is primary-only and off in production) and permuted per role
+on the repack stream (`repack_in_place`), so (i) a slot with gate/up landed and down pending is a natural
+PARTIAL state (`ShardPool::partial`), (ii) the gate/up kernels (`pair_kwide`) never touch the down region a
+later landing writes, and the down landing goes through the repack stream + a host sync before the down
+kernel (`q2k_down`) is queued -- no SDMA/kernel race, (iii) the land was awaited whole inside pass B's
+`ensure_layer_phased`. Mechanics: `EnsurePhase::{Full, GateUp, Down}` on `ensure`; pass B under
+`land_two_phase` = `ensure(GateUp)` (misses read w1/w3 only, commit, PARTIAL) -> builder + gate/up + q8k
+queued (`batched_pass_gateup`) -> `ensure(Down)` (the host reads w2 while the GPU runs gate/up) ->
+`batched_pass_down`. A PARTIAL slot is resident for `is_resident_pool` (no early certain read: the pass
+reads its down first thing), NOT resident for `resident_mask` (pass A never runs on it), masked from
+`residency_words` / `soft_words` / `PinBook::report` (never held, never pinned), PAGED for the reply
+(honest: it needs a read), completed by the down landing, cleared by any eviction. LIKELY reads under
+`likely_gateup_only` fetch gate/up only (12.5 MB, hint bytes -33%) and land PARTIAL nursery entries; on
+use the relabel keeps the partial state and the pass's Down phase (or a Full `ensure`, if two-phase is
+off: then on the critical path) reads the down; a recycled unused entry cost 2/3 of a read. The hub mirror
+sees a partial entry only as nursery-covered (dedup). Counters: `b2_req` `partial_lands`,
+`partial_promotions`, `partial_slots`, `gateup_wait_us`, `down_wait_us`; invariants (tests): a partial
+slot is never pinned / held / in a map, `partial_promotions <= partial_lands`, `completions +
+partial_evicted <= partial_lands`, a pass never runs on a partial slot (the sim's `ensure` completes it).
+PRICE (+-15%, the section-4 model): per hinted miss the exposure drops from ~2.2 - lead 1.7 + queueing to
+~max(0, 0.75 - gate/up compute ~0.5) ~ 0.25 ms; per UNHINTED miss from ~2.2 to ~1.75 ms (gate/up 1.5 +
+residual down 0.25) -- the latter applies to every paged read, hinted or not, so it is the larger lever
+at ~4 paged replies/step. Not covered: the decode (non-batched) chain and single-pass batched passes use
+`Full` (a partial slot wanted there is completed synchronously); `coalesce=1` falls back to per-role
+reads for partial reads.
+
 3.3 **Interim (b), hub-only.** Hints as plain PREFETCH words down 3.1's path, with the per-step budget
 (2.4) keeping the readers idle for them and the sets free. Keeps the gate/drop/pin defects in weakened
 form; live only as the fallback (section 8).

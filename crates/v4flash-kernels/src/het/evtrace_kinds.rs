@@ -320,6 +320,12 @@ pub static B2_REQ: Kind = Kind {
         // level after it. Per step: `lands = hits + recycled + delta(occupied)`.
         "pf_run_likely", "pf_q_likely", "n_likely_words",
         "nursery_lands", "nursery_hits", "nursery_recycled", "nursery_drops", "nursery_shrunk", "nursery_occupied",
+        // TWO-PHASE LANDING (design 3.4, `land_two_phase` / `likely_gateup_only`):
+        // gate/up-only landings and their promotions across the request, the
+        // PARTIAL slots after it, and the us the request's `ensure` phases
+        // waited on the gate/up reads and on the down reads (under two-phase
+        // the down wait overlaps the gate/up kernels).
+        "partial_lands", "partial_promotions", "partial_slots", "gateup_wait_us", "down_wait_us",
     ],
 };
 
