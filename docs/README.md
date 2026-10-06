@@ -15,8 +15,10 @@ dated journals; this page says which ones describe the system as it is.
   hot set), box 2 the rest.
 - **Serving:** the multistream arena (8 slots, prefill/decode bursts, one or two
   lanes per step), arena DSpark (speculative decoding while at most
-  `V41_MS_DSPARK_STREAMS` streams are live), snapshot / prefix restore, vision
-  (`v41/VISION_PORT.md`), OpenAI-compatible API.
+  `V41_MS_DSPARK_STREAMS` streams are live; two since 2026-10-06), arena stage
+  graphs keyed by (stage, rows), snapshot / prefix restore, vision
+  (`v41/VISION_PORT.md`), OpenAI-compatible API, and `/v1/embeddings` through the
+  embed phase (Qwen3-Embedding-4B on the dGPU, `--embed-gguf`).
 - **Dropped:** V4-Flash / GGUF (2026-09-24). Its code is still in the tree until
   the removal branch merges; its docs are history.
 - **Laguna** support lives beside it (`laguna/`), CLI only.
@@ -43,7 +45,9 @@ production values as of 2026-10-04.
 
 | doc | state (2026-10-04) |
 |---|---|
-| `v41/MS_DSPARK_STREAMS_DESIGN.md` | built and deployed; `V41_MS_DSPARK_STREAMS` = 1 live |
+| `v41/MS_DSPARK_STREAMS_DESIGN.md` | built; two speculating streams live since 2026-10-06, default 2 (b5def35) |
+| `v41/GRAPH_KEYS_DESIGN.md` | built; `V41_MS_GRAPH_KEYS=stage_b` live since 2026-10-05, default since b5def35 |
+| `v41/EMBED_PHASE_DESIGN.md` | built; embed phase deployed 2026-10-05 |
 | `v41/DSPARK_ARENA_PLAN.md` | built: the live DSpark path |
 | `v41/MULTISTREAM_DECODE_PLAN.md` | M1 built; later milestones open or replaced |
 | `v41/KV_PREFIX_STORE_DESIGN.md` | approved design; M1 code on branch `worktree-kv-prefix-store` |

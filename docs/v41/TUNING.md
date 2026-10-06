@@ -19,6 +19,13 @@ env's 0.25). Box 2's environment is not captured here; its 10-03 launch line is
 in §3. Only knobs whose production value differs from the code default, plus the
 ones that define the topology:
 
+**Since the snapshot (re-read 2026-10-06):** b5def35 made `V41_MS_DSPARK_STREAMS=2`
+and `V41_MS_GRAPH_KEYS=stage_b` the code defaults after the production A/Bs, and
+the live knob file sets both (two speculating streams since 2026-10-06 01:39 UTC;
+stage-keyed graphs since 2026-10-05 21:41 UTC, `GRAPH_KEYS_DESIGN.md`). The hub
+also loads the embed phase (`--embed-gguf`, Qwen3-Embedding-4B Q8_0;
+`/v1/embeddings`, `EMBED_PHASE_DESIGN.md`).
+
 | knob | code default | production | what it does |
 |---|---|---|---|
 | `V41_PAGED_EXPERTS` | 0 | 1 | LRU-paged routed experts (the only supported V4.1 mode) |
@@ -45,7 +52,8 @@ ones that define the topology:
 | `V41_MS_PIPELINE_MIN_ROWS` | 6 | 4 | two lanes from this many rows |
 | `V41_MS_LANES_LEARNED` | off | 1 | pick one or two lanes per row count from live cost cells |
 | `V41_MS_DSPARK` | off | accept | arena DSpark |
-| `V41_MS_DSPARK_STREAMS` | 1 | 1 | streams that may speculate at once (max 2; `MS_DSPARK_STREAMS_DESIGN.md`) |
+| `V41_MS_DSPARK_STREAMS` | 2 (since b5def35; was 1) | 2 (knob file, since 2026-10-06) | streams that may speculate at once (max 2; `MS_DSPARK_STREAMS_DESIGN.md`) |
+| `V41_MS_GRAPH_KEYS` | stage_b (since b5def35; was legacy) | stage_b (knob file) | arena stage graphs keyed by (stage, rows) (`GRAPH_KEYS_DESIGN.md`) |
 | `V41_MS_DSPARK_RING` | all | solo | drafter ring writes only while speculation is possible |
 | `V41_MS_DSPARK_DRAFT_MS` / `_COST` | 20 / unset | 12 / 8-point one-lane ladder (ms for 1..8 rows) | starting estimates for the live cost cells (`_COST_LIVE`, default on) |
 | `V41_MTP_MOE_GROUPED` / `V41_MTP_EXPERT_STATS` | 0 / 0 | 1 / 1 | drafter MoE grouping / stats |

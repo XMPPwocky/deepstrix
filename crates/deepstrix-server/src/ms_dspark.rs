@@ -1,6 +1,7 @@
 //! DSpark on the multistream arena (docs/v41/DSPARK_ARENA_PLAN.md): while at
-//! most `V41_MS_DSPARK_STREAMS` streams are live (default 1 = a lone stream;
-//! 2 per docs/v41/MS_DSPARK_STREAMS_DESIGN.md), each verifies the drafter's
+//! most `V41_MS_DSPARK_STREAMS` streams are live (default 2 since b5def35, per
+//! docs/v41/MS_DSPARK_STREAMS_DESIGN.md; 1 = a lone stream only), each verifies
+//! the drafter's
 //! block in the SAME arena step as its next token (rows `[next, d_0 ..
 //! d_{K-1}]`, `KvArena::tables`), rejection-samples the rows against the drafts
 //! (`spec_sample::verify_block`: min(1, p/q) tests against the sampled draft

@@ -22,7 +22,8 @@ BUILD noted in section 9 (1ddedf3, 24df0e9), all on main:
   it engages only with `V41_MS_STAGGER=2` (production) and `V41_MS_SPEC_LANES` on; learned lane
   counts (268b48b, `V41_MS_LANES_LEARNED`);
 * **two speculating streams** in one step on the per-row dependency abstraction `StepRows`
-  (4c139ae, `V41_MS_DSPARK_STREAMS`, MS_DSPARK_STREAMS_DESIGN.md; default 1).
+  (4c139ae, `V41_MS_DSPARK_STREAMS`, MS_DSPARK_STREAMS_DESIGN.md; default 2 since b5def35,
+  live in production since 2026-10-06 01:39 UTC).
 
 Not built: the batched multi-stream drafter (two streams draft serially), ring in snapshots,
 shadow mode, online confidence calibration applied to K, M2.5, M8; G-RS3 as specified here (the
@@ -560,7 +561,7 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
 |---|---|---|---|
 | `V41_MULTISTREAM` | off | `1` | the arena scheduler; `V41_MS_DSPARK` does nothing without it |
 | `V41_MS_DSPARK` | `off` (`0`/`off`, `accept`/`1`/`on`) | `accept` | DSpark on the arena; loads the drafter |
-| `V41_MS_DSPARK_STREAMS` | 1 (1..=2), live | 1 | speculate while at most this many streams are live |
+| `V41_MS_DSPARK_STREAMS` | 2 (1..=2; since b5def35, was 1), live | 2 (knob file) | speculate while at most this many streams are live |
 | `V41_MS_DSPARK_DRAFTS` | `sampled` | | `argmax` = point-mass drafts for every request |
 | `V41_MS_DSPARK_RING` | `all` | `solo` | `all`: every live stream's kept rows are ring-written each step; `solo`: only while the live-stream count is within the speculation limit (`ms_dspark::ring_streams`: 1, or 2 once `V41_MS_DSPARK_STREAMS` has been above 1) |
 | `V41_MS_DSPARK_RING_ASYNC` | on | | kept-row ring writes without a sync |
