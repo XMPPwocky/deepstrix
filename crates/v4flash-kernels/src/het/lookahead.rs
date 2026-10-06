@@ -15,10 +15,15 @@
 //!   how often a hinted expert is in the router's OWN picks one lane-layer
 //!   later (`dry_hits`).
 //!
-//! SLICE A (design 8.A): hub-only. No word reaches box 2: `dry` (and, until
-//! slice B, `k1`/`k2`) launch the look-ahead, filter, queue and count. The
-//! only behaviour it adds is the look-ahead launches and host bookkeeping
-//! (I1/I2, section 7): nothing here touches a pick, a weight or a kernel input.
+//! SLICE A (design 8.A): hub-only. `dry` launches the look-ahead, filters,
+//! queues and counts; no word reaches box 2. SLICE B (8.B): under `k1`/`k2`
+//! the queued words go on the wire as `REQ_FLAG_LIKELY` words ahead of
+//! admissions and restores -- once box 2 has answered `RESP_FLAG_NURSERY`
+//! (`Mode::wire`; `b2_mirror::nursery_supported`), under the per-step budget,
+//! the surplus re-queued, the absolute abort bars (`Bars`) turning the rest of
+//! a step dry. The only behaviour either adds is the look-ahead launches and
+//! host bookkeeping (I1/I2, section 7): nothing here touches a pick, a weight
+//! or a kernel input, and the mirror's NURSERY bits never feed the prior.
 //!
 //! The knobs are read ONCE per decode step (`begin_step`) into a plain `Cfg`
 //! that the lane-layers copy -- never on the lane path (KNOB_AUDIT, "getenv on
@@ -30,7 +35,7 @@
 
 use crate::config::{N_EXPERT, N_LAYER};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 const NE: usize = N_EXPERT as usize;
 const LAYERS: usize = N_LAYER as usize;
@@ -73,12 +78,18 @@ impl Mode {
         self == Mode::K2
     }
 
-    /// May the queued words go on the wire? SLICE B: `k1` / `k2` AND the
-    /// daemon has answered `RESP_FLAG_NURSERY` (design 3.2, "capability = a
-    /// RESP flag": an echoed request bit proves nothing). Slice A: never.
-    #[allow(clippy::unused_self)]
+    /// `k1` / `k2`: the hub ASKS for the nursery (`REQ_FLAG_LIKELY` on every
+    /// decode request, words or none -- the capability probe).
+    pub fn asks(self) -> bool {
+        matches!(self, Mode::K1 | Mode::K2)
+    }
+
+    /// May the queued words go on the wire? `k1` / `k2` AND the daemon has
+    /// answered `RESP_FLAG_NURSERY` (design 3.2, "capability = a RESP flag":
+    /// an echoed request bit proves nothing; `b2_mirror::nursery_supported`).
+    /// Until then (and under `dry`) the words are counted and dropped.
     pub fn wire(self) -> bool {
-        false
+        self.asks() && super::b2_mirror::nursery_supported()
     }
 }
 
@@ -95,31 +106,68 @@ pub struct Cfg {
     /// `V41_B2_SPEC_BUDGET`: speculative words per step; 0 = legacy caps.
     pub spec_budget: u16,
     pub step: u32,
+    /// The step's decode rows (`begin_step`).
+    pub rows: u16,
+    /// The per-step abort bar on hint words, RESOLVED: the knob, or its
+    /// rows-aware default `10 + 5 * max(0, rows - 4)` (design 5).
+    pub max_words_step: u16,
+    /// `V41_B2_MISS_PREFETCH_MAX_PER_LL_X10`: the per-lane-layer bar x10.
+    pub per_ll_x10: u8,
+    /// `V41_B2_NURSERY_PRIOR`: mark sent hints INCOMING when R >= 2.
+    pub nursery_prior: bool,
+    /// `V41_B2_MISS_PREFETCH_MARGIN` x1000 (0 = no filter).
+    pub margin_x1000: u16,
 }
 
 impl Cfg {
-    fn pack(self) -> u64 {
-        (self.mode as u64) | (u64::from(self.rank) << 4) | (u64::from(self.cap) << 8) | (u64::from(self.spec_budget) << 16) | (u64::from(self.step) << 32)
+    fn pack(self) -> (u64, u64) {
+        (
+            (self.mode as u64) | (u64::from(self.rank) << 4) | (u64::from(self.cap) << 8) | (u64::from(self.spec_budget) << 16) | (u64::from(self.step) << 32),
+            u64::from(self.rows)
+                | (u64::from(self.max_words_step) << 16)
+                | (u64::from(self.per_ll_x10) << 32)
+                | (u64::from(self.nursery_prior) << 40)
+                | (u64::from(self.margin_x1000) << 41),
+        )
     }
 
-    fn unpack(v: u64) -> Cfg {
+    fn unpack(v: u64, w: u64) -> Cfg {
         Cfg {
             mode: Mode::from_knob((v & 0xf) as usize),
             rank: ((v >> 4) & 0xf) as u8,
             cap: ((v >> 8) & 0xff) as u8,
             spec_budget: ((v >> 16) & 0xffff) as u16,
             step: (v >> 32) as u32,
+            rows: (w & 0xffff) as u16,
+            max_words_step: ((w >> 16) & 0xffff) as u16,
+            per_ll_x10: ((w >> 32) & 0xff) as u8,
+            nursery_prior: (w >> 40) & 1 == 1,
+            margin_x1000: ((w >> 41) & 0xffff) as u16,
         }
+    }
+
+    /// The margin threshold (`V41_B2_MISS_PREFETCH_MARGIN`).
+    pub fn margin(self) -> f32 {
+        f32::from(self.margin_x1000) / 1000.0
     }
 }
 
-/// The current step's `Cfg`, packed (one relaxed load per read).
+/// The rows-aware default of the per-step abort bar (design 5): 10 at `<= 4`
+/// rows, +5 per row beyond.
+pub fn default_max_words_step(rows: usize) -> u16 {
+    (10 + 5 * rows.saturating_sub(4)).min(u16::MAX as usize) as u16
+}
+
+/// The current step's `Cfg`, packed (two relaxed loads per read; the two
+/// words are written together under `begin_step`, read on the lane path where
+/// a torn read between them is harmless -- the second word is per-step
+/// policy a lane-layer late is fine with).
 static CFG: AtomicU64 = AtomicU64::new(0);
-static WARNED_SLICE_B: AtomicBool = AtomicBool::new(false);
+static CFG2: AtomicU64 = AtomicU64::new(0);
 
 /// The step's knob snapshot (`begin_step`); the defaults before any step.
 pub fn cfg() -> Cfg {
-    Cfg::unpack(CFG.load(Relaxed))
+    Cfg::unpack(CFG.load(Relaxed), CFG2.load(Relaxed))
 }
 
 /// Anything to count this step (the `hub_lh2` record is emitted iff so).
@@ -129,25 +177,94 @@ pub fn active() -> bool {
 }
 
 /// A decode step begins (right after `b2_mirror::begin_step`, which advanced
-/// `step`): read the four knobs through the framework into this step's
-/// `Cfg`, drop the hint queue's earlier-step words, clear its dedup set and
-/// reset the speculative budget.
-pub fn begin_step(step: u32) {
+/// `step`) with `rows` decode rows: read the knobs through the framework into
+/// this step's `Cfg`, drop the hint queue's earlier-step words, clear its
+/// dedup / sent sets, reset the speculative budget and the abort bars.
+pub fn begin_step(step: u32, rows: usize) {
     let k = &crate::knobs::B2_MISS_PREFETCH;
+    let bar = crate::knobs::B2_MISS_PREFETCH_MAX_WORDS_STEP.get();
     let c = Cfg {
         mode: Mode::from_knob(k.pick()),
         rank: crate::knobs::B2_MISS_PREFETCH_RANK.get() as u8,
         cap: crate::knobs::B2_MISS_PREFETCH_CAP.get() as u8,
         spec_budget: crate::knobs::B2_SPEC_BUDGET.get() as u16,
         step,
+        rows: rows.min(u16::MAX as usize) as u16,
+        max_words_step: if bar == 0 { default_max_words_step(rows) } else { bar.min(u64::from(u16::MAX)) as u16 },
+        per_ll_x10: crate::knobs::B2_MISS_PREFETCH_MAX_PER_LL_X10.get() as u8,
+        nursery_prior: crate::knobs::B2_NURSERY_PRIOR.on(),
+        margin_x1000: (crate::knobs::B2_MISS_PREFETCH_MARGIN.f64() * 1000.0).round().clamp(0.0, 1000.0) as u16,
     };
-    CFG.store(c.pack(), Relaxed);
-    if matches!(c.mode, Mode::K1 | Mode::K2) && !WARNED_SLICE_B.swap(true, Relaxed) {
-        tracing::warn!(knob = k.name, value = %k.show(), "predicted-miss prefetch: slice B (hints on the wire) is not built; behaving as `dry`");
-    }
+    let (v, w) = c.pack();
+    CFG.store(v, Relaxed);
+    CFG2.store(w, Relaxed);
     let stale = super::remote_experts::hint_queue_begin_step(step);
     bump(Stat::Stale, u64::from(stale));
     BUDGET.lock().unwrap_or_else(|p| p.into_inner()).reset(u32::from(c.spec_budget));
+    BARS.lock().unwrap_or_else(|p| p.into_inner()).reset();
+}
+
+// ---- the absolute abort bars (design 5) ----
+
+/// Per step: hint words sent, lane-layers routed, and whether a bar tripped
+/// (the rest of the step is dry). A bound must not read a runtime estimate:
+/// both bars are knobs or fixed defaults (`Cfg::max_words_step`,
+/// `Cfg::per_ll_x10`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bars {
+    pub sent: u32,
+    pub lane_layers: u32,
+    pub tripped: bool,
+}
+
+/// Lane-layers a step must have routed before the per-lane-layer bar is
+/// judged (the first lane-layer alone may send the cap).
+pub const PER_LL_MIN_LANE_LAYERS: u32 = 8;
+
+impl Bars {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A lane-layer routed (one `classify` of layer L+1).
+    pub fn note_lane_layer(&mut self) {
+        self.lane_layers += 1;
+    }
+
+    /// `n` hint words are about to go: how many the bars allow. Tripped (the
+    /// step total would pass `max_words_step`, or the per-lane-layer rate
+    /// `per_ll_x10 / 10` once `PER_LL_MIN_LANE_LAYERS` have routed), nothing
+    /// goes for the rest of the step; returns `(allowed, tripped now)`.
+    pub fn allow(&mut self, n: usize, max_words_step: u16, per_ll_x10: u8) -> (usize, bool) {
+        if self.tripped || n == 0 {
+            return (0, false);
+        }
+        let total = self.sent + n as u32;
+        let over_step = total > u32::from(max_words_step);
+        let over_ll = self.lane_layers >= PER_LL_MIN_LANE_LAYERS && total * 10 > u32::from(per_ll_x10) * self.lane_layers;
+        if over_step || over_ll {
+            self.tripped = true;
+            return (0, true);
+        }
+        self.sent = total;
+        (n, false)
+    }
+}
+
+static BARS: std::sync::Mutex<Bars> = std::sync::Mutex::new(Bars { sent: 0, lane_layers: 0, tripped: false });
+
+/// A lane-layer routed this step (`Bars::note_lane_layer`).
+pub fn note_lane_layer() {
+    BARS.lock().unwrap_or_else(|p| p.into_inner()).note_lane_layer();
+}
+
+/// `Bars::allow` on this step's bars with this step's `Cfg`; a trip bumps
+/// `lh2_bar_trips`.
+pub fn bars_allow(n: usize) -> usize {
+    let c = cfg();
+    let (ok, tripped) = BARS.lock().unwrap_or_else(|p| p.into_inner()).allow(n, c.max_words_step, c.per_ll_x10);
+    bump(Stat::BarTrips, u64::from(tripped));
+    ok
 }
 
 /// Does the look-ahead router of layer L+1 run (`look_next`), and L+2's
@@ -171,7 +288,7 @@ pub fn legacy_words(mode: Mode, legacy_env: bool, hints_ok: bool) -> bool {
 // ---- the filter (design 2.2) ----
 
 /// One distinct predicted pick of a look-ahead router, box 2's share.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Pred {
     pub e: u16,
     /// Best rank over the rows, 1 = the router's first pick.
@@ -182,11 +299,37 @@ pub struct Pred {
     /// (review round 1, finding 5). `None` from `lookup` (box 2 has not
     /// reported the layer) counts as resident: nothing is known to be missing.
     pub nonres: bool,
+    /// Slice A amendment (10-06): the normalized gate MARGIN of a predicted
+    /// rank-1 pick over the row's predicted rank 2, `(w1 - w2) / sum(row)`
+    /// from the look-ahead's weights (`classify_w`), the largest over the rows
+    /// where it is rank 1. NaN = unknown (no weights packed, or not rank 1):
+    /// passes any threshold, counts in no margin bucket.
+    pub margin: f32,
+}
+
+impl PartialEq for Pred {
+    fn eq(&self, o: &Self) -> bool {
+        self.e == o.e && self.rank == o.rank && self.nonres == o.nonres && self.margin.to_bits() == o.margin.to_bits()
+    }
+}
+
+impl Eq for Pred {}
+
+impl Pred {
+    /// Does the margin filter pass this prediction? Only rank 1 is judged
+    /// (`V41_B2_MISS_PREFETCH_MARGIN`); an unknown margin passes.
+    pub fn margin_ok(&self, thr: f32) -> bool {
+        self.rank != 1 || thr <= 0.0 || !(self.margin < thr)
+    }
 }
 
 /// Ranks the filter and the counters care about (R `<= 3`, design 5): a
 /// prediction of a lower rank is neither counted nor hinted.
 pub const MAX_RANK: u8 = 3;
+
+/// The dry run's margin buckets (`lh2_nonres_m{k}`, `lh2_hits_prot_m{k}`):
+/// a rank-1 prediction with margin `>= MARGIN_BUCKETS[k]` counts in bucket k.
+pub const MARGIN_BUCKETS: [f32; 4] = [0.0, 0.1, 0.2, 0.3];
 
 /// Per-lane host state of the filter (`BatchDgpuScratch::lh2`), reused across
 /// the lane's layers: the Route path allocates nothing after the first use
@@ -197,21 +340,26 @@ pub const MAX_RANK: u8 = 3;
 pub struct LaneState {
     /// Per expert during `classify`: 0 unseen, 1..=3 best rank, 255 box 1's.
     best: Vec<u8>,
-    /// Per expert during `dry_hits`: in the own picks.
-    seen: Vec<bool>,
+    /// Per expert during `classify_w`: the best margin as a rank-1 pick.
+    marg: Vec<f32>,
+    /// Per expert during `dry_hits`: best ACTUAL rank in the own picks (0 = absent).
+    seen: Vec<u8>,
     /// The last `classify`.
     pub preds: Vec<Pred>,
     /// What this lane predicted for `pending` `(layer, step)`: the non-resident
     /// predictions only (`set_pending`); `None` = nothing pending.
     pub pending: Option<(i32, u32)>,
     pub pending_preds: Vec<Pred>,
+    /// The router's `n_used` (the own picks' row width, for the actual rank).
+    pub pending_n_used: usize,
 }
 
 impl LaneState {
     fn ensure(&mut self) {
         if self.best.len() != NE {
             self.best = vec![0; NE];
-            self.seen = vec![false; NE];
+            self.marg = vec![f32::NAN; NE];
+            self.seen = vec![0; NE];
         }
     }
 
@@ -220,14 +368,23 @@ impl LaneState {
     /// first appearance (a 3-bucket scan, no sort). `look` is `[rows][n_used]`
     /// in the router's descending selection order (rank r is column r-1), as
     /// `forward_prefill` unpacks `sd.look_sel`; ids outside `0..N_EXPERT`
-    /// (NO_PICK, padding) are skipped.
+    /// (NO_PICK, padding) are skipped. Margins unknown (`classify_w`).
     pub fn classify(&mut self, look: &[i32], n_used: usize, is_box2: impl Fn(u32) -> bool, nonres: impl Fn(u32) -> bool) {
+        self.classify_w(look, &[], n_used, is_box2, nonres)
+    }
+
+    /// `classify` with the look-ahead's gate weights `look_w` (`[rows][n_used]`
+    /// like `look`, rank order, normalized to the row's top-k sum; empty = no
+    /// weights): each rank-1 prediction's `margin` is the largest `(w1 - w2) /
+    /// sum(row)` over the rows where it is rank 1 (slice A amendment).
+    pub fn classify_w(&mut self, look: &[i32], look_w: &[f32], n_used: usize, is_box2: impl Fn(u32) -> bool, nonres: impl Fn(u32) -> bool) {
         self.ensure();
         self.preds.clear();
         if n_used == 0 {
             return;
         }
         let valid = |sv: i32| (0..N_EXPERT as i32).contains(&sv);
+        let weights = look_w.len() == look.len() && n_used >= 2;
         for (i, &sv) in look.iter().enumerate() {
             if !valid(sv) {
                 continue;
@@ -239,6 +396,14 @@ impl LaneState {
             } else if rank < self.best[e] as usize {
                 self.best[e] = rank as u8;
             }
+            if weights && rank == 1 {
+                let row = &look_w[i..i + n_used];
+                let sum: f32 = row.iter().filter(|w| w.is_finite()).sum();
+                let m = if sum > 0.0 { ((row[0] - row[1]) / sum).clamp(0.0, 1.0) } else { 0.0 };
+                if self.marg[e].is_nan() || m > self.marg[e] {
+                    self.marg[e] = m;
+                }
+            }
         }
         // Bucket by rank; within a bucket, first appearance. Emitting an expert
         // flips its mark to 255, so it comes out once and the slice walk below
@@ -247,13 +412,15 @@ impl LaneState {
             for &sv in look {
                 if valid(sv) && self.best[sv as usize] == rank {
                     self.best[sv as usize] = 255;
-                    self.preds.push(Pred { e: sv as u16, rank, nonres: nonres(sv as u32) });
+                    let margin = if rank == 1 { self.marg[sv as usize] } else { f32::NAN };
+                    self.preds.push(Pred { e: sv as u16, rank, nonres: nonres(sv as u32), margin });
                 }
             }
         }
         for &sv in look {
             if valid(sv) {
                 self.best[sv as usize] = 0;
+                self.marg[sv as usize] = f32::NAN;
             }
         }
     }
@@ -264,38 +431,89 @@ impl LaneState {
         self.pending_preds.clear();
         self.pending_preds.extend(self.preds.iter().filter(|p| p.nonres));
         self.pending = Some((layer, step));
+        if self.pending_n_used == 0 {
+            self.pending_n_used = crate::config::N_EXPERT_USED;
+        }
     }
 
     /// Layer `layer` of step `step` has routed on this lane: is the pending
-    /// prediction its (same lane, next layer, same step)? Either way nothing
-    /// stays pending: a mismatch (a new step at layer 0, a hash-router layer
-    /// with no look-ahead in between) is dropped without a count, on purpose.
+    /// prediction its (same lane, next layer, same step)? A mismatch (a new
+    /// step at layer 0, a hash-router layer with no look-ahead in between) is
+    /// dropped without a count, on purpose. On a match `pending` stays set
+    /// for `dry_hits_demanded`'s target layer; the next `set_pending` or
+    /// `take_pending` replaces it.
     pub fn take_pending(&mut self, layer: i32, step: u32) -> bool {
-        self.pending.take() == Some((layer, step))
+        if self.pending == Some((layer, step)) {
+            true
+        } else {
+            self.pending = None;
+            false
+        }
     }
 
     /// `dry_hits` of the pending prediction against the own picks `own`.
     pub fn dry_hits(&mut self, own: &[i32]) -> [u32; 3] {
+        self.dry_hits_demanded(own, |_| false, 0).hits
+    }
+
+    /// The dry match of the pending prediction against the own picks `own`
+    /// (`[rows][n_used]`, rank order: column r-1 is actual rank r): per R the
+    /// non-resident predictions of rank `<= R` in the own picks at ANY rank
+    /// (`hits`) and at ACTUAL rank `<= protect` (`hits_prot`: `V41_SUB_PROTECT`,
+    /// the picks the prior cannot swap away -- what a hint can hide; slice A
+    /// amendment); the protected hits among the rank-1 predictions per margin
+    /// bucket (`hits_prot_m`); and (slice B) the ones SENT as hints this step
+    /// (`sent(word)`: `demanded`, `demanded_prot` = at a protected actual rank).
+    pub fn dry_hits_demanded(&mut self, own: &[i32], sent: impl Fn(u32) -> bool, protect: u32) -> DryHits {
         self.ensure();
         let valid = |sv: i32| (0..N_EXPERT as i32).contains(&sv);
-        for &sv in own {
+        let n_used = self.pending_n_used.max(1);
+        for (i, &sv) in own.iter().enumerate() {
             if valid(sv) {
-                self.seen[sv as usize] = true;
+                let r = ((i % n_used) + 1).min(255) as u8;
+                let s = &mut self.seen[sv as usize];
+                if *s == 0 || r < *s {
+                    *s = r;
+                }
             }
         }
-        let mut hits = [0u32; 3];
-        for p in self.pending_preds.iter().filter(|p| p.nonres && p.rank >= 1 && p.rank <= MAX_RANK && self.seen[p.e as usize]) {
+        let mut d = DryHits::default();
+        let target = self.pending.map_or(0, |(l, _)| l);
+        for p in self.pending_preds.iter().filter(|p| p.nonres && p.rank >= 1 && p.rank <= MAX_RANK && self.seen[p.e as usize] != 0) {
+            let prot = u32::from(self.seen[p.e as usize]) <= protect;
             for r in p.rank as usize..=3 {
-                hits[r - 1] += 1;
+                d.hits[r - 1] += 1;
+                d.hits_prot[r - 1] += u32::from(prot);
+            }
+            if p.rank == 1 && prot {
+                for (k, &b) in MARGIN_BUCKETS.iter().enumerate() {
+                    d.hits_prot_m[k] += u32::from(p.margin >= b);
+                }
+            }
+            if sent(word(target, p.e)) {
+                d.demanded += 1;
+                d.demanded_prot += u32::from(prot);
             }
         }
         for &sv in own {
             if valid(sv) {
-                self.seen[sv as usize] = false;
+                self.seen[sv as usize] = 0;
             }
         }
-        hits
+        d
     }
+}
+
+/// `LaneState::dry_hits_demanded`'s counts (`lh2_dry_hits_rN`,
+/// `lh2_dry_hits_prot_rN`, `lh2_hits_prot_m{k}`, `lh2_demanded`,
+/// `lh2_demanded_prot`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DryHits {
+    pub hits: [u32; 3],
+    pub hits_prot: [u32; 3],
+    pub hits_prot_m: [u32; 4],
+    pub demanded: u32,
+    pub demanded_prot: u32,
 }
 
 /// `LaneState::classify` on a fresh state (tests, tools).
@@ -318,9 +536,17 @@ pub fn word(layer: i32, e: u16) -> u32 {
 /// at any rank: a protected or gap-blocked pick is read anyway, and
 /// `admit_passes` refuses 22 of 26 candidates/step at r4 (round 1, finding 2).
 pub fn hint_words(preds: &[Pred], target: i32, rank: u8, cap: usize, already: impl Fn(u32) -> bool) -> (Vec<u32>, u32) {
+    hint_words_m(preds, target, rank, cap, 0.0, already)
+}
+
+/// `hint_words` under the MARGIN filter (slice A amendment): a rank-1
+/// prediction whose margin is below `margin` is not hinted (not counted as
+/// dropped either: it is the filter's job); `margin <= 0` or an unknown margin
+/// filters nothing.
+pub fn hint_words_m(preds: &[Pred], target: i32, rank: u8, cap: usize, margin: f32, already: impl Fn(u32) -> bool) -> (Vec<u32>, u32) {
     let mut out = Vec::with_capacity(cap.min(16));
     let mut dropped = 0u32;
-    for p in preds.iter().filter(|p| p.nonres && p.rank <= rank) {
+    for p in preds.iter().filter(|p| p.nonres && p.rank <= rank && p.margin_ok(margin)) {
         let w = word(target, p.e);
         if already(w) {
             continue;
@@ -345,6 +571,18 @@ pub fn count(preds: &[Pred]) -> ([u32; 3], [u32; 3]) {
         }
     }
     (cand, nonres)
+}
+
+/// Per margin bucket: the non-resident rank-1 predictions with margin `>=
+/// MARGIN_BUCKETS[k]` (`lh2_nonres_m{k}`; an unknown margin counts nowhere).
+pub fn count_margin(preds: &[Pred]) -> [u32; 4] {
+    let mut m = [0u32; 4];
+    for p in preds.iter().filter(|p| p.nonres && p.rank == 1) {
+        for (k, &b) in MARGIN_BUCKETS.iter().enumerate() {
+            m[k] += u32::from(p.margin >= b);
+        }
+    }
+    m
 }
 
 /// The pending layer has routed: per R in 1..=3, how many of the non-resident
@@ -375,19 +613,22 @@ pub const HINT_QUEUE_MAX: usize = 1024;
 /// earlier step or names a layer `<=` the carrying request's (round 1,
 /// finding 9: a word queued late in step s and drained by step s+1's layer-0
 /// request is 35 layers stale). `hinted` remembers this step's words, queued
-/// or already handed out, for the filter's dedup.
+/// or already handed out, for the filter's dedup; `sent` the ones that went
+/// on the wire (`lh2_demanded`, `lh2_paged_hinted`).
 #[derive(Debug, Default)]
 pub struct HintQueue {
     /// `(word, step)`, oldest first.
     words: VecDeque<(u32, u32)>,
     /// Bit `(layer, e)`: hinted this step.
     hinted: Vec<u64>,
+    /// Bit `(layer, e)`: on the wire this step (`mark_sent`).
+    sent: Vec<u64>,
     step: u32,
 }
 
 impl HintQueue {
     pub fn new() -> Self {
-        Self { words: VecDeque::new(), hinted: vec![0; LAYERS * WORDS], step: 0 }
+        Self { words: VecDeque::new(), hinted: vec![0; LAYERS * WORDS], sent: vec![0; LAYERS * WORDS], step: 0 }
     }
 
     fn bit(w: u32) -> Option<(usize, u64)> {
@@ -398,6 +639,31 @@ impl HintQueue {
     /// Queued or handed out this step.
     pub fn hinted(&self, w: u32) -> bool {
         Self::bit(w).is_some_and(|(i, m)| self.hinted[i] & m != 0)
+    }
+
+    /// On the wire this step.
+    pub fn sent(&self, w: u32) -> bool {
+        Self::bit(w).is_some_and(|(i, m)| self.sent[i] & m != 0)
+    }
+
+    /// `words` went on the wire.
+    pub fn mark_sent(&mut self, words: &[u32]) {
+        for &w in words {
+            if let Some((i, m)) = Self::bit(w) {
+                self.sent[i] |= m;
+            }
+        }
+    }
+
+    /// Words a submit took (`take`) but could not send (the budget or a bar):
+    /// back to the FRONT, in order, for the next submit (design 2.4: never
+    /// drop the surplus).
+    pub fn requeue(&mut self, words: &[u32]) {
+        for &w in words.iter().rev() {
+            if self.words.len() < HINT_QUEUE_MAX {
+                self.words.push_front((w, self.step));
+            }
+        }
     }
 
     /// Queue `words` (already filtered and deduped by `hint_words`) tagged
@@ -443,6 +709,7 @@ impl HintQueue {
         let before = self.words.len();
         self.words.retain(|&(_, s)| s == step);
         self.hinted.iter_mut().for_each(|w| *w = 0);
+        self.sent.iter_mut().for_each(|w| *w = 0);
         self.step = step;
         (before - self.words.len()) as u32
     }
@@ -455,6 +722,7 @@ impl HintQueue {
         let n = self.words.len();
         self.words.clear();
         self.hinted.iter_mut().for_each(|w| *w = 0);
+        self.sent.iter_mut().for_each(|w| *w = 0);
         n
     }
 
@@ -563,10 +831,11 @@ pub fn budget_plan(hints: usize, admissions: usize, restores: usize, room: usize
     BUDGET.lock().unwrap_or_else(|p| p.into_inner()).plan(hints, admissions, restores, room, restores_ok, legacy_restore_cap)
 }
 
-/// `SpecBudget::commit` on this step's budget, and the `lh2_*` counters it moves.
+/// `SpecBudget::commit` on this step's budget, and the `lh2_budget_deferred`
+/// counter it moves (`lh2_hints_sent` is bumped by the submit for the words
+/// that actually went: the bars may cut `t.hints`).
 pub fn budget_commit(t: &Take) {
     BUDGET.lock().unwrap_or_else(|p| p.into_inner()).commit(t);
-    bump(Stat::HintsSent, t.hints as u64);
     bump(Stat::BudgetDeferred, u64::from(t.deferred));
 }
 
@@ -579,8 +848,12 @@ pub fn budget_commit(t: &Take) {
 /// lane's own picks one lane-layer later (a floor, `dry_hits`); then hint words the queue handed a decode
 /// submit (slice A: counted, kept off the wire), words on the wire (0 in slice
 /// A), words the per-request cap dropped, words dropped stale, and admission /
-/// restore words the per-step budget held back vs today's rule.
-pub const STATS: [(&str, &str); 14] = [
+/// restore words the per-step budget held back vs today's rule; then slice B
+/// (`evtrace_kinds::HUB_LH2`): sent hints the same lane demanded at the target
+/// layer (and of those the protected-rank ones), paged experts in pin replies
+/// that had been hinted, hints deduped against the mirror's NURSERY bits, the
+/// `after` placement's late look-aheads (0 under `before`), abort-bar trips.
+pub const STATS: [(&str, &str); 31] = [
     ("lh2_cand_r1", "lh2.cand_r1"),
     ("lh2_cand_r2", "lh2.cand_r2"),
     ("lh2_cand_r3", "lh2.cand_r3"),
@@ -595,7 +868,31 @@ pub const STATS: [(&str, &str); 14] = [
     ("lh2_dropped_cap", "lh2.dropped_cap"),
     ("lh2_stale", "lh2.stale"),
     ("lh2_budget_deferred", "lh2.budget_deferred"),
+    ("lh2_demanded", "lh2.demanded"),
+    ("lh2_demanded_prot", "lh2.demanded_prot"),
+    ("lh2_paged_hinted", "lh2.paged_hinted"),
+    ("lh2_nursery_covered", "lh2.nursery_covered"),
+    ("lh2_look_late", "lh2.look_late"),
+    ("lh2_bar_trips", "lh2.bar_trips"),
+    // Slice A amendment (10-06): the protected set and the margin buckets.
+    ("lh2_dry_hits_prot_r1", "lh2.dry_hits_prot_r1"),
+    ("lh2_dry_hits_prot_r2", "lh2.dry_hits_prot_r2"),
+    ("lh2_dry_hits_prot_r3", "lh2.dry_hits_prot_r3"),
+    ("lh2_nonres_m0", "lh2.nonres_m0"),
+    ("lh2_nonres_m1", "lh2.nonres_m1"),
+    ("lh2_nonres_m2", "lh2.nonres_m2"),
+    ("lh2_nonres_m3", "lh2.nonres_m3"),
+    ("lh2_hits_prot_m0", "lh2.hits_prot_m0"),
+    ("lh2_hits_prot_m1", "lh2.hits_prot_m1"),
+    ("lh2_hits_prot_m2", "lh2.hits_prot_m2"),
+    ("lh2_hits_prot_m3", "lh2.hits_prot_m3"),
 ];
+
+/// `STATS` index of the first `lh2_dry_hits_prot_rN` / `lh2_nonres_m{k}` /
+/// `lh2_hits_prot_m{k}` entry.
+const STAT_DRY_HITS_PROT: usize = 20;
+const STAT_NONRES_M: usize = 23;
+const STAT_HITS_PROT_M: usize = 27;
 
 static COUNTS: [AtomicU64; STATS.len()] = [const { AtomicU64::new(0) }; STATS.len()];
 
@@ -608,6 +905,12 @@ pub enum Stat {
     DroppedCap = 11,
     Stale = 12,
     BudgetDeferred = 13,
+    Demanded = 14,
+    DemandedProt = 15,
+    PagedHinted = 16,
+    NurseryCovered = 17,
+    LookLate = 18,
+    BarTrips = 19,
 }
 
 pub fn bump(s: Stat, n: u64) {
@@ -616,19 +919,28 @@ pub fn bump(s: Stat, n: u64) {
     }
 }
 
-/// One lane-layer's L+1 predictions classified: `lh2_cand_rN`, `lh2_nonres_rN`.
+/// One lane-layer's L+1 predictions classified: `lh2_cand_rN`, `lh2_nonres_rN`,
+/// `lh2_nonres_m{k}`.
 pub fn count_preds(preds: &[Pred]) {
     let (cand, nonres) = count(preds);
     for r in 0..3 {
         COUNTS[r].fetch_add(u64::from(cand[r]), Relaxed);
         COUNTS[3 + r].fetch_add(u64::from(nonres[r]), Relaxed);
     }
+    for (k, m) in count_margin(preds).into_iter().enumerate() {
+        COUNTS[STAT_NONRES_M + k].fetch_add(u64::from(m), Relaxed);
+    }
 }
 
-/// One lane-layer's `dry_hits`: `lh2_dry_hits_rN`.
-pub fn count_dry_hits(hits: [u32; 3]) {
+/// One lane-layer's dry match: `lh2_dry_hits_rN`, `lh2_dry_hits_prot_rN`,
+/// `lh2_hits_prot_m{k}`.
+pub fn count_dry_hits(d: &DryHits) {
     for r in 0..3 {
-        COUNTS[6 + r].fetch_add(u64::from(hits[r]), Relaxed);
+        COUNTS[6 + r].fetch_add(u64::from(d.hits[r]), Relaxed);
+        COUNTS[STAT_DRY_HITS_PROT + r].fetch_add(u64::from(d.hits_prot[r]), Relaxed);
+    }
+    for k in 0..4 {
+        COUNTS[STAT_HITS_PROT_M + k].fetch_add(u64::from(d.hits_prot_m[k]), Relaxed);
     }
 }
 
@@ -649,14 +961,14 @@ mod tests {
     const NU: usize = 6;
 
     fn pred(e: u16, rank: u8, nonres: bool) -> Pred {
-        Pred { e, rank, nonres }
+        Pred { e, rank, nonres, margin: f32::NAN }
     }
 
     #[test]
     fn cfg_packs_and_unpacks() {
-        let c = Cfg { mode: Mode::K2, rank: 3, cap: 200, spec_budget: 65535, step: u32::MAX - 7 };
-        assert_eq!(Cfg::unpack(c.pack()), c);
-        assert_eq!(Cfg::unpack(0), Cfg::default());
+        let c = Cfg { mode: Mode::K2, rank: 3, cap: 200, spec_budget: 65535, step: u32::MAX - 7, rows: 300, max_words_step: 1490, per_ll_x10: 25, nursery_prior: true, margin_x1000: 1000 };
+        let (v, w) = c.pack(); assert_eq!(Cfg::unpack(v, w), c);
+        assert_eq!(Cfg::unpack(0, 0), Cfg::default());
         assert_eq!(Cfg::default().mode, Mode::Off);
     }
 
@@ -685,6 +997,24 @@ mod tests {
         assert!(matches!(B2_MISS_PREFETCH_RANK.kind, crate::knobs::Kind::Int { default: 1, .. }));
         assert!(matches!(B2_MISS_PREFETCH_CAP.kind, crate::knobs::Kind::Int { default: 8, .. }));
         assert!(matches!(B2_SPEC_BUDGET.kind, crate::knobs::Kind::Int { default: 0, .. }), "today's rule until the budget is A/B'd live (code review, finding 1)");
+        // Slice B + the amendment: the bars, the prior mark, the margin.
+        use crate::knobs::{B2_MISS_PREFETCH_MARGIN, B2_MISS_PREFETCH_MAX_PER_LL_X10, B2_MISS_PREFETCH_MAX_WORDS_STEP, B2_NURSERY_PRIOR};
+        assert!(matches!(B2_MISS_PREFETCH_MAX_WORDS_STEP.kind, crate::knobs::Kind::Int { default: 0, .. }), "0 = rows-aware default");
+        assert!(matches!(B2_MISS_PREFETCH_MAX_PER_LL_X10.kind, crate::knobs::Kind::Int { default: 25, .. }));
+        assert!(matches!(B2_NURSERY_PRIOR.kind, crate::knobs::Kind::Flag(false)), "the prior stays hint-blind by default");
+        assert!(matches!(B2_MISS_PREFETCH_MARGIN.kind, crate::knobs::Kind::Real { default, .. } if default == 0.0), "no margin filter until the dry run picks one");
+        assert_eq!(B2_MISS_PREFETCH_MARGIN.kind.parse("0.15").map(f64::from_bits), Some(0.15));
+        for k in [&B2_MISS_PREFETCH_MAX_WORDS_STEP, &B2_MISS_PREFETCH_MAX_PER_LL_X10, &B2_NURSERY_PRIOR, &B2_MISS_PREFETCH_MARGIN] {
+            assert!(k.live, "{}: flipped per turn", k.name);
+        }
+        assert_eq!(STATS.len(), 31);
+        assert_eq!(STATS[STAT_DRY_HITS_PROT].0, "lh2_dry_hits_prot_r1");
+        assert_eq!(STATS[STAT_NONRES_M].0, "lh2_nonres_m0");
+        assert_eq!(STATS[STAT_HITS_PROT_M + 3].0, "lh2_hits_prot_m3");
+        assert_eq!(STATS[Stat::BarTrips as usize].0, "lh2_bar_trips");
+        assert_eq!(STATS[Stat::NurseryCovered as usize].0, "lh2_nursery_covered");
+        assert_eq!(STATS[Stat::PagedHinted as usize].1, "lh2.paged_hinted");
+        assert_eq!(STATS[Stat::Demanded as usize].0, "lh2_demanded");
     }
 
     /// Design 2.1 (review round 2, finding 1): the knob drives the look-ahead;
@@ -702,8 +1032,18 @@ mod tests {
         for m in [Mode::Dry, Mode::K1, Mode::K2] {
             assert!(!legacy_words(m, false, true), "{m:?}: legacy var unset pushes nothing from 9515");
             assert!(!legacy_words(m, true, true), "{m:?}: the knob replaces the old block even with the legacy var set");
-            assert!(!m.wire(), "{m:?}: slice A puts nothing on the wire");
         }
+        // Slice B: the wire needs `k1`/`k2` AND box 2's `RESP_FLAG_NURSERY`.
+        super::super::b2_mirror::reset_nursery_support();
+        for m in [Mode::Off, Mode::Dry, Mode::K1, Mode::K2] {
+            assert!(!m.wire(), "{m:?}: nothing on the wire before box 2 answers");
+        }
+        assert!(Mode::K1.asks() && Mode::K2.asks() && !Mode::Dry.asks() && !Mode::Off.asks());
+        super::super::b2_mirror::nursery_reply_seen(true);
+        assert!(Mode::K1.wire() && Mode::K2.wire() && !Mode::Dry.wire() && !Mode::Off.wire());
+        super::super::b2_mirror::nursery_reply_seen(false);
+        assert!(!Mode::K1.wire(), "the capability was lost: dry again");
+        super::super::b2_mirror::reset_nursery_support();
         assert!(legacy_words(Mode::Off, true, true), "the old behaviour survives under the legacy var alone");
         assert!(!legacy_words(Mode::Off, true, false), "... where the driver allows hints");
         assert!(!legacy_words(Mode::Off, false, true));
@@ -850,12 +1190,115 @@ mod tests {
         assert!(per_req[..40].iter().all(|&r| r == 3) && per_req[40..].iter().all(|&r| r == 0), "{per_req:?}");
     }
 
+    /// Slice A amendment: the margin of a rank-1 prediction from the weights,
+    /// the margin buckets, the margin filter, and the PROTECTED set (own pick
+    /// at actual rank `<= protect`) per R and per bucket.
+    #[test]
+    fn margin_filter_and_protected_set_counters() {
+        // Two rows, n_used 6. Row 0: 5 (w .5) over 9 (w .25): margin .25 / 1.0 = 0.25.
+        // Row 1: 7 (w .4) over 5 (w .35): margin 0.05; 7 is rank 1, 5 rank 2 here.
+        let look = [5, 9, 7, 11, 13, 1, 7, 5, 11, 13, 9, 2];
+        let w = [0.5f32, 0.25, 0.1, 0.1, 0.03, 0.02, 0.4, 0.35, 0.1, 0.1, 0.03, 0.02];
+        let mut s = LaneState::default();
+        s.classify_w(&look, &w, NU, |_| true, |_| true);
+        let m = |e: u16| s.preds.iter().find(|p| p.e == e).map(|p| p.margin).unwrap();
+        assert!((m(5) - 0.25).abs() < 1e-6, "{}", m(5));
+        assert!((m(7) - 0.05).abs() < 1e-6, "{}", m(7));
+        assert!(m(9).is_nan() && m(11).is_nan(), "ranks 2-3 carry no margin");
+        assert_eq!(count_margin(&s.preds), [2, 1, 1, 0], "5 at >= 0 / .1 / .2; 7 only at >= 0");
+        // The filter: judged on rank 1 only, unknown passes, 0 filters nothing.
+        let (hw, _) = hint_words_m(&s.preds, 4, 1, 8, 0.1, |_| false);
+        assert_eq!(hw, vec![word(4, 5)], "7's margin .05 < .1");
+        let (hw, dropped) = hint_words_m(&s.preds, 4, 3, 8, 0.1, |_| false);
+        assert_eq!((hw, dropped), (vec![word(4, 5), word(4, 9), word(4, 11)], 0), "ranks 2-3 are not judged (13 is rank 4: never a prediction); a filtered word is not a cap drop");
+        assert_eq!(hint_words_m(&s.preds, 4, 1, 8, 0.0, |_| false).0.len(), 2);
+        assert_eq!(hint_words_m(&s.preds, 4, 1, 8, 0.3, |_| false).0.len(), 0);
+        assert!(pred(3, 1, true).margin_ok(0.5), "unknown passes");
+        // No weights: margins unknown, nothing counts in a bucket, the filter passes all.
+        let mut t = LaneState::default();
+        t.classify(&look, NU, |_| true, |_| true);
+        assert_eq!(count_margin(&t.preds), [0, 0, 0, 0]);
+        assert_eq!(hint_words_m(&t.preds, 4, 1, 8, 0.3, |_| false).0.len(), 2);
+        // The protected set: own picks `[rows][6]`; protect 1.
+        s.set_pending(4, 9);
+        assert!(s.take_pending(4, 9));
+        // Row 0 of the own picks: 9 at rank 1, 5 at rank 2; row 1: 7 at rank 1, 11 at rank 4.
+        let own = [9, 5, 20, 21, 22, 23, 7, 30, 31, 11, 32, 33];
+        let d = s.dry_hits_demanded(&own, |w| w == word(4, 5) || w == word(4, 9), 1);
+        assert_eq!(d.hits, [2, 3, 4], "5, 7 (rank 1); + 9 (rank 2); + 11 (rank 3)");
+        assert_eq!(d.hits_prot, [1, 2, 2], "7 at actual rank 1; 9 at actual rank 1; 5 is actual rank 2, 11 rank 4");
+        assert_eq!(d.hits_prot_m, [1, 0, 0, 0], "7 (margin .05) is the only protected rank-1 hit");
+        assert_eq!((d.demanded, d.demanded_prot), (2, 1), "5 and 9 were sent; 9 is protected");
+        // protect 2: 5 (actual rank 2) joins.
+        s.set_pending(4, 9);
+        assert!(s.take_pending(4, 9));
+        let d2 = s.dry_hits_demanded(&own, |_| false, 2);
+        assert_eq!(d2.hits_prot, [2, 3, 3]);
+        assert_eq!(d2.hits_prot_m, [2, 1, 1, 0]);
+        assert_eq!(s.dry_hits(&own), [2, 3, 4], "the any-rank diagnostic is unchanged");
+        assert_eq!(default_max_words_step(1), 10);
+        assert_eq!(default_max_words_step(4), 10);
+        assert_eq!(default_max_words_step(8), 30);
+    }
+
+    /// The absolute abort bars (design 5): the step bar, the per-lane-layer
+    /// bar once 8 lane-layers routed, and dry for the rest of the step.
+    #[test]
+    fn bars_trip_and_the_step_goes_dry() {
+        let mut b = Bars::default();
+        assert_eq!(b.allow(0, 10, 25), (0, false));
+        assert_eq!(b.allow(6, 10, 25), (6, false));
+        assert_eq!(b.allow(4, 10, 25), (4, false), "exactly the bar is fine");
+        assert_eq!(b.allow(1, 10, 25), (0, true), "the 11th word trips");
+        assert!(b.tripped);
+        assert_eq!(b.allow(1, 100, 255), (0, false), "dry for the rest of the step, counted once");
+        b.reset();
+        assert_eq!(b, Bars::default());
+        // Per lane-layer: 2.5 x lane-layers, judged from 8 lane-layers on.
+        for _ in 0..7 {
+            b.note_lane_layer();
+        }
+        assert_eq!(b.allow(30, 1000, 25), (30, false), "7 lane-layers: not judged yet");
+        b.note_lane_layer();
+        assert_eq!(b.allow(1, 1000, 25), (0, true), "31 > 2.5 x 8");
+        let mut c = Bars::default();
+        for _ in 0..8 {
+            c.note_lane_layer();
+        }
+        assert_eq!(c.allow(20, 1000, 25), (20, false), "20 = 2.5 x 8");
+        assert_eq!(c.allow(1, 1000, 25), (0, true));
+    }
+
+    /// The queue's `sent` set and the surplus re-queue (design 2.4: never drop).
+    #[test]
+    fn queue_marks_sent_and_requeues_the_surplus() {
+        let mut q = HintQueue::new();
+        q.begin_step(3);
+        q.push(3, &[word(5, 1), word(5, 2), word(6, 3)]);
+        let (taken, _) = q.take(3, 2, 8);
+        assert_eq!(taken, vec![word(5, 1), word(5, 2), word(6, 3)]);
+        q.mark_sent(&taken[..1]);
+        q.requeue(&taken[1..]);
+        assert!(q.sent(word(5, 1)) && !q.sent(word(5, 2)));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.take(3, 2, 8).0, vec![word(5, 2), word(6, 3)], "in order, at the front");
+        q.push(3, &[word(7, 7)]);
+        q.requeue(&[word(5, 2)]);
+        assert_eq!(q.take(3, 2, 8).0, vec![word(5, 2), word(7, 7)]);
+        assert!(q.hinted(word(5, 2)), "re-queued words stay deduped");
+        q.begin_step(4);
+        assert!(!q.sent(word(5, 1)), "a new step forgets the sent set");
+        q.mark_sent(&[word(5, 1)]);
+        q.clear();
+        assert!(!q.sent(word(5, 1)));
+    }
+
     #[test]
     fn counters_take_and_clear_in_stats_order() {
         // Process-wide counters: tolerate other tests' bumps by reading twice.
         let _ = take_stats();
         count_preds(&[pred(1, 1, true), pred(2, 2, false)]);
-        count_dry_hits([1, 1, 1]);
+        count_dry_hits(&DryHits { hits: [1, 1, 1], hits_prot: [0, 1, 1], hits_prot_m: [1, 1, 0, 0], ..DryHits::default() });
         bump(Stat::DryWords, 2);
         bump(Stat::Stale, 0);
         bump(Stat::BudgetDeferred, 7);

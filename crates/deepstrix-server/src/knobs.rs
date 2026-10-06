@@ -214,12 +214,14 @@ mod tests {
         // per turn), the embed phase's share and return verification (read
         // between phases), the arena graph keys with their canary and
         // taint-probe gate hook (read once per arena step), and the
-        // predicted-miss prefetch knobs with the speculative budget (A/B'd per
-        // turn; read once per decode step into `het::lookahead::Cfg`).
+        // predicted-miss prefetch knobs with the speculative budget, the margin
+        // filter, the abort bars and the nursery-prior mark (A/B'd per turn;
+        // read once per decode step into `het::lookahead::Cfg`).
         let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
         live.sort();
         assert_eq!(live, [
-            "V41_B2_MISS_PREFETCH", "V41_B2_MISS_PREFETCH_CAP", "V41_B2_MISS_PREFETCH_RANK", "V41_B2_PIN_PREFILL_BAND", "V41_B2_SPEC_BUDGET",
+            "V41_B2_MISS_PREFETCH", "V41_B2_MISS_PREFETCH_CAP", "V41_B2_MISS_PREFETCH_MARGIN", "V41_B2_MISS_PREFETCH_MAX_PER_LL_X10",
+            "V41_B2_MISS_PREFETCH_MAX_WORDS_STEP", "V41_B2_MISS_PREFETCH_RANK", "V41_B2_NURSERY_PRIOR", "V41_B2_PIN_PREFILL_BAND", "V41_B2_SPEC_BUDGET",
             "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
             "V41_MS_CTX_CHECK", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
             "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",

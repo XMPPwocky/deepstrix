@@ -1292,8 +1292,10 @@ impl BatchDgpuScratch {
             },
             rb_pack: {
                 let rp = b.min(super::forward_prefill::rb_pack_max_rows() as usize);
+                // sel, look, look2, orig, ew, look_ew (the look-ahead's gate
+                // weights, `V41_B2_MISS_PREFETCH`'s margin filter): 6 x n_used.
                 v4flash_hip::PinnedBuffer::new(
-                    rp * (5 * N_EXPERT_USED + 2 * crate::router_topk::ROUTER_MAX_ALT as usize + 1)
+                    rp * (6 * N_EXPERT_USED + 2 * crate::router_topk::ROUTER_MAX_ALT as usize + 1)
                         + if std::env::var("V41_REMOTE_ADDR").is_ok() {
                             rp * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES / 4
                         } else {

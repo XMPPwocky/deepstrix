@@ -4224,10 +4224,24 @@ static MISS_HINT_WORDS: std::sync::LazyLock<std::sync::Mutex<super::lookahead::H
 
 /// Filter layer `target`'s classified look-ahead picks into hint words and
 /// queue them (`lookahead::hint_words`: rank `<= rank`, non-resident, not
-/// hinted this step, at most `cap`); returns `(queued, dropped by the cap)`.
-pub fn queue_hint_words(step: u32, target: i32, preds: &[super::lookahead::Pred], rank: u8, cap: usize) -> (usize, u32) {
+/// hinted this step, not in box 2's NURSERY per the mirror -- counted as
+/// `lh2_nursery_covered` -- at most `cap`); returns `(queued, dropped by the
+/// cap)`. One lane-layer for the abort bars.
+pub fn queue_hint_words(step: u32, target: i32, preds: &[super::lookahead::Pred], rank: u8, cap: usize, margin: f32) -> (usize, u32) {
+    super::lookahead::note_lane_layer();
     let mut q = MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner());
-    let (words, dropped) = super::lookahead::hint_words(preds, target, rank, cap, |w| q.hinted(w));
+    let covered = std::cell::Cell::new(0u64);
+    let (words, dropped) = super::lookahead::hint_words_m(preds, target, rank, cap, margin, |w| {
+        if q.hinted(w) {
+            return true;
+        }
+        if super::b2_mirror::nursery(target, w & 0xFFFF) {
+            covered.set(covered.get() + 1);
+            return true;
+        }
+        false
+    });
+    super::lookahead::bump(super::lookahead::Stat::NurseryCovered, covered.get());
     (q.push(step, &words), dropped)
 }
 
@@ -4238,6 +4252,27 @@ pub fn take_hint_words(step: u32, layer: i32, max: usize) -> Vec<u32> {
     let (words, stale) = MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).take(step, layer, max);
     super::lookahead::bump(super::lookahead::Stat::Stale, u64::from(stale));
     words
+}
+
+/// Words a submit took and could not send (budget / bar): back to the front.
+pub fn requeue_hint_words(words: &[u32]) {
+    if !words.is_empty() {
+        MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).requeue(words);
+    }
+}
+
+/// Words that went on the wire (`lh2_hints_sent`; the `sent` set for
+/// `lh2_demanded` / `lh2_paged_hinted`).
+pub fn mark_hint_words_sent(words: &[u32]) {
+    if !words.is_empty() {
+        MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).mark_sent(words);
+        super::lookahead::bump(super::lookahead::Stat::HintsSent, words.len() as u64);
+    }
+}
+
+/// Was `(layer, e)` sent as a hint this step?
+pub fn hint_word_sent(w: u32) -> bool {
+    MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).sent(w)
 }
 
 /// A new decode step (`lookahead::begin_step`): the earlier step's words are
@@ -9278,10 +9313,16 @@ impl RemoteExpertClient {
         let rel = if pin_req { super::b2_mirror::take_release_words(128) } else { Vec::new() };
         // PREDICTED-MISS HINT WORDS (`het::lookahead`, design 2.3): a decode
         // request drains the hint queue first; the stale rule is applied there.
-        // SLICE A: the fresh words are counted (`lh2_dry_words`) and go no
-        // further -- `Mode::wire` is false until slice B (k1/k2 and the
-        // daemon's `RESP_FLAG_NURSERY`), when they lead `pf` under the budget.
+        // The fresh words are counted (`lh2_dry_words`); under `dry`, or under
+        // `k1`/`k2` before box 2 has answered `RESP_FLAG_NURSERY`, they go no
+        // further. SLICE B (`Mode::wire`): they lead `pf` as `REQ_FLAG_LIKELY`
+        // words (`LIKELY_WORD_BIT`), ahead of admissions and restores, under
+        // the per-step budget and the abort bars; what cannot go is RE-QUEUED
+        // for the next submit, never dropped (design 2.4). `k1`/`k2` set the
+        // flag on EVERY decode request (words or none): the capability probe.
         let lh2 = super::lookahead::cfg();
+        let asks = self.decode_phase && lh2.mode.asks();
+        let flags = if asks { flags | proto::REQ_FLAG_LIKELY } else { flags };
         let hints: Vec<u32> = if self.decode_phase && lh2.mode.on() {
             let h = take_hint_words(lh2.step, layer as i32, 128);
             super::lookahead::bump(super::lookahead::Stat::DryWords, h.len() as u64);
@@ -9289,12 +9330,17 @@ impl RemoteExpertClient {
         } else {
             Vec::new()
         };
+        // The bars (design 5): how many of the fresh words may go at all.
+        let allowed = if hints.is_empty() { 0 } else { super::lookahead::bars_allow(hints.len()) };
         let mut n_hint_words = 0u32;
-        let pf = if lh2.spec_budget == 0 || !self.decode_phase {
+        let mut pf = if lh2.spec_budget == 0 || !self.decode_phase {
             // Today's rule (`V41_B2_SPEC_BUDGET=0`; and every prefill request:
             // the budget is a decode-step quantity, and the layer-major group
-            // prefetch paces its own words through `PREFETCH_TAKE_CAP`).
-            let mut pf = take_prefetch_words(128);
+            // prefetch paces its own words through `PREFETCH_TAKE_CAP`). Hints
+            // first, up to the frame.
+            n_hint_words = allowed.min(128) as u32;
+            let mut pf: Vec<u32> = hints[..n_hint_words as usize].iter().map(|&w| proto::mark_likely(w)).collect();
+            pf.extend(take_prefetch_words(128 - pf.len()));
             // RESTORE words fill the room the admission / look-ahead words leave,
             // a few per request, and only once every release is on the wire: box
             // 2 applies a request's releases before its prefetch grants, so a
@@ -9309,24 +9355,33 @@ impl RemoteExpertClient {
             // 16 per step), at most `V41_B2_SPEC_BUDGET` words per step in all.
             // What the budget holds back stays queued (`lh2_budget_deferred`);
             // the release-before-restore rule above still holds.
-            // TODO(slice B): `take_hint_words(.., 128)` above hands out EVERY
-            // fresh word and `.take(t.hints)` below drops the surplus past the
-            // budget; with `Mode::wire` on, derive the drain's `max` from the
-            // plan (plan first, then take) or re-queue the surplus -- never drop.
             let restores_ok = pin_req && super::b2_mirror::releases_queued() == 0;
             let t = super::lookahead::budget_plan(
-                hints.len(), prefetch_words_queued(), if restores_ok { restore_words_queued() } else { 0 },
+                allowed, prefetch_words_queued(), if restores_ok { restore_words_queued() } else { 0 },
                 128, restores_ok, super::b2_mirror::pin_restore_per_request(),
             );
-            let mut pf: Vec<u32> = hints.iter().copied().take(t.hints).collect();
+            n_hint_words = t.hints as u32;
+            let mut pf: Vec<u32> = hints[..t.hints].iter().map(|&w| proto::mark_likely(w)).collect();
             pf.extend(take_prefetch_words(t.admissions));
             if restores_ok {
                 pf.extend(take_restore_words(t.restores));
             }
             super::lookahead::budget_commit(&t);
-            n_hint_words = t.hints as u32;
             pf
         };
+        if !hints.is_empty() {
+            let (sent, surplus) = hints.split_at(n_hint_words as usize);
+            mark_hint_words_sent(sent);
+            requeue_hint_words(surplus);
+            // `V41_B2_NURSERY_PRIOR` at R >= 2: the prior sees a hinted pick
+            // as INCOMING, so it does not swap it away and waste the entry.
+            if lh2.nursery_prior && lh2.rank >= 2 {
+                super::b2_mirror::note_incoming(sent);
+            }
+        }
+        if !asks {
+            debug_assert!(pf.iter().all(|&w| !proto::likely_word(w)));
+        }
         let flags = if pf.is_empty() { flags } else { flags | proto::REQ_FLAG_PREFETCH };
         let (held, n_held) = if pin_req {
             let decode_shaped = b as u32 <= proto::PIN_DECODE_MAX_ROWS && pin.decode.unwrap_or(true);
@@ -9494,6 +9549,22 @@ impl RemoteExpertClient {
             super::b2_mirror::pin_reply_seen(pin.is_some());
             if let Some(p) = pin.as_ref() {
                 n_surprise = super::b2_mirror::check_surprises(m.layer, h.seq, &ticket.held, &p.paged);
+                // Tail recall (`lh2_paged_hinted`): a paged expert that had
+                // been hinted this step -- the hint was late, dropped, or
+                // recycled before the pick came.
+                let hinted_paged = (0..N_EXPERT as usize)
+                    .filter(|&e| (p.paged[e / 32] >> (e % 32)) & 1 == 1 && hint_word_sent((m.layer << 16) | e as u32))
+                    .count();
+                super::lookahead::bump(super::lookahead::Stat::PagedHinted, hinted_paged as u64);
+            }
+        }
+        // The NURSERY block (design 3.2): the capability, and the mirror's
+        // NURSERY bits for the filter's dedup (never `held`).
+        if ticket.flags & proto::REQ_FLAG_LIKELY != 0 {
+            let nursery = proto::response_nursery(&buf, &m);
+            super::b2_mirror::nursery_reply_seen(nursery.is_some());
+            if let Some(words) = nursery {
+                super::b2_mirror::update_nursery(m.layer, words);
             }
         }
         // NTP quadruple for this exchange. t1 is what the WRITER stamped (echoed

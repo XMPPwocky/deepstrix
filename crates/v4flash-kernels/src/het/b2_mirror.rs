@@ -143,6 +143,19 @@ static STEP: AtomicU32 = AtomicU32::new(0);
 /// Per (layer, expert): the `STEP` from which a queued admission counts as
 /// resident (module doc, INCOMING); 0 = no mark.
 static INCOMING: [[AtomicU32; NE]; LAYERS] = [const { [const { AtomicU32::new(0) }; NE] }; LAYERS];
+/// NURSERY bits (docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 3.2): box 2's
+/// nursery entries per its last `RESP_FLAG_NURSERY` block for the layer (a
+/// reply replaces its own layer's row and adds the other layers' entries it
+/// carried). For the hint filter's dedup and `lh2_nursery_covered` ONLY --
+/// never `held`: the cache prior stays hint-blind (I2), and a nursery entry
+/// is not pinned, so it must not count as held.
+static NURSERY: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
+/// Does box 2 understand `REQ_FLAG_LIKELY`? 0 unknown (no LIKELY-flagged
+/// reply yet), 1 yes (a reply carried `RESP_FLAG_NURSERY`), 2 no (a reply
+/// to a LIKELY-flagged request did not). The hub puts hint words on the wire
+/// only at 1 (`lookahead::Mode::wire`); an echoed request bit proves nothing
+/// (review round 2, finding 5).
+static NURSERY_SUPPORT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// `V41_SUB`: 0 off, 1 dry run, 2 host planner, 3 cache-prior.
 pub fn mode() -> u32 {
@@ -374,6 +387,10 @@ pub struct Residency {
     /// A queued background admission inside its step window
     /// (`note_incoming`; false when `V41_SUB_INCOMING=0`).
     pub incoming: bool,
+    /// A box-2 NURSERY entry per its last block (`update_nursery`): a hint
+    /// that has landed and is not promoted yet. NOT residency for the prior
+    /// (`resident()` ignores it): the filter's dedup only.
+    pub nursery: bool,
 }
 
 /// `(layer, e)`'s residency sources; `None` until box 2 has reported `layer`.
@@ -387,7 +404,79 @@ pub fn lookup(layer: i32, e: u32) -> Option<Residency> {
         held: (BITS[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
         pending: (PENDING[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
         incoming: incoming(l, e as usize),
+        nursery: (NURSERY[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
     })
+}
+
+// ---- the nursery (design 3.2) ----
+
+/// Is `(layer, e)` a box-2 nursery entry per its last block? (`lookup`'s
+/// `nursery`, without the SEEN requirement: the block may precede the layer's
+/// first residency map.)
+pub fn nursery(layer: i32, e: u32) -> bool {
+    let l = layer as usize;
+    if l >= LAYERS || e >= N_EXPERT {
+        return false;
+    }
+    (NURSERY[l][(e / 64) as usize].load(Ordering::Relaxed) >> (e % 64)) & 1 == 1
+}
+
+/// A reply for `layer` carried a NURSERY block (`proto::response_nursery`,
+/// `(layer << 16) | expert` words, any layer): the reply layer's row is
+/// REPLACED (box 2 lists all of that layer's entries first), the other
+/// layers' entries are added (their own rows are replaced by their own
+/// replies, every step).
+pub fn update_nursery(layer: u32, words: &[u32]) {
+    let l = layer as usize;
+    if l >= LAYERS {
+        return;
+    }
+    let mut row = [0u64; WORDS];
+    let mut other: Vec<(usize, u64)> = Vec::new();
+    for &w in words {
+        let (wl, we) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
+        if wl >= LAYERS || we >= NE {
+            continue;
+        }
+        if wl == l {
+            row[we / 64] |= 1u64 << (we % 64);
+        } else {
+            other.push((wl * WORDS + we / 64, 1u64 << (we % 64)));
+        }
+    }
+    for (i, slot) in NURSERY[l].iter().enumerate() {
+        slot.store(row[i], Ordering::Relaxed);
+    }
+    for (i, m) in other {
+        NURSERY[i / WORDS][i % WORDS].fetch_or(m, Ordering::Relaxed);
+    }
+}
+
+/// Does box 2 answer `REQ_FLAG_LIKELY` with `RESP_FLAG_NURSERY`? (The hub
+/// sends hint words only then.)
+pub fn nursery_supported() -> bool {
+    NURSERY_SUPPORT.load(Ordering::Relaxed) == 1
+}
+
+/// A reply to a LIKELY-flagged request did (`supported`) or did not carry a
+/// NURSERY block: detection, and loss, each logged once per transition.
+pub fn nursery_reply_seen(supported: bool) {
+    let to = if supported { 1 } else { 2 };
+    let was = NURSERY_SUPPORT.swap(to, Ordering::Relaxed);
+    if was != to {
+        if supported {
+            eprintln!("b2 mirror: box 2 answers REQ_FLAG_LIKELY with a NURSERY block: predicted-miss hints go on the wire (V41_B2_MISS_PREFETCH k1/k2)");
+        } else if was == 1 {
+            eprintln!("b2 mirror: WARNING box 2 stopped answering REQ_FLAG_LIKELY with a NURSERY block (nursery=0 or an older expertd): hints stay off the wire (dry)");
+        } else {
+            eprintln!("b2 mirror: box 2 does not support the nursery (older expertd or nursery=0): V41_B2_MISS_PREFETCH k1/k2 behave as dry");
+        }
+    }
+}
+
+/// Tests: forget what box 2 answered.
+pub fn reset_nursery_support() {
+    NURSERY_SUPPORT.store(0, Ordering::Relaxed);
 }
 
 // ---- pinning (module doc, PINNING) ----
@@ -943,9 +1032,12 @@ pub fn on_connect() {
         for i in 0..WORDS {
             BITS[l][i].store(0, Ordering::Relaxed);
             PENDING[l][i].store(0, Ordering::Relaxed);
+            NURSERY[l][i].store(0, Ordering::Relaxed);
         }
     }
     PIN_MODE.store(if pin_wanted() { 1 } else { 0 }, Ordering::Relaxed);
+    // The new daemon may or may not have a nursery: probe again.
+    NURSERY_SUPPORT.store(0, Ordering::Relaxed);
 }
 
 /// `REQ_FLAG_PIN` while pinning is asked for or on.
@@ -1681,6 +1773,41 @@ pub fn substitute(
 mod tests {
     use super::*;
 
+    /// The NURSERY bits (design 3.2): a block replaces its reply layer's row
+    /// and adds other layers' entries; they are dedup state, never `held`;
+    /// the capability flips once per transition and `on_connect` forgets it.
+    #[test]
+    fn nursery_bits_replace_the_reply_layers_row() {
+        on_connect();
+        let w = |l: u32, e: u32| (l << 16) | e;
+        update_nursery(5, &[w(5, 1), w(5, 70), w(9, 3)]);
+        assert!(nursery(5, 1) && nursery(5, 70) && nursery(9, 3) && !nursery(5, 2));
+        assert_eq!(resident(5, 1), None, "no residency map yet: SEEN is false");
+        update(5, &[0; RESID_WORDS]);
+        let r = lookup(5, 1).unwrap();
+        assert!(r.nursery && !r.held && !r.pending && !r.incoming);
+        assert_eq!(resident(5, 1), Some(false), "a nursery entry is NOT resident for the prior (I2)");
+        // The next reply for layer 5 lists only 70: 1 left the nursery (promoted or recycled).
+        update_nursery(5, &[w(5, 70), w(9, 3)]);
+        assert!(!nursery(5, 1) && nursery(5, 70) && nursery(9, 3));
+        // Layer 9's own reply replaces ITS row; layer 5's is untouched.
+        update_nursery(9, &[]);
+        assert!(!nursery(9, 3) && nursery(5, 70));
+        update_nursery(7, &[w(40, 1), w(7, 400), w(7, 2)]);
+        assert!(nursery(7, 2) && !nursery(7, 2 + 1), "out-of-range words are skipped");
+        // Capability: unknown -> yes -> no -> yes; a reconnect forgets.
+        reset_nursery_support();
+        assert!(!nursery_supported());
+        nursery_reply_seen(true);
+        assert!(nursery_supported());
+        nursery_reply_seen(false);
+        assert!(!nursery_supported());
+        nursery_reply_seen(true);
+        assert!(nursery_supported());
+        on_connect();
+        assert!(!nursery_supported() && !nursery(5, 70));
+    }
+
     /// The mirror's rows, marks and the pin ledger are process-wide statics:
     /// tests that touch them run one at a time.
     static STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1974,7 +2101,7 @@ mod tests {
         assert_eq!(resident(l as i32, 4), Some(true));
         assert_eq!(
             lookup(l as i32, 4),
-            Some(Residency { held: false, pending: true, incoming: false }),
+            Some(Residency { held: false, pending: true, incoming: false, nursery: false }),
             "pending, not held"
         );
         // The next reply is authoritative again.
@@ -2013,7 +2140,7 @@ mod tests {
         let mut w = empty.clone();
         w[0] = 1 << 8;
         update(l, &w);
-        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: true }));
+        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: true, nursery: false }));
         update(l, &empty);
         assert_eq!(resident(l as i32, 8), Some(true), "still covered by its mark");
         // A prefill pass ends it at once.

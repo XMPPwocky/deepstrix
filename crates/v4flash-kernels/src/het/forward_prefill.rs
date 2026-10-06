@@ -3770,6 +3770,11 @@ struct RbLayout {
     packed: bool,
     sel: Option<(u32, u32)>,
     look: Option<(u32, u32)>,
+    /// Layer L+1's look-ahead gate WEIGHTS (`sd.look_ew`, `[rows][n_used]`,
+    /// rank order, normalized to the row's top-k sum): the predicted-miss
+    /// prefetch's margin filter (`het::lookahead::Pred::margin`). L+2's are
+    /// not packed (`RB_PACK_MAX_SEG`; k2 is slice E).
+    look_ew: Option<(u32, u32)>,
     look2: Option<(u32, u32)>,
     alts: Option<(u32, u32)>,
     alt_w: Option<(u32, u32)>,
@@ -3978,7 +3983,7 @@ impl HeterogeneousEngine {
         // Decode-phase link window (the rows are decode rows of live streams).
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
-        super::lookahead::begin_step(super::b2_mirror::step());
+        super::lookahead::begin_step(super::b2_mirror::step(), tokens.len());
         let slots = rows.slots();
         let b = tokens.len();
         if b == 0 {
@@ -4080,7 +4085,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<(RowTables, RowTables)> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
-        super::lookahead::begin_step(super::b2_mirror::step());
+        super::lookahead::begin_step(super::b2_mirror::step(), tokens.len());
         let slots = rows.slots();
         let b = tokens.len();
         if b < 2 {
@@ -4273,7 +4278,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
-        super::lookahead::begin_step(super::b2_mirror::step());
+        super::lookahead::begin_step(super::b2_mirror::step(), tokens.len());
         let slots = rows.slots();
         let b = tokens.len();
         let n = lanes.len();
@@ -4426,7 +4431,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
-        super::lookahead::begin_step(super::b2_mirror::step());
+        super::lookahead::begin_step(super::b2_mirror::step(), tokens.len());
         let slots = rows.slots();
         let b = tokens.len();
         let n = lanes.len();
@@ -8616,6 +8621,12 @@ impl HeterogeneousEngine {
             l.sel = Some(plan.push(PackSeg::words(&bd.d_selected, n_sel)?));
             if look_next.is_some() {
                 l.look = Some(plan.push(PackSeg::words(&sd.look_sel, n_sel)?));
+                // + the weights, for the margin filter (slice A amendment 10-06:
+                // ~90% of predicted rank-1 non-resident picks land at ranks 2-6
+                // where the prior swaps them away; the gate margin tells).
+                if mp.mode.on() {
+                    l.look_ew = Some(plan.push(PackSeg::words(&sd.look_ew, n_sel)?));
+                }
             }
             if look_next2.is_some() {
                 l.look2 = Some(plan.push(PackSeg::words(&sd.look_sel2, n_sel)?));
@@ -9009,8 +9020,8 @@ impl HeterogeneousEngine {
                 let look_ok = lookahead_hints_ok || (rb.packed && mp.mode.on());
                 let (look_on, look_on2) = (look_ok && look_next.is_some(), look_ok && look_next2.is_some());
                 #[allow(clippy::type_complexity)]
-                let (mut sel_host, look_host, look_host2, alts_host, alt_w_host, orig_host, range_host, ew_read, mut xq_read): (
-                    Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>, Option<Vec<u8>>,
+                let (mut sel_host, look_host, look_host2, alts_host, alt_w_host, orig_host, range_host, ew_read, mut xq_read, look_ew_host): (
+                    Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>, Option<Vec<u8>>, Vec<f32>,
                 ) = if rb.packed {
                     // READBACK PACK: the words landed in `rb_pack` ahead of
                     // `selected_ready`, which the wait above covered. Each
@@ -9020,6 +9031,8 @@ impl HeterogeneousEngine {
                     let f32s = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
                     let sel = i32s(RbLayout::seg(w, rb.sel, "sel", n_sel)?);
                     let look = if look_on { i32s(RbLayout::seg(w, rb.look, "look", n_sel)?) } else { Vec::new() };
+                    // The weights ride only under the knob (packed beside `look`).
+                    let look_ew = if look_on && rb.look_ew.is_some() { f32s(RbLayout::seg(w, rb.look_ew, "look_ew", n_sel)?) } else { Vec::new() };
                     let look2 = if look_on2 { i32s(RbLayout::seg(w, rb.look2, "look2", n_sel)?) } else { Vec::new() };
                     // Ranks 7..6+n_alt per row.
                     let (alts, alt_w) = if na > 0 {
@@ -9044,7 +9057,7 @@ impl HeterogeneousEngine {
                     } else {
                         None
                     };
-                    (sel, look, look2, alts, alt_w, orig, range, ew, xq)
+                    (sel, look, look2, alts, alt_w, orig, range, ew, xq, look_ew)
                 } else {
                     // Staging offsets: i32 [sel | look | look2 | alts | orig],
                     // f32 [alt_w | range | ew].
@@ -9102,7 +9115,7 @@ impl HeterogeneousEngine {
                     let ew: Vec<f32> = rf[o_ew..o_ew + n_sel].to_vec();
                     let xq: Option<Vec<u8>> =
                         if want_xq { bd.rb_u8.as_ref().map(|p| p.as_slice()[..xq_bytes_rb].to_vec()) } else { None };
-                    (sel, look, look2, alts, alt_w, orig, range, ew, xq)
+                    (sel, look, look2, alts, alt_w, orig, range, ew, xq, Vec::new())
                 };
                 // Cache-prior (`V41_SUB=3`): the picks without the prior
                 // (`orig_host`), and the score ranges that feed the layer's
@@ -9576,8 +9589,16 @@ impl HeterogeneousEngine {
                     // between) is dropped without a count, on purpose.
                     if bd.lh2.take_pending(layer as i32, mp.step) {
                         let own: &[i32] = if sel_orig.is_empty() { &sel_host } else { &sel_orig };
-                        let hits = bd.lh2.dry_hits(own);
-                        lh2::count_dry_hits(hits);
+                        // Slice B: of the predictions in the own picks, the
+                        // ones SENT as hints (`lh2_demanded`; `_prot` = of a
+                        // rank the prior protects, `V41_SUB_PROTECT`).
+                        // Slice A amendment (10-06): the PROTECTED set -- an own
+                        // pick at ACTUAL rank <= `V41_SUB_PROTECT` -- is what a
+                        // hint can hide; per margin bucket too.
+                        let d = bd.lh2.dry_hits_demanded(own, super::remote_experts::hint_word_sent, super::b2_mirror::protect());
+                        lh2::count_dry_hits(&d);
+                        lh2::bump(lh2::Stat::Demanded, u64::from(d.demanded));
+                        lh2::bump(lh2::Stat::DemandedProt, u64::from(d.demanded_prot));
                     }
                     // Ownership of layer `nl`: the partition's rule (the live path),
                     // else box 2's HELLO bitmap FOR `nl` (`owns_remote` above is
@@ -9600,13 +9621,16 @@ impl HeterogeneousEngine {
                         let nl = layer as i32 + k;
                         let owns = owns_next[(k - 1) as usize].as_deref();
                         let is_box2 = |e: u32| if t2 { super::expert_pager::partition_box2(nl, e) } else { owns.is_some_and(|o| o[e as usize]) };
-                        bd.lh2.classify(lh, cs_n_used, is_box2, |e| nonres(nl, e));
+                        // L+1's gate weights (the pack) give each rank-1
+                        // prediction its margin over rank 2; L+2's are not packed.
+                        let lw: &[f32] = if k == 1 && look_ew_host.len() == lh.len() { &look_ew_host } else { &[] };
+                        bd.lh2.classify_w(lh, lw, cs_n_used, is_box2, |e| nonres(nl, e));
                         if k == 1 {
                             // The per-R counters and the dry match are L+1's only.
                             lh2::count_preds(&bd.lh2.preds);
                             bd.lh2.set_pending(nl, mp.step);
                         }
-                        let (_queued, dropped) = super::remote_experts::queue_hint_words(mp.step, nl, &bd.lh2.preds, mp.rank, mp.cap as usize);
+                        let (_queued, dropped) = super::remote_experts::queue_hint_words(mp.step, nl, &bd.lh2.preds, mp.rank, mp.cap as usize, mp.margin());
                         lh2::bump(lh2::Stat::DroppedCap, u64::from(dropped));
                     }
                 } else if !mp.mode.on() {

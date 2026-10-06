@@ -761,6 +761,27 @@ crate::knobs! {
     /// knob off; flipped to 60 live as its own per-turn A/B (restore refill after a phase
     /// switch, `pf_d_dropped`, `b2_pinned`, paged late replies in the 0-20 s phase bin).
     pub static B2_SPEC_BUDGET = Knob::int("V41_B2_SPEC_BUDGET", 0, 0, 65535).live();
+    /// `V41_B2_MISS_PREFETCH_MARGIN` (default 0 = no filter, 0..=1; live): a predicted rank-1 pick
+    /// is hinted only when its normalized gate margin over the predicted rank-2 pick (`(w1 - w2) /
+    /// sum(row)`, from the look-ahead's weights in the readback pack) exceeds this. Slice A
+    /// amendment 10-06: ~90% of predicted rank-1 non-resident picks are NOT the actual rank-1 next
+    /// layer (they land at ranks 2-6, where the prior swaps them away): the dry run's
+    /// `lh2_nonres_m{0..3}` / `lh2_hits_prot_m{0..3}` (margin >= 0 / 0.1 / 0.2 / 0.3) pick the value.
+    pub static B2_MISS_PREFETCH_MARGIN = Knob::real("V41_B2_MISS_PREFETCH_MARGIN", 0.0, 0.0, 1.0).live();
+    /// `V41_B2_MISS_PREFETCH_MAX_WORDS_STEP` (default 0 = rows-aware `10 + 5 * max(0, rows - 4)`,
+    /// 0..=65535; live): the absolute abort bar on hint words sent per decode step (design 5; a
+    /// bound must not read a runtime estimate). Tripped: the rest of the step is `dry` and
+    /// `lh2_bar_trips` counts it. The live hint volume at R=1 was 17-65 words/step with a cold
+    /// pool (10-06), so the default trips often at <= 4 rows until the pool warms; a knob so the
+    /// A/B can raise it without a restart.
+    pub static B2_MISS_PREFETCH_MAX_WORDS_STEP = Knob::int("V41_B2_MISS_PREFETCH_MAX_WORDS_STEP", 0, 0, 65535).live();
+    /// `V41_B2_MISS_PREFETCH_MAX_PER_LL_X10` (default 25 = 2.5 words per lane-layer, 0..=255; live):
+    /// the per-lane-layer abort bar at any size, judged once the step has routed 8 lane-layers.
+    pub static B2_MISS_PREFETCH_MAX_PER_LL_X10 = Knob::int("V41_B2_MISS_PREFETCH_MAX_PER_LL_X10", 25, 0, 255).live();
+    /// `V41_B2_NURSERY_PRIOR` (default off; live): with `V41_B2_MISS_PREFETCH_RANK >= 2`, mark the
+    /// hint words sent INCOMING on the mirror (`b2_mirror::note_incoming`) so the cache prior does
+    /// not swap a hinted rank-2 pick away (design 3.2). Off: the prior stays hint-blind (I2 exact).
+    pub static B2_NURSERY_PRIOR = Knob::flag("V41_B2_NURSERY_PRIOR", false).live();
 }
 
 #[cfg(test)]

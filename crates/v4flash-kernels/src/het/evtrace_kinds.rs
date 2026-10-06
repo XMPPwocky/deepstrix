@@ -165,7 +165,23 @@ pub static HUB_STEP: Kind = Kind {
 /// 5 reads); `hints_sent` = words on the wire (0 in slice A); `dropped_cap`,
 /// `stale` = words the per-request cap / the stale rule dropped;
 /// `budget_deferred` = admission / restore words the budget held back vs
-/// today's per-request rule, summed over the step's requests.
+/// today's per-request rule, summed over the step's requests. SLICE B (hints
+/// on the wire under `k1`/`k2` once box 2 answers `RESP_FLAG_NURSERY`):
+/// `demanded` = sent hints whose expert the SAME lane picked at the target
+/// layer (`demanded_prot`: of rank `<= V41_SUB_PROTECT`, i.e. a read the prior
+/// could not have avoided), `paged_hinted` = paged experts in pin replies that
+/// had been hinted this step (tail recall: the hint was late or dropped),
+/// `nursery_covered` = would-be hints already in box 2's nursery per the
+/// mirror (deduped), `look_late` = 0 under `PLACE=before` (reserved for
+/// `after`), `bar_trips` = steps that hit an abort bar (design 5) and went dry.
+/// SLICE A AMENDMENT (10-06): `dry_hits_prot_rN` = of the non-resident
+/// predictions of rank `<= N`, the ones whose own pick at the target layer
+/// is at ACTUAL rank `<= V41_SUB_PROTECT` (the prior cannot swap it: the
+/// precision that matters is `dry_hits_prot_r1 / nonres_r1`; `dry_hits_rN`
+/// is the any-rank diagnostic); `nonres_m{k}` = non-resident predicted
+/// rank-1 picks with a gate margin `>= 0 / 0.1 / 0.2 / 0.3` over the predicted
+/// rank 2, and `hits_prot_m{k}` the protected hits among them: one dry run
+/// picks `V41_B2_MISS_PREFETCH_MARGIN`.
 pub static HUB_LH2: Kind = Kind {
     id: 15,
     name: "hub_lh2",
@@ -174,6 +190,10 @@ pub static HUB_LH2: Kind = Kind {
         "lh2_cand_r1", "lh2_cand_r2", "lh2_cand_r3", "lh2_nonres_r1", "lh2_nonres_r2", "lh2_nonres_r3",
         "lh2_dry_hits_r1", "lh2_dry_hits_r2", "lh2_dry_hits_r3", "lh2_dry_words", "lh2_hints_sent", "lh2_dropped_cap", "lh2_stale",
         "lh2_budget_deferred",
+        "lh2_demanded", "lh2_demanded_prot", "lh2_paged_hinted", "lh2_nursery_covered", "lh2_look_late", "lh2_bar_trips",
+        "lh2_dry_hits_prot_r1", "lh2_dry_hits_prot_r2", "lh2_dry_hits_prot_r3",
+        "lh2_nonres_m0", "lh2_nonres_m1", "lh2_nonres_m2", "lh2_nonres_m3",
+        "lh2_hits_prot_m0", "lh2_hits_prot_m1", "lh2_hits_prot_m2", "lh2_hits_prot_m3",
     ],
 };
 
