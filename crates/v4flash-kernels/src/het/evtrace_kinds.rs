@@ -259,6 +259,15 @@ pub static B2_REQ: Kind = Kind {
         // claim into staging, or a prefill claim into main; 0 by design at the
         // default sizes).
         "stage_claims", "stage_hits", "stage_spills",
+        // the NURSERY (docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 3.2, 6):
+        // LIKELY readers running / queued at dequeue; the request's LIKELY
+        // (`REQ_FLAG_LIKELY`) words; nursery counter deltas across the request
+        // -- lands, hits (promotions), recycled (unused entries a later hint
+        // evicted = wrong hints), drops (no staging set / no nursery slot),
+        // shrunk (a promotion found no refill victim) -- and the occupied
+        // level after it. Per step: `lands = hits + recycled + delta(occupied)`.
+        "pf_run_likely", "pf_q_likely", "n_likely_words",
+        "nursery_lands", "nursery_hits", "nursery_recycled", "nursery_drops", "nursery_shrunk", "nursery_occupied",
     ],
 };
 
@@ -286,7 +295,8 @@ pub static B2_ENSURE: Kind = Kind {
 
 /// One expert read on box 2. `src`: 0 demand miss (`ensure`), 1 background
 /// read popped as certain, 2 popped speculative but made certain before its
-/// read, 3 speculative. Demand: emitted after its repack (`t_hint` = the
+/// read, 3 speculative, 4 LIKELY (a hub predicted-miss hint, landing in the
+/// nursery; `victim_*` = the recycled entry). Demand: emitted after its repack (`t_hint` = the
 /// ensure start, `t_pop` = its chunk start). Background: emitted when the
 /// compute thread LANDS it (`t_recv` = received, `t_land_*` = victim + repack
 /// + commit). `rK_start/end` = the three role reader threads; `pause_ns` =

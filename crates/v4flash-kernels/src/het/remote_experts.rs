@@ -446,6 +446,58 @@ pub mod proto {
     pub const RESP_FLAG_PIN: u32 = 1 << 14;
     pub const PIN_HDR_WORDS: usize = 4;
     pub const PIN_WORDS: usize = PIN_HDR_WORDS + RESID_WORDS;
+    /// Request flag (2026-10-06, docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md
+    /// 3.2): the PREFETCH block carries the hub's predicted-miss HINTS, each
+    /// marked by `LIKELY_WORD_BIT`, ahead of its plain words. Box 2 reads a
+    /// marked word as a LIKELY job into its NURSERY (no pin grant, no admit
+    /// gate), applying it when the FRAME ARRIVES (the early-page hook), and
+    /// answers a decode request carrying this flag with `RESP_FLAG_NURSERY`
+    /// (even with no marked word: the flag alone is the capability probe). An
+    /// older daemon echoes the flag, never sets `RESP_FLAG_NURSERY`, and skips
+    /// a marked word (its layer field is out of range), so the hub sends marked
+    /// words only after seeing the reply flag.
+    pub const REQ_FLAG_LIKELY: u32 = 2048;
+    /// A PREFETCH word `(layer << 16) | expert` with this bit set is a LIKELY
+    /// hint (layers use bits 16-21, experts 0-9: the bit is free).
+    pub const LIKELY_WORD_BIT: u32 = 1 << 31;
+    /// RESPONSE flag: a NURSERY block (`NURSERY_WORDS` u32s) follows the pin
+    /// block / residency map (whichever is last): the daemon understood
+    /// `REQ_FLAG_LIKELY` (the hub's capability signal -- an echoed request bit
+    /// proves nothing) and these are up to `NURSERY_WORDS` nursery entries as
+    /// `(layer << 16) | expert`, the reply's own layer's entries FIRST (all of
+    /// them when they fit, so the hub may replace that layer's NURSERY row),
+    /// then other layers' in rotation, padded with `NURSERY_NONE`. Only ever
+    /// set on a reply to a request that carried `REQ_FLAG_LIKELY` (an older hub
+    /// would fail the frame-length check).
+    pub const RESP_FLAG_NURSERY: u32 = 1 << 13;
+    pub const NURSERY_WORDS: usize = 12;
+    pub const NURSERY_NONE: u32 = u32::MAX;
+
+    /// Is `w` a LIKELY-marked PREFETCH word (`REQ_FLAG_LIKELY`)?
+    pub fn likely_word(w: u32) -> bool {
+        w & LIKELY_WORD_BIT != 0
+    }
+
+    /// Mark a word LIKELY.
+    pub fn mark_likely(w: u32) -> u32 {
+        w | LIKELY_WORD_BIT
+    }
+
+    /// A request's PREFETCH words split into `(likely, plain)`, the marks
+    /// stripped: under `REQ_FLAG_LIKELY` the marked words are the hints;
+    /// without the flag every word is plain (a marked word is kept as is, so
+    /// it fails the daemon's layer check and is skipped).
+    pub fn split_prefetch_words(flags: u32, words: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        let (mut likely, mut plain) = (Vec::new(), Vec::new());
+        for &w in words {
+            if flags & REQ_FLAG_LIKELY != 0 && likely_word(w) {
+                likely.push(w & !LIKELY_WORD_BIT);
+            } else {
+                plain.push(w);
+            }
+        }
+        (likely, plain)
+    }
     /// A REQUEST of at most this many rows is DECODE-SHAPED for pinning: box 2
     /// makes its picks pin-eligible at the reply, the hub counts them for
     /// release ranking. Per request, never per merged pass (two mergeable
@@ -553,6 +605,34 @@ pub mod proto {
         let mut paged = [0u32; RESID_WORDS];
         paged.copy_from_slice(&w[PIN_HDR_WORDS..]);
         Some(PinReply { epoch: w[0], pinned: w[1], budget: w[2], paged })
+    }
+
+    /// Append the NURSERY block (after the residency map and pin block, if
+    /// any) and set `RESP_FLAG_NURSERY`. Call before `patch_len`.
+    pub fn append_nursery(buf: &mut AlignedBuf, words: &[u32; NURSERY_WORDS]) {
+        const FLAGS_OFF: usize = HDR_LEN + 8;
+        let mut f = [0u8; 4];
+        f.copy_from_slice(&buf.as_bytes()[FLAGS_OFF..FLAGS_OFF + 4]);
+        let flags = u32::from_le_bytes(f) | RESP_FLAG_NURSERY;
+        buf.as_bytes_mut()[FLAGS_OFF..FLAGS_OFF + 4].copy_from_slice(&flags.to_le_bytes());
+        for &w in words {
+            buf.put_u32(w);
+        }
+    }
+
+    /// The NURSERY block of a RESPONSE (`RESP_FLAG_NURSERY`), if any: the
+    /// entries as `(layer << 16) | expert`, `NURSERY_NONE` padding excluded.
+    pub fn response_nursery<'a>(buf: &'a AlignedBuf, m: &ResponseMeta) -> Option<&'a [u32]> {
+        if m.flags & RESP_FLAG_NURSERY == 0 {
+            return None;
+        }
+        let off = RESP_DATA_OFF
+            + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
+            + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 };
+        let w = buf.view::<u32>(off, NURSERY_WORDS);
+        let n = w.iter().position(|&x| x == NURSERY_NONE).unwrap_or(NURSERY_WORDS);
+        Some(&w[..n])
     }
 
     pub fn parse_header(h: &[u8]) -> eyre::Result<Header> {
@@ -958,7 +1038,8 @@ pub mod proto {
         let want = RESP_DATA_OFF
             + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
             + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 }
-            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 };
+            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_NURSERY != 0 { NURSERY_WORDS * 4 } else { 0 };
         if p.len() != want {
             return Err(eyre!("response: frame len {} != expected {want}", p.len()));
         }
@@ -2002,6 +2083,19 @@ fn ev_pin_fields(
     ]
 }
 
+/// `evtrace` `b2_req` nursery fields, `nursery_lands` .. `nursery_occupied` in
+/// `B2_REQ` order: counter deltas across the request (lands, hits, recycled,
+/// drops, shrunk), then the occupied LEVEL after it. Per step the readers
+/// check `lands = hits + recycled + delta(occupied)` (design section 6).
+fn ev_nursery_fields(before: NurseryCounters, after: (NurseryCounters, u32)) -> [f64; 6] {
+    let (a, occupied) = after;
+    let d = |x: u64, y: u64| x.saturating_sub(y) as f64;
+    [
+        d(a.lands, before.lands), d(a.hits, before.hits), d(a.recycled, before.recycled),
+        d(a.drops, before.drops), d(a.shrunk, before.shrunk), f64::from(occupied),
+    ]
+}
+
 /// `evtrace` `b2_req` prefill-staging fields, `stage_claims` .. `stage_spills`
 /// in `B2_REQ` order: counter deltas across the request.
 fn ev_stage_fields(before: StageCounters, after: StageCounters) -> [f64; 3] {
@@ -2341,6 +2435,10 @@ pub struct ExpertShard {
     /// Pin mode: each queued request's picks NOT landed when its frame
     /// ARRIVED (see [`EarlyPaged`]). Empty unless pins are on.
     pub early_paged: EarlyPaged,
+    /// Frames (by seq) whose LIKELY words were applied at arrival
+    /// (`likely_words_in`), so the dequeue does not apply them twice. A
+    /// bounded ring like `EarlyPaged`.
+    likely_seen: std::collections::VecDeque<u32>,
     /// Cumulative time the compute thread spent BLOCKED in `admit_prefetched`
     /// waiting for a prefetch read it needs this request (2026-09-22). Also
     /// added to the layer's `read_ns`, see the note there.
@@ -2451,6 +2549,8 @@ struct ShardPool {
     /// Per layer: `ensure` passes served (`note_serve`), the unused rule's clock.
     serves: Vec<u64>,
     nc: NurseryCounters,
+    /// `nursery_words`' rotation over the other layers' entries.
+    nursery_cursor: usize,
 }
 
 /// Nursery counters (cumulative since `enable_paging`; `b2_req` reports
@@ -3211,7 +3311,38 @@ impl ShardPool {
             nursery_land: vec![(0, 0); n_slots],
             serves: vec![0; N_LAYER as usize],
             nc: NurseryCounters::default(),
+            nursery_cursor: 0,
         }
+    }
+
+    /// The reply's NURSERY block for `layer` (`proto::RESP_FLAG_NURSERY`):
+    /// the layer's own entries first (all of them when they fit: the hub
+    /// replaces that layer's row), then other layers' entries in rotation,
+    /// `NURSERY_NONE`-padded.
+    fn nursery_words(&mut self, layer: u32) -> [u32; proto::NURSERY_WORDS] {
+        let mut w = [proto::NURSERY_NONE; proto::NURSERY_WORDS];
+        let mut n = 0;
+        let entries: Vec<(usize, (u32, u32))> =
+            self.nursery.iter().enumerate().filter_map(|(sl, &f)| if f { self.owner_of[sl].map(|k| (sl, k)) } else { None }).collect();
+        for &(_, (l, e)) in entries.iter().filter(|(_, k)| k.0 == layer) {
+            if n == w.len() {
+                return w;
+            }
+            w[n] = (l << 16) | e;
+            n += 1;
+        }
+        let others: Vec<(u32, u32)> = entries.iter().filter(|(_, k)| k.0 != layer).map(|&(_, k)| k).collect();
+        if !others.is_empty() {
+            let mut taken = 0;
+            while taken < others.len() && n < w.len() {
+                let (l, e) = others[(self.nursery_cursor + taken) % others.len()];
+                w[n] = (l << 16) | e;
+                n += 1;
+                taken += 1;
+            }
+            self.nursery_cursor = (self.nursery_cursor + taken) % others.len();
+        }
+        w
     }
 
     // ---- the nursery (design 3.2) ----
@@ -4570,6 +4701,7 @@ impl ExpertShard {
             park_prefill: false,
             req_prefill: false,
             early_paged: EarlyPaged::default(),
+            likely_seen: Default::default(),
             prefetch_wait_ns: 0,
             ev_admit: [0; 5],
         })
@@ -5188,13 +5320,15 @@ impl ExpertShard {
     /// queued certain / speculative, free staging sets, pending keys), their
     /// cumulative hinted / admitted / dropped / waited / promoted, and the
     /// pool's resident count.
-    pub fn ev_pf_snapshot(&self) -> [f64; 12] {
-        let mut v = [f64::NAN; 12];
+    pub fn ev_pf_snapshot(&self) -> [f64; 14] {
+        let mut v = [f64::NAN; 14];
         if let Some(p) = self.prefetch.as_ref() {
             v[..4].copy_from_slice(&p.queue.counts());
             v[4] = p.free.len() as f64;
             v[5] = p.pending.len() as f64;
             v[6..11].copy_from_slice(&[p.hinted as f64, p.admitted as f64, p.dropped as f64, p.waited as f64, p.promoted as f64]);
+            // Running / queued LIKELY jobs (`b2_req` `pf_run_likely`, `pf_q_likely`).
+            v[12..14].copy_from_slice(&p.queue.counts_likely());
         }
         v[11] = self.pool.as_ref().map_or(f64::NAN, |p| p.slot_of.len() as f64);
         v
@@ -5359,6 +5493,40 @@ impl ExpertShard {
         self.pool.as_ref().map_or(0, |p| p.stage_slots())
     }
 
+    /// The nursery is on (`knobs::nursery > 0` at `enable_paging`): LIKELY
+    /// words land there and decode replies to `REQ_FLAG_LIKELY` requests carry
+    /// `RESP_FLAG_NURSERY`.
+    pub fn nursery_on(&self) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.nursery_target > 0)
+    }
+
+    /// The reply's NURSERY block for `layer` (`ShardPool::nursery_words`).
+    pub fn nursery_words(&mut self, layer: u32) -> [u32; proto::NURSERY_WORDS] {
+        match self.pool.as_mut() {
+            Some(p) => p.nursery_words(layer),
+            None => [proto::NURSERY_NONE; proto::NURSERY_WORDS],
+        }
+    }
+
+    /// Cumulative nursery counters and the occupied level (`b2_req`, the stats line).
+    pub fn nursery_counters(&self) -> (NurseryCounters, u32) {
+        self.pool.as_ref().map_or((NurseryCounters::default(), 0), |p| (p.nc, p.nursery_occupied()))
+    }
+
+    /// A frame's LIKELY words (`proto::split_prefetch_words`) at the first
+    /// sight of frame `seq` -- the early-page hook at arrival, else the
+    /// dequeue; the second sight is a no-op. Returns how many were queued.
+    pub fn likely_words_in(&mut self, seq: u32, likely: &[u32]) -> usize {
+        if likely.is_empty() || self.likely_seen.contains(&seq) {
+            return 0;
+        }
+        if self.likely_seen.len() >= EarlyPaged::MAX {
+            self.likely_seen.pop_front();
+        }
+        self.likely_seen.push_back(seq);
+        self.prefetch_words_likely(likely)
+    }
+
     /// Cumulative prefill-staging counters (zero without a pool).
     pub fn stage_counters(&self) -> StageCounters {
         self.pool.as_ref().map_or_else(StageCounters::default, |p| p.sc)
@@ -5401,6 +5569,7 @@ impl ExpertShard {
             p.pins = PinBook::off();
         }
         self.early_paged.clear();
+        self.likely_seen.clear();
     }
 
     /// The hub asked for pins (`REQ_FLAG_PIN`): turn them on for this
@@ -7525,7 +7694,7 @@ pub fn serve_connection(
             let ev_t_dequeue = if ev_on { super::evtrace::now() } else { nan };
             let (ev_t_hdr, ev_t_frame) = if ev_on { (super::evtrace::inst_to_raw(t_first), t2 as f64) } else { (nan, nan) };
             let ev_idle_us = t_prev_ready.map_or(nan, |p| t_start.saturating_duration_since(p).as_secs_f64() * 1e6);
-            let ev_pf0 = if ev_on { shard.ev_pf_snapshot() } else { [nan; 12] };
+            let ev_pf0 = if ev_on { shard.ev_pf_snapshot() } else { [nan; 14] };
             let mut ev_promised = nan;
             if ev_on {
                 EV_CUR_SEQ.store(u64::from(hdr.seq), std::sync::atomic::Ordering::Relaxed);
@@ -7664,22 +7833,35 @@ pub fn serve_connection(
                 shard.pump_restore();
                 let ev_pin0 = shard.pin_counters();
                 let ev_sc0 = shard.stage_counters();
+                // LIKELY words (`REQ_FLAG_LIKELY`, design 3.2) are split off
+                // the PREFETCH block: no pin grant, no admission, applied at
+                // arrival by the early-page hook (`likely_words_in` is a no-op
+                // the second time) -- here only when the frame was never
+                // pulled while another request ran.
+                let (likely_a, plain_a) = proto::split_prefetch_words(req.flags, req.prefetch);
+                let (likely_b, plain_b) = match reqb.as_ref() {
+                    Some(rb) => proto::split_prefetch_words(rb.flags, rb.prefetch),
+                    None => (Vec::new(), Vec::new()),
+                };
                 // A prefill-shaped request's prefetch words are layer-major group
                 // prefetch, never pin grants (they would pin prefill experts).
-                shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { req.prefetch });
+                shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { &plain_a });
                 if let Some(rb) = reqb.as_ref() {
-                    shard.pin_apply_words(rb.release, if rb.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { rb.prefetch });
+                    shard.pin_apply_words(rb.release, if rb.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { &plain_b });
                 }
                 if let Some(rb) = reqb.as_ref() {
                     if !rb.hint_admit.is_empty() {
                         shard.hint_evict_first(rb.hint_admit);
                     }
-                    if !rb.prefetch.is_empty() {
+                    if !plain_b.is_empty() {
                         if rb.b > proto::PIN_DECODE_MAX_ROWS {
-                            shard.prefetch_words_prefill(rb.prefetch);
+                            shard.prefetch_words_prefill(&plain_b);
                         } else {
-                            shard.prefetch_words(rb.prefetch);
+                            shard.prefetch_words(&plain_b);
                         }
+                    }
+                    if let Some((hb, ..)) = partner.as_ref() {
+                        shard.likely_words_in(hb.seq, &likely_b);
                     }
                 }
                 // Paging THIS request did on our own NVMe. `run_path` calls
@@ -7691,13 +7873,15 @@ pub fn serve_connection(
                 if !req.hint_admit.is_empty() {
                     shard.hint_evict_first(req.hint_admit);
                 }
-                if !req.prefetch.is_empty() {
+                if !plain_a.is_empty() {
                     if req.b > proto::PIN_DECODE_MAX_ROWS {
-                        shard.prefetch_words_prefill(req.prefetch);
+                        shard.prefetch_words_prefill(&plain_a);
                     } else {
-                        shard.prefetch_words(req.prefetch);
+                        shard.prefetch_words(&plain_a);
                     }
                 }
+                shard.likely_words_in(hdr.seq, &likely_a);
+                let ev_nc0 = shard.nursery_counters().0;
                 let ev_t_hints = if ev_on { super::evtrace::now() } else { nan };
                 let ev_pd0 = shard.layer_page_detail(req.layer);
                 let ev_pw0 = shard.prefetch_wait_ns;
@@ -7754,6 +7938,9 @@ pub fn serve_connection(
                             return;
                         }
                         shard.note_early_paged(hdr.seq, nreq.layer, nreq.sel);
+                        // The frame's LIKELY words at ARRIVAL (design 3.2: the
+                        // b2q tail), queued behind its own certain reads.
+                        let (likely, _) = proto::split_prefetch_words(nreq.flags, nreq.prefetch);
                         let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
                         for &e in nreq.sel {
                             if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
@@ -7769,6 +7956,7 @@ pub fn serve_connection(
                             shard.prefetch_words_cls(&words, true, pf_class);
                             shard.pinned.clear();
                         }
+                        shard.likely_words_in(hdr.seq, &likely);
                     };
                     let pull = |shard: &mut ExpertShard, pending: &mut std::collections::VecDeque<Inbound>| {
                         while let Ok(m) = rx_in_ref.try_recv() {
@@ -7982,6 +8170,11 @@ pub fn serve_connection(
                     }
                     None => {}
                 }
+                // NURSERY block (design 3.2): on every reply to a `REQ_FLAG_LIKELY`
+                // request while the nursery is on, words or none (the capability).
+                if req.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
+                    proto::append_nursery(&mut resp, &shard.nursery_words(req.layer));
+                }
                 // The partner's reply: rows [b, b + bb) of the same pass. Page
                 // time and miss count are reported on THIS request only, so the
                 // hub's per-step sums are unchanged.
@@ -8010,6 +8203,9 @@ pub fn serve_connection(
                                 proto::append_residency(&mut resp_b, &shard.residency_words(rb.layer));
                             }
                             None => {}
+                        }
+                        if rb.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
+                            proto::append_nursery(&mut resp_b, &shard.nursery_words(rb.layer));
                         }
                         proto::patch_len(&mut resp_b);
                         let t_ready_b = Instant::now();
@@ -8113,6 +8309,11 @@ pub fn serve_connection(
                     v.push(pf1[11]);
                     v.extend_from_slice(&ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &paged));
                     v.extend_from_slice(&ev_stage_fields(ev_sc0, shard.stage_counters()));
+                    // LIKELY readers at dequeue, this request's LIKELY words, the
+                    // nursery deltas across the request and the occupied level.
+                    v.extend_from_slice(&ev_pf0[12..14]);
+                    v.push(likely_a.len() as f64);
+                    v.extend_from_slice(&ev_nursery_fields(ev_nc0, shard.nursery_counters()));
                     super::evtrace::emit(&super::evtrace_kinds::B2_REQ, &v);
                     // The merged partner: same pass, its own identity and arrival.
                     if let (Some(rb), Some((hb, _, tfb, _, t2b))) = (reqb.as_ref(), partner.as_ref()) {
@@ -8140,6 +8341,8 @@ pub fn serve_connection(
                             ("pin_drops_no_victim", nan), ("pin_evictions", nan),
                             ("n_paged", paged_b.iter().map(|w| w.count_ones()).sum::<u32>() as f64),
                             ("stage_claims", nan), ("stage_hits", nan), ("stage_spills", nan),
+                            ("n_likely_words", likely_b.len() as f64), ("nursery_lands", nan), ("nursery_hits", nan),
+                            ("nursery_recycled", nan), ("nursery_drops", nan), ("nursery_shrunk", nan),
                         ] {
                             super::evtrace::set_named(k, &mut v, name, x);
                         }
@@ -8225,6 +8428,13 @@ pub fn serve_connection(
                                 pfs.push_str(&format!(
                                     " | stage {} claims={} hits={} spill_in={} spill_out={} drops={}",
                                     shard.stage_slots(), s.claims, s.hits, s.spill_in, s.spill_out, s.drops
+                                ));
+                            }
+                            if shard.nursery_on() {
+                                let (n, occupied) = shard.nursery_counters();
+                                pfs.push_str(&format!(
+                                    " | nursery lands={} hits={} recycled={} drops={} shrunk={} occupied={}",
+                                    n.lands, n.hits, n.recycled, n.drops, n.shrunk, occupied
                                 ));
                             }
                             // `pread` here is the PROCESS-WIDE read counter differenced
@@ -8343,17 +8553,20 @@ fn serve_interleaved(
     shard.set_request_mode(req.flags);
     let ev_pin0 = shard.pin_counters();
     let ev_sc0 = shard.stage_counters();
-    shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { req.prefetch });
+    let (likely, plain) = proto::split_prefetch_words(req.flags, req.prefetch);
+    shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { &plain });
     if !req.hint_admit.is_empty() {
         shard.hint_evict_first(req.hint_admit);
     }
-    if !req.prefetch.is_empty() {
+    if !plain.is_empty() {
         if req.b > proto::PIN_DECODE_MAX_ROWS {
-            shard.prefetch_words_prefill(req.prefetch);
+            shard.prefetch_words_prefill(&plain);
         } else {
-            shard.prefetch_words(req.prefetch);
+            shard.prefetch_words(&plain);
         }
     }
+    shard.likely_words_in(hdr.seq, &likely);
+    let ev_nc0 = shard.nursery_counters().0;
     let ev_pd0 = shard.layer_page_detail(req.layer);
     let ev_pw0 = shard.prefetch_wait_ns;
     let ev_t_run0 = if ev_on { super::evtrace::now() } else { f64::NAN };
@@ -8399,6 +8612,9 @@ fn serve_interleaved(
         }
         None => {}
     }
+    if req.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
+        proto::append_nursery(&mut resp, &shard.nursery_words(req.layer));
+    }
     proto::patch_len(&mut resp);
     let t_ready = Instant::now();
     let t_server_us = (t_ready - t_done).as_micros() as u32;
@@ -8412,6 +8628,7 @@ fn serve_interleaved(
         let under = if g.0 == u64::MAX { f64::NAN } else { g.0 as f64 };
         let pf = ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &paged);
         let sf = ev_stage_fields(ev_sc0, shard.stage_counters());
+        let nf = ev_nursery_fields(ev_nc0, shard.nursery_counters());
         super::evtrace::emit_named(&super::evtrace_kinds::B2_REQ, &[
             ("pin_on", pf[0]), ("pin_pinned", pf[1]), ("pin_budget", pf[2]), ("pin_epoch", pf[3]),
             ("pin_release_words", pf[4]), ("pin_new", pf[5]), ("pin_denied", pf[6]), ("pin_drops_no_victim", pf[7]),
@@ -8430,6 +8647,8 @@ fn serve_interleaved(
             ("path_decode", f64::from(u8::from(timing.path_decode))), ("two_pass", f64::from(u8::from(timing.two_pass))),
             ("n_work_items", f64::from(timing.n_work_items)), ("n_missing", f64::from(timing.n_missing)),
             ("exec_h2d_us", timing.h2d.as_secs_f64() * 1e6), ("exec_gpu_us", timing.gpu.as_secs_f64() * 1e6),
+            ("n_likely_words", likely.len() as f64), ("nursery_lands", nf[0]), ("nursery_hits", nf[1]), ("nursery_recycled", nf[2]),
+            ("nursery_drops", nf[3]), ("nursery_shrunk", nf[4]), ("nursery_occupied", nf[5]),
         ]);
     }
     resp.as_bytes_mut()[proto::HDR_LEN + 20..proto::HDR_LEN + 24].copy_from_slice(&t_server_us.to_le_bytes());
@@ -9871,6 +10090,127 @@ mod tests {
         assert!(proto::response_residency(&old, &m).is_some());
     }
 
+    /// `REQ_FLAG_LIKELY` / `LIKELY_WORD_BIT` / `RESP_FLAG_NURSERY` (design
+    /// 3.2): marked hint words ride the PREFETCH block and split off; the
+    /// NURSERY block sits after whatever of the residency map and pin block
+    /// is present, is length-checked, and an echoed request flag alone (an
+    /// older daemon) is no capability.
+    #[test]
+    fn likely_and_nursery_proto_roundtrip() {
+        let nu = N_EXPERT_USED;
+        let xq = vec![7u8; XQ_BYTES_PER_TOKEN];
+        let sel: Vec<i32> = (0..nu as i32).collect();
+        let ew = vec![0.25f32; nu];
+        let hint = |l: u32, e: u32| proto::mark_likely((l << 16) | e);
+        let pf = [hint(4, 5), hint(4, 9), (3u32 << 16) | 5, (6u32 << 16) | 1];
+        let mut buf = AlignedBuf::with_capacity(1 << 16);
+        let f = proto::REQ_FLAG_PIN | proto::REQ_FLAG_PREFETCH | proto::REQ_FLAG_LIKELY | proto::REQ_FLAG_DECODE;
+        proto::encode_request(&mut buf, 1, 3, 1, f, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &pf, &[]);
+        let r = proto::decode_request(&buf).unwrap();
+        assert_eq!(r.prefetch, &pf[..], "the wire carries the marks");
+        let (likely, plain) = proto::split_prefetch_words(r.flags, r.prefetch);
+        assert_eq!(likely, vec![(4 << 16) | 5, (4 << 16) | 9]);
+        assert_eq!(plain, vec![(3 << 16) | 5, (6 << 16) | 1]);
+        assert!(likely.iter().all(|&w| !proto::likely_word(w)));
+        // Without the flag a marked word stays marked (and out of range for the daemon).
+        let (l2, p2) = proto::split_prefetch_words(f & !proto::REQ_FLAG_LIKELY, r.prefetch);
+        assert!(l2.is_empty() && p2 == pf.to_vec());
+        assert!((p2[0] >> 16) as usize >= N_LAYER as usize, "an older daemon skips it by the layer check");
+
+        let (b, n) = (1usize, N_EMBD as usize);
+        let mut nursery = [proto::NURSERY_NONE; proto::NURSERY_WORDS];
+        nursery[0] = (3 << 16) | 7;
+        nursery[1] = (9 << 16) | 383;
+        let mut map = [0u32; proto::RESID_WORDS];
+        map[0] = 0b1001;
+        let paged = [0u32; proto::RESID_WORDS];
+        // After the residency map and pin block.
+        let mut resp = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut resp, 1, 3, b as u32, f | proto::REQ_FLAG_RESID, 0, 1, 2, N_EMBD, 2, 3, 4);
+        resp.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::append_residency(&mut resp, &map);
+        proto::append_pin(&mut resp, 5, 7, 9, &paged);
+        proto::append_nursery(&mut resp, &nursery);
+        proto::patch_len(&mut resp);
+        let m = proto::decode_response_meta(&resp).unwrap();
+        assert_ne!(m.flags & proto::RESP_FLAG_NURSERY, 0);
+        assert_eq!(proto::response_residency(&resp, &m).unwrap(), &map[..]);
+        assert_eq!(proto::response_pin(&resp, &m).unwrap().epoch, 5);
+        assert_eq!(proto::response_nursery(&resp, &m).unwrap(), &nursery[..2], "padding excluded");
+        // After the residency map alone; alone; and all-padding (the capability with no entry).
+        for (resid, words) in [(true, nursery), (false, nursery), (false, [proto::NURSERY_NONE; proto::NURSERY_WORDS])] {
+            let mut r2 = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+            proto::begin_response(&mut r2, 1, 3, b as u32, proto::REQ_FLAG_LIKELY, 0, 1, 2, N_EMBD, 2, 3, 4);
+            r2.resize(proto::RESP_DATA_OFF + n * 2);
+            if resid {
+                proto::append_residency(&mut r2, &map);
+            }
+            proto::append_nursery(&mut r2, &words);
+            proto::patch_len(&mut r2);
+            let m = proto::decode_response_meta(&r2).unwrap();
+            let got = proto::response_nursery(&r2, &m).unwrap();
+            assert_eq!(got.len(), words.iter().filter(|&&w| w != proto::NURSERY_NONE).count());
+            assert_eq!(proto::response_residency(&r2, &m).is_some(), resid);
+        }
+        // The length check: a flagged block that is not there fails the frame.
+        let mut bad = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut bad, 1, 3, b as u32, proto::RESP_FLAG_NURSERY, 0, 1, 2, N_EMBD, 2, 3, 4);
+        bad.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::patch_len(&mut bad);
+        assert!(proto::decode_response_meta(&bad).is_err());
+        // Older daemon: echoes REQ_FLAG_LIKELY, appends nothing -> no capability.
+        let mut old = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut old, 1, 3, b as u32, f, 0, 1, 2, N_EMBD, 2, 3, 4);
+        old.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::patch_len(&mut old);
+        let m = proto::decode_response_meta(&old).unwrap();
+        assert_ne!(m.flags & proto::REQ_FLAG_LIKELY, 0, "echoed");
+        assert!(proto::response_nursery(&old, &m).is_none());
+        // The flag bits are disjoint from the miss mask and the other flags.
+        assert_eq!(proto::RESP_FLAG_NURSERY & (proto::RESP_MISS_MASK | proto::RESP_FLAG_PIN | proto::RESP_FLAG_RESID | 0x7FF | proto::REQ_FLAG_LIKELY), 0);
+        assert_eq!(proto::REQ_FLAG_LIKELY, 2048);
+    }
+
+    /// `nursery_words`: the reply layer's entries first, then other layers'
+    /// in rotation, padded; the cursor advances across calls.
+    #[test]
+    fn nursery_words_report_own_layer_first_then_rotate() {
+        let ids: Vec<u32> = (0..4).collect();
+        let mut pool = ShardPool::seeded(80, &[(1, 0, &ids), (2, 4, &ids)], 0.0);
+        assert_eq!(pool.carve_nursery(16), 16, "80 slots: a quarter");
+        for sl in 0..80 {
+            if pool.nursery[sl] {
+                let _ = pool.evict(sl as u32, 0);
+            }
+        }
+        // 3 entries of layer 7, 14 of layer 8 (one short of... 13 fit beside them? 12 words total).
+        let free: Vec<u32> = (0..80).filter(|&sl| pool.nursery[sl as usize]).collect();
+        for (i, &sl) in free.iter().enumerate() {
+            let key = if i < 3 { (7, i as u32) } else { (8, i as u32) };
+            pool.land_nursery(sl, key);
+        }
+        let w = pool.nursery_words(7);
+        assert!(w.iter().all(|&x| x != proto::NURSERY_NONE), "12 of 16 entries fit");
+        assert!(w[..3].iter().all(|&x| x >> 16 == 7), "{w:?}");
+        assert!(w[3..].iter().all(|&x| x >> 16 == 8));
+        let first: Vec<u32> = w[3..].to_vec();
+        let w2 = pool.nursery_words(7);
+        assert_ne!(w2[3..].to_vec(), first, "the rotation moved on");
+        let mut seen: std::collections::HashSet<u32> = w[3..].iter().copied().collect();
+        seen.extend(w2[3..].iter().copied());
+        assert_eq!(seen.len(), 13, "two reports cover every layer-8 entry");
+        // A layer with no entries: the others fill the block; an empty nursery is all padding.
+        assert!(pool.nursery_words(5).iter().all(|&x| x != proto::NURSERY_NONE));
+        let mut empty = ShardPool::seeded(8, &[(1, 0, &ids)], 0.0);
+        assert_eq!(empty.carve_nursery(2), 2);
+        for sl in 0..8 {
+            if empty.nursery[sl] {
+                let _ = empty.evict(sl as u32, 0);
+            }
+        }
+        assert_eq!(empty.nursery_words(1), [proto::NURSERY_NONE; proto::NURSERY_WORDS]);
+    }
+
     /// `PinBook`: eligibility, pin on report within budget (the pass's own
     /// grants first), a denial drops the grant, a grant expires after
     /// `PIN_GRANT_TTL` reports, release (every word advances the epoch),
@@ -10666,6 +11006,13 @@ mod tests {
             // band and hit there across chunks, never spilled out (STAGE >=
             // the union); the per-event invariants live in `Box2Sim`.
             assert!(s.sc.claims > 100 && s.sc.hits > 50 && s.sc.spill_out == 0, "seed {seed}: {s:?}");
+            // The nursery was exercised: LIKELY words landed, some were
+            // promoted on use, some recycled, blocks were reported and none
+            // of their entries was ever in the pin map; the per-event
+            // invariants live in `pin_sim`'s `check`.
+            assert!(s.nc.lands > 30 && s.nc.hits > 5 && s.nc.recycled > 5, "seed {seed}: nursery not exercised {s:?}");
+            assert!(s.nursery_reported > 50 && s.nursery_pin_violations == 0, "seed {seed}: {s:?}");
+            assert!(s.nursery_covered > 0, "seed {seed}: the mirror never deduped a hint");
             eprintln!("pin sim seed {seed}: {s:?}");
         }
         // Mutation: a hub that applies maps without masking later releases.
@@ -10693,6 +11040,13 @@ mod tests {
         max_pinned: u32,
         /// The pool's prefill-staging counters at the end.
         sc: StageCounters,
+        /// The pool's nursery counters at the end; entries reported in
+        /// NURSERY blocks; reported entries found in the pin map (must be 0);
+        /// hub-side hints skipped because the NURSERY mirror had the entry.
+        nc: NurseryCounters,
+        nursery_reported: u64,
+        nursery_pin_violations: u64,
+        nursery_covered: u64,
     }
 
     /// xorshift64.
@@ -10714,6 +11068,9 @@ mod tests {
         sel: Vec<i32>,
         prefetch: Vec<u32>,
         release: Vec<u32>,
+        /// The LIKELY words (`REQ_FLAG_LIKELY`, marks stripped): hints for
+        /// the next layer's picks.
+        likely: Vec<u32>,
         /// Hub side: the sent picks the ledger held at submit.
         held: [u32; proto::RESID_WORDS],
         /// Box 2 has pulled this frame off the wire (its arrival bits noted).
@@ -10738,8 +11095,9 @@ mod tests {
     struct Box2Sim {
         pool: ShardPool,
         /// Background reads in flight (prefetch words, early page, park), and
-        /// whether each is a PREFILL-shaped request's own (`PfJob::stage`).
-        bg: Vec<((u32, u32), bool)>,
+        /// whether each is a PREFILL-shaped request's own (`PfJob::stage`) /
+        /// a LIKELY hint (`PfJob::likely`: lands in the nursery).
+        bg: Vec<((u32, u32), bool, bool)>,
         budget: u32,
         per: u32,
         global: bool,
@@ -10768,20 +11126,27 @@ mod tests {
             v
         }
 
-        /// `prefetch_words_cls`: skip resident / in flight; bounded sets.
-        fn queue_bg(&mut self, words: &[u32], stage: bool) {
+        /// `prefetch_words_cls` / `prefetch_words_likely`: skip resident / in
+        /// flight; bounded sets (LIKELY words have their reserved pair too).
+        fn queue_bg(&mut self, words: &[u32], stage: bool, likely: bool) {
             let stage = stage && self.pool.stage_slots() > 0;
+            let likely = likely && self.pool.nursery_target > 0;
             for &w in words {
                 let key = (w >> 16, w & 0xFFFF);
-                if !self.pool.slot_of.contains_key(&key) && !self.bg.iter().any(|b| b.0 == key) && self.bg.len() < Self::BG_SETS {
-                    self.bg.push((key, stage));
+                let cap = Self::BG_SETS + if likely { B2_LIKELY_SETS } else { 0 };
+                if !self.pool.slot_of.contains_key(&key) && !self.bg.iter().any(|b| b.0 == key) && self.bg.len() < cap {
+                    self.bg.push((key, stage, likely));
+                } else if likely && !self.pool.slot_of.contains_key(&key) && !self.bg.iter().any(|b| b.0 == key) {
+                    self.pool.nc.drops += 1;
                 }
             }
         }
 
         /// `admit_prefetched`: a random subset has completed; land it in random
         /// order, protecting `want` of `layer` and `extra`; drop the landing
-        /// when every victim is pinned (or, staged, when staging has none).
+        /// when every victim is pinned (or, staged, when staging has none). A
+        /// LIKELY read lands in the nursery (`nursery_victim`), or straight
+        /// into main as a land + hit when the pass wants it.
         fn admit(&mut self, rng: &mut SimRng, layer: u32, want: &[u32], extra: &[(u32, u32)]) {
             let mut i = 0;
             while i < self.bg.len() {
@@ -10790,8 +11155,26 @@ mod tests {
                     continue;
                 }
                 let j = i + rng.below((self.bg.len() - i) as u64) as usize;
-                let (key, stage) = self.bg.swap_remove(j);
+                let (key, stage, likely) = self.bg.swap_remove(j);
                 if self.pool.slot_of.contains_key(&key) {
+                    continue;
+                }
+                let wanted = key.0 == layer && want.contains(&key.1);
+                if likely && !wanted {
+                    match self.pool.nursery_victim(layer, want, extra, 2) {
+                        Some(v) => {
+                            assert!(self.pool.nursery[v as usize] && (v as u32) < self.pool.stage);
+                            assert!(!self.pool.owner_of[v as usize].is_some_and(|(l, e)| self.pool.pins.is_pinned(l, e)), "a pinned nursery entry");
+                            self.st.evictions += u64::from(self.pool.evict(v, layer).is_some());
+                            self.pool.land_nursery(v, key);
+                            self.pool.nursery_refill_free();
+                            self.st.bg_landed += 1;
+                        }
+                        None => {
+                            self.pool.nc.drops += 1;
+                            self.st.bg_dropped += 1;
+                        }
+                    }
                     continue;
                 }
                 let region = self.region(key.0);
@@ -10800,8 +11183,13 @@ mod tests {
                     Some(v) => {
                         // STAGING INVARIANT: a landing takes a slot of its own band.
                         assert_eq!(v >= self.pool.stage, stage, "landing of {key:?} (stage {stage}) at slot {v}");
+                        assert!(!self.pool.nursery[v as usize], "a main landing took nursery slot {v}");
                         self.st.evictions += u64::from(self.pool.evict(v, layer).is_some());
                         self.pool.land(v, key, stage);
+                        if likely {
+                            self.pool.nc.lands += 1;
+                            self.pool.nc.hits += 1;
+                        }
                         self.st.bg_landed += 1;
                     }
                     None => {
@@ -10822,9 +11210,22 @@ mod tests {
             let want = Self::distinct(sel);
             self.admit(rng, layer, &want, extra);
             let region = self.region(layer);
+            self.pool.note_serve(layer);
             let mut claims = Vec::new();
             for &e in &want {
+                let was_nursery = self.pool.in_nursery(layer, e);
                 if self.pool.touch_hit(layer, e, prefill) {
+                    if was_nursery {
+                        // Promoted: refill the nursery with the main pool's victim.
+                        let slots = self.pool.nursery_slots;
+                        let shrunk = self.pool.nc.shrunk;
+                        let v = self.pool.nursery_refill(region, self.global, layer, &want, extra, prefill);
+                        assert!(v.is_some() || self.pool.nc.shrunk == shrunk + 1 || slots >= self.pool.nursery_target);
+                        if let Some(v) = v {
+                            assert!(self.pool.nursery[v as usize] && self.pool.owner_of[v as usize].is_none() && (v as u32) < self.pool.stage);
+                            self.st.evictions += 1;
+                        }
+                    }
                     continue;
                 }
                 let sc0 = self.pool.sc;
@@ -10864,8 +11265,9 @@ mod tests {
             w
         }
 
-        /// A request's words at service: `pin_enable`, `pin_apply_words`, then
-        /// the prefetch readers.
+        /// A request's words at service: `pin_enable`, `pin_apply_words`
+        /// (plain words only: a LIKELY word is never a grant), then the
+        /// prefetch readers (LIKELY words as LIKELY jobs).
         fn words_in(&mut self, r: &SimReq) {
             self.pool.pins.enable(self.budget);
             for &w in &r.release {
@@ -10874,7 +11276,26 @@ mod tests {
             for &w in &r.prefetch {
                 self.pool.pins.grant(w >> 16, w & 0xFFFF);
             }
-            self.queue_bg(&r.prefetch, false);
+            self.queue_bg(&r.prefetch, false, false);
+            self.queue_bg(&r.likely, false, true);
+        }
+
+        /// The reply's NURSERY block, checked at report time: every entry is a
+        /// resident nursery entry and none is in the pin map.
+        fn nursery_block(&mut self, layer: u32, map: &[u32; proto::RESID_WORDS]) -> Vec<(u32, u32)> {
+            if self.pool.nursery_target == 0 {
+                return Vec::new();
+            }
+            let words = self.pool.nursery_words(layer);
+            let ents: Vec<(u32, u32)> = words.iter().filter(|&&w| w != proto::NURSERY_NONE).map(|&w| (w >> 16, w & 0xFFFF)).collect();
+            for &(l, e) in &ents {
+                assert!(self.pool.in_nursery(l, e), "reported nursery entry L{l} e{e} is not one");
+                if l == layer && map[e as usize / 32] >> (e % 32) & 1 == 1 {
+                    self.st.nursery_pin_violations += 1;
+                }
+            }
+            self.st.nursery_reported += ents.len() as u64;
+            ents
         }
 
         /// `pin_grant` for each decode-shaped request of a pass, then ONE
@@ -10907,8 +11328,9 @@ mod tests {
             }
             let row = self.pool.remap_hosts[r.layer as usize].clone();
             let map = self.pool.pins.report(r.layer, &row, self.pool.stage, &self.pool.nursery);
-            let p = &self.pool.pins;
-            SimReply { seq: r.seq, layer: r.layer, map, epoch: p.epoch, pinned: p.pinned, budget: p.budget, paged, nursery: Vec::new() }
+            let (epoch, pinned, budget) = (self.pool.pins.epoch, self.pool.pins.pinned, self.pool.pins.budget);
+            let nursery = self.nursery_block(r.layer, &map);
+            SimReply { seq: r.seq, layer: r.layer, map, epoch, pinned, budget, paged, nursery }
         }
 
         /// Serve the wire's front request as `serve_connection` does: words in
@@ -10941,8 +11363,11 @@ mod tests {
             if let Some(nx) = wire.front() {
                 if !self.scripted && rng.below(2) == 0 {
                     let w: Vec<u32> = Self::distinct(&nx.sel).into_iter().map(|e| (nx.layer << 16) | e).collect();
-                    // The early-page hook: a prefill frame's reads are staged.
-                    self.queue_bg(&w, nx.b > 16);
+                    // The early-page hook: a prefill frame's reads are staged;
+                    // its LIKELY words are applied at arrival too.
+                    let likely = nx.likely.clone();
+                    self.queue_bg(&w, nx.b > 16, false);
+                    self.queue_bg(&likely, false, true);
                 }
             }
             let mut sel = a.sel.clone();
@@ -10956,7 +11381,7 @@ mod tests {
                 let parked: Vec<(u32, u32)> = Self::distinct(&sel).into_iter().map(|e| (a.layer, e)).collect();
                 let w: Vec<u32> = parked.iter().filter(|k| !self.pool.slot_of.contains_key(k)).map(|k| (k.0 << 16) | k.1).collect();
                 // The park hook: a parked prefill chunk's reads are staged.
-                self.queue_bg(&w, a.b > 16);
+                self.queue_bg(&w, a.b > 16, false);
                 for _ in 0..1 + rng.below(3) {
                     if wire.front().is_some_and(|nx| nx.b <= PARK_MAX_ROWS) {
                         let c = wire.pop_front().unwrap();
@@ -10999,8 +11424,9 @@ mod tests {
             // grants first, then the layer's report, reused by the partner.
             if let Some(b) = partner.as_ref() {
                 let (map, epoch, pinned, budget) = self.report_pass(a.layer, &[(&a, dec(&a)), (b, dec(b))]);
-                replies.push(SimReply { seq: a.seq, layer: a.layer, map, epoch, pinned, budget, paged: paged_a, nursery: Vec::new() });
-                replies.push(SimReply { seq: b.seq, layer: b.layer, map, epoch, pinned, budget, paged: paged_b, nursery: Vec::new() });
+                let nursery = self.nursery_block(a.layer, &map);
+                replies.push(SimReply { seq: a.seq, layer: a.layer, map, epoch, pinned, budget, paged: paged_a, nursery: nursery.clone() });
+                replies.push(SimReply { seq: b.seq, layer: b.layer, map, epoch, pinned, budget, paged: paged_b, nursery });
             } else {
                 let r = self.reply(&a, &a.sel, dec(&a), paged_a);
                 replies.push(r);
@@ -11036,7 +11462,7 @@ mod tests {
         let e = 20i32;
         let row = |first: i32| -> Vec<i32> { vec![first, 0, 1, 2, 3, 4] };
         let req = |seq: u32, b: usize, sel: Vec<i32>, held: [u32; proto::RESID_WORDS]| SimReq {
-            seq, layer: 0, b, sel, prefetch: Vec::new(), release: Vec::new(), held, pulled: false,
+            seq, layer: 0, b, sel, prefetch: Vec::new(), release: Vec::new(), likely: Vec::new(), held, pulled: false,
         };
         let none = [0u32; proto::RESID_WORDS];
         let r = req(1, 1, vec![e, 21, 22, 23, 24, 25], none);
@@ -11103,19 +11529,28 @@ mod tests {
         };
         let region_ids: Vec<u32> = (0..PER).collect();
         let regions: Vec<(u32, u32, &[u32])> = (0..L).map(|l| (l, l * PER, &region_ids[..])).collect();
+        // The NURSERY (design 3.2): 4 slots carved from the main band, out of
+        // the pin budget; the hub hints the NEXT layer's picks as LIKELY words.
+        const NURSERY: usize = 4;
         let mut pool = ShardPool::seeded(N, &regions, 0.0);
         assert_eq!(pool.set_stage(STAGE), STAGE);
+        assert_eq!(pool.carve_nursery(NURSERY), NURSERY);
         let mut b2 = Box2Sim {
             pool,
             bg: Vec::new(),
-            budget: (N - STAGE - R) as u32,
+            budget: (N - STAGE - R - NURSERY) as u32,
             per: PER,
             global: seed % 2 == 1,
             early: EarlyPaged::default(),
             scripted: false,
             st: PinSimStats::default(),
         };
+        let occ0 = b2.pool.nursery_occupied() as i64;
         let mut ledger = PinLedger::new();
+        // The hub's NURSERY mirror (`b2_mirror` NURSERY bits): a reply replaces
+        // its layer's row; the filter skips an expert the mirror has.
+        let mut nursery_mirror: std::collections::HashSet<(u32, u32)> = Default::default();
+        let mut nursery_covered = 0u64;
         let mut wire: std::collections::VecDeque<SimReq> = Default::default();
         let mut replies: Vec<SimReply> = Vec::new();
         let mut sent: Vec<SimReq> = Vec::new();
@@ -11125,7 +11560,8 @@ mod tests {
         let mut held_checked = 0u64;
         let mut stale_maps = 0u64;
 
-        // held ⊆ pinned ⊆ landed, and the pinned count / budget.
+        // held ⊆ pinned ⊆ landed, and the pinned count / budget; the nursery's
+        // `lands = hits + recycled + delta(occupied)` and "never pinned".
         let check = |b2: &mut Box2Sim, ledger: &PinLedger, subset_violations: &mut u64| {
             let mut n_pinned = 0u32;
             for l in 0..L {
@@ -11139,6 +11575,8 @@ mod tests {
                     assert!(!pinned || r != 0, "pinned but not landed: L{l} e{e}");
                     // STAGING INVARIANT: pinned => landed in the MAIN band.
                     assert!(!pinned || ((-r - 1) as u32) < b2.pool.stage, "pinned in staging: L{l} e{e} slot {}", -r - 1);
+                    // NURSERY INVARIANT: pinned => not a nursery slot.
+                    assert!(!pinned || !b2.pool.nursery[(-r - 1) as usize], "pinned in the nursery: L{l} e{e} slot {}", -r - 1);
                 }
             }
             if b2.pool.pins.on {
@@ -11146,6 +11584,11 @@ mod tests {
                 assert!(b2.pool.pins.pinned <= b2.pool.pins.budget);
             }
             b2.st.max_pinned = b2.st.max_pinned.max(b2.pool.pins.pinned);
+            let nc = b2.pool.nc;
+            let occ = b2.pool.nursery_occupied() as i64;
+            assert_eq!(nc.lands as i64, nc.hits as i64 + nc.recycled as i64 + (occ - occ0), "nursery invariant: {nc:?} occupied {occ} from {occ0}");
+            assert_eq!(b2.pool.nursery.iter().filter(|&&f| f).count() as u32, b2.pool.nursery_slots);
+            assert!(b2.pool.nursery_slots <= NURSERY as u32);
         };
 
         for _step in 0..300 {
@@ -11195,8 +11638,24 @@ mod tests {
                         .map(|e| (layer << 16) | e)
                         .collect();
                     let release = if pin_active { ledger.take_words(128) } else { Vec::new() };
+                    // LIKELY words: the hub's predicted-miss hints for the NEXT
+                    // layer -- its Zipf picks the ledger does not hold and the
+                    // NURSERY mirror does not already have (the filter's dedup).
+                    let nl = (layer + 1) % L;
+                    let mut likely: Vec<u32> = Vec::new();
+                    for _ in 0..rng.below(3) {
+                        let e = zipf(rng.below(u64::MAX), nl);
+                        if ledger.held(nl, e) {
+                            continue;
+                        }
+                        if nursery_mirror.contains(&(nl, e)) {
+                            nursery_covered += 1;
+                            continue;
+                        }
+                        likely.push((nl << 16) | e);
+                    }
                     seq += 1;
-                    let r = SimReq { seq, layer, b, sel, prefetch, release, held, pulled: false };
+                    let r = SimReq { seq, layer, b, sel, prefetch, release, likely, held, pulled: false };
                     sent.push(r.clone());
                     wire.push_back(r);
                     // Box 2 and the hub's reply consumption interleave at random;
@@ -11217,6 +11676,13 @@ mod tests {
                             let _ = ledger.apply_map(rp.layer, &rp.map, epoch);
                             surprises += surprise_count(&q.held, &rp.paged);
                             pin_active = true;
+                            // The NURSERY block: replace the reply layer's row,
+                            // add the other layers' entries; never a held one.
+                            nursery_mirror.retain(|&(l, _)| l != rp.layer);
+                            for &(l, e) in &rp.nursery {
+                                assert!(!(l == rp.layer && ledger.held(l, e)), "a nursery entry reported held: L{l} e{e}");
+                                nursery_mirror.insert((l, e));
+                            }
                         } else if act == 0 && !must {
                             break;
                         }
@@ -11232,6 +11698,8 @@ mod tests {
             held_checked,
             stale_maps,
             sc: b2.pool.sc,
+            nc: b2.pool.nc,
+            nursery_covered,
             ..b2.st
         }
     }
