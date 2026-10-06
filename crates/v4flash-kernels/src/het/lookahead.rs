@@ -176,10 +176,27 @@ pub fn cfg() -> Cfg {
 }
 
 /// Anything to count this step (the `hub_lh2` record is emitted iff so): the
-/// prefetch knob, the budget, or the SOFT-HELD map (its counters live here).
+/// prefetch knob, the budget, or a SOFT-HELD consumer being evaluated.
 pub fn active() -> bool {
     let c = cfg();
-    c.mode.on() || c.spec_budget > 0 || super::b2_mirror::soft_map()
+    c.mode.on() || c.spec_budget > 0 || scoring()
+}
+
+/// Score replies and run the before-submit passes (`protected_nonres`,
+/// `nonres_bits`, `pick_bits`: three passes over the sent sel with a mirror
+/// lookup per distinct expert, on the Route path)? Only while the prefetch
+/// knob is on or a SOFT-HELD consumer is on: with every knob off, production
+/// runs today's path (the map alone, `V41_B2_SOFT_MAP`, costs 12 reply words).
+pub fn scoring() -> bool {
+    cfg().mode.on() || super::b2_mirror::soft_prior() || super::b2_mirror::soft_hint()
+}
+
+/// LATE, b2tail's definition, at the Post that finds a lane's reply READY:
+/// the lane-layer's `moe_arrived` event was already complete (`moe_done`,
+/// `None` = the query failed) -- the MoE finished before the reply was
+/// consumed. No remote ticket, or no completed MoE: not late.
+pub fn late_at_ready(has_ticket: bool, moe_done: Option<bool>) -> bool {
+    has_ticket && moe_done == Some(true)
 }
 
 /// A decode step begins (right after `b2_mirror::begin_step`, which advanced
@@ -1334,6 +1351,17 @@ mod tests {
         let mut paged = [0u32; PAGED_WORDS];
         paged[0] = (1 << 3) | (1 << 7);
         assert_eq!(paged_soft(&paged, &bits), 1);
+        // A repeated expert whose predicate is false: evaluated ONCE, never set.
+        let calls = std::cell::Cell::new(0u32);
+        let mut none = [0u32; PAGED_WORDS];
+        pick_bits(&[9, 9, 9, 1, 9], |e| { calls.set(calls.get() + 1); e != 9 }, &mut none);
+        assert_eq!((calls.get(), none[0]), (2, 1 << 1), "9 once, 1 once; only 1 set");
+        // The late proxy (b2tail's definition): the MoE already done when the
+        // reply is found ready; a failed query or no ticket is never late.
+        assert!(late_at_ready(true, Some(true)));
+        assert!(!late_at_ready(true, Some(false)));
+        assert!(!late_at_ready(true, None));
+        assert!(!late_at_ready(false, Some(true)));
         assert_eq!(STATS[STAT_ANY_PAGED].0, "lh2_hits_paged_any_r1");
         assert_eq!(STATS[STAT_ANY_LATE + 5].0, "lh2_hits_late_any_r6");
         assert_eq!(STATS[STAT_ANY_PAGED_M].0, "lh2_hits_paged_any_m0");

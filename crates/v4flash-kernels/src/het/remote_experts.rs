@@ -488,6 +488,14 @@ pub mod proto {
     pub const REQ2_FLAG_SOFT: u32 = 1;
     pub const REQ_FLAGS2_OFF: usize = HDR_LEN + 20;
     pub const RESP_FLAG_SOFT: u32 = 1 << 12;
+    /// Request flags in the FIRST flags word stop at this bit (`REQ_FLAG_LIKELY`):
+    /// bits 12-15 are response-only (SOFT, NURSERY, PIN, RESID) and 16-31 the
+    /// miss mask. A new request bit goes in the second word (`REQ2_FLAG_*`): a
+    /// request bit 12 would be echoed and read as a SOFT block by a new hub.
+    pub const REQ_FLAG_LAST_BIT: u32 = 11;
+    const _: () = assert!(REQ_FLAG_LIKELY == 1 << REQ_FLAG_LAST_BIT);
+    const _: () = assert!(RESP_FLAG_SOFT == 1 << (REQ_FLAG_LAST_BIT + 1) && RESP_FLAG_NURSERY == 1 << 13 && RESP_FLAG_PIN == 1 << 14 && RESP_FLAG_RESID == 1 << 15);
+    const _: () = assert!(RESP_MISS_SHIFT == 16);
 
     /// Write the request's second flags word (after `encode_request`).
     pub fn patch_request_flags2(buf: &mut AlignedBuf, flags2: u32) {
@@ -3128,6 +3136,22 @@ impl PinBook {
         self.on && Self::idx(layer, e).is_some_and(|i| self.state[i] == PIN_HELD)
     }
 
+    /// The layer's pinned set as a bitset (`soft_words`: one pass over the
+    /// layer's `state` slice, no per-expert index checks). All zero when off.
+    fn pinned_words(&self, layer: u32) -> [u32; proto::RESID_WORDS] {
+        let mut w = [0u32; proto::RESID_WORDS];
+        if !self.on || layer >= N_LAYER as u32 {
+            return w;
+        }
+        let base = layer as usize * N_EXPERT as usize;
+        for (e, &s) in self.state[base..base + N_EXPERT as usize].iter().enumerate() {
+            if s == PIN_HELD {
+                w[e / 32] |= 1 << (e % 32);
+            }
+        }
+        w
+    }
+
     /// The hub wants `(layer, e)` resident (a decode-shaped pick, a prefetch
     /// word): pin it at its layer's next report, budget allowing. A repeat
     /// grant restarts the eligibility clock.
@@ -5672,9 +5696,14 @@ impl ExpertShard {
         let Some(p) = self.pool.as_ref() else { return w };
         let row = &p.remap_hosts[layer as usize];
         for e in 0..N_EXPERT as usize {
-            if landed_main(row[e], &p.nursery) && !p.pins.is_pinned(layer, e as u32) {
+            if landed_main(row[e], &p.nursery) {
                 w[e / 32] |= 1 << (e % 32);
             }
+        }
+        // Minus the pinned set: 12 word ops over the layer's pin bitset.
+        let pinned = p.pins.pinned_words(layer);
+        for (x, y) in w.iter_mut().zip(&pinned) {
+            *x &= !y;
         }
         w
     }
@@ -9757,10 +9786,13 @@ impl RemoteExpertClient {
             }
         }
         // The SOFT-HELD map: the mirror's SOFT row for the layer (expires at
-        // its next reply), counted (`lh2_soft_total`).
+        // its next reply or the phase switch), counted while a consumer or
+        // the prefetch knob is on (`lh2_soft_total`).
         if let Some(words) = proto::response_soft(&buf, &m) {
             super::b2_mirror::update_soft(m.layer, words);
-            super::lookahead::bump(super::lookahead::Stat::SoftTotal, words.iter().map(|w| u64::from(w.count_ones())).sum());
+            if super::lookahead::scoring() {
+                super::lookahead::bump(super::lookahead::Stat::SoftTotal, words.iter().map(|w| u64::from(w.count_ones())).sum());
+            }
         }
         // The NURSERY block (design 3.2): the capability, and the mirror's
         // NURSERY bits for the filter's dedup (never `held`).
@@ -10528,6 +10560,11 @@ mod tests {
         assert!(pool.pins.is_pinned(1, 1));
         let soft: Vec<u32> = (0..4).filter(|&e| landed_main(row[e as usize], &pool.nursery) && !pool.pins.is_pinned(1, e)).collect();
         assert_eq!(soft, vec![2, 3], "0 is a nursery entry, 1 is pinned");
+        // The pin bitset `soft_words` subtracts agrees with `is_pinned`.
+        let pw = pool.pins.pinned_words(1);
+        assert_eq!(pw[0], 1 << 1);
+        assert_eq!(pool.pins.pinned_words(2), [0; proto::RESID_WORDS]);
+        assert_eq!(PinBook::off().pinned_words(1), [0; proto::RESID_WORDS]);
     }
 
     /// `nursery_words`: the reply layer's entries first, then other layers'

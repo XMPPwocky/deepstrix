@@ -4657,9 +4657,15 @@ impl HeterogeneousEngine {
                                 }
                             },
                         };
-                        if !ready {
-                            // The lane stalled on this reply (`het::lookahead` "late").
-                            lanes[i].0.remote_post_spun = true;
+                        if ready && lanes[i].0.remote_ticket.is_some() {
+                            // LATE (`het::lookahead`, b2tail's definition): the reply
+                            // is consumed after the lane-layer's MoE end, i.e. the
+                            // `moe_arrived` event is already complete when the Post
+                            // finds the reply ready (a non-blocking query; an error
+                            // reads as "not late"). Checked at the first Post that
+                            // finds it ready, so within the loop's polling grain.
+                            let moe_done = self.sync_events_lane(i).layers[l].moe_arrived.query().ok();
+                            lanes[i].0.remote_late = super::lookahead::late_at_ready(true, moe_done);
                         }
                         // TEST: hold lane 0 until lane 1 has posted this layer.
                         let ready = ready && !(hold_lane0 && i == 0 && posted[1] <= l);
@@ -9810,7 +9816,7 @@ impl HeterogeneousEngine {
                         // picks (actual rank <= `V41_SUB_PROTECT`) the mirror calls
                         // non-resident, and the non-resident bitset over all its
                         // sent picks; scored at the reply against the PAGED bits.
-                        if super::lookahead::active() {
+                        if super::lookahead::scoring() {
                             let sent_sel: &[i32] = if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote };
                             super::lookahead::protected_nonres(sent_sel, cs_n_used, super::b2_mirror::protect(), |e| nonres_miss(layer as i32, e), &mut bd.lh2.prot_nonres);
                             super::lookahead::nonres_bits(sent_sel, |e| nonres_miss(layer as i32, e), &mut bd.lh2.nonres_bits);
@@ -9984,7 +9990,7 @@ impl HeterogeneousEngine {
                         // `remote.expert (host)` track IS the overlap we bought.
                         bd.remote_ticket = ticket;
                         bd.remote_ffn_moe_layer = layer as i32;
-                        bd.remote_post_spun = false;
+                        bd.remote_late = false;
                         if let Some(pf) = self.perfetto.as_ref() {
                             if let Ok(pf) = pf.lock() {
                                 let _ = pf.emit_host_slice(
@@ -11506,10 +11512,12 @@ impl HeterogeneousEngine {
             // Also the ANY-rank sets (every paged read stalls the lane, not only
             // a rank-1 one) and the step's denominators: paged experts in all,
             // on late replies, the mirror-held ones (surprises) and the
-            // mirror-non-resident ones (the hintable misses).
+            // mirror-non-resident ones (the hintable misses). `paged` counts
+            // REPLY-experts: an expert read once for lane A and waited on by
+            // lane B is paged in both replies (as b2tail's `b2_paged_replies`).
             if partial.pin.is_some() && partial.layer as i32 == layer && t.flags & super::remote_experts::proto::REQ_FLAG_DECODE != 0 {
-                let late = bd.remote_post_spun;
-                if super::lookahead::active() {
+                let late = bd.remote_late;
+                if super::lookahead::scoring() {
                     super::lookahead::bump(super::lookahead::Stat::PagedMirrorSoft, u64::from(super::lookahead::paged_soft(&partial.paged, &bd.lh2.soft_bits)));
                     if !bd.lh2.prot_hits.is_empty() || !bd.lh2.prot_nonres.is_empty() {
                         super::lookahead::count_reply_hits(&super::lookahead::reply_hits(&bd.lh2.prot_hits, &bd.lh2.prot_nonres, &partial.paged, late));

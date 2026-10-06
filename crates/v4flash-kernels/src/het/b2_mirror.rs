@@ -320,6 +320,21 @@ pub fn step() -> u32 {
 /// then at least N steps old.
 pub fn expire_incoming() {
     STEP.fetch_add(incoming_steps() + 1, Ordering::Relaxed);
+    // A prefill chunk churns box 2's pool: the SOFT rows are stale too.
+    clear_soft();
+}
+
+/// Forget every layer's SOFT row (the decode -> prefill switch beside the
+/// hint-queue clear, and every prefill chunk via `expire_incoming`): during a
+/// prefill phase the band is released and prefill evicts freely, so a row
+/// would describe the pre-prefill pool at the first decode step after it --
+/// where `V41_B2_SOFT_PRIOR` would call evicted experts resident.
+pub fn clear_soft() {
+    for row in SOFT.iter() {
+        for slot in row {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Admissions `(layer << 16) | e` were just queued for box 2: count them as
@@ -1888,9 +1903,18 @@ pub(crate) mod tests {
         // The next reply replaces the row (the previous map expires).
         update_soft(L, &[0; RESID_WORDS]);
         assert!(!soft(L as i32, 5) && !lookup(L as i32, 5).unwrap().soft);
+        // Staleness across a prefill phase: the switch (`clear_soft`) and every
+        // chunk (`expire_incoming`) forget EVERY layer's row.
         update_soft(L, &words);
-        update_soft(L, &[0; RESID_WORDS]);
-        assert!(!soft(L as i32, 383));
+        update_soft(L + 1, &words);
+        clear_soft();
+        assert!(!soft(L as i32, 5) && !soft(L as i32 + 1, 383));
+        update_soft(L, &words);
+        expire_incoming();
+        assert!(!soft(L as i32, 5) && !lookup(L as i32, 5).unwrap().soft);
+        assert!(B2_SOFT_PRIOR.set("1"));
+        assert_eq!(resident(L as i32, 5), Some(false), "an evicted-by-prefill expert is not resident after the switch");
+        assert!(B2_SOFT_PRIOR.set("0"));
     }
 
     /// The NURSERY bits (design 3.2): a block replaces its reply layer's row

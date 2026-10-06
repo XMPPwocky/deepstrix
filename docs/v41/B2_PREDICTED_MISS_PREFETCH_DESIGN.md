@@ -444,6 +444,18 @@ and stays dry. Keep `V41_B2_SPEC_BUDGET=0` for that run. Code review of B+C (APP
 on are protected from recycling until it is served (`nursery_protect`), the bars count the words that go
 and a tripped step takes nothing more, the restore pump's throttle sees the general sets only.
 
+11.4c **Dry runs 1-3 SUPERSEDED by run 4 (classify fix, abce02e).** Before it a box-1 expert first seen
+at a low rank and again at a better rank was un-marked and surfaced as box 2's: never in box 2's maps, so
+"non-resident", a candidate, a hinted word and -- if the row picked it -- a dry hit. Affected in runs 1-3:
+`lh2_cand_rN`, `nonres_rN`, `nonres_m*`, `dry_words`, `dropped_cap`, the hint volumes quoted above (~43 and
+17-65 words/step), `dry_hits_rN`, `dry_hits_prot_rN`, `hits_prot_m*` and every precision built from them
+(the 0.93-at-margin-0.1 of run 2). Unaffected: `b2_*` / `sub_*`, `paged_hinted`, `nursery_*`, the budget
+A/B, the mirror finding (11.4b). Re-derive the margin from run 4+. Also from run 4's successor: LATE is
+b2tail's definition (the reply consumed after the lane-layer's `moe_arrived`; the first-Post-not-ready proxy
+of 78663a2 fired ~0.1-0.3 ms after the submit against a 0.47 ms median RTT and marked nearly every reply);
+`paged_total` counts reply-experts (an expert read once for lane A and waited on by lane B is paged in both
+replies), as `b2_paged_replies`.
+
 11.4b **SOFT-HELD residency map (10-06, dry runs 3/4).** Under `V41_B2_PIN=1` the reply map is the
 PINNED set (held ⊆ pinned ⊆ resident), so the ~850 resident-but-unpinned experts (budget 4000 of 4480,
 ~13 releases/step) are invisible: ~24 rank-1 picks/step the mirror calls non-resident are served without

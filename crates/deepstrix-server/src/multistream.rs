@@ -1121,6 +1121,8 @@ impl Sched {
                     // never ride a prefill chunk: the queue empties here, not in
                     // the per-chunk `expire_incoming` (review round 2, finding 6).
                     v4flash_kernels::het::remote_experts::clear_hint_words();
+                    // The SOFT-HELD rows describe the pre-prefill pool from here.
+                    v4flash_kernels::het::b2_mirror::clear_soft();
                     (v4flash_kernels::het::b2_mirror::pin_enter_prefill(), 0)
                 }
                 Phase::Decode => (
