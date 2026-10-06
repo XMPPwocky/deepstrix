@@ -472,6 +472,53 @@ pub mod proto {
     pub const RESP_FLAG_NURSERY: u32 = 1 << 13;
     pub const NURSERY_WORDS: usize = 12;
     pub const NURSERY_NONE: u32 = u32::MAX;
+    /// SOFT-HELD residency map (2026-10-06, dry runs 3/4: under pin mode the
+    /// reply map is the PINNED set, so the ~850 resident-but-unpinned experts
+    /// are invisible to the hub -- ~24 rank-1 picks/step the mirror calls
+    /// non-resident are served without a read, and the prior swaps ~43
+    /// picks/step against the same map). The hub asks with `REQ2_FLAG_SOFT`
+    /// in the request's SECOND flags word (the formerly reserved fixed field
+    /// at `REQ_FLAGS2_OFF`, which an older daemon never reads); the daemon
+    /// answers a decode request with `RESP_FLAG_SOFT` and `RESID_WORDS` words
+    /// after the nursery block: bit e = expert e of the layer is landed in a
+    /// MAIN slot, not pinned, not a nursery entry (`residency_words`
+    /// semantics minus the pinned set: served right now without a read, but
+    /// evictable any time). Bit 12 of `flags` is never a request flag, so an
+    /// older daemon's echo leaves it clear and an older hub sees no block.
+    pub const REQ2_FLAG_SOFT: u32 = 1;
+    pub const REQ_FLAGS2_OFF: usize = HDR_LEN + 20;
+    pub const RESP_FLAG_SOFT: u32 = 1 << 12;
+
+    /// Write the request's second flags word (after `encode_request`).
+    pub fn patch_request_flags2(buf: &mut AlignedBuf, flags2: u32) {
+        buf.as_bytes_mut()[REQ_FLAGS2_OFF..REQ_FLAGS2_OFF + 4].copy_from_slice(&flags2.to_le_bytes());
+    }
+
+    /// Append the SOFT map (after every other block) and set `RESP_FLAG_SOFT`.
+    /// Call before `patch_len`.
+    pub fn append_soft(buf: &mut AlignedBuf, words: &[u32; RESID_WORDS]) {
+        const FLAGS_OFF: usize = HDR_LEN + 8;
+        let mut f = [0u8; 4];
+        f.copy_from_slice(&buf.as_bytes()[FLAGS_OFF..FLAGS_OFF + 4]);
+        let flags = u32::from_le_bytes(f) | RESP_FLAG_SOFT;
+        buf.as_bytes_mut()[FLAGS_OFF..FLAGS_OFF + 4].copy_from_slice(&flags.to_le_bytes());
+        for &w in words {
+            buf.put_u32(w);
+        }
+    }
+
+    /// The SOFT map of a RESPONSE (`RESP_FLAG_SOFT`), if any.
+    pub fn response_soft<'a>(buf: &'a AlignedBuf, m: &ResponseMeta) -> Option<&'a [u32]> {
+        if m.flags & RESP_FLAG_SOFT == 0 {
+            return None;
+        }
+        let off = RESP_DATA_OFF
+            + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
+            + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_NURSERY != 0 { NURSERY_WORDS * 4 } else { 0 };
+        Some(buf.view::<u32>(off, RESID_WORDS))
+    }
 
     /// Is `w` a LIKELY-marked PREFETCH word (`REQ_FLAG_LIKELY`)?
     pub fn likely_word(w: u32) -> bool {
@@ -847,6 +894,8 @@ pub mod proto {
         pub flags: u32,
         pub n_used: u32,
         pub xq_bpt: u32,
+        /// The second flags word (`REQ2_FLAG_*`; 0 from an older hub).
+        pub flags2: u32,
         /// Client's CLOCK_MONOTONIC_RAW immediately before its `write()`.
         pub t1: u64,
         pub xq: &'a [u8],
@@ -939,6 +988,7 @@ pub mod proto {
             flags,
             n_used,
             xq_bpt,
+            flags2: u(5),
             t1: read_u64(p, REQ_T1_OFF),
             xq: &p[xq_off..sel_off],
             sel: buf.view::<i32>(sel_off, n_sel),
@@ -1039,7 +1089,8 @@ pub mod proto {
             + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
             + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 }
             + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 }
-            + if m.flags & RESP_FLAG_NURSERY != 0 { NURSERY_WORDS * 4 } else { 0 };
+            + if m.flags & RESP_FLAG_NURSERY != 0 { NURSERY_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_SOFT != 0 { RESID_WORDS * 4 } else { 0 };
         if p.len() != want {
             return Err(eyre!("response: frame len {} != expected {want}", p.len()));
         }
@@ -5609,6 +5660,25 @@ impl ExpertShard {
         self.pool.as_ref().is_some_and(|p| p.nursery_target > 0)
     }
 
+    /// `REQ2_FLAG_SOFT`: the SOFT-HELD map of `layer` -- landed in a MAIN
+    /// slot (`residency_words`), not hub-pinned, not a nursery entry: served
+    /// right now without a read, evictable any time. All zero for an
+    /// unpaged layer (its static set is in the residency map) or no pool.
+    pub fn soft_words(&self, layer: u32) -> [u32; proto::RESID_WORDS] {
+        let mut w = [0u32; proto::RESID_WORDS];
+        if !self.layer_is_paged(layer) {
+            return w;
+        }
+        let Some(p) = self.pool.as_ref() else { return w };
+        let row = &p.remap_hosts[layer as usize];
+        for e in 0..N_EXPERT as usize {
+            if landed_main(row[e], &p.nursery) && !p.pins.is_pinned(layer, e as u32) {
+                w[e / 32] |= 1 << (e % 32);
+            }
+        }
+        w
+    }
+
     /// The reply's NURSERY block for `layer` (`ShardPool::nursery_words`).
     pub fn nursery_words(&mut self, layer: u32) -> [u32; proto::NURSERY_WORDS] {
         match self.pool.as_mut() {
@@ -8313,6 +8383,10 @@ pub fn serve_connection(
                 if req.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
                     proto::append_nursery(&mut resp, &shard.nursery_words(req.layer));
                 }
+                // SOFT-HELD map: on every decode reply the hub asked for it.
+                if req.flags2 & proto::REQ2_FLAG_SOFT != 0 && req.flags & proto::REQ_FLAG_DECODE != 0 {
+                    proto::append_soft(&mut resp, &shard.soft_words(req.layer));
+                }
                 // The partner's reply: rows [b, b + bb) of the same pass. Page
                 // time and miss count are reported on THIS request only, so the
                 // hub's per-step sums are unchanged.
@@ -8344,6 +8418,9 @@ pub fn serve_connection(
                         }
                         if rb.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
                             proto::append_nursery(&mut resp_b, &shard.nursery_words(rb.layer));
+                        }
+                        if rb.flags2 & proto::REQ2_FLAG_SOFT != 0 && rb.flags & proto::REQ_FLAG_DECODE != 0 {
+                            proto::append_soft(&mut resp_b, &shard.soft_words(rb.layer));
                         }
                         proto::patch_len(&mut resp_b);
                         let t_ready_b = Instant::now();
@@ -8753,6 +8830,9 @@ fn serve_interleaved(
     }
     if req.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
         proto::append_nursery(&mut resp, &shard.nursery_words(req.layer));
+    }
+    if req.flags2 & proto::REQ2_FLAG_SOFT != 0 && req.flags & proto::REQ_FLAG_DECODE != 0 {
+        proto::append_soft(&mut resp, &shard.soft_words(req.layer));
     }
     proto::patch_len(&mut resp);
     let t_ready = Instant::now();
@@ -9516,6 +9596,11 @@ impl RemoteExpertClient {
             &mut buf, seq, layer, b as u32, flags, nu as u32, XQ_BYTES_PER_TOKEN as u32, xq,
             &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he), &pf, &rel,
         );
+        // The SOFT-HELD map (`REQ2_FLAG_SOFT`, `V41_B2_SOFT_MAP`): asked on
+        // every decode request; an older daemon never reads the word.
+        if self.decode_phase && super::b2_mirror::soft_map() {
+            proto::patch_request_flags2(&mut buf, proto::REQ2_FLAG_SOFT);
+        }
         let ticket = Ticket {
             seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now(),
             flags, n_hints: (ha.len() + he.len()) as u32, n_pf_words: pf.len() as u32, n_hint_words,
@@ -9670,6 +9755,12 @@ impl RemoteExpertClient {
                     .count();
                 super::lookahead::bump(super::lookahead::Stat::PagedHinted, hinted_paged as u64);
             }
+        }
+        // The SOFT-HELD map: the mirror's SOFT row for the layer (expires at
+        // its next reply), counted (`lh2_soft_total`).
+        if let Some(words) = proto::response_soft(&buf, &m) {
+            super::b2_mirror::update_soft(m.layer, words);
+            super::lookahead::bump(super::lookahead::Stat::SoftTotal, words.iter().map(|w| u64::from(w.count_ones())).sum());
         }
         // The NURSERY block (design 3.2): the capability, and the mirror's
         // NURSERY bits for the filter's dedup (never `held`).
@@ -10354,6 +10445,89 @@ mod tests {
         // The flag bits are disjoint from the miss mask and the other flags.
         assert_eq!(proto::RESP_FLAG_NURSERY & (proto::RESP_MISS_MASK | proto::RESP_FLAG_PIN | proto::RESP_FLAG_RESID | 0x7FF | proto::REQ_FLAG_LIKELY), 0);
         assert_eq!(proto::REQ_FLAG_LIKELY, 2048);
+    }
+
+    /// The SOFT-HELD map on the wire: asked in the request's second flags
+    /// word (an older daemon never reads it, an older hub never sets it),
+    /// answered after every other block under `RESP_FLAG_SOFT` (never a
+    /// request flag, so an older daemon's echo leaves it clear); the daemon's
+    /// map = landed main, not pinned, not nursery.
+    #[test]
+    fn soft_map_proto_roundtrip_and_compatibility() {
+        let nu = N_EXPERT_USED;
+        let xq = vec![7u8; XQ_BYTES_PER_TOKEN];
+        let sel: Vec<i32> = (0..nu as i32).collect();
+        let ew = vec![0.25f32; nu];
+        let mut buf = AlignedBuf::with_capacity(1 << 16);
+        let f = proto::REQ_FLAG_PIN | proto::REQ_FLAG_RESID | proto::REQ_FLAG_DECODE;
+        proto::encode_request(&mut buf, 1, 3, 1, f, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &[], &[]);
+        assert_eq!(proto::decode_request(&buf).unwrap().flags2, 0, "an older hub: the reserved word is 0");
+        proto::patch_request_flags2(&mut buf, proto::REQ2_FLAG_SOFT);
+        let r = proto::decode_request(&buf).unwrap();
+        assert_eq!((r.flags2, r.flags, r.layer), (proto::REQ2_FLAG_SOFT, f, 3), "the first flags word is untouched");
+        assert_eq!(proto::RESP_FLAG_SOFT & (0xFFF | proto::RESP_FLAG_NURSERY | proto::RESP_FLAG_PIN | proto::RESP_FLAG_RESID | proto::RESP_MISS_MASK), 0);
+
+        let (b, n) = (1usize, N_EMBD as usize);
+        let mut map = [0u32; proto::RESID_WORDS];
+        map[0] = 0b1001;
+        let mut soft = [0u32; proto::RESID_WORDS];
+        soft[0] = 0b0110;
+        soft[11] = 1 << 31;
+        let paged = [0u32; proto::RESID_WORDS];
+        let nursery = [proto::NURSERY_NONE; proto::NURSERY_WORDS];
+        // New daemon, new hub: after the residency map, pin block and nursery block.
+        let mut resp = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 512);
+        proto::begin_response(&mut resp, 1, 3, b as u32, f | proto::REQ_FLAG_LIKELY, 0, 1, 2, N_EMBD, 2, 3, 4);
+        resp.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::append_residency(&mut resp, &map);
+        proto::append_pin(&mut resp, 5, 7, 9, &paged);
+        proto::append_nursery(&mut resp, &nursery);
+        proto::append_soft(&mut resp, &soft);
+        proto::patch_len(&mut resp);
+        let m = proto::decode_response_meta(&resp).unwrap();
+        assert_ne!(m.flags & proto::RESP_FLAG_SOFT, 0);
+        assert_eq!(proto::response_residency(&resp, &m).unwrap(), &map[..]);
+        assert_eq!(proto::response_pin(&resp, &m).unwrap().epoch, 5);
+        assert!(proto::response_nursery(&resp, &m).unwrap().is_empty());
+        assert_eq!(proto::response_soft(&resp, &m).unwrap(), &soft[..]);
+        // After the residency map alone.
+        let mut r2 = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut r2, 1, 3, b as u32, f, 0, 1, 2, N_EMBD, 2, 3, 4);
+        r2.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::append_residency(&mut r2, &map);
+        proto::append_soft(&mut r2, &soft);
+        proto::patch_len(&mut r2);
+        let m = proto::decode_response_meta(&r2).unwrap();
+        assert_eq!(proto::response_soft(&r2, &m).unwrap(), &soft[..]);
+        assert!(proto::response_nursery(&r2, &m).is_none());
+        // Old daemon, new hub: the request asked, the echo carries no bit 12, no block.
+        let mut old = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut old, 1, 3, b as u32, f, 0, 1, 2, N_EMBD, 2, 3, 4);
+        old.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::append_residency(&mut old, &map);
+        proto::patch_len(&mut old);
+        let m = proto::decode_response_meta(&old).unwrap();
+        assert!(proto::response_soft(&old, &m).is_none());
+        // The length check: a flagged map that is not there fails the frame.
+        let mut bad = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut bad, 1, 3, b as u32, proto::RESP_FLAG_SOFT, 0, 1, 2, N_EMBD, 2, 3, 4);
+        bad.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::patch_len(&mut bad);
+        assert!(proto::decode_response_meta(&bad).is_err());
+    }
+
+    /// The daemon's SOFT map: landed main minus pinned minus nursery.
+    #[test]
+    fn soft_words_are_landed_main_minus_pinned_minus_nursery() {
+        let mut pool = nursery_pool(0.0);
+        // Layer 1: slots 0 (nursery entry (1,0)), 1-3 main; pin (1,1).
+        pool.pins.enable(8);
+        pool.pins.grant(1, 1);
+        let row = pool.remap_hosts[1].clone();
+        let _ = pool.pins.report(1, &row, pool.stage, &pool.nursery);
+        assert!(pool.pins.is_pinned(1, 1));
+        let soft: Vec<u32> = (0..4).filter(|&e| landed_main(row[e as usize], &pool.nursery) && !pool.pins.is_pinned(1, e)).collect();
+        assert_eq!(soft, vec![2, 3], "0 is a nursery entry, 1 is pinned");
     }
 
     /// `nursery_words`: the reply layer's entries first, then other layers'

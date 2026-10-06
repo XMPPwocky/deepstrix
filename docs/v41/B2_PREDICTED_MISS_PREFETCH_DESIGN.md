@@ -444,6 +444,22 @@ and stays dry. Keep `V41_B2_SPEC_BUDGET=0` for that run. Code review of B+C (APP
 on are protected from recycling until it is served (`nursery_protect`), the bars count the words that go
 and a tripped step takes nothing more, the restore pump's throttle sees the general sets only.
 
+11.4b **SOFT-HELD residency map (10-06, dry runs 3/4).** Under `V41_B2_PIN=1` the reply map is the
+PINNED set (held ⊆ pinned ⊆ resident), so the ~850 resident-but-unpinned experts (budget 4000 of 4480,
+~13 releases/step) are invisible: ~24 rank-1 picks/step the mirror calls non-resident are served without
+a read, and the prior swaps ~43 picks/step against that map. The hub asks with `REQ2_FLAG_SOFT` in the
+request's second flags word (`V41_B2_SOFT_MAP`, default on; an older daemon never reads it) and the
+daemon answers every decode reply with `RESP_FLAG_SOFT` (bit 12, never a request flag) + 12 words = landed
+main, not pinned, not nursery (`ExpertShard::soft_words`). The mirror keeps a SOFT row per layer,
+replaced at the layer's next reply (no epoch rules: soft entries may be evicted any time); `lookup().soft`.
+Consumers, each a live knob defaulting to today's behaviour: `V41_B2_SOFT_PRIOR` (prior / planner /
+`n_pred_miss` via `resident()` and `nonres_for_miss`: no swap, no predicted miss -- the A/B of interest:
+`sub.picks_swapped`, `sub.predicted_miss`, `box2.paged`, `lh2_paged_mirror_soft`), `V41_B2_SOFT_HINT`
+(the look-ahead filter via `nonres_for_hint`). Counters in `hub_lh2`: `lh2_soft_total`,
+`lh2_paged_mirror_soft` (soft at submit, paged = evicted between reply and use), `sub_soft_unswapped`
+(plain picks resident only by softness under SOFT_PRIOR). With both consumer knobs 0 nothing changes but
+the 12 reply words.
+
 11.5 **Slice D checklist.** (1) Build expertd ON box 2 (clock skew: `project_v41_box2_build_clock_skew`),
 `nursery=32` in its knob file, `V41_B2_PREFETCH_SETS` as today (+2 reserved sets, +113 MB pinned). (2)
 Server-down window with box 2 attached: `tests/remote_experts_nursery_loopback` and

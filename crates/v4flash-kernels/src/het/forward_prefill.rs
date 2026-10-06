@@ -9235,11 +9235,24 @@ impl HeterogeneousEngine {
                     // `predicted`, `avoided`, `blocked` count box-2 misses; `slots`
                     // counts every displaced pick, box 1's included.
                     let mut predicted: Vec<i32> = Vec::new();
+                    let mut soft_kept: Vec<i32> = Vec::new();
                     for &e in plain {
                         if box2_missing(e) && !predicted.contains(&e) {
                             predicted.push(e);
                         }
+                        // `V41_B2_SOFT_PRIOR`: a plain pick resident ONLY by the
+                        // SOFT map -- what the prior would have treated as missing
+                        // (and may have swapped) without it (`sub_soft_unswapped`).
+                        if super::b2_mirror::soft_prior()
+                            && (0..N_EXPERT as i32).contains(&e)
+                            && super::expert_pager::partition_box2(layer, e as u32)
+                            && !soft_kept.contains(&e)
+                            && super::b2_mirror::lookup(layer, e as u32).is_some_and(|r| r.soft && !r.held && !r.pending && !r.incoming)
+                        {
+                            soft_kept.push(e);
+                        }
                     }
+                    super::lookahead::bump(super::lookahead::Stat::SubSoftUnswapped, soft_kept.len() as u64);
                     let mut slots = 0u32;
                     let mut admit: Vec<u32> = Vec::new();
                     let mut touch: Vec<u32> = Vec::new();
@@ -9582,8 +9595,11 @@ impl HeterogeneousEngine {
                 //      and NEVER calls `push_prefetch_words` or puts them on a
                 //      frame. Nothing here touches a pick, weight or kernel input
                 //      (I1/I2, design section 7). Decode rows only (design 5).
-                // The `n_pred_miss` predicate (`b2_mirror::lookup`, not `resident()`).
-                let nonres_at = |nl: i32, e: u32| super::b2_mirror::lookup(nl, e).is_some_and(|r| !r.held && !r.pending && !r.incoming);
+                // The `n_pred_miss` predicate (`b2_mirror::lookup`, not `resident()`),
+                // with the SOFT-HELD map under `V41_B2_SOFT_HINT` (the filter) /
+                // `V41_B2_SOFT_PRIOR` (the miss count).
+                let nonres_at = |nl: i32, e: u32| super::b2_mirror::lookup(nl, e).is_some_and(|r| super::b2_mirror::nonres_for_hint(&r));
+                let nonres_miss = |nl: i32, e: u32| super::b2_mirror::lookup(nl, e).is_some_and(|r| super::b2_mirror::nonres_for_miss(&r));
                 if mp.mode.on() && remote_split_on && matches!(rows, RowLayout::Arena { .. }) {
                     let _t_look = LayerHostTimer::start(&LH_LOOK_FILTER);
                     if layer_host_timing() {
@@ -9794,13 +9810,15 @@ impl HeterogeneousEngine {
                         // picks (actual rank <= `V41_SUB_PROTECT`) the mirror calls
                         // non-resident, and the non-resident bitset over all its
                         // sent picks; scored at the reply against the PAGED bits.
-                        if mp.mode.on() {
+                        if super::lookahead::active() {
                             let sent_sel: &[i32] = if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote };
-                            super::lookahead::protected_nonres(sent_sel, cs_n_used, super::b2_mirror::protect(), |e| nonres_at(layer as i32, e), &mut bd.lh2.prot_nonres);
-                            super::lookahead::nonres_bits(sent_sel, |e| nonres_at(layer as i32, e), &mut bd.lh2.nonres_bits);
+                            super::lookahead::protected_nonres(sent_sel, cs_n_used, super::b2_mirror::protect(), |e| nonres_miss(layer as i32, e), &mut bd.lh2.prot_nonres);
+                            super::lookahead::nonres_bits(sent_sel, |e| nonres_miss(layer as i32, e), &mut bd.lh2.nonres_bits);
+                            super::lookahead::pick_bits(sent_sel, |e| super::b2_mirror::soft(layer as i32, e), &mut bd.lh2.soft_bits);
                         } else {
                             bd.lh2.prot_nonres.clear();
                             bd.lh2.nonres_bits = [0; super::lookahead::PAGED_WORDS];
+                            bd.lh2.soft_bits = [0; super::lookahead::PAGED_WORDS];
                         }
                         let n_sel = (b as usize) * cs_n_used;
                         let xq_bytes = (b as usize)
@@ -9877,7 +9895,7 @@ impl HeterogeneousEngine {
                             let (mut miss, mut inc, mut pend) = (0u32, 0u32, 0u32);
                             for &e in &ids {
                                 if let Some(r) = super::b2_mirror::lookup(layer, e as u32) {
-                                    miss += u32::from(!r.held && !r.pending && !r.incoming);
+                                    miss += u32::from(super::b2_mirror::nonres_for_miss(&r));
                                     inc += u32::from(!r.held && r.incoming);
                                     pend += u32::from(!r.held && r.pending);
                                 }
@@ -11491,7 +11509,8 @@ impl HeterogeneousEngine {
             // mirror-non-resident ones (the hintable misses).
             if partial.pin.is_some() && partial.layer as i32 == layer && t.flags & super::remote_experts::proto::REQ_FLAG_DECODE != 0 {
                 let late = bd.remote_post_spun;
-                if super::lookahead::cfg().mode.on() {
+                if super::lookahead::active() {
+                    super::lookahead::bump(super::lookahead::Stat::PagedMirrorSoft, u64::from(super::lookahead::paged_soft(&partial.paged, &bd.lh2.soft_bits)));
                     if !bd.lh2.prot_hits.is_empty() || !bd.lh2.prot_nonres.is_empty() {
                         super::lookahead::count_reply_hits(&super::lookahead::reply_hits(&bd.lh2.prot_hits, &bd.lh2.prot_nonres, &partial.paged, late));
                     }

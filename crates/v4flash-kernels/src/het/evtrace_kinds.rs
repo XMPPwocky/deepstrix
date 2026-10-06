@@ -220,6 +220,12 @@ pub static HUB_LH2: Kind = Kind {
         "lh2_hits_paged_any_m0", "lh2_hits_paged_any_m1", "lh2_hits_paged_any_m2", "lh2_hits_paged_any_m3",
         "lh2_hits_late_any_m0", "lh2_hits_late_any_m1", "lh2_hits_late_any_m2", "lh2_hits_late_any_m3",
         "lh2_paged_total", "lh2_paged_late_total", "lh2_paged_mirror_held", "lh2_paged_mirror_nonres",
+        // The SOFT-HELD map (`V41_B2_SOFT_MAP`): soft experts received per
+        // step (summed over the decode replies), paged experts the mirror had
+        // as soft at submit (evicted between the reply and the pick), and --
+        // under `V41_B2_SOFT_PRIOR` -- plain box-2 picks resident only by
+        // softness (what the prior would have treated as missing).
+        "lh2_soft_total", "lh2_paged_mirror_soft", "sub_soft_unswapped",
     ],
 };
 

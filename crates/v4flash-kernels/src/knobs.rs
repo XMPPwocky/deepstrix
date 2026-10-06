@@ -782,6 +782,17 @@ crate::knobs! {
     /// hint words sent INCOMING on the mirror (`b2_mirror::note_incoming`) so the cache prior does
     /// not swap a hinted rank-2 pick away (design 3.2). Off: the prior stays hint-blind (I2 exact).
     pub static B2_NURSERY_PRIOR = Knob::flag("V41_B2_NURSERY_PRIOR", false).live();
+    /// `V41_B2_SOFT_MAP` (default on; live): ask box 2 for the SOFT-HELD map on every decode request
+    /// (`REQ2_FLAG_SOFT`: resident-but-unpinned experts, 12 reply words; an older daemon sends none).
+    /// Off = today's wire. The map feeds counters only unless a consumer knob below is on.
+    pub static B2_SOFT_MAP = Knob::flag("V41_B2_SOFT_MAP", true).live();
+    /// `V41_B2_SOFT_PRIOR` (default off; live): the cache prior, the planner and `n_pred_miss` treat a
+    /// soft-held expert as resident (no swap, no predicted miss). Changes routing decisions -- the A/B
+    /// of interest: `sub.picks_swapped`, `sub.predicted_miss`, `box2.paged`, `lh2_paged_mirror_soft`.
+    pub static B2_SOFT_PRIOR = Knob::flag("V41_B2_SOFT_PRIOR", false).live();
+    /// `V41_B2_SOFT_HINT` (default off; live): the look-ahead filter treats a soft-held expert as
+    /// resident (no hint for it).
+    pub static B2_SOFT_HINT = Knob::flag("V41_B2_SOFT_HINT", false).live();
 }
 
 #[cfg(test)]

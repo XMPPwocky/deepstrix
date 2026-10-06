@@ -175,10 +175,11 @@ pub fn cfg() -> Cfg {
     Cfg::unpack(CFG.load(Relaxed), CFG2.load(Relaxed))
 }
 
-/// Anything to count this step (the `hub_lh2` record is emitted iff so).
+/// Anything to count this step (the `hub_lh2` record is emitted iff so): the
+/// prefetch knob, the budget, or the SOFT-HELD map (its counters live here).
 pub fn active() -> bool {
     let c = cfg();
-    c.mode.on() || c.spec_budget > 0
+    c.mode.on() || c.spec_budget > 0 || super::b2_mirror::soft_map()
 }
 
 /// A decode step begins (right after `b2_mirror::begin_step`, which advanced
@@ -386,6 +387,10 @@ pub struct LaneState {
     /// Bit e: the request sent pick e and the mirror called it non-resident
     /// at submit (`nonres_bits`): the hintable misses among the paged ones.
     pub nonres_bits: [u32; PAGED_WORDS],
+    /// Bit e: the request sent pick e and the mirror had it SOFT-held at
+    /// submit (`pick_bits`): a paged one was evicted between reply and use
+    /// (`lh2_paged_mirror_soft`).
+    pub soft_bits: [u32; PAGED_WORDS],
 }
 
 /// A protected dry hit: the predicted rank and margin of a prediction whose
@@ -504,15 +509,30 @@ pub fn paged_totals(paged: &[u32], held: &[u32], nonres_bits: &[u32], late: bool
 /// Bit e of `out`: pick e is in `sel` (as sent to box 2, `NO_PICK` for box
 /// 1's) and the mirror calls it non-resident (`nonres`).
 pub fn nonres_bits(sel: &[i32], nonres: impl Fn(u32) -> bool, out: &mut [u32; PAGED_WORDS]) {
+    pick_bits(sel, nonres, out)
+}
+
+/// Bit e of `out`: pick e is in `sel` and `pred(e)` holds (the predicate
+/// runs once per distinct expert).
+pub fn pick_bits(sel: &[i32], pred: impl Fn(u32) -> bool, out: &mut [u32; PAGED_WORDS]) {
     *out = [0; PAGED_WORDS];
+    let mut seen = [0u32; PAGED_WORDS];
     for &sv in sel {
         if (0..N_EXPERT as i32).contains(&sv) {
             let e = sv as usize;
-            if (out[e / 32] >> (e % 32)) & 1 == 0 && nonres(sv as u32) {
-                out[e / 32] |= 1 << (e % 32);
+            if (seen[e / 32] >> (e % 32)) & 1 == 0 {
+                seen[e / 32] |= 1 << (e % 32);
+                if pred(sv as u32) {
+                    out[e / 32] |= 1 << (e % 32);
+                }
             }
         }
     }
+}
+
+/// Paged experts the mirror had as SOFT-held at submit (`lh2_paged_mirror_soft`).
+pub fn paged_soft(paged: &[u32], soft_bits: &[u32]) -> u32 {
+    paged.iter().zip(soft_bits).map(|(p, s)| (p & s).count_ones()).sum()
 }
 
 /// The request's PROTECTED box-2 picks (`sel` as sent to box 2, `[rows][n_used]`
@@ -1050,7 +1070,7 @@ pub fn budget_commit(t: &Take) {
 /// layer (and of those the protected-rank ones), paged experts in pin replies
 /// that had been hinted, hints deduped against the mirror's NURSERY bits, the
 /// `after` placement's late look-aheads (0 under `before`), abort-bar trips.
-pub const STATS: [(&str, &str); 70] = [
+pub const STATS: [(&str, &str); 73] = [
     ("lh2_cand_r1", "lh2.cand_r1"),
     ("lh2_cand_r2", "lh2.cand_r2"),
     ("lh2_cand_r3", "lh2.cand_r3"),
@@ -1126,6 +1146,12 @@ pub const STATS: [(&str, &str); 70] = [
     ("lh2_paged_late_total", "lh2.paged_late_total"),
     ("lh2_paged_mirror_held", "lh2.paged_mirror_held"),
     ("lh2_paged_mirror_nonres", "lh2.paged_mirror_nonres"),
+    // The SOFT-HELD map: soft experts received per step, paged experts the
+    // mirror had as soft at submit (evicted between reply and use), and plain
+    // picks the prior kept only because they were soft (`V41_B2_SOFT_PRIOR`).
+    ("lh2_soft_total", "lh2.soft_total"),
+    ("lh2_paged_mirror_soft", "lh2.paged_mirror_soft"),
+    ("sub_soft_unswapped", "sub.soft_unswapped"),
 ];
 
 const STAT_ANY_PAGED: usize = 46;
@@ -1194,6 +1220,9 @@ pub enum Stat {
     NurseryCovered = 17,
     LookLate = 18,
     BarTrips = 19,
+    SoftTotal = 70,
+    PagedMirrorSoft = 71,
+    SubSoftUnswapped = 72,
 }
 
 pub fn bump(s: Stat, n: u64) {
@@ -1290,7 +1319,21 @@ mod tests {
         for k in [&B2_MISS_PREFETCH_MAX_WORDS_STEP, &B2_MISS_PREFETCH_MAX_PER_LL_X10, &B2_NURSERY_PRIOR, &B2_MISS_PREFETCH_MARGIN] {
             assert!(k.live, "{}: flipped per turn", k.name);
         }
-        assert_eq!(STATS.len(), 70);
+        assert_eq!(STATS.len(), 73);
+        assert_eq!(STATS[Stat::SoftTotal as usize].0, "lh2_soft_total");
+        assert_eq!(STATS[Stat::PagedMirrorSoft as usize].0, "lh2_paged_mirror_soft");
+        assert_eq!(STATS[Stat::SubSoftUnswapped as usize].1, "sub.soft_unswapped");
+        use crate::knobs::{B2_SOFT_HINT, B2_SOFT_MAP, B2_SOFT_PRIOR};
+        assert!(matches!(B2_SOFT_MAP.kind, crate::knobs::Kind::Flag(true)), "the map is asked by default (12 reply words)");
+        assert!(matches!(B2_SOFT_PRIOR.kind, crate::knobs::Kind::Flag(false)) && matches!(B2_SOFT_HINT.kind, crate::knobs::Kind::Flag(false)), "consumers off: today's routing");
+        assert!(B2_SOFT_MAP.live && B2_SOFT_PRIOR.live && B2_SOFT_HINT.live);
+        // `pick_bits` / `paged_soft`.
+        let mut bits = [0u32; PAGED_WORDS];
+        pick_bits(&[3, 40, -1, 3, 400, 7], |e| e != 7, &mut bits);
+        assert_eq!((bits[0], bits[1]), (1 << 3, 1 << 8));
+        let mut paged = [0u32; PAGED_WORDS];
+        paged[0] = (1 << 3) | (1 << 7);
+        assert_eq!(paged_soft(&paged, &bits), 1);
         assert_eq!(STATS[STAT_ANY_PAGED].0, "lh2_hits_paged_any_r1");
         assert_eq!(STATS[STAT_ANY_LATE + 5].0, "lh2_hits_late_any_r6");
         assert_eq!(STATS[STAT_ANY_PAGED_M].0, "lh2_hits_paged_any_m0");
@@ -1327,7 +1370,9 @@ mod tests {
             assert!(!legacy_words(m, false, true), "{m:?}: legacy var unset pushes nothing from 9515");
             assert!(!legacy_words(m, true, true), "{m:?}: the knob replaces the old block even with the legacy var set");
         }
-        // Slice B: the wire needs `k1`/`k2` AND box 2's `RESP_FLAG_NURSERY`.
+        // Slice B: the wire needs `k1`/`k2` AND box 2's `RESP_FLAG_NURSERY`
+        // (the mirror's statics are process-wide: hold its test guard).
+        let _statics = super::super::b2_mirror::tests::statics_guard();
         super::super::b2_mirror::reset_nursery_support();
         for m in [Mode::Off, Mode::Dry, Mode::K1, Mode::K2] {
             assert!(!m.wire(), "{m:?}: nothing on the wire before box 2 answers");

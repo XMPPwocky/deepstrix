@@ -150,6 +150,14 @@ static INCOMING: [[AtomicU32; NE]; LAYERS] = [const { [const { AtomicU32::new(0)
 /// never `held`: the cache prior stays hint-blind (I2), and a nursery entry
 /// is not pinned, so it must not count as held.
 static NURSERY: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
+/// SOFT-HELD bits (`proto::RESP_FLAG_SOFT`): per the layer's last reply, the
+/// experts landed in a main slot but NOT pinned (served without a read right
+/// now, evictable any time). Replaced at the layer's next reply -- no epoch
+/// masking (`apply_map`'s release rules are for pins); a soft entry evicted
+/// between the reply and the pick shows up as a paged reply of a mirror-soft
+/// expert (`lh2_paged_mirror_soft`). Consumers only under `V41_B2_SOFT_PRIOR`
+/// (`resident()`) / `V41_B2_SOFT_HINT` (the look-ahead filter).
+static SOFT: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
 /// Does box 2 understand `REQ_FLAG_LIKELY`? 0 unknown (no LIKELY-flagged
 /// reply yet), 1 yes (a reply carried `RESP_FLAG_NURSERY`), 2 no (a reply
 /// to a LIKELY-flagged request did not). The hub puts hint words on the wire
@@ -373,7 +381,65 @@ pub fn note_submitted(layer: u32, sel: &[i32]) {
 /// a background read of it is already queued (INCOMING). `None` until box 2
 /// has reported `layer` at all.
 pub fn resident(layer: i32, e: u32) -> Option<bool> {
-    lookup(layer, e).map(|r| r.held || (r.pending && pending_on()) || r.incoming)
+    lookup(layer, e).map(|r| r.held || (r.pending && pending_on()) || r.incoming || (r.soft && soft_prior()))
+}
+
+/// `V41_B2_SOFT_MAP` (default on): ask box 2 for the SOFT-HELD map.
+pub fn soft_map() -> bool {
+    crate::knobs::B2_SOFT_MAP.on()
+}
+
+/// `V41_B2_SOFT_PRIOR` (default off): the cache prior, the planner and
+/// `n_pred_miss` treat a soft-held expert as resident (no swap, no
+/// predicted miss). The A/B of interest: fewer swaps (`sub.picks_swapped`,
+/// `sub.predicted_miss`) against surprises on evicted soft picks
+/// (`lh2_paged_mirror_soft`, `box2.paged`).
+pub fn soft_prior() -> bool {
+    crate::knobs::B2_SOFT_PRIOR.on()
+}
+
+/// `V41_B2_SOFT_HINT` (default off): the look-ahead filter treats a soft-held
+/// expert as resident (no hint).
+pub fn soft_hint() -> bool {
+    crate::knobs::B2_SOFT_HINT.on()
+}
+
+/// The `n_pred_miss` predicate on a `lookup` (the hub's "box 2 would have to
+/// read it"): not held, not pending, not incoming, and -- under
+/// `V41_B2_SOFT_PRIOR` -- not soft-held.
+pub fn nonres_for_miss(r: &Residency) -> bool {
+    !r.held && !r.pending && !r.incoming && !(r.soft && soft_prior())
+}
+
+/// The look-ahead filter's predicate: as `nonres_for_miss`, with
+/// `V41_B2_SOFT_HINT` gating the soft term instead.
+pub fn nonres_for_hint(r: &Residency) -> bool {
+    !r.held && !r.pending && !r.incoming && !(r.soft && soft_hint())
+}
+
+/// Is `(layer, e)` soft-held per the layer's last reply?
+pub fn soft(layer: i32, e: u32) -> bool {
+    let l = layer as usize;
+    if l >= LAYERS || e >= N_EXPERT {
+        return false;
+    }
+    (SOFT[l][(e / 64) as usize].load(Ordering::Relaxed) >> (e % 64)) & 1 == 1
+}
+
+/// A reply for `layer` carried a SOFT map (`RESID_WORDS` u32s, bit e): the
+/// layer's row is REPLACED (the previous map expires).
+pub fn update_soft(layer: u32, words: &[u32]) {
+    let l = layer as usize;
+    if l >= LAYERS {
+        return;
+    }
+    let mut row = [0u64; WORDS];
+    for (i, &w) in words.iter().enumerate().take(RESID_WORDS) {
+        row[i / 2] |= u64::from(w) << (32 * (i % 2));
+    }
+    for (i, slot) in SOFT[l].iter().enumerate() {
+        slot.store(row[i], Ordering::Relaxed);
+    }
 }
 
 /// Box 1's view of one box-2 expert, the sources kept apart (for the trace).
@@ -391,6 +457,10 @@ pub struct Residency {
     /// that has landed and is not promoted yet. NOT residency for the prior
     /// (`resident()` ignores it): the filter's dedup only.
     pub nursery: bool,
+    /// SOFT-HELD per the layer's last reply (`update_soft`): landed, not
+    /// pinned. Residency for the prior only under `V41_B2_SOFT_PRIOR`, for the
+    /// look-ahead filter only under `V41_B2_SOFT_HINT`.
+    pub soft: bool,
 }
 
 /// `(layer, e)`'s residency sources; `None` until box 2 has reported `layer`.
@@ -405,6 +475,7 @@ pub fn lookup(layer: i32, e: u32) -> Option<Residency> {
         pending: (PENDING[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
         incoming: incoming(l, e as usize),
         nursery: (NURSERY[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
+        soft: (SOFT[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
     })
 }
 
@@ -1033,6 +1104,7 @@ pub fn on_connect() {
             BITS[l][i].store(0, Ordering::Relaxed);
             PENDING[l][i].store(0, Ordering::Relaxed);
             NURSERY[l][i].store(0, Ordering::Relaxed);
+            SOFT[l][i].store(0, Ordering::Relaxed);
         }
     }
     PIN_MODE.store(if pin_wanted() { 1 } else { 0 }, Ordering::Relaxed);
@@ -1770,32 +1842,82 @@ pub fn substitute(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// `STATICS` (below) for a test in another module (lookahead's wire gating).
+    pub(crate) fn statics_guard() -> std::sync::MutexGuard<'static, ()> {
+        STATICS.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The SOFT-HELD map: a reply replaces its layer's row (the previous map
+    /// expires), `lookup().soft` reports it, and it is residency for
+    /// `resident()` / `nonres_for_miss` only under `V41_B2_SOFT_PRIOR`, for
+    /// `nonres_for_hint` only under `V41_B2_SOFT_HINT`; `on_connect` forgets it.
+    #[test]
+    fn soft_map_replaces_the_row_and_consumers_are_knobbed() {
+        let _statics = statics_guard();
+        use crate::knobs::{B2_SOFT_HINT, B2_SOFT_PRIOR};
+        // Layers 36-37 are this test's alone (the statics are process-wide and
+        // the pin tests run beside this one: never `on_connect` here).
+        const L: u32 = 36;
+        assert!(B2_SOFT_PRIOR.set("0") && B2_SOFT_HINT.set("0"));
+        let mut words = [0u32; RESID_WORDS];
+        words[0] = 1 << 5;
+        words[1] = 1 << 8; // expert 40
+        words[11] = 1 << 31; // expert 383
+        update_soft(L, &words);
+        assert!(soft(L as i32, 5) && soft(L as i32, 40) && soft(L as i32, 383) && !soft(L as i32, 6) && !soft(L as i32 + 1, 5));
+        assert!(!soft(99, 5) && !soft(L as i32, 9999));
+        update(L, &[0; RESID_WORDS]);
+        let r = lookup(L as i32, 5).unwrap();
+        assert!(r.soft && !r.held && !r.pending && !r.incoming);
+        // Consumers off: soft is not residency for anyone.
+        assert_eq!(resident(L as i32, 5), Some(false));
+        assert!(nonres_for_miss(&r) && nonres_for_hint(&r));
+        // The prior knob: resident for the prior / miss count, not for the filter.
+        assert!(B2_SOFT_PRIOR.set("1"));
+        assert_eq!(resident(L as i32, 5), Some(true));
+        assert!(!nonres_for_miss(&r) && nonres_for_hint(&r));
+        assert!(B2_SOFT_PRIOR.set("0"));
+        // The hint knob: the filter only.
+        assert!(B2_SOFT_HINT.set("1"));
+        assert_eq!(resident(L as i32, 5), Some(false));
+        assert!(nonres_for_miss(&r) && !nonres_for_hint(&r));
+        assert!(B2_SOFT_HINT.set("0"));
+        // The next reply replaces the row (the previous map expires).
+        update_soft(L, &[0; RESID_WORDS]);
+        assert!(!soft(L as i32, 5) && !lookup(L as i32, 5).unwrap().soft);
+        update_soft(L, &words);
+        update_soft(L, &[0; RESID_WORDS]);
+        assert!(!soft(L as i32, 383));
+    }
 
     /// The NURSERY bits (design 3.2): a block replaces its reply layer's row
     /// and adds other layers' entries; they are dedup state, never `held`;
     /// the capability flips once per transition and `on_connect` forgets it.
     #[test]
     fn nursery_bits_replace_the_reply_layers_row() {
-        on_connect();
+        let _statics = statics_guard();
+        // Layers 38-39 are this test's alone (never `on_connect` here: the
+        // statics are process-wide and the pin tests run beside this one).
+        let (a, b) = (38u32, 39u32);
         let w = |l: u32, e: u32| (l << 16) | e;
-        update_nursery(5, &[w(5, 1), w(5, 70), w(9, 3)]);
-        assert!(nursery(5, 1) && nursery(5, 70) && nursery(9, 3) && !nursery(5, 2));
-        assert_eq!(resident(5, 1), None, "no residency map yet: SEEN is false");
-        update(5, &[0; RESID_WORDS]);
-        let r = lookup(5, 1).unwrap();
+        update_nursery(a, &[w(a, 1), w(a, 70), w(b, 3)]);
+        assert!(nursery(a as i32, 1) && nursery(a as i32, 70) && nursery(b as i32, 3) && !nursery(a as i32, 2));
+        update(a, &[0; RESID_WORDS]);
+        let r = lookup(a as i32, 1).unwrap();
         assert!(r.nursery && !r.held && !r.pending && !r.incoming);
-        assert_eq!(resident(5, 1), Some(false), "a nursery entry is NOT resident for the prior (I2)");
-        // The next reply for layer 5 lists only 70: 1 left the nursery (promoted or recycled).
-        update_nursery(5, &[w(5, 70), w(9, 3)]);
-        assert!(!nursery(5, 1) && nursery(5, 70) && nursery(9, 3));
-        // Layer 9's own reply replaces ITS row; layer 5's is untouched.
-        update_nursery(9, &[]);
-        assert!(!nursery(9, 3) && nursery(5, 70));
-        update_nursery(7, &[w(40, 1), w(7, 400), w(7, 2)]);
-        assert!(nursery(7, 2) && !nursery(7, 2 + 1), "out-of-range words are skipped");
-        // Capability: unknown -> yes -> no -> yes; a reconnect forgets.
+        assert_eq!(resident(a as i32, 1), Some(false), "a nursery entry is NOT resident for the prior (I2)");
+        // The next reply for layer a lists only 70: 1 left the nursery (promoted or recycled).
+        update_nursery(a, &[w(a, 70), w(b, 3)]);
+        assert!(!nursery(a as i32, 1) && nursery(a as i32, 70) && nursery(b as i32, 3));
+        // Layer b's own reply replaces ITS row; layer a's is untouched.
+        update_nursery(b, &[]);
+        assert!(!nursery(b as i32, 3) && nursery(a as i32, 70));
+        update_nursery(b, &[w(40, 1), w(b, 400), w(b, 2)]);
+        assert!(nursery(b as i32, 2) && !nursery(b as i32, 3), "out-of-range words are skipped");
+        // Capability: unknown -> yes -> no -> yes (this static is the test's own).
         reset_nursery_support();
         assert!(!nursery_supported());
         nursery_reply_seen(true);
@@ -1804,13 +1926,16 @@ mod tests {
         assert!(!nursery_supported());
         nursery_reply_seen(true);
         assert!(nursery_supported());
-        on_connect();
-        assert!(!nursery_supported() && !nursery(5, 70));
+        reset_nursery_support();
+        update_nursery(a, &[]);
+        update_nursery(b, &[]);
+        assert!(!nursery(a as i32, 70));
     }
 
-    /// The mirror's rows, marks and the pin ledger are process-wide statics:
-    /// tests that touch them run one at a time.
-    static STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The mirror's rows, marks, the pin ledger, the NURSERY / SOFT rows and
+    /// the nursery capability are process-wide statics (`on_connect` wipes
+    /// them all): tests that touch them run one at a time. NOT re-entrant.
+    pub(crate) static STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const S: f32 = 1.5;
     const R6: SubRules = SubRules { min_rank: 6, max_w: None, scale: S };
@@ -2101,7 +2226,7 @@ mod tests {
         assert_eq!(resident(l as i32, 4), Some(true));
         assert_eq!(
             lookup(l as i32, 4),
-            Some(Residency { held: false, pending: true, incoming: false, nursery: false }),
+            Some(Residency { held: false, pending: true, incoming: false, nursery: false, soft: false }),
             "pending, not held"
         );
         // The next reply is authoritative again.
@@ -2140,7 +2265,7 @@ mod tests {
         let mut w = empty.clone();
         w[0] = 1 << 8;
         update(l, &w);
-        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: true, nursery: false }));
+        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: true, nursery: false, soft: false }));
         update(l, &empty);
         assert_eq!(resident(l as i32, 8), Some(true), "still covered by its mark");
         // A prefill pass ends it at once.
