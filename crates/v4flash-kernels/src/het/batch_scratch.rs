@@ -436,10 +436,10 @@ pub struct BatchDgpuScratch {
     /// n_pred_miss, n_pred_incoming, n_pred_pending.
     pub ev_req: [f64; 9],
     /// Predicted-miss look-ahead (`V41_B2_MISS_PREFETCH`, `het::lookahead`):
-    /// what this lane hinted for its NEXT layer, matched against the lane's
-    /// own picks when that layer routes (`lh2_dry_hits_rN`). Per lane, so the
-    /// two lanes' predictions never cross.
-    pub lh2_pending: Option<crate::het::lookahead::Pending>,
+    /// the filter's reusable scratch and what this lane hinted for its NEXT
+    /// layer, matched against the lane's own picks when that layer routes
+    /// (`lh2_dry_hits_rN`). Per lane, so the two lanes' predictions never cross.
+    pub lh2: crate::het::lookahead::LaneState,
 }
 
 /// Lane rows up to which `V41_MS_MHC_SPLIT` runs the mHC mixes on the side
@@ -1334,7 +1334,7 @@ impl BatchDgpuScratch {
             mhc_ffn_split_pending: false,
             remote_ticket: None,
             ev_req: [f64::NAN; 9],
-            lh2_pending: None,
+            lh2: Default::default(),
         })
     }
 }

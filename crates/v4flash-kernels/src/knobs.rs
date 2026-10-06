@@ -751,13 +751,16 @@ crate::knobs! {
     pub static B2_MISS_PREFETCH_RANK = Knob::int("V41_B2_MISS_PREFETCH_RANK", 1, 1, 3).live();
     /// `V41_B2_MISS_PREFETCH_CAP` (default 8, 0..=64; live): hint words per lane-layer and target layer.
     pub static B2_MISS_PREFETCH_CAP = Knob::int("V41_B2_MISS_PREFETCH_CAP", 8, 0, 64).live();
-    /// `V41_B2_SPEC_BUDGET` (default 60, 0..=65535; live, read once per decode step): speculative
-    /// words -- hints + cache-prior admissions + pin restores -- a decode step sends box 2 in all
-    /// (design 2.4; `het::lookahead::SpecBudget`: hints first, restores paced at ~1 per request
-    /// with a floor of 16 per step). `0` = today's rule: up to 128 admission words plus
-    /// `V41_B2_PIN_RESTORE_PER_REQ` restores per REQUEST, which bursts 1,280 restores per step
-    /// after a phase switch and loses what finds no free staging set on box 2.
-    pub static B2_SPEC_BUDGET = Knob::int("V41_B2_SPEC_BUDGET", 60, 0, 65535).live();
+    /// `V41_B2_SPEC_BUDGET` (default 0 = off, 0..=65535; live, read once per decode step):
+    /// speculative words -- hints + cache-prior admissions + pin restores -- a decode step sends
+    /// box 2 in all (design 2.4; `het::lookahead::SpecBudget`: hints first, restores paced at ~1
+    /// per request with a floor of 16 per step; the design's value is 60). `0` = today's rule:
+    /// up to 128 admission words plus `V41_B2_PIN_RESTORE_PER_REQ` restores per REQUEST, which
+    /// bursts 1,280 restores per step after a phase switch and loses what finds no free staging
+    /// set on box 2. Ships in slice A OFF so the slice-A restart changes nothing with the hint
+    /// knob off; flipped to 60 live as its own per-turn A/B (restore refill after a phase
+    /// switch, `pf_d_dropped`, `b2_pinned`, paged late replies in the 0-20 s phase bin).
+    pub static B2_SPEC_BUDGET = Knob::int("V41_B2_SPEC_BUDGET", 0, 0, 65535).live();
 }
 
 #[cfg(test)]

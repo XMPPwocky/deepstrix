@@ -85,7 +85,10 @@ owned, no residency test) -> `push_prefetch_words` (remote_experts.rs:3688) -> `
    spike; leftover restore words survive a phase flip via `pin_enter_prefill` 1086-1088, so starvation is
    impossible; the real cap is the daemon's start capacity ~40/step under busy walls): a 1,000-word
    restore refills in ~1 s with ~0 loss instead of a burst that lands a fraction. A win for the restore
-   lever on its own; on regardless of the hint knob; may ship in slice A.
+   lever on its own; on regardless of the hint knob. SHIPS IN SLICE A (code review 10-06, finding 1): knob
+   default 0 = today's per-request caps, so the slice-A restart changes nothing with the hint knob off; flipped
+   to 60 live as its own per-turn A/B (restore refill time after a phase switch, `pf_d_dropped`, `b2_pinned`,
+   paged late replies in the 0-20 s phase bin).
 5. **Shared scratch is safe under the pack.** The drivers' `lookahead_hints_ok = false` (4189-4195,
    4507-4510) guards the COPY path (`rb_stream` 9017-9036); the pack reads `sd.look_sel*` on `de.compute`
    in stream order (8573-8575). Change: `lookahead_hints_ok = rb.packed && knob on`.
@@ -214,7 +217,7 @@ nursery). (a)-at-arrival vs at-dequeue is the b2q tail only.
 ## 5. Policy safety
 
 - Hub knob `V41_B2_MISS_PREFETCH = off | dry | k1 | k2` (default `off`; live knob file); `_RANK` 1-3
-  (default 1), `_CAP` 8, `_PLACE=before|after`, `V41_B2_SPEC_BUDGET` 60/step. Box 2: `nursery` slots
+  (default 1), `_CAP` 8, `_PLACE=before|after`, `V41_B2_SPEC_BUDGET` (default 0 = today's caps; 60 is the A/B value). Box 2: `nursery` slots
   (0 = off; file key, restart), LIKELY class on iff nursery > 0.
 - Nothing adaptive. If R is ever adaptive: epsilon-uniform over {1,2,3}, forget by time, bounded sample.
 - Scope: `RowLayout::Arena` decode rows, `remote_split_on`, learned routers (8319, 1848-1860).
@@ -273,7 +276,8 @@ Gates:
   (2.1) WITH the 9515-9539 replacement (else `dry` either launches nothing or leaks the legacy words);
   `dry` never calls `push_prefetch_words`; `look_next2` off unless `k2`; `lookahead_hints_ok` left as is
   in A; filter, queue, per-R counters, section 6 hub counters, host timers + the per-cell `ms.step` watch
-  (dry on/off per turn); the per-step budget (2.4) may ship in A too. Decides R and the host-cost question.
+  (dry on/off per turn); the per-step budget (2.4) ships in A at default 0, A/B'd live on its own. Decides R
+  and the host-cost question.
 - **B. Hub filter/queue/pacing/RESP detection** in the same hub binary: `k1` sends only once the daemon
   answers `RESP_FLAG_NURSERY`; the per-step speculative budget on regardless; `lookahead_hints_ok =
   rb.packed`.

@@ -2253,12 +2253,24 @@ impl Sched {
                 let e = acc.stages.entry(("host", "pager.read_ms")).or_insert((0.0, 0));
                 e.0 += dr as f64 / 1e6; e.1 += 1;
             }
-            for (name, us) in v4flash_kernels::het::forward_prefill::take_layer_host_timing() {
+            let lh = v4flash_kernels::het::forward_prefill::take_layer_host_timing();
+            for &(name, us) in &lh {
                 let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                 e.0 += us as f64 / 1e3;
                 e.1 += 1;
                 if ev_on {
                     ev.insert(name.replacen("lh.", "lh_", 1), us as f64 / 1e3);
+                }
+            }
+            // The predicted-miss look-ahead's host cost PER LANE-LAYER (us), the
+            // number the design's 2.6 compares with the 0.03 ms turnaround slack
+            // (`lh.look_*` above are per step; `_n_x1e3` counts the lane-layers).
+            for (us_name, n_name, stage) in [("lh.look_launch", "lh.look_launch_n_x1e3", "lh2.look_launch_us_per_ll"), ("lh.look_filter", "lh.look_filter_n_x1e3", "lh2.look_filter_us_per_ll")] {
+                let get = |k: &str| lh.iter().find(|h| h.0 == k).map(|h| h.1).unwrap_or(0);
+                let (us, n) = (get(us_name), get(n_name) / 1000);
+                if n > 0 {
+                    let e = acc.stages.entry(("host", stage)).or_insert((0.0, 0));
+                    e.0 += us as f64 / n as f64; e.1 += 1;
                 }
             }
             {

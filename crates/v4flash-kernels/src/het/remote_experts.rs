@@ -8597,8 +8597,11 @@ impl RemoteExpertClient {
             // hints, then admissions, then restores (~1 per request, a floor of
             // 16 per step), at most `V41_B2_SPEC_BUDGET` words per step in all.
             // What the budget holds back stays queued (`lh2_budget_deferred`);
-            // the release-before-restore rule above still holds. A hint past
-            // the budget is dropped here (slice B decides whether to re-queue).
+            // the release-before-restore rule above still holds.
+            // TODO(slice B): `take_hint_words(.., 128)` above hands out EVERY
+            // fresh word and `.take(t.hints)` below drops the surplus past the
+            // budget; with `Mode::wire` on, derive the drain's `max` from the
+            // plan (plan first, then take) or re-queue the surplus -- never drop.
             let restores_ok = pin_req && super::b2_mirror::releases_queued() == 0;
             let t = super::lookahead::budget_plan(
                 hints.len(), prefetch_words_queued(), if restores_ok { restore_words_queued() } else { 0 },

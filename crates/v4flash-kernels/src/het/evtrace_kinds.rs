@@ -152,11 +152,14 @@ pub static HUB_STEP: Kind = Kind {
 /// (`V41_B2_MISS_PREFETCH`, `het::lookahead`; design section 6) and of the
 /// per-step speculative budget (`V41_B2_SPEC_BUDGET`): one record per decode
 /// step while either is on, joined to `hub_step` by `step` (`hub_step` is at
-/// its field limit). Per R in 1..=3: distinct box-2-owned predicted picks of
-/// rank `<= R` over the step's lane-layers (`cand`), the mirror-non-resident
-/// ones among them (`nonres`), and of THOSE the ones in the router's own picks
-/// one lane-layer later (`dry_hits`: the live Step 0; `dry_hits_r1 /
-/// nonres_r1` is rank-1 recall, 0.71 in design section 1). `dry_words` = hint
+/// its field limit). Per R in 1..=3, summed over the step's lane-layers:
+/// box-2-owned predicted picks of rank `<= R`, distinct per LANE-layer (both
+/// lanes predicting one expert for one layer count twice; the hint WORDS are
+/// deduped across lanes) (`cand`), the mirror-non-resident ones among them
+/// (`nonres`), and of THOSE the ones in the SAME lane's own picks one
+/// lane-layer later (`dry_hits`: the live Step 0; `dry_hits_r1 / nonres_r1` is
+/// rank-1 recall, 0.71 in design section 1 -- a FLOOR: a hint the other lane's
+/// rows demand counts as a miss, so the bar is conservative). `dry_words` = hint
 /// words at the knob's R and cap the queue handed a decode submit (slice A:
 /// counted, kept off the wire -- the volume the absolute abort bar of section
 /// 5 reads); `hints_sent` = words on the wire (0 in slice A); `dropped_cap`,

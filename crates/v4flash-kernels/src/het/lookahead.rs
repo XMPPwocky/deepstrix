@@ -76,8 +76,8 @@ impl Mode {
     /// May the queued words go on the wire? SLICE B: `k1` / `k2` AND the
     /// daemon has answered `RESP_FLAG_NURSERY` (design 3.2, "capability = a
     /// RESP flag": an echoed request bit proves nothing). Slice A: never.
+    #[allow(clippy::unused_self)]
     pub fn wire(self) -> bool {
-        let _ = self;
         false
     }
 }
@@ -184,40 +184,125 @@ pub struct Pred {
     pub nonres: bool,
 }
 
-/// Layer `target`'s predicted picks, DISTINCT by expert, box 2's only
-/// (`is_box2`), best rank first, then first appearance. `look` is
-/// `[rows][n_used]` in the router's descending selection order (rank r is
-/// column r-1), as `forward_prefill` unpacks `sd.look_sel`; ids outside
-/// `0..N_EXPERT` (NO_PICK, padding) are skipped.
-pub fn classify(look: &[i32], n_used: usize, is_box2: impl Fn(u32) -> bool, nonres: impl Fn(u32) -> bool) -> Vec<Pred> {
-    if n_used == 0 {
-        return Vec::new();
-    }
-    // Per expert: best rank (0 = unseen) and the index of its first appearance.
-    let mut best = [0u8; NE];
-    let mut first = [u32::MAX; NE];
-    for (i, &sv) in look.iter().enumerate() {
-        if !(0..N_EXPERT as i32).contains(&sv) {
-            continue;
+/// Ranks the filter and the counters care about (R `<= 3`, design 5): a
+/// prediction of a lower rank is neither counted nor hinted.
+pub const MAX_RANK: u8 = 3;
+
+/// Per-lane host state of the filter (`BatchDgpuScratch::lh2`), reused across
+/// the lane's layers: the Route path allocates nothing after the first use
+/// (review: 5-20 us against the 0.03 ms turnaround slack). `best` / `seen` are
+/// cleared by walking the same slice that dirtied them, never the whole
+/// 384-entry array.
+#[derive(Debug, Default)]
+pub struct LaneState {
+    /// Per expert during `classify`: 0 unseen, 1..=3 best rank, 255 box 1's.
+    best: Vec<u8>,
+    /// Per expert during `dry_hits`: in the own picks.
+    seen: Vec<bool>,
+    /// The last `classify`.
+    pub preds: Vec<Pred>,
+    /// What this lane predicted for `pending` `(layer, step)`: the non-resident
+    /// predictions only (`set_pending`); `None` = nothing pending.
+    pub pending: Option<(i32, u32)>,
+    pub pending_preds: Vec<Pred>,
+}
+
+impl LaneState {
+    fn ensure(&mut self) {
+        if self.best.len() != NE {
+            self.best = vec![0; NE];
+            self.seen = vec![false; NE];
         }
-        let e = sv as usize;
-        let rank = ((i % n_used) + 1).min(255) as u8;
-        if best[e] == 0 {
-            if !is_box2(e as u32) {
-                // Mark box 1's so the ownership test runs once per expert.
-                best[e] = 255;
-                first[e] = u32::MAX;
+    }
+
+    /// Layer `target`'s predicted picks into `self.preds`: DISTINCT by expert,
+    /// box 2's only (`is_box2`), of rank `<= MAX_RANK`, best rank first, then
+    /// first appearance (a 3-bucket scan, no sort). `look` is `[rows][n_used]`
+    /// in the router's descending selection order (rank r is column r-1), as
+    /// `forward_prefill` unpacks `sd.look_sel`; ids outside `0..N_EXPERT`
+    /// (NO_PICK, padding) are skipped.
+    pub fn classify(&mut self, look: &[i32], n_used: usize, is_box2: impl Fn(u32) -> bool, nonres: impl Fn(u32) -> bool) {
+        self.ensure();
+        self.preds.clear();
+        if n_used == 0 {
+            return;
+        }
+        let valid = |sv: i32| (0..N_EXPERT as i32).contains(&sv);
+        for (i, &sv) in look.iter().enumerate() {
+            if !valid(sv) {
                 continue;
             }
-            best[e] = rank;
-            first[e] = i as u32;
-        } else if rank < best[e] {
-            best[e] = rank;
+            let (e, rank) = (sv as usize, (i % n_used) + 1);
+            if self.best[e] == 0 {
+                // Box 1's are marked, so the ownership test runs once per expert.
+                self.best[e] = if is_box2(e as u32) { rank.min(255) as u8 } else { 255 };
+            } else if rank < self.best[e] as usize {
+                self.best[e] = rank as u8;
+            }
+        }
+        // Bucket by rank; within a bucket, first appearance. Emitting an expert
+        // flips its mark to 255, so it comes out once and the slice walk below
+        // still finds every dirtied entry.
+        for rank in 1..=MAX_RANK {
+            for &sv in look {
+                if valid(sv) && self.best[sv as usize] == rank {
+                    self.best[sv as usize] = 255;
+                    self.preds.push(Pred { e: sv as u16, rank, nonres: nonres(sv as u32) });
+                }
+            }
+        }
+        for &sv in look {
+            if valid(sv) {
+                self.best[sv as usize] = 0;
+            }
         }
     }
-    let mut out: Vec<(u8, u32, u16)> = (0..NE).filter(|&e| best[e] != 0 && first[e] != u32::MAX).map(|e| (best[e], first[e], e as u16)).collect();
-    out.sort_unstable();
-    out.into_iter().map(|(rank, _, e)| Pred { e, rank, nonres: nonres(u32::from(e)) }).collect()
+
+    /// Keep the last `classify`'s non-resident predictions as this lane's
+    /// prediction for `(layer, step)`.
+    pub fn set_pending(&mut self, layer: i32, step: u32) {
+        self.pending_preds.clear();
+        self.pending_preds.extend(self.preds.iter().filter(|p| p.nonres));
+        self.pending = Some((layer, step));
+    }
+
+    /// Layer `layer` of step `step` has routed on this lane: is the pending
+    /// prediction its (same lane, next layer, same step)? Either way nothing
+    /// stays pending: a mismatch (a new step at layer 0, a hash-router layer
+    /// with no look-ahead in between) is dropped without a count, on purpose.
+    pub fn take_pending(&mut self, layer: i32, step: u32) -> bool {
+        self.pending.take() == Some((layer, step))
+    }
+
+    /// `dry_hits` of the pending prediction against the own picks `own`.
+    pub fn dry_hits(&mut self, own: &[i32]) -> [u32; 3] {
+        self.ensure();
+        let valid = |sv: i32| (0..N_EXPERT as i32).contains(&sv);
+        for &sv in own {
+            if valid(sv) {
+                self.seen[sv as usize] = true;
+            }
+        }
+        let mut hits = [0u32; 3];
+        for p in self.pending_preds.iter().filter(|p| p.nonres && p.rank >= 1 && p.rank <= MAX_RANK && self.seen[p.e as usize]) {
+            for r in p.rank as usize..=3 {
+                hits[r - 1] += 1;
+            }
+        }
+        for &sv in own {
+            if valid(sv) {
+                self.seen[sv as usize] = false;
+            }
+        }
+        hits
+    }
+}
+
+/// `LaneState::classify` on a fresh state (tests, tools).
+pub fn classify(look: &[i32], n_used: usize, is_box2: impl Fn(u32) -> bool, nonres: impl Fn(u32) -> bool) -> Vec<Pred> {
+    let mut s = LaneState::default();
+    s.classify(look, n_used, is_box2, nonres);
+    s.preds
 }
 
 /// A hint word: `(layer << 16) | expert`, the `PREFETCH_WORDS` encoding.
@@ -262,38 +347,21 @@ pub fn count(preds: &[Pred]) -> ([u32; 3], [u32; 3]) {
     (cand, nonres)
 }
 
-/// What a lane predicted for its next layer, kept on the lane's scratch
-/// (`BatchDgpuScratch::lh2_pending`) until that layer routes. Per lane so the
-/// two lanes' predictions never cross: a lane-layer's look-ahead for L+1 is
-/// matched against the SAME lane's layer-L+1 picks on its next lane-layer,
-/// whatever the ready-first interleaving or the two-stream cut does between.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Pending {
-    pub layer: i32,
-    pub step: u32,
-    /// The non-resident predictions only.
-    pub preds: Vec<Pred>,
-}
-
-/// Layer `pending.layer` has routed: per R in 1..=3, how many of the
-/// non-resident predictions of rank `<= R` are among the router's OWN picks
-/// `own` (`[rows][n_used]`; `sel_orig` under a live cache prior, else
-/// `sel_host`), distinct experts. The live Step 0 (design sections 1 and 6):
-/// recall on today's exposed misses, not the 09-14 cold tail.
+/// The pending layer has routed: per R in 1..=3, how many of the non-resident
+/// predictions of rank `<= R` are among the router's OWN picks `own`
+/// (`[rows][n_used]`; `sel_orig` under a live cache prior, else `sel_host`),
+/// distinct experts. The live Step 0 (design sections 1 and 6): recall on
+/// today's exposed misses, not the 09-14 cold tail.
+///
+/// PER LANE, so a FLOOR on recall: a lane-layer's look-ahead for L+1 is
+/// matched against the SAME lane's layer-L+1 picks on its next lane-layer
+/// (`LaneState::pending`), whatever the ready-first interleaving or the
+/// two-stream ordered cut does in between; a hinted expert that only the OTHER
+/// lane's rows demand at L+1 counts as a miss here although box 2 would serve
+/// it from the nursery. The 0.71 bar of section 1 is therefore conservative.
 pub fn dry_hits(preds: &[Pred], own: &[i32]) -> [u32; 3] {
-    let mut seen = [false; NE];
-    for &sv in own {
-        if (0..N_EXPERT as i32).contains(&sv) {
-            seen[sv as usize] = true;
-        }
-    }
-    let mut hits = [0u32; 3];
-    for p in preds.iter().filter(|p| p.nonres && seen[p.e as usize]) {
-        for r in (p.rank as usize).max(1)..=3 {
-            hits[r - 1] += 1;
-        }
-    }
-    hits
+    let mut s = LaneState { pending_preds: preds.to_vec(), ..LaneState::default() };
+    s.dry_hits(own)
 }
 
 // ---- the queue (design 2.3) ----
@@ -354,17 +422,18 @@ impl HintQueue {
     pub fn take(&mut self, step: u32, layer: i32, max: usize) -> (Vec<u32>, u32) {
         let mut out = Vec::new();
         let mut stale = 0u32;
-        let mut keep = VecDeque::with_capacity(self.words.len());
-        for (w, s) in self.words.drain(..) {
+        // In place (`retain`): no deque reallocation per decode submit.
+        self.words.retain(|&(w, s)| {
             if s != step || (w >> 16) as i32 <= layer {
                 stale += 1;
+                false
             } else if out.len() < max {
                 out.push(w);
+                false
             } else {
-                keep.push_back((w, s));
+                true
             }
-        }
-        self.words = keep;
+        });
         (out, stale)
     }
 
@@ -447,8 +516,11 @@ impl SpecBudget {
     }
 
     /// Restores per request: the budget spread over ONE lane's requests of a
-    /// step (`N_LAYER`), at least 1 -- ~1-2 at the default 60, so a restore
-    /// burst paces out over the step even with a single lane running.
+    /// step (`N_LAYER`), at least 1 -- 1 at 60, so a restore burst paces out
+    /// over the step even with a single lane running. With two lanes (80
+    /// requests) a budget `>= 120` gives `pace x 80 > budget`: the step total
+    /// then binds first and the step's later requests carry no restore
+    /// (tested); the pacing is a smoothing, the total is the cap.
     pub fn restore_pace(&self) -> usize {
         (self.budget as usize / LAYERS).max(1)
     }
@@ -501,9 +573,10 @@ pub fn budget_commit(t: &Take) {
 // ---- counters (design section 6) ----
 
 /// `(hub_lh2 field, ms.stage host stage)` per counter, in `take_stats` order:
-/// per R in 1..=3 the distinct box-2-owned predictions of rank `<= R`, the
-/// mirror-non-resident ones among them, and of THOSE the ones in the router's
-/// own picks one lane-layer later; then hint words the queue handed a decode
+/// per R in 1..=3 the box-2-owned predictions of rank `<= R` (distinct per
+/// LANE-layer: both lanes predicting one expert for one layer count twice), the
+/// mirror-non-resident ones among them, and of THOSE the ones in the same
+/// lane's own picks one lane-layer later (a floor, `dry_hits`); then hint words the queue handed a decode
 /// submit (slice A: counted, kept off the wire), words on the wire (0 in slice
 /// A), words the per-request cap dropped, words dropped stale, and admission /
 /// restore words the per-step budget held back vs today's rule.
@@ -611,7 +684,7 @@ mod tests {
         assert!(matches!(B2_MISS_PREFETCH.kind, crate::knobs::Kind::Choice { default: 0, .. }));
         assert!(matches!(B2_MISS_PREFETCH_RANK.kind, crate::knobs::Kind::Int { default: 1, .. }));
         assert!(matches!(B2_MISS_PREFETCH_CAP.kind, crate::knobs::Kind::Int { default: 8, .. }));
-        assert!(matches!(B2_SPEC_BUDGET.kind, crate::knobs::Kind::Int { default: 60, .. }));
+        assert!(matches!(B2_SPEC_BUDGET.kind, crate::knobs::Kind::Int { default: 0, .. }), "today's rule until the budget is A/B'd live (code review, finding 1)");
     }
 
     /// Design 2.1 (review round 2, finding 1): the knob drives the look-ahead;
@@ -648,6 +721,22 @@ mod tests {
         let (cand, nonres) = count(&preds);
         assert_eq!(cand, [2, 3, 4]);
         assert_eq!(nonres, [1, 1, 2]);
+        // Ranks past `MAX_RANK` are neither counted nor hinted.
+        assert_eq!(classify(&[1, 2, 3, 4, 5, 6], NU, |_| true, |_| true).len(), 3);
+        // The state is reusable: a second classify on the same `LaneState` sees
+        // clean marks (an expert of the first call is not stuck at 255 / rank).
+        let mut s = LaneState::default();
+        s.classify(&look, NU, |e| e != 9, |_| false);
+        s.classify(&[9, 7, 1, -1, -1, -1], NU, |_| true, |_| true);
+        assert_eq!(s.preds, vec![pred(9, 1, true), pred(7, 2, true), pred(1, 3, true)]);
+        s.set_pending(4, 5);
+        assert_eq!(s.pending_preds, s.preds.clone());
+        assert!(!s.take_pending(4, 6), "another step: dropped");
+        assert!(s.pending.is_none());
+        s.set_pending(4, 5);
+        assert!(s.take_pending(4, 5));
+        assert_eq!(s.dry_hits(&[7, 0, 0, 0, 0, 0]), [0, 1, 1]);
+        assert_eq!(s.dry_hits(&[7, 0, 0, 0, 0, 0]), [0, 1, 1], "`seen` is cleared between calls");
     }
 
     #[test]
@@ -692,6 +781,11 @@ mod tests {
         assert!(q.hinted(word(4, 10)), "handed out still counts for dedup this step");
         // A request for layer 4 (or later) cannot carry a layer-4 word: stale.
         assert_eq!(q.take(5, 4, 8), (vec![], 1));
+        // Lane B's request for an EARLIER layer may carry lane A's word (design
+        // 2.3: any lane's next decode submit), and a later layer's word rides
+        // ahead of an earlier one only by queue order.
+        q.push(5, &[word(9, 1), word(6, 2)]);
+        assert_eq!(q.take(5, 3, 8), (vec![word(9, 1), word(6, 2)], 0));
         // An earlier step's word is stale too, whatever the layer.
         q.push(5, &[word(9, 1)]);
         assert_eq!(q.take(6, 0, 8), (vec![], 1));
@@ -747,6 +841,13 @@ mod tests {
         assert_eq!(b, SpecBudget::new(60));
         // With nothing waiting, nothing is deferred.
         assert_eq!(SpecBudget::new(60).plan(0, 0, 0, 128, true, 16), Take::default());
+        // Budget 120, two lanes = 80 requests, a 1000-word restore: the pace is
+        // 3 per request, so the step total binds after 40 requests and the
+        // later requests carry nothing (review finding 9: the total is the cap).
+        let mut b = SpecBudget::new(120);
+        let per_req: Vec<usize> = (0..80).map(|_| { let t = b.plan(0, 0, 1000, 128, true, 16); b.commit(&t); t.restores }).collect();
+        assert_eq!(per_req.iter().sum::<usize>(), 120);
+        assert!(per_req[..40].iter().all(|&r| r == 3) && per_req[40..].iter().all(|&r| r == 0), "{per_req:?}");
     }
 
     #[test]
@@ -765,7 +866,11 @@ mod tests {
         assert_eq!(s[Stat::Stale as usize], 0);
         assert_eq!(s[Stat::BudgetDeferred as usize], 7);
         assert_eq!(take_stats(), [0; STATS.len()]);
+        // The `Stat` discriminants index `STATS` by hand: pin all five.
         assert_eq!(STATS[Stat::DryWords as usize].0, "lh2_dry_words");
+        assert_eq!(STATS[Stat::HintsSent as usize].0, "lh2_hints_sent");
+        assert_eq!(STATS[Stat::DroppedCap as usize].0, "lh2_dropped_cap");
+        assert_eq!(STATS[Stat::Stale as usize].0, "lh2_stale");
         assert_eq!(STATS[Stat::BudgetDeferred as usize].1, "lh2.budget_deferred");
     }
 }

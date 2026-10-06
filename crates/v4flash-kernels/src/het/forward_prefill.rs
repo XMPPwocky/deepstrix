@@ -8541,7 +8541,14 @@ impl HeterogeneousEngine {
         // not hashed has a `look_next`, and the pack shipped stale `look_sel`.
         // `lh.look_launch`: the host cost of these launches sits in the chain
         // enqueue on the ready-first thread (design 2.6; slice A prices it).
-        let _t_look = if look_next.is_some() || look_next2.is_some() { LayerHostTimer::start(&LH_LOOK_LAUNCH) } else { None };
+        let _t_look = if look_next.is_some() || look_next2.is_some() {
+            if layer_host_timing() {
+                LH_LOOK_LAUNCH_N.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+            }
+            LayerHostTimer::start(&LH_LOOK_LAUNCH)
+        } else {
+            None
+        };
         if let Some(nl) = look_next {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
             de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
@@ -9560,39 +9567,50 @@ impl HeterogeneousEngine {
                 //      (I1/I2, design section 7). Decode rows only (design 5).
                 if mp.mode.on() && remote_split_on && matches!(rows, RowLayout::Arena { .. }) {
                     let _t_look = LayerHostTimer::start(&LH_LOOK_FILTER);
-                    use super::lookahead as lh2;
-                    if let Some(p) = bd.lh2_pending.take() {
-                        // Same lane, next layer, same step: anything else (a new
-                        // step at layer 0, a hash-router layer with no look-ahead
-                        // in between) is dropped without a count.
-                        if p.layer == layer as i32 && p.step == mp.step {
-                            let own: &[i32] = if sel_orig.is_empty() { &sel_host } else { &sel_orig };
-                            lh2::count_dry_hits(lh2::dry_hits(&p.preds, own));
-                        }
+                    if layer_host_timing() {
+                        LH_LOOK_FILTER_N.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // Ownership of layer `nl`: the partition's rule, else box 2's
-                    // HELLO bitmap (per layer; the legacy block used layer L's for
-                    // L+1 too). Residency: `b2_mirror::lookup` with the 9725
+                    use super::lookahead as lh2;
+                    // Same lane, next layer, same step: anything else (a new step
+                    // at layer 0, a hash-router layer with no look-ahead in
+                    // between) is dropped without a count, on purpose.
+                    if bd.lh2.take_pending(layer as i32, mp.step) {
+                        let own: &[i32] = if sel_orig.is_empty() { &sel_host } else { &sel_orig };
+                        let hits = bd.lh2.dry_hits(own);
+                        lh2::count_dry_hits(hits);
+                    }
+                    // Ownership of layer `nl`: the partition's rule (the live path),
+                    // else box 2's HELLO bitmap FOR `nl` (`owns_remote` above is
+                    // layer L's), resolved once per lane-layer under the client
+                    // lock. Residency: `b2_mirror::lookup` with the `n_pred_miss`
                     // predicate, not `resident()` (round 1, finding 5).
                     let t2 = super::expert_pager::t2_partition();
-                    let is_box2 = |nl: i32, e: u32| if t2 { super::expert_pager::partition_box2(nl, e) } else { owns_remote.as_ref().is_some_and(|o| o[e as usize]) };
+                    let owns_next: [Option<Vec<bool>>; 2] = if t2 || owns_remote.is_none() {
+                        [None, None]
+                    } else {
+                        let c = self.remote.as_ref().and_then(|r| r.lock().ok());
+                        let for_layer = |nl: i32| c.as_ref().map(|c| (0..N_EXPERT).map(|e| c.owns(nl as u32, e as i32)).collect::<Vec<bool>>());
+                        [(!look_host.is_empty()).then(|| for_layer(layer as i32 + 1)).flatten(), (!look_host2.is_empty()).then(|| for_layer(layer as i32 + 2)).flatten()]
+                    };
                     let nonres = |nl: i32, e: u32| super::b2_mirror::lookup(nl, e).is_some_and(|r| !r.held && !r.pending && !r.incoming);
                     for (k, lh) in [(1i32, &look_host), (2, &look_host2)] {
                         if lh.is_empty() {
                             continue;
                         }
                         let nl = layer as i32 + k;
-                        let preds = lh2::classify(lh, cs_n_used, |e| is_box2(nl, e), |e| nonres(nl, e));
+                        let owns = owns_next[(k - 1) as usize].as_deref();
+                        let is_box2 = |e: u32| if t2 { super::expert_pager::partition_box2(nl, e) } else { owns.is_some_and(|o| o[e as usize]) };
+                        bd.lh2.classify(lh, cs_n_used, is_box2, |e| nonres(nl, e));
                         if k == 1 {
                             // The per-R counters and the dry match are L+1's only.
-                            lh2::count_preds(&preds);
-                            bd.lh2_pending = Some(lh2::Pending { layer: nl, step: mp.step, preds: preds.iter().copied().filter(|p| p.nonres).collect() });
+                            lh2::count_preds(&bd.lh2.preds);
+                            bd.lh2.set_pending(nl, mp.step);
                         }
-                        let (_queued, dropped) = super::remote_experts::queue_hint_words(mp.step, nl, &preds, mp.rank, mp.cap as usize);
+                        let (_queued, dropped) = super::remote_experts::queue_hint_words(mp.step, nl, &bd.lh2.preds, mp.rank, mp.cap as usize);
                         lh2::bump(lh2::Stat::DroppedCap, u64::from(dropped));
                     }
-                } else if !mp.mode.on() && bd.lh2_pending.is_some() {
-                    bd.lh2_pending = None;
+                } else if !mp.mode.on() {
+                    bd.lh2.pending = None;
                 }
                 // LEGACY (`V41_LOOKAHEAD_PREFETCH=1`, the knob off; 09-21: measured a
                 // loss). `sd.look_sel`/`look_sel2` are SHARED dGPU scratch, so in the
@@ -11680,6 +11698,11 @@ impl HeterogeneousEngine {
 /// track idle and the real work at ~5.6 ms/layer — i.e. ~18 ms/layer running
 /// nowhere and covered by no `events.stage()` scope. These attribute it to the
 /// three host calls the loop actually makes. `V41_LAYER_HOST_TIMING=1`.
+///
+/// `LH_PRE` (`lh.pre_moe`) on the ARENA drivers: 0 until the predicted-miss
+/// prefetch slice A (2026-10-06), since then the ready-first chain enqueue
+/// (`pre_moe_chain`, look-ahead launches included) per lane-layer. Compare it
+/// across deploys only within binaries from that commit on.
 pub static LH_POST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_PRE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_ENGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -11756,6 +11779,10 @@ pub static LH_SUB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// (`pre_moe_route`). Both on the ready-first thread.
 pub static LH_LOOK_LAUNCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_LOOK_FILTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lane-layers that ran them (+1000 each, the `_x1e3` trick above), so the
+/// `ms.stage` rollup can price them PER LANE-LAYER (`lh2.look_*_us_per_ll`).
+pub static LH_LOOK_LAUNCH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_LOOK_FILTER_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// EXPOSED-WAIT PROBE (2026-09-22). `lh.work_items_count` (90.7 ms/step) and
 /// `lh.sel_d2h` (39.4) are blocking readbacks, and a blocking readback costs one
 /// of two things that need OPPOSITE fixes: real device work we depend on
@@ -11813,6 +11840,8 @@ pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
         ("lh.remote_upload", LH_REMOTE_UPLOAD.swap(0, Relaxed)),
         ("lh.look_launch", LH_LOOK_LAUNCH.swap(0, Relaxed)),
         ("lh.look_filter", LH_LOOK_FILTER.swap(0, Relaxed)),
+        ("lh.look_launch_n_x1e3", LH_LOOK_LAUNCH_N.swap(0, Relaxed)),
+        ("lh.look_filter_n_x1e3", LH_LOOK_FILTER_N.swap(0, Relaxed)),
     ]
 }
 
