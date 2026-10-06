@@ -431,6 +431,10 @@ pub struct BatchDgpuScratch {
     /// (as the first cut did) serialises the ~74 ms round trip at B=1024 in front
     /// of local compute and throws away the whole point of overlapping.
     pub remote_ticket: Option<crate::het::remote_experts::Ticket>,
+    /// The ready-first driver's Post found `remote_ticket`'s reply NOT ready
+    /// at least once (the lane stalled on box 2): `het::lookahead`'s "late"
+    /// (`lh2_hits_prot_late_*`). Cleared at submit.
+    pub remote_post_spun: bool,
     /// `evtrace` submit-time fields of `remote_ticket` (see `HUB_REQ`):
     /// t_submit, t_submit_end, partner, unmasked, n_picks, n_distinct,
     /// n_pred_miss, n_pred_incoming, n_pred_pending.
@@ -1335,6 +1339,7 @@ impl BatchDgpuScratch {
             remote_upload_pending: false,
             mhc_ffn_split_pending: false,
             remote_ticket: None,
+            remote_post_spun: false,
             ev_req: [f64::NAN; 9],
             lh2: Default::default(),
         })

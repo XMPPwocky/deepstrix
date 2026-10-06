@@ -195,6 +195,17 @@ pub static HUB_LH2: Kind = Kind {
         "lh2_dry_hits_prot_r1", "lh2_dry_hits_prot_r2", "lh2_dry_hits_prot_r3",
         "lh2_nonres_m0", "lh2_nonres_m1", "lh2_nonres_m2", "lh2_nonres_m3",
         "lh2_hits_prot_m0", "lh2_hits_prot_m1", "lh2_hits_prot_m2", "lh2_hits_prot_m3",
+        // The REFINED OBJECTIVE (owner 10-06, design section 6): of the
+        // protected dry hits, the ones the lane-layer's reply PAGED (per R, per
+        // margin bucket) and of those the ones whose reply the lane STALLED on
+        // (Post found it not ready); `prot_paged_late_total` = the request's
+        // protected non-resident picks that were paged AND late, hinted or
+        // not = the reads the step blocked on (the recall denominator).
+        "lh2_hits_prot_paged_r1", "lh2_hits_prot_paged_r2", "lh2_hits_prot_paged_r3",
+        "lh2_hits_prot_paged_m0", "lh2_hits_prot_paged_m1", "lh2_hits_prot_paged_m2", "lh2_hits_prot_paged_m3",
+        "lh2_hits_prot_late_r1", "lh2_hits_prot_late_r2", "lh2_hits_prot_late_r3",
+        "lh2_hits_prot_late_m0", "lh2_hits_prot_late_m1", "lh2_hits_prot_late_m2", "lh2_hits_prot_late_m3",
+        "lh2_prot_paged_late_total",
     ],
 };
 

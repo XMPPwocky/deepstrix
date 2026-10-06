@@ -8930,6 +8930,9 @@ pub struct RemotePartial {
     pub n_held: u32,
     pub n_surprise: u32,
     pub n_paged: u32,
+    /// Pin mode: the reply's PAGED bits (bit e = the pass had to page or wait
+    /// for expert e of `layer`); all zero without a pin block.
+    pub paged: [u32; proto::RESID_WORDS],
     frame: AlignedBuf,
 }
 
@@ -9701,6 +9704,7 @@ impl RemoteExpertClient {
             n_held: ticket.n_held,
             n_surprise,
             n_paged: pin.as_ref().map_or(0, |p| p.paged.iter().map(|w| w.count_ones()).sum()),
+            paged: pin.as_ref().map_or([0; proto::RESID_WORDS], |p| p.paged),
             frame: buf,
         };
         // Every partial passes through here, so this is the one place the link

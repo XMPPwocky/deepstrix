@@ -4657,6 +4657,10 @@ impl HeterogeneousEngine {
                                 }
                             },
                         };
+                        if !ready {
+                            // The lane stalled on this reply (`het::lookahead` "late").
+                            lanes[i].0.remote_post_spun = true;
+                        }
                         // TEST: hold lane 0 until lane 1 has posted this layer.
                         let ready = ready && !(hold_lane0 && i == 0 && posted[1] <= l);
                         if ready {
@@ -9578,6 +9582,8 @@ impl HeterogeneousEngine {
                 //      and NEVER calls `push_prefetch_words` or puts them on a
                 //      frame. Nothing here touches a pick, weight or kernel input
                 //      (I1/I2, design section 7). Decode rows only (design 5).
+                // The `n_pred_miss` predicate (`b2_mirror::lookup`, not `resident()`).
+                let nonres_at = |nl: i32, e: u32| super::b2_mirror::lookup(nl, e).is_some_and(|r| !r.held && !r.pending && !r.incoming);
                 if mp.mode.on() && remote_split_on && matches!(rows, RowLayout::Arena { .. }) {
                     let _t_look = LayerHostTimer::start(&LH_LOOK_FILTER);
                     if layer_host_timing() {
@@ -9599,6 +9605,9 @@ impl HeterogeneousEngine {
                         lh2::count_dry_hits(&d);
                         lh2::bump(lh2::Stat::Demanded, u64::from(d.demanded));
                         lh2::bump(lh2::Stat::DemandedProt, u64::from(d.demanded_prot));
+                    } else {
+                        // No prediction for this layer: nothing to score at its reply.
+                        bd.lh2.prot_hits.clear();
                     }
                     // Ownership of layer `nl`: the partition's rule (the live path),
                     // else box 2's HELLO bitmap FOR `nl` (`owns_remote` above is
@@ -9613,7 +9622,7 @@ impl HeterogeneousEngine {
                         let for_layer = |nl: i32| c.as_ref().map(|c| (0..N_EXPERT).map(|e| c.owns(nl as u32, e as i32)).collect::<Vec<bool>>());
                         [(!look_host.is_empty()).then(|| for_layer(layer as i32 + 1)).flatten(), (!look_host2.is_empty()).then(|| for_layer(layer as i32 + 2)).flatten()]
                     };
-                    let nonres = |nl: i32, e: u32| super::b2_mirror::lookup(nl, e).is_some_and(|r| !r.held && !r.pending && !r.incoming);
+                    let nonres = nonres_at;
                     for (k, lh) in [(1i32, &look_host), (2, &look_host2)] {
                         if lh.is_empty() {
                             continue;
@@ -9941,6 +9950,18 @@ impl HeterogeneousEngine {
                         // `remote.expert (host)` track IS the overlap we bought.
                         bd.remote_ticket = ticket;
                         bd.remote_ffn_moe_layer = layer as i32;
+                        bd.remote_post_spun = false;
+                        // The refined objective's denominator (design section 6):
+                        // this request's PROTECTED box-2 picks (actual rank <=
+                        // `V41_SUB_PROTECT`, in the sel sent) the mirror says are
+                        // not resident -- hinted or not; scored at the reply
+                        // against its PAGED bits and the lane's stall.
+                        if mp.mode.on() {
+                            let sent_sel: &[i32] = if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote };
+                            super::lookahead::protected_nonres(sent_sel, cs_n_used, super::b2_mirror::protect(), |e| nonres_at(layer as i32, e), &mut bd.lh2.prot_nonres);
+                        } else {
+                            bd.lh2.prot_nonres.clear();
+                        }
                         if let Some(pf) = self.perfetto.as_ref() {
                             if let Ok(pf) = pf.lock() {
                                 let _ = pf.emit_host_slice(
@@ -11456,6 +11477,15 @@ impl HeterogeneousEngine {
                 .lock()
                 .map_err(|_| eyre!("remote expert client mutex poisoned"))?
                 .wait(t)?;
+            // Refined objective (design section 6): the lane-layer's protected
+            // dry hits and protected non-resident picks against this reply's
+            // PAGED bits and whether the lane stalled on it (`remote_post_spun`).
+            if partial.pin.is_some() && (!bd.lh2.prot_hits.is_empty() || !bd.lh2.prot_nonres.is_empty()) && partial.layer as i32 == layer {
+                let rh = super::lookahead::reply_hits(&bd.lh2.prot_hits, &bd.lh2.prot_nonres, &partial.paged, bd.remote_post_spun);
+                super::lookahead::count_reply_hits(&rh);
+            }
+            bd.lh2.prot_hits.clear();
+            bd.lh2.prot_nonres.clear();
             // SLACK PROBE site `remote`: hold the partial back by a known
             // amount, i.e. pretend box 2 (or the link) was slower. Regressing
             // the step against it gives the box-2 leg's share of the critical

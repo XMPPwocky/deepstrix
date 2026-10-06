@@ -244,6 +244,18 @@ joined to hint words by (layer, expert, time): queueing, wall, `wanted`. Precisi
 0.71 at R=1); churn/step; main evictions/step unchanged vs nursery off minus promotions. Lateness per class
 reuses `b2tail/late.py`.
 
+**Refined objective (owner, 10-06): "correctly predict protected hits we would otherwise have to block on
+paging."** Three nested sets, scored at the lane-layer's REPLY (`lookahead::reply_hits`, the request the
+dry-hit matching already identifies): (1) `lh2_dry_hits_prot_rN` / `lh2_hits_prot_m{k}`: hinted (a dry
+hit) AND the same lane's own pick at the target layer at actual rank `<= V41_SUB_PROTECT`; (2)
+`lh2_hits_prot_paged_{rN,m{k}}`: (1) AND that request's demand read actually PAGED on box 2 (the expert's
+bit in the reply's `PinReply.paged`); (3) `lh2_hits_prot_late_{rN,m{k}}`: (2) AND the lane's Post found the
+reply NOT ready at least once (it stalled; `BatchDgpuScratch::remote_post_spun`). The denominator
+`lh2_prot_paged_late_total` = the request's protected box-2 picks the mirror called non-resident, hinted or
+not, that were paged AND late: the per-step count of reads the step blocked on (compare `b2tail`'s ~9
+late/step and `sub.blocked`); recall for the real target = `hits_prot_late_r1 / prot_paged_late_total`,
+precision = `hits_prot_late_*` / `nonres_*`. Pin mode only (no paged bits otherwise).
+
 ## 7. Invariants and gates
 
 I1 (numerics): `d_selected`, `d_ew`, `xq`, every kernel input and partial byte-identical knob on/off;
