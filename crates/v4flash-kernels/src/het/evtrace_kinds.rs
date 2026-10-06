@@ -153,9 +153,10 @@ pub static HUB_STEP: Kind = Kind {
 /// per-step speculative budget (`V41_B2_SPEC_BUDGET`): one record per decode
 /// step while either is on, joined to `hub_step` by `step` (`hub_step` is at
 /// its field limit). Per R in 1..=3, summed over the step's lane-layers:
-/// box-2-owned predicted picks of rank `<= R`, distinct per LANE-layer (both
-/// lanes predicting one expert for one layer count twice; the hint WORDS are
-/// deduped across lanes) (`cand`), the mirror-non-resident ones among them
+/// box-2-owned predicted picks of rank `<= R`, distinct per LANE-layer only
+/// (two or three lanes predicting one expert for one layer count two or three
+/// times, and a step's 40 layers each count their own; the hint WORDS are
+/// deduped across lanes and the step) (`cand`), the mirror-non-resident ones among them
 /// (`nonres`), and of THOSE the ones in the SAME lane's own picks one
 /// lane-layer later (`dry_hits`: the live Step 0; `dry_hits_r1 / nonres_r1` is
 /// rank-1 recall, 0.71 in design section 1 -- a FLOOR: a hint the other lane's

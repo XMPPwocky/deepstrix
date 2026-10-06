@@ -2438,7 +2438,7 @@ pub struct ExpertShard {
     /// Frames (by seq) whose LIKELY words were applied at arrival
     /// (`likely_words_in`), so the dequeue does not apply them twice. A
     /// bounded ring like `EarlyPaged`.
-    likely_seen: std::collections::VecDeque<u32>,
+    likely_seen: SeqRing,
     /// Cumulative time the compute thread spent BLOCKED in `admit_prefetched`
     /// waiting for a prefetch read it needs this request (2026-09-22). Also
     /// added to the layer's `read_ns`, see the note there.
@@ -2551,6 +2551,12 @@ struct ShardPool {
     nc: NurseryCounters,
     /// `nursery_words`' rotation over the other layers' entries.
     nursery_cursor: usize,
+    /// Nursery entries an ARRIVED, not yet served frame relies on (the
+    /// early-page hook issued no certain read for them), per seq
+    /// (`protect_nursery` / `unprotect_nursery`): never a `nursery_victim`
+    /// meanwhile. A bounded ring like `EarlyPaged` (a dropped entry only
+    /// weakens the protection: the frame then demand-reads).
+    nursery_protect: Vec<(u32, Vec<(u32, u32)>)>,
 }
 
 /// Nursery counters (cumulative since `enable_paging`; `b2_req` reports
@@ -3260,6 +3266,45 @@ impl EarlyPaged {
 /// and the early-page `pinned` set.
 type ExtraPins<'a> = &'a [(u32, u32)];
 
+/// A bounded ring of request seqs seen once (`likely_words_in`: a frame's
+/// LIKELY words are applied at its first sight -- arrival or dequeue -- and
+/// never twice). Beyond `cap` entries the oldest is forgotten.
+#[derive(Clone, Debug, Default)]
+pub struct SeqRing {
+    ring: std::collections::VecDeque<u32>,
+    cap: usize,
+}
+
+impl SeqRing {
+    pub fn new(cap: usize) -> Self {
+        Self { ring: Default::default(), cap: cap.max(1) }
+    }
+
+    /// First sight of `seq`? (Records it.)
+    pub fn insert(&mut self, seq: u32) -> bool {
+        if self.ring.contains(&seq) {
+            return false;
+        }
+        if self.ring.len() >= self.cap {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(seq);
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.ring.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+}
+
 /// `residency_words`' predicate: remap entry `r` (`-(slot) - 1`, 0 = not
 /// landed) is landed in a slot that is NOT a nursery slot (design 3.2).
 fn landed_main(r: i32, nursery: &[bool]) -> bool {
@@ -3312,7 +3357,29 @@ impl ShardPool {
             serves: vec![0; N_LAYER as usize],
             nc: NurseryCounters::default(),
             nursery_cursor: 0,
+            nursery_protect: Vec::new(),
         }
+    }
+
+    /// Frame `seq` arrived relying on nursery entries `keys` (none: nothing kept).
+    fn protect_nursery(&mut self, seq: u32, keys: &[(u32, u32)]) {
+        if keys.is_empty() {
+            return;
+        }
+        if self.nursery_protect.len() >= EarlyPaged::MAX {
+            self.nursery_protect.remove(0);
+        }
+        self.nursery_protect.push((seq, keys.to_vec()));
+    }
+
+    /// Frame `seq` was served.
+    fn unprotect_nursery(&mut self, seq: u32) {
+        self.nursery_protect.retain(|(s, _)| *s != seq);
+    }
+
+    /// Is `(layer, e)` a nursery entry an arrived frame relies on?
+    fn nursery_protected(&self, key: (u32, u32)) -> bool {
+        self.nursery_protect.iter().any(|(_, keys)| keys.contains(&key))
     }
 
     /// The reply's NURSERY block for `layer` (`proto::RESP_FLAG_NURSERY`):
@@ -3393,8 +3460,8 @@ impl ShardPool {
     /// slot first, then an UNUSED entry (its layer served `>= lanes` passes
     /// since it landed), oldest landing first, then the oldest landing among
     /// the fresh ones; never a slot whose entry the pass being served wants
-    /// (`want` on `want_layer`, `extra`). `None` = no nursery, or every slot
-    /// is wanted.
+    /// (`want` on `want_layer`, `extra`) or an ARRIVED frame relies on
+    /// (`nursery_protect`). `None` = no nursery, or every slot is wanted.
     fn nursery_victim(&self, want_layer: u32, want: &[u32], extra: ExtraPins<'_>, lanes: u64) -> Option<u32> {
         let mut best: Option<((u8, u64), u32)> = None;
         for (sl, &flag) in self.nursery.iter().enumerate() {
@@ -3404,7 +3471,7 @@ impl ShardPool {
             let key = match self.owner_of[sl] {
                 None => (0u8, 0u64),
                 Some((ol, oe)) => {
-                    if (ol == want_layer && want.contains(&oe)) || extra.contains(&(ol, oe)) {
+                    if (ol == want_layer && want.contains(&oe)) || extra.contains(&(ol, oe)) || self.nursery_protected((ol, oe)) {
                         continue;
                     }
                     let (at, tick) = self.nursery_land[sl];
@@ -4249,9 +4316,15 @@ pub fn queue_hint_words(step: u32, target: i32, preds: &[super::lookahead::Pred]
 /// fresh words, oldest first, up to `max`; stale ones (an earlier step, or a
 /// layer `<= layer`) are dropped and counted (`lh2_stale`).
 pub fn take_hint_words(step: u32, layer: i32, max: usize) -> Vec<u32> {
-    let (words, stale) = MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).take(step, layer, max);
+    let mut out = Vec::new();
+    take_hint_words_into(step, layer, max, &mut out);
+    out
+}
+
+/// `take_hint_words` into a reused buffer (the submit path allocates nothing).
+pub fn take_hint_words_into(step: u32, layer: i32, max: usize, out: &mut Vec<u32>) {
+    let stale = MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).take_into(step, layer, max, out);
     super::lookahead::bump(super::lookahead::Stat::Stale, u64::from(stale));
-    words
 }
 
 /// Words a submit took and could not send (budget / bar): back to the front.
@@ -4736,7 +4809,7 @@ impl ExpertShard {
             park_prefill: false,
             req_prefill: false,
             early_paged: EarlyPaged::default(),
-            likely_seen: Default::default(),
+            likely_seen: SeqRing::new(EarlyPaged::MAX),
             prefetch_wait_ns: 0,
             ev_admit: [0; 5],
         })
@@ -5007,7 +5080,8 @@ impl ExpertShard {
     /// entry decode already paged back is skipped. Called per request.
     pub fn pump_restore(&mut self) {
         // Throttle: only while more than half the staging sets are free.
-        if self.prefetch.as_ref().is_some_and(|pf| pf.free.len() * 2 <= pf.stages.len()) {
+        // The GENERAL sets only: the reserved LIKELY pair is not the pump's.
+        if self.prefetch.as_ref().is_some_and(|pf| pf.free.len() * 2 <= pf.n_general) {
             return;
         }
         let pending_of = |pf: &Option<B2Prefetch>, k: &(u32, u32)| pf.as_ref().is_some_and(|pf| pf.pending.contains(k));
@@ -5552,14 +5626,35 @@ impl ExpertShard {
     /// sight of frame `seq` -- the early-page hook at arrival, else the
     /// dequeue; the second sight is a no-op. Returns how many were queued.
     pub fn likely_words_in(&mut self, seq: u32, likely: &[u32]) -> usize {
-        if likely.is_empty() || self.likely_seen.contains(&seq) {
+        if likely.is_empty() || !self.likely_seen.insert(seq) {
             return 0;
         }
-        if self.likely_seen.len() >= EarlyPaged::MAX {
-            self.likely_seen.pop_front();
-        }
-        self.likely_seen.push_back(seq);
         self.prefetch_words_likely(likely)
+    }
+
+    /// A queued frame `seq` for `layer` with picks `sel` arrived (the
+    /// early-page hook): its picks that are NURSERY entries get no certain
+    /// read, so they must survive until the frame is served -- protect them
+    /// from recycling by other passes' LIKELY landings (review of slices B+C,
+    /// finding 2). Released by `nursery_protect_done`.
+    pub fn note_nursery_protect(&mut self, seq: u32, layer: u32, sel: &[i32]) {
+        let Some(p) = self.pool.as_mut() else { return };
+        if p.nursery_target == 0 {
+            return;
+        }
+        let keys: Vec<(u32, u32)> = sel
+            .iter()
+            .filter(|&&e| (0..N_EXPERT as i32).contains(&e) && p.in_nursery(layer, e as u32))
+            .map(|&e| (layer, e as u32))
+            .collect();
+        p.protect_nursery(seq, &keys);
+    }
+
+    /// Frame `seq` has been served: its nursery entries are fair game again.
+    pub fn nursery_protect_done(&mut self, seq: u32) {
+        if let Some(p) = self.pool.as_mut() {
+            p.unprotect_nursery(seq);
+        }
     }
 
     /// Cumulative prefill-staging counters (zero without a pool).
@@ -5605,6 +5700,9 @@ impl ExpertShard {
         }
         self.early_paged.clear();
         self.likely_seen.clear();
+        if let Some(p) = self.pool.as_mut() {
+            p.nursery_protect.clear();
+        }
     }
 
     /// The hub asked for pins (`REQ_FLAG_PIN`): turn them on for this
@@ -7973,6 +8071,9 @@ pub fn serve_connection(
                             return;
                         }
                         shard.note_early_paged(hdr.seq, nreq.layer, nreq.sel);
+                        // Its nursery-resident picks get no certain read below:
+                        // keep them from being recycled until it is served.
+                        shard.note_nursery_protect(hdr.seq, nreq.layer, nreq.sel);
                         // The frame's LIKELY words at ARRIVAL (design 3.2: the
                         // b2q tail), queued behind its own certain reads.
                         let (likely, _) = proto::split_prefetch_words(nreq.flags, nreq.prefetch);
@@ -8183,10 +8284,12 @@ pub fn serve_connection(
                 // what was missing when ITS frame arrived, not its lane mate's).
                 let mut paged = timing.paged;
                 let mut paged_b = timing.paged;
+                shard.nursery_protect_done(hdr.seq);
                 if req.flags & proto::REQ_FLAG_PIN != 0 {
                     or_words(&mut paged, &shard.take_early_paged(hdr.seq));
                 }
                 if let (Some(rb), Some((hb, ..))) = (reqb.as_ref(), partner.as_ref()) {
+                    shard.nursery_protect_done(hb.seq);
                     if rb.flags & proto::REQ_FLAG_PIN != 0 {
                         or_words(&mut paged_b, &shard.take_early_paged(hb.seq));
                     }
@@ -8633,6 +8736,7 @@ fn serve_interleaved(
     // PAGED bits: the pass's own plus the early-page hook's at arrival (see
     // `serve_connection`).
     let mut paged = timing.paged;
+    shard.nursery_protect_done(hdr.seq);
     if req.flags & proto::REQ_FLAG_PIN != 0 {
         or_words(&mut paged, &shard.take_early_paged(hdr.seq));
     }
@@ -8967,6 +9071,8 @@ pub struct RemoteExpertClient {
     in_flight: std::collections::VecDeque<Ticket>,
     sel_scratch: Vec<i32>,
     ew_scratch: Vec<f32>,
+    /// The hint words a decode submit drains (`take_hint_words_into`), reused.
+    hint_scratch: Vec<u32>,
     clock: ClockSync,
     writer: Option<std::thread::JoinHandle<()>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -9124,6 +9230,7 @@ impl RemoteExpertClient {
             long_job: false,
             sel_scratch: vec![NO_PICK; info.max_batch as usize * nu],
             ew_scratch: vec![0.0; info.max_batch as usize * nu],
+            hint_scratch: Vec::with_capacity(128),
             clock,
             info,
             stream,
@@ -9323,22 +9430,22 @@ impl RemoteExpertClient {
         let lh2 = super::lookahead::cfg();
         let asks = self.decode_phase && lh2.mode.asks();
         let flags = if asks { flags | proto::REQ_FLAG_LIKELY } else { flags };
-        let hints: Vec<u32> = if self.decode_phase && lh2.mode.on() {
-            let h = take_hint_words(lh2.step, layer as i32, 128);
-            super::lookahead::bump(super::lookahead::Stat::DryWords, h.len() as u64);
-            if lh2.mode.wire() { h } else { Vec::new() }
+        // A step that tripped a bar takes nothing more (else every later
+        // submit would re-take and re-queue the whole queue).
+        let hints: &[u32] = if self.decode_phase && lh2.mode.on() && !super::lookahead::bars_tripped() {
+            take_hint_words_into(lh2.step, layer as i32, 128, &mut self.hint_scratch);
+            super::lookahead::bump(super::lookahead::Stat::DryWords, self.hint_scratch.len() as u64);
+            if lh2.mode.wire() { &self.hint_scratch } else { &[] }
         } else {
-            Vec::new()
+            &[]
         };
-        // The bars (design 5): how many of the fresh words may go at all.
-        let allowed = if hints.is_empty() { 0 } else { super::lookahead::bars_allow(hints.len()) };
         let mut n_hint_words = 0u32;
         let mut pf = if lh2.spec_budget == 0 || !self.decode_phase {
             // Today's rule (`V41_B2_SPEC_BUDGET=0`; and every prefill request:
             // the budget is a decode-step quantity, and the layer-major group
             // prefetch paces its own words through `PREFETCH_TAKE_CAP`). Hints
-            // first, up to the frame.
-            n_hint_words = allowed.min(128) as u32;
+            // first, up to the frame; the bars (design 5) count what GOES.
+            n_hint_words = super::lookahead::bars_allow(hints.len().min(128)) as u32;
             let mut pf: Vec<u32> = hints[..n_hint_words as usize].iter().map(|&w| proto::mark_likely(w)).collect();
             pf.extend(take_prefetch_words(128 - pf.len()));
             // RESTORE words fill the room the admission / look-ahead words leave,
@@ -9356,10 +9463,13 @@ impl RemoteExpertClient {
             // What the budget holds back stays queued (`lh2_budget_deferred`);
             // the release-before-restore rule above still holds.
             let restores_ok = pin_req && super::b2_mirror::releases_queued() == 0;
-            let t = super::lookahead::budget_plan(
-                allowed, prefetch_words_queued(), if restores_ok { restore_words_queued() } else { 0 },
+            let mut t = super::lookahead::budget_plan(
+                hints.len(), prefetch_words_queued(), if restores_ok { restore_words_queued() } else { 0 },
                 128, restores_ok, super::b2_mirror::pin_restore_per_request(),
             );
+            // The bars count the words that GO (after the plan): a trip sends
+            // none and the budget is charged for none.
+            t.hints = super::lookahead::bars_allow(t.hints);
             n_hint_words = t.hints as u32;
             let mut pf: Vec<u32> = hints[..t.hints].iter().map(|&w| proto::mark_likely(w)).collect();
             pf.extend(take_prefetch_words(t.admissions));
@@ -11843,6 +11953,58 @@ mod tests {
         assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0), "free first");
         assert_eq!(occupied(&pool), 1);
         assert_eq!(pool.nc, NurseryCounters { lands: 1, hits: 0, recycled: 2, drops: 0, shrunk: 0 });
+    }
+
+    /// Review of slices B+C, finding 2: an ARRIVED frame's nursery entries
+    /// (no certain read was issued for them) are not recycled by another
+    /// pass's LIKELY landing until that frame is served -- whether fresh or
+    /// "unused"; released per seq; the ring is bounded.
+    #[test]
+    fn nursery_entries_an_arrived_frame_relies_on_are_not_recycled() {
+        let mut pool = nursery_pool(0.0);
+        // R2 (seq 7) arrived wanting (1,0), a nursery entry in slot 0; make it
+        // "unused" too (layer 1 served twice since it landed).
+        pool.note_serve(1);
+        pool.note_serve(1);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0), "unprotected: the unused entry goes first");
+        pool.protect_nursery(7, &[(1, 0)]);
+        assert!(pool.nursery_protected((1, 0)) && !pool.nursery_protected((2, 2)));
+        // R1's ensure lands a LIKELY read: it must take the OTHER slot.
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(6));
+        pool.protect_nursery(8, &[(2, 2)]);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), None, "both entries relied on: the landing is dropped");
+        // R2 served: its entry is fair game again; R1's (seq 8) still protected.
+        pool.unprotect_nursery(7);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0));
+        pool.unprotect_nursery(8);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0));
+        // Empty key lists are not kept; the ring is bounded to `EarlyPaged::MAX`.
+        pool.protect_nursery(9, &[]);
+        assert!(pool.nursery_protect.is_empty());
+        for s in 0..(EarlyPaged::MAX as u32 + 5) {
+            pool.protect_nursery(100 + s, &[(1, 0)]);
+        }
+        assert_eq!(pool.nursery_protect.len(), EarlyPaged::MAX);
+        assert_eq!(pool.nursery_protect[0].0, 105, "the oldest were dropped");
+        pool.unprotect_nursery(999);
+        assert!(pool.nursery_protected((1, 0)));
+    }
+
+    /// `SeqRing` (`likely_words_in`): a frame's LIKELY words are applied at
+    /// its first sight only; the ring is bounded, the oldest seq forgotten.
+    #[test]
+    fn seq_ring_dedups_by_seq_and_evicts_the_oldest() {
+        let mut r = SeqRing::new(3);
+        assert!(r.is_empty());
+        assert!(r.insert(10) && !r.insert(10), "second sight of 10 is a no-op");
+        assert!(r.insert(11) && r.insert(12));
+        assert_eq!(r.len(), 3);
+        assert!(r.insert(13), "a 4th seq evicts the oldest (10)");
+        assert!(r.insert(10), "10 was forgotten: seen again");
+        assert!(!r.insert(12) && !r.insert(13));
+        r.clear();
+        assert!(r.insert(12));
+        assert_eq!(SeqRing::new(0).cap, 1, "never a zero-capacity ring");
     }
 
     /// `touch_hit` on an entry RELABELS it (main `held`, decode-hit stamp,

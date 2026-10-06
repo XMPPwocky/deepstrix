@@ -96,6 +96,11 @@ impl Mode {
 /// One decode step's knob values, read by `begin_step` and copied by every
 /// lane-layer (`PreMoeCarry::mp`) and every decode submit. `step` = the
 /// mirror's step clock (`b2_mirror::begin_step`), the tag on queued words.
+/// Stored as TWO atomics (`CFG`, `CFG2`), written back to back by
+/// `begin_step` and read without a lock on the lane path: a reader between
+/// the two stores sees the new mode/rank/cap/budget/step with the old
+/// rows/bars/prior/margin -- a tear that is harmless (the second word is
+/// per-step policy, a lane-layer late is fine) and lasts one store.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cfg {
     pub mode: Mode,
@@ -258,8 +263,13 @@ pub fn note_lane_layer() {
     BARS.lock().unwrap_or_else(|p| p.into_inner()).note_lane_layer();
 }
 
-/// `Bars::allow` on this step's bars with this step's `Cfg`; a trip bumps
-/// `lh2_bar_trips`.
+/// Has this step tripped a bar? (The submit then takes nothing more.)
+pub fn bars_tripped() -> bool {
+    BARS.lock().unwrap_or_else(|p| p.into_inner()).tripped
+}
+
+/// `Bars::allow` on this step's bars with this step's `Cfg`, called with the
+/// words that would GO (after the budget plan); a trip bumps `lh2_bar_trips`.
 pub fn bars_allow(n: usize) -> usize {
     let c = cfg();
     let (ok, tripped) = BARS.lock().unwrap_or_else(|p| p.into_inner()).allow(n, c.max_words_step, c.per_ll_x10);
@@ -303,7 +313,12 @@ pub struct Pred {
     /// rank-1 pick over the row's predicted rank 2, `(w1 - w2) / sum(row)`
     /// from the look-ahead's weights (`classify_w`), the largest over the rows
     /// where it is rank 1. NaN = unknown (no weights packed, or not rank 1):
-    /// passes any threshold, counts in no margin bucket.
+    /// passes any threshold, counts in no margin bucket. A WEIGHT margin,
+    /// while the rank comes from the router's selection on score + bias: an
+    /// inversion (rank 1 by bias, lower weight) clamps to 0 and lands in
+    /// bucket m0 only -- an empirical proxy, measured against `hits_prot` by
+    /// the dry run; if m0 >> m1 at flat precision, the right quantity is the
+    /// biased selection score (a `look_score` segment, no pack room under k2).
     pub margin: f32,
 }
 
@@ -687,8 +702,15 @@ impl HintQueue {
     /// words are dropped and counted.
     pub fn take(&mut self, step: u32, layer: i32, max: usize) -> (Vec<u32>, u32) {
         let mut out = Vec::new();
+        let stale = self.take_into(step, layer, max, &mut out);
+        (out, stale)
+    }
+
+    /// `take` into a reused buffer (cleared first); returns the stale count.
+    /// In place (`retain`), so a decode submit allocates nothing.
+    pub fn take_into(&mut self, step: u32, layer: i32, max: usize, out: &mut Vec<u32>) -> u32 {
+        out.clear();
         let mut stale = 0u32;
-        // In place (`retain`): no deque reallocation per decode submit.
         self.words.retain(|&(w, s)| {
             if s != step || (w >> 16) as i32 <= layer {
                 stale += 1;
@@ -700,7 +722,7 @@ impl HintQueue {
                 true
             }
         });
-        (out, stale)
+        stale
     }
 
     /// A new step: drop the earlier step's words (counted stale) and forget
@@ -783,12 +805,13 @@ impl SpecBudget {
         *self = Self::new(budget);
     }
 
-    /// Restores per request: the budget spread over ONE lane's requests of a
-    /// step (`N_LAYER`), at least 1 -- 1 at 60, so a restore burst paces out
-    /// over the step even with a single lane running. With two lanes (80
-    /// requests) a budget `>= 120` gives `pace x 80 > budget`: the step total
-    /// then binds first and the step's later requests carry no restore
-    /// (tested); the pacing is a smoothing, the total is the cap.
+    /// Restores per request: the budget spread over `N_LAYER` requests (one
+    /// lane's share of a step; the live step has two or three lanes, i.e.
+    /// 80-120 requests), at least 1 -- 1 at 60, so a restore burst paces out
+    /// over the step whatever the lane count. With two lanes (80 requests) a
+    /// budget `>= 120` gives `pace x 80 > budget`: the step total then binds
+    /// first and the step's later requests carry no restore (tested); the
+    /// pacing is a smoothing, the total is the cap.
     pub fn restore_pace(&self) -> usize {
         (self.budget as usize / LAYERS).max(1)
     }
@@ -1267,6 +1290,74 @@ mod tests {
         }
         assert_eq!(c.allow(20, 1000, 25), (20, false), "20 = 2.5 x 8");
         assert_eq!(c.allow(1, 1000, 25), (0, true));
+    }
+
+    /// The submit path with the wire on, as `submit_inner` sequences it:
+    /// take, plan, bars on the words that GO, mark sent, re-queue the
+    /// surplus; a tripped step takes nothing more; the next submit picks the
+    /// re-queued words first; budget > 0 puts hints first.
+    #[test]
+    fn submit_path_bars_requeue_and_budget_order() {
+        let c = Cfg { spec_budget: 60, max_words_step: 10, per_ll_x10: 255, ..Cfg::default() };
+        let mut q = HintQueue::new();
+        let mut budget = SpecBudget::new(60);
+        let mut bars = Bars::default();
+        q.begin_step(1);
+        let words: Vec<u32> = (0..30).map(|e| word(5, e)).collect();
+        q.push(1, &words);
+        // Submit 1 (layer 2): 30 fresh words; the plan takes all 30 (budget
+        // 60), the step bar (10) trips on the words that would go -> none go,
+        // the budget is charged for none, all 30 are re-queued, `sent` 0.
+        let mut scratch = Vec::new();
+        let mut submit = |q: &mut HintQueue, budget: &mut SpecBudget, bars: &mut Bars, layer: i32, scratch: &mut Vec<u32>| -> (usize, usize) {
+            if bars.tripped {
+                return (0, 0);
+            }
+            q.take_into(1, layer, 128, scratch);
+            let mut t = budget.plan(scratch.len(), 5, 100, 128, true, 16);
+            let (go, _) = bars.allow(t.hints, c.max_words_step, c.per_ll_x10);
+            t.hints = go;
+            budget.commit(&t);
+            q.mark_sent(&scratch[..go]);
+            q.requeue(&scratch[go..]);
+            (go, t.admissions)
+        };
+        assert_eq!(submit(&mut q, &mut budget, &mut bars, 2, &mut scratch), (0, 5), "tripped: no hint went, admissions still go");
+        assert!(bars.tripped && bars.sent == 0);
+        assert_eq!(budget.used, 6, "charged for the 5 admissions and the one paced restore only");
+        assert_eq!(q.len(), 30, "all re-queued");
+        assert!(!q.sent(word(5, 0)));
+        // Submit 2: a tripped step takes nothing more (the queue is untouched).
+        assert_eq!(submit(&mut q, &mut budget, &mut bars, 3, &mut scratch), (0, 0));
+        assert_eq!(q.len(), 30);
+        // A fresh step with the bar at 100: 30 go (hints first: the plan gives
+        // them the budget before admissions), then 40 more fresh words: 24 go
+        // (60 - 36 used), 16 are re-queued and come back FIRST next submit.
+        let c = Cfg { max_words_step: 100, ..c };
+        q.begin_step(2);
+        budget.reset(60);
+        bars.reset();
+        q.push(2, &words);
+        let mut submit2 = |q: &mut HintQueue, budget: &mut SpecBudget, bars: &mut Bars, layer: i32, scratch: &mut Vec<u32>| -> (usize, usize) {
+            if bars.tripped {
+                return (0, 0);
+            }
+            q.take_into(2, layer, 128, scratch);
+            let mut t = budget.plan(scratch.len(), 5, 100, 128, true, 16);
+            let (go, _) = bars.allow(t.hints, c.max_words_step, c.per_ll_x10);
+            t.hints = go;
+            budget.commit(&t);
+            q.mark_sent(&scratch[..go]);
+            q.requeue(&scratch[go..]);
+            (go, t.admissions)
+        };
+        assert_eq!(submit2(&mut q, &mut budget, &mut bars, 2, &mut scratch), (30, 5));
+        assert!(q.sent(word(5, 29)) && q.is_empty());
+        let more: Vec<u32> = (100..140).map(|e| word(6, e)).collect();
+        q.push(2, &more);
+        assert_eq!(submit2(&mut q, &mut budget, &mut bars, 3, &mut scratch), (24, 0), "60 - 36 = 24 hints, nothing left for admissions");
+        assert_eq!((bars.sent, q.len()), (54, 16));
+        assert_eq!(q.take(2, 3, 128).0, more[24..].to_vec(), "the re-queued surplus comes back first, in order");
     }
 
     /// The queue's `sent` set and the surplus re-queue (design 2.4: never drop).
