@@ -9608,6 +9608,7 @@ impl HeterogeneousEngine {
                     } else {
                         // No prediction for this layer: nothing to score at its reply.
                         bd.lh2.prot_hits.clear();
+                        bd.lh2.reply_preds.clear();
                     }
                     // Ownership of layer `nl`: the partition's rule (the live path),
                     // else box 2's HELLO bitmap FOR `nl` (`owns_remote` above is
@@ -9786,6 +9787,21 @@ impl HeterogeneousEngine {
                 {
                     {
                         let _t_remote = LayerHostTimer::start(&LH_REMOTE);
+                        // The refined objective's denominators (design section 6),
+                        // BEFORE the submit marks the sent picks PENDING on the
+                        // mirror (`note_submitted`; dry run 3's `prot_paged_late_total`
+                        // was 0 for that reason): this request's PROTECTED box-2
+                        // picks (actual rank <= `V41_SUB_PROTECT`) the mirror calls
+                        // non-resident, and the non-resident bitset over all its
+                        // sent picks; scored at the reply against the PAGED bits.
+                        if mp.mode.on() {
+                            let sent_sel: &[i32] = if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote };
+                            super::lookahead::protected_nonres(sent_sel, cs_n_used, super::b2_mirror::protect(), |e| nonres_at(layer as i32, e), &mut bd.lh2.prot_nonres);
+                            super::lookahead::nonres_bits(sent_sel, |e| nonres_at(layer as i32, e), &mut bd.lh2.nonres_bits);
+                        } else {
+                            bd.lh2.prot_nonres.clear();
+                            bd.lh2.nonres_bits = [0; super::lookahead::PAGED_WORDS];
+                        }
                         let n_sel = (b as usize) * cs_n_used;
                         let xq_bytes = (b as usize)
                             * (crate::config::BLOCKS_Q8K_GATE_IN as usize)
@@ -9951,17 +9967,6 @@ impl HeterogeneousEngine {
                         bd.remote_ticket = ticket;
                         bd.remote_ffn_moe_layer = layer as i32;
                         bd.remote_post_spun = false;
-                        // The refined objective's denominator (design section 6):
-                        // this request's PROTECTED box-2 picks (actual rank <=
-                        // `V41_SUB_PROTECT`, in the sel sent) the mirror says are
-                        // not resident -- hinted or not; scored at the reply
-                        // against its PAGED bits and the lane's stall.
-                        if mp.mode.on() {
-                            let sent_sel: &[i32] = if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote };
-                            super::lookahead::protected_nonres(sent_sel, cs_n_used, super::b2_mirror::protect(), |e| nonres_at(layer as i32, e), &mut bd.lh2.prot_nonres);
-                        } else {
-                            bd.lh2.prot_nonres.clear();
-                        }
                         if let Some(pf) = self.perfetto.as_ref() {
                             if let Ok(pf) = pf.lock() {
                                 let _ = pf.emit_host_slice(
@@ -11480,12 +11485,25 @@ impl HeterogeneousEngine {
             // Refined objective (design section 6): the lane-layer's protected
             // dry hits and protected non-resident picks against this reply's
             // PAGED bits and whether the lane stalled on it (`remote_post_spun`).
-            if partial.pin.is_some() && (!bd.lh2.prot_hits.is_empty() || !bd.lh2.prot_nonres.is_empty()) && partial.layer as i32 == layer {
-                let rh = super::lookahead::reply_hits(&bd.lh2.prot_hits, &bd.lh2.prot_nonres, &partial.paged, bd.remote_post_spun);
-                super::lookahead::count_reply_hits(&rh);
+            // Also the ANY-rank sets (every paged read stalls the lane, not only
+            // a rank-1 one) and the step's denominators: paged experts in all,
+            // on late replies, the mirror-held ones (surprises) and the
+            // mirror-non-resident ones (the hintable misses).
+            if partial.pin.is_some() && partial.layer as i32 == layer && t.flags & super::remote_experts::proto::REQ_FLAG_DECODE != 0 {
+                let late = bd.remote_post_spun;
+                if super::lookahead::cfg().mode.on() {
+                    if !bd.lh2.prot_hits.is_empty() || !bd.lh2.prot_nonres.is_empty() {
+                        super::lookahead::count_reply_hits(&super::lookahead::reply_hits(&bd.lh2.prot_hits, &bd.lh2.prot_nonres, &partial.paged, late));
+                    }
+                    if !bd.lh2.reply_preds.is_empty() {
+                        super::lookahead::count_reply_hits_any(&super::lookahead::reply_hits_any(&bd.lh2.reply_preds, &partial.paged, late));
+                    }
+                    super::lookahead::count_paged_totals(&super::lookahead::paged_totals(&partial.paged, &t.held, &bd.lh2.nonres_bits, late));
+                }
             }
             bd.lh2.prot_hits.clear();
             bd.lh2.prot_nonres.clear();
+            bd.lh2.reply_preds.clear();
             // SLACK PROBE site `remote`: hold the partial back by a known
             // amount, i.e. pretend box 2 (or the link) was slower. Regressing
             // the step against it gives the box-2 leg's share of the critical

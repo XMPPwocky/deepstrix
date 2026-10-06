@@ -256,6 +256,23 @@ not, that were paged AND late: the per-step count of reads the step blocked on (
 late/step and `sub.blocked`); recall for the real target = `hits_prot_late_r1 / prot_paged_late_total`,
 precision = `hits_prot_late_*` / `nonres_*`. Pin mode only (no paged bits otherwise).
 
+**Any-rank (owner 10-06 ~12:30 PDT, after dry run 3: R=1 31.6 hints/step -> 1.06 protected-paged, 1.04
+late; R=2 61.7 -> 1.27; R=3 92.5 -> 1.38; box 2 pages ~4.3 replies/step): "low hit rate is basically fine,
+since the disk would typically have spare bandwidth anyway ... how many protected-hit-but-cache-miss were
+correctly predicted? ... we can also try prefetching more than one expert."** RECALL against the reads we
+block on is the metric, precision secondary, R up to 6 in play; and every paged read stalls the lane (a
+non-resident rank-2..6 pick the prior cannot swap is paged too), so the target is ANY-rank:
+`lh2_hits_paged_any_rN` (N = 1..6; the pack carries the look-ahead's top-6 ids) = a hinted (mirror
+non-resident, predicted rank `<= N`) word's expert is in the PAGED bits of the same lane's reply at the
+target layer at any actual rank; `lh2_hits_late_any_rN` = AND the lane stalled on that reply; the
+predicted rank-1 ones per margin bucket (`_any_m{k}`). Denominators per step from the decode replies'
+bitsets, hinted or not: `lh2_paged_total`, `lh2_paged_late_total`, `lh2_paged_mirror_held` (held at submit
+= surprises, ~0 under pins), `lh2_paged_mirror_nonres` (non-resident at submit = the hintable misses;
+minus `hits_paged_any_r6` = what the predictor's top-6 never had). Recall = `hits_late_any_rN /
+paged_late_total`. Dry run 3's `prot_paged_late_total` read 0 because the denominator was computed after
+the submit had marked the sent picks PENDING on the mirror (fixed: computed before the submit; the
+`ms.stage` printer drops zero rows).
+
 ## 7. Invariants and gates
 
 I1 (numerics): `d_selected`, `d_ew`, `xq`, every kernel input and partial byte-identical knob on/off;

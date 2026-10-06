@@ -338,9 +338,15 @@ impl Pred {
     }
 }
 
-/// Ranks the filter and the counters care about (R `<= 3`, design 5): a
-/// prediction of a lower rank is neither counted nor hinted.
-pub const MAX_RANK: u8 = 3;
+/// Ranks `classify` keeps (the pack carries the look-ahead's top-6 ids per
+/// row): the any-rank reply counters (`reply_hits_any`) go to 6; the hint
+/// filter's knob (`V41_B2_MISS_PREFETCH_RANK`) and the per-R dry counters
+/// (`count`, `dry_hits`) stop at `HINT_MAX_RANK`.
+pub const MAX_RANK: u8 = 6;
+/// The rank cut the hint knob and the per-R dry counters go to (design 5).
+pub const HINT_MAX_RANK: u8 = 3;
+/// Words of a reply's PAGED bitset (`proto::RESID_WORDS`).
+pub const PAGED_WORDS: usize = NE.div_ceil(32);
 
 /// The dry run's margin buckets (`lh2_nonres_m{k}`, `lh2_hits_prot_m{k}`):
 /// a rank-1 prediction with margin `>= MARGIN_BUCKETS[k]` counts in bucket k.
@@ -373,6 +379,13 @@ pub struct LaneState {
     /// The layer's protected box-2 picks the mirror calls non-resident
     /// (`protected_nonres`), hinted or not: the refined objective's denominator.
     pub prot_nonres: Vec<u16>,
+    /// The pending prediction (non-resident, any predicted rank `<= MAX_RANK`)
+    /// for the layer whose reply is next, scored at ANY actual rank against
+    /// its PAGED bits (`reply_hits_any`).
+    pub reply_preds: Vec<Pred>,
+    /// Bit e: the request sent pick e and the mirror called it non-resident
+    /// at submit (`nonres_bits`): the hintable misses among the paged ones.
+    pub nonres_bits: [u32; PAGED_WORDS],
 }
 
 /// A protected dry hit: the predicted rank and margin of a prediction whose
@@ -428,6 +441,78 @@ pub fn reply_hits(prot_hits: &[ProtHit], prot_nonres: &[u16], paged: &[u32], lat
         r.total = prot_nonres.iter().filter(|&&e| bit(e)).count() as u32;
     }
     r
+}
+
+/// The ANY-rank reply score (owner 10-06: every paged read stalls the lane,
+/// not only a rank-1 one; recall against the reads we block on is the
+/// metric): of the non-resident predictions of predicted rank `<= R` (R in
+/// 1..=6), the ones whose expert is in the reply's PAGED bits at ANY actual
+/// rank (`paged`), and of those the ones on a reply the lane stalled on
+/// (`late`); the rank-1 ones per margin bucket (`paged_m`, `late_m`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnyHits {
+    pub paged: [u32; 6],
+    pub late: [u32; 6],
+    pub paged_m: [u32; 4],
+    pub late_m: [u32; 4],
+}
+
+/// `AnyHits` of `preds` (the lane-layer's pending prediction, non-resident
+/// ones) against a reply's PAGED bits and the lane's stall on it.
+pub fn reply_hits_any(preds: &[Pred], paged: &[u32], late: bool) -> AnyHits {
+    let bit = |e: u16| paged.get(usize::from(e) / 32).is_some_and(|w| (w >> (e % 32)) & 1 == 1);
+    let mut r = AnyHits::default();
+    for p in preds.iter().filter(|p| p.nonres && p.rank >= 1 && p.rank <= MAX_RANK && bit(p.e)) {
+        for k in p.rank as usize..=MAX_RANK as usize {
+            r.paged[k - 1] += 1;
+            r.late[k - 1] += u32::from(late);
+        }
+        if p.rank == 1 {
+            for (k, &b) in MARGIN_BUCKETS.iter().enumerate() {
+                let in_bucket = u32::from(p.margin >= b);
+                r.paged_m[k] += in_bucket;
+                r.late_m[k] += in_bucket * u32::from(late);
+            }
+        }
+    }
+    r
+}
+
+/// A decode reply's PAGED experts: all of them (`total`), on a late reply
+/// (`late_total`), the ones the mirror HELD at submit (`held` = surprises,
+/// ~0 under pins), the ones the mirror called NON-RESIDENT at submit
+/// (`nonres` = the hintable misses; `nonres - the predictor's hits` = what
+/// the top-R never had).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PagedTotals {
+    pub total: u32,
+    pub late_total: u32,
+    pub held: u32,
+    pub nonres: u32,
+}
+
+pub fn paged_totals(paged: &[u32], held: &[u32], nonres_bits: &[u32], late: bool) -> PagedTotals {
+    let total: u32 = paged.iter().map(|w| w.count_ones()).sum();
+    PagedTotals {
+        total,
+        late_total: if late { total } else { 0 },
+        held: paged.iter().zip(held).map(|(p, h)| (p & h).count_ones()).sum(),
+        nonres: paged.iter().zip(nonres_bits).map(|(p, n)| (p & n).count_ones()).sum(),
+    }
+}
+
+/// Bit e of `out`: pick e is in `sel` (as sent to box 2, `NO_PICK` for box
+/// 1's) and the mirror calls it non-resident (`nonres`).
+pub fn nonres_bits(sel: &[i32], nonres: impl Fn(u32) -> bool, out: &mut [u32; PAGED_WORDS]) {
+    *out = [0; PAGED_WORDS];
+    for &sv in sel {
+        if (0..N_EXPERT as i32).contains(&sv) {
+            let e = sv as usize;
+            if (out[e / 32] >> (e % 32)) & 1 == 0 && nonres(sv as u32) {
+                out[e / 32] |= 1 << (e % 32);
+            }
+        }
+    }
 }
 
 /// The request's PROTECTED box-2 picks (`sel` as sent to box 2, `[rows][n_used]`
@@ -488,8 +573,10 @@ impl LaneState {
             let (e, rank) = (sv as usize, (i % n_used) + 1);
             if self.best[e] == 0 {
                 // Box 1's are marked, so the ownership test runs once per expert.
-                self.best[e] = if is_box2(e as u32) { rank.min(255) as u8 } else { 255 };
-            } else if rank < self.best[e] as usize {
+                self.best[e] = if is_box2(e as u32) { rank.min(254) as u8 } else { 255 };
+            } else if self.best[e] != 255 && rank < self.best[e] as usize {
+                // (Never un-mark box 1's: a later, better rank of a box-1
+                // expert used to overwrite the 255 and surface it as box 2's.)
                 self.best[e] = rank as u8;
             }
             if weights && rank == 1 {
@@ -576,6 +663,8 @@ impl LaneState {
         let mut d = DryHits::default();
         let target = self.pending.map_or(0, |(l, _)| l);
         self.prot_hits.clear();
+        self.reply_preds.clear();
+        self.reply_preds.extend(self.pending_preds.iter().filter(|p| p.nonres));
         for p in self.pending_preds.iter().filter(|p| p.nonres && p.rank >= 1 && p.rank <= MAX_RANK && self.seen[p.e as usize] != 0) {
             let prot = u32::from(self.seen[p.e as usize]) <= protect;
             if prot {
@@ -961,7 +1050,7 @@ pub fn budget_commit(t: &Take) {
 /// layer (and of those the protected-rank ones), paged experts in pin replies
 /// that had been hinted, hints deduped against the mirror's NURSERY bits, the
 /// `after` placement's late look-aheads (0 under `before`), abort-bar trips.
-pub const STATS: [(&str, &str); 46] = [
+pub const STATS: [(&str, &str); 70] = [
     ("lh2_cand_r1", "lh2.cand_r1"),
     ("lh2_cand_r2", "lh2.cand_r2"),
     ("lh2_cand_r3", "lh2.cand_r3"),
@@ -1010,7 +1099,59 @@ pub const STATS: [(&str, &str); 46] = [
     ("lh2_hits_prot_late_m2", "lh2.hits_prot_late_m2"),
     ("lh2_hits_prot_late_m3", "lh2.hits_prot_late_m3"),
     ("lh2_prot_paged_late_total", "lh2.prot_paged_late_total"),
+    // ANY-rank (owner 10-06, dry run 4): per predicted R in 1..=6, hinted
+    // words PAGED by the same lane's reply at the target layer, and late.
+    ("lh2_hits_paged_any_r1", "lh2.hits_paged_any_r1"),
+    ("lh2_hits_paged_any_r2", "lh2.hits_paged_any_r2"),
+    ("lh2_hits_paged_any_r3", "lh2.hits_paged_any_r3"),
+    ("lh2_hits_paged_any_r4", "lh2.hits_paged_any_r4"),
+    ("lh2_hits_paged_any_r5", "lh2.hits_paged_any_r5"),
+    ("lh2_hits_paged_any_r6", "lh2.hits_paged_any_r6"),
+    ("lh2_hits_late_any_r1", "lh2.hits_late_any_r1"),
+    ("lh2_hits_late_any_r2", "lh2.hits_late_any_r2"),
+    ("lh2_hits_late_any_r3", "lh2.hits_late_any_r3"),
+    ("lh2_hits_late_any_r4", "lh2.hits_late_any_r4"),
+    ("lh2_hits_late_any_r5", "lh2.hits_late_any_r5"),
+    ("lh2_hits_late_any_r6", "lh2.hits_late_any_r6"),
+    ("lh2_hits_paged_any_m0", "lh2.hits_paged_any_m0"),
+    ("lh2_hits_paged_any_m1", "lh2.hits_paged_any_m1"),
+    ("lh2_hits_paged_any_m2", "lh2.hits_paged_any_m2"),
+    ("lh2_hits_paged_any_m3", "lh2.hits_paged_any_m3"),
+    ("lh2_hits_late_any_m0", "lh2.hits_late_any_m0"),
+    ("lh2_hits_late_any_m1", "lh2.hits_late_any_m1"),
+    ("lh2_hits_late_any_m2", "lh2.hits_late_any_m2"),
+    ("lh2_hits_late_any_m3", "lh2.hits_late_any_m3"),
+    // The step's denominators from the decode replies' PAGED bitsets.
+    ("lh2_paged_total", "lh2.paged_total"),
+    ("lh2_paged_late_total", "lh2.paged_late_total"),
+    ("lh2_paged_mirror_held", "lh2.paged_mirror_held"),
+    ("lh2_paged_mirror_nonres", "lh2.paged_mirror_nonres"),
 ];
+
+const STAT_ANY_PAGED: usize = 46;
+const STAT_ANY_LATE: usize = 52;
+const STAT_ANY_PAGED_M: usize = 58;
+const STAT_ANY_LATE_M: usize = 62;
+const STAT_PAGED_TOTAL: usize = 66;
+
+/// One lane-layer's reply scored at any rank (`reply_hits_any`).
+pub fn count_reply_hits_any(r: &AnyHits) {
+    for k in 0..6 {
+        COUNTS[STAT_ANY_PAGED + k].fetch_add(u64::from(r.paged[k]), Relaxed);
+        COUNTS[STAT_ANY_LATE + k].fetch_add(u64::from(r.late[k]), Relaxed);
+    }
+    for k in 0..4 {
+        COUNTS[STAT_ANY_PAGED_M + k].fetch_add(u64::from(r.paged_m[k]), Relaxed);
+        COUNTS[STAT_ANY_LATE_M + k].fetch_add(u64::from(r.late_m[k]), Relaxed);
+    }
+}
+
+/// One decode reply's PAGED totals (`paged_totals`).
+pub fn count_paged_totals(t: &PagedTotals) {
+    for (k, v) in [t.total, t.late_total, t.held, t.nonres].into_iter().enumerate() {
+        COUNTS[STAT_PAGED_TOTAL + k].fetch_add(u64::from(v), Relaxed);
+    }
+}
 
 /// `STATS` index of the first `lh2_dry_hits_prot_rN` / `lh2_nonres_m{k}` /
 /// `lh2_hits_prot_m{k}` / `lh2_hits_prot_paged_*` / `lh2_hits_prot_late_*`
@@ -1149,7 +1290,13 @@ mod tests {
         for k in [&B2_MISS_PREFETCH_MAX_WORDS_STEP, &B2_MISS_PREFETCH_MAX_PER_LL_X10, &B2_NURSERY_PRIOR, &B2_MISS_PREFETCH_MARGIN] {
             assert!(k.live, "{}: flipped per turn", k.name);
         }
-        assert_eq!(STATS.len(), 46);
+        assert_eq!(STATS.len(), 70);
+        assert_eq!(STATS[STAT_ANY_PAGED].0, "lh2_hits_paged_any_r1");
+        assert_eq!(STATS[STAT_ANY_LATE + 5].0, "lh2_hits_late_any_r6");
+        assert_eq!(STATS[STAT_ANY_PAGED_M].0, "lh2_hits_paged_any_m0");
+        assert_eq!(STATS[STAT_ANY_LATE_M + 3].0, "lh2_hits_late_any_m3");
+        assert_eq!(STATS[STAT_PAGED_TOTAL].0, "lh2_paged_total");
+        assert_eq!(STATS[STAT_PAGED_TOTAL + 3].1, "lh2.paged_mirror_nonres");
         assert_eq!(STATS[STAT_DRY_HITS_PROT].0, "lh2_dry_hits_prot_r1");
         assert_eq!(STATS[STAT_PROT_PAGED].0, "lh2_hits_prot_paged_r1");
         assert_eq!(STATS[STAT_PROT_PAGED + 3].0, "lh2_hits_prot_paged_m0");
@@ -1208,8 +1355,16 @@ mod tests {
         let (cand, nonres) = count(&preds);
         assert_eq!(cand, [2, 3, 4]);
         assert_eq!(nonres, [1, 1, 2]);
-        // Ranks past `MAX_RANK` are neither counted nor hinted.
-        assert_eq!(classify(&[1, 2, 3, 4, 5, 6], NU, |_| true, |_| true).len(), 3);
+        // All six ranks are classified (the any-rank reply counters); the
+        // per-R dry counters and the hint filter stop at `HINT_MAX_RANK`.
+        let six = classify(&[1, 2, 3, 4, 5, 6], NU, |_| true, |_| true);
+        assert_eq!(six.len(), 6);
+        // A box-1 expert seen first at a low rank and again at a better one
+        // stays box 1's (it used to be un-marked and surface as box 2's).
+        assert!(classify(&[1, 2, 3, 9, 5, 6, 9, 2, 3, 4, 5, 6], NU, |e| e != 9, |_| true).iter().all(|p| p.e != 9));
+        assert_eq!(count(&six).0, [1, 2, 3], "ranks 4-6 count toward no R <= 3");
+        assert_eq!(hint_words(&six, 7, 3, 8, |_| false).0.len(), 3);
+        assert_eq!(HINT_MAX_RANK, 3);
         // The state is reusable: a second classify on the same `LaneState` sees
         // clean marks (an expert of the first call is not stuck at 255 / rank).
         let mut s = LaneState::default();
@@ -1440,6 +1595,58 @@ mod tests {
         assert_eq!(&st[STAT_PROT_PAGED..STAT_PROT_PAGED + 3], &[0, 1, 1]);
         assert_eq!(&st[STAT_PROT_LATE..STAT_PROT_LATE + 3], &[0, 1, 1]);
         assert_eq!(st[STAT_PROT_PAGED_LATE_TOTAL], 1);
+    }
+
+    /// The ANY-rank reply score and the step denominators (owner 10-06): a
+    /// hinted word paged at any actual rank counts for every R from its
+    /// predicted rank up to 6; late = on a reply the lane stalled on; the
+    /// totals come from the bitsets alone, hinted or not.
+    #[test]
+    fn any_rank_reply_hits_and_paged_totals() {
+        let p = |e: u16, rank: u8, nonres: bool, margin: f32| Pred { e, rank, nonres, margin };
+        // Predicted: 5 (r1, m .25), 7 (r1, m .05), 9 (r2), 11 (r4), 13 (r6), 2 resident (r1).
+        let preds = [p(5, 1, true, 0.25), p(7, 1, true, 0.05), p(9, 2, true, f32::NAN), p(11, 4, true, f32::NAN), p(13, 6, true, f32::NAN), p(2, 1, false, 0.9)];
+        let mut paged = [0u32; PAGED_WORDS];
+        for e in [5u32, 9, 13, 2, 40] {
+            paged[e as usize / 32] |= 1 << (e % 32);
+        }
+        // 5 (r1), 9 (r2), 13 (r6) paged; 7, 11 not; 2 is resident (never hinted); 40 unpredicted.
+        let r = reply_hits_any(&preds, &paged, false);
+        assert_eq!(r.paged, [1, 2, 2, 2, 2, 3]);
+        assert_eq!(r.paged_m, [1, 1, 1, 0], "5's margin .25");
+        assert_eq!((r.late, r.late_m), ([0; 6], [0; 4]));
+        let r = reply_hits_any(&preds, &paged, true);
+        assert_eq!((r.paged, r.late), ([1, 2, 2, 2, 2, 3], [1, 2, 2, 2, 2, 3]));
+        assert_eq!(r.late_m, [1, 1, 1, 0]);
+        assert_eq!(reply_hits_any(&preds, &[0u32; PAGED_WORDS], true), AnyHits::default());
+        // Totals: 5 paged experts; held bits {2, 40} -> 2 surprises; nonres bits {5, 9, 11} -> 2.
+        let mut held = [0u32; PAGED_WORDS];
+        held[0] = 1 << 2; // expert 2
+        held[1] = 1 << 8; // expert 40
+        let sel = [5, 9, 11, -1, 2, 40, 5, 9, 11, -1, 2, 40];
+        let mut nonres = [0u32; PAGED_WORDS];
+        nonres_bits(&sel, |e| e == 5 || e == 9 || e == 11, &mut nonres);
+        assert_eq!(nonres[0], (1 << 5) | (1 << 9) | (1 << 11), "distinct, non-resident, in range only");
+        assert_eq!(nonres[1], 0);
+        let t = paged_totals(&paged, &held, &nonres, false);
+        assert_eq!(t, PagedTotals { total: 5, late_total: 0, held: 2, nonres: 2 });
+        assert_eq!(paged_totals(&paged, &held, &nonres, true).late_total, 5);
+        // The counters land in `STATS` order.
+        let _ = take_stats();
+        count_reply_hits_any(&r);
+        count_paged_totals(&t);
+        let st = take_stats();
+        assert_eq!(&st[STAT_ANY_PAGED..STAT_ANY_PAGED + 6], &[1, 2, 2, 2, 2, 3]);
+        assert_eq!(&st[STAT_ANY_LATE_M..STAT_ANY_LATE_M + 4], &[1, 1, 1, 0]);
+        assert_eq!(&st[STAT_PAGED_TOTAL..STAT_PAGED_TOTAL + 4], &[5, 0, 2, 2]);
+        // `dry_hits_demanded` keeps the non-resident prediction for the reply.
+        let mut s = LaneState::default();
+        s.classify(&[5, 9, 7, 11, 13, 1], 6, |_| true, |e| e != 7);
+        s.set_pending(4, 1);
+        assert!(s.take_pending(4, 1));
+        let _ = s.dry_hits_demanded(&[20, 21, 22, 23, 24, 25], |_| false, 1);
+        let kept: Vec<u16> = s.reply_preds.iter().map(|p| p.e).collect();
+        assert_eq!(kept, vec![5, 9, 11, 13, 1], "7 is resident; all six ranks kept");
     }
 
     /// The absolute abort bars (design 5): the step bar, the per-lane-layer

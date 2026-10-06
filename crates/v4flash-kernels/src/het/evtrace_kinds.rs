@@ -206,6 +206,20 @@ pub static HUB_LH2: Kind = Kind {
         "lh2_hits_prot_late_r1", "lh2_hits_prot_late_r2", "lh2_hits_prot_late_r3",
         "lh2_hits_prot_late_m0", "lh2_hits_prot_late_m1", "lh2_hits_prot_late_m2", "lh2_hits_prot_late_m3",
         "lh2_prot_paged_late_total",
+        // ANY-rank (owner 10-06: every paged read stalls the lane; recall
+        // against the reads we block on is the metric, R up to 6 in play):
+        // per predicted R in 1..=6, hinted (non-resident) words the same
+        // lane's reply at the target layer PAGED at any actual rank, and of
+        // those the late ones; the rank-1 ones per margin bucket. Then the
+        // step's denominators from the decode replies' PAGED bitsets: all
+        // paged experts, on late replies, the mirror-held ones at submit
+        // (surprises, ~0 under pins), the mirror-non-resident ones (the
+        // hintable misses: minus the predictor's hits = what its top-R missed).
+        "lh2_hits_paged_any_r1", "lh2_hits_paged_any_r2", "lh2_hits_paged_any_r3", "lh2_hits_paged_any_r4", "lh2_hits_paged_any_r5", "lh2_hits_paged_any_r6",
+        "lh2_hits_late_any_r1", "lh2_hits_late_any_r2", "lh2_hits_late_any_r3", "lh2_hits_late_any_r4", "lh2_hits_late_any_r5", "lh2_hits_late_any_r6",
+        "lh2_hits_paged_any_m0", "lh2_hits_paged_any_m1", "lh2_hits_paged_any_m2", "lh2_hits_paged_any_m3",
+        "lh2_hits_late_any_m0", "lh2_hits_late_any_m1", "lh2_hits_late_any_m2", "lh2_hits_late_any_m3",
+        "lh2_paged_total", "lh2_paged_late_total", "lh2_paged_mirror_held", "lh2_paged_mirror_nonres",
     ],
 };
 
