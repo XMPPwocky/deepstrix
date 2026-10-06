@@ -1981,7 +1981,32 @@ pub mod knobs {
         /// `V41_EXPERT_MIRROR_FRAC` (default 0.6), key `mirror_frac`: pushed into
         /// `v4flash_core::hf_v41::set_expert_mirror_frac` (the reader's state).
         pub static MIRROR_FRAC = Knob::real("V41_EXPERT_MIRROR_FRAC", 0.6, 0.0, 1.0).alias("mirror_frac").hook(sync_mirror_frac);
+        /// `V41_B2_NURSERY` (default 32, 0..=512; 0 = off), key `nursery`: nursery
+        /// slots for the hub's predicted-miss hints (design 3.2). STARTUP ONLY
+        /// (the slots are carved at `enable_paging`); a file edit takes effect at
+        /// the next restart. 32 by default (k1 burst bound 16, room for cap bursts
+        /// and k2; 0.6 GB); 64-96 if the live hint volume (17-65 words/step at
+        /// R=1 with a cold pool, 10-06) says so.
+        pub static NURSERY = Knob::int("V41_B2_NURSERY", 32, 0, 512).alias("nursery");
+        /// `V41_B2_NURSERY_LANES` (default 2, 1..=8), key `nursery_lanes`: a
+        /// nursery entry is UNUSED (recycled first) once its layer has served
+        /// this many passes since it landed -- the hub's lane count (the other
+        /// lane's same-layer request arrives one period later). Live.
+        pub static NURSERY_LANES = Knob::int("V41_B2_NURSERY_LANES", 2, 1, 8).alias("nursery_lanes");
+        /// `V41_B2_LIKELY_PAUSE_FOR_CERTAIN` (default on), key
+        /// `likely_pause_for_certain`: a LIKELY (hint) read's chunks pause while a
+        /// certain read runs (review round 3, finding 1: protect the known-late
+        /// reply; off = keep the hint's lead and stretch an overlapped certain
+        /// read ~1 ms). Never pauses for speculative reads either way. Live
+        /// (the A/B flips it per turn via SIGUSR2).
+        pub static LIKELY_PAUSE_FOR_CERTAIN = Knob::flag("V41_B2_LIKELY_PAUSE_FOR_CERTAIN", true).alias("likely_pause_for_certain");
     }
+    /// Nursery slots to carve at `enable_paging` (0 = off; design 3.2).
+    pub fn nursery() -> usize { NURSERY.usize() }
+    /// Same-layer passes after which an unpromoted nursery entry is "unused".
+    pub fn nursery_lanes() -> u64 { NURSERY_LANES.get() }
+    /// LIKELY reads pause for certain ones (review round 3, finding 1).
+    pub fn likely_pause_for_certain() -> bool { LIKELY_PAUSE_FOR_CERTAIN.on() }
     /// `V41_B2_FAST_CHAIN` (default ON; `0` = the exact old chain); file key
     /// `fast_chain`. A batched pass of `b <= FAST_CHAIN_MAX_B` rows (every
     /// box-2 decode request of 2+ rows, verify batches, merged decode pairs)
@@ -2090,10 +2115,11 @@ pub mod knobs {
     /// one-line summary.
     pub fn reload() -> String {
         crate::knobs::step_now();
-        format!("knobs reloaded from {:?}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={}",
+        format!("knobs reloaded from {:?}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={} nursery={} (startup) nursery_lanes={} likely_pause_for_certain={}",
             crate::knobs::knob_file(), u8::from(park()), u8::from(merge()), merge_wait_us(), miss_par(), u8::from(coalesce()),
             v4flash_core::hf_v41::expert_mirror_frac(), if route_urgency() { "urgency" } else { "split" },
-            if prefill_route_split() { "split" } else { "mirror" }, u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()))
+            if prefill_route_split() { "split" } else { "mirror" }, u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()),
+            nursery(), nursery_lanes(), u8::from(likely_pause_for_certain()))
     }
 }
 
@@ -2268,6 +2294,59 @@ struct ShardPool {
     sc: StageCounters,
     /// Mode-aware eviction (`V41_B2_MODE_EVICT`); off unless enabled at load.
     me: ModeEvict,
+    /// THE NURSERY (docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 3.2; owner
+    /// direction 2026-10-06): per slot, "this slot is a nursery slot". A SET
+    /// of slot ids, never an address range (a `Band::Stage`-style range cost
+    /// prefill 3x, 09-27). The hub's predicted-miss hints (`REQ_FLAG_LIKELY`)
+    /// land ONLY here; every main-band search (`pick_victim`: claims,
+    /// landings, restores) skips these slots. A nursery entry is resident
+    /// (`slot_of`, `remap_hosts`: the kernel reads it like any slot, so
+    /// `is_resident_pool` / `resident_mask` see it and the early-page hook
+    /// issues no certain read for it -- the hit at `ensure` is what makes the
+    /// hint pay), but it is NOT in `held` (`nursery_held`), never pinnable
+    /// (`PinBook::report`), and masked out of `residency_words`. On a hit
+    /// `touch_hit` RELABELS the slot into the main pool (no copy: the remap
+    /// already points at it) and the caller refills the nursery with the main
+    /// pool's victim (`nursery_refill`). Empty (all false) = off.
+    nursery: Vec<bool>,
+    /// Slots flagged `nursery` now; `nursery_target` = the knob (`nursery`).
+    /// Below the target after a promotion found no refill victim
+    /// (`NurseryCounters::shrunk`); refilled from free main slots later.
+    nursery_slots: u32,
+    nursery_target: u32,
+    /// Per layer: resident nursery entries of the layer (NOT in `held`:
+    /// `pick_victim` protects a foreign layer only while `held > floor`, and
+    /// a counted nursery entry would let a main slot of a layer AT its floor
+    /// be evicted -- review round 3, finding 3).
+    nursery_held: Vec<u32>,
+    /// Per slot (nursery slots only): `(serves[layer] when the entry landed,
+    /// landing tick)` for the recycle order: UNUSED first (its layer has been
+    /// served `>= nursery_lanes` requests since the landing: the other lane's
+    /// same-layer request came one period later and did not pick it), then
+    /// the oldest landing.
+    nursery_land: Vec<(u64, u64)>,
+    /// Per layer: `ensure` passes served (`note_serve`), the unused rule's clock.
+    serves: Vec<u64>,
+    nc: NurseryCounters,
+}
+
+/// Nursery counters (cumulative since `enable_paging`; `b2_req` reports
+/// deltas per request, `nursery_occupied` is a level). Invariant per step:
+/// `lands = hits + recycled + delta(occupied)` (design section 6; a hint
+/// landed straight into the main pool because the serving request wanted it
+/// counts as a land AND a hit; `drops` never land).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NurseryCounters {
+    /// LIKELY reads landed (into a nursery slot, or straight into main when wanted).
+    pub lands: u64,
+    /// Nursery entries promoted on use (`touch_hit`), incl. the direct ones.
+    pub hits: u64,
+    /// Unused nursery entries evicted by a later landing (= wrong hints, churn).
+    pub recycled: u64,
+    /// LIKELY words not read: no staging set, or no nursery slot to land in.
+    pub drops: u64,
+    /// Promotions that found no main-band refill victim (the nursery shrank).
+    pub shrunk: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2855,15 +2934,20 @@ impl PinBook {
     /// return the layer's pinned set as a residency map. A pinned expert
     /// found NOT landed is a violation (it left the pool around the choke
     /// point): unpinned, reported, and absent from the map.
-    fn report(&mut self, layer: u32, row: &[i32], stage: u32) -> [u32; proto::RESID_WORDS] {
+    fn report(&mut self, layer: u32, row: &[i32], stage: u32, nursery: &[bool]) -> [u32; proto::RESID_WORDS] {
         let mut w = [0u32; proto::RESID_WORDS];
         if !self.on || layer >= N_LAYER as u32 {
             return w;
         }
-        // (landed, pinnable): a staging slot is landed but never pinned.
+        // (landed, pinnable): a staging slot or a NURSERY slot (design 3.2)
+        // is landed but never pinned -- else `apply_map` on the hub would
+        // count a nursery entry as a hub pin.
         let state = |e: usize| -> (bool, bool) {
             match row.get(e) {
-                Some(&r) if r != 0 => (true, ((-r - 1) as u32) < stage),
+                Some(&r) if r != 0 => {
+                    let slot = (-r - 1) as usize;
+                    (true, (slot as u32) < stage && !nursery.get(slot).copied().unwrap_or(false))
+                }
                 _ => (false, false),
             }
         };
@@ -2953,6 +3037,12 @@ impl EarlyPaged {
 /// and the early-page `pinned` set.
 type ExtraPins<'a> = &'a [(u32, u32)];
 
+/// `residency_words`' predicate: remap entry `r` (`-(slot) - 1`, 0 = not
+/// landed) is landed in a slot that is NOT a nursery slot (design 3.2).
+fn landed_main(r: i32, nursery: &[bool]) -> bool {
+    r != 0 && !nursery.get((-r - 1) as usize).copied().unwrap_or(false)
+}
+
 impl ShardPool {
     /// A pool of `n_slots`, seeded with `(layer, base_slot, ids)` regions as
     /// `load` placed them (slot `base + i` holds `ids[i]`, all landed, oldest
@@ -2991,6 +3081,148 @@ impl ShardPool {
             stage: n_slots as u32,
             sc: StageCounters::default(),
             me: ModeEvict::default(),
+            nursery: vec![false; n_slots],
+            nursery_slots: 0,
+            nursery_target: 0,
+            nursery_held: vec![0; N_LAYER as usize],
+            nursery_land: vec![(0, 0); n_slots],
+            serves: vec![0; N_LAYER as usize],
+            nc: NurseryCounters::default(),
+        }
+    }
+
+    // ---- the nursery (design 3.2) ----
+
+    /// Carve `n` nursery slots out of the MAIN band (call after `set_stage`;
+    /// 0 = off). The slots are spread over the band (`i * main / n`), so no
+    /// layer's region loses more than its share; an occupant stays resident
+    /// as a nursery ENTRY (unused, oldest-landed: the first to be recycled),
+    /// its count moving from `held` to `nursery_held`. Clamped to a quarter
+    /// of the band. Returns the slots carved.
+    fn carve_nursery(&mut self, n: usize) -> usize {
+        let main = self.stage as usize;
+        let n = n.min(main / 4);
+        self.nursery_target = n as u32;
+        for i in 0..n {
+            let sl = i * main / n;
+            if self.nursery[sl] {
+                continue;
+            }
+            debug_assert!(!self.owner_of[sl].is_some_and(|(l, e)| self.pins.is_pinned(l, e)), "carving a pinned slot");
+            self.nursery[sl] = true;
+            self.nursery_slots += 1;
+            self.nursery_land[sl] = (0, 0);
+            if let Some((ol, _)) = self.owner_of[sl] {
+                self.held[ol as usize] -= 1;
+                self.nursery_held[ol as usize] += 1;
+            }
+        }
+        n
+    }
+
+    /// `ensure` is serving a pass of `layer`: the unused rule's clock.
+    fn note_serve(&mut self, layer: u32) {
+        self.serves[layer as usize] += 1;
+    }
+
+    /// Nursery slots holding an entry (the `nursery_occupied` level).
+    fn nursery_occupied(&self) -> u32 {
+        self.nursery.iter().enumerate().filter(|&(sl, &f)| f && self.owner_of[sl].is_some()).count() as u32
+    }
+
+    /// Is `(layer, e)` a nursery entry (resident, not yet promoted)?
+    fn in_nursery(&self, layer: u32, e: u32) -> bool {
+        self.slot_of.get(&(layer, e)).is_some_and(|&sl| self.nursery[sl as usize])
+    }
+
+    /// Where a LIKELY read lands (design 3.2, recycle rule): a FREE nursery
+    /// slot first, then an UNUSED entry (its layer served `>= lanes` passes
+    /// since it landed), oldest landing first, then the oldest landing among
+    /// the fresh ones; never a slot whose entry the pass being served wants
+    /// (`want` on `want_layer`, `extra`). `None` = no nursery, or every slot
+    /// is wanted.
+    fn nursery_victim(&self, want_layer: u32, want: &[u32], extra: ExtraPins<'_>, lanes: u64) -> Option<u32> {
+        let mut best: Option<((u8, u64), u32)> = None;
+        for (sl, &flag) in self.nursery.iter().enumerate() {
+            if !flag {
+                continue;
+            }
+            let key = match self.owner_of[sl] {
+                None => (0u8, 0u64),
+                Some((ol, oe)) => {
+                    if (ol == want_layer && want.contains(&oe)) || extra.contains(&(ol, oe)) {
+                        continue;
+                    }
+                    let (at, tick) = self.nursery_land[sl];
+                    let unused = self.serves[ol as usize].saturating_sub(at) >= lanes;
+                    (if unused { 1 } else { 2 }, tick)
+                }
+            };
+            if best.is_none_or(|(bk, _)| key < bk) {
+                best = Some((key, sl as u32));
+            }
+        }
+        best.map(|(_, sl)| sl)
+    }
+
+    /// A LIKELY read of `key` has been repacked into nursery `slot` (already
+    /// detached by `evict`): own and map it as a nursery ENTRY. Not in
+    /// `held`; `last_use` 0-class (main searches skip the slot anyway); the
+    /// landing sets the layer `dirty` (the relabel on use will not).
+    fn land_nursery(&mut self, slot: u32, key: (u32, u32)) {
+        debug_assert!(self.nursery[slot as usize] && self.owner_of[slot as usize].is_none());
+        self.owner_of[slot as usize] = Some(key);
+        self.slot_of.insert(key, slot);
+        self.nursery_held[key.0 as usize] += 1;
+        self.tick += 1;
+        self.last_use[slot as usize] = 0;
+        self.nursery_land[slot as usize] = (self.serves[key.0 as usize], self.tick);
+        self.remap_hosts[key.0 as usize][key.1 as usize] = -(slot as i32) - 1;
+        self.dirty[key.0 as usize] = true;
+        self.nc.lands += 1;
+    }
+
+    /// After `touch_hit` promoted an entry: hand the nursery the main pool's
+    /// victim -- `pick_victim_any` (never a hub pin, floors honoured, the
+    /// serving pass's `want` and `extra` excluded), `me_account` on that
+    /// victim with the pass's mode (the `claim_miss` order), `evict`, flag.
+    /// Exactly the eviction the demand read would have caused. No victim: the
+    /// nursery shrinks by one (`shrunk`) and refills from a free slot later
+    /// (`nursery_refill_free`). Returns the victim slot.
+    #[allow(clippy::too_many_arguments)]
+    fn nursery_refill(
+        &mut self,
+        region: (u32, u32),
+        global: bool,
+        want_layer: u32,
+        want: &[u32],
+        extra: ExtraPins<'_>,
+        prefill_mode: bool,
+    ) -> Option<u32> {
+        if self.nursery_slots >= self.nursery_target {
+            return None;
+        }
+        let Some(v) = self.pick_victim_any(region, global, Band::Main, want_layer, want, extra, want_layer, false, prefill_mode) else {
+            self.nc.shrunk += 1;
+            return None;
+        };
+        self.me_account(v, prefill_mode);
+        let _ = self.evict(v, want_layer);
+        self.nursery[v as usize] = true;
+        self.nursery_slots += 1;
+        self.nursery_land[v as usize] = (0, 0);
+        self.last_use[v as usize] = 0;
+        Some(v)
+    }
+
+    /// A shrunk nursery takes a FREE main-band slot when one exists (a landing
+    /// time check; `nursery_slots < target` is rare).
+    fn nursery_refill_free(&mut self) {
+        while self.nursery_slots < self.nursery_target {
+            let Some(sl) = (0..self.stage as usize).find(|&sl| self.owner_of[sl].is_none() && !self.nursery[sl]) else { return };
+            self.nursery[sl] = true;
+            self.nursery_slots += 1;
+            self.nursery_land[sl] = (0, 0);
         }
     }
 
@@ -3220,6 +3452,11 @@ impl ShardPool {
         let enc_first = tiered && knobs::encoder_victims_first();
         let mut best: Option<((u8, u8, u64), u32)> = None;
         for sl in range {
+            // Nursery slots belong to the hints (design 3.2): never a victim
+            // of a claim, a landing or a restore.
+            if self.nursery[sl as usize] {
+                continue;
+            }
             let ok = match self.owner_of[sl as usize] {
                 Some((ol, oe)) => {
                     if (ol == want_layer && want.contains(&oe))
@@ -3292,7 +3529,14 @@ impl ShardPool {
         let (ol, oe) = self.owner_of[slot as usize].take()?;
         self.slot_of.remove(&(ol, oe));
         self.remap_hosts[ol as usize][oe as usize] = 0;
-        self.held[ol as usize] -= 1;
+        if self.nursery[slot as usize] {
+            // A nursery entry recycled by a later hint (the only path that
+            // evicts one): never pinned, so `on_evict` below is false.
+            self.nursery_held[ol as usize] -= 1;
+            self.nc.recycled += 1;
+        } else {
+            self.held[ol as usize] -= 1;
+        }
         if ol != cur_layer {
             self.dirty[ol as usize] = true;
         }
@@ -3307,6 +3551,20 @@ impl ShardPool {
     fn touch_hit(&mut self, layer: u32, e: u32, scan_class: bool) -> bool {
         let Some(&slot) = self.slot_of.get(&(layer, e)) else { return false };
         self.tick += 1;
+        if self.nursery[slot as usize] {
+            // PROMOTE ON USE (design 3.2; review round 3, finding 3): the hint
+            // was right. RELABEL the slot into the main pool -- no copy, no
+            // remap write (it already points here), no `dirty` -- and let
+            // the stamp below be the decode hit's. Pin eligibility comes from
+            // the request's own `pin_grant`, like any pick. The caller
+            // refills the nursery (`nursery_refill`: the eviction the demand
+            // read would have caused).
+            self.nursery[slot as usize] = false;
+            self.nursery_slots -= 1;
+            self.nursery_held[layer as usize] -= 1;
+            self.held[layer as usize] += 1;
+            self.nc.hits += 1;
+        }
         let staged = slot >= self.stage;
         self.sc.hits += u64::from(staged);
         let lu = &mut self.last_use[slot as usize];
@@ -4806,14 +5064,26 @@ impl ExpertShard {
                 eprintln!("expertd: V41_B2_MODE_EVICT=1 IGNORED: needs V41_B2_PREFILL_STAGE=0, the two-class LRU (V41_B2_SCAN_CLASS != 0) and the global pool (V41_B2_GLOBAL_POOL != 0)");
             }
         }
+        // THE NURSERY (design 3.2; knob `nursery`, 0 = off): carved from the
+        // main band; LIKELY reads land only there, and the LIKELY reader class
+        // is on iff it is. Startup-only: the slots are chosen once.
+        let nursery = pool.carve_nursery(knobs::nursery());
+        if knobs::nursery() > 0 {
+            eprintln!(
+                "expertd: nursery ON: {nursery} slots ({:.2} GB) for the hub's predicted-miss hints (REQ_FLAG_LIKELY; unused after {} same-layer passes; LIKELY reads {} for certain ones)",
+                nursery as f64 * self.info.bytes_per_expert as f64 / 1e9,
+                knobs::nursery_lanes(),
+                if knobs::likely_pause_for_certain() { "pause" } else { "do not pause" },
+            );
+        }
         let floors: usize = pool.floor.iter().map(|&f| f as usize).sum();
         let reserve = b2_pin_reserve(stage);
         eprintln!(
-            "expertd: prefill staging {} ({stage} slots [{}, {n_slots}) of {n_slots}; main band {}; pin budget {} = {n_slots} - {stage} - reserve {reserve} - floors {floors})",
+            "expertd: prefill staging {} ({stage} slots [{}, {n_slots}) of {n_slots}; main band {}; pin budget {} = {n_slots} - {stage} - reserve {reserve} - floors {floors} - nursery {nursery})",
             if stage > 0 { "ON" } else { "OFF" },
             n_slots - stage,
             n_slots - stage,
-            n_slots.saturating_sub(stage + reserve + floors),
+            n_slots.saturating_sub(stage + reserve + floors + nursery),
         );
         self.pool = Some(pool);
         // Do NOT touch the advertised HELLO bitmap. `info.owned` is what the hub's
@@ -4869,7 +5139,10 @@ impl ExpertShard {
 
     /// Is `layer` a PAGED layer (catch-all pool)? Hits-first only applies there:
     /// an unpaged layer is fully resident by construction.
-    /// Resident in the paged pool right now (false for unpaged layers).
+    /// Resident in the paged pool right now (false for unpaged layers). A
+    /// NURSERY entry counts (design 3.2): the early-page hook issues no
+    /// certain read for a hinted expert that has landed -- the hit at
+    /// `ensure` promotes it.
     pub fn is_resident_pool(&self, layer: u32, e: u32) -> bool {
         self.pool.as_ref().is_some_and(|p| p.slot_of.contains_key(&(layer, e)))
     }
@@ -4896,13 +5169,15 @@ impl ExpertShard {
     pub fn residency_words(&self, layer: u32) -> [u32; proto::RESID_WORDS] {
         let mut w = [0u32; proto::RESID_WORDS];
         let paged = if self.layer_is_paged(layer) {
-            self.pool.as_ref().and_then(|p| p.remap_hosts.get(layer as usize))
+            self.pool.as_ref().map(|p| (&p.remap_hosts[layer as usize], &p.nursery))
         } else {
             None
         };
         for e in 0..N_EXPERT as usize {
+            // A nursery entry is landed but masked (design 3.2): the hub's
+            // `held` never includes one, and the cache prior stays hint-blind.
             let here = match paged {
-                Some(r) => r[e] != 0,
+                Some((r, nursery)) => landed_main(r[e], nursery),
                 None => self.owns(layer, e as i32),
             };
             if here {
@@ -4933,10 +5208,12 @@ impl ExpertShard {
             let stage = p.stage_slots();
             let floors: usize = p.floor.iter().map(|&f| f as usize).sum();
             let r = b2_pin_reserve(stage);
-            let budget = n.saturating_sub(stage + r + floors) as u32;
+            // Nursery slots are never pinnable (design 3.2): out of the budget.
+            let nursery = p.nursery_target as usize;
+            let budget = n.saturating_sub(stage + r + floors + nursery) as u32;
             p.pins.enable(budget);
             eprintln!(
-                "expertd: pinning ON for this connection: budget {budget} of {n} slots (staging {stage}, reserve {r}, floors {floors}; \
+                "expertd: pinning ON for this connection: budget {budget} of {n} slots (staging {stage}, reserve {r}, floors {floors}, nursery {nursery}; \
                  no-deadlock minimum reserve + staging >= {PIN_RESERVE_MIN}){}",
                 if b2_assert_pinned() { ", V41_B2_ASSERT_PINNED" } else { "" }
             );
@@ -5013,7 +5290,7 @@ impl ExpertShard {
                     }
                 }
                 let row = &p.remap_hosts[layer as usize];
-                p.pins.report(layer, row, p.stage)
+                p.pins.report(layer, row, p.stage, &p.nursery)
             }
         };
         Some((map, [p.pins.epoch, p.pins.pinned, p.pins.budget]))
@@ -5186,10 +5463,18 @@ impl ExpertShard {
         // reports an expert resident that nobody wrote.
         let mut failed: Option<eyre::Report> = None;
         let region = (base as u32, base as u32 + n_region as u32);
+        pool.note_serve(layer);
         for &e in &want {
             pg.requests += 1;
+            let was_nursery = pool.in_nursery(layer, e);
             if pool.touch_hit(layer, e, scan_class) {
                 ev_hits += 1;
+                if was_nursery {
+                    // The hit promoted a nursery entry (design 3.2): refill the
+                    // nursery with the main pool's victim NOW, before the next
+                    // claim -- the eviction this demand read would have caused.
+                    pool.nursery_refill(region, global, layer, &want, &pinned, prefill_mode);
+                }
                 continue;
             }
             pg.misses += 1;
@@ -9269,22 +9554,22 @@ mod tests {
         for e in [2, 3, 4, 5] {
             p.grant(1, e);
         }
-        let w = p.report(1, &row, u32::MAX);
+        let w = p.report(1, &row, u32::MAX, &[]);
         assert_eq!(w[0], (1 << 2) | (1 << 3), "budget 2: the first two landed grants, in grant order");
         assert_eq!((p.pinned, p.c.new_pins, p.c.denied), (2, 2, 1));
         assert!(!p.is_pinned(1, 5), "5 is eligible but not landed");
-        let _ = p.report(1, &row, u32::MAX);
+        let _ = p.report(1, &row, u32::MAX, &[]);
         assert_eq!(p.c.denied, 1, "a denial drops the grant: counted once per grant");
         // Resident but never used / granted: never pinned.
         row[6] = -7;
-        assert_eq!(p.report(1, &row, u32::MAX)[0] & (1 << 6), 0);
+        assert_eq!(p.report(1, &row, u32::MAX, &[])[0] & (1 << 6), 0);
         // Release 2: epoch 1; 4 was denied (grant dropped) so the freed budget
         // stays free until it is granted again.
         p.release((1 << 16) | 2);
         assert_eq!((p.epoch, p.pinned), (1, 1));
-        assert_eq!(p.report(1, &row, u32::MAX)[0], 1 << 3);
+        assert_eq!(p.report(1, &row, u32::MAX, &[])[0], 1 << 3);
         p.grant(1, 4);
-        assert_eq!(p.report(1, &row, u32::MAX)[0], (1 << 3) | (1 << 4));
+        assert_eq!(p.report(1, &row, u32::MAX, &[])[0], (1 << 3) | (1 << 4));
         assert!(!p.is_pinned(1, 2), "a released expert needs a new grant to pin again");
         // Words for unknown / unpinned keys still advance the epoch.
         p.release((1 << 16) | 300);
@@ -9292,15 +9577,15 @@ mod tests {
         assert_eq!(p.epoch, 3);
         // 5 lands (still within its TTL): budget full, so its grant is dropped.
         row[5] = -9;
-        let _ = p.report(1, &row, u32::MAX);
+        let _ = p.report(1, &row, u32::MAX, &[]);
         assert!(!p.is_pinned(1, 5));
         assert_eq!(p.c.denied, 2);
         assert!(p.on_evict(1, 3), "evicting a pinned expert is reported");
         assert_eq!((p.pinned, p.c.pinned_evictions), (1, 1));
         row[3] = 0;
-        assert_eq!(p.report(1, &row, u32::MAX)[0], 1 << 4, "5 needs a fresh grant");
+        assert_eq!(p.report(1, &row, u32::MAX, &[])[0], 1 << 4, "5 needs a fresh grant");
         p.grant(1, 5);
-        assert_eq!(p.report(1, &row, u32::MAX)[0], (1 << 4) | (1 << 5));
+        assert_eq!(p.report(1, &row, u32::MAX, &[])[0], (1 << 4) | (1 << 5));
         assert!(!p.on_evict(1, 6));
         assert_eq!(p.pinned, 2);
         // Enabling again keeps the state; `off` resets it.
@@ -9314,26 +9599,26 @@ mod tests {
         let mut row = vec![0i32; REMAP_LEN];
         q.grant(2, 7);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row, u32::MAX);
+            let _ = q.report(2, &row, u32::MAX, &[]);
         }
         row[7] = -1;
-        assert_eq!(q.report(2, &row, u32::MAX)[0], 1 << 7, "landed on its last report: pinned");
+        assert_eq!(q.report(2, &row, u32::MAX, &[])[0], 1 << 7, "landed on its last report: pinned");
         q.grant(2, 8);
         for _ in 0..PIN_GRANT_TTL {
-            let _ = q.report(2, &row, u32::MAX);
+            let _ = q.report(2, &row, u32::MAX, &[]);
         }
         row[8] = -2;
-        assert_eq!(q.report(2, &row, u32::MAX)[0] & (1 << 8), 0, "expired: never pinned");
+        assert_eq!(q.report(2, &row, u32::MAX, &[])[0] & (1 << 8), 0, "expired: never pinned");
         q.grant(2, 9);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row, u32::MAX);
+            let _ = q.report(2, &row, u32::MAX, &[]);
         }
         q.grant(2, 9);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row, u32::MAX);
+            let _ = q.report(2, &row, u32::MAX, &[]);
         }
         row[9] = -3;
-        assert_eq!(q.report(2, &row, u32::MAX)[0] & (1 << 9), 1 << 9, "re-granted: clock restarted");
+        assert_eq!(q.report(2, &row, u32::MAX, &[])[0] & (1 << 9), 1 << 9, "re-granted: clock restarted");
         assert_eq!(q.c.denied, 0);
 
         // Fresh first: with one budget slot, the pass's own pick (300) beats an
@@ -9342,11 +9627,11 @@ mod tests {
         f.enable(1);
         let mut row = vec![0i32; REMAP_LEN];
         f.grant(3, 10);
-        let _ = f.report(3, &row, u32::MAX);
+        let _ = f.report(3, &row, u32::MAX, &[]);
         row[10] = -1;
         row[300] = -2;
         f.grant(3, 300);
-        let w = f.report(3, &row, u32::MAX);
+        let w = f.report(3, &row, u32::MAX, &[]);
         assert!(f.is_pinned(3, 300) && !f.is_pinned(3, 10), "{w:?}");
         assert_eq!((f.pinned, f.c.denied), (1, 1));
     }
@@ -9391,7 +9676,7 @@ mod tests {
             pool.pins.grant(1, e);
         }
         let row = pool.remap_hosts[1].clone();
-        let _ = pool.pins.report(1, &row, pool.stage);
+        let _ = pool.pins.report(1, &row, pool.stage, &pool.nursery);
         assert!(pool.pins.is_pinned(1, 0) && pool.pins.is_pinned(1, 2));
         // Oldest slots are layer 1's (seeded first); 0-2 pinned, 3 is next.
         let (slot, ev) = pool.claim_miss(2, 10, &[10], &[], (4, 8), true, false, false).unwrap();
@@ -9425,7 +9710,7 @@ mod tests {
         pool.pins.grant(1, 0);
         pool.pins.grant(1, 1);
         let row = pool.remap_hosts[1].clone();
-        let _ = pool.pins.report(1, &row, pool.stage);
+        let _ = pool.pins.report(1, &row, pool.stage, &pool.nursery);
         let v0 = PIN_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed);
         let (_, ev) = pool.claim_miss(1, 5, &[5], &[], (0, 2), true, false, false).expect("revoke, not fail");
         assert!(ev.is_some());
@@ -9976,7 +10261,7 @@ mod tests {
         pool.pins.grant(1, 41); // main
         pool.pins.grant(1, 20); // staged (a prefill claim)
         let row = pool.remap_hosts[1].clone();
-        let map = pool.pins.report(1, &row, pool.stage);
+        let map = pool.pins.report(1, &row, pool.stage, &pool.nursery);
         assert!(pool.pins.is_pinned(1, 41) && map[1] & (1 << 9) != 0);
         assert!(!pool.pins.is_pinned(1, 40) && !pool.pins.is_pinned(1, 20), "never pinned in staging");
         assert_eq!(map[1] & (1 << 8), 0);
@@ -10006,7 +10291,7 @@ mod tests {
         }
         for l in 1..=3u32 {
             let row = pool.remap_hosts[l as usize].clone();
-            let _ = pool.pins.report(l, &row, pool.stage);
+            let _ = pool.pins.report(l, &row, pool.stage, &pool.nursery);
         }
         assert_eq!(pool.pins.pinned, 8);
         let (slot, ev) = pool.claim_miss(2, 60, &[60], &[], (4, 8), true, false, false).unwrap();
@@ -10109,6 +10394,8 @@ mod tests {
         pinned: u32,
         budget: u32,
         paged: [u32; proto::RESID_WORDS],
+        /// The NURSERY block (`RESP_FLAG_NURSERY`): `(layer, e)` entries.
+        nursery: Vec<(u32, u32)>,
     }
 
     /// Box 2 for `pin_sim`: the REAL `ShardPool` (victim search, choke point,
@@ -10270,7 +10557,7 @@ mod tests {
                 }
             }
             let row = self.pool.remap_hosts[layer as usize].clone();
-            let map = self.pool.pins.report(layer, &row, self.pool.stage);
+            let map = self.pool.pins.report(layer, &row, self.pool.stage, &self.pool.nursery);
             let p = &self.pool.pins;
             (map, p.epoch, p.pinned, p.budget)
         }
@@ -10285,9 +10572,9 @@ mod tests {
                 }
             }
             let row = self.pool.remap_hosts[r.layer as usize].clone();
-            let map = self.pool.pins.report(r.layer, &row, self.pool.stage);
+            let map = self.pool.pins.report(r.layer, &row, self.pool.stage, &self.pool.nursery);
             let p = &self.pool.pins;
-            SimReply { seq: r.seq, layer: r.layer, map, epoch: p.epoch, pinned: p.pinned, budget: p.budget, paged }
+            SimReply { seq: r.seq, layer: r.layer, map, epoch: p.epoch, pinned: p.pinned, budget: p.budget, paged, nursery: Vec::new() }
         }
 
         /// Serve the wire's front request as `serve_connection` does: words in
@@ -10378,8 +10665,8 @@ mod tests {
             // grants first, then the layer's report, reused by the partner.
             if let Some(b) = partner.as_ref() {
                 let (map, epoch, pinned, budget) = self.report_pass(a.layer, &[(&a, dec(&a)), (b, dec(b))]);
-                replies.push(SimReply { seq: a.seq, layer: a.layer, map, epoch, pinned, budget, paged: paged_a });
-                replies.push(SimReply { seq: b.seq, layer: b.layer, map, epoch, pinned, budget, paged: paged_b });
+                replies.push(SimReply { seq: a.seq, layer: a.layer, map, epoch, pinned, budget, paged: paged_a, nursery: Vec::new() });
+                replies.push(SimReply { seq: b.seq, layer: b.layer, map, epoch, pinned, budget, paged: paged_b, nursery: Vec::new() });
             } else {
                 let r = self.reply(&a, &a.sel, dec(&a), paged_a);
                 replies.push(r);
@@ -10612,6 +10899,284 @@ mod tests {
             stale_maps,
             sc: b2.pool.sc,
             ..b2.st
+        }
+    }
+
+    // ---- the nursery (design 3.2, section 7 gates) ----
+
+    /// Three layers x 4 seeded slots; two nursery slots carved (spread: slots
+    /// 0 and 6, occupants (1,0) and (2,2) become entries).
+    fn nursery_pool(floor_frac: f32) -> ShardPool {
+        let ids: Vec<u32> = (0..4).collect();
+        let mut pool = ShardPool::seeded(12, &[(1, 0, &ids), (2, 4, &ids), (3, 8, &ids)], floor_frac);
+        assert_eq!(pool.carve_nursery(2), 2);
+        pool
+    }
+
+    fn occupied(pool: &ShardPool) -> u32 {
+        pool.nursery_occupied()
+    }
+
+    /// Carving relabels occupants into entries (counts move `held` ->
+    /// `nursery_held`); no victim search ever returns a nursery slot; the
+    /// recycle order is free, then unused (served `>= lanes` passes since the
+    /// landing), then the oldest landing; never a wanted slot; a landing
+    /// recycles (`recycled`, `on_evict` false) and maps the entry.
+    #[test]
+    fn nursery_carve_victims_and_recycle_order() {
+        let mut pool = nursery_pool(0.0);
+        assert_eq!((pool.nursery_slots, pool.nursery_target), (2, 2));
+        assert!(pool.nursery[0] && pool.nursery[6]);
+        assert_eq!((pool.held[1], pool.nursery_held[1], pool.held[2], pool.nursery_held[2]), (3, 1, 3, 1));
+        assert_eq!(occupied(&pool), 2);
+        assert!(pool.in_nursery(1, 0) && pool.in_nursery(2, 2) && !pool.in_nursery(1, 1));
+        // Claims of a fourth layer take every main slot in turn, never 0 or 6.
+        let want: Vec<u32> = (100..110).collect();
+        for &e in &want {
+            let (v, _) = pool.claim_miss(5, e, &want, &[], (0, 12), true, false, false).expect("a victim");
+            assert!(v != 0 && v != 6, "claim took nursery slot {v}");
+            pool.commit(5, e, v);
+        }
+        assert!(pool.claim_miss(5, 110, &want, &[], (0, 12), true, false, false).is_none(), "10 main slots, all wanted");
+        assert!(pool.pick_victim_any((0, 12), true, Band::Main, 5, &[], &[], 5, true, false).is_some_and(|v| v != 0 && v != 6));
+        // Recycle order: both entries are fresh (no pass since they landed):
+        // the oldest landing (tick 0 both) -> the lowest slot.
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0));
+        // Layer 2 served twice: (2,2) in slot 6 is UNUSED and goes first.
+        pool.note_serve(2);
+        pool.note_serve(2);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(6));
+        assert_eq!(pool.nursery_victim(9, &[], &[], 3), Some(0), "lanes 3: not yet unused");
+        // Never a wanted slot: the pass wants (2,2) -> slot 0; wants both -> none.
+        assert_eq!(pool.nursery_victim(2, &[2], &[], 2), Some(0));
+        assert_eq!(pool.nursery_victim(2, &[2], &[(1, 0)], 2), None);
+        // Landing: evict the occupant (recycled; never pinned so no violation),
+        // map the entry, count the land; the layer goes dirty by the landing.
+        let v = pool.nursery_victim(9, &[], &[], 2).unwrap();
+        assert_eq!(v, 6);
+        pool.dirty[7] = false;
+        assert_eq!(pool.evict(v, 9), Some((2, 2)));
+        assert_eq!((pool.nc.recycled, pool.nursery_held[2], pool.held[2]), (1, 0, 0), "layer 2's main slots went to the layer-5 claims above");
+        assert!(!pool.pins.on_evict(2, 2), "a nursery entry is never pinned");
+        pool.land_nursery(v, (7, 3));
+        assert_eq!(pool.nc.lands, 1);
+        assert_eq!(pool.slot_of.get(&(7, 3)), Some(&6));
+        assert_eq!(pool.remap_hosts[7][3], -7);
+        assert!(pool.dirty[7] && pool.in_nursery(7, 3));
+        assert_eq!((pool.nursery_held[7], pool.held[7]), (1, 0), "an entry is not in `held`");
+        assert_eq!(pool.last_use[6], 0, "0-class stamp");
+        // A free nursery slot goes first.
+        assert_eq!(pool.evict(0, 9), Some((1, 0)));
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0), "free first");
+        assert_eq!(occupied(&pool), 1);
+        assert_eq!(pool.nc, NurseryCounters { lands: 1, hits: 0, recycled: 2, drops: 0, shrunk: 0 });
+    }
+
+    /// `touch_hit` on an entry RELABELS it (main `held`, decode-hit stamp,
+    /// flag off, `hits`), and the refill takes the main pool's victim --
+    /// never a hub pin, never a wanted slot, `me_account`ed -- else shrinks;
+    /// a shrunk nursery refills from a free main slot.
+    #[test]
+    fn nursery_promote_on_hit_relabels_and_refills() {
+        let mut pool = nursery_pool(0.0);
+        let tick0 = pool.tick;
+        // The hit: a decode pass of layer 1 wanting 0 and 1.
+        assert!(pool.touch_hit(1, 0, false));
+        assert!(!pool.nursery[0] && !pool.in_nursery(1, 0));
+        assert_eq!((pool.held[1], pool.nursery_held[1], pool.nursery_slots), (4, 0, 1));
+        assert_eq!(pool.nc.hits, 1);
+        assert_eq!(pool.last_use[0], tick0 + 1 + PREFILL_AGE, "exactly a demand hit's stamp");
+        assert_eq!(pool.remap_hosts[1][0], -1, "no remap write: it already points here");
+        assert!(!pool.dirty[1], "no dirty by the relabel");
+        // Refill: LRU main slot that is not wanted. Layer 1's slots are the
+        // oldest; 0 was just touched and 1 is wanted -> slot 2 ((1,2)).
+        assert_eq!(pool.nursery_refill((0, 4), true, 1, &[0, 1], &[], false), Some(2));
+        assert!(pool.nursery[2] && pool.owner_of[2].is_none());
+        assert_eq!((pool.nursery_slots, pool.held[1], pool.nc.shrunk), (2, 3, 0));
+        assert!(!pool.slot_of.contains_key(&(1, 2)), "the refill victim was evicted");
+        assert_eq!(pool.nursery_refill((0, 4), true, 1, &[], &[], false), None, "at target: nothing to do");
+        // Pins: pin every main slot but one; the refill takes that one; with
+        // every candidate pinned it SHRINKS (never revokes a hub pin).
+        pool.pins.enable(64);
+        for sl in 0..12 {
+            if let Some((l, e)) = pool.owner_of[sl] {
+                if !pool.nursery[sl] && (l, e) != (3, 3) {
+                    pool.pins.grant(l, e);
+                }
+            }
+        }
+        for l in 1..=3 {
+            let row = pool.remap_hosts[l as usize].clone();
+            let _ = pool.pins.report(l, &row, pool.stage, &pool.nursery);
+        }
+        assert_eq!(pool.pins.pinned, 9, "10 main occupants (slot 0 promoted, slot 2 now nursery) minus (3,3)");
+        assert!(pool.touch_hit(2, 2, false), "promote the other entry");
+        assert_eq!(pool.nursery_refill((4, 8), true, 2, &[2], &[], false), Some(11), "the only unpinned main slot");
+        assert_eq!(pool.pins.c.pinned_evictions, 0);
+        pool.pins.grant(3, 3);
+        // Land a hint in the free slot 11, promote it, and now every main slot is pinned.
+        pool.land_nursery(11, (8, 1));
+        pool.pins.grant(8, 1);
+        let row = pool.remap_hosts[8].clone();
+        let _ = pool.pins.report(8, &row, pool.stage, &pool.nursery);
+        assert!(!pool.pins.is_pinned(8, 1), "granted but still a nursery entry: not pinnable");
+        assert!(pool.touch_hit(8, 1, false));
+        pool.pins.grant(8, 1); // the request's own `pin_grant` (no promotion grant)
+        let _ = pool.pins.report(8, &row, pool.stage, &pool.nursery);
+        assert!(pool.pins.is_pinned(8, 1), "promoted: pinnable at the next report");
+        // (2,2), promoted above into slot 6, is the last unpinned main slot: pin it too.
+        pool.pins.grant(2, 2);
+        let row2 = pool.remap_hosts[2].clone();
+        let _ = pool.pins.report(2, &row2, pool.stage, &pool.nursery);
+        assert!(pool.pins.is_pinned(2, 2));
+        assert_eq!(pool.nursery_refill((0, 12), true, 8, &[1], &[], false), None, "every main slot pinned: shrink, never revoke");
+        assert_eq!((pool.nc.shrunk, pool.nursery_slots), (1, 1));
+        // A free main slot refills a shrunk nursery.
+        pool.pins.release((8 << 16) | 1);
+        assert_eq!(pool.evict(11, 8), Some((8, 1)));
+        assert_eq!(pool.pins.c.pinned_evictions, 0);
+        pool.nursery_refill_free();
+        assert_eq!(pool.nursery_slots, 2);
+        assert!(pool.nursery[11]);
+        // `me_account` ran on the refill victim: a prefill-mode refill in a
+        // prefill phase counts its decode victim.
+        let mut p2 = nursery_pool(0.0);
+        p2.enable_mode_evict(10);
+        p2.me_note_request(true);
+        assert!(p2.touch_hit(1, 0, true));
+        let before = p2.me.c;
+        assert!(p2.nursery_refill((0, 4), true, 1, &[0], &[], true).is_some());
+        assert_ne!(p2.me.c, before, "the refill victim was accounted");
+    }
+
+    /// `held` excludes nursery entries: a layer whose MAIN slots are at its
+    /// floor keeps them against a foreign claim even though one of its
+    /// experts sits in the nursery (counting it would let a main slot go).
+    #[test]
+    fn nursery_entries_do_not_count_toward_the_floor() {
+        // floor 3 of 4 per layer; layer 1 has 3 main + 1 nursery entry.
+        let mut pool = nursery_pool(0.75);
+        assert_eq!((pool.floor[1], pool.held[1], pool.nursery_held[1]), (3, 3, 1));
+        // Layer 2: 3 main (slot 6 is a nursery entry) -> also at its floor.
+        // Layer 3: 4 main > floor 3: the ONLY foreign victim is one of layer
+        // 3's; after it every layer is at its floor and a second claim finds
+        // nothing -- although layers 1 and 2 each hold 4 experts counting
+        // their nursery entries.
+        let want = [100u32, 101];
+        let (v, ev) = pool.claim_miss(5, 100, &want, &[], (0, 12), true, false, false).expect("victim");
+        assert!((8..12).contains(&v) && ev.is_some_and(|(l, _)| l == 3), "slot {v} from {ev:?}");
+        pool.commit(5, 100, v);
+        assert_eq!(pool.held[3], 3, "layer 3 stopped at its floor");
+        assert!(pool.claim_miss(5, 101, &want, &[], (0, 12), true, false, false).is_none(), "layers 1-2's main slots stayed protected");
+        // The nursery entries themselves are still resident and promotable.
+        assert!(pool.in_nursery(1, 0) && pool.in_nursery(2, 2));
+    }
+
+    /// Maps: `PinBook::report` never pins a nursery slot (a granted, landed
+    /// entry is treated as a staging slot: aged, not pinned, not in the map);
+    /// `residency_words`' predicate masks a nursery slot.
+    #[test]
+    fn nursery_slots_are_never_pinnable_and_are_masked() {
+        let mut p = PinBook::off();
+        p.enable(8);
+        let mut row = vec![0i32; REMAP_LEN];
+        row[2] = -1; // slot 0, a nursery slot
+        row[3] = -2; // slot 1, main
+        let mut nursery = vec![false; 4];
+        nursery[0] = true;
+        p.grant(1, 2);
+        p.grant(1, 3);
+        let w = p.report(1, &row, 4, &nursery);
+        assert_eq!(w[0], 1 << 3, "only the main slot's expert is pinned");
+        assert!(!p.is_pinned(1, 2) && p.is_pinned(1, 3));
+        assert!(!p.on_evict(1, 2), "evicting (recycling) a nursery entry is never a violation");
+        assert_eq!(p.pinned, 1);
+        // The same row with the slot promoted (flag off) pins it.
+        nursery[0] = false;
+        p.grant(1, 2);
+        assert_eq!(p.report(1, &row, 4, &nursery)[0], (1 << 2) | (1 << 3));
+        // `residency_words`: landed in main only.
+        let n = [true, false];
+        assert!(!landed_main(0, &n), "not landed");
+        assert!(!landed_main(-1, &n), "slot 0 is a nursery slot");
+        assert!(landed_main(-2, &n));
+        assert!(landed_main(-3, &n), "a slot past the mask is main");
+    }
+
+    /// `lands = hits + recycled + delta(occupied)` over a random sequence of
+    /// landings, hits (with refills, some of which shrink) and shrink refills.
+    #[test]
+    fn nursery_lands_invariant() {
+        for seed in 1..=6u64 {
+            let mut rng = SimRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let ids: Vec<u32> = (0..6).collect();
+            let mut pool = ShardPool::seeded(24, &[(1, 0, &ids), (2, 6, &ids), (3, 12, &ids), (4, 18, &ids)], 0.0);
+            assert_eq!(pool.carve_nursery(4), 4);
+            pool.pins.enable(12);
+            let occ0 = pool.nursery_occupied();
+            let check = |pool: &ShardPool, step: usize| {
+                let occ = pool.nursery_occupied() as i64;
+                assert_eq!(pool.nc.lands as i64, pool.nc.hits as i64 + pool.nc.recycled as i64 + (occ - occ0 as i64), "seed {seed} step {step}: {:?} occupied {occ} (from {occ0})", pool.nc);
+                assert_eq!(pool.nursery.iter().filter(|&&f| f).count() as u32, pool.nursery_slots, "seed {seed} step {step}: flag count");
+                let nh: u32 = (0..24).filter(|&sl| pool.nursery[sl] && pool.owner_of[sl].is_some()).count() as u32;
+                assert_eq!(nh, pool.nursery_held.iter().sum::<u32>(), "seed {seed} step {step}: nursery_held");
+                let mh: u32 = (0..24).filter(|&sl| !pool.nursery[sl] && pool.owner_of[sl].is_some()).count() as u32;
+                assert_eq!(mh, pool.held.iter().sum::<u32>(), "seed {seed} step {step}: held");
+            };
+            let (mut hits, mut lands, mut shrunk) = (0, 0, 0);
+            for step in 0..2000 {
+                let layer = 1 + rng.below(4) as u32;
+                let e = rng.below(12) as u32;
+                match rng.below(4) {
+                    0 | 1 => {
+                        // A hint lands (skipping keys already resident, as the readers do).
+                        if pool.slot_of.contains_key(&(layer, e)) {
+                            continue;
+                        }
+                        let want = [rng.below(12) as u32];
+                        if let Some(v) = pool.nursery_victim(layer, &want, &[], 2) {
+                            let _ = pool.evict(v, layer);
+                            pool.land_nursery(v, (layer, e));
+                            lands += 1;
+                        } else {
+                            pool.nc.drops += 1;
+                        }
+                    }
+                    2 => {
+                        // A pass of `layer` wanting e (hit or claim), refill on a promotion.
+                        pool.note_serve(layer);
+                        let was = pool.in_nursery(layer, e);
+                        if pool.touch_hit(layer, e, false) {
+                            if was {
+                                hits += 1;
+                                let s0 = pool.nc.shrunk;
+                                pool.nursery_refill((0, 24), true, layer, &[e], &[], false);
+                                shrunk += pool.nc.shrunk - s0;
+                            }
+                        } else if let Some((v, _)) = pool.claim_miss(layer, e, &[e], &[], (0, 24), true, false, false) {
+                            pool.commit(layer, e, v);
+                        }
+                        // Pin a few of the layer's experts at its report (never a nursery one).
+                        if rng.below(3) == 0 {
+                            pool.pins.grant(layer, e);
+                            let row = pool.remap_hosts[layer as usize].clone();
+                            let _ = pool.pins.report(layer, &row, pool.stage, &pool.nursery);
+                            assert!(!pool.in_nursery(layer, e) || !pool.pins.is_pinned(layer, e), "pinned a nursery entry");
+                        }
+                    }
+                    _ => {
+                        if rng.below(4) == 0 {
+                            pool.pins.release((layer << 16) | e);
+                        }
+                        pool.nursery_refill_free();
+                    }
+                }
+                check(&pool, step);
+            }
+            assert_eq!((pool.nc.lands, pool.nc.hits), (lands, hits), "seed {seed}");
+            assert_eq!(pool.nc.shrunk, shrunk);
+            assert!(lands > 200 && hits > 10 && pool.nc.recycled > 50, "seed {seed}: not exercised {:?}", pool.nc);
+            assert_eq!(pool.pins.c.pinned_evictions, 0, "seed {seed}");
         }
     }
 
