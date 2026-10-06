@@ -124,6 +124,34 @@ iGPU byte floor (every non-MoE term hidden): 12-28% headroom, 18% at the modal l
   time); the 09-26 sweep skipped the merged two-lane GEMV as "serializes lanes".
 - **3 lanes are negative**: 3 chains + 3 shared experts per layer = 1.8 ms dGPU vs 1.76 ms iGPU.
 
+### The box-2 tail, decomposed (10-06 05:40 UTC; `decode_ideas_2026-10-06/b2tail/`)
+Hub `hub_req` (all 40 fields, 350 steps/cell) joined by `seq` with box 2's `b2_req`/`b2_read` (02:53-04:39 UTC,
+107K requests, 0 mismatches).
+
+- ~9 late replies per step in every cell; the hub-side legs are flat (encode 2-3 us, writer 1, link excess
+  0-10 us at the median): **everything late is on box 2.**
+- **Paged replies are 36-89% of late replies by count but 85-99% of the lateness.** Each carries exactly ONE
+  paged expert: a certain demand read of 18.8 MB in 2.0-2.5 ms (8.4 GB/s = the 990 Pro's peak; p90 4.4-8.7
+  ms), lateness med 1.3-2.5 ms. No-page late replies are ordinary compute at 5-10 distinct experts (box-2 pass
+  = ~104-145 + 90 us/expert, bytes-bound like the iGPU). Box-2 queueing 0.07-0.24 ms/step; link / f16 reply /
+  writev: dead; hub-side reordering: impossible (Route needs the picks; Post -> chain(l+1) is a true dependency).
+- **The hub predicted 96-98% of the paged late replies** (`n_pred_miss > 0` before the submit; 2-6% of on-time
+  replies): the tail is the cache prior's residue, the predicted-miss picks it may not displace
+  (`V41_SUB_PROTECT` 2, lambda 0.15). `sub_blocked` per step tracks `b2_paged_replies`.
+- Bursty: steps within 2 s of a prefill -> decode switch carry 2x the late count; every decode -> prefill switch
+  (~every 40 s) releases all ~3656 pins, prefill evicts freely, and the re-displacement is re-read over the
+  first 10-20 s of decode: **15-30% of all paged replies** (phase displacement).
+- Levers, ranked: (a) **predicted-miss-only look-ahead prefetch** -- hint layer l+1's predicted-miss experts one
+  lane-layer early (~1-2 reads per lane-layer at today's 97% precision; `V41_LOOKAHEAD_PREFETCH` has been off
+  since 09-21 because the old 40-reads/step version was 26% wrong and contended with demand reads; the
+  ready-first driver forces `lookahead_hints_ok = false`, shared `sd.look_sel` scratch): 3.3-6.6 ms/step if the
+  read starts 1 ms earlier, most of the +9 ms ceiling; hub-only, fidelity-neutral. (b) phase displacement:
+  restore-the-delta / mode-evict (built on worktree-lm-prefill, undeployed, box-2 restart) or a smaller
+  release band: 1.3-2.7 ms. (c) box-2 pool 4480 -> ~4750 slots (+5.1 GB, fits in box 2's 10 GB available):
+  ~1.5-2.5 ms, no code, box-2 restart. (d) `V41_SUB_PROTECT` 2 -> 1/0 removes the class but costs fidelity.
+- Behavior-free counters to add first: `sub_blocked` split protected/gap; `paged_in_restore_list`;
+  `lookahead_dry_hits` (compute l+1 look-ahead picks, intersect with the next layer's actual predicted misses).
+
 ## 3. Other measured facts worth keeping
 - iGPU MoE kernels at lone 4-6 rows move 10.1-12.7 GB in 66-81 ms = **151-157 GB/s**, vs 200-205 the same
   kernels reached at 8 rows (09-29) and 214 achievable: a 19-22 ms/block in-busy shortfall at b=2-3 per lane.
@@ -152,7 +180,7 @@ Traffic-weighted aggregate tok/s unless marked capacity/turn-time. Gains are aft
 | # | lever | gain | cost | notes |
 |---|---|---|---|---|
 | 1 | **Hot split** across boxes (interleave head ranks, box 1 ~55-60% of mass, replicated top-10 per layer) | **+10..15%** | L 4-5 d, two-box restart | sim +12.1 ms weighted; ~0 at 3 rows, 37 ms at M8; the only lever that moves the floor |
-| 2 | **Box-2 reply tail** (p90 RTT > MoE; 6-10 late lane-layers/step; reply gates Post -> next chain) | **~10% ceiling** | M; decompose first | paging tail vs link vs server from `hub_req` stamps; levers: paging policy/pins, fewer marginal box-2 experts, f16 decode reply (KL gate), pool +~270 slots |
+| 2 | **Box-2 reply tail** = ONE paged expert per late reply, 97% predicted by the hub before the submit (see section 2) | **~10% ceiling**; look-ahead prefetch of predicted misses alone 3.3-6.6 ms/step | M, hub-only, exact | plus phase-displacement restore (1.3-2.7 ms) and box-2 pool +270 slots (1.5-2.5 ms, box-2 restart); link / f16 / server queue are dead |
 | 3 | **Engram join hidden** (spawn before the draft / join off the lane thread) + join each table at its own layer (L14's gather sits on L1's path today) + async staging copy | **+3.5%** | S-M 1.5-2 d; threads sweep 0 d | one host thread joins at L1 -> both lanes stall |
 | 4 | **dGPU bundle**: capture the 4 remaining direct launches / fuse small stages (-30% latency floor), merged two-lane dense GEMV (-50% dGPU bytes), handoff -50% (route/prep/launch/post) | +4.9% together (<= 1.4x) | M-L | each alone 1-2%; becomes the pole after #1 -- build as #1's companion |
 | 5 | Small-b MoE kernel bandwidth (151-157 GB/s at lone 4-6 rows vs 200+ at 8 rows) | up to +20% lone IF real | microbench first (one GPU window) | unverified |
