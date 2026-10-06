@@ -2170,14 +2170,19 @@ fn ev_nursery_fields(before: NurseryCounters, after: (NurseryCounters, u32)) -> 
 /// `down_wait_us` in `B2_REQ` order: partial landings and promotions across
 /// the request, the partial level after it, and the gate/up / down waits
 /// (us) the request's `ensure` phases spent (design 3.4).
-fn ev_partial_fields(before: ([u64; 2], PartialCounters, u32), after: ([u64; 2], PartialCounters, u32)) -> [f64; 5] {
+fn ev_partial_fields(before: ([u64; 2], PartialCounters, u32, [u64; 2]), after: ([u64; 2], PartialCounters, u32, [u64; 2])) -> [f64; 6] {
     let d = |a: u64, b: u64| a.saturating_sub(b) as f64;
+    // `down_exposed`: 1 this pass's down read was fully exposed, 0 hidden
+    // under the gate/up kernels, NaN no two-phase pass in this request.
+    let (ex, hid) = (d(after.3[0], before.3[0]), d(after.3[1], before.3[1]));
+    let exposed = if ex + hid == 0.0 { f64::NAN } else { ex / (ex + hid) };
     [
         d(after.1.partial_lands, before.1.partial_lands),
         d(after.1.partial_promotions, before.1.partial_promotions),
         f64::from(after.2),
         d(after.0[0], before.0[0]) / 1e3,
         d(after.0[1], before.0[1]) / 1e3,
+        exposed,
     ]
 }
 
@@ -2314,11 +2319,25 @@ pub mod knobs {
         /// kernel, else it is on the critical path). An unused partial entry
         /// recycled costs 2/3 of a read. Live.
         pub static LIKELY_GATEUP_ONLY = Knob::flag("V41_B2_LIKELY_GATEUP_ONLY", false).alias("likely_gateup_only");
+        /// `V41_B2_ROLE_STRIPES` (default 3, 1..=8), key `role_stripes`: a read
+        /// of FEWER than three roles (the Down phase, a gate/up-only hint)
+        /// stripes each role's packed plane in this many pieces over as many
+        /// threads and both drives (`read_range_into_direct_striped`), so one
+        /// role lands at ~the whole expert's bandwidth instead of one stream
+        /// per drive (measured 10-06: a role alone 2.1 ms vs 2.26 for all
+        /// three). 1 = the plain per-role read. Live. Whole-expert reads keep
+        /// their three role threads x two drives.
+        pub static ROLE_STRIPES = Knob::int("V41_B2_ROLE_STRIPES", 3, 1, 8).alias("role_stripes");
     }
     /// Two-phase landing (design 3.4).
     pub fn land_two_phase() -> bool { LAND_TWO_PHASE.on() }
-    /// LIKELY reads fetch gate/up only (design 3.4).
-    pub fn likely_gateup_only() -> bool { LIKELY_GATEUP_ONLY.on() }
+    /// LIKELY reads fetch gate/up only (design 3.4) -- only WITH the two-phase
+    /// landing: without it the pass would read the down role synchronously
+    /// at the top of `ensure` where today the early-page hook reads the whole
+    /// expert in the background (review of 9f713ac, finding 3).
+    pub fn likely_gateup_only() -> bool { LIKELY_GATEUP_ONLY.on() && LAND_TWO_PHASE.on() }
+    /// Stripes per role for a read of fewer than three roles (design 3.4).
+    pub fn role_stripes() -> usize { ROLE_STRIPES.usize() }
     /// Nursery slots to carve at `enable_paging` (0 = off; design 3.2).
     pub fn nursery() -> usize { NURSERY.usize() }
     /// Same-layer passes after which an unpromoted nursery entry is "unused".
@@ -2438,7 +2457,7 @@ pub mod knobs {
             v4flash_core::hf_v41::expert_mirror_frac(), if route_urgency() { "urgency" } else { "split" },
             if prefill_route_split() { "split" } else { "mirror" }, u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()),
             nursery(), nursery_lanes(), u8::from(likely_pause_for_certain()))
-            + &format!(" land_two_phase={} likely_gateup_only={}", u8::from(land_two_phase()), u8::from(likely_gateup_only()))
+            + &format!(" land_two_phase={} likely_gateup_only={} role_stripes={}", u8::from(land_two_phase()), u8::from(likely_gateup_only()), role_stripes())
     }
 }
 
@@ -2533,6 +2552,28 @@ pub fn phase_plan(want: &[u32], resident: impl Fn(u32) -> bool, partial: impl Fn
     (misses, down_only)
 }
 
+/// The early-page hook's reads for a queued frame (design 3.4): its picks
+/// not resident at all (`resident` false) as whole certain words, and its
+/// picks in PARTIAL slots (`partial`) as down-only certain words; distinct,
+/// in pick order. A partial entry counts as resident for `resident`.
+pub fn early_page_plan(layer: u32, sel: &[i32], resident: impl Fn(u32) -> bool, partial: impl Fn(u32) -> bool) -> (Vec<u32>, Vec<u32>) {
+    let (mut words, mut down) = (Vec::with_capacity(sel.len()), Vec::new());
+    for &e in sel {
+        if !(0..N_EXPERT as i32).contains(&e) {
+            continue;
+        }
+        let w = (layer << 16) | e as u32;
+        if partial(e as u32) {
+            if !down.contains(&w) {
+                down.push(w);
+            }
+        } else if !resident(e as u32) && !words.contains(&w) {
+            words.push(w);
+        }
+    }
+    (words, down)
+}
+
 /// Which landing an `ensure` performs (design 3.4). `Full`: today -- every
 /// miss lands whole, every partial slot wanted is completed (its down role
 /// read) before the call returns. `GateUp`: misses land their gate/up roles
@@ -2597,6 +2638,9 @@ pub struct ExpertShard {
     /// (`likely_words_in`), so the dequeue does not apply them twice. A
     /// bounded ring like `EarlyPaged`.
     likely_seen: SeqRing,
+    /// Two-phase passes whose down read was `[exposed, hidden]`
+    /// (`note_down_overlap`).
+    down_overlap: [u64; 2],
     /// Cumulative time the compute thread spent BLOCKED in `admit_prefetched`
     /// waiting for a prefetch read it needs this request (2026-09-22). Also
     /// added to the layer's `read_ns`, see the note there.
@@ -5051,6 +5095,7 @@ impl ExpertShard {
             req_prefill: false,
             early_paged: EarlyPaged::default(),
             likely_seen: SeqRing::new(EarlyPaged::MAX),
+            down_overlap: [0; 2],
             prefetch_wait_ns: 0,
             ev_admit: [0; 5],
         })
@@ -5110,7 +5155,7 @@ impl ExpertShard {
     }
 
     fn prefetch_words_full(&mut self, words: &[u32], certain: bool, stage: bool, prefill: bool) {
-        let _ = self.prefetch_words_core(words, &[], certain, stage, prefill, false);
+        let _ = self.prefetch_words_core(words, &[], certain, stage, prefill, false, false);
     }
 
     /// The hub's predicted-miss hints (`REQ_FLAG_LIKELY`; design 3.2): LIKELY
@@ -5120,15 +5165,24 @@ impl ExpertShard {
     /// sends them after seeing `RESP_FLAG_NURSERY`, so that is a defence).
     /// Returns how many were queued.
     pub fn prefetch_words_likely(&mut self, words: &[u32]) -> usize {
-        let dropped = self.prefetch_words_core(words, &[], false, false, false, true);
+        let dropped = self.prefetch_words_core(words, &[], false, false, false, true, false);
         words.len() - dropped.len()
+    }
+
+    /// CERTAIN down-only reads for queued frames' picks that sit in PARTIAL
+    /// slots (the early-page hook, design 3.4 / review of 9f713ac finding
+    /// 3): the down role lands into the EXISTING slot (`admit_prefetched`)
+    /// under the current request, as a whole-expert early read would. Words
+    /// whose expert is not a partial entry are skipped.
+    pub fn prefetch_down_words(&mut self, words: &[u32]) {
+        let _ = self.prefetch_words_core(words, &[], true, false, false, false, true);
     }
 
     /// `prefetch_words_full`, with an optional restore stamp per word
     /// (`stamps` empty, or one per word: `PfJob::restore`) and the LIKELY
     /// class (`likely`). Returns the words DROPPED for want of a free staging
     /// set (the delta restore re-queues them; a LIKELY drop is `nursery_drops`).
-    fn prefetch_words_core(&mut self, words: &[u32], stamps: &[u64], certain: bool, stage: bool, prefill: bool, likely: bool) -> Vec<u32> {
+    fn prefetch_words_core(&mut self, words: &[u32], stamps: &[u64], certain: bool, stage: bool, prefill: bool, likely: bool, down_only: bool) -> Vec<u32> {
         let mut dropped_words = Vec::new();
         if words.is_empty() || self.pool.is_none() {
             return dropped_words;
@@ -5284,7 +5338,9 @@ impl ExpertShard {
             if key.0 as usize >= self.layers.len() || key.1 >= N_EXPERT || self.layers[key.0 as usize].is_none() {
                 continue;
             }
-            if pool.slot_of.contains_key(&key) {
+            // A down-only read is for a PARTIAL entry (resident, down pending);
+            // any other read is for a key not resident at all.
+            if down_only != pool.is_partial(key.0, key.1) || (!down_only && pool.slot_of.contains_key(&key)) {
                 continue;
             }
             if pf.pending.contains(&key) {
@@ -5311,8 +5367,9 @@ impl ExpertShard {
             pf.pending.insert(key);
             pf.hinted += 1;
             // A LIKELY read fetches gate/up only under `likely_gateup_only`
-            // (design 3.4: a PARTIAL nursery entry, 2/3 of the bytes).
-            let roles = if likely && knobs::likely_gateup_only() { ROLES_GATEUP } else { ROLES_ALL };
+            // (design 3.4: a PARTIAL nursery entry, 2/3 of the bytes); a
+            // down-only read completes a partial entry.
+            let roles = if down_only { ROLE_DOWN } else if likely && knobs::likely_gateup_only() { ROLES_GATEUP } else { ROLES_ALL };
             pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, own_prefill, prefill, restore, likely, roles, t_hint: std::time::Instant::now() });
         }
         dropped_words
@@ -5350,7 +5407,7 @@ impl ExpertShard {
         }
         let words: Vec<u32> = batch.iter().map(|&(l, e, _)| (l << 16) | e).collect();
         let stamps: Vec<u64> = batch.iter().map(|&(_, _, t)| t).collect();
-        let dropped = self.prefetch_words_core(&words, &stamps, false, false, false, false);
+        let dropped = self.prefetch_words_core(&words, &stamps, false, false, false, false, false);
         let pool = self.pool.as_mut().expect("checked above");
         for ent in &batch {
             if !dropped.contains(&((ent.0 << 16) | ent.1)) {
@@ -5495,6 +5552,31 @@ impl ExpertShard {
             pool.me.restore_inflight.remove(&key);
             pf.pending.remove(&key);
             pf.queue.clear_urgent(d.layer, d.e);
+            // A DOWN-ONLY read (`prefetch_down_words`) lands into the EXISTING
+            // partial slot and completes it; stale if the slot was recycled or
+            // completed meanwhile.
+            if d.roles == ROLE_DOWN {
+                if let Some(&sl) = pool.slot_of.get(&key) {
+                    if pool.partial[sl as usize] {
+                        let ev_t_repack = std::time::Instant::now();
+                        let landed: eyre::Result<()> = match (repack, repack_stream) {
+                            (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, sl, &pf.stages[d.set], &d.offs, d.coalesced, ROLE_DOWN).map(|_| ()),
+                            _ => r.down.buffer.slice_view_mut(sl as usize * bpe[2], bpe[2]).copy_from_host(&pf.stages[d.set][2].as_slice()[..bpe[2]]),
+                        };
+                        if let Err(err) = landed {
+                            pf.release_set(d.set);
+                            return Err(err);
+                        }
+                        pool.complete(d.layer, d.e);
+                        pf.admitted += 1;
+                        if ev_on {
+                            ev_read(&d, f64::from(sl), None, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this, 0.0, ev_t_repack.elapsed().as_nanos() as f64, false);
+                        }
+                    }
+                }
+                pf.release_set(d.set);
+                continue;
+            }
             if pool.slot_of.contains_key(&key) {
                 if ev_on {
                     ev_read(&d, f64::NAN, None, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this, f64::NAN, f64::NAN, true);
@@ -5654,9 +5736,14 @@ impl ExpertShard {
     }
 
     /// Two-phase landing (design 3.4): cumulative `[gate/up, down]` wait ns
-    /// over every paged layer, and the pool's partial counters + the partial
-    /// level (`b2_req`, the stats line).
-    pub fn two_phase_stats(&self) -> ([u64; 2], PartialCounters, u32) {
+    /// over every paged layer, the pool's partial counters, the partial level
+    /// and the passes whose down read was fully EXPOSED (`[exposed, hidden]`)
+    /// (`b2_req`, the stats line). Zero / default unless a two-phase knob is
+    /// on (the walk over the layers is not on the default path).
+    pub fn two_phase_stats(&self) -> ([u64; 2], PartialCounters, u32, [u64; 2]) {
+        if !(knobs::land_two_phase() || knobs::likely_gateup_only()) {
+            return ([0; 2], PartialCounters::default(), 0, [0; 2]);
+        }
         let mut ns = [0u64; 2];
         for l in self.layers.iter().flatten() {
             if let Some(pg) = l.page.as_ref() {
@@ -5665,7 +5752,13 @@ impl ExpertShard {
             }
         }
         let (pc, n) = self.pool.as_ref().map_or((PartialCounters::default(), 0), |p| (p.pc, p.partial_count()));
-        (ns, pc, n)
+        (ns, pc, n, self.down_overlap)
+    }
+
+    /// A two-phase pass finished its Down phase: was the gate/up half already
+    /// done (`exposed`)?
+    pub fn note_down_overlap(&mut self, exposed: bool) {
+        self.down_overlap[usize::from(!exposed)] += 1;
     }
 
     /// Cumulative `(misses, page_ns)` for `layer`, or `(0, 0)` when the layer is
@@ -5871,6 +5964,11 @@ impl ExpertShard {
     /// of all three roles into a second slot.
     pub fn is_resident_pool(&self, layer: u32, e: u32) -> bool {
         self.pool.as_ref().is_some_and(|p| p.slot_of.contains_key(&(layer, e)))
+    }
+
+    /// Resident in a PARTIAL slot (gate/up only; design 3.4).
+    pub fn is_partial_pool(&self, layer: u32, e: u32) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.is_partial(layer, e))
     }
 
     /// Prefill staging slots (0 = off / no pool).
@@ -6117,8 +6215,15 @@ impl ExpertShard {
         let Some(p) = self.pool.as_ref() else { return w };
         let row = &p.remap_hosts[layer as usize];
         for &e in sel {
+            if !(0..N_EXPERT as i32).contains(&e) {
+                continue;
+            }
             // Not landed, or landed PARTIAL (design 3.4: the pass reads its down).
-            if (0..N_EXPERT as i32).contains(&e) && (row[e as usize] == 0 || p.partial[(-row[e as usize] - 1).max(0) as usize]) {
+            let paged = match row[e as usize] {
+                0 => true,
+                r => p.partial[(-r - 1) as usize],
+            };
+            if paged {
                 w[e as usize / 32] |= 1 << (e % 32);
             }
         }
@@ -6193,6 +6298,15 @@ impl ExpertShard {
     }
 
     fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool, phase: EnsurePhase) -> eyre::Result<()> {
+        // The Down phase does ONLY the down reads of the wanted partial slots
+        // (review of 9f713ac, finding 2 / 5): no prologue, no serve or
+        // request accounting (the GateUp phase did them), no landings, no
+        // `b2_ensure` record; and nothing at all when no wanted expert is
+        // partial (the no-miss hot path: one scan).
+        let down_phase = phase == EnsurePhase::Down;
+        if down_phase && !self.pool.as_ref().is_some_and(|p| ids.iter().any(|&e| (0..N_EXPERT as i32).contains(&e) && p.is_partial(layer, e as u32))) {
+            return Ok(());
+        }
         let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
         // `evtrace` (`b2_ensure` + one `b2_read` per demand miss): NaN when off.
         let ev_on = super::evtrace::enabled();
@@ -6205,7 +6319,7 @@ impl ExpertShard {
         self.ev_admit = [0; 5];
         // Land completed look-ahead prefetches first (any layer): nothing reads
         // the pool here, and this layer's picks are protected from eviction.
-        if self.prefetch.is_some() {
+        if self.prefetch.is_some() && !down_phase {
             let want_pre: Vec<u32> = ids.iter().filter(|&&e| (0..N_EXPERT as i32).contains(&e)).map(|&e| e as u32).collect();
             self.admit_prefetched(layer, &want_pre)?;
         }
@@ -6289,8 +6403,19 @@ impl ExpertShard {
         // reports an expert resident that nobody wrote.
         let mut failed: Option<eyre::Report> = None;
         let region = (base as u32, base as u32 + n_region as u32);
-        pool.note_serve(layer);
+        if !down_phase {
+            pool.note_serve(layer);
+        }
         for &e in &want {
+            if down_phase {
+                // The GateUp phase served this pass: only the partial slots matter.
+                if let Some(&sl) = pool.slot_of.get(&(layer, e)) {
+                    if pool.partial[sl as usize] {
+                        down_pending.push((e, sl));
+                    }
+                }
+                continue;
+            }
             pg.requests += 1;
             let was_nursery = pool.in_nursery(layer, e);
             if pool.touch_hit(layer, e, scan_class) {
@@ -6514,7 +6639,7 @@ impl ExpertShard {
             l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
             pool.dirty[layer as usize] = false;
         }
-        if ev_on {
+        if ev_on && !down_phase {
             let n_miss = pending.len();
             super::evtrace::emit(&super::evtrace_kinds::B2_ENSURE, &[
                 ev_cur_seq(), f64::from(layer), ids.len() as f64, want.len() as f64, f64::from(ev_hits), n_miss as f64,
@@ -6640,6 +6765,7 @@ impl ExpertShard {
             if !coalesced {
                 let bufs: [&mut [u8]; 3] = [b0, b1, b2];
                 let mut errs: Vec<String> = Vec::new();
+                let stripes = if roles == ROLES_ALL { 1 } else { knobs::role_stripes() };
                 // The caller's background mark (io_throttle) must reach the role
                 // threads: thread-locals do not cross `spawn`.
                 let bg = v4flash_core::io_throttle::background();
@@ -6667,8 +6793,11 @@ impl ExpertShard {
                                 if gpu_repack && direct {
                                     // Zero-copy: O_DIRECT lands each region at its
                                     // own 4096-residue, straight into GTT staging.
+                                    // Fewer than three roles: each role striped
+                                    // (`knobs::role_stripes`) so it lands at ~the
+                                    // whole expert's bandwidth (design 3.4).
                                     if let Some(o) = src
-                                        .read_expert_hf_layout_direct_routed(t, e as usize, buf, route)
+                                        .read_expert_hf_layout_direct_routed_striped(t, e as usize, buf, route, stripes)
                                         .map_err(|err| format!("{name}: {err}"))?
                                     {
                                         return Ok(Some(o));
@@ -6964,6 +7093,10 @@ pub struct MoeExecutor {
     /// paging caught only 40% of non-resident experts because the next frame
     /// had usually not arrived at the single poll point).
     ev_done: v4flash_hip::Event,
+    /// Two-phase landing (design 3.4): recorded after the gate/up half's
+    /// q8k; queried after the Down phase -- complete means the down read was
+    /// fully EXPOSED (the kernels had finished), else hidden under them.
+    ev_gateup: v4flash_hip::Event,
     /// The last handoff of the engine's event pool to Tier B (`dev_epoch`).
     dev_epoch_t: Instant,
     // --- The short batched chain (`knobs::fast_chain`) ---------------------
@@ -7051,6 +7184,7 @@ impl MoeExecutor {
             warm_out: DeviceBuffer::new(id, BLOCK_Q8_K_BYTES)?,
             ev: None,
             ev_done: v4flash_hip::Event::new_no_timing()?,
+            ev_gateup: v4flash_hip::Event::new_no_timing()?,
             dev_epoch_t: Instant::now(),
             fast_k: crate::b2_fast_chain::B2FastChain::for_arch(&arch)?,
             fast_rows,
@@ -7457,7 +7591,11 @@ impl MoeExecutor {
                         let (gate, up, _, remap) = shard.layer_views(layer)?;
                         self.batched_pass_gateup(&gate, &up, remap, &geo, false, fast, &io)?
                     };
+                    // The overlap probe: complete after the Down phase = the
+                    // down read was fully exposed (finding 6 of the review).
+                    self.ev_gateup.record(&self.engine.compute)?;
                     shard.ensure_layer_phase(layer, sel, b > 16, EnsurePhase::Down)?;
+                    shard.note_down_overlap(self.ev_gateup.query().unwrap_or(true));
                     let (_, _, down, remap) = shard.layer_views(layer)?;
                     let (n_wi, _) = self.batched_pass_down(&down, remap, &geo, false, fast, &mid)?;
                     timing.n_work_items += n_wi;
@@ -8511,12 +8649,13 @@ pub fn serve_connection(
                         // The frame's LIKELY words at ARRIVAL (design 3.2: the
                         // b2q tail), queued behind its own certain reads.
                         let (likely, _) = proto::split_prefetch_words(nreq.flags, nreq.prefetch);
-                        let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
-                        for &e in nreq.sel {
-                            if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
-                                let w = (nreq.layer << 16) | e as u32;
-                                if !words.contains(&w) { words.push(w); }
-                            }
+                        // Its non-resident picks: certain whole reads; its picks in
+                        // PARTIAL slots: certain down-only reads (design 3.4).
+                        let (words, down_words) = early_page_plan(nreq.layer, nreq.sel, |e| shard.is_resident_pool(nreq.layer, e), |e| shard.is_partial_pool(nreq.layer, e));
+                        if !down_words.is_empty() {
+                            shard.pinned = cur_pins.clone();
+                            shard.prefetch_down_words(&down_words);
+                            shard.pinned.clear();
                         }
                         if !words.is_empty() {
                             shard.pinned = cur_pins.clone();
@@ -8923,8 +9062,8 @@ pub fn serve_connection(
                             ("stage_claims", nan), ("stage_hits", nan), ("stage_spills", nan),
                             ("n_likely_words", likely_b.len() as f64), ("nursery_lands", nan), ("nursery_hits", nan),
                             ("nursery_recycled", nan), ("nursery_drops", nan), ("nursery_shrunk", nan),
-                            ("partial_lands", nan), ("partial_promotions", nan), ("gateup_wait_us", nan), ("down_wait_us", nan),
-                            ("partial_slots", nan),
+                            ("partial_lands", nan), ("partial_promotions", nan), ("partial_slots", nan), ("gateup_wait_us", nan), ("down_wait_us", nan),
+                            ("down_exposed", nan),
                         ] {
                             super::evtrace::set_named(k, &mut v, name, x);
                         }
@@ -9020,11 +9159,11 @@ pub fn serve_connection(
                                 ));
                             }
                             if knobs::land_two_phase() || knobs::likely_gateup_only() {
-                                let (ns, pc, n_partial) = shard.two_phase_stats();
+                                let (ns, pc, n_partial, ov) = shard.two_phase_stats();
                                 pfs.push_str(&format!(
-                                    " | two-phase partial_lands={} promotions={} completions={} evicted={} partial_now={} gateup_wait_ms={:.0} down_wait_ms={:.0}",
+                                    " | two-phase partial_lands={} promotions={} completions={} evicted={} partial_now={} gateup_wait_ms={:.0} down_wait_ms={:.0} down_exposed={}/{}",
                                     pc.partial_lands, pc.partial_promotions, pc.completions, pc.partial_evicted, n_partial,
-                                    ns[0] as f64 / 1e6, ns[1] as f64 / 1e6
+                                    ns[0] as f64 / 1e6, ns[1] as f64 / 1e6, ov[0], ov[0] + ov[1]
                                 ));
                             }
                             // `pread` here is the PROCESS-WIDE read counter differenced
@@ -9246,6 +9385,7 @@ fn serve_interleaved(
             ("n_likely_words", likely.len() as f64), ("nursery_lands", nf[0]), ("nursery_hits", nf[1]), ("nursery_recycled", nf[2]),
             ("nursery_drops", nf[3]), ("nursery_shrunk", nf[4]), ("nursery_occupied", nf[5]),
             ("partial_lands", tp[0]), ("partial_promotions", tp[1]), ("partial_slots", tp[2]), ("gateup_wait_us", tp[3]), ("down_wait_us", tp[4]),
+            ("down_exposed", tp[5]),
         ]);
     }
     resp.as_bytes_mut()[proto::HDR_LEN + 20..proto::HDR_LEN + 24].copy_from_slice(&t_server_us.to_le_bytes());
@@ -12681,6 +12821,62 @@ mod tests {
         // Invariants: promotions <= lands, completions + evicted <= lands + promotions' worth.
         assert!(pool.pc.partial_promotions <= pool.pc.partial_lands);
         assert_eq!(pool.pc, PartialCounters { partial_lands: 1, partial_promotions: 1, completions: 1, partial_evicted: 1 });
+    }
+
+    /// The early-page hook's plan under partial slots (review of 9f713ac,
+    /// finding 3): a queued frame's pick in a PARTIAL slot gets a certain
+    /// DOWN-only read; a non-resident pick a whole read; a whole-resident or
+    /// out-of-range pick nothing; duplicates once.
+    #[test]
+    fn early_page_plan_issues_down_reads_for_partial_entries() {
+        let resident = |e: u32| e == 1 || e == 3; // 3 is partial (resident for the hook)
+        let partial = |e: u32| e == 3;
+        let (words, down) = early_page_plan(5, &[1, 3, 7, 3, -1, 7, 400], resident, partial);
+        assert_eq!(words, vec![(5 << 16) | 7], "7 not resident; 1 whole; 3 partial");
+        assert_eq!(down, vec![(5 << 16) | 3]);
+        // The daemon's down-only word path: a down-only read is for a partial
+        // entry only (the dedup in `prefetch_words_core`).
+        let pool = nursery_pool(0.0);
+        assert!(!pool.is_partial(1, 1));
+    }
+
+    /// Review of 9f713ac, finding 2: GateUp + Down leave the pool's serve
+    /// clock exactly as one Full pass (the Down phase runs no prologue), and
+    /// the stripe plan covers a span exactly, aligned, on the right drives.
+    #[test]
+    fn two_phase_accounting_equals_one_full_pass_and_stripes_cover_the_span() {
+        // The serve clock: what `ensure` does per phase (mirrors the gating in
+        // `ensure_layer_inner`: `note_serve` and the request / hit accounting
+        // only when the phase is not Down).
+        let mut a = nursery_pool(0.0);
+        let mut b = nursery_pool(0.0);
+        for phase in [EnsurePhase::GateUp, EnsurePhase::Down] {
+            if phase != EnsurePhase::Down {
+                a.note_serve(1);
+            }
+        }
+        b.note_serve(1); // one Full pass
+        assert_eq!(a.serves[1], b.serves[1]);
+        assert_eq!(a.serves[1], 1, "two-phase advanced the clock once");
+        // `likely_gateup_only` needs `land_two_phase`.
+        assert!(knobs::LIKELY_GATEUP_ONLY.set("1") && knobs::LAND_TWO_PHASE.set("0"));
+        assert!(!knobs::likely_gateup_only(), "gate/up-only hints are forced off without the two-phase landing");
+        assert!(knobs::LAND_TWO_PHASE.set("1"));
+        assert!(knobs::likely_gateup_only());
+        assert!(knobs::LIKELY_GATEUP_ONLY.set("0") && knobs::LAND_TWO_PHASE.set("0"));
+        assert!(matches!(knobs::ROLE_STRIPES.kind, crate::knobs::Kind::Int { default: 3, .. }));
+        // The stripe plan.
+        use v4flash_core::safetensors::stripe_plan;
+        let a4 = 4096;
+        let plan = stripe_plan(12 * a4, 5 * a4, 3);
+        assert_eq!(plan, vec![(0, 4 * a4, false), (4 * a4, a4, false), (5 * a4, 3 * a4, true), (8 * a4, 4 * a4, true)], "the piece straddling the cut is split at it");
+        let cover: usize = plan.iter().map(|p| p.1).sum();
+        assert_eq!(cover, 12 * a4);
+        assert!(plan.iter().all(|p| p.0 % a4 == 0 && p.1 % a4 == 0));
+        assert_eq!(stripe_plan(12 * a4, 0, 3), vec![(0, 4 * a4, true), (4 * a4, 4 * a4, true), (8 * a4, 4 * a4, true)], "mirror only");
+        assert_eq!(stripe_plan(12 * a4, 12 * a4, 3).iter().filter(|p| p.2).count(), 0, "primary only");
+        assert_eq!(stripe_plan(2 * a4, a4, 8).len(), 2, "never more pieces than blocks");
+        assert_eq!(stripe_plan(12 * a4, 6 * a4, 1), vec![(0, 6 * a4, false), (6 * a4, 6 * a4, true)], "1 stripe = the split read's two halves");
     }
 
     /// `touch_hit` on an entry RELABELS it (main `held`, decode-hit stamp,

@@ -286,7 +286,7 @@ fn remote_experts_nursery_loopback() -> eyre::Result<()> {
     // and the two-phase landing stats (`[gate/up, down]` wait ns, partial
     // counters, partial slots now).
     #[allow(clippy::type_complexity)]
-    let (tx_stats, rx_stats) = mpsc::channel::<(Option<(PinCounters, u32, u32, u32)>, (NurseryCounters, u32), bool, ([u64; 2], PartialCounters, u32))>();
+    let (tx_stats, rx_stats) = mpsc::channel::<(Option<(PinCounters, u32, u32, u32)>, (NurseryCounters, u32), bool, ([u64; 2], PartialCounters, u32, [u64; 2]))>();
     let daemon = std::thread::spawn(move || -> eyre::Result<()> {
         let setup = (|| -> eyre::Result<(ExpertShard, MoeExecutor)> {
             let hf = V41HfWeights::open(&dir, None)?;
@@ -335,8 +335,8 @@ fn remote_experts_nursery_loopback() -> eyre::Result<()> {
     let (pins_two, (nc_two, _), _, tp_two) = rx_stats.recv()?;
     daemon.join().map_err(|_| eyre!("daemon panicked"))??;
     let _ = tx_done.send(());
-    eprintln!("two-phase: pins {pins_two:?}; nursery {nc_two:?}; partial {:?} waits gate/up {:.1} ms down {:.1} ms; paged {} surprises {}",
-        tp_two.1, tp_two.0[0] as f64 / 1e6, tp_two.0[1] as f64 / 1e6, two.paged, two.surprises);
+    eprintln!("two-phase: pins {pins_two:?}; nursery {nc_two:?}; partial {:?} waits gate/up {:.1} ms down {:.1} ms (exposed {}/{}); paged {} surprises {}",
+        tp_two.1, tp_two.0[0] as f64 / 1e6, tp_two.0[1] as f64 / 1e6, tp_two.3[0], tp_two.3[0] + tp_two.3[1], two.paged, two.surprises);
 
     eprintln!("hints OFF: pins {pins_off:?}; nursery {nc_off:?} occupied {occ_off}; paged {} surprises {}", off.paged, off.surprises);
     eprintln!(

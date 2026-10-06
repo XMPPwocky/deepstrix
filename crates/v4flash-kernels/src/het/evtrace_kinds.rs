@@ -325,7 +325,10 @@ pub static B2_REQ: Kind = Kind {
         // PARTIAL slots after it, and the us the request's `ensure` phases
         // waited on the gate/up reads and on the down reads (under two-phase
         // the down wait overlaps the gate/up kernels).
-        "partial_lands", "partial_promotions", "partial_slots", "gateup_wait_us", "down_wait_us",
+        // `down_exposed`: the share of the request's two-phase passes whose
+        // down read ended after the gate/up kernels (1 = fully exposed, 0 =
+        // hidden under them; NaN = no two-phase pass).
+        "partial_lands", "partial_promotions", "partial_slots", "gateup_wait_us", "down_wait_us", "down_exposed",
     ],
 };
 

@@ -218,12 +218,25 @@ sees a partial entry only as nursery-covered (dedup). Counters: `b2_req` `partia
 `partial_promotions`, `partial_slots`, `gateup_wait_us`, `down_wait_us`; invariants (tests): a partial
 slot is never pinned / held / in a map, `partial_promotions <= partial_lands`, `completions +
 partial_evicted <= partial_lands`, a pass never runs on a partial slot (the sim's `ensure` completes it).
-PRICE (+-15%, the section-4 model): per hinted miss the exposure drops from ~2.2 - lead 1.7 + queueing to
-~max(0, 0.75 - gate/up compute ~0.5) ~ 0.25 ms; per UNHINTED miss from ~2.2 to ~1.75 ms (gate/up 1.5 +
-residual down 0.25) -- the latter applies to every paged read, hinted or not, so it is the larger lever
-at ~4 paged replies/step. Not covered: the decode (non-batched) chain and single-pass batched passes use
-`Full` (a partial slot wanted there is completed synchronously); `coalesce=1` falls back to per-role
-reads for partial reads.
+PRICE, RE-DONE on measured walls (review of 9f713ac, finding 1; `spec_reads.log`, isolated reads): the three
+roles are read concurrently one stream per role per drive, and the drive is LATENCY-BOUND per stream --
+per-role walls r0 2.09 / r1 2.08 / r2 2.21 ms against 2.26 ms for the whole expert (busy 6.6-6.8). So a
+single role read the plain way costs ~2.1 ms, not a third: WITHOUT the striped role read, two-phase is a
+loss on unhinted misses (gate/up 2.1 + max(0, 2.1 - gate/up kernel 0.1-0.7) = 3.5-4.1 ms vs 2.26) and
+gate/up-only hints save bytes (-33%) but ~0 wall (a hinted partial miss ~1.4-2.0 ms exposed). Hence the
+chunked single-role read (`read_range_into_direct_striped`, knob `role_stripes` 3): a role's packed plane
+in 3 aligned pieces over as many threads and both drives, the whole expert's parallelism for one role.
+ESTIMATE (to be measured by the loopback's run 3 and `b2_read` src=4 walls before either knob is turned
+on): one striped role ~0.75 ms isolated, gate/up (2 roles x 3 stripes) ~1.5 ms. WITH it: per hinted
+partial miss the exposure ~max(0, 0.75 - gate/up kernel ~0.5) ~ 0.25 ms (vs ~2.2 - lead 1.7 + queueing
+today); per UNHINTED miss ~1.5 + max(0, 0.75 - 0.5) ~ 1.75 ms vs 2.26 -- every paged read, hinted or not,
+so the larger lever at ~4 paged replies/step. `down_exposed` (an event after the gate/up half's q8k,
+queried after the Down phase) tells hidden from exposed in the A/B. Churn: a recycled unused partial
+entry (`partial_evicted`) cost 2/3 of a read, so the nursery churn price is `nursery_recycled x 1 +
+partial_evicted x 2/3` reads/step. Both knobs stay 0 until the walls are measured. Not covered: the decode
+(non-batched) chain and single-pass batched passes use `Full` (a partial slot wanted there is completed
+synchronously); `coalesce=1` falls back to per-role reads for partial reads; under `route=urgency` a
+striped role goes wholly to one drive (the cut is 0 / span), still across its stripes' threads.
 
 3.3 **Interim (b), hub-only.** Hints as plain PREFETCH words down 3.1's path, with the per-step budget
 (2.4) keeping the readers idle for them and the sets free. Keeps the gate/drop/pin defects in weakened

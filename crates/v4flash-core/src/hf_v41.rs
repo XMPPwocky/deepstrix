@@ -1084,6 +1084,21 @@ impl V41HfWeights {
         dst: &mut [u8],
         route: ExpertRoute,
     ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
+        self.read_expert_hf_layout_direct_routed_striped(vt, e, dst, route, 1)
+    }
+
+    /// `read_expert_hf_layout_direct_routed` with the packed plane read in
+    /// `stripes` pieces on as many threads (`read_range_into_direct_striped`):
+    /// a single role at the whole expert's parallelism. `1` = the plain
+    /// split read.
+    pub fn read_expert_hf_layout_direct_routed_striped(
+        &self,
+        vt: &VTensor,
+        e: usize,
+        dst: &mut [u8],
+        route: ExpertRoute,
+        stripes: usize,
+    ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
         let Kind::Experts { prefix, which, n } = &vt.kind else {
             return Err(eyre!("{}: not a stacked expert tensor", vt.name));
         };
@@ -1113,7 +1128,7 @@ impl V41HfWeights {
         // role, come from the two drives per `route` (default: split by the
         // mirror fraction); the scale plane from the primary unless the route
         // puts the whole expert on the mirror.
-        let Some(pad_w) = self.st.read_range_into_direct_split(wt, 0, packed_len, region_w, route.weight_mirror_frac)? else {
+        let Some(pad_w) = self.st.read_range_into_direct_striped(wt, 0, packed_len, region_w, route.weight_mirror_frac, stripes)? else {
             return Ok(None);
         };
         EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
