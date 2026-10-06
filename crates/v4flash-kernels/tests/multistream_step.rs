@@ -344,6 +344,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // G6: the operands (stage, rows)-keyed graphs may bake (GRAPH_KEYS_DESIGN.md 2.5); without it
     // every stage_b capture taints (fail closed) -- G6 asserts none does.
     sd.register_static();
+    // G5a-h run LEGACY keys whatever the default (`stage_b` since 2026-10-06): their logits are G6's
+    // legacy references, and G6's arms expect the stage_b cache empty when they start.
+    v4flash_kernels::knobs::MS_GRAPH_KEYS.set("legacy");
     let mut si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     let mut pg = ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, 0)?;
     let hasher = EngramHash::load(Path::new(&engram_dir))?;

@@ -148,10 +148,11 @@ v4flash_kernels::knobs! {
     pub static MS_DSPARK_K = Knob::text("V41_MS_DSPARK_K");
     /// `V41_MS_DSPARK_KMAX` (default the block size).
     pub static MS_DSPARK_KMAX = Knob::int("V41_MS_DSPARK_KMAX", MTP_BLOCK as u64, 0, MTP_BLOCK as u64);
-    /// `V41_MS_DSPARK_STREAMS` (live, default 1, at most 2): every live stream
-    /// may draft while at most this many are live
-    /// (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2.1); 1 = a lone stream only.
-    pub static MS_DSPARK_STREAMS = Knob::int("V41_MS_DSPARK_STREAMS", 1, 1, 2).live();
+    /// `V41_MS_DSPARK_STREAMS` (live, default 2 since 2026-10-06, at most 2): every
+    /// live stream may draft while at most this many are live
+    /// (docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2.1; production A/B 2026-10-06: slower
+    /// stream 1.033x, aggregate +22.6%); 1 = a lone stream only.
+    pub static MS_DSPARK_STREAMS = Knob::int("V41_MS_DSPARK_STREAMS", 2, 1, 2).live();
 
     // ---- embed phase (docs/v41/EMBED_PHASE_DESIGN.md; static unless marked)
     /// `V41_EMBED_PHASE_TOKENS` (default 16384): max tokens in one embed
@@ -210,14 +211,15 @@ mod tests {
         // Live: the eight 10-01 `_FILE` knobs, the live-trace trigger, Tier
         // B's device timing (its kill switch), the box-2 partial upload and the
         // layer-major group prefetch and the speculating-streams count (A/B'd
-        // per turn), and the embed phase's share and return verification (read
-        // between phases).
+        // per turn), the embed phase's share and return verification (read
+        // between phases), and the arena graph keys with their canary and
+        // taint-probe gate hook (read once per arena step).
         let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
         live.sort();
         assert_eq!(live, [
             "V41_B2_PIN_PREFILL_BAND", "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
-            "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
-            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
+            "V41_MS_CTX_CHECK", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
+            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA",
         ]);
         // The parses these knobs had before.
