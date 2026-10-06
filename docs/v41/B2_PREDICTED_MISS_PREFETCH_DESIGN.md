@@ -407,6 +407,17 @@ daemon's LIKELY class and reserved sets (3.3), not hub pacing.** Per-cell `ms.st
 both directions in both A/Bs: turn-to-turn workload noise; a 2 h per-turn A/B cannot resolve < ~5% per
 cell, so the 1.01 bar in section 7 is replaced by the standard >= 20K steps per arm.
 
+11.4b **Dry run 2 (hub `e5edc707`, 2026-10-06, 94 turns, `b2_prefetch_2026-10-06/ab_dry2_result.txt`).**
+Unfiltered R=1 words/step -> protected hits (precision): lone 31.8 -> 23.0 (0.72), two-stream 68 -> 48.5
+(0.71), plain 3/4/5 8-17 -> 5-10 (0.56-0.67). Margin >= 0.1: lone 7.3 -> 6.8 (0.93), two-stream 14.1 -> 13.2
+(0.93), plain 1.7-3.0 (0.82-0.92); >= 0.2: ~1 word/step at 0.96. The margin cannot be chosen from this
+table: protected non-resident hits are ~23/step at lone while paged replies are ~3-7/step, so most picks
+the mirror calls non-resident do not page (box 2 holds them, or the early-page hook read them already).
+The refined objective (section 6, owner 10-06) is what dry run 3 (`aada3692`, `lh2_hits_prot_paged_*`,
+`lh2_hits_prot_late_*`, `lh2_prot_paged_late_total`) measures; the same counters also measure the
+mirror's residency accuracy, which the cache prior's ~42 swaps/step rely on (a fidelity question of its
+own if the mirror under-reports residency).
+
 11.4a **Hub-only relaunch for dry run 2 (before slice D).** The hub binary is slice-B-capable but
 inert: `Mode::wire` needs `RESP_FLAG_NURSERY`, which the live daemon cannot send. `k1` on the live box 2
 = `dry` + a probe flag (bit 11) on every decode request -- safe: the old daemon uses the flags only for
