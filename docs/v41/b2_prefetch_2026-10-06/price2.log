@@ -1,0 +1,22 @@
+per-cell ms/step removed; weighted by regime share
+
+-- R=1 (rank-1 recall 0.71)
+(b) hub-only, busy share 0.23 (time-weighted bound), 10% never started weighted  2.9 ms/step (2.9%) raw  4.1 | lone_r3 2.4 lone_r4 2.7 lone_r5 4.1 lone_r6 4.6 plain_M3 2.8 two_r7 6.4 plain_M8 7.4
+(b) hub-only, busy share 0.60 (reviewer: per-read share)   weighted  2.2 ms/step (2.2%) raw  3.1 | lone_r3 1.7 lone_r4 2.0 lone_r5 2.9 lone_r6 3.3 plain_M3 2.0 two_r7 5.0 plain_M8 6.3
+(a) daemon hint class, applied at dequeue                  weighted  3.6 ms/step (3.7%) raw  5.1 | lone_r3 3.1 lone_r4 3.5 lone_r5 5.0 lone_r6 5.6 plain_M3 3.7 two_r7 7.7 plain_M8 8.5
+(a) daemon hint class, applied at frame arrival            weighted  3.6 ms/step (3.7%) raw  5.1 | lone_r3 3.1 lone_r4 3.5 lone_r5 5.0 lone_r6 5.6 plain_M3 3.7 two_r7 7.7 plain_M8 8.5
+(a) + k2 (recall x0.9 on the remainder approx)             weighted  4.3 ms/step (4.6%) raw  6.1 | lone_r3 5.0 lone_r4 4.7 lone_r5 5.7 lone_r6 5.9 plain_M3 6.0 two_r7 7.4 plain_M8 8.3
+-- R=2 (rank-1 recall 0.86)
+(b) hub-only, busy share 0.23 (time-weighted bound), 10% never started weighted  3.4 ms/step (3.4%) raw  4.8 | lone_r3 2.9 lone_r4 3.3 lone_r5 4.7 lone_r6 5.3 plain_M3 3.4 two_r7 7.3 plain_M8 8.3
+(b) hub-only, busy share 0.60 (reviewer: per-read share)   weighted  2.6 ms/step (2.6%) raw  3.7 | lone_r3 2.0 lone_r4 2.4 lone_r5 3.5 lone_r6 4.0 plain_M3 2.4 two_r7 5.9 plain_M8 7.1
+(a) daemon hint class, applied at dequeue                  weighted  4.2 ms/step (4.3%) raw  5.9 | lone_r3 3.7 lone_r4 4.2 lone_r5 5.9 lone_r6 6.5 plain_M3 4.5 two_r7 8.8 plain_M8 9.7
+(a) daemon hint class, applied at frame arrival            weighted  4.2 ms/step (4.3%) raw  5.9 | lone_r3 3.7 lone_r4 4.2 lone_r5 5.9 lone_r6 6.5 plain_M3 4.5 two_r7 8.8 plain_M8 9.7
+(a) + k2 (recall x0.9 on the remainder approx)             weighted  5.0 ms/step (5.4%) raw  7.1 | lone_r3 6.0 lone_r4 5.6 lone_r5 6.7 lone_r6 6.8 plain_M3 7.2 two_r7 8.5 plain_M8 9.3
+-- R=3 (rank-1 recall 0.91)
+(b) hub-only, busy share 0.23 (time-weighted bound), 10% never started weighted  3.6 ms/step (3.6%) raw  5.0 | lone_r3 3.0 lone_r4 3.5 lone_r5 4.9 lone_r6 5.5 plain_M3 3.6 two_r7 7.6 plain_M8 8.6
+(b) hub-only, busy share 0.60 (reviewer: per-read share)   weighted  2.7 ms/step (2.7%) raw  3.9 | lone_r3 2.2 lone_r4 2.5 lone_r5 3.7 lone_r6 4.2 plain_M3 2.6 two_r7 6.1 plain_M8 7.3
+(a) daemon hint class, applied at dequeue                  weighted  4.4 ms/step (4.5%) raw  6.2 | lone_r3 3.9 lone_r4 4.4 lone_r5 6.1 lone_r6 6.8 plain_M3 4.7 two_r7 9.2 plain_M8 10.0
+(a) daemon hint class, applied at frame arrival            weighted  4.4 ms/step (4.5%) raw  6.2 | lone_r3 3.9 lone_r4 4.4 lone_r5 6.1 lone_r6 6.8 plain_M3 4.7 two_r7 9.2 plain_M8 10.0
+(a) + k2 (recall x0.9 on the remainder approx)             weighted  5.3 ms/step (5.7%) raw  7.4 | lone_r3 6.4 lone_r4 5.8 lone_r5 7.0 lone_r6 7.2 plain_M3 7.6 two_r7 8.8 plain_M8 9.7
+
+ceiling: every paged reply never late = 7.9 ms/step weighted (normalised; raw 11.1); per-cell values are raw, quote +-15%
