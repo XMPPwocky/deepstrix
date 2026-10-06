@@ -1,11 +1,16 @@
 # Predicted-miss look-ahead prefetch on the decode step
 
-Status: DESIGN rev 4, 2026-10-06: APPROVED WITH CHANGES folded (3 review rounds), **slice A cleared to
-build**. Owner direction 10-06 "speculative reads into a small nursery of slots, keep only if used in the
-next layer" is the target mechanism (section 3.2; changelog section 10). Branch `worktree-b2-prefetch` (base main 8996153 = production b5def35). No code
-yet. Scratch `~/.claude/jobs/749c61d3/tmp/prefetch_design/` (`trace_lru.py`, `recall_protected.py`,
-`recall.log`, `price2.py`, `price2.log`, `nursery_draft.md`); reviews and `spec_reads.*` in
-`../prefetch_review/`.
+Status: DESIGN rev 4, 2026-10-06: APPROVED WITH CHANGES folded (3 review rounds). **Slices A, B and C
+BUILT** on `worktree-b2-prefetch` (base main 8996153 = production b5def35): A live since 10-06 (dry),
+B (hub wire) and C (daemon nursery + LIKELY class) built and host-tested 10-06, NOT deployed -- slice D
+(section 11) needs the box-2 restart. Owner direction 10-06 "speculative reads into a small nursery of
+slots, keep only if used in the next layer" is the target mechanism (section 3.2; changelog section 10).
+Slice A live finding (10-06 11:00 UTC, 1 h): rank-1 ANY-rank recall 0.92-0.95, host 0.2 ms/step, but
+~44 hint words/step at R=1 against ~2 paged replies and 1-3 `sub.blocked`: ~90% of predicted rank-1
+non-resident picks land at actual ranks 2-6 where the prior swaps them away. Hence the **slice A
+amendment** (section 11.1: protected-set counters + a gate-margin filter). Scratch
+`~/.claude/jobs/749c61d3/tmp/prefetch_design/` (`trace_lru.py`, `recall_protected.py`, `recall.log`,
+`price2.py`, `price2.log`, `nursery_draft.md`); reviews and `spec_reads.*` in `b2_prefetch_2026-10-06/`.
 
 ## 0. What and why
 
@@ -329,6 +334,61 @@ per the reviewer (pace ~1/request; absolute bar; skip the grant; 1.35 ms was an 
 rev 2 (round 1): pricing on the measured speculative path; no admit gate at rank <= 2; drops measured;
 host cost priced; `lookup()` predicate; `note_admits` (now moot: hints never pin); pins stated; per-R dry
 counts; step tag; slice A a measurement; G5 assert conditional; `before` control.
+
+## 11. Build notes: slices B and C (2026-10-06, `worktree-b2-prefetch`, commits 5646edf..)
+
+Code: hub `het/lookahead.rs` (filter, queue, budget, bars, counters), `het/b2_mirror.rs` (NURSERY bits,
+capability), `het/remote_experts.rs` (proto, `submit_inner` drain, `wait` parse; and the whole daemon:
+`ShardPool` nursery, `PfQueue` LIKELY class, `admit_prefetched` landings, serve loop), `knobs.rs`,
+`het/evtrace_kinds.rs`, `het/forward_prefill.rs` (pack `look_ew`, demanded/protected counting),
+`het/batch_scratch.rs` (pack sizing); tests `tests/remote_experts_nursery_loopback.rs` (GPU; compiled,
+not run: the hub was live on both GPUs).
+
+11.1 **Slice A amendment (protected set + margin).** The pack carries L+1's look-ahead gate WEIGHTS
+(`sd.look_ew`, 6 f32/row; the pack already carries `xq` at 5,840 B/row, so +24 B/row at r4; L+2's are
+not packed: `RB_PACK_MAX_SEG` 10, slice E). Per rank-1 prediction `margin = (w1 - w2) / sum(row)`, the
+largest over its rank-1 rows. Dry counters: `lh2_dry_hits_prot_rN` (own pick at ACTUAL rank `<=
+V41_SUB_PROTECT`), `lh2_nonres_m{0..3}` / `lh2_hits_prot_m{0..3}` (margin `>= 0 / 0.1 / 0.2 / 0.3`); the
+precision that matters is `dry_hits_prot_r1 / nonres_r1`, and `hits_prot_m{k} / nonres_m{k}` picks the
+threshold. Knob `V41_B2_MISS_PREFETCH_MARGIN` (default 0 = off) gates rank-1 hints on the wire path; an
+unknown margin (no weights packed) passes.
+
+11.2 **Wire.** `REQ_FLAG_LIKELY` (2048) on every decode request under `k1`/`k2` (the probe); hint words
+lead the PREFETCH block marked by `LIKELY_WORD_BIT` (bit 31: an older daemon skips them by its layer
+check); `RESP_FLAG_NURSERY` (1<<13) + a 12-word NURSERY block (own layer first, others in rotation,
+`NURSERY_NONE` padding) on every reply to a LIKELY-flagged request while `nursery > 0`. The hub mirror
+replaces the reply layer's NURSERY row and dedups hints against it (`lh2_nursery_covered`), never `held`.
+`Mode::wire = asks && nursery_supported`; detection and loss logged once per transition; a reconnect
+re-probes. The drain honours the budget and the bars; the surplus is re-queued at the front.
+
+11.3 **Daemon.** Nursery = per-slot set carved from the main band at `enable_paging` (spread `i * main /
+n`; occupants become unused entries); `pick_victim` skips it; `touch_hit` relabels on a hit and `ensure`
+refills via `pick_victim_any` + `me_account` (shrinks when every candidate is pinned; refills from free
+slots later); `held` excludes entries; `PinBook::report` and `residency_words` mask them; pin budget minus
+`nursery`. LIKELY class in `PfQueue`; reserved staging pair = the LAST two sets (+2 when `nursery > 0`);
+LIKELY reads chunked and pausing for certain reads under `likely_pause_for_certain` (off = unchunked:
+nothing to pause for); under `route=urgency` LIKELY behaves as speculative for routing (primary drive, no
+pause). A hint the serving pass wants lands straight into main (a land + a hit). Counters in `b2_req`
+(`pf_run_likely`, `pf_q_likely`, `n_likely_words`, `nursery_*`) and the 2,000-request stats line.
+
+11.4 **Knobs.** Hub (live, `knobs.rs`): `V41_B2_MISS_PREFETCH` off|dry|k1|k2, `_RANK` 1, `_CAP` 8,
+`_MARGIN` 0, `_MAX_WORDS_STEP` 0 (= `10 + 5 * max(0, rows - 4)`), `_MAX_PER_LL_X10` 25 (judged from 8
+lane-layers), `V41_B2_NURSERY_PRIOR` 0, `V41_B2_SPEC_BUDGET` 0. Daemon (`~/expertd-knobs.txt` keys):
+`nursery` 32 (STARTUP ONLY; 0 = off), `nursery_lanes` 2 (live), `likely_pause_for_certain` 1 (live, the
+A/B knob; SIGUSR2).
+
+11.5 **Slice D checklist.** (1) Build expertd ON box 2 (clock skew: `project_v41_box2_build_clock_skew`),
+`nursery=32` in its knob file, `V41_B2_PREFETCH_SETS` as today (+2 reserved sets, +113 MB pinned). (2)
+Server-down window with box 2 attached: `tests/remote_experts_nursery_loopback` and
+`remote_experts_pin_loopback` on box 1's iGPU; `tests/multistream_step.rs` G5a-h `k1` vs `off` bit for
+bit (needs a remote); the determinism recipe (section 7). (3) Two-box restart bundle in the two-box order
+(box 1 down, box 2 down, box 2 up, box 1 up): pool 4480 -> ~4750 slots (+270, minus the 32 carved) and
+mode-evict per `project_hardware_move_2026-10-03` / `project_v41_lm_mode_evict_deployed_2026-10-01`.
+(4) Hub up with `V41_B2_MISS_PREFETCH=dry`: confirm `hub_lh2` emits, `b2 mirror: box 2 answers
+REQ_FLAG_LIKELY` is NOT logged (dry does not probe), then flip `k1` per turn: expect the detection log
+once, `lh2_hints_sent > 0`, `lh2_bar_trips` 0 at the chosen margin, box 2 `nursery lands/hits`. (5) A/B
+per section 7 (paged late replies/step -25% at r4, `ms.step` p50 <= 1.00x); rollback knob `off` /
+`nursery=0` + restart.
 
 ## Open questions for the reviewer (rev 4)
 
