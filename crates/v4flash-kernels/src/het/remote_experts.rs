@@ -2777,10 +2777,15 @@ pub struct PartialCounters {
     pub partial_lands: u64,
     /// Partial nursery entries promoted on use (`touch_hit`).
     pub partial_promotions: u64,
-    /// Partial slots completed (their down role landed).
+    /// Partial slots completed (their down role landed): hint-made AND
+    /// demand-made (`demand_partial`).
     pub completions: u64,
     /// Partial slots evicted / recycled before completion.
     pub partial_evicted: u64,
+    /// A pass's own demand miss landed gate/up first (`EnsurePhase::GateUp`)
+    /// and was left PARTIAL for its Down phase. Invariant:
+    /// `completions + partial_evicted <= partial_lands + demand_partial`.
+    pub demand_partial: u64,
 }
 
 /// Nursery counters (cumulative since `enable_paging`; `b2_req` reports
@@ -6572,6 +6577,7 @@ impl ExpertShard {
                         pool.commit(layer, e, victim);
                         if roles != ROLES_ALL {
                             pool.mark_partial(victim);
+                            pool.pc.demand_partial += 1;
                         }
                         dirty = true;
                     } else {
@@ -12506,7 +12512,7 @@ mod tests {
                 }
             }
             assert!(b2.pool.pc.partial_promotions <= b2.pool.pc.partial_lands);
-            assert!(b2.pool.pc.completions + b2.pool.pc.partial_evicted <= b2.pool.pc.partial_lands);
+            assert!(b2.pool.pc.completions + b2.pool.pc.partial_evicted <= b2.pool.pc.partial_lands + b2.pool.pc.demand_partial);
             if b2.pool.pins.on {
                 assert_eq!(n_pinned, b2.pool.pins.pinned, "pinned count drifted");
                 assert!(b2.pool.pins.pinned <= b2.pool.pins.budget);
@@ -12820,7 +12826,7 @@ mod tests {
         assert!(!pool.partial[v as usize]);
         // Invariants: promotions <= lands, completions + evicted <= lands + promotions' worth.
         assert!(pool.pc.partial_promotions <= pool.pc.partial_lands);
-        assert_eq!(pool.pc, PartialCounters { partial_lands: 1, partial_promotions: 1, completions: 1, partial_evicted: 1 });
+        assert_eq!(pool.pc, PartialCounters { partial_lands: 1, partial_promotions: 1, completions: 1, partial_evicted: 1, demand_partial: 0 });
     }
 
     /// The early-page hook's plan under partial slots (review of 9f713ac,

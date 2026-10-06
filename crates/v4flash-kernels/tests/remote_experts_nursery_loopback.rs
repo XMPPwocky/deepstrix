@@ -361,7 +361,12 @@ fn remote_experts_nursery_loopback() -> eyre::Result<()> {
     let (lands, hits, recycled) = (d(nc_on.lands, nc_off.lands), d(nc_on.hits, nc_off.hits), d(nc_on.recycled, nc_off.recycled));
     assert!(lands > 10 && hits > 0, "landed {lands}, promoted {hits}");
     assert_eq!(lands as i64, hits as i64 + recycled as i64 + (i64::from(occ_on) - i64::from(occ_off)), "lands = hits + recycled + delta(occupied): {nc_on:?}");
-    assert_eq!(nc_on.drops, nc_off.drops, "no LIKELY word dropped ({} sets)", 4);
+    // A LIKELY word that finds both reserved sets busy is dropped by design
+    // (the demand read still happens). First GPU run, 2026-10-06: 17 of 456
+    // (3.7%) at 4 + 2 sets. Bound it at the A/B abort bar (design section 7:
+    // nursery_drops > 10% of sent).
+    let drops = d(nc_on.drops, nc_off.drops);
+    assert!(drops * 10 <= on.hints_sent, "LIKELY words dropped {drops} of {} sent (> 10%): {nc_on:?}", on.hints_sent);
     assert!(on.nursery_words > 0, "the mirror saw NURSERY entries");
     assert_eq!(on.nursery_held, 0, "a nursery entry is never held (I2)");
     // The pin contract held with hints on: zero surprises, zero pinned
@@ -378,7 +383,10 @@ fn remote_experts_nursery_loopback() -> eyre::Result<()> {
     assert_eq!(mismatched, 0, "the two-phase landing changed {mismatched} of {n_req} partials (I1)");
     let pc = tp_two.1;
     assert!(pc.partial_lands > 10 && pc.partial_promotions > 0, "{pc:?}");
-    assert!(pc.partial_promotions <= pc.partial_lands && pc.completions + pc.partial_evicted <= pc.partial_lands, "{pc:?}");
+    // A pass's own demand misses land gate/up first under two-phase and are
+    // completed too (first GPU run: completions 192 > hint-made partials 159).
+    assert!(pc.demand_partial > 0, "two-phase demand landings went gate/up first: {pc:?}");
+    assert!(pc.partial_promotions <= pc.partial_lands && pc.completions + pc.partial_evicted <= pc.partial_lands + pc.demand_partial, "{pc:?}");
     assert_eq!(two.surprises, 0);
     let c2 = pins_two.ok_or_else(|| eyre!("pinning never turned on"))?.0;
     assert_eq!((c2.pinned_evictions, c2.revokes), (0, 0), "{c2:?}");
