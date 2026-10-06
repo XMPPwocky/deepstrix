@@ -377,6 +377,24 @@ lane-layers), `V41_B2_NURSERY_PRIOR` 0, `V41_B2_SPEC_BUDGET` 0. Daemon (`~/exper
 `nursery` 32 (STARTUP ONLY; 0 = off), `nursery_lanes` 2 (live), `likely_pause_for_certain` 1 (live, the
 A/B knob; SIGUSR2).
 
+11.4 **Live A/B results, 2026-10-06 (slice A binary `cd00cd9d`, per-turn knob flips, 84 and 109 turns).**
+Dry run 1 (`V41_B2_MISS_PREFETCH` off/dry): host cost 0.2 ms/step + 0.4 ms `sel_sync` (the `before`
+placement); any-rank recall of hinted rank-1 picks 0.93-0.94; BUT hinted words at R=1 ~43/step (lone)
+vs `sub.blocked` ~3.5 and paged replies ~2.7 -- ~90% of predicted-rank-1 non-resident picks are actual
+rank 2-6 and get swapped by the prior, never demanded; precision vs the protected set <= 8% at lone, 19%
+two-stream, ~100% plain-3. Hence the amendment (protected-set hits + margin buckets, dry run 2). Offline
+(`tmp/predictor/REPORT*.md`): margin >= 0.1 keeps 1.9 words/step at 0.93 precision; a trained residual
+head loses to the untrained gate (needs ~50K tokens); a per-layer AFFINE on the router's scores
+regularised toward zero never loses and adds +2.5-3 pt at matched volume at zero inference cost (bias
+folds into the look-ahead bias, scale into the threshold) -- fit it on a look-ahead trace line later.
+Budget A/B (`V41_B2_SPEC_BUDGET` 0/60): NEGATIVE where it was meant to help -- paged replies per step
+by seconds since the decode phase began: 0-5 s 8.0 vs 8.0, **5-20 s 6.25 vs 9.05 (page_ms 14.6 vs
+22.1)**, 20 s+ 5.7 vs 5.4. Pacing restores re-warms box 2 slower than the burst, dropped words or not.
+**The per-step speculative budget (2.4) is withdrawn: keep 0; hints avoid the restore queue through the
+daemon's LIKELY class and reserved sets (3.3), not hub pacing.** Per-cell `ms.step` p50 moved +-5% in
+both directions in both A/Bs: turn-to-turn workload noise; a 2 h per-turn A/B cannot resolve < ~5% per
+cell, so the 1.01 bar in section 7 is replaced by the standard >= 20K steps per arm.
+
 11.4a **Hub-only relaunch for dry run 2 (before slice D).** The hub binary is slice-B-capable but
 inert: `Mode::wire` needs `RESP_FLAG_NURSERY`, which the live daemon cannot send. `k1` on the live box 2
 = `dry` + a probe flag (bit 11) on every decode request -- safe: the old daemon uses the flags only for
