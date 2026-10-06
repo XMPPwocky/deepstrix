@@ -1116,7 +1116,13 @@ impl Sched {
             // `pin_released`: the band's opening release (-> Prefill), or the
             // phase's per-chunk reopens (-> Decode).
             let (pin_released, pin_restore) = match next {
-                Phase::Prefill => (v4flash_kernels::het::b2_mirror::pin_enter_prefill(), 0),
+                Phase::Prefill => {
+                    // Predicted-miss hint words (`het::lookahead`, design 2.3)
+                    // never ride a prefill chunk: the queue empties here, not in
+                    // the per-chunk `expire_incoming` (review round 2, finding 6).
+                    v4flash_kernels::het::remote_experts::clear_hint_words();
+                    (v4flash_kernels::het::b2_mirror::pin_enter_prefill(), 0)
+                }
                 Phase::Decode => (
                     v4flash_kernels::het::b2_mirror::take_band_reopened(),
                     v4flash_kernels::het::b2_mirror::pin_enter_decode(),
@@ -2181,6 +2187,26 @@ impl Sched {
                 for (name, v) in [("sub.predicted_miss", p as f64), ("sub.reads_avoided", av as f64), ("sub.picks_swapped", sw as f64), ("sub.blocked", bl as f64), ("sub.plan_failed", fl as f64), ("sub.admits_queued", ad as f64), ("sub.incoming_covered", inc as f64), ("sub.admits_gated", gated as f64)] {
                     let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                     e.0 += v; e.1 += 1;
+                }
+            }
+            // Predicted-miss look-ahead prefetch (`V41_B2_MISS_PREFETCH`) and
+            // the per-step speculative budget (`V41_B2_SPEC_BUDGET`), counts per
+            // step (`het::lookahead::STATS`): their own `hub_lh2` record keyed
+            // by the step (`hub_step` is at its field limit), and `lh2.*` host
+            // stages in the `ms.stage` rollup. The dry run reads
+            // `lh2.dry_hits_r1 / lh2.nonres_r1` (rank-1 recall; design 0.71)
+            // and `lh2.dry_words` per step against the section-5 abort bar.
+            if v4flash_kernels::het::lookahead::active() {
+                use v4flash_kernels::het::lookahead::{take_stats, STATS};
+                let st = take_stats();
+                if ev_on {
+                    let mut pairs: Vec<(&str, f64)> = vec![("step", step_id as f64), ("rows", b as f64)];
+                    pairs.extend(STATS.iter().zip(&st).map(|((field, _), v)| (*field, *v as f64)));
+                    v4flash_kernels::het::evtrace::emit_named(&v4flash_kernels::het::evtrace_kinds::HUB_LH2, &pairs);
+                }
+                for ((_, stage), v) in STATS.iter().zip(&st) {
+                    let e = acc.stages.entry(("host", *stage)).or_insert((0.0, 0));
+                    e.0 += *v as f64; e.1 += 1;
                 }
             }
             // Box-2 pinning, per step (drained above).

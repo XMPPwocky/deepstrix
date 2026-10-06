@@ -7,7 +7,7 @@ use super::evtrace::Kind;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Every hub/box-2 kind (added to `evtrace`'s header list).
-pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED];
+pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED, &HUB_LH2];
 
 // ---- hub: step context for per-request records ----
 
@@ -64,6 +64,9 @@ pub static HUB_REQ: Kind = Kind {
         // page anyway (SURPRISES: must be 0), box 2's paged experts for the
         // pass, and its pinned count / release epoch.
         "n_held", "n_surprise", "n_paged", "pinned", "pin_epoch",
+        // predicted-miss hint words on the frame (`het::lookahead`; 0 until
+        // slice B puts them on the wire)
+        "n_hint_words",
     ],
 };
 
@@ -133,12 +136,42 @@ pub static HUB_STEP: Kind = Kind {
         "lh_excl", "lh_audit", "lh_remap_h2d", "lh_work_items_sync", "lh_remote_wait", "lh_pager_sync_igpu", "lh_engram_join",
         "lh_work_items_count", "lh_sel_d2h", "lh_sub", "lh_wic_busy_x1e3", "lh_wic_idle_x1e3", "lh_seld2h_busy_x1e3",
         "lh_seld2h_idle_x1e3", "lh_remote_sync", "lh_remote_upload",
+        // predicted-miss look-ahead host cost (`het::lookahead`; design 2.6):
+        // the two dGPU launches in the chain enqueue, and the filter + dry
+        // matching + queue at Route
+        "lh_look_launch", "lh_look_filter",
         ;
         // context
         "pos_min", "pos_max",
         // Tier B (see above)
         "dev_skipped", "t_fwd_sync",
     ),
+};
+
+/// Per-step counters of the predicted-miss look-ahead prefetch
+/// (`V41_B2_MISS_PREFETCH`, `het::lookahead`; design section 6) and of the
+/// per-step speculative budget (`V41_B2_SPEC_BUDGET`): one record per decode
+/// step while either is on, joined to `hub_step` by `step` (`hub_step` is at
+/// its field limit). Per R in 1..=3: distinct box-2-owned predicted picks of
+/// rank `<= R` over the step's lane-layers (`cand`), the mirror-non-resident
+/// ones among them (`nonres`), and of THOSE the ones in the router's own picks
+/// one lane-layer later (`dry_hits`: the live Step 0; `dry_hits_r1 /
+/// nonres_r1` is rank-1 recall, 0.71 in design section 1). `dry_words` = hint
+/// words at the knob's R and cap the queue handed a decode submit (slice A:
+/// counted, kept off the wire -- the volume the absolute abort bar of section
+/// 5 reads); `hints_sent` = words on the wire (0 in slice A); `dropped_cap`,
+/// `stale` = words the per-request cap / the stale rule dropped;
+/// `budget_deferred` = admission / restore words the budget held back vs
+/// today's per-request rule, summed over the step's requests.
+pub static HUB_LH2: Kind = Kind {
+    id: 15,
+    name: "hub_lh2",
+    fields: &[
+        "step", "rows",
+        "lh2_cand_r1", "lh2_cand_r2", "lh2_cand_r3", "lh2_nonres_r1", "lh2_nonres_r2", "lh2_nonres_r3",
+        "lh2_dry_hits_r1", "lh2_dry_hits_r2", "lh2_dry_hits_r3", "lh2_dry_words", "lh2_hints_sent", "lh2_dropped_cap", "lh2_stale",
+        "lh2_budget_deferred",
+    ],
 };
 
 /// One decode step's device time on one device, from the Tier B thread
