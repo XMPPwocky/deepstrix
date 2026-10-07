@@ -529,6 +529,36 @@ once, `lh2_hints_sent > 0`, `lh2_bar_trips` 0 at the chosen margin, box 2 `nurse
 per section 7 (paged late replies/step -25% at r4, `ms.step` p50 <= 1.00x); rollback knob `off` /
 `nursery=0` + restart.
 
+11.6 **Dry run 4 final (hub `ea0935e4`, 2026-10-06, 99 turns; the reference after the classify fix).**
+Recall = real box-2 misses (paged, any rank) the look-ahead predicted at rank <= R, per regime:
+
+| regime | real misses/step | R=1 | R=2 | R=3 |
+|---|---|---|---|---|
+| lone DSpark | 3.0 | .30 | .54 | .72 |
+| two-stream DSpark | 7.3 | .30 | .49 | .63 |
+| plain 3-5 rows | 3.0-6.3 | .28 | .48-.50 | .63-.67 |
+
+0 surprises. R=2 costs 9-18.5 hint words/step (~2-3.5 GB/s of box-2 reads, inside the disk's spare
+bandwidth; owner 10-06: low precision is fine). Chosen for the first live A/B: R=2, margin 0,
+`MAX_WORDS_STEP` 40, nursery 48. `land_two_phase` / `likely_gateup_only` stay 0 until the striped
+per-role read walls are measured.
+
+11.7 **Slice-D window (2026-10-07).** Two aborts, then a pass, prod restored each time by the exit
+trap (box 2 untouched by the aborts):
+- v1 23:11 UTC 10-06 (2b8dd15e): nursery loopback, two over-strict asserts (5344be1).
+- v2 04:40 UTC (and an accidental duplicate run 04:58): pin loopback budget 5 != 8 -- the nursery (3 of
+  the test's 20 slots) comes out of the pin budget since 5646edf and the test never ran on the GPU after
+  that default; held picks 29 < 50 would have failed next. 61433e9 runs that test with
+  `V41_B2_NURSERY=0` (pins + nursery = the nursery loopback's coverage).
+- v3 05:23-05:53 UTC (61433e9; hub `6e3ede8e`, box 2 expertd `46fe6913`): both loopbacks PASS (pin
+  budget 8/8, 152 held, 0 surprises), G5a-h + G6 `off` vs the old daemon 906 s, `k1` vs the new daemon
+  787 s: 244 logits files bit-identical, D/P picks identical (133,039 lines) -> GATE PASS. Box 2 at
+  L0-L39:265-383 (4760 slots, nursery 48 = 0.90 GB, pin budget 4232, mode-evict on), hub up after 43 s,
+  embedding check cos 0.99968. Hub down 30 min. Caveat: the gate's run printed no box-2 stats line with
+  `nursery lands > 0` (one line per 2000 requests): landings are confirmed on live traffic, not by the gate.
+- Live A/B from 05:54 UTC: per-turn `V41_B2_MISS_PREFETCH` dry vs k1, 3 h (`start_ab_k1.sh`,
+  `ab_k1_20261007.log`); bars per section 7.
+
 ## Open questions for the reviewer (rev 4)
 
 Rev-3 questions 1-4 are closed (nursery 32, own `pin_grant`, two new pinned buffers, floor 16). Open for
