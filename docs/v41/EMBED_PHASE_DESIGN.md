@@ -548,3 +548,12 @@ Branch binary ce52ee3c (21b43bf). Script and logs in the job's tmp dir: `window2
 3. Long batches are compute-bound now: the forward, not I/O, is the lever above ~4K tokens per phase.
 
 **Deployed 2026-10-05 01:43 UTC** (hub-only, owner-approved): hub ce52ee3c from this branch (code 21b43bf), box 2 untouched. The launcher passes `--embed-gguf "$EMBED_GGUF"` from the production env file, only to a binary that has the flag. Post-deploy check: `/v1/models` lists both models; a live embedding vs llama.cpp cos 0.999677 (27 tokens), phase 1.64 s; chat answers.
+
+**Input cap raised to 16,384 tokens, 2026-10-06 23:32 UTC** (owner; a client sent an 11,412-token input). `V41_EMBED_MAX_INPUT_TOKENS=16384` in the production env file, equal to `V41_EMBED_PHASE_TOKENS`, so the loan is unchanged; the model's GGUF `context_length` is 40,960. Checked on production with `scripts/qwen3_embed/long_ref.py`, real text cut to exact token counts:
+
+| Input | Phase (prod) | E0: tokenizer vs llama.cpp ids | E1: CPU oracle vs the hub's GPU vector |
+|---|---|---|---|
+| 11,412 tokens | 9.85 s | identical | cos 1.000000 |
+| 16,384 tokens | 18.7 s | identical | cos 0.999998 |
+
+A long input's phase is attention-bound (quadratic) and blocks chat for its whole length. llama.cpp's CPU embedding could not be the reference here: at 11K tokens it took box 1 from 9.7 to 1.7 GB available in 5 s while the hub ran (a guard killed it), so the CPU oracle (26 and 52 min at nice 19) stood in.
