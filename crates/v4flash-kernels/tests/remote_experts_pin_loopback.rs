@@ -234,6 +234,11 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
         ("V41_B2_HITS_FIRST", "1"),
         ("V41_B2_ASSERT_PINNED", "1"),
         ("V41_B2_ASSERT_NO_SURPRISE", "1"),
+        // The nursery (default 32, clamped to a quarter of the band = 3 of
+        // these 20 slots) is never pinnable and comes out of the pin budget:
+        // off here so the budget and held-pick bars below stay the pin
+        // protocol's own. Pins with the nursery on = the nursery loopback.
+        ("V41_B2_NURSERY", "0"),
     ] {
         std::env::set_var(k, v);
     }
