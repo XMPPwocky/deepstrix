@@ -557,7 +557,24 @@ trap (box 2 untouched by the aborts):
   embedding check cos 0.99968. Hub down 30 min. Caveat: the gate's run printed no box-2 stats line with
   `nursery lands > 0` (one line per 2000 requests): landings are confirmed on live traffic, not by the gate.
 - Live A/B from 05:54 UTC: per-turn `V41_B2_MISS_PREFETCH` dry vs k1, 3 h (`start_ab_k1.sh`,
-  `ab_k1_20261007.log`); bars per section 7.
+  `ab_k1_20261007.log`); bars per section 7. Got 0 turns (no traffic until 09:00 UTC); rerun below.
+
+11.8 **k1 A/B RESULT (2026-10-07 15:13-20:13 UTC, 239 turns, dry vs k1; R=2, margin 0, 40
+words/step, nursery 48).** Medians of 20-step blocks per regime, dry -> k1:
+
+| regime | paged LATE replies/step | page_ms/step | ms.step p50 k1/dry |
+|---|---|---|---|
+| lone DSpark | 2.35 -> 1.65 (-30%) | 5.2 -> 3.2 | 0.987-0.998 (r2-r6) |
+| two-stream DSpark | 6.65 -> 4.80 (-28%) | 13.4 -> 8.9 | 0.913-0.990, r9 1.013 (n457) |
+| plain 3 | 2.75 -> 2.25 (-18%) | 6.1 -> 4.1 | 0.975 (r3), 0.956 (r4) |
+| plain 4 | 4.33 -> 2.75 (-36%) | 9.4 -> 5.3 | 0.981 |
+| plain 5 | 5.53 -> 3.55 (-36%) | 12.5 -> 7.6 | 0.970 |
+
+Hints 5.5-18 words/step, 0 surprises, box-2 nursery ~25% of lands used. Bars: paged late -25% at r4
+PASS (lone -30%, plain4 -36%); step p50 <= 1.00x in 21 of 22 cells, the exception (two-stream r9
++1.3%) inside the per-cell noise with r8/r10 at -8%. `pager_block` flat except plain 5 (2.2 -> 3.6
+ms, step still -3%). Next: k1 as the default (knob-file line, no restart), then protect 1 vs 2 under
+k1 (owner 10-07; `V41_SUB_PROTECT` live in a3da745, rides the next restart) and SOFT_PRIOR.
 
 ## Open questions for the reviewer (rev 4)
 
