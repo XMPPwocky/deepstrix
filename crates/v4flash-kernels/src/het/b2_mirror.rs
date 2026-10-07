@@ -225,13 +225,10 @@ pub fn dry() -> bool {
     *D
 }
 
-/// `V41_SUB_PROTECT` (mode 3; default 2): the original top picks the prior
-/// may never displace (the paper's J; 2 for fine-grained MoEs).
+/// `V41_SUB_PROTECT` (mode 3; default 2; live): the original top picks the
+/// prior may never displace (the paper's J; 2 for fine-grained MoEs).
 pub fn protect() -> u32 {
-    static J: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_SUB_PROTECT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(2).min(6)
-    });
-    *J
+    crate::knobs::SUB_PROTECT.get() as u32
 }
 
 /// Running per-layer average of the selection-score range (`Delta_layer`),

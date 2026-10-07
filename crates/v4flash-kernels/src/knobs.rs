@@ -697,6 +697,11 @@ crate::knobs! {
     /// `V41_SUB_LAMBDA` (default 0.1, 0..=1): the cache prior's strength
     /// (`b2_mirror::lambda`). Live; `V41_SUB_LAMBDA_FILE` still works.
     pub static SUB_LAMBDA = Knob::real("V41_SUB_LAMBDA", 0.1, 0.0, 1.0).legacy("V41_SUB_LAMBDA_FILE");
+    /// `V41_SUB_PROTECT` (default 2, 0..=6; live): the original top picks the cache prior may
+    /// never displace (`b2_mirror::protect`). Read at every router launch: the top-k runs
+    /// UNCAPTURED (after `g.router_matvec`'s graph ends), so the scalar argument follows the
+    /// knob. Owner 10-07: protect 1 -> 2 under k1 (the hints cover ranks 1-2), per-turn A/B.
+    pub static SUB_PROTECT = Knob::int("V41_SUB_PROTECT", 2, 0, 6).live();
     /// `V41_B2_PIN_PREFILL_BAND` (default 2048): `b2_mirror::pin_prefill_band`.
     /// Live; `V41_B2_PIN_PREFILL_BAND_FILE` still works.
     pub static B2_PIN_PREFILL_BAND = Knob::int("V41_B2_PIN_PREFILL_BAND", 2048, 0, u32::MAX as u64).legacy("V41_B2_PIN_PREFILL_BAND_FILE");

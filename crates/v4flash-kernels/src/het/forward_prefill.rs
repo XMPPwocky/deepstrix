@@ -8431,6 +8431,9 @@ impl HeterogeneousEngine {
                     n_alt,
                     alt_w: if n_alt > 0 { Some(&mut bd.d_alt_w) } else { None },
                     prior: if prior_on { Some(&bd.d_prior) } else { None },
+                    // Live (`V41_SUB_PROTECT`): a kernel scalar, valid only because this
+                    // launch is never captured. Capturing it would bake the value in --
+                    // move it into `d_prior` (copied per layer) first.
                     n_protect: super::b2_mirror::protect(),
                     prior_dry: super::b2_mirror::dry(),
                     orig_sel: if sub3 { Some(&mut bd.d_orig_sel) } else { None },
