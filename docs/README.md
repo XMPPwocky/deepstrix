@@ -54,6 +54,7 @@ production values as of 2026-10-04.
 | `v41/EVTRACE_REBUILD_PLAN.md` | P0, P1, P3 built |
 | `ONTOLOGY_REVIEW_2026-10-04.md` | glossary adopted; renames pending |
 | `v41/HOT_SPLIT_SIM.md` | simulator + its recommendations (`scripts/split_sim`) |
+| `v41/DEEPSTRIX_RECIPE.html` | recipe delta on astra's ds4-recipe: what a single box could take from us, with permalinked sources (HTML source of the published page) |
 
 ## History
 
