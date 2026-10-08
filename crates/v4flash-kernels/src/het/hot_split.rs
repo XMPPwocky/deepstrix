@@ -209,22 +209,32 @@ pub fn interleave_layer(counts: &[u32], prev: &[Side], p: &IlParams) -> LayerPla
         }
         let ones: Vec<usize> = (0..ne).filter(|&e| side[e] == Side::B1).collect();
         let twos: Vec<usize> = (0..ne).filter(|&e| side[e] == Side::B2Head).collect();
-        let mut best: Option<(f64, usize, usize)> = None;
+        // Among the pairs that IMPROVE the deviation: one that lands within
+        // the tolerance with the smallest moved mass (the fewest hot ids
+        // exposed); else the one that improves most. Ties: lower ids.
+        let mut best_in: Option<(f64, usize, usize)> = None;
+        let mut best_any: Option<(f64, usize, usize)> = None;
+        let better = |cur: Option<(f64, usize, usize)>, key: f64, a: usize, b: usize| match cur {
+            None => true,
+            Some((k, ba, bb)) => key < k - 1e-12 || ((key - k).abs() <= 1e-12 && (a, b) < (ba, bb)),
+        };
         for &a in &ones {
             for &b in &twos {
                 let after = (m1 - counts[a] as f64 + counts[b] as f64) / mass - p.target;
                 if after.abs() + 1e-12 >= dev.abs() {
                     continue;
                 }
-                let better = match best {
-                    None => true,
-                    Some((s, ba, bb)) => after.abs() < s - 1e-12 || ((after.abs() - s).abs() <= 1e-12 && (a, b) < (ba, bb)),
-                };
-                if better {
-                    best = Some((after.abs(), a, b));
+                if after.abs() <= p.tol {
+                    let moved = counts[a] as f64 + counts[b] as f64;
+                    if better(best_in, moved, a, b) {
+                        best_in = Some((moved, a, b));
+                    }
+                } else if better(best_any, after.abs(), a, b) {
+                    best_any = Some((after.abs(), a, b));
                 }
             }
         }
+        let best = best_in.or(best_any);
         let Some((_, a, b)) = best else { break };
         side[a] = Side::B2Head;
         side[b] = Side::B1;
