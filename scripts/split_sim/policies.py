@@ -34,10 +34,10 @@ class Today:
     name = 'a_today'
 
     def __init__(self, refresh_times=None, refresh_every=None, per_layer=103, pin2=85, b2_slots=106,
-                 b1_slots=135):
+                 b1_slots=135, snapshot=None, refresh_start=0):
         self.hs = simlib.HotSet(per_layer=per_layer)
         self.refresh_times = refresh_times or []
-        self.ri = 0
+        self.ri = refresh_start
         self.refresh_every = refresh_every
         self.n = 0
         self.pin2 = pin2
@@ -47,6 +47,17 @@ class Today:
         self.b1_resident = [set() for _ in range(NL)]
         self.b1_lru = [[] for _ in range(NL)]
         self.refreshes = 0
+        if snapshot:
+            # mid-run start (build_cache --window): the replica's state before the
+            # window; owned ids resident, box 2 pinning its hottest
+            self.hs.load(snapshot)
+            if self.hs.warm:
+                for l in range(NL):
+                    own = self.hs.own[l]
+                    self.b1_resident[l] = {e for e in range(NE) if own[e]}
+                    cnt = self.hs.counts[l]
+                    cand = sorted((e for e in range(NE) if not own[e]), key=lambda e: (-cnt[e], e))
+                    self.pinned[l] = set(cand[:self.pin2])
 
     def _refresh(self):
         before = [list(o) for o in self.hs.own] if self.hs.warm else None

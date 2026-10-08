@@ -54,6 +54,39 @@ def load_refresh_times(path):
     return out
 
 
+def load_refresh_log(path):
+    """[(unix s, {key: value})] from the refresh file; the extra columns
+    (owned= per_layer= mass= changed= picks=) are kept when present."""
+    out = []
+    for line in open(path):
+        p = line.split()
+        if not p:
+            continue
+        kv = {}
+        for x in p[1:]:
+            if '=' in x:
+                k, v = x.split('=', 1)
+                try:
+                    kv[k] = float(v.strip('"'))
+                except ValueError:
+                    pass
+        out.append((parse_iso(p[0]), kv))
+    return out
+
+
+def first_refresh_after(refresh, cache):
+    """Index of the first refresh time a replay over `cache` must still apply:
+    0, or past the hot-set snapshot when the cache starts mid-run (build_cache
+    --window ran the replica over the steps before the window)."""
+    snap = cache.get('hs0') if cache else None
+    if not snap:
+        return 0
+    i = 0
+    while i < len(refresh) and refresh[i] <= snap['t_unix']:
+        i += 1
+    return i
+
+
 # ---------------------------------------------------------------- today's ownership
 
 def hash_box2(layer, e, milli=420):
@@ -76,6 +109,20 @@ class HotSet:
         self.own = [[False] * N_EXPERT for _ in range(N_LAYER)]
         self.warm = False
         self.total = 0
+
+    def snapshot(self, t_unix):
+        return {'counts': [list(c) for c in self.counts], 'own': [list(o) for o in self.own], 'warm': self.warm,
+                'total': self.total, 't_unix': t_unix, 'k': self.k, 'hyst': self.hyst, 'cap': self.cap}
+
+    def load(self, snap):
+        """Start from a snapshot (counts, ownership) taken by build_cache before the window."""
+        if not snap:
+            return self
+        self.counts = [list(c) for c in snap['counts']]
+        self.own = [list(o) for o in snap['own']]
+        self.warm = snap['warm']
+        self.total = snap['total']
+        return self
 
     def note(self, layer, e):
         self.counts[layer][e] += 1

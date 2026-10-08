@@ -72,6 +72,32 @@ def measured_req(req_path):
     return agg, _m2_from(per)
 
 
+def measured_split(req_path):
+    """{(step, lane index, layer): (box-2 picks, box-2 distinct)} from hub_req:
+    the split the hub ACTUALLY made (a lane-layer without a request had none on
+    box 2). Box 1's share is the rest of the lane-layer's picks. Lane index as
+    in `_m2_from` (lane A submits a common layer first)."""
+    per = defaultdict(dict)
+    for r in csv.DictReader(open(req_path), delimiter='\t'):
+        s = f(r['step'])
+        if math.isnan(s):
+            continue
+        per[int(s)][(int(f(r['lane'])), int(f(r['layer'])))] = (f(r['t_submit']), int(f(r['n_picks'])), int(f(r['n_distinct'])))
+    out = {}
+    for s, d in per.items():
+        ids = sorted({k[0] for k in d})
+        order = ids
+        if len(ids) == 2:
+            a, b = ids
+            common = sorted({k[1] for k in d if k[0] == a} & {k[1] for k in d if k[0] == b})
+            if common:
+                l0 = common[0]
+                order = [a, b] if d[(a, l0)][0] <= d[(b, l0)][0] else [b, a]
+        for (lid, layer), (_, npk, nd) in d.items():
+            out[(s, order.index(lid), layer)] = (npk, nd)
+    return out
+
+
 def measured_cadence(req_path):
     """Per step: (periods, sub_to_wait, exit_to_next_sub) lists (ms)."""
     rows = defaultdict(lambda: defaultdict(list))
@@ -193,20 +219,39 @@ def main():
     T0 = {}
     if params_path:
         T0 = {int(k): v for k, v in json.load(open(params_path)).get('T0', {}).items()}
-    # first warm step: after the first refresh
+    # first warm step: after the first refresh (a windowed cache starts warm)
     first_warm = 0
-    for i, s in enumerate(cache['steps']):
-        if clk.to_unix(s['t_start']) > refresh[0]:
-            first_warm = i
-            break
+    snap = cache.get('hs0')
+    r0 = simlib.first_refresh_after(refresh, cache)
+    if not (snap and snap.get('warm')):
+        for i, s in enumerate(cache['steps']):
+            if clk.to_unix(s['t_start']) > refresh[0]:
+                first_warm = i
+                break
+    if '--from-step' in sys.argv:
+        first_warm = max(first_warm, int(sys.argv[sys.argv.index('--from-step') + 1]))
     req, m2_meas = measured_req(req_path)
-    pol = policies.Today(refresh_times=refresh)
+    a = sys.argv
+    opt = lambda k, d=None: a[a.index(k) + 1] if k in a else d  # noqa: E731
+    if opt('--policy', 'today') == 'live-top':
+        import policies_live
+        pol = policies_live.LiveSplit('top', refresh_times=refresh, snapshot=snap, refresh_start=r0,
+                                      b1_slots=int(opt('--b1-slots', 126)), b2_slots=int(opt('--b2-slots', 119)),
+                                      pin_total=int(opt('--pin-total', 105)))
+    else:
+        pol = policies.Today(refresh_times=refresh, snapshot=snap, refresh_start=r0,
+                             pin2=int(opt('--pin2', 85)), b2_slots=int(opt('--b2-slots', 106)),
+                             b1_slots=int(opt('--b1-slots', 135)))
     use_meas = '--pool-model' not in sys.argv
     b1m = {int(s['step']): (0 if math.isnan(s['b1_misses']) else s['b1_misses']) for s in cache['steps']}
     picks = sys.argv[sys.argv.index('--picks') + 1] if '--picks' in sys.argv else 'ran'
+    split = measured_split(req_path) if '--measured-split' in a else None
     col = replay.run(cache, pol, P, clk, eval_from=first_warm, picks=picks, record='collect',
                      m2_override=m2_meas if use_meas else None, b1miss_override=b1m if use_meas else None,
-                     miss_keep=float(sys.argv[sys.argv.index('--miss-keep') + 1]) if '--miss-keep' in sys.argv else 1.0)
+                     miss_keep=float(sys.argv[sys.argv.index('--miss-keep') + 1]) if '--miss-keep' in sys.argv else 1.0,
+                     classes=opt('--classes'), split_override=split)
+    if split is not None:
+        print('box-1 / box-2 split per lane-layer: MEASURED (hub_req n_picks / n_distinct; box 1 = the rest)')
     print('box-2 / box-1 misses:', 'MEASURED (hub_req n_paged, hub_step b1_misses)' if use_meas else 'pool model')
     if '--grid' in sys.argv:
         grid_search(col, P, sys.argv[sys.argv.index('--grid') + 1], measured_cadence(req_path))

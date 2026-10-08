@@ -348,3 +348,35 @@ redirects a pick. The holder rests on host tests and review; in production it fa
 (`V41_B1_HOT_HOLDER=0`); its effect (`holder_b1` / `holder_b2`) is watched at the first live flip.
 G-top (arms A/B) covers the hash split with pins off; `top`'s warm refresh, STATE and the KEEP
 predicates under `top` are verified by host tests and review.
+
+## 14. The sim re-run on production data (2026-10-08; `scripts/split_sim`, outputs data/r1008/)
+
+Production's own pick trace (`picks-sub-20261007-0552.trace`) + the hub evtrace, two windows after
+k1 went default: W1 10-08 14:00-17:00 UTC (26,477 steps, 87% lone) and W2 21:15-22:30 (31,833,
+mostly live >= 3). 0 dropped alignments; the ownership replica matches hub_req exactly on 69.9% of
+lane-layers (unbiased +-1), so costs and calibration use the MEASURED split. Refit costs: iGPU 0.082
++ 0.0818 d1 + 0.0094 n1 + 0.0068 b ms; box 2 95.6 + 101.1 d + 34.1 b us; paging 1.89 ms/expert;
+drain OFF (async upload). Calibration: every W1 cell within -2.9..+2.0% (traffic-weighted -0.3%),
+W2 within +-2.2% except cells holding ~1.5% of its steps. Coverage: W1 + W2 span every decode
+class (live 1 41%, live 2 14%, live >= 3 45% of decode time).
+
+| policy (held out, vs today's top) | W1 lone | W2 all classes |
+|---|---|---|
+| N1 103 P2 60 T 0.60 REP 0 (the code defaults) | -5.3% | -4.6% |
+| N1 115 | -6.8% | -5.9% |
+| N1 124, P2 60 / 75 | -7.0% / -7.4% | -6.3% / -6.4% |
+| N1 124 REP 10 | -9.2% | -8.3% |
+
+N1 is the lever (box-2 misses/step 4.24 at 103 -> 2.91 at 115 -> 2.41 at 124); P2 and the target
+move <= 0.4 pt; OPEN 0 vs 0.2 makes no difference. Per cell (N124): 1L r4 93.2 -> 87.7, 2L r6
+100.2 -> 90.5, 32L r3 76.3 -> 72.4, 32L r4 84.0 -> 77.0. Sensitivity (N124): link +150 us -5.8%,
+box-2 per-expert +25% -5.3%; the ranking holds in every row. Transition from today's top-103 at
+MOVES 3: N124 needs ~16 refreshes (mean share in tolerance; 20-53 min); MOVES 6 converges in ~5 and
+its steady state is as good or better; steady churn ~2x today's box-1 reads (~104 newcomers per
+refresh vs ~47); pre-warm ~0.15 ms/step. Unmodelled: prefill displacement of box 2's head (KEEP off),
+box 1's unified-pool prefill evictions of owned experts (at N1 124 only 2 spare slots per layer),
+the cache prior's re-steering, k1 coverage under the new placement.
+
+**First live settings:** `V41_B1_HOT_IL_PER_LAYER=115` (11 spare slots per layer; 124 gains only
+0.2 pt more and has no prefill margin), `V41_B1_HOT_B2HEAD=60`, `V41_B1_HOT_TARGET=0.60`,
+`V41_B1_HOT_MOVES=6`, REP 0. Then 124 and REP 10 as their own A/Bs.

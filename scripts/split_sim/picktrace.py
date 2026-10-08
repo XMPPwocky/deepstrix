@@ -24,6 +24,11 @@ n_prior_rows, offset). Streams the file; `max_bytes` cuts a growing file.
 """
 import os
 
+# Interned ids: ids >= 257 are not cached by CPython, so every parsed row would
+# carry its own int objects (a long replay cache is mostly these).
+_NI = 4096
+_I = list(range(_NI))
+
 
 class Batch:
     __slots__ = ('layer', 'b', 'ran', 'router', 'n_changed', 'off')
@@ -63,7 +68,7 @@ def batches(path, max_bytes=None, start=0):
                 parts = raw.split()
                 layer = int(parts[1])
                 b = int(parts[2])
-                ids = tuple(int(x) for x in parts[3:])
+                ids = tuple([_I[v] if 0 <= v < _NI else v for v in map(int, parts[3:])])
                 if cur is not None and (cur.layer != layer or cur.b != b or len(cur.ran) >= cur.b):
                     if len(cur.ran) == cur.b:
                         last_done = cur
@@ -79,7 +84,7 @@ def batches(path, max_bytes=None, start=0):
             elif k == b'O':
                 parts = raw.split()
                 layer, b, r = int(parts[1]), int(parts[2]), int(parts[3])
-                ids = tuple(int(x) for x in parts[4:])
+                ids = tuple([_I[v] if 0 <= v < _NI else v for v in map(int, parts[4:])])
                 tgt = last_done
                 if tgt is not None and tgt.layer == layer and tgt.b == b and r < tgt.b:
                     if tgt.router is None:
