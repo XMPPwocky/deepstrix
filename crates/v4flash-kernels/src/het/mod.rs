@@ -26,6 +26,7 @@ pub mod evtrace_ring;
 pub mod evtrace_dev;
 pub mod evtrace_kinds;
 pub mod expert_pager;
+pub mod hot_split;
 pub mod probe_dump;
 pub mod forward_head;
 pub mod forward_layer;
