@@ -318,3 +318,19 @@ admissions unchanged -> 3 table. 8 return sub-mode -> 2.4 (MOVING + pre-warm for
 reads after the exit counted, not prevented). 9 overclaim -> 0.5. 10 sim prerequisites -> 8 step 2
 (production's own trace; params reconstructed; recalibrated post-async). 11 nits -> `IlParams.hyst`
 doc, 2.4 last bullet.
+
+## 12. Review round 3 (code, a44685b; APPROVE WITH CHANGES) and the fixes
+
+Verified: `top` outside a return is bit-identical on every path (refresh, route, prior mask,
+ledger order with and without `by_wants`, band, restore, residency hints, `begin_step`); exactly-once
+routing holds with the holder fallback; no nested locks (`pin_budget`, `keep_fill`); no torn view
+(refresh and route share the scheduler thread). Fixed: (1) `interleave` on a cold hot set (the knob
+left on across a restart) warms up as `top` first (test `interleave_cold_start_warms_as_top`);
+(2) MOVING stamps are u32 (no wrap resurrection); (3) `keep_fill` at every interleave refresh
+(re-queues expired grants); (4) look-ahead hints skip MOVING ids; a pre-warm read refused at the
+in-flight cap goes back to the queue's front (`prefetch_now` -> `Option<bool>`); (5) gate arm D
+`MS_HOT_SPLIT=interleave_holder` (MOVING ids, holder on, `MS_ALLOW_INEXACT=1`, KL bars); (6) the
+`P2` clamp counts `K`, `pin_budget` survives a poisoned lock, `reset_for_test` restores the knobs.
+Caveat kept: KEEP words are decode-only because `pin_enter_prefill` drains the restore queue onto
+the ledger; with `V41_B2_PIN_PREFILL_BAND=0` it returns before draining, so restore (and KEEP) words
+can ride prefill requests -- production runs the band at 4096.

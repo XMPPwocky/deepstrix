@@ -1669,7 +1669,11 @@ impl Sched {
             let n = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize();
             if n > 0 {
                 for (l, e) in v4flash_kernels::het::expert_pager::hot_set::take_prewarm(n) {
-                    pg.prefetch_now(l, e);
+                    if pg.prefetch_now(l, e).is_none() {
+                        // The in-flight cap is full: back to the front, retry next step.
+                        v4flash_kernels::het::expert_pager::hot_set::requeue_prewarm(l, e);
+                        break;
+                    }
                 }
             }
         }

@@ -555,12 +555,12 @@ pub mod hot_set {
     const RETURN_MARGIN: usize = 10;
     /// Return-mode refreshes before it is forced off (logged).
     const RETURN_MAX_REFRESHES: u32 = 60;
-    /// Refresh counter (u16, never 0) and, per (layer, expert), the counter of
+    /// Refresh counter (u32, never 0) and, per (layer, expert), the counter of
     /// the refresh that last moved its HOME between the boxes (0 = never):
     /// design 3.2's MOVING ids, the only ones the holder fallback, the prior's
     /// either-box mask and the ledger's not-stale rule apply to.
     static EPOCH: AtomicU32 = AtomicU32::new(0);
-    static MOVED_AT: [std::sync::atomic::AtomicU16; NL * NE] = [const { std::sync::atomic::AtomicU16::new(0) }; NL * NE];
+    static MOVED_AT: [AtomicU32; NL * NE] = [const { AtomicU32::new(0) }; NL * NE];
     /// A move counts as MOVING for this many refreshes at most (the
     /// destination usually confirms sooner: `clear_moving`).
     const MOVING_REFRESHES: u32 = 4;
@@ -607,7 +607,7 @@ pub mod hot_set {
             return false;
         }
         let at = MOVED_AT[layer as usize * NE + e as usize].load(Relaxed);
-        at != 0 && ((EPOCH.load(Relaxed) as u16).wrapping_sub(at) as u32) < MOVING_REFRESHES
+        at != 0 && EPOCH.load(Relaxed).wrapping_sub(at) < MOVING_REFRESHES
     }
     /// The destination holds it: no longer MOVING.
     #[inline]
@@ -616,12 +616,22 @@ pub mod hot_set {
             MOVED_AT[layer as usize * NE + e as usize].store(0, Relaxed);
         }
     }
-    fn next_epoch() -> u16 {
-        let mut v = (EPOCH.fetch_add(1, Relaxed) + 1) as u16;
+    fn next_epoch() -> u32 {
+        // u32: one refresh a minute wraps in ~8,000 years; 0 is "never moved".
+        let mut v = EPOCH.fetch_add(1, Relaxed).wrapping_add(1);
         if v == 0 {
-            v = (EPOCH.fetch_add(1, Relaxed) + 1) as u16;
+            v = EPOCH.fetch_add(1, Relaxed).wrapping_add(1);
         }
         v
+    }
+    /// MOVING ids now (the gate's report).
+    pub fn moving_count() -> usize {
+        (0..NL * NE).filter(|&i| moving((i / NE) as i32, (i % NE) as u32)).count()
+    }
+    /// A pre-warm read the prefetcher could not take (in-flight cap): back to
+    /// the front of the queue.
+    pub fn requeue_prewarm(layer: i32, e: u32) {
+        PREWARM.lock().unwrap_or_else(|p| p.into_inner()).push_front((layer, e));
     }
     /// The pin ledger's "box 2 no longer owns it" (stale / lost): today's
     /// `!partition_box2` (the hash split before warm-up included), less the
@@ -759,10 +769,13 @@ pub mod hot_set {
         if !enabled() || TOTAL.load(Relaxed) < env_u("V41_B1_HOT_MIN_PICKS", 20_000) as u64 {
             return None;
         }
-        if crate::knobs::B1_HOT_POLICY.pick() == 1 {
+        if crate::knobs::B1_HOT_POLICY.pick() == 1 && WARM.load(Relaxed) {
             RETURNING.store(false, Relaxed);
             return Some(refresh_interleave());
         }
+        // (`interleave` on a cold hot set -- e.g. the knob left on across a
+        // restart -- warms up as `top` first: the interleave fills box 1 only at
+        // `MOVES` per layer per refresh from an empty start.)
         if IL_ACTIVE.swap(false, Relaxed) {
             // Design 2.4: leaving the interleave. KEEP empties now; every
             // layer returns to the top set at the change cap's pace.
@@ -915,7 +928,7 @@ pub mod hot_set {
         let p = super::super::hot_split::IlParams {
             n1,
             k: k::B1_HOT_REP.usize(),
-            p2: k::B1_HOT_B2HEAD.usize().min(keep_cap_per_layer()),
+            p2: k::B1_HOT_B2HEAD.usize().min(keep_cap_per_layer().saturating_sub(k::B1_HOT_REP.usize())),
             target: k::B1_HOT_TARGET.f64(),
             tol: k::B1_HOT_TOL.f64(),
             moves: k::B1_HOT_MOVES.usize(),
@@ -978,9 +991,9 @@ pub mod hot_set {
         IL_STATS[3].store(b2n, Relaxed);
         IL_STATS[4].store(keep_n, Relaxed);
         KEEP_ANY.store(keep_n > 0, Relaxed);
-        if b2n > 0 || first {
-            KEEP_DIRTY.store(true, Relaxed);
-        }
+        // Every interleave refresh: `keep_fill` dedups against held ids and the
+        // queue, so this also re-queues grants that expired unpinned.
+        KEEP_DIRTY.store(true, Relaxed);
         IL_ACTIVE.store(true, Relaxed);
         TOTAL.store(TOTAL.load(Relaxed) / 2, Relaxed);
         WARM.store(true, Relaxed);
@@ -1013,6 +1026,12 @@ pub mod hot_set {
         TOTAL.store(0, Relaxed);
         EPOCH.store(0, Relaxed);
         PREWARM.lock().unwrap().clear();
+        use crate::knobs as k;
+        for (kn, v) in [(&k::B1_HOT_POLICY, "top"), (&k::B1_HOT_TARGET, "0.60"), (&k::B1_HOT_TOL, "0.02"), (&k::B1_HOT_MOVES, "3"),
+                        (&k::B1_HOT_IL_HYST, "40"), (&k::B1_HOT_B2HEAD, "60"), (&k::B1_HOT_IL_PER_LAYER, "0"), (&k::B1_HOT_MAX_CHANGE, "0"),
+                        (&k::B1_HOT_HOLDER, "1"), (&k::B1_HOT_REP, "0"), (&k::B1_HOT_REP_HYST, "5")] {
+            kn.set(v);
+        }
     }
 
     #[cfg(test)]
@@ -1113,6 +1132,29 @@ pub mod hot_set {
             for k in [&crate::knobs::B1_HOT_MAX_CHANGE] {
                 k.set("0");
             }
+            reset_for_test();
+        }
+
+        /// `interleave` on a COLD hot set (the knob left on across a restart):
+        /// the first refresh warms up as `top` (box 1 full at once), the next one
+        /// interleaves from that set.
+        #[test]
+        fn interleave_cold_start_warms_as_top() {
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_for_test();
+            std::env::set_var("V41_B1_HOT_MIN_PICKS", "0");
+            std::env::set_var("V41_B1_HOT_PER_LAYER", "40");
+            crate::knobs::B1_HOT_B2HEAD.set("20");
+            crate::knobs::B1_HOT_POLICY.set("interleave");
+            let mut seed = 7u64;
+            feed(&mut seed, 0.0);
+            let (owned, _, _) = refresh().unwrap();
+            assert_eq!(owned, NL * 40, "box 1 full after the first refresh");
+            assert!(!interleave_active() && keep_list().is_empty());
+            feed(&mut seed, 0.0);
+            refresh().unwrap();
+            assert!(interleave_active());
+            assert_eq!(keep_list().len(), NL * 20);
             reset_for_test();
         }
 
@@ -1661,17 +1703,17 @@ impl ExpertPager {
 
     /// HOT SPLIT pre-warm (design 5): queue `(layer, id)` for the background read
     /// now -- no min-touch gate (a refresh newcomer is wanted on purpose). Same
-    /// dedup and in-flight cap as `prefetch_hint`; false = not queued (no
-    /// prefetcher, resident, already queued, or the queue is full).
-    pub fn prefetch_now(&mut self, layer: i32, id: u32) -> bool {
-        let Some(pf) = self.prefetch.as_mut() else { return false };
+    /// dedup and in-flight cap as `prefetch_hint`. `Some(true)` = queued,
+    /// `Some(false)` = not needed (no prefetcher, resident, already queued),
+    /// `None` = the in-flight cap is full (try again later).
+    pub fn prefetch_now(&mut self, layer: i32, id: u32) -> Option<bool> {
+        let Some(pf) = self.prefetch.as_mut() else { return Some(false) };
         let key = (layer, id);
         if self.res.slot_of.contains_key(&key) || pf.pending.contains(&key) {
-            return false;
+            return Some(false);
         }
         if pf.pending.len() >= PREFETCH_INFLIGHT_MAX {
-            pf.dropped_full += 1;
-            return false;
+            return None;
         }
         {
             let (m, cv) = &*pf.stack;
@@ -1680,7 +1722,7 @@ impl ExpertPager {
         }
         pf.pending.insert(key);
         pf.queued += 1;
-        true
+        Some(true)
     }
 
     /// Queue `(layer, id)` for the background read if it is neither resident nor

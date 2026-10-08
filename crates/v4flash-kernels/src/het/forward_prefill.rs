@@ -9687,7 +9687,8 @@ impl HeterogeneousEngine {
                         }
                         let nl = layer as i32 + k;
                         let owns = owns_next[(k - 1) as usize].as_deref();
-                        let is_box2 = |e: u32| if t2 { super::expert_pager::partition_box2(nl, e) } else { owns.is_some_and(|o| o[e as usize]) };
+                        // (A MOVING id may be served by box 1 meanwhile: no hint for it.)
+                        let is_box2 = |e: u32| if t2 { super::expert_pager::partition_box2(nl, e) && !super::expert_pager::hot_set::moving(nl, e) } else { owns.is_some_and(|o| o[e as usize]) };
                         // L+1's gate weights (the pack) give each rank-1
                         // prediction its margin over rank 2; L+2's are not packed.
                         let lw: &[f32] = if k == 1 && look_ew_host.len() == lh.len() { &look_ew_host } else { &[] };

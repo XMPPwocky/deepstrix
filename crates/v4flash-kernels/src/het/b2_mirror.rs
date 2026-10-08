@@ -343,7 +343,7 @@ pub fn keep_queued_total() -> u64 {
 
 /// Box 2's pin budget from its last pin reply (`None` before one).
 pub fn pin_budget() -> Option<u32> {
-    LEDGER.lock().ok()?.est_pinned().map(|(_, b)| b)
+    LEDGER.lock().unwrap_or_else(|p| p.into_inner()).est_pinned().map(|(_, b)| b)
 }
 
 /// The step clock's value now (the tag on predicted-miss hint words,
