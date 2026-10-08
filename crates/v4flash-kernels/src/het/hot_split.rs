@@ -57,7 +57,7 @@ pub struct IlParams {
     /// Moves per layer per refresh: box-1 newcomers (region fills and swaps
     /// both read on box 1) and replicated-set newcomers.
     pub moves: usize,
-    /// Rank hysteresis of the region (the hot set's `V41_B1_HOT_HYST`).
+    /// Rank hysteresis of the region (`V41_B1_HOT_IL_HYST`).
     pub hyst: usize,
     /// Rank hysteresis of the replicated set.
     pub rep_hyst: usize,

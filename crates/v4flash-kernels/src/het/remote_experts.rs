@@ -4682,6 +4682,11 @@ pub fn take_restore_words(max: usize) -> Vec<u32> {
     g.drain(..n).collect()
 }
 
+/// A copy of the restore queue (the KEEP fill's dedup, `b2_mirror::keep_fill`).
+pub fn restore_words_snapshot() -> Vec<u32> {
+    RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner()).iter().copied().collect()
+}
+
 /// Restore words waiting (the per-step speculative budget's view).
 pub fn restore_words_queued() -> usize {
     RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner()).len()

@@ -302,6 +302,48 @@ pub fn incoming_steps() -> u32 {
 pub fn begin_step() {
     STEP.fetch_add(1, Ordering::Relaxed);
     pin_begin_step();
+    if pin_active() && (super::expert_pager::hot_set::take_keep_dirty() | KEEP_REFILL.swap(false, Ordering::Relaxed)) {
+        keep_fill();
+    }
+}
+
+/// A reconnect: re-queue the KEEP pins at the first decode step with pins on
+/// (`pin_apply_words` ignores grants before that).
+static KEEP_REFILL: AtomicBool = AtomicBool::new(false);
+/// KEEP words queued in all (`keep_fill`).
+static KEEP_QUEUED_TOT: AtomicU64 = AtomicU64::new(0);
+
+/// HOT SPLIT (docs/v41/HOT_SPLIT_DESIGN.md 4): queue a pin word for every KEEP
+/// id the mirror does not show held and that is not already on the restore
+/// queue, on the restore queue (decode requests only, after every queued
+/// release, paced per request; a resident expert is pinned without a read).
+/// Called at a refresh that changed the KEEP set and after a reconnect;
+/// decode entry re-pins through `take_restore_keep`. Returns the count.
+pub fn keep_fill() -> usize {
+    let list = super::expert_pager::hot_set::keep_list();
+    if list.is_empty() {
+        return 0;
+    }
+    let queued: std::collections::HashSet<u32> = super::remote_experts::restore_words_snapshot().into_iter().collect();
+    let words: Vec<u32> = list
+        .into_iter()
+        .filter(|&(l, e)| !held(l, e))
+        .map(|(l, e)| (l << 16) | e)
+        .filter(|w| !queued.contains(w))
+        .collect();
+    let n = super::remote_experts::push_restore_words(&words);
+    KEEP_QUEUED_TOT.fetch_add(n as u64, Ordering::Relaxed);
+    n
+}
+
+/// KEEP words queued since the start.
+pub fn keep_queued_total() -> u64 {
+    KEEP_QUEUED_TOT.load(Ordering::Relaxed)
+}
+
+/// Box 2's pin budget from its last pin reply (`None` before one).
+pub fn pin_budget() -> Option<u32> {
+    LEDGER.lock().ok()?.est_pinned().map(|(_, b)| b)
 }
 
 /// The step clock's value now (the tag on predicted-miss hint words,
@@ -939,12 +981,18 @@ impl PinLedger {
     /// `(count, layer, e)`, so uncredited prefill pins go first only as count-0
     /// ties.
     pub fn release_for_prefill(&mut self, band: u32, max: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
+        self.release_for_prefill_keep(band, max, stale, |_, _| false, false)
+    }
+
+    /// `release_for_prefill` with box 2's KEEP set (docs/v41/HOT_SPLIT_DESIGN.md
+    /// 4): KEEP pins go last, or never with `skip_keep` (`V41_B1_HOT_KEEP_PREFILL`).
+    pub fn release_for_prefill_keep(&mut self, band: u32, max: usize, stale: impl Fn(u32, u32) -> bool, keep: impl Fn(u32, u32) -> bool, skip_keep: bool) -> Vec<u32> {
         let Some((est, budget)) = self.est_pinned() else { return Vec::new() };
         let target = budget.saturating_sub(band);
         if est <= target {
             return Vec::new();
         }
-        let words = self.release_coldest(((est - target) as usize).min(max), stale);
+        let words = self.release_coldest_ex(((est - target) as usize).min(max), stale, keep, skip_keep).0;
         self.prefill_released.extend_from_slice(&words);
         words
     }
@@ -955,18 +1003,24 @@ impl PinLedger {
     /// held again, and box 2 still owns (not `stale`), hottest first (count,
     /// then recency), as admission words. Clears the list.
     pub fn take_restore(&mut self, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
+        self.take_restore_keep(stale, |_, _| false)
+    }
+
+    /// `take_restore` with box 2's KEEP set (design 4): a released KEEP id is
+    /// restored regardless of `last_want` and `stale`, ahead of the rest.
+    pub fn take_restore_keep(&mut self, stale: impl Fn(u32, u32) -> bool, keep: impl Fn(u32, u32) -> bool) -> Vec<u32> {
         let mut words = std::mem::take(&mut self.prefill_released);
         words.retain(|&w| {
             let (l, e) = (w >> 16, w & 0xFFFF);
             (l as usize) < LAYERS
                 && (e as usize) < NE
-                && self.last_want[l as usize * NE + e as usize] != 0
                 && !self.held(l, e)
-                && !stale(l, e)
+                && (keep(l, e) || (self.last_want[l as usize * NE + e as usize] != 0 && !stale(l, e)))
         });
         words.sort_by_key(|&w| {
-            let k = (w >> 16) as usize * NE + (w & 0xFFFF) as usize;
-            (std::cmp::Reverse(self.counts[k]), std::cmp::Reverse(self.last_want[k]), w)
+            let (l, e) = (w >> 16, w & 0xFFFF);
+            let k = l as usize * NE + e as usize;
+            (!keep(l, e), std::cmp::Reverse(self.counts[k]), std::cmp::Reverse(self.last_want[k]), w)
         });
         words.dedup();
         words
@@ -985,6 +1039,11 @@ impl PinLedger {
     /// `step`, where (with `by_wants` only) a held expert `stale(layer, e)`
     /// -- box 2 no longer owns it -- ranks below every other one.
     pub fn step_ranked(&mut self, headroom: u32, decay_steps: u32, max: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
+        self.step_ranked_keep(headroom, decay_steps, max, stale, |_, _| false)
+    }
+
+    /// `step_ranked` that never releases a KEEP pin (design 4).
+    pub fn step_ranked_keep(&mut self, headroom: u32, decay_steps: u32, max: usize, stale: impl Fn(u32, u32) -> bool, keep: impl Fn(u32, u32) -> bool) -> Vec<u32> {
         self.steps = self.steps.wrapping_add(1);
         if decay_steps > 0 && self.steps % decay_steps == 0 {
             for c in self.counts.iter_mut() {
@@ -1005,7 +1064,7 @@ impl PinLedger {
             return Vec::new();
         }
         let want = (est - budget.saturating_sub(2 * headroom)) as usize;
-        let (words, watermark) = self.release_coldest_ex(want.min(max), stale);
+        let (words, watermark) = self.release_coldest_ex(want.min(max), stale, keep, true);
         // A sweep of only stale experts says nothing about the pressure.
         if let Some(w) = watermark {
             self.watermark = w;
@@ -1028,12 +1087,15 @@ impl PinLedger {
     /// as in `step_ranked`: each is not held from now on, gets the next release
     /// index, and its word is queued. Returns the words.
     pub fn release_coldest(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
-        self.release_coldest_ex(n, stale).0
+        self.release_coldest_ex(n, stale, |_, _| false, false).0
     }
 
     /// `release_coldest`, also returning the highest count released among
     /// experts box 2 still owns (the admission watermark; `None` if none went).
-    fn release_coldest_ex(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool) -> (Vec<u32>, Option<u32>) {
+    /// KEEP pins (design 4) are tier 2 (after every other pin), or not
+    /// candidates at all with `skip_keep`; with an empty KEEP set the order is
+    /// exactly the old one.
+    fn release_coldest_ex(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool, keep: impl Fn(u32, u32) -> bool, skip_keep: bool) -> (Vec<u32>, Option<u32>) {
         // `(tier, count, recency, key)`; tier and recency are constant without
         // `by_wants`, so the order is exactly the old `(count, key)` one.
         let mut cand: Vec<(u32, u32, u32, u32)> = Vec::new();
@@ -1044,6 +1106,12 @@ impl PinLedger {
                 bits &= bits - 1;
                 let (l, e) = (wi / WORDS, (wi % WORDS) * 64 + b);
                 let k = l * NE + e;
+                if keep(l as u32, e as u32) {
+                    if !skip_keep {
+                        cand.push((2, self.counts[k], self.last_want[k], k as u32));
+                    }
+                    continue;
+                }
                 if self.by_wants {
                     let tier = u32::from(!stale(l as u32, e as u32));
                     cand.push((tier, self.counts[k], self.last_want[k], k as u32));
@@ -1120,6 +1188,7 @@ pub fn on_connect() {
         }
     }
     PIN_MODE.store(if pin_wanted() { 1 } else { 0 }, Ordering::Relaxed);
+    KEEP_REFILL.store(true, Ordering::Relaxed);
     // The new daemon may or may not have a nursery: probe again.
     NURSERY_SUPPORT.store(0, Ordering::Relaxed);
 }
@@ -1217,9 +1286,13 @@ fn pin_begin_step() {
     }
     let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
     let partition = super::expert_pager::t2_partition();
-    let words = g.step_ranked(pin_headroom(), pin_decay_steps(), PIN_RELEASE_MAX_PER_STEP, |l, e| {
-        partition && !super::expert_pager::partition_box2(l as i32, e)
-    });
+    let words = g.step_ranked_keep(
+        pin_headroom(),
+        pin_decay_steps(),
+        PIN_RELEASE_MAX_PER_STEP,
+        |l, e| partition && super::expert_pager::hot_set::box2_stale(l as i32, e),
+        |l, e| super::expert_pager::hot_set::keep(l as i32, e),
+    );
     for &w in &words {
         let (l, e) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
         BITS[l][e / 64].fetch_and(!(1u64 << (e % 64)), Ordering::Relaxed);
@@ -1231,9 +1304,15 @@ fn pin_begin_step() {
     N_RELEASED_UNUSED.fetch_add(u64::from(unused), Ordering::Relaxed);
 }
 
-/// Box 2 no longer owns `(layer, e)`: the T2 partition moved it to box 1.
+/// Box 2 no longer owns `(layer, e)`: the T2 partition moved it to box 1
+/// (and box 2 need not keep it, nor still serve it while it moves:
+/// `hot_set::box2_stale`).
 fn box2_lost(layer: u32, e: u32) -> bool {
-    super::expert_pager::t2_partition() && !super::expert_pager::partition_box2(layer as i32, e)
+    super::expert_pager::t2_partition() && super::expert_pager::hot_set::box2_stale(layer as i32, e)
+}
+
+fn keep_pred(layer: u32, e: u32) -> bool {
+    super::expert_pager::hot_set::keep(layer as i32, e)
 }
 
 /// Release pins down to `budget - band`, clearing them from the mirror at
@@ -1241,7 +1320,7 @@ fn box2_lost(layer: u32, e: u32) -> bool {
 /// it); `TOT_RELEASED` counts every release, and `N_RELEASED_UNUSED` (the
 /// next `hub_step`) counts these too.
 fn band_release(g: &mut PinLedger, band: u32) -> usize {
-    let words = g.release_for_prefill(band, PIN_PREFILL_RELEASE_MAX, box2_lost);
+    let words = g.release_for_prefill_keep(band, PIN_PREFILL_RELEASE_MAX, box2_lost, keep_pred, crate::knobs::B1_HOT_KEEP_PREFILL.on());
     for &w in &words {
         let (l, e) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
         BITS[l][e / 64].fetch_and(!(1u64 << (e % 64)), Ordering::Relaxed);
@@ -1296,7 +1375,7 @@ pub fn take_band_reopened() -> usize {
 /// low-priority restore queue (`remote_experts::push_restore_words`). Returns
 /// the number queued.
 pub fn pin_enter_decode() -> usize {
-    let words = LEDGER.lock().map(|mut g| g.take_restore(box2_lost)).unwrap_or_default();
+    let words = LEDGER.lock().map(|mut g| g.take_restore_keep(box2_lost, keep_pred)).unwrap_or_default();
     if words.is_empty() || !pin_active() || !pin_restore() {
         return 0;
     }
@@ -2807,6 +2886,46 @@ pub(crate) mod tests {
         g.apply_map(1, &map(&[2, 4, 5, 6, 7, 8, 9]), 4);
         assert_eq!(g.take_restore(|l, e| l == 1 && e == 1), vec![(1 << 16) | 3, (1 << 16) | 0], "hottest first; re-held and stale skipped");
         assert!(g.take_restore(|_, _| false).is_empty(), "taken once");
+    }
+
+    /// HOT SPLIT KEEP tier (docs/v41/HOT_SPLIT_DESIGN.md 4): headroom never
+    /// releases a KEEP pin; the prefill band releases KEEP last (or skips it);
+    /// the restore takes KEEP first regardless of wants and staleness; an empty
+    /// KEEP predicate is the old ledger.
+    #[test]
+    fn pin_keep_tier() {
+        let ids: Vec<u32> = (0..10).collect();
+        let setup = || {
+            let mut g = PinLedger::new();
+            g.apply_map(1, &map(&ids), 0);
+            g.note_reply(0, 10, 10);
+            for e in 0..10u32 {
+                g.note_pick_w(1, e, e);
+                g.note_wanted(1, e);
+            }
+            g
+        };
+        // The coldest three are KEEP.
+        let keep = |l: u32, e: u32| l == 1 && e < 3;
+        let w1 = |w: Vec<u32>| {
+            let mut v: Vec<u32> = w.iter().map(|&w| w & 0xFFFF).collect();
+            v.sort();
+            v
+        };
+        // Headroom: est 10 > 10 - 1 -> down to 8: the two coldest NON-KEEP.
+        let mut g = setup();
+        assert_eq!(w1(g.step_ranked_keep(1, 0, 512, |_, _| false, keep)), vec![3, 4]);
+        let mut o = setup();
+        assert_eq!(w1(o.step_ranked_keep(1, 0, 512, |_, _| false, |_, _| false)), w1(setup().step_ranked(1, 0, 512, |_, _| false)), "no KEEP = the old order");
+        // Band to target 1 (9 releases wanted): KEEP skipped -> only the 7 others.
+        let mut h = setup();
+        assert_eq!(w1(h.release_for_prefill_keep(9, 4096, |_, _| false, keep, true)), (3..10).collect::<Vec<_>>());
+        assert!((0..3).all(|e| h.held(1, e)));
+        // KEEP last: the 7 others, then the two coldest KEEP.
+        let mut k = setup();
+        assert_eq!(w1(k.release_for_prefill_keep(9, 4096, |_, _| false, keep, false)), vec![0, 1, 3, 4, 5, 6, 7, 8, 9]);
+        // Restore with everything stale: only KEEP comes back, hottest first.
+        assert_eq!(k.take_restore_keep(|_, _| true, keep), vec![(1 << 16) | 1, 1 << 16]);
     }
 
     /// Box 2 pins what a <= 16-row prefill request picks (no decode credit on

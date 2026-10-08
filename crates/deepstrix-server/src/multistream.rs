@@ -1635,9 +1635,22 @@ impl Sched {
         // Hot-set ownership refresh (see expert_pager::hot_set); `tick` is
         // advanced once per scheduler tick.
         if self.tick % knobs::B1_HOT_REFRESH.get() == 0 {
-            if let Some((owned, mass, changed)) = v4flash_kernels::het::expert_pager::hot_set::refresh() {
-                tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
-                    picks = v4flash_kernels::het::expert_pager::hot_set::picks_seen(), "multistream: box-1 hot set refreshed");
+            use v4flash_kernels::het::expert_pager::hot_set;
+            if let Some((owned, mass, changed)) = hot_set::refresh() {
+                if hot_set::interleave_active() || hot_set::returning() {
+                    // HOT SPLIT (docs/v41/HOT_SPLIT_DESIGN.md): the placement's
+                    // own numbers, and the holder / pre-warm / KEEP totals.
+                    let (share1, swaps, b1_new, b2_new, keep) = hot_set::il_stats();
+                    let (holder_b1, holder_b2) = hot_set::holder_totals();
+                    tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
+                        picks = hot_set::picks_seen(), interleave = hot_set::interleave_active(), returning = hot_set::returning(),
+                        share1 = format!("{share1:.3}"), swaps, b1_new, b2_new, keep, holder_b1, holder_b2,
+                        prewarm_queued = hot_set::prewarm_queued(), keep_queued = v4flash_kernels::het::b2_mirror::keep_queued_total(),
+                        "multistream: box-1 hot set refreshed");
+                } else {
+                    tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
+                        picks = hot_set::picks_seen(), "multistream: box-1 hot set refreshed");
+                }
             }
         }
         // Token boundary: nothing is reading the pool (the previous step and
@@ -1649,7 +1662,17 @@ impl Sched {
         // would otherwise return a write's fault as their own (`settle_writes`).
         // (The wait is what the step's host tail did not hide of the last write.)
         let ring_settle_ms = self.dsp.as_mut().map(|d| d.settle_writes()).unwrap_or(0.0);
-        if let Some(pg) = state.pager.as_mut() { pg.drain_prefetched()?; }
+        if let Some(pg) = state.pager.as_mut() {
+            pg.drain_prefetched()?;
+            // HOT SPLIT pre-warm (design 5): box-1 newcomers of the last
+            // refreshes, a few per step (empty outside an interleave / return).
+            let n = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize();
+            if n > 0 {
+                for (l, e) in v4flash_kernels::het::expert_pager::hot_set::take_prewarm(n) {
+                    pg.prefetch_now(l, e);
+                }
+            }
+        }
         // Perfetto (`V41_PERFETTO_STEPS` live, or `V41_PERFETTO_OUT`): the
         // previous step's leftovers (the drafter's ring writes, recorded after
         // its export) go out before this step's pool reset.

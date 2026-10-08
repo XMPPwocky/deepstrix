@@ -8402,7 +8402,18 @@ impl HeterogeneousEngine {
                         {
                             let dst = &mut bd.prior_pin.as_mut_slice()[slot..slot + ne];
                             for (e, d) in dst.iter_mut().enumerate() {
-                                let held = if super::expert_pager::partition_box2(layer, e as u32) {
+                                // HOT SPLIT 3.2: held by the box that will SERVE it
+                                // (the route's `serve_on_box2`; only a MOVING id can
+                                // differ from its home).
+                                let home2 = super::expert_pager::partition_box2(layer, e as u32);
+                                let on2 = if super::expert_pager::hot_set::moving(layer, e as u32) {
+                                    let r = super::b2_mirror::lookup(layer, e as u32);
+                                    let (h, inc) = r.map_or((false, false), |r| (r.held, r.incoming));
+                                    super::expert_pager::hot_set::serve_on_box2(layer, e as u32, home2, pg.is_resident(layer, e as u32), h, inc)
+                                } else {
+                                    home2
+                                };
+                                let held = if on2 {
                                     super::b2_mirror::resident(layer, e as u32) == Some(true)
                                 } else {
                                     pg.is_resident(layer, e as u32)
@@ -9492,6 +9503,9 @@ impl HeterogeneousEngine {
                 let mut seen = vec![false; N_EXPERT as usize];
                 let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
                 let mut skipped_remote = 0usize;
+                // HOT SPLIT 3.2: the holder fallback serves decode rows only
+                // (prefill and verify chunks keep the home rule).
+                let holder_rows = matches!(rows, RowLayout::Arena { .. });
                 // Under a live cache-prior, rank the hot set by the ROUTER's picks,
                 // not the prior's (held experts would inflate their own rank and
                 // lock box 1's set in).
@@ -9537,8 +9551,26 @@ impl HeterogeneousEngine {
                         // keeps `V41_REPLAY_OFFLOAD` off is a property of the CED
                         // replay's 162-wide union at B=128, not of a verify.
                         if remote_split_on && super::expert_pager::t2_partition() {
-                            // Box 2's share: always hers.
-                            if super::expert_pager::partition_box2(layer as i32, sv as u32) {
+                            // Box 2's share: always hers -- except a MOVING id of a
+                            // decode row, served by whichever box holds it until its
+                            // new home does (HOT SPLIT 3.2, `serve_on_box2`).
+                            let home2 = super::expert_pager::partition_box2(layer as i32, sv as u32);
+                            let on2 = if holder_rows && super::expert_pager::hot_set::moving(layer as i32, sv as u32) {
+                                let b1_has = pg.is_resident(layer as i32, sv as u32);
+                                let r = super::b2_mirror::lookup(layer as i32, sv as u32);
+                                let (h, inc) = r.map_or((false, false), |r| (r.held, r.incoming));
+                                if (home2 && h) || (!home2 && b1_has) {
+                                    super::expert_pager::hot_set::clear_moving(layer as i32, sv as u32);
+                                }
+                                let on2 = super::expert_pager::hot_set::serve_on_box2(layer as i32, sv as u32, home2, b1_has, h, inc);
+                                if on2 != home2 {
+                                    super::expert_pager::hot_set::note_holder(on2);
+                                }
+                                on2
+                            } else {
+                                home2
+                            };
+                            if on2 {
                                 extra_remote[sv as usize] = true;
                                 continue;
                             }

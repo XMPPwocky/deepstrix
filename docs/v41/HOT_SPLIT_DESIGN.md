@@ -1,8 +1,9 @@
 # Hot split: interleaved head (+ replicated top-K later) (design, 2026-10-08)
 
-Status: DRAFT rev 2 (2026-10-08), branch `worktree-hot-split` (from `cb5b594`, the deployed
+Status: DRAFT rev 3 (2026-10-08), branch `worktree-hot-split` (from `cb5b594`, the deployed
 prefetch source). Owner 10-08: "let's go for hot split. no restarts w/o asking; otherwise, go nuts".
-Rev 2 folds in review round 1 (16 findings; section 10 lists them and where each went).
+Rev 2 folded in review round 1 (16 findings), rev 3 round 2 (11 findings) and matches the slice-1
+wiring; section 10 maps every finding.
 
 Sources: `HOT_SPLIT_SIM.md` (policy (c)/(d), the replay simulator), `DECODE_IDEAS_SWEEP_2026-10-06.md`
 lever #1, the 10-08 code map of every ownership consumer (section 3), the live hub log of 10-08.
@@ -15,7 +16,7 @@ lever #1, the 10-08 code map of every ownership consumer (section 3), the live h
    the deploy is ONE hub restart (owner's go) with the policy `top`.
 2. **One live knob picks the policy**: `V41_B1_HOT_POLICY = top` (default; today's code path,
    bit-identical) `| interleave`. Both directions of the switch are bounded migrations (section 2.4);
-   rollback is the knob back to `top`, which RETURNS to today's placement within ~20 refreshes.
+   rollback is the knob back to `top`, which RETURNS to today's placement layer by layer (2.4).
 3. **Ownership states per (layer, expert):** `B1` (box 1 owns and computes), `B2H` (box-2 head: box 2
    computes, the hub keeps it PINNED), `B2` (box 2's cold tail, its LRU), and, in the second step,
    `REP` (resident on both; the route picks the leg). `partition_box2(l, e)` keeps its meaning "box 2
@@ -24,8 +25,10 @@ lever #1, the 10-08 code map of every ownership consumer (section 3), the live h
    keep their side; box 1's mass share is pulled toward the target by at most `V41_B1_HOT_MOVES`
    box-1 reads per layer per refresh. A strict rank alternation flips both owners of every adjacent
    rank swap at every refresh; the sim never priced that churn (`HOT_SPLIT_SIM.md` 6, 8).
-5. **A moved expert is served by whichever box holds it** until the destination holds it (the
-   HOLDER FALLBACK, section 3.2): a refresh never puts a demand read on the critical path.
+5. **A MOVING expert is served by whichever box holds it** until the destination holds it (the
+   HOLDER FALLBACK, section 3.2). Demand reads from a refresh are bounded and counted, not zero: an
+   expert neither box holds is still read (a tail id filled into a vacancy that box 2 holds
+   unpinned, a dropped KEEP read after box 1 evicted the id).
 6. **Ship policy (c) first: `REP = 0`.** The sim gives (c) at 0.55 -10.3% of (d)'s -12.6%. Without
    the replicated set there is no leg choice, no co-row dependence of a row's split, no REP pins and
    no residency-hint conflict, and the bit-exact gates stay meaningful. `REP` ships in the same build
@@ -90,17 +93,21 @@ per refresh, and separately the REP newcomers.
   already resident and pinned there: no box-1 reads), then swaps toward the target, `MOVES` per
   layer per refresh (~3-8 refreshes at the measured curve; the test on a Zipf curve converges in a
   few). The holder fallback (3.2) keeps the swapped ids served from box 1 until box 2 holds them.
-- **`interleave -> top` (RETURN MODE):** today's `refresh` would keep the interleaved set forever
-  (every incumbent within rank `per_layer + hyst` = 203 stays, so nothing is ever replaced). On a
-  switch to `top` the hub enters return mode: `refresh` runs with incumbency limited to rank <
-  `per_layer` (hysteresis off) and the change cap (`V41_B1_HOT_MAX_CHANGE`, made LIVE) still on, and
-  leaves return mode when `OWN` equals the top-`per_layer` set of every layer (then the normal
-  hysteresis applies again). Box 2's head ids return to box 1 at <= MAX_CHANGE per layer per refresh:
-  ~50 per layer / 3 = ~17 refreshes, ~15-20 min at the measured 45-68 s refresh period; the
-  holder fallback serves them from box 2 meanwhile. KEEP empties at once (STATE has no B2H under
-  `top`), so the ledger releases the ex-head pins by its normal order.
+- **`interleave -> top` (RETURN MODE, per layer):** today's `refresh` would keep the interleaved
+  set forever (every incumbent within rank `per_layer + hyst` = 203 stays, so nothing is ever
+  replaced). On a switch to `top` EVERY layer enters return mode: a returning layer refreshes with
+  incumbency limited to rank < `per_layer` (hysteresis off) and the change cap
+  (`V41_B1_HOT_MAX_CHANGE`, made LIVE) on; its changes are MOVING (3.2) and its box-1 newcomers are
+  pre-warmed. A layer leaves return mode on COVERAGE -- box 1 owns every rank below `per_layer -
+  10` -- not on equality with the top set (live counts reshuffle the flat region at the cutoff by
+  more than the cap every refresh, so equality never comes). Return mode ends when no layer is
+  returning, or after 60 refreshes (forced, logged). Box 2's head ids return at <= MAX_CHANGE per
+  layer per refresh; KEEP empties at once (STATE has no B2H under `top`), so the ledger releases the
+  ex-head pins by its normal order. After it, `top` is exactly today's refresh again. Test:
+  `hot_set::tests::interleave_switch_and_return` (counts jittered +-30% every refresh).
 - `policy = top` outside return mode runs today's `refresh` unchanged, STATE = B1/B2 from `OWN`, KEEP
-  empty, no pre-warm, no holder fallback: every consumer sees exactly today's answers (G-top).
+  empty, no MOVING id, no pre-warm, no holder fallback: every consumer sees exactly today's answers
+  (G-top). Before warm-up `keep()` is false and `partition_box2` takes the hash path, as today.
 
 ## 3. Consumers (FP = `forward_prefill.rs`, BM = `b2_mirror.rs`, RE = `remote_experts.rs`)
 
@@ -108,13 +115,13 @@ per refresh, and separately the REP newcomers.
 |---|---|---|
 | route pick loop FP:9539-9556 | `partition_box2` -> `extra_remote`, else `ids` (b1_page_misses) | B1 -> `ids`; B2H/B2 -> `extra_remote`; each subject to the holder fallback (3.2); REP -> the leg choice (3.1) |
 | prefill / verify rows (same loop, b > 8 or not Arena) | same | no holder fallback; REP -> box 1 (fixed), so `lm_prefetch_words` FP:836 and `prefill_readahead` FP:10210 see box 1 as home |
-| cache-prior held mask FP:8405-8410 | box-1 owned: `pg.is_resident`; else `b2_mirror::resident` | held if the box that will SERVE it holds it, i.e. either box for REP and for an id in transition (3.2) |
+| cache-prior held mask FP:8405-8410 | box-1 owned: `pg.is_resident`; else `b2_mirror::resident` | held by the box that will SERVE it: `serve_on_box2` (3.2), the same function the route calls; differs from today only for MOVING ids (and REP) |
 | substitution `predicted_miss` (mode 2, off) FP:9152, 9342 | | same rule as the held mask |
-| displaced-pick admissions FP:9239-9308 | box-2 picks not held -> admission words | unchanged for B2; B2H not held -> the KEEP queue instead (section 4); REP never |
+| displaced-pick admissions FP:9239-9308 | box-2 picks not held -> admission words | unchanged (an admission word grants a pin; B2H keeps its INCOMING mark and priority); REP never |
 | `note_incoming_covered` FP:9229 | counter | counts box-2 home picks only |
 | look-ahead `is_box2` FP:9658 (`V41_B2_MISS_PREFETCH`) | box-2 predictions -> LIKELY hints | unchanged (already skips held B2H); REP is not box 2 |
 | `wants_for_box2` FP:9745 / ledger counts | masked to box 2's partition | REP and B2H count as box-2 wants (ranking; KEEP protects them anyway) |
-| ledger stale `pin_begin_step` BM:1219-1222, `box2_lost` BM:1235-1237 | `!partition_box2` = stale/lost | stale/lost = STATE `B1` only; KEEP = STATE in {B2H, REP} (section 4) |
+| ledger stale `pin_begin_step` BM:1219-1222, `box2_lost` BM:1235-1237 | `!partition_box2` = stale/lost | `hot_set::box2_stale` = `!partition_box2 && !keep && !moving` (today's expression, hash regime included, less KEEP and less a MOVING id box 2 still serves); KEEP = STATE in {B2H, REP} (section 4) |
 | residency hints `push_hint` on box-1 admissions (RE:5776-5787, sent RE:10017) | box 2 demotes its copy | never for a KEEP id |
 | `touch_resident` FP:9310-9319 | prior-added box-1 substitutes | also every REP pick routed to box 2 |
 | pick trace FP:9188-9207 | owner chars `1`/`2`; nothing offline reads them | `R` for REP; the leg chosen goes to evtrace `hub_req` (`n_rep_b1`, `n_rep_b2`) and the trace's new `L` line |
@@ -151,20 +158,28 @@ the partition branch before `b1_page_misses`, before `sel_wants`, `owns_eff`,
 choose differently for the same layer (`mark_remote_after_ensure` rebuilds the remap per lane;
 the upload is stream-ordered on `ie.compute`).
 
-### 3.2 The holder fallback (decode rows under `interleave`; `V41_B1_HOT_HOLDER`, default on)
+### 3.2 MOVING ids and the holder fallback (decode rows; `V41_B1_HOT_HOLDER`, default on)
 
 A refresh flips `STATE` before the destination box holds the moved expert, and the next step picks
-it (the refresh runs at the head of `decode_rows`, MS:1637). So at route, per distinct decode pick:
+it (the refresh runs at the head of `decode_rows`, MS:1637). An id whose HOME changed boxes at a
+refresh (interleave, or a returning layer under `top`) is MOVING: `MOVED_AT[l][e]` = the refresh
+counter, MOVING while fewer than 4 refreshes old and not confirmed. The destination confirms it:
+the route clears it when the home box holds it (box 1 `pg.is_resident`, box 2 mirror `held`), and a
+box-1 pre-warm admission clears it. Only MOVING ids are affected (applying the rule to every id
+would route box-2 tail ids still in box 1's ~921 spare LRU slots to box 1 for good, pulling mass onto
+the bottleneck above the target):
 
-- home box 1 (`B1`) but `!pg.is_resident` and the mirror shows box 2 holding it (held or pending)
-  -> box 2;
-- home box 2 (`B2H` or `B2`) but the mirror does not show it held/pending and `pg.is_resident`
-  -> box 1;
-- otherwise the home.
+    serve_on_box2(l, e, home_box2, b1_has, b2_held, b2_incoming):
+      not MOVING or knob off            -> home
+      home box 1, !b1_has, b2_held      -> box 2   (pinned there: no read, no surprise)
+      home box 2, !b2_held, !b2_incoming, b1_has -> box 1
+      otherwise                         -> home
 
-It covers both directions of every swap, the return mode, and box 1's de-owned leftovers. It reads
-residency, so the split depends on history: it is OFF in the bit-exact gate arms. Counted per step
-(`hs_fallback_b1`, `hs_fallback_b2`).
+`held` is the mirror's pinned bit (the PENDING overlay is off in production, `V41_SUB_PENDING`=0);
+INCOMING keeps a box-2-home id on box 2. The cache prior's held mask calls the same function, so
+mask and route agree; a residency change between chain time and route costs at most one read. It
+reads residency, so the split depends on history: OFF in the bit-exact gate arms. Counted:
+`holder_b1` / `holder_b2` in the refresh log line. Test: `hot_set::tests::holder_decision`.
 
 ## 4. Box 2: the KEEP set
 
@@ -175,13 +190,18 @@ ledger is replaced on every reconnect, `on_connect` BM:1108-1126). Size at the d
 
 - **Never released:** `release_coldest_ex` (headroom and decay) skips KEEP candidates; stale = STATE
   `B1` only; `take_restore` accepts a KEEP id regardless of `last_want` and stale.
-- **Pinned by words on their own queue:** a low-priority KEEP queue beside the restore words (not
-  `PREFETCH_WORDS`, whose 4,096 cap and LM-prefill guard (FP:817-821) it would share with the
-  cache-prior admissions). It is filled at a refresh (box-2 newcomers first), at decode entry and
-  after a reconnect, with every KEEP id the mirror does not show held, and drains at most
-  `V41_B1_HOT_KEEP_WORDS_STEP` (default 16) per decode step. A grant that expires unpinned (a word
-  for an expert sitting in a nursery or partial slot, RE:3245-3250) is simply re-queued at the next
-  fill; `hs_keep_requeued` counts them. Decode picks of B2H ids grant pins too.
+- **Pinned by words on the RESTORE queue** (`remote_experts::RESTORE_WORDS`, not
+  `PREFETCH_WORDS`, whose 4,096 cap and LM-prefill guard it would share with the cache-prior
+  admissions): decode requests only (a prefill entry moves the queue onto the ledger's restore
+  list), after every queued release (`releases_queued() == 0`, so a grant never overtakes the
+  release of an id that left KEEP and came back), paced per request like restores. `keep_fill`
+  queues every KEEP id the mirror does not show held and that is not on the queue already, at the
+  first decode step after a refresh that changed KEEP, and after a reconnect at the first decode
+  step with pins on (`pin_apply_words` ignores grants before). At decode entry KEEP comes back
+  through `take_restore_keep` only (KEEP first, regardless of `last_want` and stale). A grant that
+  expires unpinned (nursery or partial slot, RE:3245-3250) is re-queued at the next fill.
+  `keep_queued` (total) is in the refresh log line. Decode picks and admissions of B2H ids grant
+  pins too. If `V41_B2_SPEC_BUDGET` is ever turned on, `budget_plan` sees these as restores.
 - **Prefill band:** `V41_B1_HOT_KEEP_PREFILL` (live, default OFF). Off: today's band release order
   (KEEP last), and KEEP is restored first at decode entry (resident ids re-pin without a read). On:
   the band skips KEEP, so box 2's unpinned room for prefill falls from ~4,620 to ~2,360 slots (REP
@@ -236,9 +256,11 @@ ledger is replaced on every reconnect, `on_connect` BM:1108-1126). Size at the d
 ## 8. Rollout
 
 1. Build + tests; ONE hub restart window with the owner's go (G-top, G-il; up with `top`): no
-   change in behaviour. The pick trace becomes a live knob (`V41_PICK_TRACE_ON`, path
-   `V41_PICK_TRACE`) so no second restart is needed for it.
-2. **Re-run the sim** on a fresh 2-3 h trace under `top`: port `hot_split::interleave_layer` (and
+   change in behaviour.
+2. **Re-run the sim** BEFORE the window, on production's own pick trace (`V41_PICK_TRACE` is set in
+   the hub env: `picks-sub-20261007-0552.trace` since the current hub's start) with its evtrace,
+   recalibrated post-async (fit_costs + calibrate; `params.json` reconstructed, the DES's drain
+   coupling off): port `hot_split::interleave_layer` (and
    the holder fallback, the KEEP pins) into `scripts/split_sim/policies.py`, box 2 at 119 slots,
    `N1` 103 / 115 / 124, `P2` 50 / 60 / 75, target 0.55 / 0.60 / 0.65, REP 0 / 10 with `OPEN`.
    Quote that number; pick the defaults.
@@ -263,15 +285,13 @@ ledger is replaced on every reconnect, `on_connect` BM:1108-1126). Size at the d
 | `V41_B1_HOT_B2HEAD` | 60 | box 2's pinned head share per layer (clamped by the pin budget) |
 | `V41_B1_HOT_IL_PER_LAYER` | 0 (= `per_layer()`) | box 1's owned + replicated ids per layer |
 | `V41_B1_HOT_MAX_CHANGE` | env value (prod 3) | today's change cap, now live (return mode) |
-| `V41_B1_HOT_HOLDER` | on | the holder fallback (decode rows, interleave only) |
+| `V41_B1_HOT_HOLDER` | on | the holder fallback (decode rows, MOVING ids only) |
 | `V41_B1_HOT_KEEP_PREFILL` | off | the prefill band skips KEEP |
-| `V41_B1_HOT_KEEP_WORDS_STEP` | 16 | KEEP words per decode step |
 | `V41_B1_HOT_PREWARM_STEP` | 2 | box-1 pre-warm reads queued per decode step (interleave only) |
 | `V41_B1_HOT_REP` | 0 | replicated ids per layer |
 | `V41_B1_HOT_REP_HYST` | 5 | rank hysteresis of the replicated set |
 | `V41_B1_HOT_REP_LEG` | `cost` | `cost` / `box1` / `box2` (route; per decode step) |
 | `V41_B1_HOT_LEG_*`, `..._LEG_OPEN_MS` | the 10-03 fit, 0.2 | the leg-choice constants (route; per decode step) |
-| `V41_PICK_TRACE_ON` | off | write the pick trace to `V41_PICK_TRACE` (path; env) |
 
 ## 10. Review round 1 (2026-10-08): where each finding went
 
@@ -284,3 +304,17 @@ power -> 8 step 4. 9 region rule + separate hysteresis -> 2 steps 2-3, `IL_HYST`
 (residency hints, readahead, incoming, trace). 13 KEEP queue -> 4. 14 clamp fallback, prefill
 room -> 4. 15 REP later -> 0.6 (and KEEP re-queue limited to refresh / decode entry / reconnect).
 16 line refs fixed; swap cost noted in 2 step 4.
+
+## 11. Review round 2 (2026-10-08): where each finding went
+
+1 return exit unreachable -> 2.4 per-layer coverage exit (`per_layer - 10`), 60-refresh cap, noisy
+test. 2 stale rule -> 3 table (`box2_stale` = today's expression less KEEP less MOVING). 3 holder
+on every id -> 3.2 MOVING ids only (refresh-stamped, confirmed by the destination). 4 holder
+predicate -> 3.2 (`held` only for box 2; not held and not incoming for box 1; the mask calls the
+same function). 5 KEEP after prefill -> 4 (decode entry via `take_restore_keep` only; refresh and
+reconnect fills on the restore queue; `KEEP_WORDS_STEP` dropped). 6 queue requirements -> 4 (decode
+only, releases first, refill on the first step with pins on, dedup against the queue). 7 B2H
+admissions unchanged -> 3 table. 8 return sub-mode -> 2.4 (MOVING + pre-warm for returning layers;
+reads after the exit counted, not prevented). 9 overclaim -> 0.5. 10 sim prerequisites -> 8 step 2
+(production's own trace; params reconstructed; recalibrated post-async). 11 nits -> `IlParams.hyst`
+doc, 2.4 last bullet.
