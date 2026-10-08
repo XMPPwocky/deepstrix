@@ -347,6 +347,40 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // G5a-h run LEGACY keys whatever the default (`stage_b` since 2026-10-06): their logits are G6's
     // legacy references, and G6's arms expect the stage_b cache empty when they start.
     v4flash_kernels::knobs::MS_GRAPH_KEYS.set("legacy");
+    // HOT SPLIT gate arm G-il (docs/v41/HOT_SPLIT_DESIGN.md 7): `MS_HOT_SPLIT=interleave` seeds the
+    // hot set with a fixed Zipf count table and refreshes it into the interleave, holder fallback
+    // OFF, so every G5 arm routes by one fixed placement (nothing refreshes it during the run: the
+    // refresh lives in the server's scheduler). `MS_HOT_SPLIT=top` = the same table's top set.
+    // Unset = the hash split, as before (G-top compares that against the deployed hub).
+    if let Ok(arm) = std::env::var("MS_HOT_SPLIT") {
+        use v4flash_kernels::het::expert_pager::hot_set;
+        let (nl, ne) = (v4flash_kernels::config::N_LAYER as usize, v4flash_kernels::config::N_EXPERT as usize);
+        std::env::set_var("V41_B1_HOT_MIN_PICKS", "0");
+        v4flash_kernels::knobs::B1_HOT_HOLDER.set("0");
+        let feed = || {
+            for l in 0..nl {
+                for i in 0..ne {
+                    let e = ((i * 7 + l) % ne) as u32;
+                    for _ in 0..2000 / (i + 1) {
+                        hot_set::note_pick(l, e);
+                    }
+                }
+            }
+        };
+        feed();
+        hot_set::refresh().ok_or_else(|| eyre!("MS_HOT_SPLIT: the hot set did not warm"))?;
+        if arm == "interleave" {
+            v4flash_kernels::knobs::B1_HOT_POLICY.set("interleave");
+            for _ in 0..30 {
+                feed();
+                hot_set::refresh();
+            }
+            eyre::ensure!(hot_set::interleave_active(), "MS_HOT_SPLIT: the interleave is not active");
+        }
+        let (share1, swaps, b1_new, b2_new, keep) = hot_set::il_stats();
+        eprintln!("G-il: hot split placement {arm}: interleave={} share1={share1:.3} last swaps={swaps} b1_new={b1_new} b2_new={b2_new} keep={keep}",
+            hot_set::interleave_active());
+    }
     let mut si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     let mut pg = ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, 0)?;
     let hasher = EngramHash::load(Path::new(&engram_dir))?;
