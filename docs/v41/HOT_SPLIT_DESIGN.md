@@ -334,3 +334,17 @@ in-flight cap goes back to the queue's front (`prefetch_now` -> `Option<bool>`);
 Caveat kept: KEEP words are decode-only because `pin_enter_prefill` drains the restore queue onto
 the ledger; with `V41_B2_PIN_PREFILL_BAND=0` it returns before draining, so restore (and KEEP) words
 can ride prefill requests -- production runs the band at 4096.
+
+## 13. Review round 4 (round-3 fixes + window/prep; APPROVE WITH CHANGES)
+
+Fixed: the pre-warm requeue puts back the whole remainder in order; the window's interleave arm
+runs `V41_B1_HOT_PER_LAYER=40` (fits the gate's 40 GB pool, no thrash/timeout); the clean-tree
+checks look at code only (`crates`, `Cargo.*`); the window prints the effective `V41_SUB_PROTECT`
+/ lambda / policy after launch (the restart also ships the live protect knob, a3da745: its value
+must be the env file's 1). Gate arm D (`interleave_holder`) is SMOKE ONLY and opt-in: in the
+harness box 1's pool is empty when ids start MOVING and no pins/maps exist, so the holder never
+redirects a pick. The holder rests on host tests and review; in production it fails closed
+(`verify_routing_exactly_once` makes a violation a step error) and has a live kill switch
+(`V41_B1_HOT_HOLDER=0`); its effect (`holder_b1` / `holder_b2`) is watched at the first live flip.
+G-top (arms A/B) covers the hash split with pins off; `top`'s warm refresh, STATE and the KEEP
+predicates under `top` are verified by host tests and review.

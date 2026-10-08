@@ -1668,10 +1668,14 @@ impl Sched {
             // refreshes, a few per step (empty outside an interleave / return).
             let n = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize();
             if n > 0 {
-                for (l, e) in v4flash_kernels::het::expert_pager::hot_set::take_prewarm(n) {
+                let batch = v4flash_kernels::het::expert_pager::hot_set::take_prewarm(n);
+                for (i, &(l, e)) in batch.iter().enumerate() {
                     if pg.prefetch_now(l, e).is_none() {
-                        // The in-flight cap is full: back to the front, retry next step.
-                        v4flash_kernels::het::expert_pager::hot_set::requeue_prewarm(l, e);
+                        // The in-flight cap is full: this one and the rest back to
+                        // the front (in order), retry next step.
+                        for &(l2, e2) in batch[i..].iter().rev() {
+                            v4flash_kernels::het::expert_pager::hot_set::requeue_prewarm(l2, e2);
+                        }
                         break;
                     }
                 }
