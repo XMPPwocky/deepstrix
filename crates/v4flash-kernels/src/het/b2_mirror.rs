@@ -143,6 +143,27 @@ static STEP: AtomicU32 = AtomicU32::new(0);
 /// Per (layer, expert): the `STEP` from which a queued admission counts as
 /// resident (module doc, INCOMING); 0 = no mark.
 static INCOMING: [[AtomicU32; NE]; LAYERS] = [const { [const { AtomicU32::new(0) }; NE] }; LAYERS];
+/// NURSERY bits (docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 3.2): box 2's
+/// nursery entries per its last `RESP_FLAG_NURSERY` block for the layer (a
+/// reply replaces its own layer's row and adds the other layers' entries it
+/// carried). For the hint filter's dedup and `lh2_nursery_covered` ONLY --
+/// never `held`: the cache prior stays hint-blind (I2), and a nursery entry
+/// is not pinned, so it must not count as held.
+static NURSERY: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
+/// SOFT-HELD bits (`proto::RESP_FLAG_SOFT`): per the layer's last reply, the
+/// experts landed in a main slot but NOT pinned (served without a read right
+/// now, evictable any time). Replaced at the layer's next reply -- no epoch
+/// masking (`apply_map`'s release rules are for pins); a soft entry evicted
+/// between the reply and the pick shows up as a paged reply of a mirror-soft
+/// expert (`lh2_paged_mirror_soft`). Consumers only under `V41_B2_SOFT_PRIOR`
+/// (`resident()`) / `V41_B2_SOFT_HINT` (the look-ahead filter).
+static SOFT: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
+/// Does box 2 understand `REQ_FLAG_LIKELY`? 0 unknown (no LIKELY-flagged
+/// reply yet), 1 yes (a reply carried `RESP_FLAG_NURSERY`), 2 no (a reply
+/// to a LIKELY-flagged request did not). The hub puts hint words on the wire
+/// only at 1 (`lookahead::Mode::wire`); an echoed request bit proves nothing
+/// (review round 2, finding 5).
+static NURSERY_SUPPORT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// `V41_SUB`: 0 off, 1 dry run, 2 host planner, 3 cache-prior.
 pub fn mode() -> u32 {
@@ -204,13 +225,10 @@ pub fn dry() -> bool {
     *D
 }
 
-/// `V41_SUB_PROTECT` (mode 3; default 2): the original top picks the prior
-/// may never displace (the paper's J; 2 for fine-grained MoEs).
+/// `V41_SUB_PROTECT` (mode 3; default 2; live): the original top picks the
+/// prior may never displace (the paper's J; 2 for fine-grained MoEs).
 pub fn protect() -> u32 {
-    static J: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_SUB_PROTECT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(2).min(6)
-    });
-    *J
+    crate::knobs::SUB_PROTECT.get() as u32
 }
 
 /// Running per-layer average of the selection-score range (`Delta_layer`),
@@ -284,6 +302,54 @@ pub fn incoming_steps() -> u32 {
 pub fn begin_step() {
     STEP.fetch_add(1, Ordering::Relaxed);
     pin_begin_step();
+    if pin_active() && (super::expert_pager::hot_set::take_keep_dirty() | KEEP_REFILL.swap(false, Ordering::Relaxed)) {
+        keep_fill();
+    }
+}
+
+/// A reconnect: re-queue the KEEP pins at the first decode step with pins on
+/// (`pin_apply_words` ignores grants before that).
+static KEEP_REFILL: AtomicBool = AtomicBool::new(false);
+/// KEEP words queued in all (`keep_fill`).
+static KEEP_QUEUED_TOT: AtomicU64 = AtomicU64::new(0);
+
+/// HOT SPLIT (docs/v41/HOT_SPLIT_DESIGN.md 4): queue a pin word for every KEEP
+/// id the mirror does not show held and that is not already on the restore
+/// queue, on the restore queue (decode requests only, after every queued
+/// release, paced per request; a resident expert is pinned without a read).
+/// Called at a refresh that changed the KEEP set and after a reconnect;
+/// decode entry re-pins through `take_restore_keep`. Returns the count.
+pub fn keep_fill() -> usize {
+    let list = super::expert_pager::hot_set::keep_list();
+    if list.is_empty() {
+        return 0;
+    }
+    let queued: std::collections::HashSet<u32> = super::remote_experts::restore_words_snapshot().into_iter().collect();
+    let words: Vec<u32> = list
+        .into_iter()
+        .filter(|&(l, e)| !held(l, e))
+        .map(|(l, e)| (l << 16) | e)
+        .filter(|w| !queued.contains(w))
+        .collect();
+    let n = super::remote_experts::push_restore_words(&words);
+    KEEP_QUEUED_TOT.fetch_add(n as u64, Ordering::Relaxed);
+    n
+}
+
+/// KEEP words queued since the start.
+pub fn keep_queued_total() -> u64 {
+    KEEP_QUEUED_TOT.load(Ordering::Relaxed)
+}
+
+/// Box 2's pin budget from its last pin reply (`None` before one).
+pub fn pin_budget() -> Option<u32> {
+    LEDGER.lock().unwrap_or_else(|p| p.into_inner()).est_pinned().map(|(_, b)| b)
+}
+
+/// The step clock's value now (the tag on predicted-miss hint words,
+/// `het::lookahead`).
+pub fn step() -> u32 {
+    STEP.load(Ordering::Relaxed)
 }
 
 /// A prefill-shaped pass begins (every prefill entry calls this after
@@ -293,6 +359,21 @@ pub fn begin_step() {
 /// then at least N steps old.
 pub fn expire_incoming() {
     STEP.fetch_add(incoming_steps() + 1, Ordering::Relaxed);
+    // A prefill chunk churns box 2's pool: the SOFT rows are stale too.
+    clear_soft();
+}
+
+/// Forget every layer's SOFT row (the decode -> prefill switch beside the
+/// hint-queue clear, and every prefill chunk via `expire_incoming`): during a
+/// prefill phase the band is released and prefill evicts freely, so a row
+/// would describe the pre-prefill pool at the first decode step after it --
+/// where `V41_B2_SOFT_PRIOR` would call evicted experts resident.
+pub fn clear_soft() {
+    for row in SOFT.iter() {
+        for slot in row {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Admissions `(layer << 16) | e` were just queued for box 2: count them as
@@ -354,7 +435,65 @@ pub fn note_submitted(layer: u32, sel: &[i32]) {
 /// a background read of it is already queued (INCOMING). `None` until box 2
 /// has reported `layer` at all.
 pub fn resident(layer: i32, e: u32) -> Option<bool> {
-    lookup(layer, e).map(|r| r.held || (r.pending && pending_on()) || r.incoming)
+    lookup(layer, e).map(|r| r.held || (r.pending && pending_on()) || r.incoming || (r.soft && soft_prior()))
+}
+
+/// `V41_B2_SOFT_MAP` (default on): ask box 2 for the SOFT-HELD map.
+pub fn soft_map() -> bool {
+    crate::knobs::B2_SOFT_MAP.on()
+}
+
+/// `V41_B2_SOFT_PRIOR` (default off): the cache prior, the planner and
+/// `n_pred_miss` treat a soft-held expert as resident (no swap, no
+/// predicted miss). The A/B of interest: fewer swaps (`sub.picks_swapped`,
+/// `sub.predicted_miss`) against surprises on evicted soft picks
+/// (`lh2_paged_mirror_soft`, `box2.paged`).
+pub fn soft_prior() -> bool {
+    crate::knobs::B2_SOFT_PRIOR.on()
+}
+
+/// `V41_B2_SOFT_HINT` (default off): the look-ahead filter treats a soft-held
+/// expert as resident (no hint).
+pub fn soft_hint() -> bool {
+    crate::knobs::B2_SOFT_HINT.on()
+}
+
+/// The `n_pred_miss` predicate on a `lookup` (the hub's "box 2 would have to
+/// read it"): not held, not pending, not incoming, and -- under
+/// `V41_B2_SOFT_PRIOR` -- not soft-held.
+pub fn nonres_for_miss(r: &Residency) -> bool {
+    !r.held && !r.pending && !r.incoming && !(r.soft && soft_prior())
+}
+
+/// The look-ahead filter's predicate: as `nonres_for_miss`, with
+/// `V41_B2_SOFT_HINT` gating the soft term instead.
+pub fn nonres_for_hint(r: &Residency) -> bool {
+    !r.held && !r.pending && !r.incoming && !(r.soft && soft_hint())
+}
+
+/// Is `(layer, e)` soft-held per the layer's last reply?
+pub fn soft(layer: i32, e: u32) -> bool {
+    let l = layer as usize;
+    if l >= LAYERS || e >= N_EXPERT {
+        return false;
+    }
+    (SOFT[l][(e / 64) as usize].load(Ordering::Relaxed) >> (e % 64)) & 1 == 1
+}
+
+/// A reply for `layer` carried a SOFT map (`RESID_WORDS` u32s, bit e): the
+/// layer's row is REPLACED (the previous map expires).
+pub fn update_soft(layer: u32, words: &[u32]) {
+    let l = layer as usize;
+    if l >= LAYERS {
+        return;
+    }
+    let mut row = [0u64; WORDS];
+    for (i, &w) in words.iter().enumerate().take(RESID_WORDS) {
+        row[i / 2] |= u64::from(w) << (32 * (i % 2));
+    }
+    for (i, slot) in SOFT[l].iter().enumerate() {
+        slot.store(row[i], Ordering::Relaxed);
+    }
 }
 
 /// Box 1's view of one box-2 expert, the sources kept apart (for the trace).
@@ -368,6 +507,14 @@ pub struct Residency {
     /// A queued background admission inside its step window
     /// (`note_incoming`; false when `V41_SUB_INCOMING=0`).
     pub incoming: bool,
+    /// A box-2 NURSERY entry per its last block (`update_nursery`): a hint
+    /// that has landed and is not promoted yet. NOT residency for the prior
+    /// (`resident()` ignores it): the filter's dedup only.
+    pub nursery: bool,
+    /// SOFT-HELD per the layer's last reply (`update_soft`): landed, not
+    /// pinned. Residency for the prior only under `V41_B2_SOFT_PRIOR`, for the
+    /// look-ahead filter only under `V41_B2_SOFT_HINT`.
+    pub soft: bool,
 }
 
 /// `(layer, e)`'s residency sources; `None` until box 2 has reported `layer`.
@@ -381,7 +528,80 @@ pub fn lookup(layer: i32, e: u32) -> Option<Residency> {
         held: (BITS[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
         pending: (PENDING[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
         incoming: incoming(l, e as usize),
+        nursery: (NURSERY[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
+        soft: (SOFT[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
     })
+}
+
+// ---- the nursery (design 3.2) ----
+
+/// Is `(layer, e)` a box-2 nursery entry per its last block? (`lookup`'s
+/// `nursery`, without the SEEN requirement: the block may precede the layer's
+/// first residency map.)
+pub fn nursery(layer: i32, e: u32) -> bool {
+    let l = layer as usize;
+    if l >= LAYERS || e >= N_EXPERT {
+        return false;
+    }
+    (NURSERY[l][(e / 64) as usize].load(Ordering::Relaxed) >> (e % 64)) & 1 == 1
+}
+
+/// A reply for `layer` carried a NURSERY block (`proto::response_nursery`,
+/// `(layer << 16) | expert` words, any layer): the reply layer's row is
+/// REPLACED (box 2 lists all of that layer's entries first), the other
+/// layers' entries are added (their own rows are replaced by their own
+/// replies, every step).
+pub fn update_nursery(layer: u32, words: &[u32]) {
+    let l = layer as usize;
+    if l >= LAYERS {
+        return;
+    }
+    let mut row = [0u64; WORDS];
+    let mut other: Vec<(usize, u64)> = Vec::new();
+    for &w in words {
+        let (wl, we) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
+        if wl >= LAYERS || we >= NE {
+            continue;
+        }
+        if wl == l {
+            row[we / 64] |= 1u64 << (we % 64);
+        } else {
+            other.push((wl * WORDS + we / 64, 1u64 << (we % 64)));
+        }
+    }
+    for (i, slot) in NURSERY[l].iter().enumerate() {
+        slot.store(row[i], Ordering::Relaxed);
+    }
+    for (i, m) in other {
+        NURSERY[i / WORDS][i % WORDS].fetch_or(m, Ordering::Relaxed);
+    }
+}
+
+/// Does box 2 answer `REQ_FLAG_LIKELY` with `RESP_FLAG_NURSERY`? (The hub
+/// sends hint words only then.)
+pub fn nursery_supported() -> bool {
+    NURSERY_SUPPORT.load(Ordering::Relaxed) == 1
+}
+
+/// A reply to a LIKELY-flagged request did (`supported`) or did not carry a
+/// NURSERY block: detection, and loss, each logged once per transition.
+pub fn nursery_reply_seen(supported: bool) {
+    let to = if supported { 1 } else { 2 };
+    let was = NURSERY_SUPPORT.swap(to, Ordering::Relaxed);
+    if was != to {
+        if supported {
+            eprintln!("b2 mirror: box 2 answers REQ_FLAG_LIKELY with a NURSERY block: predicted-miss hints go on the wire (V41_B2_MISS_PREFETCH k1/k2)");
+        } else if was == 1 {
+            eprintln!("b2 mirror: WARNING box 2 stopped answering REQ_FLAG_LIKELY with a NURSERY block (nursery=0 or an older expertd): hints stay off the wire (dry)");
+        } else {
+            eprintln!("b2 mirror: box 2 does not support the nursery (older expertd or nursery=0): V41_B2_MISS_PREFETCH k1/k2 behave as dry");
+        }
+    }
+}
+
+/// Tests: forget what box 2 answered.
+pub fn reset_nursery_support() {
+    NURSERY_SUPPORT.store(0, Ordering::Relaxed);
 }
 
 // ---- pinning (module doc, PINNING) ----
@@ -761,12 +981,18 @@ impl PinLedger {
     /// `(count, layer, e)`, so uncredited prefill pins go first only as count-0
     /// ties.
     pub fn release_for_prefill(&mut self, band: u32, max: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
+        self.release_for_prefill_keep(band, max, stale, |_, _| false, false)
+    }
+
+    /// `release_for_prefill` with box 2's KEEP set (docs/v41/HOT_SPLIT_DESIGN.md
+    /// 4): KEEP pins go last, or never with `skip_keep` (`V41_B1_HOT_KEEP_PREFILL`).
+    pub fn release_for_prefill_keep(&mut self, band: u32, max: usize, stale: impl Fn(u32, u32) -> bool, keep: impl Fn(u32, u32) -> bool, skip_keep: bool) -> Vec<u32> {
         let Some((est, budget)) = self.est_pinned() else { return Vec::new() };
         let target = budget.saturating_sub(band);
         if est <= target {
             return Vec::new();
         }
-        let words = self.release_coldest(((est - target) as usize).min(max), stale);
+        let words = self.release_coldest_ex(((est - target) as usize).min(max), stale, keep, skip_keep).0;
         self.prefill_released.extend_from_slice(&words);
         words
     }
@@ -777,18 +1003,24 @@ impl PinLedger {
     /// held again, and box 2 still owns (not `stale`), hottest first (count,
     /// then recency), as admission words. Clears the list.
     pub fn take_restore(&mut self, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
+        self.take_restore_keep(stale, |_, _| false)
+    }
+
+    /// `take_restore` with box 2's KEEP set (design 4): a released KEEP id is
+    /// restored regardless of `last_want` and `stale`, ahead of the rest.
+    pub fn take_restore_keep(&mut self, stale: impl Fn(u32, u32) -> bool, keep: impl Fn(u32, u32) -> bool) -> Vec<u32> {
         let mut words = std::mem::take(&mut self.prefill_released);
         words.retain(|&w| {
             let (l, e) = (w >> 16, w & 0xFFFF);
             (l as usize) < LAYERS
                 && (e as usize) < NE
-                && self.last_want[l as usize * NE + e as usize] != 0
                 && !self.held(l, e)
-                && !stale(l, e)
+                && (keep(l, e) || (self.last_want[l as usize * NE + e as usize] != 0 && !stale(l, e)))
         });
         words.sort_by_key(|&w| {
-            let k = (w >> 16) as usize * NE + (w & 0xFFFF) as usize;
-            (std::cmp::Reverse(self.counts[k]), std::cmp::Reverse(self.last_want[k]), w)
+            let (l, e) = (w >> 16, w & 0xFFFF);
+            let k = l as usize * NE + e as usize;
+            (!keep(l, e), std::cmp::Reverse(self.counts[k]), std::cmp::Reverse(self.last_want[k]), w)
         });
         words.dedup();
         words
@@ -807,6 +1039,11 @@ impl PinLedger {
     /// `step`, where (with `by_wants` only) a held expert `stale(layer, e)`
     /// -- box 2 no longer owns it -- ranks below every other one.
     pub fn step_ranked(&mut self, headroom: u32, decay_steps: u32, max: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
+        self.step_ranked_keep(headroom, decay_steps, max, stale, |_, _| false)
+    }
+
+    /// `step_ranked` that never releases a KEEP pin (design 4).
+    pub fn step_ranked_keep(&mut self, headroom: u32, decay_steps: u32, max: usize, stale: impl Fn(u32, u32) -> bool, keep: impl Fn(u32, u32) -> bool) -> Vec<u32> {
         self.steps = self.steps.wrapping_add(1);
         if decay_steps > 0 && self.steps % decay_steps == 0 {
             for c in self.counts.iter_mut() {
@@ -827,7 +1064,7 @@ impl PinLedger {
             return Vec::new();
         }
         let want = (est - budget.saturating_sub(2 * headroom)) as usize;
-        let (words, watermark) = self.release_coldest_ex(want.min(max), stale);
+        let (words, watermark) = self.release_coldest_ex(want.min(max), stale, keep, true);
         // A sweep of only stale experts says nothing about the pressure.
         if let Some(w) = watermark {
             self.watermark = w;
@@ -850,12 +1087,15 @@ impl PinLedger {
     /// as in `step_ranked`: each is not held from now on, gets the next release
     /// index, and its word is queued. Returns the words.
     pub fn release_coldest(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool) -> Vec<u32> {
-        self.release_coldest_ex(n, stale).0
+        self.release_coldest_ex(n, stale, |_, _| false, false).0
     }
 
     /// `release_coldest`, also returning the highest count released among
     /// experts box 2 still owns (the admission watermark; `None` if none went).
-    fn release_coldest_ex(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool) -> (Vec<u32>, Option<u32>) {
+    /// KEEP pins (design 4) are tier 2 (after every other pin), or not
+    /// candidates at all with `skip_keep`; with an empty KEEP set the order is
+    /// exactly the old one.
+    fn release_coldest_ex(&mut self, n: usize, stale: impl Fn(u32, u32) -> bool, keep: impl Fn(u32, u32) -> bool, skip_keep: bool) -> (Vec<u32>, Option<u32>) {
         // `(tier, count, recency, key)`; tier and recency are constant without
         // `by_wants`, so the order is exactly the old `(count, key)` one.
         let mut cand: Vec<(u32, u32, u32, u32)> = Vec::new();
@@ -866,6 +1106,12 @@ impl PinLedger {
                 bits &= bits - 1;
                 let (l, e) = (wi / WORDS, (wi % WORDS) * 64 + b);
                 let k = l * NE + e;
+                if keep(l as u32, e as u32) {
+                    if !skip_keep {
+                        cand.push((2, self.counts[k], self.last_want[k], k as u32));
+                    }
+                    continue;
+                }
                 if self.by_wants {
                     let tier = u32::from(!stale(l as u32, e as u32));
                     cand.push((tier, self.counts[k], self.last_want[k], k as u32));
@@ -937,9 +1183,14 @@ pub fn on_connect() {
         for i in 0..WORDS {
             BITS[l][i].store(0, Ordering::Relaxed);
             PENDING[l][i].store(0, Ordering::Relaxed);
+            NURSERY[l][i].store(0, Ordering::Relaxed);
+            SOFT[l][i].store(0, Ordering::Relaxed);
         }
     }
     PIN_MODE.store(if pin_wanted() { 1 } else { 0 }, Ordering::Relaxed);
+    KEEP_REFILL.store(true, Ordering::Relaxed);
+    // The new daemon may or may not have a nursery: probe again.
+    NURSERY_SUPPORT.store(0, Ordering::Relaxed);
 }
 
 /// `REQ_FLAG_PIN` while pinning is asked for or on.
@@ -1035,9 +1286,13 @@ fn pin_begin_step() {
     }
     let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
     let partition = super::expert_pager::t2_partition();
-    let words = g.step_ranked(pin_headroom(), pin_decay_steps(), PIN_RELEASE_MAX_PER_STEP, |l, e| {
-        partition && !super::expert_pager::partition_box2(l as i32, e)
-    });
+    let words = g.step_ranked_keep(
+        pin_headroom(),
+        pin_decay_steps(),
+        PIN_RELEASE_MAX_PER_STEP,
+        |l, e| partition && super::expert_pager::hot_set::box2_stale(l as i32, e),
+        |l, e| super::expert_pager::hot_set::keep(l as i32, e),
+    );
     for &w in &words {
         let (l, e) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
         BITS[l][e / 64].fetch_and(!(1u64 << (e % 64)), Ordering::Relaxed);
@@ -1049,9 +1304,15 @@ fn pin_begin_step() {
     N_RELEASED_UNUSED.fetch_add(u64::from(unused), Ordering::Relaxed);
 }
 
-/// Box 2 no longer owns `(layer, e)`: the T2 partition moved it to box 1.
+/// Box 2 no longer owns `(layer, e)`: the T2 partition moved it to box 1
+/// (and box 2 need not keep it, nor still serve it while it moves:
+/// `hot_set::box2_stale`).
 fn box2_lost(layer: u32, e: u32) -> bool {
-    super::expert_pager::t2_partition() && !super::expert_pager::partition_box2(layer as i32, e)
+    super::expert_pager::t2_partition() && super::expert_pager::hot_set::box2_stale(layer as i32, e)
+}
+
+fn keep_pred(layer: u32, e: u32) -> bool {
+    super::expert_pager::hot_set::keep(layer as i32, e)
 }
 
 /// Release pins down to `budget - band`, clearing them from the mirror at
@@ -1059,7 +1320,7 @@ fn box2_lost(layer: u32, e: u32) -> bool {
 /// it); `TOT_RELEASED` counts every release, and `N_RELEASED_UNUSED` (the
 /// next `hub_step`) counts these too.
 fn band_release(g: &mut PinLedger, band: u32) -> usize {
-    let words = g.release_for_prefill(band, PIN_PREFILL_RELEASE_MAX, box2_lost);
+    let words = g.release_for_prefill_keep(band, PIN_PREFILL_RELEASE_MAX, box2_lost, keep_pred, crate::knobs::B1_HOT_KEEP_PREFILL.on());
     for &w in &words {
         let (l, e) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
         BITS[l][e / 64].fetch_and(!(1u64 << (e % 64)), Ordering::Relaxed);
@@ -1114,7 +1375,7 @@ pub fn take_band_reopened() -> usize {
 /// low-priority restore queue (`remote_experts::push_restore_words`). Returns
 /// the number queued.
 pub fn pin_enter_decode() -> usize {
-    let words = LEDGER.lock().map(|mut g| g.take_restore(box2_lost)).unwrap_or_default();
+    let words = LEDGER.lock().map(|mut g| g.take_restore_keep(box2_lost, keep_pred)).unwrap_or_default();
     if words.is_empty() || !pin_active() || !pin_restore() {
         return 0;
     }
@@ -1672,12 +1933,109 @@ pub fn substitute(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// The mirror's rows, marks and the pin ledger are process-wide statics:
-    /// tests that touch them run one at a time.
-    static STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `STATICS` (below) for a test in another module (lookahead's wire gating).
+    pub(crate) fn statics_guard() -> std::sync::MutexGuard<'static, ()> {
+        STATICS.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The SOFT-HELD map: a reply replaces its layer's row (the previous map
+    /// expires), `lookup().soft` reports it, and it is residency for
+    /// `resident()` / `nonres_for_miss` only under `V41_B2_SOFT_PRIOR`, for
+    /// `nonres_for_hint` only under `V41_B2_SOFT_HINT`; `on_connect` forgets it.
+    #[test]
+    fn soft_map_replaces_the_row_and_consumers_are_knobbed() {
+        let _statics = statics_guard();
+        use crate::knobs::{B2_SOFT_HINT, B2_SOFT_PRIOR};
+        // Layers 36-37 are this test's alone (the statics are process-wide and
+        // the pin tests run beside this one: never `on_connect` here).
+        const L: u32 = 36;
+        assert!(B2_SOFT_PRIOR.set("0") && B2_SOFT_HINT.set("0"));
+        let mut words = [0u32; RESID_WORDS];
+        words[0] = 1 << 5;
+        words[1] = 1 << 8; // expert 40
+        words[11] = 1 << 31; // expert 383
+        update_soft(L, &words);
+        assert!(soft(L as i32, 5) && soft(L as i32, 40) && soft(L as i32, 383) && !soft(L as i32, 6) && !soft(L as i32 + 1, 5));
+        assert!(!soft(99, 5) && !soft(L as i32, 9999));
+        update(L, &[0; RESID_WORDS]);
+        let r = lookup(L as i32, 5).unwrap();
+        assert!(r.soft && !r.held && !r.pending && !r.incoming);
+        // Consumers off: soft is not residency for anyone.
+        assert_eq!(resident(L as i32, 5), Some(false));
+        assert!(nonres_for_miss(&r) && nonres_for_hint(&r));
+        // The prior knob: resident for the prior / miss count, not for the filter.
+        assert!(B2_SOFT_PRIOR.set("1"));
+        assert_eq!(resident(L as i32, 5), Some(true));
+        assert!(!nonres_for_miss(&r) && nonres_for_hint(&r));
+        assert!(B2_SOFT_PRIOR.set("0"));
+        // The hint knob: the filter only.
+        assert!(B2_SOFT_HINT.set("1"));
+        assert_eq!(resident(L as i32, 5), Some(false));
+        assert!(nonres_for_miss(&r) && !nonres_for_hint(&r));
+        assert!(B2_SOFT_HINT.set("0"));
+        // The next reply replaces the row (the previous map expires).
+        update_soft(L, &[0; RESID_WORDS]);
+        assert!(!soft(L as i32, 5) && !lookup(L as i32, 5).unwrap().soft);
+        // Staleness across a prefill phase: the switch (`clear_soft`) and every
+        // chunk (`expire_incoming`) forget EVERY layer's row.
+        update_soft(L, &words);
+        update_soft(L + 1, &words);
+        clear_soft();
+        assert!(!soft(L as i32, 5) && !soft(L as i32 + 1, 383));
+        update_soft(L, &words);
+        expire_incoming();
+        assert!(!soft(L as i32, 5) && !lookup(L as i32, 5).unwrap().soft);
+        assert!(B2_SOFT_PRIOR.set("1"));
+        assert_eq!(resident(L as i32, 5), Some(false), "an evicted-by-prefill expert is not resident after the switch");
+        assert!(B2_SOFT_PRIOR.set("0"));
+    }
+
+    /// The NURSERY bits (design 3.2): a block replaces its reply layer's row
+    /// and adds other layers' entries; they are dedup state, never `held`;
+    /// the capability flips once per transition and `on_connect` forgets it.
+    #[test]
+    fn nursery_bits_replace_the_reply_layers_row() {
+        let _statics = statics_guard();
+        // Layers 38-39 are this test's alone (never `on_connect` here: the
+        // statics are process-wide and the pin tests run beside this one).
+        let (a, b) = (38u32, 39u32);
+        let w = |l: u32, e: u32| (l << 16) | e;
+        update_nursery(a, &[w(a, 1), w(a, 70), w(b, 3)]);
+        assert!(nursery(a as i32, 1) && nursery(a as i32, 70) && nursery(b as i32, 3) && !nursery(a as i32, 2));
+        update(a, &[0; RESID_WORDS]);
+        let r = lookup(a as i32, 1).unwrap();
+        assert!(r.nursery && !r.held && !r.pending && !r.incoming);
+        assert_eq!(resident(a as i32, 1), Some(false), "a nursery entry is NOT resident for the prior (I2)");
+        // The next reply for layer a lists only 70: 1 left the nursery (promoted or recycled).
+        update_nursery(a, &[w(a, 70), w(b, 3)]);
+        assert!(!nursery(a as i32, 1) && nursery(a as i32, 70) && nursery(b as i32, 3));
+        // Layer b's own reply replaces ITS row; layer a's is untouched.
+        update_nursery(b, &[]);
+        assert!(!nursery(b as i32, 3) && nursery(a as i32, 70));
+        update_nursery(b, &[w(40, 1), w(b, 400), w(b, 2)]);
+        assert!(nursery(b as i32, 2) && !nursery(b as i32, 3), "out-of-range words are skipped");
+        // Capability: unknown -> yes -> no -> yes (this static is the test's own).
+        reset_nursery_support();
+        assert!(!nursery_supported());
+        nursery_reply_seen(true);
+        assert!(nursery_supported());
+        nursery_reply_seen(false);
+        assert!(!nursery_supported());
+        nursery_reply_seen(true);
+        assert!(nursery_supported());
+        reset_nursery_support();
+        update_nursery(a, &[]);
+        update_nursery(b, &[]);
+        assert!(!nursery(a as i32, 70));
+    }
+
+    /// The mirror's rows, marks, the pin ledger, the NURSERY / SOFT rows and
+    /// the nursery capability are process-wide statics (`on_connect` wipes
+    /// them all): tests that touch them run one at a time. NOT re-entrant.
+    pub(crate) static STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const S: f32 = 1.5;
     const R6: SubRules = SubRules { min_rank: 6, max_w: None, scale: S };
@@ -1968,7 +2326,7 @@ mod tests {
         assert_eq!(resident(l as i32, 4), Some(true));
         assert_eq!(
             lookup(l as i32, 4),
-            Some(Residency { held: false, pending: true, incoming: false }),
+            Some(Residency { held: false, pending: true, incoming: false, nursery: false, soft: false }),
             "pending, not held"
         );
         // The next reply is authoritative again.
@@ -2007,7 +2365,7 @@ mod tests {
         let mut w = empty.clone();
         w[0] = 1 << 8;
         update(l, &w);
-        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: true }));
+        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: true, nursery: false, soft: false }));
         update(l, &empty);
         assert_eq!(resident(l as i32, 8), Some(true), "still covered by its mark");
         // A prefill pass ends it at once.
@@ -2528,6 +2886,46 @@ mod tests {
         g.apply_map(1, &map(&[2, 4, 5, 6, 7, 8, 9]), 4);
         assert_eq!(g.take_restore(|l, e| l == 1 && e == 1), vec![(1 << 16) | 3, (1 << 16) | 0], "hottest first; re-held and stale skipped");
         assert!(g.take_restore(|_, _| false).is_empty(), "taken once");
+    }
+
+    /// HOT SPLIT KEEP tier (docs/v41/HOT_SPLIT_DESIGN.md 4): headroom never
+    /// releases a KEEP pin; the prefill band releases KEEP last (or skips it);
+    /// the restore takes KEEP first regardless of wants and staleness; an empty
+    /// KEEP predicate is the old ledger.
+    #[test]
+    fn pin_keep_tier() {
+        let ids: Vec<u32> = (0..10).collect();
+        let setup = || {
+            let mut g = PinLedger::new();
+            g.apply_map(1, &map(&ids), 0);
+            g.note_reply(0, 10, 10);
+            for e in 0..10u32 {
+                g.note_pick_w(1, e, e);
+                g.note_wanted(1, e);
+            }
+            g
+        };
+        // The coldest three are KEEP.
+        let keep = |l: u32, e: u32| l == 1 && e < 3;
+        let w1 = |w: Vec<u32>| {
+            let mut v: Vec<u32> = w.iter().map(|&w| w & 0xFFFF).collect();
+            v.sort();
+            v
+        };
+        // Headroom: est 10 > 10 - 1 -> down to 8: the two coldest NON-KEEP.
+        let mut g = setup();
+        assert_eq!(w1(g.step_ranked_keep(1, 0, 512, |_, _| false, keep)), vec![3, 4]);
+        let mut o = setup();
+        assert_eq!(w1(o.step_ranked_keep(1, 0, 512, |_, _| false, |_, _| false)), w1(setup().step_ranked(1, 0, 512, |_, _| false)), "no KEEP = the old order");
+        // Band to target 1 (9 releases wanted): KEEP skipped -> only the 7 others.
+        let mut h = setup();
+        assert_eq!(w1(h.release_for_prefill_keep(9, 4096, |_, _| false, keep, true)), (3..10).collect::<Vec<_>>());
+        assert!((0..3).all(|e| h.held(1, e)));
+        // KEEP last: the 7 others, then the two coldest KEEP.
+        let mut k = setup();
+        assert_eq!(w1(k.release_for_prefill_keep(9, 4096, |_, _| false, keep, false)), vec![0, 1, 3, 4, 5, 6, 7, 8, 9]);
+        // Restore with everything stale: only KEEP comes back, hottest first.
+        assert_eq!(k.take_restore_keep(|_, _| true, keep), vec![(1 << 16) | 1, 1 << 16]);
     }
 
     /// Box 2 pins what a <= 16-row prefill request picks (no decode credit on

@@ -66,10 +66,11 @@ def r2(X, y, beta):
     return 1 - ss_r / ss_t if ss_t else float('nan'), pred
 
 
-def replay_today_features(cache, refresh, clk):
+def replay_today_features(cache, refresh, clk, split=None):
     """Per step: list of lane-layer feature tuples under today's ownership."""
     hs = simlib.HotSet()
-    ri = 0
+    hs.load(cache.get('hs0'))
+    ri = simlib.first_refresh_after(refresh, cache)
     out = []
     for stp in cache['steps']:
         t_unix = clk.to_unix(stp['t_start'])
@@ -83,7 +84,14 @@ def replay_today_features(cache, refresh, clk):
                 rows = stp['ran'][li][l]
                 p1 = [e for row in rows for e in row if 0 <= e < simlib.N_EXPERT and not hs.box2(l, e)]
                 p2 = [e for row in rows for e in row if 0 <= e < simlib.N_EXPERT and hs.box2(l, e)]
-                ll.append((li, l, len(rows), len(p1), len(set(p1)), len(p2), len(set(p2))))
+                n1_, d1_, n2_, d2_ = len(p1), len(set(p1)), len(p2), len(set(p2))
+                if split is not None:
+                    # the hub's MEASURED split (hub_req), box 1 = the rest
+                    mn, md = split.get((int(stp['step']), li, l), (0, 0))
+                    n_, d_ = n1_ + n2_, d1_ + d2_
+                    n2_, d2_ = min(mn, n_), min(md, d_)
+                    n1_, d1_ = n_ - n2_, d_ - d2_
+                ll.append((li, l, len(rows), n1_, d1_, n2_, d2_))
         out.append((stp, ll, hs.warm))
         for li in range(lanes):
             for l in range(simlib.N_LAYER):
@@ -102,7 +110,11 @@ def main():
     clk = simlib.Clock(h['t_mono_raw_at_open'], h['t_realtime_at_open'])
     cache = simlib.load_cache(cache_path)
     refresh = simlib.load_refresh_times(refresh_path)
-    feats = replay_today_features(cache, refresh, clk)
+    split = None
+    if '--measured-split' in sys.argv:
+        import calibrate
+        split = calibrate.measured_split(req_path)
+    feats = replay_today_features(cache, refresh, clk, split)
     res = {}
 
     # ---------------- box-1 iGPU per lane-layer

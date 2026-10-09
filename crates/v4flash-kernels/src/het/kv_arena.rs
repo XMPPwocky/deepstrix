@@ -411,7 +411,7 @@ pub struct RowTablesDev {
 
 impl RowTablesDev {
     pub fn alloc(dgpu: Device, rows_cap: u32, n_stores: usize) -> eyre::Result<Self> {
-        dgpu.set_current()?;
+        let _cur = dgpu.scoped_current()?;
         let n = rows_cap.max(1) as usize;
         let mut stores = Vec::with_capacity(n_stores);
         for _ in 0..n_stores {
@@ -486,7 +486,7 @@ impl KvArena {
         if n_slots == 0 {
             return Err(eyre!("kv arena: n_slots must be >= 1"));
         }
-        dgpu.set_current()?;
+        let _cur = dgpu.scoped_current()?;
         let raw_rows = (n_slots as usize) * ARENA_RAW_ROWS;
         let mut stores = Vec::with_capacity(KV_SOURCE_LAYERS.len());
         let mut layers = Vec::with_capacity(N_LAYER as usize);
@@ -735,7 +735,11 @@ impl KvArena {
         if self.stores.iter().zip(&comp).zip(&need).any(|((st, r), &n)| n.saturating_sub(r.cap) > st.free.free_rows()) {
             return Ok(None);
         }
-        self.dgpu.set_current()?;
+        // Scoped, not bare: the het engine caches the current device
+        // (`set_current_cached`), and a bare switch here left its next iGPU
+        // launch on the dGPU (KNOWN_BUGS #56: hipErrorInvalidHandle in the
+        // drafter right after an in-step `grow`, 2026-10-06).
+        let _cur = self.dgpu.scoped_current()?;
         let mut how = GrowHow::InPlace;
         let mut copied = false;
         for si in 0..self.stores.len() {
@@ -882,7 +886,7 @@ impl KvArena {
     /// Copy `src`'s live KV into freshly admitted `slot` (`admit_from_state`).
     fn fill_admitted(&mut self, src: &HetModelState, slot: u32, n_raw: u32, n_raw_dec: u32, stream: &Stream) -> eyre::Result<()> {
         let hd = N_HEAD_DIM as usize;
-        self.dgpu.set_current()?;
+        let _cur = self.dgpu.scoped_current()?;
         let region = Self::raw_region_base(slot) as usize;
         for (dst, s) in self.state.layers.iter_mut().zip(&src.layers) {
             if s.n_raw == 0 {
@@ -964,7 +968,7 @@ impl KvArena {
             return Err(eyre!("kv arena: export target has {} layers, arena {}", dst.layers.len(), self.state.layers.len()));
         }
         let hd = N_HEAD_DIM as usize;
-        self.dgpu.set_current()?;
+        let _cur = self.dgpu.scoped_current()?;
         let region = Self::raw_region_base(slot) as usize;
         for (l, (src, d)) in self.state.layers.iter().zip(dst.layers.iter_mut()).enumerate() {
             let (n_raw, raw_off) = if l < CED_DECODER_START { (s.n_raw, s.raw_off) } else { (s.n_raw_dec, s.raw_off_dec) };
@@ -1042,7 +1046,7 @@ impl KvArena {
     }
 
     fn compact_stores_inner(&mut self, stream: &Stream, bounce_f16: &mut DeviceBuffer<u16>, bounce_u8: &mut DeviceBuffer<u8>) -> eyre::Result<()> {
-        self.dgpu.set_current()?;
+        let _cur = self.dgpu.scoped_current()?;
         let n_stores = self.stores.len();
         for si in 0..n_stores {
             // (slot, base, cap) of every live region, ascending by base.
@@ -1260,7 +1264,7 @@ impl KvArena {
         };
         let hd = N_HEAD_DIM as usize;
         let region = Self::raw_region_base(slot) as usize * hd;
-        self.dgpu.set_current()?;
+        let _cur = self.dgpu.scoped_current()?;
         for (l, ls) in self.state.layers.iter_mut().enumerate() {
             let (off, n) = if l < CED_DECODER_START { (raw_off, n_raw) } else { (raw_off_dec, n_raw_dec) };
             if off == 0 || n == 0 {
@@ -1315,9 +1319,8 @@ impl KvArena {
             self.advance(slot)?;
         }
         let copies = self.commit_copies(slot, pos0, keep);
-        if !copies.is_empty() {
-            self.dgpu.set_current()?;
-        }
+        // Held across the copies; restores the caller's device on return.
+        let _cur = if copies.is_empty() { None } else { Some(self.dgpu.scoped_current()?) };
         for (from, to, layer, block) in copies {
             let cs = self.state.layers[layer].compressor.as_mut().ok_or_else(|| {
                 eyre!("kv arena: store L{layer} is lent out (accept between steps)")

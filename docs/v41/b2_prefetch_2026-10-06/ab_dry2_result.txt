@@ -1,0 +1,72 @@
+knob V41_B2_MISS_PREFETCH; arms ['dry', 'off']; switches 96
+
+== ms.step p50 by cell (n) ==
+cell                           dry             off   ratio b/a
+lone_plain r1             54.3 n65       59.8 n142
+lone_spec r2             65.6 n108       73.5 n139
+lone_spec r3             75.2 n618      78.4 n1311   1.043  ABORT
+lone_spec r4            83.4 n1180      84.7 n2025   1.016  ABORT
+lone_spec r5             94.0 n393      93.8 n1095   0.998  ok
+lone_spec r6            103.4 n725     101.7 n1230   0.984  ok
+lone_spec r7                     -               -
+lone_spec r8                     -               -
+lone_spec r9                     -               -
+lone_spec r10                    -               -
+lone_spec r11                    -               -
+lone_spec r12                    -               -
+plain0 r4                        -               -
+plain0 r5                        -               -
+plain0 r6                        -               -
+plain2 r2                        -               -
+plain2 r3                        -               -
+plain3 r3                80.9 n120      77.0 n2299
+plain3 r4                        -               -
+plain3 r5                        -               -
+plain4 r4               90.0 n1472       91.9 n259   1.021  ABORT
+plain4 r5                        -               -
+plain5 r5              107.5 n1425     104.8 n1472   0.975  ok
+plain5 r6                        -               -
+plain6 r6              122.4 n1979     121.1 n1605   0.989  ok
+plain6 r7                        -               -
+plain7 r7              138.7 n1127     137.4 n1100   0.991  ok
+plain7 r8                        -               -
+plain8 r8              153.2 n1813     152.7 n2002   0.997  ok
+two_spec r3                      -               -
+two_spec r4                      -               -
+two_spec r5               98.4 n54        97.5 n72
+two_spec r6             108.9 n208      111.7 n217   1.026  ABORT
+two_spec r7             118.4 n594      119.4 n282   1.008  fail
+two_spec r8             130.9 n152      133.6 n134
+two_spec r9             141.8 n117       147.2 n32
+two_spec r10            148.3 n208      145.7 n155
+two_spec r11             156.8 n89       153.4 n46
+two_spec r12                     -       170.7 n31
+
+== ms.stage fields per arm and regime (median of 20-step blocks) ==
+lone_spec     dry: dry_hits_r1=29.750 nonres_r1=31.775 cand_r1=57.375 dry_hits_prot_r1=22.975 dry_hits_prot_r2=31.825 dry_hits_prot_r3=36.975 nonres_m0=31.775 nonres_m1=7.275 nonres_m2=1.150 nonres_m3=0.250 hits_prot_m0=22.975 hits_prot_m1=6.775 hits_prot_m2=1.100 hits_prot_m3=0.250 blocked=3.700 predicted_miss=35.025 dry_hits_r2=56.850 nonres_r2=62.000 dry_hits_r3=79.925 nonres_r3=90.725 dry_words=26.825 stale=2.150 look_launch_us_per_ll=2.450 look_filter_us_per_ll=0.060 look_launch=0.190 look_filter=0.010 pre_moe=6.485 sel_sync=2.625 remote_submit=0.145 engram_join=2.255 pager_block=2.840 page_ms=4.390 paged_x1e6=1.900
+lone_spec     off: dry_hits_r1=6.925 nonres_r1=7.350 cand_r1=9.675 dry_hits_prot_r1=5.375 dry_hits_prot_r2=6.975 dry_hits_prot_r3=8.000 nonres_m0=7.350 nonres_m1=1.800 nonres_m2=0.475 nonres_m3=0.150 hits_prot_m0=5.375 hits_prot_m1=1.700 hits_prot_m2=0.450 hits_prot_m3=0.150 blocked=4.300 predicted_miss=42.925 dry_hits_r2=12.775 nonres_r2=14.150 dry_hits_r3=18.275 nonres_r3=21.350 dry_words=5.675 stale=0.900 look_launch_us_per_ll=0.475 look_filter_us_per_ll=0.020 look_launch=0.035 look_filter=0.010 pre_moe=6.340 sel_sync=2.720 remote_submit=0.150 engram_join=2.665 pager_block=2.005 page_ms=5.365 paged_x1e6=2.400
+lone_spec  recall_r1 any-rank (median hits / median nonres, arm off) = 0.942
+lone_spec  precision vs PROTECTED set at R=1 = 0.731  (hinted words/step 7.3, protected hits/step 5.4)
+lone_spec  margin m0: words/step    7.3  protected hits   5.4 (prec 0.731)
+lone_spec  margin m1: words/step    1.8  protected hits   1.7 (prec 0.944)
+lone_spec  margin m2: words/step    0.5  protected hits   0.5 (prec 0.947)
+lone_spec  margin m3: words/step    0.1  protected hits   0.1 (prec 1.000)
+two_spec      dry: dry_hits_r1=63.400 nonres_r1=68.050 cand_r1=119.350 dry_hits_prot_r1=48.500 dry_hits_prot_r2=66.200 dry_hits_prot_r3=74.950 nonres_m0=68.050 nonres_m1=14.100 nonres_m2=2.050 nonres_m3=0.400 hits_prot_m0=48.500 hits_prot_m1=13.150 hits_prot_m2=2.000 hits_prot_m3=0.400 blocked=11.000 predicted_miss=92.550 dry_hits_r2=116.850 nonres_r2=129.700 dry_hits_r3=165.200 nonres_r3=191.800 dry_words=65.450 stale=1.350 look_launch_us_per_ll=2.730 look_filter_us_per_ll=0.360 look_launch=0.210 look_filter=0.030 pre_moe=7.360 sel_sync=2.570 remote_submit=0.220 engram_join=3.650 pager_block=2.250 page_ms=13.500 paged_x1e6=6.050
+two_spec      off: dry_hits_r1=1.650 nonres_r1=1.900 cand_r1=4.750 dry_hits_prot_r1=1.300 dry_hits_prot_r2=2.200 dry_hits_prot_r3=2.450 nonres_m0=1.900 nonres_m1=0.400 nonres_m2=0.150 hits_prot_m0=1.300 hits_prot_m1=0.350 hits_prot_m2=0.150 blocked=9.750 predicted_miss=88.300 dry_hits_r2=3.550 nonres_r2=3.950 dry_hits_r3=5.200 nonres_r3=6.300 dry_words=1.750 stale=0.150 look_launch_us_per_ll=0.270 look_launch=0.020 pre_moe=7.060 sel_sync=2.910 remote_submit=0.210 engram_join=4.750 pager_block=2.240 page_ms=12.610 paged_x1e6=5.450
+two_spec   recall_r1 any-rank (median hits / median nonres, arm off) = 0.868
+two_spec   precision vs PROTECTED set at R=1 = 0.684  (hinted words/step 1.9, protected hits/step 1.3)
+two_spec   margin m0: words/step    1.9  protected hits   1.3 (prec 0.684)
+two_spec   margin m1: words/step    0.4  protected hits   0.3 (prec 0.875)
+two_spec   margin m2: words/step    0.1  protected hits   0.1 (prec 1.000)
+plain3        dry: dry_hits_r1=6.925 nonres_r1=8.150 cand_r1=22.525 dry_hits_prot_r1=5.450 dry_hits_prot_r2=7.100 dry_hits_prot_r3=8.225 nonres_m0=8.150 nonres_m1=1.700 nonres_m2=0.175 nonres_m3=0.075 hits_prot_m0=5.450 hits_prot_m1=1.400 hits_prot_m2=0.150 hits_prot_m3=0.075 blocked=5.525 predicted_miss=41.950 dry_hits_r2=13.025 nonres_r2=16.375 dry_hits_r3=18.975 nonres_r3=27.250 dry_words=7.025 stale=0.825 look_launch_us_per_ll=2.245 look_filter_us_per_ll=0.010 look_launch=0.170 pre_moe=5.915 sel_sync=39.700 remote_submit=0.100 engram_join=2.465 pager_block=1.350 page_ms=6.875 paged_x1e6=2.600
+plain3        off: blocked=7.450 predicted_miss=61.050 pre_moe=5.855 sel_sync=2.400 remote_submit=0.120 engram_join=1.800 pager_block=2.175 page_ms=8.650 paged_x1e6=4.050
+plain4        dry: dry_hits_r1=9.300 nonres_r1=11.600 cand_r1=40.750 dry_hits_prot_r1=6.475 dry_hits_prot_r2=9.025 dry_hits_prot_r3=10.400 nonres_m0=11.600 nonres_m1=1.775 nonres_m2=0.250 nonres_m3=0.050 hits_prot_m0=6.475 hits_prot_m1=1.500 hits_prot_m2=0.200 hits_prot_m3=0.050 blocked=7.325 predicted_miss=57.200 dry_hits_r2=19.600 nonres_r2=26.150 dry_hits_r3=30.000 nonres_r3=45.075 dry_words=10.350 stale=0.800 look_launch_us_per_ll=2.420 look_filter_us_per_ll=0.030 look_launch=0.190 look_filter=0.010 pre_moe=6.385 sel_sync=2.630 remote_submit=0.150 engram_join=2.735 pager_block=1.890 page_ms=9.050 paged_x1e6=4.125
+plain4        off: blocked=6.875 predicted_miss=53.575 pre_moe=6.025 sel_sync=2.925 remote_submit=0.145 engram_join=3.045 pager_block=1.730 page_ms=8.860 paged_x1e6=3.900
+plain5        dry: dry_hits_r1=14.950 nonres_r1=17.450 cand_r1=52.650 dry_hits_prot_r1=10.500 dry_hits_prot_r2=14.600 dry_hits_prot_r3=16.950 nonres_m0=17.450 nonres_m1=3.050 nonres_m2=0.450 nonres_m3=0.100 hits_prot_m0=10.500 hits_prot_m1=2.500 hits_prot_m2=0.400 hits_prot_m3=0.100 blocked=9.650 predicted_miss=80.500 dry_hits_r2=30.200 nonres_r2=38.800 dry_hits_r3=46.150 nonres_r3=64.550 dry_words=16.700 stale=0.650 look_launch_us_per_ll=2.560 look_filter_us_per_ll=0.070 look_launch=0.200 look_filter=0.010 pre_moe=6.640 sel_sync=3.010 remote_submit=0.170 engram_join=3.920 pager_block=2.590 page_ms=12.250 paged_x1e6=5.450
+plain5        off: dry_hits_r1=8.300 nonres_r1=8.900 cand_r1=11.750 dry_hits_prot_r1=6.050 dry_hits_prot_r2=7.600 dry_hits_prot_r3=8.450 nonres_m0=8.900 nonres_m1=3.050 nonres_m2=0.650 nonres_m3=0.200 hits_prot_m0=6.050 hits_prot_m1=2.800 hits_prot_m2=0.650 hits_prot_m3=0.200 blocked=14.025 predicted_miss=87.775 dry_hits_r2=15.850 nonres_r2=18.250 dry_hits_r3=22.300 nonres_r3=27.400 dry_words=8.550 stale=0.350 look_launch_us_per_ll=0.350 look_filter_us_per_ll=0.050 look_launch=0.030 pre_moe=6.405 sel_sync=2.570 remote_submit=0.170 engram_join=3.100 pager_block=1.665 page_ms=15.525 paged_x1e6=7.325
+plain5     recall_r1 any-rank (median hits / median nonres, arm off) = 0.933
+plain5     precision vs PROTECTED set at R=1 = 0.680  (hinted words/step 8.9, protected hits/step 6.0)
+plain5     margin m0: words/step    8.9  protected hits   6.0 (prec 0.680)
+plain5     margin m1: words/step    3.0  protected hits   2.8 (prec 0.918)
+plain5     margin m2: words/step    0.7  protected hits   0.7 (prec 1.000)
+plain5     margin m3: words/step    0.2  protected hits   0.2 (prec 1.000)

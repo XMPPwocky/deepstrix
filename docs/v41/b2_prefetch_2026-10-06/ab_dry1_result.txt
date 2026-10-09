@@ -1,0 +1,52 @@
+knob V41_B2_MISS_PREFETCH; arms ['dry', 'off']; switches 86
+
+== ms.step p50 by cell (n) ==
+cell                           dry             off   ratio b/a
+lone_plain r1             57.2 n72       58.0 n119
+lone_spec r2             68.7 n117       64.5 n354
+lone_spec r3             74.2 n790      76.8 n1444   1.035  ABORT
+lone_spec r4            83.1 n1781      82.5 n4738   0.993  ok
+lone_spec r5             95.8 n770      93.6 n1244   0.977  ok
+lone_spec r6           110.2 n2748     102.1 n4843   0.926  ok
+lone_spec r7                     -               -
+lone_spec r8                     -               -
+lone_spec r9                     -               -
+lone_spec r10                    -               -
+lone_spec r11                    -               -
+lone_spec r12                    -               -
+plain0 r4                        -               -
+plain0 r5                        -               -
+plain0 r6                        -               -
+plain2 r2                 65.5 n60        67.7 n39
+plain2 r3                        -               -
+plain3 r3               78.8 n1820      76.3 n1993   0.968  ok
+plain3 r4                        -               -
+plain4 r4                86.7 n730      85.8 n1276   0.990  ok
+plain4 r5                        -               -
+plain5 r5                104.0 n86      102.1 n565
+two_spec r3               78.0 n47               -
+two_spec r4                      -               -
+two_spec r5              95.3 n290       94.8 n369   0.995  ok
+two_spec r6             106.4 n142       110.0 n71
+two_spec r7             120.6 n357      115.9 n345   0.961  ok
+two_spec r8             136.0 n175      127.7 n519
+two_spec r9             132.9 n182      146.6 n235
+two_spec r10            155.1 n130      151.5 n200
+two_spec r11            153.1 n143               -
+two_spec r12            170.1 n132      161.7 n287
+
+== ms.stage fields per arm and regime (median of 20-step blocks) ==
+lone_spec     dry: dry_hits_r1=39.700 nonres_r1=43.100 cand_r1=65.700 blocked=3.450 predicted_miss=36.100 dry_hits_r2=72.000 nonres_r2=82.100 dry_hits_r3=96.950 nonres_r3=121.550 dry_words=35.200 stale=2.300 look_launch_us_per_ll=2.400 look_filter_us_per_ll=0.020 look_launch=0.190 look_filter=0.010 pre_moe=6.350 sel_sync=2.790 remote_submit=0.150 engram_join=1.555 pager_block=2.630 page_ms=4.390 paged_x1e6=1.950
+lone_spec     off: dry_hits_r1=7.425 nonres_r1=8.000 cand_r1=10.525 blocked=4.200 predicted_miss=42.600 dry_hits_r2=13.925 nonres_r2=15.575 dry_hits_r3=19.950 nonres_r3=23.475 dry_words=6.250 stale=1.450 look_launch_us_per_ll=1.625 look_filter_us_per_ll=0.060 look_launch=0.125 pre_moe=6.310 sel_sync=2.390 remote_submit=0.160 engram_join=2.430 pager_block=3.035 page_ms=5.120 paged_x1e6=2.300
+lone_spec  recall_r1 any-rank (median hits / median nonres, arm off) = 0.928
+two_spec      dry: dry_hits_r1=65.400 nonres_r1=71.900 cand_r1=134.600 blocked=13.600 predicted_miss=96.750 dry_hits_r2=118.750 nonres_r2=135.700 dry_hits_r3=165.300 nonres_r3=200.200 dry_words=70.050 stale=0.750 look_launch_us_per_ll=2.670 look_filter_us_per_ll=0.150 look_launch=0.200 look_filter=0.010 pre_moe=7.120 sel_sync=2.440 remote_submit=0.230 engram_join=3.470 pager_block=2.480 page_ms=16.010 paged_x1e6=7.700
+two_spec      off: dry_hits_r1=6.250 nonres_r1=6.650 cand_r1=9.150 blocked=13.700 predicted_miss=107.225 dry_hits_r2=12.000 nonres_r2=13.350 dry_hits_r3=17.000 nonres_r3=20.300 dry_words=5.900 stale=0.750 look_launch_us_per_ll=0.440 look_launch=0.030 pre_moe=7.100 sel_sync=2.340 remote_submit=0.240 engram_join=3.150 pager_block=2.520 page_ms=15.325 paged_x1e6=7.250
+two_spec   recall_r1 any-rank (median hits / median nonres, arm off) = 0.940
+plain3        dry: dry_hits_r1=4.650 nonres_r1=6.300 cand_r1=37.450 blocked=6.450 predicted_miss=47.700 dry_hits_r2=9.650 nonres_r2=15.500 dry_hits_r3=15.300 nonres_r3=27.650 dry_words=6.050 stale=0.200 look_launch_us_per_ll=2.230 look_filter_us_per_ll=0.010 look_launch=0.170 pre_moe=5.930 sel_sync=2.510 remote_submit=0.130 engram_join=1.410 pager_block=3.120 page_ms=8.120 paged_x1e6=3.750
+plain3        off: dry_hits_r1=3.650 nonres_r1=4.500 cand_r1=6.500 blocked=5.675 predicted_miss=47.350 dry_hits_r2=7.250 nonres_r2=9.650 dry_hits_r3=10.850 nonres_r3=15.650 dry_words=3.850 stale=0.650 look_launch_us_per_ll=0.390 look_filter_us_per_ll=0.010 look_launch=0.030 pre_moe=5.950 sel_sync=2.330 remote_submit=0.130 engram_join=1.320 pager_block=1.900 page_ms=6.525 paged_x1e6=3.100
+plain3     recall_r1 any-rank (median hits / median nonres, arm off) = 0.811
+plain4        dry: dry_hits_r1=7.850 nonres_r1=10.200 cand_r1=51.050 blocked=8.250 predicted_miss=62.050 dry_hits_r2=16.350 nonres_r2=23.750 dry_hits_r3=25.250 nonres_r3=41.350 dry_words=9.950 stale=0.200 look_launch_us_per_ll=2.230 look_filter_us_per_ll=0.010 look_launch=0.170 pre_moe=5.880 sel_sync=2.190 remote_submit=0.160 engram_join=1.730 pager_block=3.310 page_ms=10.160 paged_x1e6=4.800
+plain4        off: blocked=8.075 predicted_miss=62.350 pre_moe=5.905 sel_sync=2.035 remote_submit=0.150 engram_join=1.710 pager_block=1.900 page_ms=9.480 paged_x1e6=4.350
+plain5        dry: dry_hits_r1=12.500 nonres_r1=15.650 cand_r1=67.050 blocked=12.275 predicted_miss=73.525 dry_hits_r2=26.775 nonres_r2=35.375 dry_hits_r3=40.575 nonres_r3=58.475 dry_words=15.325 stale=0.300 look_launch_us_per_ll=2.435 look_filter_us_per_ll=0.010 look_launch=0.180 pre_moe=6.275 sel_sync=2.150 remote_submit=0.185 engram_join=1.715 pager_block=3.625 page_ms=17.970 paged_x1e6=7.600
+plain5        off: dry_hits_r1=0.350 nonres_r1=0.400 cand_r1=3.850 blocked=6.350 predicted_miss=60.875 dry_hits_r2=0.650 nonres_r2=1.000 dry_hits_r3=1.150 nonres_r3=2.000 dry_words=0.350 stale=0.050 look_launch_us_per_ll=0.210 look_launch=0.020 pre_moe=5.855 sel_sync=2.610 remote_submit=0.160 engram_join=1.825 pager_block=2.175 page_ms=8.350 paged_x1e6=3.725
+plain5     recall_r1 any-rank (median hits / median nonres, arm off) = 0.875

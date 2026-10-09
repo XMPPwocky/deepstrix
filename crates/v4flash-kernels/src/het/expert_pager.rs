@@ -527,6 +527,7 @@ pub fn partition_box2(layer: i32, e: u32) -> bool {
 /// scheduler every `V41_B1_HOT_REFRESH` steps with the counts halved (decaying
 /// window). Until the first refresh with enough data the hash split applies.
 pub mod hot_set {
+    use super::super::hot_split::Side;
     use crate::config::{N_EXPERT, N_LAYER};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
     const NE: usize = N_EXPERT as usize;
@@ -535,6 +536,172 @@ pub mod hot_set {
     static OWN: [AtomicBool; NL * NE] = [const { AtomicBool::new(false) }; NL * NE];
     static WARM: AtomicBool = AtomicBool::new(false);
     static TOTAL: AtomicU64 = AtomicU64::new(0);
+    /// HOT SPLIT (docs/v41/HOT_SPLIT_DESIGN.md 2): each (layer, expert)'s
+    /// `hot_split::Side`. `OWN` stays the routing truth for `box1_owns` (= B1
+    /// or Rep); STATE adds box 2's head (B2Head: the KEEP set) and the
+    /// replicated set. Under `top` it is B1/B2 from `OWN`.
+    static STATE: [std::sync::atomic::AtomicU8; NL * NE] = [const { std::sync::atomic::AtomicU8::new(0) }; NL * NE];
+    /// Any STATE entry is B2Head or Rep (cheap gate for the KEEP predicate).
+    static KEEP_ANY: AtomicBool = AtomicBool::new(false);
+    /// The last refresh ran `interleave`.
+    static IL_ACTIVE: AtomicBool = AtomicBool::new(false);
+    /// Design 2.4: back on `top` after an interleave. Per layer: a returning
+    /// layer refreshes with the hysteresis off (change cap on) until box 1 owns
+    /// every rank below `per_layer - RETURN_MARGIN` (exact equality never comes:
+    /// live counts reshuffle the flat region at the cutoff every refresh).
+    static RETURNING: AtomicBool = AtomicBool::new(false);
+    static RET_LAYER: [AtomicBool; NL] = [const { AtomicBool::new(false) }; NL];
+    static RET_REFRESHES: AtomicU32 = AtomicU32::new(0);
+    const RETURN_MARGIN: usize = 10;
+    /// Return-mode refreshes before it is forced off (logged).
+    const RETURN_MAX_REFRESHES: u32 = 60;
+    /// Refresh counter (u32, never 0) and, per (layer, expert), the counter of
+    /// the refresh that last moved its HOME between the boxes (0 = never):
+    /// design 3.2's MOVING ids, the only ones the holder fallback, the prior's
+    /// either-box mask and the ledger's not-stale rule apply to.
+    static EPOCH: AtomicU32 = AtomicU32::new(0);
+    static MOVED_AT: [AtomicU32; NL * NE] = [const { AtomicU32::new(0) }; NL * NE];
+    /// A move counts as MOVING for this many refreshes at most (the
+    /// destination usually confirms sooner: `clear_moving`).
+    const MOVING_REFRESHES: u32 = 4;
+    /// Box-1 newcomers of interleave refreshes, for the paced pre-warm (design 5).
+    static PREWARM: std::sync::Mutex<std::collections::VecDeque<(i32, u32)>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    /// A refresh changed the KEEP set: the hub re-queues the KEEP pins (design 4).
+    static KEEP_DIRTY: AtomicBool = AtomicBool::new(false);
+    /// Last refresh's interleave stats (share x1000 mean over layers, swaps,
+    /// box-1 newcomers, box-2 newcomers, KEEP size), for the refresh log line.
+    static IL_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+    /// `(layer, e)`'s placement (B2 when cold / out of range).
+    #[inline]
+    pub fn state(layer: i32, e: u32) -> Side {
+        if layer < 0 || layer as usize >= NL || (e as usize) >= NE {
+            return Side::B2;
+        }
+        Side::from_u8(STATE[layer as usize * NE + e as usize].load(Relaxed))
+    }
+    /// Box 2 must keep `(layer, e)` pinned (design 4: B2Head or Rep). Always
+    /// false under `top` (outside an interleave nothing is KEEP).
+    #[inline]
+    pub fn keep(layer: i32, e: u32) -> bool {
+        KEEP_ANY.load(Relaxed) && state(layer, e).keep()
+    }
+    /// Holder-fallback picks (design 3.2): served by box 1 / by box 2 instead
+    /// of their home, since the start.
+    static HOLDER_B1: AtomicU64 = AtomicU64::new(0);
+    static HOLDER_B2: AtomicU64 = AtomicU64::new(0);
+    #[inline]
+    pub fn note_holder(on_box2: bool) {
+        if on_box2 { &HOLDER_B2 } else { &HOLDER_B1 }.fetch_add(1, Relaxed);
+    }
+    /// (picks served by box 1 instead of box 2, by box 2 instead of box 1).
+    pub fn holder_totals() -> (u64, u64) {
+        (HOLDER_B1.load(Relaxed), HOLDER_B2.load(Relaxed))
+    }
+    /// Is `(layer, e)` MOVING: its home changed boxes within the last
+    /// `MOVING_REFRESHES` refreshes and the destination has not confirmed it?
+    #[inline]
+    pub fn moving(layer: i32, e: u32) -> bool {
+        if layer < 0 || layer as usize >= NL || (e as usize) >= NE {
+            return false;
+        }
+        let at = MOVED_AT[layer as usize * NE + e as usize].load(Relaxed);
+        at != 0 && EPOCH.load(Relaxed).wrapping_sub(at) < MOVING_REFRESHES
+    }
+    /// The destination holds it: no longer MOVING.
+    #[inline]
+    pub fn clear_moving(layer: i32, e: u32) {
+        if layer >= 0 && (layer as usize) < NL && (e as usize) < NE {
+            MOVED_AT[layer as usize * NE + e as usize].store(0, Relaxed);
+        }
+    }
+    fn next_epoch() -> u32 {
+        // u32: one refresh a minute wraps in ~8,000 years; 0 is "never moved".
+        let mut v = EPOCH.fetch_add(1, Relaxed).wrapping_add(1);
+        if v == 0 {
+            v = EPOCH.fetch_add(1, Relaxed).wrapping_add(1);
+        }
+        v
+    }
+    /// MOVING ids now (the gate's report).
+    pub fn moving_count() -> usize {
+        (0..NL * NE).filter(|&i| moving((i / NE) as i32, (i % NE) as u32)).count()
+    }
+    /// A pre-warm read the prefetcher could not take (in-flight cap): back to
+    /// the front of the queue.
+    pub fn requeue_prewarm(layer: i32, e: u32) {
+        PREWARM.lock().unwrap_or_else(|p| p.into_inner()).push_front((layer, e));
+    }
+    /// The pin ledger's "box 2 no longer owns it" (stale / lost): today's
+    /// `!partition_box2` (the hash split before warm-up included), less the
+    /// KEEP set and less a MOVING id box 2 still serves (design 3.2).
+    /// Exactly `!partition_box2` under `top` outside a return.
+    #[inline]
+    pub fn box2_stale(layer: i32, e: u32) -> bool {
+        !super::partition_box2(layer, e) && !keep(layer, e) && !moving(layer, e)
+    }
+    /// Design 3.2 (with review round 2's predicate): should a decode pick of
+    /// `(layer, e)` go to box 2? `home_box2` = `partition_box2`. Only a MOVING
+    /// id (with `V41_B1_HOT_HOLDER`) leaves its home: box-1 home -> box 2 when
+    /// box 1 lacks it and box 2 HOLDS it (pinned: no read, no surprise); box-2
+    /// home -> box 1 when box 2 neither holds it nor has it incoming and box 1
+    /// has it. The prior's held mask uses the same function, so the mask and
+    /// the route agree (a residency change between chain and route costs at
+    /// most one read).
+    #[inline]
+    pub fn serve_on_box2(layer: i32, e: u32, home_box2: bool, b1_has: bool, b2_held: bool, b2_incoming: bool) -> bool {
+        if !moving(layer, e) || !crate::knobs::B1_HOT_HOLDER.on() {
+            return home_box2;
+        }
+        if !home_box2 && !b1_has && b2_held {
+            return true;
+        }
+        if home_box2 && !b2_held && !b2_incoming && b1_has {
+            return false;
+        }
+        home_box2
+    }
+    /// The interleave is in force (its route and ledger rules apply).
+    pub fn interleave_active() -> bool {
+        IL_ACTIVE.load(Relaxed)
+    }
+    pub fn returning() -> bool {
+        RETURNING.load(Relaxed)
+    }
+    /// Up to `n` box-1 newcomers to pre-warm.
+    pub fn take_prewarm(n: usize) -> Vec<(i32, u32)> {
+        let mut g = PREWARM.lock().unwrap_or_else(|p| p.into_inner());
+        let k = g.len().min(n);
+        g.drain(..k).collect()
+    }
+    pub fn prewarm_queued() -> usize {
+        PREWARM.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+    /// Did a refresh change the KEEP set since the last call?
+    pub fn take_keep_dirty() -> bool {
+        KEEP_DIRTY.swap(false, Relaxed)
+    }
+    /// Every KEEP `(layer, e)` (design 4's fill: refresh, decode entry, reconnect).
+    pub fn keep_list() -> Vec<(u32, u32)> {
+        if !KEEP_ANY.load(Relaxed) {
+            return Vec::new();
+        }
+        let mut v = Vec::new();
+        for l in 0..NL {
+            for e in 0..NE {
+                if Side::from_u8(STATE[l * NE + e].load(Relaxed)).keep() {
+                    v.push((l as u32, e as u32));
+                }
+            }
+        }
+        v
+    }
+    /// (box-1 share of the non-replicated mass, swaps, box-1 newcomers,
+    /// box-2 newcomers, KEEP size) of the last interleave refresh.
+    pub fn il_stats() -> (f32, u64, u64, u64, u64) {
+        (IL_STATS[0].load(Relaxed) as f32 / 1000.0, IL_STATS[1].load(Relaxed), IL_STATS[2].load(Relaxed), IL_STATS[3].load(Relaxed), IL_STATS[4].load(Relaxed))
+    }
     pub fn enabled() -> bool {
         static B: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var("V41_B1_HOT").as_deref() != Ok("0"));
@@ -602,6 +769,46 @@ pub mod hot_set {
         if !enabled() || TOTAL.load(Relaxed) < env_u("V41_B1_HOT_MIN_PICKS", 20_000) as u64 {
             return None;
         }
+        if crate::knobs::B1_HOT_POLICY.pick() == 1 && WARM.load(Relaxed) {
+            RETURNING.store(false, Relaxed);
+            return Some(refresh_interleave());
+        }
+        // (`interleave` on a cold hot set -- e.g. the knob left on across a
+        // restart -- warms up as `top` first: the interleave fills box 1 only at
+        // `MOVES` per layer per refresh from an empty start.)
+        if IL_ACTIVE.swap(false, Relaxed) {
+            // Design 2.4: leaving the interleave. KEEP empties now; every
+            // layer returns to the top set at the change cap's pace.
+            for r in RET_LAYER.iter() {
+                r.store(true, Relaxed);
+            }
+            RET_REFRESHES.store(0, Relaxed);
+            RETURNING.store(true, Relaxed);
+        }
+        let returning = RETURNING.load(Relaxed);
+        let out = refresh_top(returning);
+        if returning {
+            let left = RET_LAYER.iter().filter(|r| r.load(Relaxed)).count();
+            let n = RET_REFRESHES.fetch_add(1, Relaxed) + 1;
+            if left == 0 {
+                RETURNING.store(false, Relaxed);
+                tracing::info!(refreshes = n, "box-1 hot set: RETURN MODE done (every layer owns its top ranks again)");
+            } else if n >= RETURN_MAX_REFRESHES {
+                for r in RET_LAYER.iter() {
+                    r.store(false, Relaxed);
+                }
+                RETURNING.store(false, Relaxed);
+                tracing::warn!(refreshes = n, layers_left = left, "box-1 hot set: RETURN MODE forced off (refresh cap)");
+            }
+        }
+        Some(out)
+    }
+
+    /// Today's top-`per_layer` refresh. `returning` (design 2.4): a layer still
+    /// returning keeps incumbents only within the top `per_layer` (hysteresis
+    /// off); its changes are MOVING and its newcomers are pre-warmed. Outside
+    /// a return this is exactly the pre-hot-split refresh.
+    fn refresh_top(returning: bool) -> (usize, f32, usize) {
         let per_layer = per_layer();
         let mass_cap = env_f("V41_B1_HOT_MASS", 0.9).clamp(0.0, 1.0);
         // HYSTERESIS (`V41_B1_HOT_HYST`, default 40 ranks): an incumbent keeps
@@ -609,10 +816,14 @@ pub mod hot_set {
         // fill the slots that frees. Without it a refresh flipped ~1/3 of the
         // set (the cutoff sits in the flat part of the distribution) and every
         // flipped id was a synchronous box-1 read on its next pick.
-        let hyst = env_u("V41_B1_HOT_HYST", 40);
+        let hyst_knob = env_u("V41_B1_HOT_HYST", 40);
         let warm = WARM.load(Relaxed);
         let (mut owned, mut changed, mut mass_sum) = (0usize, 0usize, 0f32);
+        let epoch = next_epoch();
+        let mut prewarm: Vec<(i32, u32)> = Vec::new();
         for l in 0..NL {
+            let ret_l = returning && RET_LAYER[l].load(Relaxed);
+            let hyst = if ret_l { 0 } else { hyst_knob };
             let mut v: Vec<(u32, usize)> = (0..NE).map(|e| (COUNTS[l * NE + e].load(Relaxed), e)).collect();
             let total: u64 = v.iter().map(|&(c, _)| c as u64).sum();
             v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -647,7 +858,7 @@ pub mod hot_set {
             // still flipped 255 ids (p90 462) every ~68 s = 208 GB/h of box-1
             // reads while the set's pick mass only moved 0.75-0.83, and the
             // flips are the +18-21 ms of `b1_read` in the slowest decode steps.
-            let cap = env_u("V41_B1_HOT_MAX_CHANGE", 0);
+            let cap = crate::knobs::B1_HOT_MAX_CHANGE.usize();
             if warm && cap > 0 {
                 let prev_own = |e: usize| OWN[l * NE + e].load(Relaxed);
                 let mut newcomers: Vec<(u32, usize)> = (0..NE).filter(|&e| own[e] && !prev_own(e)).map(|e| (COUNTS[l * NE + e].load(Relaxed), e)).collect();
@@ -667,31 +878,327 @@ pub mod hot_set {
             mass_sum += if total > 0 { acc as f32 / total as f32 } else { 0.0 };
             for e in 0..NE {
                 let prev = OWN[l * NE + e].swap(own[e], Relaxed);
-                if prev != own[e] { changed += 1; }
+                if prev != own[e] {
+                    changed += 1;
+                    if ret_l {
+                        MOVED_AT[l * NE + e].store(epoch, Relaxed);
+                        if own[e] {
+                            prewarm.push((l as i32, e as u32));
+                        }
+                    }
+                }
                 if own[e] { owned += 1; }
+                STATE[l * NE + e].store(if own[e] { Side::B1 as u8 } else { Side::B2 as u8 }, Relaxed);
                 // decay: half-life = one refresh interval
                 let c = COUNTS[l * NE + e].load(Relaxed);
                 COUNTS[l * NE + e].store(c / 2, Relaxed);
             }
+            // Coverage exit: every rank below `per_layer - RETURN_MARGIN` owned.
+            if ret_l && (0..NE).all(|e| rank[e] >= per_layer.saturating_sub(RETURN_MARGIN) || own[e]) {
+                RET_LAYER[l].store(false, Relaxed);
+            }
         }
+        if returning {
+            push_prewarm(prewarm);
+        }
+        KEEP_ANY.store(false, Relaxed);
         TOTAL.store(TOTAL.load(Relaxed) / 2, Relaxed);
         WARM.store(true, Relaxed);
-        Some((owned, mass_sum / NL as f32, changed))
+        (owned, mass_sum / NL as f32, changed)
+    }
+
+    /// Queue pre-warm reads; drop older entries box 1 no longer needs.
+    fn push_prewarm(new: Vec<(i32, u32)>) {
+        let mut g = PREWARM.lock().unwrap_or_else(|p| p.into_inner());
+        g.retain(|&(l, e)| Side::from_u8(STATE[l as usize * NE + e as usize].load(Relaxed)).box1_resident());
+        g.extend(new);
+    }
+
+    /// Design 2: the sticky interleave (`hot_split::interleave_layer`) per
+    /// layer from the decayed counts and the current STATE (today's top set as
+    /// B1 on the first interleave refresh). Same decay as `refresh_top`.
+    fn refresh_interleave() -> (usize, f32, usize) {
+        use crate::knobs as k;
+        let first = !IL_ACTIVE.load(Relaxed);
+        let mut n1 = k::B1_HOT_IL_PER_LAYER.usize();
+        if n1 == 0 {
+            n1 = per_layer();
+        }
+        let n1 = fit_per_layer(n1.min(NE), CAPACITY.load(Relaxed), env_u("V41_B1_HOT_SLACK", 2));
+        let p = super::super::hot_split::IlParams {
+            n1,
+            k: k::B1_HOT_REP.usize(),
+            p2: k::B1_HOT_B2HEAD.usize().min(keep_cap_per_layer().saturating_sub(k::B1_HOT_REP.usize())),
+            target: k::B1_HOT_TARGET.f64(),
+            tol: k::B1_HOT_TOL.f64(),
+            moves: k::B1_HOT_MOVES.usize(),
+            hyst: k::B1_HOT_IL_HYST.usize(),
+            rep_hyst: k::B1_HOT_REP_HYST.usize(),
+        };
+        let warm = WARM.load(Relaxed);
+        let (mut owned, mut changed, mut mass_sum) = (0usize, 0usize, 0f32);
+        let (mut share_sum, mut swaps, mut b1n, mut b2n, mut keep_n) = (0f64, 0u64, 0u64, 0u64, 0u64);
+        let mut prewarm: Vec<(i32, u32)> = Vec::new();
+        let mut counts = vec![0u32; NE];
+        let mut prev = vec![Side::B2; NE];
+        let epoch = next_epoch();
+        for l in 0..NL {
+            for e in 0..NE {
+                counts[e] = COUNTS[l * NE + e].load(Relaxed);
+                prev[e] = if !warm {
+                    Side::B2
+                } else if first {
+                    if OWN[l * NE + e].load(Relaxed) { Side::B1 } else { Side::B2 }
+                } else {
+                    Side::from_u8(STATE[l * NE + e].load(Relaxed))
+                };
+            }
+            let plan = super::super::hot_split::interleave_layer(&counts, &prev, &p);
+            let total: u64 = counts.iter().map(|&c| c as u64).sum();
+            let mut acc = 0u64;
+            for e in 0..NE {
+                let s = plan.sides[e];
+                let own = s.box1_resident();
+                if OWN[l * NE + e].swap(own, Relaxed) != own {
+                    changed += 1;
+                }
+                if own {
+                    owned += 1;
+                    acc += counts[e] as u64;
+                }
+                if s.keep() {
+                    keep_n += 1;
+                }
+                if warm && s.box2_home() != prev[e].box2_home() {
+                    MOVED_AT[l * NE + e].store(epoch, Relaxed);
+                }
+                STATE[l * NE + e].store(s as u8, Relaxed);
+                COUNTS[l * NE + e].store(counts[e] / 2, Relaxed);
+            }
+            mass_sum += if total > 0 { acc as f32 / total as f32 } else { 0.0 };
+            share_sum += plan.share1;
+            swaps += plan.swaps as u64;
+            b1n += plan.b1_new.len() as u64;
+            b2n += plan.b2_new.len() as u64;
+            if warm {
+                prewarm.extend(plan.b1_new.iter().map(|&e| (l as i32, e)));
+            }
+        }
+        push_prewarm(prewarm);
+        IL_STATS[0].store((share_sum / NL as f64 * 1000.0) as u64, Relaxed);
+        IL_STATS[1].store(swaps, Relaxed);
+        IL_STATS[2].store(b1n, Relaxed);
+        IL_STATS[3].store(b2n, Relaxed);
+        IL_STATS[4].store(keep_n, Relaxed);
+        KEEP_ANY.store(keep_n > 0, Relaxed);
+        // Every interleave refresh: `keep_fill` dedups against held ids and the
+        // queue, so this also re-queues grants that expired unpinned.
+        KEEP_DIRTY.store(true, Relaxed);
+        IL_ACTIVE.store(true, Relaxed);
+        TOTAL.store(TOTAL.load(Relaxed) / 2, Relaxed);
+        WARM.store(true, Relaxed);
+        (owned, mass_sum / NL as f32, changed)
+    }
+
+    /// Design 4's clamp: box 2's KEEP per layer <= (pin budget - 1,024) / 40,
+    /// the budget from box 2's replies (`b2_mirror::pin_budget`), else the
+    /// production 4,232.
+    fn keep_cap_per_layer() -> usize {
+        let budget = super::super::b2_mirror::pin_budget().unwrap_or(4232) as usize;
+        budget.saturating_sub(1024) / NL
+    }
+
+    /// Tests: forget every placement static (they are process-wide).
+    #[cfg(test)]
+    fn reset_for_test() {
+        for i in 0..NL * NE {
+            COUNTS[i].store(0, Relaxed);
+            OWN[i].store(false, Relaxed);
+            STATE[i].store(0, Relaxed);
+            MOVED_AT[i].store(0, Relaxed);
+        }
+        for r in RET_LAYER.iter() {
+            r.store(false, Relaxed);
+        }
+        for f in [&WARM, &KEEP_ANY, &IL_ACTIVE, &RETURNING, &KEEP_DIRTY] {
+            f.store(false, Relaxed);
+        }
+        TOTAL.store(0, Relaxed);
+        EPOCH.store(0, Relaxed);
+        PREWARM.lock().unwrap().clear();
+        use crate::knobs as k;
+        for (kn, v) in [(&k::B1_HOT_POLICY, "top"), (&k::B1_HOT_TARGET, "0.60"), (&k::B1_HOT_TOL, "0.02"), (&k::B1_HOT_MOVES, "3"),
+                        (&k::B1_HOT_IL_HYST, "40"), (&k::B1_HOT_B2HEAD, "60"), (&k::B1_HOT_IL_PER_LAYER, "0"), (&k::B1_HOT_MAX_CHANGE, "0"),
+                        (&k::B1_HOT_HOLDER, "1"), (&k::B1_HOT_REP, "0"), (&k::B1_HOT_REP_HYST, "5")] {
+            kn.set(v);
+        }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        /// The statics are process-wide: the tests touching them run one at a time.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// Every layer gets Zipf-like picks over `ne` ids, id order permuted per
+        /// layer and perturbed by `noise` (0..1 relative, deterministic LCG).
+        fn feed(seed: &mut u64, noise: f64) {
+            for l in 0..NL {
+                for i in 0..NE {
+                    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let r = ((*seed >> 33) as f64) / (1u64 << 31) as f64; // 0..1
+                    let base = 2000.0 / (i + 1) as f64;
+                    let n = (base * (1.0 + noise * (2.0 * r - 1.0))).max(0.0) as u32;
+                    let e = ((i * 7 + l) % NE) as u32;
+                    for _ in 0..n {
+                        note_pick(l, e);
+                    }
+                }
+            }
+        }
+
+        /// HOT SPLIT end to end on the statics: `top` -> `interleave` (share
+        /// converges, KEEP and MOVING appear, box-1 newcomers are queued for the
+        /// pre-warm, the ledger predicates follow) -> `top` again under noisy
+        /// counts (the RETURN MODE ends by coverage within its cap, KEEP is
+        /// empty at once, and afterwards `box2_stale == !partition_box2`).
+        #[test]
+        fn interleave_switch_and_return() {
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_for_test();
+            std::env::set_var("V41_B1_HOT_MIN_PICKS", "0");
+            std::env::set_var("V41_B1_HOT_PER_LAYER", "40");
+            std::env::set_var("V41_B1_HOT_HYST", "20");
+            crate::knobs::B1_HOT_MAX_CHANGE.set("3");
+            crate::knobs::B1_HOT_B2HEAD.set("20");
+            crate::knobs::B1_HOT_TARGET.set("0.35");
+            crate::knobs::B1_HOT_MOVES.set("3");
+            crate::knobs::B1_HOT_IL_HYST.set("10");
+            crate::knobs::B1_HOT_REP.set("0");
+            crate::knobs::B1_HOT_POLICY.set("top");
+            let mut seed = 1u64;
+            for _ in 0..3 {
+                feed(&mut seed, 0.0);
+                refresh().unwrap();
+            }
+            assert!(!interleave_active() && !returning());
+            assert!(keep_list().is_empty());
+            for l in 0..NL as i32 {
+                for e in 0..NE as u32 {
+                    assert_eq!(box2_stale(l, e), !super::super::partition_box2(l, e));
+                }
+            }
+            // To the interleave.
+            crate::knobs::B1_HOT_POLICY.set("interleave");
+            let mut share = 1.0;
+            for _ in 0..40 {
+                feed(&mut seed, 0.0);
+                refresh().unwrap();
+                share = il_stats().0;
+            }
+            assert!(interleave_active());
+            assert!((share - 0.35).abs() <= 0.03, "share {share}");
+            let kl = keep_list();
+            assert_eq!(kl.len(), NL * 20, "box 2's head is full");
+            assert!(kl.iter().all(|&(l, e)| keep(l as i32, e) && !box2_stale(l as i32, e) && super::super::partition_box2(l as i32, e)));
+            assert!(take_keep_dirty());
+            assert!(prewarm_queued() > 0, "swapped-in ids queued for the pre-warm");
+            // Back to top, counts jittering +-30% every refresh.
+            crate::knobs::B1_HOT_POLICY.set("top");
+            feed(&mut seed, 0.3);
+            refresh().unwrap();
+            assert!(returning() && !interleave_active());
+            assert!(keep_list().is_empty() && (0..NE as u32).all(|e| !keep(0, e)), "KEEP empties at once");
+            let mut n = 1;
+            while returning() {
+                feed(&mut seed, 0.3);
+                refresh().unwrap();
+                n += 1;
+                assert!(n <= RETURN_MAX_REFRESHES as usize + 1);
+            }
+            assert!(n > 1 && n < RETURN_MAX_REFRESHES as usize, "ended by coverage after several capped refreshes, not the cap ({n} refreshes)");
+            // Moves expire after MOVING_REFRESHES more refreshes.
+            for _ in 0..MOVING_REFRESHES {
+                feed(&mut seed, 0.0);
+                refresh().unwrap();
+            }
+            for l in 0..NL as i32 {
+                for e in 0..NE as u32 {
+                    assert!(!moving(l, e));
+                    assert_eq!(box2_stale(l, e), !super::super::partition_box2(l, e));
+                }
+            }
+            for k in [&crate::knobs::B1_HOT_MAX_CHANGE] {
+                k.set("0");
+            }
+            reset_for_test();
+        }
+
+        /// `interleave` on a COLD hot set (the knob left on across a restart):
+        /// the first refresh warms up as `top` (box 1 full at once), the next one
+        /// interleaves from that set.
+        #[test]
+        fn interleave_cold_start_warms_as_top() {
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_for_test();
+            std::env::set_var("V41_B1_HOT_MIN_PICKS", "0");
+            std::env::set_var("V41_B1_HOT_PER_LAYER", "40");
+            crate::knobs::B1_HOT_B2HEAD.set("20");
+            crate::knobs::B1_HOT_POLICY.set("interleave");
+            let mut seed = 7u64;
+            feed(&mut seed, 0.0);
+            let (owned, _, _) = refresh().unwrap();
+            assert_eq!(owned, NL * 40, "box 1 full after the first refresh");
+            assert!(!interleave_active() && keep_list().is_empty());
+            feed(&mut seed, 0.0);
+            refresh().unwrap();
+            assert!(interleave_active());
+            assert_eq!(keep_list().len(), NL * 20);
+            reset_for_test();
+        }
+
+        /// Design 3.2's decision table: only a MOVING id leaves its home, and
+        /// only to a box that holds it.
+        #[test]
+        fn holder_decision() {
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_for_test();
+            crate::knobs::B1_HOT_HOLDER.set("1");
+            let (l, e) = (3i32, 7u32);
+            // Not moving: always home.
+            assert!(serve_on_box2(l, e, true, true, false, false));
+            assert!(!serve_on_box2(l, e, false, false, true, false));
+            let ep = next_epoch();
+            MOVED_AT[l as usize * NE + e as usize].store(ep, Relaxed);
+            assert!(moving(l, e));
+            // Box-1 home, box 1 lacks it, box 2 holds it -> box 2.
+            assert!(serve_on_box2(l, e, false, false, true, false));
+            // ... but only if box 2 HOLDS it (incoming is not enough).
+            assert!(!serve_on_box2(l, e, false, false, false, true));
+            // Box-2 home, box 2 neither holds nor has it incoming, box 1 has it -> box 1.
+            assert!(!serve_on_box2(l, e, true, true, false, false));
+            assert!(serve_on_box2(l, e, true, true, false, true), "incoming: stay on box 2");
+            assert!(serve_on_box2(l, e, true, false, false, false), "nobody holds it: home");
+            crate::knobs::B1_HOT_HOLDER.set("0");
+            assert!(!serve_on_box2(l, e, false, false, true, false), "knob off: home");
+            crate::knobs::B1_HOT_HOLDER.set("1");
+            clear_moving(l, e);
+            assert!(!moving(l, e));
+            reset_for_test();
+        }
+
         /// The change cap bounds newcomers per layer per refresh and keeps the
         /// set `per_layer` wide by retaining the strongest departing incumbents.
         /// (One test: the module's counts are process-wide statics.)
         #[test]
         fn refresh_change_cap() {
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_for_test();
             std::env::set_var("V41_B1_HOT_MIN_PICKS", "0");
             std::env::set_var("V41_B1_HOT_PER_LAYER", "4");
             std::env::set_var("V41_B1_HOT_HYST", "0");
-            std::env::set_var("V41_B1_HOT_MAX_CHANGE", "1");
+            crate::knobs::B1_HOT_MAX_CHANGE.set("1");
             // Warm-up refresh: layer 0 owns 0..4 (counts 40, 30, 20, 10).
             for (e, n) in [(0u32, 40), (1, 30), (2, 20), (3, 10)] {
                 for _ in 0..n { note_pick(0, e); }
@@ -712,7 +1219,8 @@ pub mod hot_set {
             assert!((11..14).all(|e| box1_owns(0, e) == Some(false)));
             assert!((0..3).all(|e| box1_owns(0, e) == Some(true)), "strongest incumbents kept");
             assert_eq!(box1_owns(0, 3), Some(false), "the weakest incumbent left");
-            std::env::set_var("V41_B1_HOT_MAX_CHANGE", "0");
+            crate::knobs::B1_HOT_MAX_CHANGE.set("0");
+            reset_for_test();
         }
 
         /// The size never exceeds what the decode LRU holds (less slack); an
@@ -1193,6 +1701,30 @@ impl ExpertPager {
         Ok(())
     }
 
+    /// HOT SPLIT pre-warm (design 5): queue `(layer, id)` for the background read
+    /// now -- no min-touch gate (a refresh newcomer is wanted on purpose). Same
+    /// dedup and in-flight cap as `prefetch_hint`. `Some(true)` = queued,
+    /// `Some(false)` = not needed (no prefetcher, resident, already queued),
+    /// `None` = the in-flight cap is full (try again later).
+    pub fn prefetch_now(&mut self, layer: i32, id: u32) -> Option<bool> {
+        let Some(pf) = self.prefetch.as_mut() else { return Some(false) };
+        let key = (layer, id);
+        if self.res.slot_of.contains_key(&key) || pf.pending.contains(&key) {
+            return Some(false);
+        }
+        if pf.pending.len() >= PREFETCH_INFLIGHT_MAX {
+            return None;
+        }
+        {
+            let (m, cv) = &*pf.stack;
+            m.lock().unwrap().push(key);
+            cv.notify_one();
+        }
+        pf.pending.insert(key);
+        pf.queued += 1;
+        Some(true)
+    }
+
     /// Queue `(layer, id)` for the background read if it is neither resident nor
     /// already queued. Never blocks: a full queue drops the hint (counted).
     pub fn prefetch_hint(&mut self, layer: i32, id: u32) {
@@ -1276,7 +1808,14 @@ impl ExpertPager {
                     if let Some(d) = self.window_dense.get_mut(w as usize) { *d = false; }
                 }
             }
-            push_hint(true, p.layer, p.id);
+            // HOT SPLIT: box 2 must keep a KEEP id (design 4) -- no "box 1 has
+            // it" demotion; and a box-1-home id that lands is done MOVING.
+            if !hot_set::keep(p.layer, p.id) {
+                push_hint(true, p.layer, p.id);
+            }
+            if !partition_box2(p.layer, p.id) {
+                hot_set::clear_moving(p.layer, p.id);
+            }
             if self.repack.is_some() {
                 let (rp, st) = (self.repack.as_ref().unwrap(), self.repack_stream.as_ref().unwrap());
                 Self::upload_and_repack(

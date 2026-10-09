@@ -15,6 +15,7 @@ looked at in that pass.
 
 | entry | status | note |
 |---|---|---|
+| #56 | ~~FIXED~~ 2026-10-06 | `KvArena` switched the current device behind the engine's cache; one failed draft after an in-step `grow` (an instance of #10) |
 | #53 | **OPEN** | f16 box-2 prefill partials are on by default with no fidelity gate (new 2026-10-04) |
 | #54 | **OPEN** | `V41_SUB=1/2` substitution runs after the fidelity pin; production's mode 3 is unaffected (new 2026-10-04) |
 | #55 | **OPEN** | OpenAI `tool_choice` silently ignored; `"role": "function"` answered with a bare 422 (new 2026-10-04) |
@@ -37,6 +38,37 @@ looked at in that pass.
 ---
 
 ## Recent entries (newest first; most are FIXED)
+
+### 56. FIXED (found and fixed 2026-10-06) — `KvArena` switched the current device behind the het engine's cache: `hipErrorInvalidHandle` in the drafter right after an in-step reservation grow
+
+Production (hub 3eccfdf9), 2026-10-06 05:44:40 UTC, first occurrence in any log:
+`ms dspark: draft failed; plain step, ring restarts slot=0 error=HIP error 400
+(hipErrorInvalidHandle) in hipModuleLaunchKernel`, 10 ms after `stream
+reservation grown slot=0 pos=199924 from=200175 to=216559 how=InPlace
+completion_tokens=16136` (a lone stream at ~200K positions whose completion
+exhausted its KV reservation; the 64K `max_tokens` default makes this reachable).
+
+Mechanism = #10 exactly as `v4flash-hip/src/device.rs` describes it. The het
+engine caches the current device (`set_current_cached`, `engine.rs`) and skips
+the driver call when the cache matches. `KvArena::grow_inner` (and seven other
+arena entry points: `alloc`, `alloc_inner`, `fill_admitted`, `export_to_state`,
+`compact_stores_inner`, `compact_raw`, `accept`) did a bare `dgpu.set_current()`,
+switching the thread to the dGPU behind the cache. `decode_step` grows
+reservations (`take_stalled`) right before the draft; the previous step's last
+engine op was on the iGPU (the lone stream's ring write under `RING=solo`), so
+the cache said iGPU, `dspark_draft`'s `set_current_cached(igpu)` was a no-op,
+and the iGPU drafter kernel was launched with the dGPU current. Recovery was
+clean (plain step, ring restart; the next dGPU chain re-synced the cache), cost
+one draft. The other sites had been getting lucky: their next engine op is a
+dGPU op, where a stale "iGPU" cache forces a real switch.
+
+Fix: every arena site holds `dgpu.scoped_current()` (RAII; restores the previous
+device on drop) instead of the bare call, so the engine's cache stays truthful.
+No numeric path changes. Regression coverage: the existing `kv_arena_compact`
+tests exercise grow/compact; the failure itself needs a live engine (an iGPU op,
+then a grow, then an iGPU op), which `tests/multistream_step.rs` G5 runs cover
+once a stream crosses its reservation -- the gate's `MS_LENS` should include one
+such case (owed). #10 itself (91 bare `set_current*` calls in `het/`) stays open.
 
 ### 53. OPEN (found 2026-10-04) — box 2's prefill MoE partials travel as f16 by default, and no fidelity gate has been run on that
 

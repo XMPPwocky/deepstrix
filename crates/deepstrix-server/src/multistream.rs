@@ -1116,7 +1116,15 @@ impl Sched {
             // `pin_released`: the band's opening release (-> Prefill), or the
             // phase's per-chunk reopens (-> Decode).
             let (pin_released, pin_restore) = match next {
-                Phase::Prefill => (v4flash_kernels::het::b2_mirror::pin_enter_prefill(), 0),
+                Phase::Prefill => {
+                    // Predicted-miss hint words (`het::lookahead`, design 2.3)
+                    // never ride a prefill chunk: the queue empties here, not in
+                    // the per-chunk `expire_incoming` (review round 2, finding 6).
+                    v4flash_kernels::het::remote_experts::clear_hint_words();
+                    // The SOFT-HELD rows describe the pre-prefill pool from here.
+                    v4flash_kernels::het::b2_mirror::clear_soft();
+                    (v4flash_kernels::het::b2_mirror::pin_enter_prefill(), 0)
+                }
                 Phase::Decode => (
                     v4flash_kernels::het::b2_mirror::take_band_reopened(),
                     v4flash_kernels::het::b2_mirror::pin_enter_decode(),
@@ -1627,9 +1635,22 @@ impl Sched {
         // Hot-set ownership refresh (see expert_pager::hot_set); `tick` is
         // advanced once per scheduler tick.
         if self.tick % knobs::B1_HOT_REFRESH.get() == 0 {
-            if let Some((owned, mass, changed)) = v4flash_kernels::het::expert_pager::hot_set::refresh() {
-                tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
-                    picks = v4flash_kernels::het::expert_pager::hot_set::picks_seen(), "multistream: box-1 hot set refreshed");
+            use v4flash_kernels::het::expert_pager::hot_set;
+            if let Some((owned, mass, changed)) = hot_set::refresh() {
+                if hot_set::interleave_active() || hot_set::returning() {
+                    // HOT SPLIT (docs/v41/HOT_SPLIT_DESIGN.md): the placement's
+                    // own numbers, and the holder / pre-warm / KEEP totals.
+                    let (share1, swaps, b1_new, b2_new, keep) = hot_set::il_stats();
+                    let (holder_b1, holder_b2) = hot_set::holder_totals();
+                    tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
+                        picks = hot_set::picks_seen(), interleave = hot_set::interleave_active(), returning = hot_set::returning(),
+                        share1 = format!("{share1:.3}"), swaps, b1_new, b2_new, keep, holder_b1, holder_b2,
+                        prewarm_queued = hot_set::prewarm_queued(), keep_queued = v4flash_kernels::het::b2_mirror::keep_queued_total(),
+                        "multistream: box-1 hot set refreshed");
+                } else {
+                    tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
+                        picks = hot_set::picks_seen(), "multistream: box-1 hot set refreshed");
+                }
             }
         }
         // Token boundary: nothing is reading the pool (the previous step and
@@ -1641,7 +1662,25 @@ impl Sched {
         // would otherwise return a write's fault as their own (`settle_writes`).
         // (The wait is what the step's host tail did not hide of the last write.)
         let ring_settle_ms = self.dsp.as_mut().map(|d| d.settle_writes()).unwrap_or(0.0);
-        if let Some(pg) = state.pager.as_mut() { pg.drain_prefetched()?; }
+        if let Some(pg) = state.pager.as_mut() {
+            pg.drain_prefetched()?;
+            // HOT SPLIT pre-warm (design 5): box-1 newcomers of the last
+            // refreshes, a few per step (empty outside an interleave / return).
+            let n = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize();
+            if n > 0 {
+                let batch = v4flash_kernels::het::expert_pager::hot_set::take_prewarm(n);
+                for (i, &(l, e)) in batch.iter().enumerate() {
+                    if pg.prefetch_now(l, e).is_none() {
+                        // The in-flight cap is full: this one and the rest back to
+                        // the front (in order), retry next step.
+                        for &(l2, e2) in batch[i..].iter().rev() {
+                            v4flash_kernels::het::expert_pager::hot_set::requeue_prewarm(l2, e2);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         // Perfetto (`V41_PERFETTO_STEPS` live, or `V41_PERFETTO_OUT`): the
         // previous step's leftovers (the drafter's ring writes, recorded after
         // its export) go out before this step's pool reset.
@@ -2183,6 +2222,26 @@ impl Sched {
                     e.0 += v; e.1 += 1;
                 }
             }
+            // Predicted-miss look-ahead prefetch (`V41_B2_MISS_PREFETCH`) and
+            // the per-step speculative budget (`V41_B2_SPEC_BUDGET`), counts per
+            // step (`het::lookahead::STATS`): their own `hub_lh2` record keyed
+            // by the step (`hub_step` is at its field limit), and `lh2.*` host
+            // stages in the `ms.stage` rollup. The dry run reads
+            // `lh2.dry_hits_r1 / lh2.nonres_r1` (rank-1 recall; design 0.71)
+            // and `lh2.dry_words` per step against the section-5 abort bar.
+            if v4flash_kernels::het::lookahead::active() {
+                use v4flash_kernels::het::lookahead::{take_stats, STATS};
+                let st = take_stats();
+                if ev_on {
+                    let mut pairs: Vec<(&str, f64)> = vec![("step", step_id as f64), ("rows", b as f64)];
+                    pairs.extend(STATS.iter().zip(&st).map(|((field, _), v)| (*field, *v as f64)));
+                    v4flash_kernels::het::evtrace::emit_named(&v4flash_kernels::het::evtrace_kinds::HUB_LH2, &pairs);
+                }
+                for ((_, stage), v) in STATS.iter().zip(&st) {
+                    let e = acc.stages.entry(("host", *stage)).or_insert((0.0, 0));
+                    e.0 += *v as f64; e.1 += 1;
+                }
+            }
             // Box-2 pinning, per step (drained above).
             if let Some([sur, held, rel, pinned, _budget, unused]) = pin_stats {
                 for (name, v) in [("pin.surprises", sur), ("pin.held_picks", held), ("pin.released", rel), ("pin.pinned", pinned), ("pin.released_unused", unused)] {
@@ -2227,12 +2286,24 @@ impl Sched {
                 let e = acc.stages.entry(("host", "pager.read_ms")).or_insert((0.0, 0));
                 e.0 += dr as f64 / 1e6; e.1 += 1;
             }
-            for (name, us) in v4flash_kernels::het::forward_prefill::take_layer_host_timing() {
+            let lh = v4flash_kernels::het::forward_prefill::take_layer_host_timing();
+            for &(name, us) in &lh {
                 let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                 e.0 += us as f64 / 1e3;
                 e.1 += 1;
                 if ev_on {
                     ev.insert(name.replacen("lh.", "lh_", 1), us as f64 / 1e3);
+                }
+            }
+            // The predicted-miss look-ahead's host cost PER LANE-LAYER (us), the
+            // number the design's 2.6 compares with the 0.03 ms turnaround slack
+            // (`lh.look_*` above are per step; `_n_x1e3` counts the lane-layers).
+            for (us_name, n_name, stage) in [("lh.look_launch", "lh.look_launch_n_x1e3", "lh2.look_launch_us_per_ll"), ("lh.look_filter", "lh.look_filter_n_x1e3", "lh2.look_filter_us_per_ll")] {
+                let get = |k: &str| lh.iter().find(|h| h.0 == k).map(|h| h.1).unwrap_or(0);
+                let (us, n) = (get(us_name), get(n_name) / 1000);
+                if n > 0 {
+                    let e = acc.stages.entry(("host", stage)).or_insert((0.0, 0));
+                    e.0 += us as f64 / n as f64; e.1 += 1;
                 }
             }
             {

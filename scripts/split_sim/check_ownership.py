@@ -41,7 +41,14 @@ def main():
         lane_b[int(s)][int(f(r['lane']))] += 1
     # lane small-id -> index: lane A has b = lane_rows[0]
     hs = simlib.HotSet(hash_milli=int(sys.argv[5]) if len(sys.argv) > 5 else 420)
-    ri = 0
+    # a windowed cache starts from the replica's state before the window
+    hs.load(cache.get('hs0'))
+    ri = simlib.first_refresh_after(refresh, cache)
+    rc = cache.get('meta', {}).get('refresh_check')
+    if rc:
+        ok = sum(1 for _, x, y in rc if x is not None and y is not None and x == y)
+        near = sum(1 for _, x, y in rc if x is not None and y is not None and abs(x - y) <= 2)
+        print(f'replica changed== log changed at {ok}/{len(rc)} refreshes ({ok / len(rc):.3f}); within +-2: {near / len(rc):.3f}')
     stats = Counter()
     mism_by_phase = Counter()
     n_ref = 0

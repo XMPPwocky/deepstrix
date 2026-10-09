@@ -136,6 +136,23 @@ impl<'a> WeightSrc<'a> {
         }
     }
 
+    /// [`Self::read_expert_hf_layout_direct_routed`] with the packed plane in
+    /// `stripes` pieces on as many threads (a single role at the whole
+    /// expert's parallelism; `1` = the plain routed read).
+    pub fn read_expert_hf_layout_direct_routed_striped(
+        &self,
+        t: &GgufTensor,
+        e: usize,
+        dst: &mut [u8],
+        route: crate::hf_v41::ExpertRoute,
+        stripes: usize,
+    ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
+        match *self {
+            Self::Gguf(_) => Ok(None),
+            Self::V41(v) => v.read_expert_hf_layout_direct_routed_striped(v.get(&t.name)?, e, dst, route, stripes),
+        }
+    }
+
     /// Zero-copy O_DIRECT read of ALL THREE roles of one expert in TWO preads.
     /// `Ok(None)` = unavailable (GGUF source, no O_DIRECT handle, or the
     /// checkpoint's expert planes are not contiguous); caller falls back to the

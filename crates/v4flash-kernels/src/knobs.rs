@@ -697,6 +697,11 @@ crate::knobs! {
     /// `V41_SUB_LAMBDA` (default 0.1, 0..=1): the cache prior's strength
     /// (`b2_mirror::lambda`). Live; `V41_SUB_LAMBDA_FILE` still works.
     pub static SUB_LAMBDA = Knob::real("V41_SUB_LAMBDA", 0.1, 0.0, 1.0).legacy("V41_SUB_LAMBDA_FILE");
+    /// `V41_SUB_PROTECT` (default 2, 0..=6; live): the original top picks the cache prior may
+    /// never displace (`b2_mirror::protect`). Read at every router launch: the top-k runs
+    /// UNCAPTURED (after `g.router_matvec`'s graph ends), so the scalar argument follows the
+    /// knob. Owner 10-07: protect 1 -> 2 under k1 (the hints cover ranks 1-2), per-turn A/B.
+    pub static SUB_PROTECT = Knob::int("V41_SUB_PROTECT", 2, 0, 6).live();
     /// `V41_B2_PIN_PREFILL_BAND` (default 2048): `b2_mirror::pin_prefill_band`.
     /// Live; `V41_B2_PIN_PREFILL_BAND_FILE` still works.
     pub static B2_PIN_PREFILL_BAND = Knob::int("V41_B2_PIN_PREFILL_BAND", 2048, 0, u32::MAX as u64).legacy("V41_B2_PIN_PREFILL_BAND_FILE");
@@ -740,6 +745,100 @@ crate::knobs! {
     /// `V41_MS_CTX_CARRIER` (default on; process-static): `mhc_pre_attn`'s direct launch carries the
     /// lane-layer's context entry (design 2.11 R2); `0` = the standalone `arena_ctx_store` (a gate arm).
     pub static MS_CTX_CARRIER = Knob::flag("V41_MS_CTX_CARRIER", true);
+    /// `V41_B2_MISS_PREFETCH` (`off` default | `dry` | `k1` | `k2`; live, read once per decode step
+    /// into `het::lookahead::Cfg`): predicted-miss look-ahead prefetch of box-2 picks
+    /// (docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 5). `dry` runs layer L+1's router at layer
+    /// L, filters and counts (`hub_lh2`), sends nothing; `k1`/`k2` = hints live with one/two
+    /// layers of lead -- SLICE B: until it is built they behave as `dry` and warn once.
+    pub static B2_MISS_PREFETCH = Knob::choice("V41_B2_MISS_PREFETCH", 0, &[&["off", "0"], &["dry"], &["k1"], &["k2"]]).live();
+    /// `V41_B2_MISS_PREFETCH_RANK` (default 1, 1..=3; live): predicted-rank cut R of the hints
+    /// (`dry` counts R = 1, 2, 3 at once regardless).
+    pub static B2_MISS_PREFETCH_RANK = Knob::int("V41_B2_MISS_PREFETCH_RANK", 1, 1, 3).live();
+    /// `V41_B2_MISS_PREFETCH_CAP` (default 8, 0..=64; live): hint words per lane-layer and target layer.
+    pub static B2_MISS_PREFETCH_CAP = Knob::int("V41_B2_MISS_PREFETCH_CAP", 8, 0, 64).live();
+    /// `V41_B2_SPEC_BUDGET` (default 0 = off, 0..=65535; live, read once per decode step):
+    /// speculative words -- hints + cache-prior admissions + pin restores -- a decode step sends
+    /// box 2 in all (design 2.4; `het::lookahead::SpecBudget`: hints first, restores paced at ~1
+    /// per request with a floor of 16 per step; the design's value is 60). `0` = today's rule:
+    /// up to 128 admission words plus `V41_B2_PIN_RESTORE_PER_REQ` restores per REQUEST, which
+    /// bursts 1,280 restores per step after a phase switch and loses what finds no free staging
+    /// set on box 2. Ships in slice A OFF so the slice-A restart changes nothing with the hint
+    /// knob off; flipped to 60 live as its own per-turn A/B (restore refill after a phase
+    /// switch, `pf_d_dropped`, `b2_pinned`, paged late replies in the 0-20 s phase bin).
+    pub static B2_SPEC_BUDGET = Knob::int("V41_B2_SPEC_BUDGET", 0, 0, 65535).live();
+    /// `V41_B2_MISS_PREFETCH_MARGIN` (default 0 = no filter, 0..=1; live): a predicted rank-1 pick
+    /// is hinted only when its normalized gate margin over the predicted rank-2 pick (`(w1 - w2) /
+    /// sum(row)`, from the look-ahead's weights in the readback pack) exceeds this. Slice A
+    /// amendment 10-06: ~90% of predicted rank-1 non-resident picks are NOT the actual rank-1 next
+    /// layer (they land at ranks 2-6, where the prior swaps them away): the dry run's
+    /// `lh2_nonres_m{0..3}` / `lh2_hits_prot_m{0..3}` (margin >= 0 / 0.1 / 0.2 / 0.3) pick the value.
+    pub static B2_MISS_PREFETCH_MARGIN = Knob::real("V41_B2_MISS_PREFETCH_MARGIN", 0.0, 0.0, 1.0).live();
+    /// `V41_B2_MISS_PREFETCH_MAX_WORDS_STEP` (default 0 = rows-aware `10 + 5 * max(0, rows - 4)`,
+    /// 0..=65535; live): the absolute abort bar on hint words sent per decode step (design 5; a
+    /// bound must not read a runtime estimate). Tripped: the rest of the step is `dry` and
+    /// `lh2_bar_trips` counts it. The live hint volume at R=1 was 17-65 words/step with a cold
+    /// pool (10-06), so the default trips often at <= 4 rows until the pool warms; a knob so the
+    /// A/B can raise it without a restart.
+    pub static B2_MISS_PREFETCH_MAX_WORDS_STEP = Knob::int("V41_B2_MISS_PREFETCH_MAX_WORDS_STEP", 0, 0, 65535).live();
+    /// `V41_B2_MISS_PREFETCH_MAX_PER_LL_X10` (default 25 = 2.5 words per lane-layer, 0..=255; live):
+    /// the per-lane-layer abort bar at any size, judged once the step has routed 8 lane-layers.
+    pub static B2_MISS_PREFETCH_MAX_PER_LL_X10 = Knob::int("V41_B2_MISS_PREFETCH_MAX_PER_LL_X10", 25, 0, 255).live();
+    /// `V41_B2_NURSERY_PRIOR` (default off; live): with `V41_B2_MISS_PREFETCH_RANK >= 2`, mark the
+    /// hint words sent INCOMING on the mirror (`b2_mirror::note_incoming`) so the cache prior does
+    /// not swap a hinted rank-2 pick away (design 3.2). Off: the prior stays hint-blind (I2 exact).
+    pub static B2_NURSERY_PRIOR = Knob::flag("V41_B2_NURSERY_PRIOR", false).live();
+    /// `V41_B2_SOFT_MAP` (default on; live): ask box 2 for the SOFT-HELD map on every decode request
+    /// (`REQ2_FLAG_SOFT`: resident-but-unpinned experts, 12 reply words; an older daemon sends none).
+    /// Off = today's wire. The map feeds counters only unless a consumer knob below is on.
+    pub static B2_SOFT_MAP = Knob::flag("V41_B2_SOFT_MAP", true).live();
+    /// `V41_B2_SOFT_PRIOR` (default off; live): the cache prior, the planner and `n_pred_miss` treat a
+    /// soft-held expert as resident (no swap, no predicted miss). Changes routing decisions -- the A/B
+    /// of interest: `sub.picks_swapped`, `sub.predicted_miss`, `box2.paged`, `lh2_paged_mirror_soft`.
+    pub static B2_SOFT_PRIOR = Knob::flag("V41_B2_SOFT_PRIOR", false).live();
+    /// `V41_B2_SOFT_HINT` (default off; live): the look-ahead filter treats a soft-held expert as
+    /// resident (no hint for it).
+    pub static B2_SOFT_HINT = Knob::flag("V41_B2_SOFT_HINT", false).live();
+    /// `V41_B1_HOT_POLICY` (`top` default | `interleave`; live, read at each hot-set refresh): who owns
+    /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top
+    /// `per_layer()` (today, bit-identical); `interleave` = box 1 holds `V41_B1_HOT_TARGET` of the
+    /// mass, box 2 pins its head share (`hot_split::interleave_layer`). Back to `top` runs the RETURN
+    /// MODE (design 2.4) until box 1 owns exactly the top set again.
+    pub static B1_HOT_POLICY = Knob::choice("V41_B1_HOT_POLICY", 0, &[&["top"], &["interleave"]]).live();
+    /// `V41_B1_HOT_TARGET` (default 0.60; live): box 1's target share of each layer's
+    /// non-replicated pick mass under `interleave`.
+    pub static B1_HOT_TARGET = Knob::real("V41_B1_HOT_TARGET", 0.60, 0.0, 1.0).live();
+    /// `V41_B1_HOT_TOL` (default 0.02; live): the balance tolerance around the target.
+    pub static B1_HOT_TOL = Knob::real("V41_B1_HOT_TOL", 0.02, 0.0, 1.0).live();
+    /// `V41_B1_HOT_MOVES` (default 3; live): box-1 newcomers (vacancy fills + swaps) per layer per
+    /// refresh under `interleave`, and separately the replicated-set newcomers.
+    pub static B1_HOT_MOVES = Knob::int("V41_B1_HOT_MOVES", 3, 0, 384).live();
+    /// `V41_B1_HOT_IL_HYST` (default 40; live): the interleave's region hysteresis in ranks (the top
+    /// policy's `V41_B1_HOT_HYST` is 100 in production: too wide here, design 2 step 2).
+    pub static B1_HOT_IL_HYST = Knob::int("V41_B1_HOT_IL_HYST", 40, 0, 384).live();
+    /// `V41_B1_HOT_B2HEAD` (default 60; live): box 2's pinned head share per layer under
+    /// `interleave` (clamped by box 2's pin budget, design 4).
+    pub static B1_HOT_B2HEAD = Knob::int("V41_B1_HOT_B2HEAD", 60, 0, 384).live();
+    /// `V41_B1_HOT_IL_PER_LAYER` (default 0 = `hot_set::per_layer()`; live): box 1's owned +
+    /// replicated ids per layer under `interleave`, clamped to the decode LRU like `per_layer()`.
+    pub static B1_HOT_IL_PER_LAYER = Knob::int("V41_B1_HOT_IL_PER_LAYER", 0, 0, 384).live();
+    /// `V41_B1_HOT_MAX_CHANGE` (default 0 = unlimited; production env 3; live since the hot split):
+    /// the `top` policy's newcomers per layer per refresh (`hot_set::refresh`), also the return
+    /// mode's pace.
+    pub static B1_HOT_MAX_CHANGE = Knob::int("V41_B1_HOT_MAX_CHANGE", 0, 0, 384).live();
+    /// `V41_B1_HOT_HOLDER` (default on; live, read per decode step): under `interleave`, a decode pick
+    /// whose home box does not hold it but the other box does is served by the holder (design 3.2).
+    pub static B1_HOT_HOLDER = Knob::flag("V41_B1_HOT_HOLDER", true).live();
+    /// `V41_B1_HOT_KEEP_PREFILL` (default off; live): the prefill band release skips box 2's KEEP set
+    /// (design 4). Off = KEEP is released last and restored first.
+    pub static B1_HOT_KEEP_PREFILL = Knob::flag("V41_B1_HOT_KEEP_PREFILL", false).live();
+    /// `V41_B1_HOT_PREWARM_STEP` (default 2; live): box-1 newcomers queued for the background read per
+    /// decode step under `interleave` (`ExpertPager::prefetch_now`).
+    pub static B1_HOT_PREWARM_STEP = Knob::int("V41_B1_HOT_PREWARM_STEP", 2, 0, 64).live();
+    /// `V41_B1_HOT_REP` (default 0; live): replicated ids per layer (resident on both boxes; the
+    /// route picks the leg). Second step of the rollout (design 0.6).
+    pub static B1_HOT_REP = Knob::int("V41_B1_HOT_REP", 0, 0, 64).live();
+    /// `V41_B1_HOT_REP_HYST` (default 5; live): the replicated set's rank hysteresis.
+    pub static B1_HOT_REP_HYST = Knob::int("V41_B1_HOT_REP_HYST", 5, 0, 384).live();
 }
 
 #[cfg(test)]

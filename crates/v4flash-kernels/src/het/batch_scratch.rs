@@ -431,10 +431,22 @@ pub struct BatchDgpuScratch {
     /// (as the first cut did) serialises the ~74 ms round trip at B=1024 in front
     /// of local compute and throws away the whole point of overlapping.
     pub remote_ticket: Option<crate::het::remote_experts::Ticket>,
+    /// `remote_ticket`'s reply was LATE (`het::lookahead`'s `*_late_*`
+    /// counters, b2tail's definition): the ready-first driver's Post found
+    /// it ready only after the lane-layer's `moe_arrived` event had completed
+    /// (`lookahead::late_at_ready`). Cleared at the lane's submit. Only the
+    /// ready-first driver sets it: under the lockstep / pipelined drivers
+    /// every reply reads as "not late".
+    pub remote_late: bool,
     /// `evtrace` submit-time fields of `remote_ticket` (see `HUB_REQ`):
     /// t_submit, t_submit_end, partner, unmasked, n_picks, n_distinct,
     /// n_pred_miss, n_pred_incoming, n_pred_pending.
     pub ev_req: [f64; 9],
+    /// Predicted-miss look-ahead (`V41_B2_MISS_PREFETCH`, `het::lookahead`):
+    /// the filter's reusable scratch and what this lane hinted for its NEXT
+    /// layer, matched against the lane's own picks when that layer routes
+    /// (`lh2_dry_hits_rN`). Per lane, so the two lanes' predictions never cross.
+    pub lh2: crate::het::lookahead::LaneState,
 }
 
 /// Lane rows up to which `V41_MS_MHC_SPLIT` runs the mHC mixes on the side
@@ -1287,8 +1299,10 @@ impl BatchDgpuScratch {
             },
             rb_pack: {
                 let rp = b.min(super::forward_prefill::rb_pack_max_rows() as usize);
+                // sel, look, look2, orig, ew, look_ew (the look-ahead's gate
+                // weights, `V41_B2_MISS_PREFETCH`'s margin filter): 6 x n_used.
                 v4flash_hip::PinnedBuffer::new(
-                    rp * (5 * N_EXPERT_USED + 2 * crate::router_topk::ROUTER_MAX_ALT as usize + 1)
+                    rp * (6 * N_EXPERT_USED + 2 * crate::router_topk::ROUTER_MAX_ALT as usize + 1)
                         + if std::env::var("V41_REMOTE_ADDR").is_ok() {
                             rp * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES / 4
                         } else {
@@ -1328,7 +1342,9 @@ impl BatchDgpuScratch {
             remote_upload_pending: false,
             mhc_ffn_split_pending: false,
             remote_ticket: None,
+            remote_late: false,
             ev_req: [f64::NAN; 9],
+            lh2: Default::default(),
         })
     }
 }

@@ -87,6 +87,30 @@ impl StTensor {
     }
 }
 
+/// `read_range_into_direct_striped`'s plan: the padded `span` (a multiple
+/// of 4096) cut into `stripes` 4096-aligned pieces `(start, len, on_mirror)`
+/// covering it exactly, each on the drive the split read's `cut` gives it
+/// (primary below the cut, mirror from it); a piece straddling the cut is
+/// split at it, so at most `stripes + 1` pieces. Pure, for the test.
+pub fn stripe_plan(span: usize, cut: usize, stripes: usize) -> Vec<(usize, usize, bool)> {
+    const A: usize = 4096;
+    let n = stripes.max(1).min(span / A).max(1);
+    let per = (span / A).div_ceil(n) * A;
+    let mut out = Vec::with_capacity(n + 1);
+    let mut start = 0;
+    while start < span {
+        let end = (start + per).min(span);
+        if start < cut && end > cut {
+            out.push((start, cut - start, false));
+            out.push((cut, end - cut, true));
+        } else {
+            out.push((start, end - start, start >= cut));
+        }
+        start = end;
+    }
+    out
+}
+
 pub struct SafetensorsDir {
     dir: PathBuf,
     files: Vec<File>,
@@ -568,6 +592,116 @@ impl SafetensorsDir {
     /// 1.0 / 0.0 reads the whole range from the mirror / primary alone. Falls
     /// back to the single primary read when there is no mirror. Same padded
     /// layout and return value as the unsplit read.
+    /// `read_range_into_direct_split` with the span cut into `stripes`
+    /// 4096-aligned pieces, EACH read on its own thread from the drive the
+    /// mirror fraction's cut assigns it (`stripe_plan`): a single ~6 MB role
+    /// then lands with the whole expert's parallelism instead of one stream
+    /// per drive (box 2's two-phase landing and gate/up-only hints, measured
+    /// 2026-10-06: a role alone took ~2.1 ms against 2.26 for all three --
+    /// the drive is latency-bound per stream). `stripes <= 1` is exactly the
+    /// split read. Same residue, pad and short-read rules.
+    pub fn read_range_into_direct_striped(
+        &self,
+        t: &StTensor,
+        byte_off: u64,
+        len: usize,
+        dst: &mut [u8],
+        mirror_frac: f32,
+        stripes: usize,
+    ) -> eyre::Result<Option<usize>> {
+        const A: u64 = 4096;
+        if stripes <= 1 {
+            return self.read_range_into_direct_split(t, byte_off, len, dst, mirror_frac);
+        }
+        let (Some(Some(file)), Some(Some(mirror))) = (self.direct_files.get(t.shard), self.mirror_files.get(t.shard)) else {
+            return self.read_range_into_direct_padded(t, byte_off, len, dst);
+        };
+        let end = byte_off.checked_add(len as u64).ok_or_else(|| eyre!("{}: range overflow", t.name))?;
+        if end > t.len {
+            return Err(eyre!("{}: range [{byte_off},{end}) exceeds tensor length {}", t.name, t.len));
+        }
+        let mf = mirror_frac.clamp(0.0, 1.0);
+        if len < stripes * 2 * A as usize {
+            return self.read_range_into_direct_split(t, byte_off, len, dst, mirror_frac);
+        }
+        let abs = t.offset + byte_off;
+        let pad = (abs & (A - 1)) as usize;
+        let span = ((pad + len) as u64).div_ceil(A) as usize * A as usize;
+        if dst.len() < span {
+            return Err(eyre!("{}: direct dst {} < span {span} (pad {pad}, len {len})", t.name, dst.len()));
+        }
+        if dst.as_ptr() as usize & (A as usize - 1) != 0 {
+            return Err(eyre!("{}: direct dst is not {A}-aligned", t.name));
+        }
+        let cut = if mf >= 1.0 {
+            0
+        } else if mf <= 0.0 {
+            span
+        } else {
+            let frac = (1.0 - mf) as f64;
+            (((span as f64 * frac) as usize / A as usize) * A as usize).clamp(A as usize, span - A as usize)
+        };
+        let base = abs - pad as u64;
+        let plan = stripe_plan(span, cut, stripes);
+        let (bg, chunk) = match (crate::io_throttle::background(), crate::io_throttle::chunk_bytes()) {
+            (Some(token), c) if c > 0 => (Some(token), c.max(A as usize)),
+            _ => (None, usize::MAX),
+        };
+        let need_total = pad + len;
+        let read_all = move |f: &File, buf: &mut [u8], off: u64, need: usize| -> eyre::Result<()> {
+            let mut got = 0usize;
+            while got < buf.len() {
+                if let Some(token) = bg {
+                    crate::io_throttle::pause(token);
+                }
+                let end = got.saturating_add(chunk).min(buf.len());
+                let n = f.read_at(&mut buf[got..end], off + got as u64).wrap_err_with(|| format!("O_DIRECT striped pread at {} for {}", off + got as u64, t.name))?;
+                if n == 0 { break; }
+                got += n;
+            }
+            if got < need {
+                return Err(eyre!("{}: O_DIRECT striped read at {off} got {got} of {need} needed bytes (short file?)", t.name));
+            }
+            Ok(())
+        };
+        // Disjoint pieces of `dst[..span]`, one scoped thread each; the first
+        // piece on this thread.
+        let mut pieces: Vec<&mut [u8]> = Vec::with_capacity(plan.len());
+        let mut rest = &mut dst[..span];
+        for &(start, plen, _) in &plan {
+            let _ = start;
+            let (p, r) = rest.split_at_mut(plen);
+            pieces.push(p);
+            rest = r;
+        }
+        let results: Vec<eyre::Result<()>> = std::thread::scope(|sc| {
+            let mut hs = Vec::with_capacity(plan.len());
+            let mut first: Option<(&mut [u8], u64, usize, bool)> = None;
+            for (i, (buf, &(start, plen, on_mirror))) in pieces.into_iter().zip(&plan).enumerate() {
+                // Bytes this piece must land: its share of `[0, pad + len)`.
+                let need = need_total.saturating_sub(start).min(plen);
+                if i == 0 {
+                    first = Some((buf, base + start as u64, need, on_mirror));
+                    continue;
+                }
+                let f = if on_mirror { mirror } else { file };
+                hs.push(sc.spawn(move || read_all(f, buf, base + start as u64, need)));
+            }
+            let mut out = Vec::with_capacity(plan.len());
+            if let Some((buf, off, need, on_mirror)) = first {
+                out.push(read_all(if on_mirror { mirror } else { file }, buf, off, need));
+            }
+            for h in hs {
+                out.push(h.join().unwrap_or_else(|_| Err(eyre!("striped reader panicked"))));
+            }
+            out
+        });
+        for r in results {
+            r?;
+        }
+        Ok(Some(pad))
+    }
+
     pub fn read_range_into_direct_split(
         &self,
         t: &StTensor,

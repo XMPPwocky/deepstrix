@@ -446,6 +446,113 @@ pub mod proto {
     pub const RESP_FLAG_PIN: u32 = 1 << 14;
     pub const PIN_HDR_WORDS: usize = 4;
     pub const PIN_WORDS: usize = PIN_HDR_WORDS + RESID_WORDS;
+    /// Request flag (2026-10-06, docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md
+    /// 3.2): the PREFETCH block carries the hub's predicted-miss HINTS, each
+    /// marked by `LIKELY_WORD_BIT`, ahead of its plain words. Box 2 reads a
+    /// marked word as a LIKELY job into its NURSERY (no pin grant, no admit
+    /// gate), applying it when the FRAME ARRIVES (the early-page hook), and
+    /// answers a decode request carrying this flag with `RESP_FLAG_NURSERY`
+    /// (even with no marked word: the flag alone is the capability probe). An
+    /// older daemon echoes the flag, never sets `RESP_FLAG_NURSERY`, and skips
+    /// a marked word (its layer field is out of range), so the hub sends marked
+    /// words only after seeing the reply flag.
+    pub const REQ_FLAG_LIKELY: u32 = 2048;
+    /// A PREFETCH word `(layer << 16) | expert` with this bit set is a LIKELY
+    /// hint (layers use bits 16-21, experts 0-9: the bit is free).
+    pub const LIKELY_WORD_BIT: u32 = 1 << 31;
+    /// RESPONSE flag: a NURSERY block (`NURSERY_WORDS` u32s) follows the pin
+    /// block / residency map (whichever is last): the daemon understood
+    /// `REQ_FLAG_LIKELY` (the hub's capability signal -- an echoed request bit
+    /// proves nothing) and these are up to `NURSERY_WORDS` nursery entries as
+    /// `(layer << 16) | expert`, the reply's own layer's entries FIRST (all of
+    /// them when they fit, so the hub may replace that layer's NURSERY row),
+    /// then other layers' in rotation, padded with `NURSERY_NONE`. Only ever
+    /// set on a reply to a request that carried `REQ_FLAG_LIKELY` (an older hub
+    /// would fail the frame-length check).
+    pub const RESP_FLAG_NURSERY: u32 = 1 << 13;
+    pub const NURSERY_WORDS: usize = 12;
+    pub const NURSERY_NONE: u32 = u32::MAX;
+    /// SOFT-HELD residency map (2026-10-06, dry runs 3/4: under pin mode the
+    /// reply map is the PINNED set, so the ~850 resident-but-unpinned experts
+    /// are invisible to the hub -- ~24 rank-1 picks/step the mirror calls
+    /// non-resident are served without a read, and the prior swaps ~43
+    /// picks/step against the same map). The hub asks with `REQ2_FLAG_SOFT`
+    /// in the request's SECOND flags word (the formerly reserved fixed field
+    /// at `REQ_FLAGS2_OFF`, which an older daemon never reads); the daemon
+    /// answers a decode request with `RESP_FLAG_SOFT` and `RESID_WORDS` words
+    /// after the nursery block: bit e = expert e of the layer is landed in a
+    /// MAIN slot, not pinned, not a nursery entry (`residency_words`
+    /// semantics minus the pinned set: served right now without a read, but
+    /// evictable any time). Bit 12 of `flags` is never a request flag, so an
+    /// older daemon's echo leaves it clear and an older hub sees no block.
+    pub const REQ2_FLAG_SOFT: u32 = 1;
+    pub const REQ_FLAGS2_OFF: usize = HDR_LEN + 20;
+    pub const RESP_FLAG_SOFT: u32 = 1 << 12;
+    /// Request flags in the FIRST flags word stop at this bit (`REQ_FLAG_LIKELY`):
+    /// bits 12-15 are response-only (SOFT, NURSERY, PIN, RESID) and 16-31 the
+    /// miss mask. A new request bit goes in the second word (`REQ2_FLAG_*`): a
+    /// request bit 12 would be echoed and read as a SOFT block by a new hub.
+    pub const REQ_FLAG_LAST_BIT: u32 = 11;
+    const _: () = assert!(REQ_FLAG_LIKELY == 1 << REQ_FLAG_LAST_BIT);
+    const _: () = assert!(RESP_FLAG_SOFT == 1 << (REQ_FLAG_LAST_BIT + 1) && RESP_FLAG_NURSERY == 1 << 13 && RESP_FLAG_PIN == 1 << 14 && RESP_FLAG_RESID == 1 << 15);
+    const _: () = assert!(RESP_MISS_SHIFT == 16);
+
+    /// Write the request's second flags word (after `encode_request`).
+    pub fn patch_request_flags2(buf: &mut AlignedBuf, flags2: u32) {
+        buf.as_bytes_mut()[REQ_FLAGS2_OFF..REQ_FLAGS2_OFF + 4].copy_from_slice(&flags2.to_le_bytes());
+    }
+
+    /// Append the SOFT map (after every other block) and set `RESP_FLAG_SOFT`.
+    /// Call before `patch_len`.
+    pub fn append_soft(buf: &mut AlignedBuf, words: &[u32; RESID_WORDS]) {
+        const FLAGS_OFF: usize = HDR_LEN + 8;
+        let mut f = [0u8; 4];
+        f.copy_from_slice(&buf.as_bytes()[FLAGS_OFF..FLAGS_OFF + 4]);
+        let flags = u32::from_le_bytes(f) | RESP_FLAG_SOFT;
+        buf.as_bytes_mut()[FLAGS_OFF..FLAGS_OFF + 4].copy_from_slice(&flags.to_le_bytes());
+        for &w in words {
+            buf.put_u32(w);
+        }
+    }
+
+    /// The SOFT map of a RESPONSE (`RESP_FLAG_SOFT`), if any.
+    pub fn response_soft<'a>(buf: &'a AlignedBuf, m: &ResponseMeta) -> Option<&'a [u32]> {
+        if m.flags & RESP_FLAG_SOFT == 0 {
+            return None;
+        }
+        let off = RESP_DATA_OFF
+            + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
+            + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_NURSERY != 0 { NURSERY_WORDS * 4 } else { 0 };
+        Some(buf.view::<u32>(off, RESID_WORDS))
+    }
+
+    /// Is `w` a LIKELY-marked PREFETCH word (`REQ_FLAG_LIKELY`)?
+    pub fn likely_word(w: u32) -> bool {
+        w & LIKELY_WORD_BIT != 0
+    }
+
+    /// Mark a word LIKELY.
+    pub fn mark_likely(w: u32) -> u32 {
+        w | LIKELY_WORD_BIT
+    }
+
+    /// A request's PREFETCH words split into `(likely, plain)`, the marks
+    /// stripped: under `REQ_FLAG_LIKELY` the marked words are the hints;
+    /// without the flag every word is plain (a marked word is kept as is, so
+    /// it fails the daemon's layer check and is skipped).
+    pub fn split_prefetch_words(flags: u32, words: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        let (mut likely, mut plain) = (Vec::new(), Vec::new());
+        for &w in words {
+            if flags & REQ_FLAG_LIKELY != 0 && likely_word(w) {
+                likely.push(w & !LIKELY_WORD_BIT);
+            } else {
+                plain.push(w);
+            }
+        }
+        (likely, plain)
+    }
     /// A REQUEST of at most this many rows is DECODE-SHAPED for pinning: box 2
     /// makes its picks pin-eligible at the reply, the hub counts them for
     /// release ranking. Per request, never per merged pass (two mergeable
@@ -553,6 +660,34 @@ pub mod proto {
         let mut paged = [0u32; RESID_WORDS];
         paged.copy_from_slice(&w[PIN_HDR_WORDS..]);
         Some(PinReply { epoch: w[0], pinned: w[1], budget: w[2], paged })
+    }
+
+    /// Append the NURSERY block (after the residency map and pin block, if
+    /// any) and set `RESP_FLAG_NURSERY`. Call before `patch_len`.
+    pub fn append_nursery(buf: &mut AlignedBuf, words: &[u32; NURSERY_WORDS]) {
+        const FLAGS_OFF: usize = HDR_LEN + 8;
+        let mut f = [0u8; 4];
+        f.copy_from_slice(&buf.as_bytes()[FLAGS_OFF..FLAGS_OFF + 4]);
+        let flags = u32::from_le_bytes(f) | RESP_FLAG_NURSERY;
+        buf.as_bytes_mut()[FLAGS_OFF..FLAGS_OFF + 4].copy_from_slice(&flags.to_le_bytes());
+        for &w in words {
+            buf.put_u32(w);
+        }
+    }
+
+    /// The NURSERY block of a RESPONSE (`RESP_FLAG_NURSERY`), if any: the
+    /// entries as `(layer << 16) | expert`, `NURSERY_NONE` padding excluded.
+    pub fn response_nursery<'a>(buf: &'a AlignedBuf, m: &ResponseMeta) -> Option<&'a [u32]> {
+        if m.flags & RESP_FLAG_NURSERY == 0 {
+            return None;
+        }
+        let off = RESP_DATA_OFF
+            + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
+            + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 };
+        let w = buf.view::<u32>(off, NURSERY_WORDS);
+        let n = w.iter().position(|&x| x == NURSERY_NONE).unwrap_or(NURSERY_WORDS);
+        Some(&w[..n])
     }
 
     pub fn parse_header(h: &[u8]) -> eyre::Result<Header> {
@@ -767,6 +902,8 @@ pub mod proto {
         pub flags: u32,
         pub n_used: u32,
         pub xq_bpt: u32,
+        /// The second flags word (`REQ2_FLAG_*`; 0 from an older hub).
+        pub flags2: u32,
         /// Client's CLOCK_MONOTONIC_RAW immediately before its `write()`.
         pub t1: u64,
         pub xq: &'a [u8],
@@ -859,6 +996,7 @@ pub mod proto {
             flags,
             n_used,
             xq_bpt,
+            flags2: u(5),
             t1: read_u64(p, REQ_T1_OFF),
             xq: &p[xq_off..sel_off],
             sel: buf.view::<i32>(sel_off, n_sel),
@@ -958,7 +1096,9 @@ pub mod proto {
         let want = RESP_DATA_OFF
             + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
             + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 }
-            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 };
+            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_NURSERY != 0 { NURSERY_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_SOFT != 0 { RESID_WORDS * 4 } else { 0 };
         if p.len() != want {
             return Err(eyre!("response: frame len {} != expected {want}", p.len()));
         }
@@ -1409,6 +1549,11 @@ struct LayerPager {
     pub repack_cpu_ns: u64,
     /// GPU permute + the stream sync that waits on it (0 on the CPU path).
     pub repack_gpu_ns: u64,
+    /// Two-phase landing (design 3.4): wall of the gate/up reads a pass waited
+    /// on (`[0]`, the GateUp phase or a Full ensure's misses) and of the down
+    /// reads (`[1]`: the Down phase, or a Full ensure completing partial
+    /// slots). `b2_req` `gateup_wait_us` / `down_wait_us`.
+    pub two_phase_ns: [u64; 2],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1441,6 +1586,10 @@ struct PfDone {
     prefill: bool,
     /// `PfJob::restore`.
     restore: u64,
+    /// `PfJob::likely`: lands in the nursery.
+    likely: bool,
+    /// `PfJob::roles`: the roles read (`ROLES_GATEUP` = a PARTIAL landing).
+    roles: Roles,
     offs: [Option<(usize, usize, u32, u32)>; 3],
     coalesced: bool,
     /// Hint sent -> a reader picked it up (queueing behind other reads).
@@ -1478,6 +1627,16 @@ struct PfJob {
     /// Delta restore (`V41_B2_RESTORE`): the decode stamp the expert had when a
     /// prefill phase evicted it (0 = not a restore read).
     restore: u64,
+    /// LIKELY (design 3.2): the hub's predicted-miss hint (`REQ_FLAG_LIKELY`
+    /// word). Class `Certain > Likely > Spec`: queued behind certain jobs and
+    /// ahead of speculative ones, counts against the speculative reader cap,
+    /// pops regardless of running certain jobs (no yield), lands in the
+    /// NURSERY. Cleared when `promote` makes it certain.
+    likely: bool,
+    /// The roles to read (design 3.4): `ROLES_ALL`, or `ROLES_GATEUP` for a
+    /// LIKELY read under `likely_gateup_only` (a PARTIAL landing). A
+    /// promotion to certain keeps the mask: the pass completes the slot.
+    roles: Roles,
     t_hint: std::time::Instant,
 }
 
@@ -1488,6 +1647,14 @@ struct PfJob {
 /// deduped onto that job and waited out the whole queue ahead of it, plus the
 /// job's own yield to demand reads (2026-09-25: `box2.page_ms` 37 ms/step of
 /// parked waits with ~0 demand misses).
+///
+/// LIKELY jobs (`PfJob::likely`; design 3.2, review round 3 findings 1-2) sit
+/// between the two: behind every certain job, ahead of every speculative one;
+/// `running_likely + running_spec < max_spec` (the reserved reader stays the
+/// certain reserve), handed out whether or not a certain job runs; speculative
+/// chunks pause for a running LIKELY read (`background_should_wait`), a LIKELY
+/// read's chunks pause for certain reads only (and only under
+/// `knobs::likely_pause_for_certain`), never for speculative ones.
 struct PfQueue {
     inner: std::sync::Mutex<PfQueueInner>,
     cv: std::sync::Condvar,
@@ -1500,9 +1667,10 @@ struct PfQueueInner {
     /// (`admit_prefetched`), since urgency only means something while the key
     /// is pending.
     urgent: std::collections::HashSet<(u32, u32)>,
-    /// Readers currently holding a speculative / a certain job.
+    /// Readers currently holding a speculative / a certain / a LIKELY job.
     running_spec: usize,
     running_certain: usize,
+    running_likely: usize,
     /// At most this many speculative jobs run at once: the rest of the readers
     /// (`V41_B2_PREFETCH_RESERVE`) are kept for certain ones.
     max_spec: usize,
@@ -1528,6 +1696,7 @@ impl PfQueue {
                 urgent: Default::default(),
                 running_spec: 0,
                 running_certain: 0,
+                running_likely: 0,
                 max_spec: max_spec.max(1),
                 n_readers: n_readers.max(1),
                 closed: false,
@@ -1538,11 +1707,15 @@ impl PfQueue {
     }
 
     /// Urgent jobs go behind the other urgent ones and ahead of every
-    /// speculative one; speculative jobs go to the back.
+    /// speculative one; LIKELY jobs behind the certain and LIKELY ones, ahead
+    /// of every speculative one; speculative jobs go to the back.
     fn push(&self, job: PfJob) {
         let mut g = self.inner.lock().unwrap();
         if job.certain {
             let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
+            g.jobs.insert(at, job);
+        } else if job.likely {
+            let at = g.jobs.iter().position(|j| !j.certain && !j.likely).unwrap_or(g.jobs.len());
             g.jobs.insert(at, job);
         } else {
             g.jobs.push_back(job);
@@ -1561,8 +1734,10 @@ impl PfQueue {
         let changed = match g.jobs.iter().position(|j| j.layer == layer && j.e == e) {
             Some(i) if g.jobs[i].certain => false,
             Some(i) => {
+                // Spec -> Certain and Likely -> Certain alike (round 3, finding 2).
                 let mut job = g.jobs.remove(i).expect("index from position");
                 job.certain = true;
+                job.likely = false;
                 let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
                 g.jobs.insert(at, job);
                 true
@@ -1588,23 +1763,46 @@ impl PfQueue {
     /// and with no reader free, pausing the readers it is waiting for would
     /// only idle the drives. One lock per check.
     fn background_should_wait(&self, layer: u32, e: u32) -> bool {
+        self.background_should_wait_cls(layer, e, false)
+    }
+
+    /// `background_should_wait` by class: a SPECULATIVE read also holds off
+    /// while a LIKELY read runs (design 3.2: speculative pauses for LIKELY);
+    /// a LIKELY read (`likely`) holds off for certain reads only, never for
+    /// speculative or other LIKELY ones.
+    fn background_should_wait_cls(&self, layer: u32, e: u32, likely: bool) -> bool {
         let g = self.inner.lock().unwrap();
         if g.urgent.contains(&(layer, e)) {
             return false;
         }
-        g.running_certain > 0 || !g.urgent.is_empty()
+        g.running_certain > 0 || !g.urgent.is_empty() || (!likely && g.running_likely > 0)
     }
 
     fn is_urgent(&self, layer: u32, e: u32) -> bool {
         self.inner.lock().unwrap().urgent.contains(&(layer, e))
     }
 
+    /// `pause_token` carries the class and the key (tests).
+    #[cfg(test)]
+    fn pause_token_roundtrip(&self) -> bool {
+        let t = pause_token(39, 383, true);
+        let (l, e) = (((t >> 16) & 0xFFFF) as u32, (t & 0xFFFF) as u32);
+        (l, e) == (39, 383) && t & PAUSE_TOKEN_LIKELY != 0 && pause_token(39, 383, false) & PAUSE_TOKEN_LIKELY == 0
+    }
+
     /// `evtrace`: running certain, running speculative, queued certain,
-    /// queued speculative.
+    /// queued speculative (LIKELY jobs are in `counts_likely`, not here).
     fn counts(&self) -> [f64; 4] {
         let g = self.inner.lock().unwrap();
         let qc = g.jobs.iter().filter(|j| j.certain).count();
-        [g.running_certain as f64, g.running_spec as f64, qc as f64, (g.jobs.len() - qc) as f64]
+        let ql = g.jobs.iter().filter(|j| j.likely).count();
+        [g.running_certain as f64, g.running_spec as f64, qc as f64, (g.jobs.len() - qc - ql) as f64]
+    }
+
+    /// `evtrace`: running LIKELY, queued LIKELY.
+    fn counts_likely(&self) -> [f64; 2] {
+        let g = self.inner.lock().unwrap();
+        [g.running_likely as f64, g.jobs.iter().filter(|j| j.likely).count() as f64]
     }
 
     fn clear_urgent(&self, layer: u32, e: u32) {
@@ -1632,15 +1830,28 @@ impl PfQueue {
             if g.closed {
                 // Shutdown drains everything, ungated.
                 let j = g.jobs.pop_front()?;
-                if j.certain { g.running_certain += 1 } else { g.running_spec += 1 }
+                if j.certain { g.running_certain += 1 } else if j.likely { g.running_likely += 1 } else { g.running_spec += 1 }
                 return Some(j);
             }
+            // LIKELY and speculative jobs share the speculative reader cap
+            // (round 3, finding 2: LIKELY must never occupy the certain reserve).
+            let below_cap = g.running_spec + g.running_likely < Self::spec_cap(&g, urgency);
             match g.jobs.front() {
                 Some(j) if j.certain => {
                     g.running_certain += 1;
                     return g.jobs.pop_front();
                 }
-                Some(_) if g.running_spec < Self::spec_cap(&g, urgency) && (urgency || g.running_certain == 0) => {
+                // A LIKELY job pops whether or not a certain one runs (it does
+                // not yield; its chunks may pause instead).
+                Some(j) if j.likely && below_cap => {
+                    g.running_likely += 1;
+                    let j = g.jobs.pop_front()?;
+                    if urgency {
+                        g.spec_keys.insert((j.layer, j.e));
+                    }
+                    return Some(j);
+                }
+                Some(j) if !j.likely && below_cap && (urgency || g.running_certain == 0) => {
                     g.running_spec += 1;
                     let j = g.jobs.pop_front()?;
                     if urgency {
@@ -1670,20 +1881,33 @@ impl PfQueue {
         self.inner.lock().unwrap().spec_keys.clone()
     }
 
-    /// A job popped as speculative turned out to be needed (`urgent`) before
-    /// its read started: count it as certain from now on, so the gate keeps
-    /// new speculative reads off the drives while it runs.
-    fn reclassify_certain(&self) {
+    /// A job popped as speculative (or LIKELY: `from_likely`) turned out to
+    /// be needed (`urgent`) before its read started: count it as certain from
+    /// now on, so the gate keeps new speculative reads off the drives while it
+    /// runs.
+    fn reclassify_certain(&self, from_likely: bool) {
         let mut g = self.inner.lock().unwrap();
-        g.running_spec = g.running_spec.saturating_sub(1);
+        if from_likely {
+            g.running_likely = g.running_likely.saturating_sub(1);
+        } else {
+            g.running_spec = g.running_spec.saturating_sub(1);
+        }
         g.running_certain += 1;
     }
 
     /// A reader finished a job it popped as `certain` (or not).
+    #[cfg(test)]
     fn finished(&self, certain: bool) {
+        self.finished_cls(certain, false)
+    }
+
+    /// A reader finished a job of the given class (`certain` wins).
+    fn finished_cls(&self, certain: bool, likely: bool) {
         let mut g = self.inner.lock().unwrap();
         if certain {
             g.running_certain = g.running_certain.saturating_sub(1);
+        } else if likely {
+            g.running_likely = g.running_likely.saturating_sub(1);
         } else {
             g.running_spec = g.running_spec.saturating_sub(1);
         }
@@ -1711,15 +1935,25 @@ fn b2_spec_chunk_bytes() -> usize {
     std::env::var("V41_B2_SPEC_CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024).saturating_mul(1024)
 }
 
+/// The io_throttle token of a background read: `layer << 16 | e`, plus this
+/// bit for a LIKELY read (design 3.2: its chunks pause for certain reads only).
+const PAUSE_TOKEN_LIKELY: u64 = 1 << 40;
+
+fn pause_token(layer: u32, e: u32, likely: bool) -> u64 {
+    ((layer as u64) << 16) | e as u64 | if likely { PAUSE_TOKEN_LIKELY } else { 0 }
+}
+
 /// Before each chunk of a background read: wait while a demand read runs or an
-/// urgent (certain) read is active, unless this very expert has become
-/// urgent; at most 20 ms per chunk.
+/// urgent (certain) read is active -- and, for a SPECULATIVE read, while a
+/// LIKELY read runs -- unless this very expert has become urgent; at most
+/// 20 ms per chunk.
 fn b2_background_pause(token: u64) {
-    let (layer, e) = ((token >> 16) as u32, (token & 0xFFFF) as u32);
+    let (layer, e) = (((token >> 16) & 0xFFFF) as u32, (token & 0xFFFF) as u32);
+    let likely = token & PAUSE_TOKEN_LIKELY != 0;
     let Some(q) = PF_QUEUE.get() else { return };
     let t = std::time::Instant::now();
     let mut slept = false;
-    while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || q.background_should_wait(layer, e))
+    while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || q.background_should_wait_cls(layer, e, likely))
         && !q.is_urgent(layer, e)
         && t.elapsed() < std::time::Duration::from_millis(20)
     {
@@ -1782,6 +2016,7 @@ fn push_parked_pins(pins: &mut Vec<(u32, u32)>, layer: u32, sel: &[i32]) -> usiz
 struct PfFinish<'a> {
     q: &'a PfQueue,
     certain: bool,
+    likely: bool,
     /// A speculative key `pop_mode(true)` recorded, released with the job.
     spec_key: Option<(u32, u32)>,
 }
@@ -1791,8 +2026,27 @@ impl Drop for PfFinish<'_> {
         if let Some((l, e)) = self.spec_key {
             self.q.finish_spec_key(l, e);
         }
-        self.q.finished(self.certain);
+        self.q.finished_cls(self.certain, self.likely);
     }
+}
+
+/// Which staging set a background read takes (`prefetch_words_core`): a
+/// LIKELY word takes one of the RESERVED pair first (`free_likely`; design
+/// 3.2: two sets of its own, so hints never contend with restores and
+/// admissions for the general sets), then a general set under the
+/// speculative rule; a speculative word never takes one of the last
+/// `2 * reserve` general sets (kept for certain words); a certain word takes
+/// any general set. `None` = dropped.
+fn pick_set(free: &mut Vec<usize>, free_likely: &mut Vec<usize>, certain: bool, likely: bool, reserve: usize) -> Option<usize> {
+    if likely && !certain {
+        if let Some(s) = free_likely.pop() {
+            return Some(s);
+        }
+    }
+    if !certain && free.len() <= 2 * reserve {
+        return None;
+    }
+    free.pop()
 }
 
 struct B2Prefetch {
@@ -1802,7 +2056,11 @@ struct B2Prefetch {
     /// them before the staging is freed.
     readers: Vec<std::thread::JoinHandle<()>>,
     stages: Vec<[PinnedBuffer<u8>; 3]>,
+    /// Free GENERAL sets (indices `< n_general`).
     free: Vec<usize>,
+    /// Free sets of the RESERVED pair for LIKELY words (indices `>= n_general`).
+    free_likely: Vec<usize>,
+    n_general: usize,
     pending: std::collections::HashSet<(u32, u32)>,
     pub hinted: u64,
     pub admitted: u64,
@@ -1816,6 +2074,17 @@ struct B2Prefetch {
     pub queue_ns: u64,
     pub read_ns: u64,
     pub n_read: u64,
+}
+
+impl B2Prefetch {
+    /// A read is done with `set`: back to the list it came from.
+    fn release_set(&mut self, set: usize) {
+        if set >= self.n_general {
+            self.free_likely.push(set);
+        } else {
+            self.free.push(set);
+        }
+    }
 }
 
 impl Drop for B2Prefetch {
@@ -1881,6 +2150,39 @@ fn ev_pin_fields(
         1.0, f64::from(pinned), f64::from(budget), f64::from(epoch), n_release as f64,
         d(c1.new_pins, c0.new_pins), d(c1.denied, c0.denied), d(c1.no_victim_drops, c0.no_victim_drops),
         d(c1.pinned_evictions, c0.pinned_evictions), n_paged,
+    ]
+}
+
+/// `evtrace` `b2_req` nursery fields, `nursery_lands` .. `nursery_occupied` in
+/// `B2_REQ` order: counter deltas across the request (lands, hits, recycled,
+/// drops, shrunk), then the occupied LEVEL after it. Per step the readers
+/// check `lands = hits + recycled + delta(occupied)` (design section 6).
+fn ev_nursery_fields(before: NurseryCounters, after: (NurseryCounters, u32)) -> [f64; 6] {
+    let (a, occupied) = after;
+    let d = |x: u64, y: u64| x.saturating_sub(y) as f64;
+    [
+        d(a.lands, before.lands), d(a.hits, before.hits), d(a.recycled, before.recycled),
+        d(a.drops, before.drops), d(a.shrunk, before.shrunk), f64::from(occupied),
+    ]
+}
+
+/// `evtrace` `b2_req` two-phase landing fields, `partial_lands` ..
+/// `down_wait_us` in `B2_REQ` order: partial landings and promotions across
+/// the request, the partial level after it, and the gate/up / down waits
+/// (us) the request's `ensure` phases spent (design 3.4).
+fn ev_partial_fields(before: ([u64; 2], PartialCounters, u32, [u64; 2]), after: ([u64; 2], PartialCounters, u32, [u64; 2])) -> [f64; 6] {
+    let d = |a: u64, b: u64| a.saturating_sub(b) as f64;
+    // `down_exposed`: 1 this pass's down read was fully exposed, 0 hidden
+    // under the gate/up kernels, NaN no two-phase pass in this request.
+    let (ex, hid) = (d(after.3[0], before.3[0]), d(after.3[1], before.3[1]));
+    let exposed = if ex + hid == 0.0 { f64::NAN } else { ex / (ex + hid) };
+    [
+        d(after.1.partial_lands, before.1.partial_lands),
+        d(after.1.partial_promotions, before.1.partial_promotions),
+        f64::from(after.2),
+        d(after.0[0], before.0[0]) / 1e3,
+        d(after.0[1], before.0[1]) / 1e3,
+        exposed,
     ]
 }
 
@@ -1981,7 +2283,67 @@ pub mod knobs {
         /// `V41_EXPERT_MIRROR_FRAC` (default 0.6), key `mirror_frac`: pushed into
         /// `v4flash_core::hf_v41::set_expert_mirror_frac` (the reader's state).
         pub static MIRROR_FRAC = Knob::real("V41_EXPERT_MIRROR_FRAC", 0.6, 0.0, 1.0).alias("mirror_frac").hook(sync_mirror_frac);
+        /// `V41_B2_NURSERY` (default 32, 0..=512; 0 = off), key `nursery`: nursery
+        /// slots for the hub's predicted-miss hints (design 3.2). STARTUP ONLY
+        /// (the slots are carved at `enable_paging`); a file edit takes effect at
+        /// the next restart. 32 by default (k1 burst bound 16, room for cap bursts
+        /// and k2; 0.6 GB); 64-96 if the live hint volume (17-65 words/step at
+        /// R=1 with a cold pool, 10-06) says so.
+        pub static NURSERY = Knob::int("V41_B2_NURSERY", 32, 0, 512).alias("nursery");
+        /// `V41_B2_NURSERY_LANES` (default 2, 1..=8), key `nursery_lanes`: a
+        /// nursery entry is UNUSED (recycled first) once its layer has served
+        /// this many passes since it landed -- the hub's lane count (the other
+        /// lane's same-layer request arrives one period later). Live.
+        pub static NURSERY_LANES = Knob::int("V41_B2_NURSERY_LANES", 2, 1, 8).alias("nursery_lanes");
+        /// `V41_B2_LIKELY_PAUSE_FOR_CERTAIN` (default on), key
+        /// `likely_pause_for_certain`: a LIKELY (hint) read's chunks pause while a
+        /// certain read runs (review round 3, finding 1: protect the known-late
+        /// reply; off = keep the hint's lead and stretch an overlapped certain
+        /// read ~1 ms). Never pauses for speculative reads either way. Live
+        /// (the A/B flips it per turn via SIGUSR2).
+        pub static LIKELY_PAUSE_FOR_CERTAIN = Knob::flag("V41_B2_LIKELY_PAUSE_FOR_CERTAIN", true).alias("likely_pause_for_certain");
+        /// `V41_B2_LAND_TWO_PHASE` (default off), key `land_two_phase`: a paged
+        /// expert lands in TWO PHASES (owner idea 10-06, design 3.4): pass B of
+        /// a hits-first request reads the misses' gate/up roles (w1, w3), commits
+        /// them and launches the gate/up kernel, then reads their down roles (w2)
+        /// while that kernel runs, and launches the down kernel after. A slot
+        /// between the phases is PARTIAL (`ShardPool::partial`: resident for the
+        /// kernel's gate/up, masked from every residency map, pinnable never).
+        /// Off: today's single landing. Live (a partial slot left over is
+        /// completed by the next `ensure` of its layer either way).
+        pub static LAND_TWO_PHASE = Knob::flag("V41_B2_LAND_TWO_PHASE", false).alias("land_two_phase");
+        /// `V41_B2_LIKELY_GATEUP_ONLY` (default off), key `likely_gateup_only`:
+        /// LIKELY (hint) reads fetch the gate/up roles only (~12.5 of 18.8 MB)
+        /// and land PARTIAL nursery entries; on use the pass reads the down
+        /// role first thing (under `land_two_phase` it overlaps the gate/up
+        /// kernel, else it is on the critical path). An unused partial entry
+        /// recycled costs 2/3 of a read. Live.
+        pub static LIKELY_GATEUP_ONLY = Knob::flag("V41_B2_LIKELY_GATEUP_ONLY", false).alias("likely_gateup_only");
+        /// `V41_B2_ROLE_STRIPES` (default 3, 1..=8), key `role_stripes`: a read
+        /// of FEWER than three roles (the Down phase, a gate/up-only hint)
+        /// stripes each role's packed plane in this many pieces over as many
+        /// threads and both drives (`read_range_into_direct_striped`), so one
+        /// role lands at ~the whole expert's bandwidth instead of one stream
+        /// per drive (measured 10-06: a role alone 2.1 ms vs 2.26 for all
+        /// three). 1 = the plain per-role read. Live. Whole-expert reads keep
+        /// their three role threads x two drives.
+        pub static ROLE_STRIPES = Knob::int("V41_B2_ROLE_STRIPES", 3, 1, 8).alias("role_stripes");
     }
+    /// Two-phase landing (design 3.4).
+    pub fn land_two_phase() -> bool { LAND_TWO_PHASE.on() }
+    /// LIKELY reads fetch gate/up only (design 3.4) -- only WITH the two-phase
+    /// landing: without it the pass would read the down role synchronously
+    /// at the top of `ensure` where today the early-page hook reads the whole
+    /// expert in the background (review of 9f713ac, finding 3).
+    pub fn likely_gateup_only() -> bool { LIKELY_GATEUP_ONLY.on() && LAND_TWO_PHASE.on() }
+    /// Stripes per role for a read of fewer than three roles (design 3.4).
+    pub fn role_stripes() -> usize { ROLE_STRIPES.usize() }
+    /// Nursery slots to carve at `enable_paging` (0 = off; design 3.2).
+    pub fn nursery() -> usize { NURSERY.usize() }
+    /// Same-layer passes after which an unpromoted nursery entry is "unused".
+    pub fn nursery_lanes() -> u64 { NURSERY_LANES.get() }
+    /// LIKELY reads pause for certain ones (review round 3, finding 1).
+    pub fn likely_pause_for_certain() -> bool { LIKELY_PAUSE_FOR_CERTAIN.on() }
     /// `V41_B2_FAST_CHAIN` (default ON; `0` = the exact old chain); file key
     /// `fast_chain`. A batched pass of `b <= FAST_CHAIN_MAX_B` rows (every
     /// box-2 decode request of 2+ rows, verify batches, merged decode pairs)
@@ -2090,10 +2452,12 @@ pub mod knobs {
     /// one-line summary.
     pub fn reload() -> String {
         crate::knobs::step_now();
-        format!("knobs reloaded from {:?}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={}",
+        format!("knobs reloaded from {:?}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} fast_chain={} prefill_budget={} encoder_victims_first={} nursery={} (startup) nursery_lanes={} likely_pause_for_certain={}",
             crate::knobs::knob_file(), u8::from(park()), u8::from(merge()), merge_wait_us(), miss_par(), u8::from(coalesce()),
             v4flash_core::hf_v41::expert_mirror_frac(), if route_urgency() { "urgency" } else { "split" },
-            if prefill_route_split() { "split" } else { "mirror" }, u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()))
+            if prefill_route_split() { "split" } else { "mirror" }, u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()),
+            nursery(), nursery_lanes(), u8::from(likely_pause_for_certain()))
+            + &format!(" land_two_phase={} likely_gateup_only={} role_stripes={}", u8::from(land_two_phase()), u8::from(likely_gateup_only()), role_stripes())
     }
 }
 
@@ -2145,6 +2509,84 @@ fn b2_prefetch_reserve() -> usize {
     *R
 }
 
+/// Staging sets reserved for LIKELY (hint) reads when the nursery is on
+/// (design 3.2: a reserved pair, so hints never contend with restores and
+/// admissions for the general sets).
+const B2_LIKELY_SETS: usize = 2;
+
+/// Which of an expert's three roles a read / repack covers (design 3.4, the
+/// two-phase landing): bit 0 gate (w1), bit 1 up (w3), bit 2 down (w2). The
+/// three roles are separate per-role device buffers (`routed.gate / up /
+/// down`, stride `bpe[i]` per slot), so a slot with gate/up landed and down
+/// pending is a PARTIAL slot the gate/up kernels may read: nothing they touch
+/// overlaps the down region a later landing writes.
+pub type Roles = u8;
+pub const ROLE_GATE: Roles = 1;
+pub const ROLE_UP: Roles = 2;
+pub const ROLE_DOWN: Roles = 4;
+pub const ROLES_GATEUP: Roles = ROLE_GATE | ROLE_UP;
+pub const ROLES_ALL: Roles = ROLE_GATE | ROLE_UP | ROLE_DOWN;
+
+/// Is role `i` (0 gate, 1 up, 2 down) in `roles`?
+pub fn role_in(roles: Roles, i: usize) -> bool {
+    roles & (1 << i) != 0
+}
+
+/// The two-phase plan of an `ensure` (design 3.4), as a pure function over
+/// the pass's wanted experts: `resident` = fully landed (a hit), `partial` =
+/// gate/up landed, down pending. Returns `(misses, down_only)`: the experts
+/// to claim and read (all three roles, or gate/up only under the GateUp
+/// phase) and the partial ones that need their down role (the Full and Down
+/// phases). A GateUp phase reads no down at all.
+pub fn phase_plan(want: &[u32], resident: impl Fn(u32) -> bool, partial: impl Fn(u32) -> bool, phase: EnsurePhase) -> (Vec<u32>, Vec<u32>) {
+    let (mut misses, mut down_only) = (Vec::new(), Vec::new());
+    for &e in want {
+        if partial(e) {
+            if phase != EnsurePhase::GateUp {
+                down_only.push(e);
+            }
+        } else if !resident(e) && phase != EnsurePhase::Down {
+            misses.push(e);
+        }
+    }
+    (misses, down_only)
+}
+
+/// The early-page hook's reads for a queued frame (design 3.4): its picks
+/// not resident at all (`resident` false) as whole certain words, and its
+/// picks in PARTIAL slots (`partial`) as down-only certain words; distinct,
+/// in pick order. A partial entry counts as resident for `resident`.
+pub fn early_page_plan(layer: u32, sel: &[i32], resident: impl Fn(u32) -> bool, partial: impl Fn(u32) -> bool) -> (Vec<u32>, Vec<u32>) {
+    let (mut words, mut down) = (Vec::with_capacity(sel.len()), Vec::new());
+    for &e in sel {
+        if !(0..N_EXPERT as i32).contains(&e) {
+            continue;
+        }
+        let w = (layer << 16) | e as u32;
+        if partial(e as u32) {
+            if !down.contains(&w) {
+                down.push(w);
+            }
+        } else if !resident(e as u32) && !words.contains(&w) {
+            words.push(w);
+        }
+    }
+    (words, down)
+}
+
+/// Which landing an `ensure` performs (design 3.4). `Full`: today -- every
+/// miss lands whole, every partial slot wanted is completed (its down role
+/// read) before the call returns. `GateUp`: misses land their gate/up roles
+/// only (PARTIAL), partial slots wanted stay partial; the pass may launch its
+/// gate/up kernel after. `Down`: the layer's partial slots this pass wants
+/// get their down role; the pass launches its down kernel after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnsurePhase {
+    Full,
+    GateUp,
+    Down,
+}
+
 /// `V41_B2_PREFETCH_SETS`: staging sets = max prefetch reads in flight (default 8).
 fn b2_prefetch_sets() -> usize {
     std::env::var("V41_B2_PREFETCH_SETS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).clamp(0, 32)
@@ -2192,6 +2634,13 @@ pub struct ExpertShard {
     /// Pin mode: each queued request's picks NOT landed when its frame
     /// ARRIVED (see [`EarlyPaged`]). Empty unless pins are on.
     pub early_paged: EarlyPaged,
+    /// Frames (by seq) whose LIKELY words were applied at arrival
+    /// (`likely_words_in`), so the dequeue does not apply them twice. A
+    /// bounded ring like `EarlyPaged`.
+    likely_seen: SeqRing,
+    /// Two-phase passes whose down read was `[exposed, hidden]`
+    /// (`note_down_overlap`).
+    down_overlap: [u64; 2],
     /// Cumulative time the compute thread spent BLOCKED in `admit_prefetched`
     /// waiting for a prefetch read it needs this request (2026-09-22). Also
     /// added to the layer's `read_ns`, see the note there.
@@ -2268,6 +2717,94 @@ struct ShardPool {
     sc: StageCounters,
     /// Mode-aware eviction (`V41_B2_MODE_EVICT`); off unless enabled at load.
     me: ModeEvict,
+    /// THE NURSERY (docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 3.2; owner
+    /// direction 2026-10-06): per slot, "this slot is a nursery slot". A SET
+    /// of slot ids, never an address range (a `Band::Stage`-style range cost
+    /// prefill 3x, 09-27). The hub's predicted-miss hints (`REQ_FLAG_LIKELY`)
+    /// land ONLY here; every main-band search (`pick_victim`: claims,
+    /// landings, restores) skips these slots. A nursery entry is resident
+    /// (`slot_of`, `remap_hosts`: the kernel reads it like any slot, so
+    /// `is_resident_pool` / `resident_mask` see it and the early-page hook
+    /// issues no certain read for it -- the hit at `ensure` is what makes the
+    /// hint pay), but it is NOT in `held` (`nursery_held`), never pinnable
+    /// (`PinBook::report`), and masked out of `residency_words`. On a hit
+    /// `touch_hit` RELABELS the slot into the main pool (no copy: the remap
+    /// already points at it) and the caller refills the nursery with the main
+    /// pool's victim (`nursery_refill`). Empty (all false) = off.
+    nursery: Vec<bool>,
+    /// Slots flagged `nursery` now; `nursery_target` = the knob (`nursery`).
+    /// Below the target after a promotion found no refill victim
+    /// (`NurseryCounters::shrunk`); refilled from free main slots later.
+    nursery_slots: u32,
+    nursery_target: u32,
+    /// Per layer: resident nursery entries of the layer (NOT in `held`:
+    /// `pick_victim` protects a foreign layer only while `held > floor`, and
+    /// a counted nursery entry would let a main slot of a layer AT its floor
+    /// be evicted -- review round 3, finding 3).
+    nursery_held: Vec<u32>,
+    /// Per slot (nursery slots only): `(serves[layer] when the entry landed,
+    /// landing tick)` for the recycle order: UNUSED first (its layer has been
+    /// served `>= nursery_lanes` requests since the landing: the other lane's
+    /// same-layer request came one period later and did not pick it), then
+    /// the oldest landing.
+    nursery_land: Vec<(u64, u64)>,
+    /// Per layer: `ensure` passes served (`note_serve`), the unused rule's clock.
+    serves: Vec<u64>,
+    nc: NurseryCounters,
+    /// `nursery_words`' rotation over the other layers' entries.
+    nursery_cursor: usize,
+    /// Nursery entries an ARRIVED, not yet served frame relies on (the
+    /// early-page hook issued no certain read for them), per seq
+    /// (`protect_nursery` / `unprotect_nursery`): never a `nursery_victim`
+    /// meanwhile. A bounded ring like `EarlyPaged` (a dropped entry only
+    /// weakens the protection: the frame then demand-reads).
+    nursery_protect: Vec<(u32, Vec<(u32, u32)>)>,
+    /// PARTIAL slots (design 3.4): gate/up landed, down pending. Resident for
+    /// `is_resident_pool` (the early-page hook issues no read: the pass
+    /// reads the down role itself), NOT resident for `resident_mask` (pass A
+    /// must not run its down kernel on it), masked from `residency_words`,
+    /// `soft_words` and `PinBook::report` (never held, never pinned), and a
+    /// PAGED expert for the reply (it needs a read). Cleared by the down
+    /// landing (`complete`), a full landing, or eviction.
+    partial: Vec<bool>,
+    pc: PartialCounters,
+}
+
+/// Two-phase landing counters (cumulative; `b2_req` reports deltas).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartialCounters {
+    /// LIKELY gate/up-only reads landed as PARTIAL nursery entries.
+    pub partial_lands: u64,
+    /// Partial nursery entries promoted on use (`touch_hit`).
+    pub partial_promotions: u64,
+    /// Partial slots completed (their down role landed): hint-made AND
+    /// demand-made (`demand_partial`).
+    pub completions: u64,
+    /// Partial slots evicted / recycled before completion.
+    pub partial_evicted: u64,
+    /// A pass's own demand miss landed gate/up first (`EnsurePhase::GateUp`)
+    /// and was left PARTIAL for its Down phase. Invariant:
+    /// `completions + partial_evicted <= partial_lands + demand_partial`.
+    pub demand_partial: u64,
+}
+
+/// Nursery counters (cumulative since `enable_paging`; `b2_req` reports
+/// deltas per request, `nursery_occupied` is a level). Invariant per step:
+/// `lands = hits + recycled + delta(occupied)` (design section 6; a hint
+/// landed straight into the main pool because the serving request wanted it
+/// counts as a land AND a hit; `drops` never land).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NurseryCounters {
+    /// LIKELY reads landed (into a nursery slot, or straight into main when wanted).
+    pub lands: u64,
+    /// Nursery entries promoted on use (`touch_hit`), incl. the direct ones.
+    pub hits: u64,
+    /// Unused nursery entries evicted by a later landing (= wrong hints, churn).
+    pub recycled: u64,
+    /// LIKELY words not read: no staging set, or no nursery slot to land in.
+    pub drops: u64,
+    /// Promotions that found no main-band refill victim (the nursery shrank).
+    pub shrunk: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2769,6 +3306,22 @@ impl PinBook {
         self.on && Self::idx(layer, e).is_some_and(|i| self.state[i] == PIN_HELD)
     }
 
+    /// The layer's pinned set as a bitset (`soft_words`: one pass over the
+    /// layer's `state` slice, no per-expert index checks). All zero when off.
+    fn pinned_words(&self, layer: u32) -> [u32; proto::RESID_WORDS] {
+        let mut w = [0u32; proto::RESID_WORDS];
+        if !self.on || layer >= N_LAYER as u32 {
+            return w;
+        }
+        let base = layer as usize * N_EXPERT as usize;
+        for (e, &s) in self.state[base..base + N_EXPERT as usize].iter().enumerate() {
+            if s == PIN_HELD {
+                w[e / 32] |= 1 << (e % 32);
+            }
+        }
+        w
+    }
+
     /// The hub wants `(layer, e)` resident (a decode-shaped pick, a prefetch
     /// word): pin it at its layer's next report, budget allowing. A repeat
     /// grant restarts the eligibility clock.
@@ -2855,15 +3408,20 @@ impl PinBook {
     /// return the layer's pinned set as a residency map. A pinned expert
     /// found NOT landed is a violation (it left the pool around the choke
     /// point): unpinned, reported, and absent from the map.
-    fn report(&mut self, layer: u32, row: &[i32], stage: u32) -> [u32; proto::RESID_WORDS] {
+    fn report(&mut self, layer: u32, row: &[i32], stage: u32, nursery: &[bool], partial: &[bool]) -> [u32; proto::RESID_WORDS] {
         let mut w = [0u32; proto::RESID_WORDS];
         if !self.on || layer >= N_LAYER as u32 {
             return w;
         }
-        // (landed, pinnable): a staging slot is landed but never pinned.
+        // (landed, pinnable): a staging slot, a NURSERY slot (design 3.2) or a
+        // PARTIAL slot (3.4: it still needs a read) is landed but never
+        // pinned -- else `apply_map` on the hub would count it as a hub pin.
         let state = |e: usize| -> (bool, bool) {
             match row.get(e) {
-                Some(&r) if r != 0 => (true, ((-r - 1) as u32) < stage),
+                Some(&r) if r != 0 => {
+                    let slot = (-r - 1) as usize;
+                    (true, (slot as u32) < stage && !nursery.get(slot).copied().unwrap_or(false) && !partial.get(slot).copied().unwrap_or(false))
+                }
                 _ => (false, false),
             }
         };
@@ -2953,6 +3511,57 @@ impl EarlyPaged {
 /// and the early-page `pinned` set.
 type ExtraPins<'a> = &'a [(u32, u32)];
 
+/// A bounded ring of request seqs seen once (`likely_words_in`: a frame's
+/// LIKELY words are applied at its first sight -- arrival or dequeue -- and
+/// never twice). Beyond `cap` entries the oldest is forgotten.
+#[derive(Clone, Debug, Default)]
+pub struct SeqRing {
+    ring: std::collections::VecDeque<u32>,
+    cap: usize,
+}
+
+impl SeqRing {
+    pub fn new(cap: usize) -> Self {
+        Self { ring: Default::default(), cap: cap.max(1) }
+    }
+
+    /// First sight of `seq`? (Records it.)
+    pub fn insert(&mut self, seq: u32) -> bool {
+        if self.ring.contains(&seq) {
+            return false;
+        }
+        if self.ring.len() >= self.cap {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(seq);
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.ring.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+}
+
+/// `residency_words`' predicate: remap entry `r` (`-(slot) - 1`, 0 = not
+/// landed) is landed in a slot that is NOT a nursery slot (design 3.2) and
+/// NOT partial (3.4: a gate/up-only slot needs a read).
+fn landed_main(r: i32, nursery: &[bool]) -> bool {
+    r != 0 && !nursery.get((-r - 1) as usize).copied().unwrap_or(false)
+}
+
+/// `landed_main` minus the PARTIAL slots (design 3.4).
+fn landed_whole(r: i32, nursery: &[bool], partial: &[bool]) -> bool {
+    landed_main(r, nursery) && !partial.get((-r - 1) as usize).copied().unwrap_or(false)
+}
+
 impl ShardPool {
     /// A pool of `n_slots`, seeded with `(layer, base_slot, ids)` regions as
     /// `load` placed them (slot `base + i` holds `ids[i]`, all landed, oldest
@@ -2991,6 +3600,230 @@ impl ShardPool {
             stage: n_slots as u32,
             sc: StageCounters::default(),
             me: ModeEvict::default(),
+            nursery: vec![false; n_slots],
+            nursery_slots: 0,
+            nursery_target: 0,
+            nursery_held: vec![0; N_LAYER as usize],
+            nursery_land: vec![(0, 0); n_slots],
+            serves: vec![0; N_LAYER as usize],
+            nc: NurseryCounters::default(),
+            nursery_cursor: 0,
+            nursery_protect: Vec::new(),
+            partial: vec![false; n_slots],
+            pc: PartialCounters::default(),
+        }
+    }
+
+    /// Is `(layer, e)` resident in a PARTIAL slot (gate/up only)?
+    fn is_partial(&self, layer: u32, e: u32) -> bool {
+        self.slot_of.get(&(layer, e)).is_some_and(|&sl| self.partial[sl as usize])
+    }
+
+    /// A slot's gate/up landed without its down (`GateUp` phase, a LIKELY
+    /// gate/up-only landing): PARTIAL until `complete`.
+    fn mark_partial(&mut self, slot: u32) {
+        self.partial[slot as usize] = true;
+    }
+
+    /// The down role of `(layer, e)`'s partial slot landed.
+    fn complete(&mut self, layer: u32, e: u32) {
+        if let Some(&sl) = self.slot_of.get(&(layer, e)) {
+            if self.partial[sl as usize] {
+                self.partial[sl as usize] = false;
+                self.pc.completions += 1;
+            }
+        }
+    }
+
+    /// Partial slots now (a level, for the stats line / tests).
+    fn partial_count(&self) -> u32 {
+        self.partial.iter().filter(|&&p| p).count() as u32
+    }
+
+    /// Frame `seq` arrived relying on nursery entries `keys` (none: nothing kept).
+    fn protect_nursery(&mut self, seq: u32, keys: &[(u32, u32)]) {
+        if keys.is_empty() {
+            return;
+        }
+        if self.nursery_protect.len() >= EarlyPaged::MAX {
+            self.nursery_protect.remove(0);
+        }
+        self.nursery_protect.push((seq, keys.to_vec()));
+    }
+
+    /// Frame `seq` was served.
+    fn unprotect_nursery(&mut self, seq: u32) {
+        self.nursery_protect.retain(|(s, _)| *s != seq);
+    }
+
+    /// Is `(layer, e)` a nursery entry an arrived frame relies on?
+    fn nursery_protected(&self, key: (u32, u32)) -> bool {
+        self.nursery_protect.iter().any(|(_, keys)| keys.contains(&key))
+    }
+
+    /// The reply's NURSERY block for `layer` (`proto::RESP_FLAG_NURSERY`):
+    /// the layer's own entries first (all of them when they fit: the hub
+    /// replaces that layer's row), then other layers' entries in rotation,
+    /// `NURSERY_NONE`-padded.
+    fn nursery_words(&mut self, layer: u32) -> [u32; proto::NURSERY_WORDS] {
+        let mut w = [proto::NURSERY_NONE; proto::NURSERY_WORDS];
+        let mut n = 0;
+        let entries: Vec<(usize, (u32, u32))> =
+            self.nursery.iter().enumerate().filter_map(|(sl, &f)| if f { self.owner_of[sl].map(|k| (sl, k)) } else { None }).collect();
+        for &(_, (l, e)) in entries.iter().filter(|(_, k)| k.0 == layer) {
+            if n == w.len() {
+                return w;
+            }
+            w[n] = (l << 16) | e;
+            n += 1;
+        }
+        let others: Vec<(u32, u32)> = entries.iter().filter(|(_, k)| k.0 != layer).map(|&(_, k)| k).collect();
+        if !others.is_empty() {
+            let mut taken = 0;
+            while taken < others.len() && n < w.len() {
+                let (l, e) = others[(self.nursery_cursor + taken) % others.len()];
+                w[n] = (l << 16) | e;
+                n += 1;
+                taken += 1;
+            }
+            self.nursery_cursor = (self.nursery_cursor + taken) % others.len();
+        }
+        w
+    }
+
+    // ---- the nursery (design 3.2) ----
+
+    /// Carve `n` nursery slots out of the MAIN band (call after `set_stage`;
+    /// 0 = off). The slots are spread over the band (`i * main / n`), so no
+    /// layer's region loses more than its share; an occupant stays resident
+    /// as a nursery ENTRY (unused, oldest-landed: the first to be recycled),
+    /// its count moving from `held` to `nursery_held`. Clamped to a quarter
+    /// of the band. Returns the slots carved.
+    fn carve_nursery(&mut self, n: usize) -> usize {
+        let main = self.stage as usize;
+        let n = n.min(main / 4);
+        self.nursery_target = n as u32;
+        for i in 0..n {
+            let sl = i * main / n;
+            if self.nursery[sl] {
+                continue;
+            }
+            debug_assert!(!self.owner_of[sl].is_some_and(|(l, e)| self.pins.is_pinned(l, e)), "carving a pinned slot");
+            self.nursery[sl] = true;
+            self.nursery_slots += 1;
+            self.nursery_land[sl] = (0, 0);
+            if let Some((ol, _)) = self.owner_of[sl] {
+                self.held[ol as usize] -= 1;
+                self.nursery_held[ol as usize] += 1;
+            }
+        }
+        n
+    }
+
+    /// `ensure` is serving a pass of `layer`: the unused rule's clock.
+    fn note_serve(&mut self, layer: u32) {
+        self.serves[layer as usize] += 1;
+    }
+
+    /// Nursery slots holding an entry (the `nursery_occupied` level).
+    fn nursery_occupied(&self) -> u32 {
+        self.nursery.iter().enumerate().filter(|&(sl, &f)| f && self.owner_of[sl].is_some()).count() as u32
+    }
+
+    /// Is `(layer, e)` a nursery entry (resident, not yet promoted)?
+    fn in_nursery(&self, layer: u32, e: u32) -> bool {
+        self.slot_of.get(&(layer, e)).is_some_and(|&sl| self.nursery[sl as usize])
+    }
+
+    /// Where a LIKELY read lands (design 3.2, recycle rule): a FREE nursery
+    /// slot first, then an UNUSED entry (its layer served `>= lanes` passes
+    /// since it landed), oldest landing first, then the oldest landing among
+    /// the fresh ones; never a slot whose entry the pass being served wants
+    /// (`want` on `want_layer`, `extra`) or an ARRIVED frame relies on
+    /// (`nursery_protect`). `None` = no nursery, or every slot is wanted.
+    fn nursery_victim(&self, want_layer: u32, want: &[u32], extra: ExtraPins<'_>, lanes: u64) -> Option<u32> {
+        let mut best: Option<((u8, u64), u32)> = None;
+        for (sl, &flag) in self.nursery.iter().enumerate() {
+            if !flag {
+                continue;
+            }
+            let key = match self.owner_of[sl] {
+                None => (0u8, 0u64),
+                Some((ol, oe)) => {
+                    if (ol == want_layer && want.contains(&oe)) || extra.contains(&(ol, oe)) || self.nursery_protected((ol, oe)) {
+                        continue;
+                    }
+                    let (at, tick) = self.nursery_land[sl];
+                    let unused = self.serves[ol as usize].saturating_sub(at) >= lanes;
+                    (if unused { 1 } else { 2 }, tick)
+                }
+            };
+            if best.is_none_or(|(bk, _)| key < bk) {
+                best = Some((key, sl as u32));
+            }
+        }
+        best.map(|(_, sl)| sl)
+    }
+
+    /// A LIKELY read of `key` has been repacked into nursery `slot` (already
+    /// detached by `evict`): own and map it as a nursery ENTRY. Not in
+    /// `held`; `last_use` 0-class (main searches skip the slot anyway); the
+    /// landing sets the layer `dirty` (the relabel on use will not).
+    fn land_nursery(&mut self, slot: u32, key: (u32, u32)) {
+        debug_assert!(self.nursery[slot as usize] && self.owner_of[slot as usize].is_none());
+        self.owner_of[slot as usize] = Some(key);
+        self.slot_of.insert(key, slot);
+        self.partial[slot as usize] = false;
+        self.nursery_held[key.0 as usize] += 1;
+        self.tick += 1;
+        self.last_use[slot as usize] = 0;
+        self.nursery_land[slot as usize] = (self.serves[key.0 as usize], self.tick);
+        self.remap_hosts[key.0 as usize][key.1 as usize] = -(slot as i32) - 1;
+        self.dirty[key.0 as usize] = true;
+        self.nc.lands += 1;
+    }
+
+    /// After `touch_hit` promoted an entry: hand the nursery the main pool's
+    /// victim -- `pick_victim_any` (never a hub pin, floors honoured, the
+    /// serving pass's `want` and `extra` excluded), `me_account` on that
+    /// victim with the pass's mode (the `claim_miss` order), `evict`, flag.
+    /// Exactly the eviction the demand read would have caused. No victim: the
+    /// nursery shrinks by one (`shrunk`) and refills from a free slot later
+    /// (`nursery_refill_free`). Returns the victim slot.
+    #[allow(clippy::too_many_arguments)]
+    fn nursery_refill(
+        &mut self,
+        region: (u32, u32),
+        global: bool,
+        want_layer: u32,
+        want: &[u32],
+        extra: ExtraPins<'_>,
+        prefill_mode: bool,
+    ) -> Option<u32> {
+        if self.nursery_slots >= self.nursery_target {
+            return None;
+        }
+        let Some(v) = self.pick_victim_any(region, global, Band::Main, want_layer, want, extra, want_layer, false, prefill_mode) else {
+            self.nc.shrunk += 1;
+            return None;
+        };
+        self.me_account(v, prefill_mode);
+        let _ = self.evict(v, want_layer);
+        self.nursery[v as usize] = true;
+        self.nursery_slots += 1;
+        self.nursery_land[v as usize] = (0, 0);
+        self.last_use[v as usize] = 0;
+        Some(v)
+    }
+
+    /// A shrunk nursery takes a FREE main-band slot when one exists (a landing
+    /// time check; `nursery_slots < target` is rare).
+    fn nursery_refill_free(&mut self) {
+        while self.nursery_slots < self.nursery_target {
+            let Some(sl) = (0..self.stage as usize).find(|&sl| self.owner_of[sl].is_none() && !self.nursery[sl]) else { return };
+            self.nursery[sl] = true;
+            self.nursery_slots += 1;
+            self.nursery_land[sl] = (0, 0);
         }
     }
 
@@ -3220,6 +4053,11 @@ impl ShardPool {
         let enc_first = tiered && knobs::encoder_victims_first();
         let mut best: Option<((u8, u8, u64), u32)> = None;
         for sl in range {
+            // Nursery slots belong to the hints (design 3.2): never a victim
+            // of a claim, a landing or a restore.
+            if self.nursery[sl as usize] {
+                continue;
+            }
             let ok = match self.owner_of[sl as usize] {
                 Some((ol, oe)) => {
                     if (ol == want_layer && want.contains(&oe))
@@ -3292,7 +4130,18 @@ impl ShardPool {
         let (ol, oe) = self.owner_of[slot as usize].take()?;
         self.slot_of.remove(&(ol, oe));
         self.remap_hosts[ol as usize][oe as usize] = 0;
-        self.held[ol as usize] -= 1;
+        if self.partial[slot as usize] {
+            self.partial[slot as usize] = false;
+            self.pc.partial_evicted += 1;
+        }
+        if self.nursery[slot as usize] {
+            // A nursery entry recycled by a later hint (the only path that
+            // evicts one): never pinned, so `on_evict` below is false.
+            self.nursery_held[ol as usize] -= 1;
+            self.nc.recycled += 1;
+        } else {
+            self.held[ol as usize] -= 1;
+        }
         if ol != cur_layer {
             self.dirty[ol as usize] = true;
         }
@@ -3307,6 +4156,24 @@ impl ShardPool {
     fn touch_hit(&mut self, layer: u32, e: u32, scan_class: bool) -> bool {
         let Some(&slot) = self.slot_of.get(&(layer, e)) else { return false };
         self.tick += 1;
+        if self.nursery[slot as usize] {
+            // PROMOTE ON USE (design 3.2; review round 3, finding 3): the hint
+            // was right. RELABEL the slot into the main pool -- no copy, no
+            // remap write (it already points here), no `dirty` -- and let
+            // the stamp below be the decode hit's. Pin eligibility comes from
+            // the request's own `pin_grant`, like any pick. The caller
+            // refills the nursery (`nursery_refill`: the eviction the demand
+            // read would have caused). A PARTIAL entry (gate/up only) stays
+            // partial: the pass reads its down role (design 3.4).
+            self.nursery[slot as usize] = false;
+            self.nursery_slots -= 1;
+            self.nursery_held[layer as usize] -= 1;
+            self.held[layer as usize] += 1;
+            self.nc.hits += 1;
+            if self.partial[slot as usize] {
+                self.pc.partial_promotions += 1;
+            }
+        }
         let staged = slot >= self.stage;
         self.sc.hits += u64::from(staged);
         let lu = &mut self.last_use[slot as usize];
@@ -3400,6 +4267,7 @@ impl ShardPool {
     fn land(&mut self, slot: u32, key: (u32, u32), prefill: bool) {
         self.owner_of[slot as usize] = Some(key);
         self.slot_of.insert(key, slot);
+        self.partial[slot as usize] = false;
         self.held[key.0 as usize] += 1;
         self.tick += 1;
         self.last_use[slot as usize] = if prefill { self.tick } else { self.tick + PREFILL_AGE };
@@ -3413,6 +4281,7 @@ impl ShardPool {
         debug_assert!(!self.pins.is_pinned(layer, e), "a claim is never pinned");
         self.owner_of[slot as usize] = None;
         self.slot_of.remove(&(layer, e));
+        self.partial[slot as usize] = false;
         self.held[layer as usize] -= 1;
         self.last_use[slot as usize] = 0;
     }
@@ -3695,6 +4564,97 @@ pub fn push_prefetch_words(words: &[u32]) -> bool {
     }
 }
 
+/// Words waiting in `PREFETCH_WORDS` (the per-step speculative budget's view).
+pub fn prefetch_words_queued() -> usize {
+    PREFETCH_WORDS.lock().unwrap().len()
+}
+
+/// PREDICTED-MISS HINT WORDS (`het::lookahead`,
+/// docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 2.3): layer L+1's filtered
+/// look-ahead picks, queued at layer L's Route and step-tagged, drained by the
+/// next decode `submit_inner` of ANY lane ahead of admissions and restores. Its
+/// own queue, not `PREFETCH_WORDS`: a hint never waits behind an admission or
+/// restore burst, and the `dry` knob never touches `PREFETCH_WORDS`. SLICE A:
+/// drained and counted (`lh2_dry_words`), never put on a frame.
+static MISS_HINT_WORDS: std::sync::LazyLock<std::sync::Mutex<super::lookahead::HintQueue>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(super::lookahead::HintQueue::new()));
+
+/// Filter layer `target`'s classified look-ahead picks into hint words and
+/// queue them (`lookahead::hint_words`: rank `<= rank`, non-resident, not
+/// hinted this step, not in box 2's NURSERY per the mirror -- counted as
+/// `lh2_nursery_covered` -- at most `cap`); returns `(queued, dropped by the
+/// cap)`. One lane-layer for the abort bars.
+pub fn queue_hint_words(step: u32, target: i32, preds: &[super::lookahead::Pred], rank: u8, cap: usize, margin: f32) -> (usize, u32) {
+    super::lookahead::note_lane_layer();
+    let mut q = MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner());
+    let covered = std::cell::Cell::new(0u64);
+    let (words, dropped) = super::lookahead::hint_words_m(preds, target, rank, cap, margin, |w| {
+        if q.hinted(w) {
+            return true;
+        }
+        if super::b2_mirror::nursery(target, w & 0xFFFF) {
+            covered.set(covered.get() + 1);
+            return true;
+        }
+        false
+    });
+    super::lookahead::bump(super::lookahead::Stat::NurseryCovered, covered.get());
+    (q.push(step, &words), dropped)
+}
+
+/// The drain hook of a decode submit for `layer` at `step` (design 2.3): the
+/// fresh words, oldest first, up to `max`; stale ones (an earlier step, or a
+/// layer `<= layer`) are dropped and counted (`lh2_stale`).
+pub fn take_hint_words(step: u32, layer: i32, max: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    take_hint_words_into(step, layer, max, &mut out);
+    out
+}
+
+/// `take_hint_words` into a reused buffer (the submit path allocates nothing).
+pub fn take_hint_words_into(step: u32, layer: i32, max: usize, out: &mut Vec<u32>) {
+    let stale = MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).take_into(step, layer, max, out);
+    super::lookahead::bump(super::lookahead::Stat::Stale, u64::from(stale));
+}
+
+/// Words a submit took and could not send (budget / bar): back to the front.
+pub fn requeue_hint_words(words: &[u32]) {
+    if !words.is_empty() {
+        MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).requeue(words);
+    }
+}
+
+/// Words that went on the wire (`lh2_hints_sent`; the `sent` set for
+/// `lh2_demanded` / `lh2_paged_hinted`).
+pub fn mark_hint_words_sent(words: &[u32]) {
+    if !words.is_empty() {
+        MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).mark_sent(words);
+        super::lookahead::bump(super::lookahead::Stat::HintsSent, words.len() as u64);
+    }
+}
+
+/// Was `(layer, e)` sent as a hint this step?
+pub fn hint_word_sent(w: u32) -> bool {
+    MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).sent(w)
+}
+
+/// A new decode step (`lookahead::begin_step`): the earlier step's words are
+/// dropped and the dedup set forgotten; returns how many were dropped.
+pub fn hint_queue_begin_step(step: u32) -> u32 {
+    MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).begin_step(step)
+}
+
+/// The decode -> prefill switch (`multistream`, beside `pin_enter_prefill`):
+/// nothing queued may ride a prefill chunk. Returns how many were dropped.
+pub fn clear_hint_words() -> usize {
+    MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).clear()
+}
+
+/// Hint words waiting.
+pub fn hint_words_queued() -> usize {
+    MISS_HINT_WORDS.lock().unwrap_or_else(|p| p.into_inner()).len()
+}
+
 /// RESTORE words (`b2_mirror::pin_enter_decode`): experts released to open a
 /// prefill band, sent back to box 2 as admission words when decode resumes.
 /// A separate queue from `PREFETCH_WORDS` so they never go ahead of the cache
@@ -3720,6 +4680,16 @@ pub fn take_restore_words(max: usize) -> Vec<u32> {
     let mut g = RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner());
     let n = g.len().min(max);
     g.drain(..n).collect()
+}
+
+/// A copy of the restore queue (the KEEP fill's dedup, `b2_mirror::keep_fill`).
+pub fn restore_words_snapshot() -> Vec<u32> {
+    RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner()).iter().copied().collect()
+}
+
+/// Restore words waiting (the per-step speculative budget's view).
+pub fn restore_words_queued() -> usize {
+    RESTORE_WORDS.lock().unwrap_or_else(|p| p.into_inner()).len()
 }
 
 /// The pin ledger's view of one request (`b2_mirror::pin_note_submit`).
@@ -4090,9 +5060,15 @@ impl ExpertShard {
             PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
             PinnedBuffer::<u8>::new_with_flags(bpe3[2] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
         ]); }
-        // Look-ahead prefetch staging + reader thread (see `B2Prefetch`).
+        // Look-ahead prefetch staging + reader thread (see `B2Prefetch`). With
+        // the nursery on, TWO more sets are reserved for the hub's LIKELY words
+        // (design 3.2: ~113 MB of pinned memory; the general sets are sized by
+        // `V41_B2_PREFETCH_SETS` and `miss_par` caps demand concurrency at
+        // `min(knob, stages.len())`, so taking two of those would change it).
+        // The reserved pair is the LAST two sets (`B2Prefetch::n_general`).
         let mut pf_stages: Vec<[PinnedBuffer<u8>; 3]> = Vec::new();
-        for _ in 0..b2_prefetch_sets() {
+        let n_likely_sets = if knobs::nursery() > 0 { B2_LIKELY_SETS } else { 0 };
+        for _ in 0..b2_prefetch_sets() + n_likely_sets {
             pf_stages.push([
                 PinnedBuffer::<u8>::new_with_flags(3 * bpe3[0] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
                 PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
@@ -4128,6 +5104,8 @@ impl ExpertShard {
             park_prefill: false,
             req_prefill: false,
             early_paged: EarlyPaged::default(),
+            likely_seen: SeqRing::new(EarlyPaged::MAX),
+            down_overlap: [0; 2],
             prefetch_wait_ns: 0,
             ev_admit: [0; 5],
         })
@@ -4187,17 +5165,39 @@ impl ExpertShard {
     }
 
     fn prefetch_words_full(&mut self, words: &[u32], certain: bool, stage: bool, prefill: bool) {
-        let _ = self.prefetch_words_core(words, &[], certain, stage, prefill);
+        let _ = self.prefetch_words_core(words, &[], certain, stage, prefill, false, false);
+    }
+
+    /// The hub's predicted-miss hints (`REQ_FLAG_LIKELY`; design 3.2): LIKELY
+    /// reads into the NURSERY. No pin grant, no admit gate, no ledger entry;
+    /// a word for a key already resident (nursery or main) or in flight is
+    /// skipped. Plain speculative words when the nursery is off (the hub only
+    /// sends them after seeing `RESP_FLAG_NURSERY`, so that is a defence).
+    /// Returns how many were queued.
+    pub fn prefetch_words_likely(&mut self, words: &[u32]) -> usize {
+        let dropped = self.prefetch_words_core(words, &[], false, false, false, true, false);
+        words.len() - dropped.len()
+    }
+
+    /// CERTAIN down-only reads for queued frames' picks that sit in PARTIAL
+    /// slots (the early-page hook, design 3.4 / review of 9f713ac finding
+    /// 3): the down role lands into the EXISTING slot (`admit_prefetched`)
+    /// under the current request, as a whole-expert early read would. Words
+    /// whose expert is not a partial entry are skipped.
+    pub fn prefetch_down_words(&mut self, words: &[u32]) {
+        let _ = self.prefetch_words_core(words, &[], true, false, false, false, true);
     }
 
     /// `prefetch_words_full`, with an optional restore stamp per word
-    /// (`stamps` empty, or one per word: `PfJob::restore`). Returns the words
-    /// DROPPED for want of a free staging set (the delta restore re-queues them).
-    fn prefetch_words_core(&mut self, words: &[u32], stamps: &[u64], certain: bool, stage: bool, prefill: bool) -> Vec<u32> {
+    /// (`stamps` empty, or one per word: `PfJob::restore`) and the LIKELY
+    /// class (`likely`). Returns the words DROPPED for want of a free staging
+    /// set (the delta restore re-queues them; a LIKELY drop is `nursery_drops`).
+    fn prefetch_words_core(&mut self, words: &[u32], stamps: &[u64], certain: bool, stage: bool, prefill: bool, likely: bool, down_only: bool) -> Vec<u32> {
         let mut dropped_words = Vec::new();
         if words.is_empty() || self.pool.is_none() {
             return dropped_words;
         }
+        let likely = likely && !certain && self.pool.as_ref().is_some_and(|p| p.nursery_target > 0);
         // Mode-aware eviction: a prefill request's own early-page / park reads
         // land PREFILL-class even with staging off (they used to land
         // decode-class and search the global minimum = prefill's own pages).
@@ -4235,14 +5235,23 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let urgency = knobs::route_urgency();
-                    let Some(PfJob { layer, e, set, certain, stage, own_prefill, prefill, restore, t_hint }) = queue_r.pop_mode(urgency) else { break };
+                    let Some(PfJob { layer, e, set, certain, stage, own_prefill, prefill, restore, likely, roles, t_hint }) = queue_r.pop_mode(urgency) else { break };
                     let ev_on = super::evtrace::enabled();
                     let ev_t_pop = if ev_on { super::evtrace::now() } else { f64::NAN };
                     let mut ev_yield_ns = 0u64;
-                    let mut done = PfFinish { q: &queue_r, certain, spec_key: (urgency && !certain).then_some((layer, e)) };
+                    let mut done = PfFinish { q: &queue_r, certain, likely, spec_key: (urgency && !certain).then_some((layer, e)) };
+                    // A LIKELY job never yields (design 3.2: it pops regardless
+                    // of running certain reads; its chunks may pause instead),
+                    // but a promotion that landed after its pop still turns it
+                    // certain here, like a yielding speculative job's.
+                    if likely && !certain && queue_r.is_urgent(layer, e) {
+                        queue_r.reclassify_certain(true);
+                        done.certain = true;
+                        done.likely = false;
+                    }
                     // Urgency routing: a speculative read goes to the OTHER
                     // drive from demand reads, so it neither yields nor chunks.
-                    if !certain && !urgency {
+                    if !certain && !likely && !urgency {
                         // Yield the drives to demand misses (bounded: a hint that
                         // waits longer than a layer is late anyway) -- unless a
                         // request needs this very expert, in which case it IS the
@@ -4256,7 +5265,7 @@ impl ExpertShard {
                         }
                         ev_yield_ns = t.elapsed().as_nanos() as u64;
                         if queue_r.is_urgent(layer, e) {
-                            queue_r.reclassify_certain();
+                            queue_r.reclassify_certain(false);
                             done.certain = true;
                         }
                     }
@@ -4275,8 +5284,13 @@ impl ExpertShard {
                     let queue_ns = (t_read - t_hint).as_nanos() as u64;
                     // A job still speculative at read start reads in chunks and
                     // yields to urgent reads (io_throttle); certain ones do not.
+                    // A LIKELY job reads in chunks too (an isolated chunked wall
+                    // = a certain wall, design 3.2) and its chunks pause for
+                    // CERTAIN reads only, under `knobs::likely_pause_for_certain`
+                    // (off: unchunked -- nothing to pause for); never for
+                    // speculative ones (`PAUSE_TOKEN_LIKELY`).
                     // Under urgency routing: certain -> the mirror, speculative
-                    // -> the primary, and neither is throttled; a PREFILL
+                    // and LIKELY -> the primary, and none is throttled; a PREFILL
                     // chunk's own reads (`own_prefill`, staged or not) are
                     // striped across both drives like its demand reads
                     // (`knobs::prefill_route_split`).
@@ -4285,14 +5299,16 @@ impl ExpertShard {
                         (true, true, false) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
                         (true, false, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
                     };
-                    v4flash_core::io_throttle::set_background((!done.certain && !urgency).then_some(((layer as u64) << 16) | e as u64));
-                    let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route);
+                    let tok = pause_token(layer, e, done.likely);
+                    let chunked = !done.certain && !urgency && (!done.likely || knobs::likely_pause_for_certain());
+                    v4flash_core::io_throttle::set_background(chunked.then_some(tok));
+                    let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route, roles);
                     v4flash_core::io_throttle::set_background(None);
                     let read_ns = t_read.elapsed().as_nanos() as u64;
                     let mut ev = [f64::NAN; 18];
                     if ev_on {
                         let roles = EV_ROLES.with(|c| c.replace([f64::NAN; 6]));
-                        let pause = EV_PAUSE.lock().unwrap().remove(&(((layer as u64) << 16) | e as u64)).unwrap_or(0);
+                        let pause = EV_PAUSE.lock().unwrap().remove(&tok).unwrap_or(0);
                         ev[..11].copy_from_slice(&[
                             super::evtrace::inst_to_raw(t_hint), ev_t_pop, ev_t_read, super::evtrace::now(),
                             ev_yield_ns as f64, pause as f64, f64::from(u8::from(certain)), f64::from(u8::from(done.certain)),
@@ -4301,9 +5317,11 @@ impl ExpertShard {
                         ev[11..17].copy_from_slice(&roles);
                         ev[17] = route.code();
                     }
+                    // Still LIKELY at the end (not made certain): lands in the nursery.
+                    let likely_done = done.likely;
                     drop(done);
                     let msg = match r {
-                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, prefill, restore, offs, coalesced, queue_ns, read_ns, ev }),
+                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, prefill, restore, likely: likely_done, roles, offs, coalesced, queue_ns, read_ns, ev }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
                     };
                     if tx_done.send(msg).is_err() {
@@ -4313,18 +5331,26 @@ impl ExpertShard {
             }).expect("spawn b2-prefetch"));
             }
             let n = stages.len();
-            self.prefetch = Some(B2Prefetch { queue, rx_done, readers, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, promoted: 0, queue_ns: 0, read_ns: 0, n_read: 0 });
-            eprintln!("expertd: look-ahead prefetch ON ({n} staging sets, {n_par} readers)");
+            // The reserved LIKELY pair (if any) is the LAST sets (`load`).
+            let n_general = if self.pool.as_ref().is_some_and(|p| p.nursery_target > 0) { n.saturating_sub(B2_LIKELY_SETS).max(1) } else { n };
+            self.prefetch = Some(B2Prefetch {
+                queue, rx_done, readers, stages, free: (0..n_general).collect(), free_likely: (n_general..n).collect(), n_general,
+                pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, promoted: 0, queue_ns: 0, read_ns: 0, n_read: 0,
+            });
+            eprintln!("expertd: look-ahead prefetch ON ({n_general} staging sets + {} reserved for LIKELY reads, {n_par} readers)", n - n_general);
         }
-        let pool = self.pool.as_ref().unwrap();
+        let pool = self.pool.as_mut().unwrap();
         let pf = self.prefetch.as_mut().unwrap();
+        let reserve = b2_prefetch_reserve();
         for (i, &w) in words.iter().enumerate() {
             let restore = stamps.get(i).copied().unwrap_or(0);
             let key = ((w >> 16) as u32, (w & 0xFFFF) as u32);
             if key.0 as usize >= self.layers.len() || key.1 >= N_EXPERT || self.layers[key.0 as usize].is_none() {
                 continue;
             }
-            if pool.slot_of.contains_key(&key) {
+            // A down-only read is for a PARTIAL entry (resident, down pending);
+            // any other read is for a key not resident at all.
+            if down_only != pool.is_partial(key.0, key.1) || (!down_only && pool.slot_of.contains_key(&key)) {
                 continue;
             }
             if pf.pending.contains(&key) {
@@ -4338,20 +5364,23 @@ impl ExpertShard {
             }
             // Keep sets free for certain words: a speculative word that would
             // take one of the last reserved sets is dropped (it is retried by
-            // whoever wants it next); a certain word may use any set.
-            if !certain && pf.free.len() <= 2 * b2_prefetch_reserve() {
+            // whoever wants it next); a certain word may use any set; a LIKELY
+            // word takes its reserved pair first (`pick_set`).
+            let Some(set) = pick_set(&mut pf.free, &mut pf.free_likely, certain, likely, reserve) else {
                 pf.dropped += 1;
-                dropped_words.push(w);
-                continue;
-            }
-            let Some(set) = pf.free.pop() else {
-                pf.dropped += 1;
+                if likely {
+                    pool.nc.drops += 1;
+                }
                 dropped_words.push(w);
                 continue;
             };
             pf.pending.insert(key);
             pf.hinted += 1;
-            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, own_prefill, prefill, restore, t_hint: std::time::Instant::now() });
+            // A LIKELY read fetches gate/up only under `likely_gateup_only`
+            // (design 3.4: a PARTIAL nursery entry, 2/3 of the bytes); a
+            // down-only read completes a partial entry.
+            let roles = if down_only { ROLE_DOWN } else if likely && knobs::likely_gateup_only() { ROLES_GATEUP } else { ROLES_ALL };
+            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, own_prefill, prefill, restore, likely, roles, t_hint: std::time::Instant::now() });
         }
         dropped_words
     }
@@ -4362,7 +5391,8 @@ impl ExpertShard {
     /// entry decode already paged back is skipped. Called per request.
     pub fn pump_restore(&mut self) {
         // Throttle: only while more than half the staging sets are free.
-        if self.prefetch.as_ref().is_some_and(|pf| pf.free.len() * 2 <= pf.stages.len()) {
+        // The GENERAL sets only: the reserved LIKELY pair is not the pump's.
+        if self.prefetch.as_ref().is_some_and(|pf| pf.free.len() * 2 <= pf.n_general) {
             return;
         }
         let pending_of = |pf: &Option<B2Prefetch>, k: &(u32, u32)| pf.as_ref().is_some_and(|pf| pf.pending.contains(k));
@@ -4387,7 +5417,7 @@ impl ExpertShard {
         }
         let words: Vec<u32> = batch.iter().map(|&(l, e, _)| (l << 16) | e).collect();
         let stamps: Vec<u64> = batch.iter().map(|&(_, _, t)| t).collect();
-        let dropped = self.prefetch_words_core(&words, &stamps, false, false, false);
+        let dropped = self.prefetch_words_core(&words, &stamps, false, false, false, false, false);
         let pool = self.pool.as_mut().expect("checked above");
         for ent in &batch {
             if !dropped.contains(&((ent.0 << 16) | ent.1)) {
@@ -4466,7 +5496,8 @@ impl ExpertShard {
         // `b2_read` for a background read the compute thread just handled.
         #[allow(clippy::too_many_arguments)]
         let ev_read = |d: &PfDone, slot: f64, victim: Option<(u32, u32)>, t_recv: f64, t_land0: f64, wanted: bool, blocked: bool, scan_ns: f64, repack_ns: f64, already: bool| {
-            let src = if d.ev[6] == 1.0 { 1.0 } else if d.ev[7] == 1.0 { 2.0 } else { 3.0 };
+            // `src`: 1 certain at pop, 2 made certain before the read, 4 LIKELY, 3 speculative.
+            let src = if d.ev[6] == 1.0 { 1.0 } else if d.ev[7] == 1.0 { 2.0 } else if d.likely { 4.0 } else { 3.0 };
             let (vl, ve) = victim.map_or((f64::NAN, f64::NAN), |(l, e)| (f64::from(l), f64::from(e)));
             let mut v = vec![
                 src, ev_cur_seq(), f64::from(d.layer), f64::from(d.e), slot, vl, ve, d.set as f64,
@@ -4520,7 +5551,7 @@ impl ExpertShard {
                     pool.me.restore_inflight.remove(&(layer, e));
                     pf.pending.remove(&(layer, e));
                     pf.queue.clear_urgent(layer, e);
-                    pf.free.push(set);
+                    pf.release_set(set);
                     continue;
                 }
                 Err(_) => break,
@@ -4531,16 +5562,82 @@ impl ExpertShard {
             pool.me.restore_inflight.remove(&key);
             pf.pending.remove(&key);
             pf.queue.clear_urgent(d.layer, d.e);
+            // A DOWN-ONLY read (`prefetch_down_words`) lands into the EXISTING
+            // partial slot and completes it; stale if the slot was recycled or
+            // completed meanwhile.
+            if d.roles == ROLE_DOWN {
+                if let Some(&sl) = pool.slot_of.get(&key) {
+                    if pool.partial[sl as usize] {
+                        let ev_t_repack = std::time::Instant::now();
+                        let landed: eyre::Result<()> = match (repack, repack_stream) {
+                            (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, sl, &pf.stages[d.set], &d.offs, d.coalesced, ROLE_DOWN).map(|_| ()),
+                            _ => r.down.buffer.slice_view_mut(sl as usize * bpe[2], bpe[2]).copy_from_host(&pf.stages[d.set][2].as_slice()[..bpe[2]]),
+                        };
+                        if let Err(err) = landed {
+                            pf.release_set(d.set);
+                            return Err(err);
+                        }
+                        pool.complete(d.layer, d.e);
+                        pf.admitted += 1;
+                        if ev_on {
+                            ev_read(&d, f64::from(sl), None, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this, 0.0, ev_t_repack.elapsed().as_nanos() as f64, false);
+                        }
+                    }
+                }
+                pf.release_set(d.set);
+                continue;
+            }
             if pool.slot_of.contains_key(&key) {
                 if ev_on {
                     ev_read(&d, f64::NAN, None, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this, f64::NAN, f64::NAN, true);
                 }
-                pf.free.push(d.set);
+                pf.release_set(d.set);
                 continue;
             }
-            let Some(l) = self.layers.get(d.layer as usize).and_then(|l| l.as_ref()) else { pf.free.push(d.set); continue };
+            let Some(l) = self.layers.get(d.layer as usize).and_then(|l| l.as_ref()) else { pf.release_set(d.set); continue };
             let region = (l.base_slot as u32, l.base_slot as u32 + l.ids.len() as u32);
             let ev_t_scan = std::time::Instant::now();
+            // NURSERY LANDING (design 3.2): a LIKELY read lands in a nursery
+            // slot -- free first, then an unused entry, then the oldest, never
+            // one the pass being served wants (`want`, `pinned`) -- at this
+            // `ensure` only (in-flight passes read the slots otherwise). The
+            // occupant it recycles was never pinned (`on_evict` false). A hint
+            // the CURRENT pass wants skips the nursery: it is a decode landing
+            // into main below, counted as a land and a (direct) hit.
+            if d.likely && pool.nursery_target > 0 && !ev_wanted_this {
+                let Some(victim) = pool.nursery_victim(cur_layer, want, &pinned, knobs::nursery_lanes()) else {
+                    pool.nc.drops += 1;
+                    pf.release_set(d.set);
+                    continue;
+                };
+                let ev_scan_ns = ev_t_scan.elapsed().as_nanos() as f64;
+                let ev_victim = pool.evict(victim, cur_layer);
+                let ev_t_repack = std::time::Instant::now();
+                let landed: eyre::Result<()> = match (repack, repack_stream) {
+                    (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced, d.roles).map(|_| ()),
+                    _ => (0..3).filter(|&i| role_in(d.roles, i)).try_for_each(|i| {
+                        let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
+                        buf.slice_view_mut(victim as usize * bpe[i], bpe[i]).copy_from_host(&pf.stages[d.set][i].as_slice()[..bpe[i]])
+                    }),
+                };
+                if let Err(err) = landed {
+                    pf.release_set(d.set);
+                    return Err(err);
+                }
+                pool.land_nursery(victim, key);
+                if d.roles != ROLES_ALL {
+                    // Gate/up only: a PARTIAL entry (design 3.4).
+                    pool.mark_partial(victim);
+                    pool.pc.partial_lands += 1;
+                }
+                pool.nursery_refill_free();
+                pf.admitted += 1;
+                pf.release_set(d.set);
+                if ev_on {
+                    ev_read(&d, f64::from(victim), ev_victim, ev_t_recv, ev_t_recv, false, false, ev_scan_ns, ev_t_repack.elapsed().as_nanos() as f64, false);
+                }
+                continue;
+            }
             // Never a hub-pinned victim: a background landing is optional, so
             // with every candidate pinned it is DROPPED (whoever needs the
             // expert demand-reads it; the pin reserve covers that claim). A
@@ -4558,7 +5655,7 @@ impl ExpertShard {
             if restore_stamp != 0 && (!pool.me.on || pool.me.prefill_phase) {
                 pool.me.restore.push_front((d.layer, d.e, restore_stamp));
                 pool.me.rc.requeued += 1;
-                pf.free.push(d.set);
+                pf.release_set(d.set);
                 continue;
             }
             let victim = if restore_stamp != 0 {
@@ -4567,7 +5664,7 @@ impl ExpertShard {
                     None => {
                         pool.me.rc.stopped += 1;
                         pool.me.restore.clear();
-                        pf.free.push(d.set);
+                        pf.release_set(d.set);
                         continue;
                     }
                 }
@@ -4580,7 +5677,7 @@ impl ExpertShard {
                 } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, true, prefill_landing).is_some() {
                     pool.pins.c.no_victim_drops += 1;
                 }
-                pf.free.push(d.set);
+                pf.release_set(d.set);
                 continue;
             };
             let ev_scan_ns = ev_t_scan.elapsed().as_nanos() as f64;
@@ -4590,8 +5687,8 @@ impl ExpertShard {
             let ev_victim = pool.evict(victim, cur_layer);
             let ev_t_repack = std::time::Instant::now();
             let landed: eyre::Result<()> = match (repack, repack_stream) {
-                (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced).map(|_| ()),
-                _ => (0..3).try_for_each(|i| {
+                (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced, d.roles).map(|_| ()),
+                _ => (0..3).filter(|&i| role_in(d.roles, i)).try_for_each(|i| {
                     let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
                     buf.slice_view_mut(victim as usize * bpe[i], bpe[i]).copy_from_host(&pf.stages[d.set][i].as_slice()[..bpe[i]])
                 }),
@@ -4599,7 +5696,7 @@ impl ExpertShard {
             if let Err(err) = landed {
                 // The victim is already detached (free, unowned); give the set
                 // back rather than leak it, then report.
-                pf.free.push(d.set);
+                pf.release_set(d.set);
                 return Err(err);
             }
             if restore_stamp != 0 {
@@ -4607,9 +5704,23 @@ impl ExpertShard {
                 pool.me.rc.landed += 1;
             } else {
                 pool.land(victim, key, d.stage || d.prefill);
+                if d.likely && pool.nursery_target > 0 {
+                    // A wanted hint, landed straight into main: a land and a hit.
+                    pool.nc.lands += 1;
+                    pool.nc.hits += 1;
+                }
+            }
+            if d.roles != ROLES_ALL {
+                // A gate/up-only read (a wanted LIKELY word landed in main): the
+                // pass's `ensure` reads its down role (design 3.4).
+                pool.mark_partial(victim);
+                pool.pc.partial_lands += 1;
+                if d.likely {
+                    pool.pc.partial_promotions += 1;
+                }
             }
             pf.admitted += 1;
-            pf.free.push(d.set);
+            pf.release_set(d.set);
             if ev_on {
                 ev_read(&d, f64::from(victim), ev_victim, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this,
                     ev_scan_ns, ev_t_repack.elapsed().as_nanos() as f64, false);
@@ -4632,6 +5743,32 @@ impl ExpertShard {
             }
         }
         Ok(())
+    }
+
+    /// Two-phase landing (design 3.4): cumulative `[gate/up, down]` wait ns
+    /// over every paged layer, the pool's partial counters, the partial level
+    /// and the passes whose down read was fully EXPOSED (`[exposed, hidden]`)
+    /// (`b2_req`, the stats line). Zero / default unless a two-phase knob is
+    /// on (the walk over the layers is not on the default path).
+    pub fn two_phase_stats(&self) -> ([u64; 2], PartialCounters, u32, [u64; 2]) {
+        if !(knobs::land_two_phase() || knobs::likely_gateup_only()) {
+            return ([0; 2], PartialCounters::default(), 0, [0; 2]);
+        }
+        let mut ns = [0u64; 2];
+        for l in self.layers.iter().flatten() {
+            if let Some(pg) = l.page.as_ref() {
+                ns[0] += pg.two_phase_ns[0];
+                ns[1] += pg.two_phase_ns[1];
+            }
+        }
+        let (pc, n) = self.pool.as_ref().map_or((PartialCounters::default(), 0), |p| (p.pc, p.partial_count()));
+        (ns, pc, n, self.down_overlap)
+    }
+
+    /// A two-phase pass finished its Down phase: was the gate/up half already
+    /// done (`exposed`)?
+    pub fn note_down_overlap(&mut self, exposed: bool) {
+        self.down_overlap[usize::from(!exposed)] += 1;
     }
 
     /// Cumulative `(misses, page_ns)` for `layer`, or `(0, 0)` when the layer is
@@ -4668,13 +5805,15 @@ impl ExpertShard {
     /// queued certain / speculative, free staging sets, pending keys), their
     /// cumulative hinted / admitted / dropped / waited / promoted, and the
     /// pool's resident count.
-    pub fn ev_pf_snapshot(&self) -> [f64; 12] {
-        let mut v = [f64::NAN; 12];
+    pub fn ev_pf_snapshot(&self) -> [f64; 14] {
+        let mut v = [f64::NAN; 14];
         if let Some(p) = self.prefetch.as_ref() {
             v[..4].copy_from_slice(&p.queue.counts());
             v[4] = p.free.len() as f64;
             v[5] = p.pending.len() as f64;
             v[6..11].copy_from_slice(&[p.hinted as f64, p.admitted as f64, p.dropped as f64, p.waited as f64, p.promoted as f64]);
+            // Running / queued LIKELY jobs (`b2_req` `pf_run_likely`, `pf_q_likely`).
+            v[12..14].copy_from_slice(&p.queue.counts_likely());
         }
         v[11] = self.pool.as_ref().map_or(f64::NAN, |p| p.slot_of.len() as f64);
         v
@@ -4718,6 +5857,7 @@ impl ExpertShard {
             l.page = Some(LayerPager {
                 requests: 0, misses: 0, read_ns: 0, h2d_ns: 0,
                 pread_ns: 0, repack_cpu_ns: 0, repack_gpu_ns: 0,
+                two_phase_ns: [0; 2],
             });
         }
         // Shard-wide pool, seeded from what `load` already placed. Slots are
@@ -4751,14 +5891,26 @@ impl ExpertShard {
                 eprintln!("expertd: V41_B2_MODE_EVICT=1 IGNORED: needs V41_B2_PREFILL_STAGE=0, the two-class LRU (V41_B2_SCAN_CLASS != 0) and the global pool (V41_B2_GLOBAL_POOL != 0)");
             }
         }
+        // THE NURSERY (design 3.2; knob `nursery`, 0 = off): carved from the
+        // main band; LIKELY reads land only there, and the LIKELY reader class
+        // is on iff it is. Startup-only: the slots are chosen once.
+        let nursery = pool.carve_nursery(knobs::nursery());
+        if knobs::nursery() > 0 {
+            eprintln!(
+                "expertd: nursery ON: {nursery} slots ({:.2} GB) for the hub's predicted-miss hints (REQ_FLAG_LIKELY; unused after {} same-layer passes; LIKELY reads {} for certain ones)",
+                nursery as f64 * self.info.bytes_per_expert as f64 / 1e9,
+                knobs::nursery_lanes(),
+                if knobs::likely_pause_for_certain() { "pause" } else { "do not pause" },
+            );
+        }
         let floors: usize = pool.floor.iter().map(|&f| f as usize).sum();
         let reserve = b2_pin_reserve(stage);
         eprintln!(
-            "expertd: prefill staging {} ({stage} slots [{}, {n_slots}) of {n_slots}; main band {}; pin budget {} = {n_slots} - {stage} - reserve {reserve} - floors {floors})",
+            "expertd: prefill staging {} ({stage} slots [{}, {n_slots}) of {n_slots}; main band {}; pin budget {} = {n_slots} - {stage} - reserve {reserve} - floors {floors} - nursery {nursery})",
             if stage > 0 { "ON" } else { "OFF" },
             n_slots - stage,
             n_slots - stage,
-            n_slots.saturating_sub(stage + reserve + floors),
+            n_slots.saturating_sub(stage + reserve + floors + nursery),
         );
         self.pool = Some(pool);
         // Do NOT touch the advertised HELLO bitmap. `info.owned` is what the hub's
@@ -4799,29 +5951,118 @@ impl ExpertShard {
         ids: &[i32],
         missed: &mut Vec<u32>,
     ) -> eyre::Result<()> {
-        self.ensure_layer_inner(layer, ids, Some(missed), false)
+        self.ensure_layer_inner(layer, ids, Some(missed), false, EnsurePhase::Full)
     }
 
     /// `prefill_shaped`: this request sweeps a layer's union rather than a
     /// token's six picks, so eviction must stay inside the layer's own region.
     pub fn ensure_layer_phased(&mut self, layer: u32, ids: &[i32], prefill_shaped: bool) -> eyre::Result<()> {
-        self.ensure_layer_inner(layer, ids, None, prefill_shaped)
+        self.ensure_layer_inner(layer, ids, None, prefill_shaped, EnsurePhase::Full)
     }
 
     pub fn ensure_layer(&mut self, layer: u32, ids: &[i32]) -> eyre::Result<()> {
-        self.ensure_layer_inner(layer, ids, None, false)
+        self.ensure_layer_inner(layer, ids, None, false, EnsurePhase::Full)
     }
 
     /// Is `layer` a PAGED layer (catch-all pool)? Hits-first only applies there:
     /// an unpaged layer is fully resident by construction.
-    /// Resident in the paged pool right now (false for unpaged layers).
+    /// Resident in the paged pool right now (false for unpaged layers). A
+    /// NURSERY entry counts (design 3.2): the early-page hook issues no
+    /// certain read for a hinted expert that has landed -- the hit at
+    /// `ensure` promotes it. A PARTIAL slot counts too (3.4): the pass reads
+    /// its down role itself, first thing, rather than an early certain read
+    /// of all three roles into a second slot.
     pub fn is_resident_pool(&self, layer: u32, e: u32) -> bool {
         self.pool.as_ref().is_some_and(|p| p.slot_of.contains_key(&(layer, e)))
+    }
+
+    /// Resident in a PARTIAL slot (gate/up only; design 3.4).
+    pub fn is_partial_pool(&self, layer: u32, e: u32) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.is_partial(layer, e))
     }
 
     /// Prefill staging slots (0 = off / no pool).
     pub fn stage_slots(&self) -> usize {
         self.pool.as_ref().map_or(0, |p| p.stage_slots())
+    }
+
+    /// The nursery is on (`knobs::nursery > 0` at `enable_paging`): LIKELY
+    /// words land there and decode replies to `REQ_FLAG_LIKELY` requests carry
+    /// `RESP_FLAG_NURSERY`.
+    pub fn nursery_on(&self) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.nursery_target > 0)
+    }
+
+    /// `REQ2_FLAG_SOFT`: the SOFT-HELD map of `layer` -- landed in a MAIN
+    /// slot (`residency_words`), not hub-pinned, not a nursery entry: served
+    /// right now without a read, evictable any time. All zero for an
+    /// unpaged layer (its static set is in the residency map) or no pool.
+    pub fn soft_words(&self, layer: u32) -> [u32; proto::RESID_WORDS] {
+        let mut w = [0u32; proto::RESID_WORDS];
+        if !self.layer_is_paged(layer) {
+            return w;
+        }
+        let Some(p) = self.pool.as_ref() else { return w };
+        let row = &p.remap_hosts[layer as usize];
+        for e in 0..N_EXPERT as usize {
+            if landed_whole(row[e], &p.nursery, &p.partial) {
+                w[e / 32] |= 1 << (e % 32);
+            }
+        }
+        // Minus the pinned set: 12 word ops over the layer's pin bitset.
+        let pinned = p.pins.pinned_words(layer);
+        for (x, y) in w.iter_mut().zip(&pinned) {
+            *x &= !y;
+        }
+        w
+    }
+
+    /// The reply's NURSERY block for `layer` (`ShardPool::nursery_words`).
+    pub fn nursery_words(&mut self, layer: u32) -> [u32; proto::NURSERY_WORDS] {
+        match self.pool.as_mut() {
+            Some(p) => p.nursery_words(layer),
+            None => [proto::NURSERY_NONE; proto::NURSERY_WORDS],
+        }
+    }
+
+    /// Cumulative nursery counters and the occupied level (`b2_req`, the stats line).
+    pub fn nursery_counters(&self) -> (NurseryCounters, u32) {
+        self.pool.as_ref().map_or((NurseryCounters::default(), 0), |p| (p.nc, p.nursery_occupied()))
+    }
+
+    /// A frame's LIKELY words (`proto::split_prefetch_words`) at the first
+    /// sight of frame `seq` -- the early-page hook at arrival, else the
+    /// dequeue; the second sight is a no-op. Returns how many were queued.
+    pub fn likely_words_in(&mut self, seq: u32, likely: &[u32]) -> usize {
+        if likely.is_empty() || !self.likely_seen.insert(seq) {
+            return 0;
+        }
+        self.prefetch_words_likely(likely)
+    }
+
+    /// A queued frame `seq` for `layer` with picks `sel` arrived (the
+    /// early-page hook): its picks that are NURSERY entries get no certain
+    /// read, so they must survive until the frame is served -- protect them
+    /// from recycling by other passes' LIKELY landings (review of slices B+C,
+    /// finding 2). Released by `nursery_protect_done`.
+    pub fn note_nursery_protect(&mut self, seq: u32, layer: u32, sel: &[i32]) {
+        let Some(p) = self.pool.as_mut() else { return };
+        if p.nursery_target == 0 {
+            return;
+        }
+        let keys: Vec<(u32, u32)> = sel
+            .iter()
+            .filter(|&&e| (0..N_EXPERT as i32).contains(&e) && p.in_nursery(layer, e as u32))
+            .map(|&e| (layer, e as u32))
+            .collect();
+        p.protect_nursery(seq, &keys);
+    }
+
+    /// Frame `seq` has been served: its nursery entries are fair game again.
+    pub fn nursery_protect_done(&mut self, seq: u32) {
+        if let Some(p) = self.pool.as_mut() {
+            p.unprotect_nursery(seq);
+        }
     }
 
     /// Cumulative prefill-staging counters (zero without a pool).
@@ -4841,13 +6082,16 @@ impl ExpertShard {
     pub fn residency_words(&self, layer: u32) -> [u32; proto::RESID_WORDS] {
         let mut w = [0u32; proto::RESID_WORDS];
         let paged = if self.layer_is_paged(layer) {
-            self.pool.as_ref().and_then(|p| p.remap_hosts.get(layer as usize))
+            self.pool.as_ref().map(|p| (&p.remap_hosts[layer as usize], &p.nursery, &p.partial))
         } else {
             None
         };
         for e in 0..N_EXPERT as usize {
+            // A nursery entry (design 3.2) or a partial slot (3.4) is landed
+            // but masked: the hub's `held` never includes one, and the cache
+            // prior stays hint-blind.
             let here = match paged {
-                Some(r) => r[e] != 0,
+                Some((r, nursery, partial)) => landed_whole(r[e], nursery, partial),
                 None => self.owns(layer, e as i32),
             };
             if here {
@@ -4864,6 +6108,10 @@ impl ExpertShard {
             p.pins = PinBook::off();
         }
         self.early_paged.clear();
+        self.likely_seen.clear();
+        if let Some(p) = self.pool.as_mut() {
+            p.nursery_protect.clear();
+        }
     }
 
     /// The hub asked for pins (`REQ_FLAG_PIN`): turn them on for this
@@ -4878,10 +6126,12 @@ impl ExpertShard {
             let stage = p.stage_slots();
             let floors: usize = p.floor.iter().map(|&f| f as usize).sum();
             let r = b2_pin_reserve(stage);
-            let budget = n.saturating_sub(stage + r + floors) as u32;
+            // Nursery slots are never pinnable (design 3.2): out of the budget.
+            let nursery = p.nursery_target as usize;
+            let budget = n.saturating_sub(stage + r + floors + nursery) as u32;
             p.pins.enable(budget);
             eprintln!(
-                "expertd: pinning ON for this connection: budget {budget} of {n} slots (staging {stage}, reserve {r}, floors {floors}; \
+                "expertd: pinning ON for this connection: budget {budget} of {n} slots (staging {stage}, reserve {r}, floors {floors}, nursery {nursery}; \
                  no-deadlock minimum reserve + staging >= {PIN_RESERVE_MIN}){}",
                 if b2_assert_pinned() { ", V41_B2_ASSERT_PINNED" } else { "" }
             );
@@ -4958,7 +6208,7 @@ impl ExpertShard {
                     }
                 }
                 let row = &p.remap_hosts[layer as usize];
-                p.pins.report(layer, row, p.stage)
+                p.pins.report(layer, row, p.stage, &p.nursery, &p.partial)
             }
         };
         Some((map, [p.pins.epoch, p.pins.pinned, p.pins.budget]))
@@ -4972,9 +6222,18 @@ impl ExpertShard {
         if !self.layer_is_paged(layer) {
             return w;
         }
-        let Some(row) = self.pool.as_ref().and_then(|p| p.remap_hosts.get(layer as usize)) else { return w };
+        let Some(p) = self.pool.as_ref() else { return w };
+        let row = &p.remap_hosts[layer as usize];
         for &e in sel {
-            if (0..N_EXPERT as i32).contains(&e) && row[e as usize] == 0 {
+            if !(0..N_EXPERT as i32).contains(&e) {
+                continue;
+            }
+            // Not landed, or landed PARTIAL (design 3.4: the pass reads its down).
+            let paged = match row[e as usize] {
+                0 => true,
+                r => p.partial[(-r - 1) as usize],
+            };
+            if paged {
                 w[e as usize / 32] |= 1 << (e % 32);
             }
         }
@@ -5019,8 +6278,11 @@ impl ExpertShard {
             return;
         }
         let pool = self.pool.as_ref().expect("layer_is_paged checked the pool");
+        // A PARTIAL slot (design 3.4) is not resident for pass A: its down
+        // role is pending, so pass B (whose `ensure` reads it) takes the pick.
         out.extend(ids.iter().map(|&e| {
-            !(0..N_EXPERT as i32).contains(&e) || pool.slot_of.contains_key(&(layer, e as u32))
+            !(0..N_EXPERT as i32).contains(&e)
+                || pool.slot_of.get(&(layer, e as u32)).is_some_and(|&sl| !pool.partial[sl as usize])
         }));
     }
 
@@ -5037,7 +6299,24 @@ impl ExpertShard {
         Ok(())
     }
 
-    fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool) -> eyre::Result<()> {
+    /// `ensure_layer_phased` under a two-phase landing (design 3.4,
+    /// `EnsurePhase`): `GateUp` lands the misses' gate/up roles and returns
+    /// (the pass launches its gate/up kernel); `Down` lands the wanted
+    /// partial slots' down roles (the pass launches its down kernel after).
+    pub fn ensure_layer_phase(&mut self, layer: u32, ids: &[i32], prefill_shaped: bool, phase: EnsurePhase) -> eyre::Result<()> {
+        self.ensure_layer_inner(layer, ids, None, prefill_shaped, phase)
+    }
+
+    fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool, phase: EnsurePhase) -> eyre::Result<()> {
+        // The Down phase does ONLY the down reads of the wanted partial slots
+        // (review of 9f713ac, finding 2 / 5): no prologue, no serve or
+        // request accounting (the GateUp phase did them), no landings, no
+        // `b2_ensure` record; and nothing at all when no wanted expert is
+        // partial (the no-miss hot path: one scan).
+        let down_phase = phase == EnsurePhase::Down;
+        if down_phase && !self.pool.as_ref().is_some_and(|p| ids.iter().any(|&e| (0..N_EXPERT as i32).contains(&e) && p.is_partial(layer, e as u32))) {
+            return Ok(());
+        }
         let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
         // `evtrace` (`b2_ensure` + one `b2_read` per demand miss): NaN when off.
         let ev_on = super::evtrace::enabled();
@@ -5050,7 +6329,7 @@ impl ExpertShard {
         self.ev_admit = [0; 5];
         // Land completed look-ahead prefetches first (any layer): nothing reads
         // the pool here, and this layer's picks are protected from eviction.
-        if self.prefetch.is_some() {
+        if self.prefetch.is_some() && !down_phase {
             let want_pre: Vec<u32> = ids.iter().filter(|&&e| (0..N_EXPERT as i32).contains(&e)).map(|&e| e as u32).collect();
             self.admit_prefetched(layer, &want_pre)?;
         }
@@ -5123,6 +6402,9 @@ impl ExpertShard {
         }
         let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
         let mut pending: Vec<(u32, u32)> = Vec::new();
+        // PARTIAL slots this pass wants (design 3.4): `(e, slot)` whose down
+        // role is read after the misses (never under `GateUp`).
+        let mut down_pending: Vec<(u32, u32)> = Vec::new();
         // `evtrace`, parallel to `pending`: victim-search ns and the evicted owner.
         let mut ev_miss: Vec<(f64, Option<(u32, u32)>)> = Vec::new();
         let (mut ev_hits, mut ev_scan_ns, mut ev_foreign, mut ev_free) = (0u32, 0f64, 0u32, 0u32);
@@ -5131,10 +6413,37 @@ impl ExpertShard {
         // reports an expert resident that nobody wrote.
         let mut failed: Option<eyre::Report> = None;
         let region = (base as u32, base as u32 + n_region as u32);
+        if !down_phase {
+            pool.note_serve(layer);
+        }
         for &e in &want {
+            if down_phase {
+                // The GateUp phase served this pass: only the partial slots matter.
+                if let Some(&sl) = pool.slot_of.get(&(layer, e)) {
+                    if pool.partial[sl as usize] {
+                        down_pending.push((e, sl));
+                    }
+                }
+                continue;
+            }
             pg.requests += 1;
+            let was_nursery = pool.in_nursery(layer, e);
             if pool.touch_hit(layer, e, scan_class) {
                 ev_hits += 1;
+                if was_nursery {
+                    // The hit promoted a nursery entry (design 3.2): refill the
+                    // nursery with the main pool's victim NOW, before the next
+                    // claim -- the eviction this demand read would have caused.
+                    pool.nursery_refill(region, global, layer, &want, &pinned, prefill_mode);
+                }
+                // A PARTIAL slot (gate/up only, design 3.4): its down role is
+                // read below -- first thing after the misses -- unless this is
+                // the GateUp phase, whose pass only needs gate/up.
+                if phase != EnsurePhase::GateUp && pool.is_partial(layer, e) {
+                    if let Some(&sl) = pool.slot_of.get(&(layer, e)) {
+                        down_pending.push((e, sl));
+                    }
+                }
                 continue;
             }
             pg.misses += 1;
@@ -5177,7 +6486,17 @@ impl ExpertShard {
         let k = knobs::miss_par().min(stages.len()).max(1);
         let ev_t_victims = if ev_on { super::evtrace::now() } else { nan };
         let mut ev_chunks = 0u32;
-        for (ev_ci, chunk) in pending.chunks(k).enumerate() {
+        // TWO-PHASE LANDING (design 3.4): the misses read their gate/up roles
+        // only under `GateUp` (they land PARTIAL), all three otherwise; then
+        // the wanted partial slots read their down role (never under GateUp).
+        // The roles are separate per-role device buffers, so a down landing
+        // never touches bytes a gate/up kernel may be reading.
+        let roles_miss = if phase == EnsurePhase::GateUp { ROLES_GATEUP } else { ROLES_ALL };
+        let work: [(&[(u32, u32)], Roles, bool); 2] = [(&pending, roles_miss, true), (&down_pending, ROLE_DOWN, false)];
+        let mut phase_ns = [0u64; 2];
+        for &(items, roles, is_miss) in &work {
+        let t_phase = std::time::Instant::now();
+        for (ev_ci, chunk) in items.chunks(k).enumerate() {
             if failed.is_some() {
                 break;
             }
@@ -5221,7 +6540,7 @@ impl ExpertShard {
                             (std::slice::from_raw_parts_mut(sp.p[0], sp.n[0]), std::slice::from_raw_parts_mut(sp.p[1], sp.n[1]), std::slice::from_raw_parts_mut(sp.p[2], sp.n[2]))
                         };
                         let t0 = if ev_on { super::evtrace::now() } else { f64::NAN };
-                        let r = Self::read_miss_into(owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route);
+                        let r = Self::read_miss_into(owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route, roles);
                         let mut ev = [f64::NAN; 8];
                         if ev_on {
                             ev[0] = t0;
@@ -5245,10 +6564,10 @@ impl ExpertShard {
                     let ev_t_h = if ev_on { super::evtrace::now() } else { f64::NAN };
                     match (repack, repack_stream) {
                         (Some(rp), Some(rs)) => {
-                            pg.repack_gpu_ns += Self::repack_in_place(rp, rs, r, victim, st, &offs, coalesced)?;
+                            pg.repack_gpu_ns += Self::repack_in_place(rp, rs, r, victim, st, &offs, coalesced, roles)?;
                         }
                         _ => {
-                            for i in 0..3 {
+                            for i in (0..3).filter(|&i| role_in(roles, i)) {
                                 let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
                                 // `st[i]` is over-allocated by 4 blocks of alignment slack
                                 // for the O_DIRECT path, so copy only the expert's bytes.
@@ -5259,10 +6578,20 @@ impl ExpertShard {
                     }
                     let ev_repack_ns = t_h.elapsed().as_nanos() as u64;
                     h2d_ns += ev_repack_ns;
-                    pool.commit(layer, e, victim);
-                    dirty = true;
+                    if is_miss {
+                        pool.commit(layer, e, victim);
+                        if roles != ROLES_ALL {
+                            pool.mark_partial(victim);
+                            pool.pc.demand_partial += 1;
+                        }
+                        dirty = true;
+                    } else {
+                        // The down role of a partial slot: the remap already
+                        // points at it; nothing to upload.
+                        pool.complete(layer, e);
+                    }
                     if ev_on {
-                        let (scan, vic) = ev_miss.get(ev_ci * k + j).copied().unwrap_or((f64::NAN, None));
+                        let (scan, vic) = if is_miss { ev_miss.get(ev_ci * k + j).copied().unwrap_or((f64::NAN, None)) } else { (f64::NAN, None) };
                         let (vl, ve) = vic.map_or((f64::NAN, f64::NAN), |(l, e)| (f64::from(l), f64::from(e)));
                         let mut v = vec![
                             0.0, ev_cur_seq(), f64::from(layer), f64::from(e), f64::from(victim), vl, ve, j as f64,
@@ -5288,8 +6617,16 @@ impl ExpertShard {
                 failed = Some(err);
             }
         }
+        if !items.is_empty() {
+            phase_ns[usize::from(roles == ROLE_DOWN)] += t_phase.elapsed().as_nanos() as u64;
+        }
+        }
         pg.read_ns += read_ns;
         pg.h2d_ns += h2d_ns;
+        // The pass's wait on each phase (`b2_req` `gateup_wait_us` / `down_wait_us`):
+        // under `GateUp` the gate/up reads, under `Down` / `Full` the down reads.
+        pg.two_phase_ns[0] += phase_ns[0];
+        pg.two_phase_ns[1] += phase_ns[1];
         if let Some(err) = failed {
             // Roll back every claim whose data never landed: its remap entry is
             // written only after the read + upload succeed, so an entry that
@@ -5313,7 +6650,7 @@ impl ExpertShard {
             l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
             pool.dirty[layer as usize] = false;
         }
-        if ev_on {
+        if ev_on && !down_phase {
             let n_miss = pending.len();
             super::evtrace::emit(&super::evtrace_kinds::B2_ENSURE, &[
                 ev_cur_seq(), f64::from(layer), ids.len() as f64, want.len() as f64, f64::from(ev_hits), n_miss as f64,
@@ -5347,6 +6684,7 @@ impl ExpertShard {
         b1: &mut [u8],
         b2: &mut [u8],
         route: v4flash_core::hf_v41::ExpertRoute,
+        roles: Roles,
     ) -> eyre::Result<([Option<(usize, usize, u32, u32)>; 3], bool)> {
         {
             let names = [
@@ -5380,8 +6718,9 @@ impl ExpertShard {
             // O_DIRECT, or when the run-time contiguity check fails.
             let mut coalesced = false;
             // The coalesced span read is primary-only: never for a read routed
-            // to the mirror (split and primary-only reads may coalesce).
-            if gpu_repack && direct && b2_coalesce() && route.code() != 1.0 {
+            // to the mirror (split and primary-only reads may coalesce), and
+            // only for all three roles (a partial read is per role).
+            if gpu_repack && direct && b2_coalesce() && route.code() != 1.0 && roles == ROLES_ALL {
                 let (dw, ds) = (&mut *b0, &mut *b1);
                 let src0 = WeightSrc::from(owner);
                 // All three ROLE tensors: the run's physical order is derived from
@@ -5437,6 +6776,7 @@ impl ExpertShard {
             if !coalesced {
                 let bufs: [&mut [u8]; 3] = [b0, b1, b2];
                 let mut errs: Vec<String> = Vec::new();
+                let stripes = if roles == ROLES_ALL { 1 } else { knobs::role_stripes() };
                 // The caller's background mark (io_throttle) must reach the role
                 // threads: thread-locals do not cross `spawn`.
                 let bg = v4flash_core::io_throttle::background();
@@ -5448,6 +6788,7 @@ impl ExpertShard {
                     let h: Vec<_> = bufs
                         .into_iter()
                         .enumerate()
+                        .filter(|(i, _)| role_in(roles, *i))
                         .map(|(i, buf): (usize, &mut [u8])| {
                             let name = names[i].clone();
                             let src = WeightSrc::from(owner);
@@ -5463,8 +6804,11 @@ impl ExpertShard {
                                 if gpu_repack && direct {
                                     // Zero-copy: O_DIRECT lands each region at its
                                     // own 4096-residue, straight into GTT staging.
+                                    // Fewer than three roles: each role striped
+                                    // (`knobs::role_stripes`) so it lands at ~the
+                                    // whole expert's bandwidth (design 3.4).
                                     if let Some(o) = src
-                                        .read_expert_hf_layout_direct_routed(t, e as usize, buf, route)
+                                        .read_expert_hf_layout_direct_routed_striped(t, e as usize, buf, route, stripes)
                                         .map_err(|err| format!("{name}: {err}"))?
                                     {
                                         return Ok(Some(o));
@@ -5488,7 +6832,9 @@ impl ExpertShard {
                             })
                         })
                         .collect();
-                    for (i, j) in h.into_iter().enumerate() {
+                    // Joined in role order over the roles READ (the handle list
+                    // skips the others).
+                    for (i, j) in (0..3).filter(|&i| role_in(roles, i)).zip(h) {
                         match j.join() {
                             Ok(Ok(o)) => offs[i] = o,
                             Ok(Err(msg)) => errs.push(msg),
@@ -5528,6 +6874,9 @@ impl ExpertShard {
         // Coalesced staging: packed bytes for EVERY role live in `stage[0]` and
         // scales in `stage[1]`, so the two bases differ from the per-role case.
         coalesced: bool,
+        // The roles to permute (`Roles`): a two-phase landing repacks gate/up,
+        // then down, each into its own per-role buffer region of the slot.
+        roles: Roles,
     ) -> eyre::Result<u64> {
         // (rows, blocks per row) per role: gate/up are [N_FF_EXP, N_EMBD/32],
         // down is [N_EMBD, N_FF_EXP/32]. Same block count, different shape —
@@ -5542,7 +6891,7 @@ impl ExpertShard {
             routed.up_bytes_per_expert,
             routed.down_bytes_per_expert,
         ];
-        for i in 0..3 {
+        for i in (0..3).filter(|&i| role_in(roles, i)) {
             let (rows, nb) = geom[i];
             debug_assert_eq!(rows as usize * nb as usize * 17, bpe[i]);
             let dst = match i {
@@ -5679,6 +7028,14 @@ struct PassIo {
 }
 
 /// Per-request kernel geometry shared by the by-expert passes.
+/// What `batched_pass_gateup` hands `batched_pass_down`: the work-item count
+/// (or its device-side upper bound) the down kernel's grid takes.
+#[derive(Clone, Copy, Debug)]
+pub struct PassMid {
+    pub n_wi: u32,
+    pub devcount: bool,
+}
+
 struct PassGeo {
     b: usize,
     gbound: u32,
@@ -5747,6 +7104,10 @@ pub struct MoeExecutor {
     /// paging caught only 40% of non-resident experts because the next frame
     /// had usually not arrived at the single poll point).
     ev_done: v4flash_hip::Event,
+    /// Two-phase landing (design 3.4): recorded after the gate/up half's
+    /// q8k; queried after the Down phase -- complete means the down read was
+    /// fully EXPOSED (the kernels had finished), else hidden under them.
+    ev_gateup: v4flash_hip::Event,
     /// The last handoff of the engine's event pool to Tier B (`dev_epoch`).
     dev_epoch_t: Instant,
     // --- The short batched chain (`knobs::fast_chain`) ---------------------
@@ -5834,6 +7195,7 @@ impl MoeExecutor {
             warm_out: DeviceBuffer::new(id, BLOCK_Q8_K_BYTES)?,
             ev: None,
             ev_done: v4flash_hip::Event::new_no_timing()?,
+            ev_gateup: v4flash_hip::Event::new_no_timing()?,
             dev_epoch_t: Instant::now(),
             fast_k: crate::b2_fast_chain::B2FastChain::for_arch(&arch)?,
             fast_rows,
@@ -6216,7 +7578,15 @@ impl MoeExecutor {
                     shard.park_words.clear();
                     r?;
                 }
-                shard.ensure_layer_phased(layer, sel, b > 16)?;
+                // TWO-PHASE LANDING (`knobs::land_two_phase`, design 3.4): the
+                // misses land their gate/up roles, pass B's gate/up kernels are
+                // queued, then their down roles are read WHILE those kernels
+                // run, and the down kernel is queued after. The roles are
+                // separate device buffers and the down repack goes through the
+                // repack stream + a host sync before the down kernel is
+                // queued, so nothing the gate/up kernels read is being written.
+                let two_phase = knobs::land_two_phase();
+                shard.ensure_layer_phase(layer, sel, b > 16, if two_phase { EnsurePhase::GateUp } else { EnsurePhase::Full })?;
                 for (i, &e) in sel.iter().enumerate() {
                     let live = e != NO_PICK && !self.resident_scratch[i];
                     self.sel_host[i] = if live { e } else { SENTINEL_EXPERT };
@@ -6227,9 +7597,24 @@ impl MoeExecutor {
                 } else {
                     self.upload_sel(1, b)?;
                 }
-                let (gate, up, down, remap) = shard.layer_views(layer)?;
-                let (n_wi, _) = self.batched_pass(&gate, &up, &down, remap, &geo, false, fast, &io)?;
-                timing.n_work_items += n_wi;
+                if two_phase {
+                    let mid = {
+                        let (gate, up, _, remap) = shard.layer_views(layer)?;
+                        self.batched_pass_gateup(&gate, &up, remap, &geo, false, fast, &io)?
+                    };
+                    // The overlap probe: complete after the Down phase = the
+                    // down read was fully exposed (finding 6 of the review).
+                    self.ev_gateup.record(&self.engine.compute)?;
+                    shard.ensure_layer_phase(layer, sel, b > 16, EnsurePhase::Down)?;
+                    shard.note_down_overlap(self.ev_gateup.query().unwrap_or(true));
+                    let (_, _, down, remap) = shard.layer_views(layer)?;
+                    let (n_wi, _) = self.batched_pass_down(&down, remap, &geo, false, fast, &mid)?;
+                    timing.n_work_items += n_wi;
+                } else {
+                    let (gate, up, down, remap) = shard.layer_views(layer)?;
+                    let (n_wi, _) = self.batched_pass(&gate, &up, &down, remap, &geo, false, fast, &io)?;
+                    timing.n_work_items += n_wi;
+                }
                 // Reduce over the FULL pick list: every real slot, whichever pass
                 // wrote its partial.
                 for (i, &e) in sel.iter().enumerate() {
@@ -6241,6 +7626,7 @@ impl MoeExecutor {
                 } else {
                     self.upload_sel(2, b)?;
                 }
+                let (_, _, _, remap) = shard.layer_views(layer)?;
                 self.reduce_io(remap, b, fast, &io)?;
             } else {
                 let (_, _, _, remap) = shard.layer_views(layer)?;
@@ -6378,6 +7764,7 @@ impl MoeExecutor {
     /// its own slots beside the first's). Returns (work items, diagnostic-done):
     /// under `V41_B2_DECODE_DOWN` the decode down kernel writes `ffn_moe` directly
     /// and there is nothing to reduce.
+    #[allow(clippy::too_many_arguments)]
     fn batched_pass(
         &mut self,
         gate: &DeviceBuffer<u8>,
@@ -6389,6 +7776,26 @@ impl MoeExecutor {
         fast: bool,
         io: &PassIo,
     ) -> eyre::Result<(u32, bool)> {
+        let mid = self.batched_pass_gateup(gate, up, remap, g, first, fast, io)?;
+        self.batched_pass_down(down, remap, g, first, fast, &mid)
+    }
+
+    /// The first half of `batched_pass` (group build -> work items -> gate/up
+    /// -> q8k(mid)); the down half follows with `batched_pass_down`. Split so
+    /// a two-phase landing (design 3.4) can read the misses' down roles
+    /// between the two.
+    #[allow(clippy::too_many_arguments)]
+    fn batched_pass_gateup(
+        &mut self,
+        gate: &DeviceBuffer<u8>,
+        up: &DeviceBuffer<u8>,
+        remap: &DeviceBuffer<i32>,
+        g: &PassGeo,
+        first: bool,
+        fast: bool,
+        io: &PassIo,
+    ) -> eyre::Result<PassMid> {
+        let _ = first;
         let nu = N_EXPERT_USED;
         let b = g.b;
         let bu = b as u32;
@@ -6448,6 +7855,30 @@ impl MoeExecutor {
         }
         let mut midq_v = self.d_midq_cat.slice_view_mut(0, b * nu * MIDQ_BYTES_PER_SLOT);
         e.q8k.launch(s, &mut midq_v, &mid_v, BLOCKS_Q8K_DOWN_IN * nu as u32 * bu)?;
+        Ok(PassMid { n_wi, devcount })
+    }
+
+    /// The down half of `batched_pass`: the decode-down diagnostic, the
+    /// partials zeroing (first pass, old chain) and the by-expert down kernel
+    /// over the `mid` the gate/up half produced.
+    fn batched_pass_down(
+        &mut self,
+        down: &DeviceBuffer<u8>,
+        remap: &DeviceBuffer<i32>,
+        g: &PassGeo,
+        first: bool,
+        fast: bool,
+        mid: &PassMid,
+    ) -> eyre::Result<(u32, bool)> {
+        let nu = N_EXPERT_USED;
+        let b = g.b;
+        let bu = b as u32;
+        let e = &self.engine;
+        let s = &e.compute;
+        let max_per_expert = self.rows as u32;
+        let (n_wi, devcount) = (mid.n_wi, mid.devcount);
+        let n_wi_dev: Option<&DeviceBuffer<i32>> = if devcount { Some(&self.n_work_items) } else { None };
+        let midq_v = self.d_midq_cat.slice_view(0, b * nu * MIDQ_BYTES_PER_SLOT);
         // `V41_B2_DECODE_DOWN=1`: run the DECODE down kernel per token over the
         // batched midq (same derivation the decode branch uses: sel/midq/out
         // sliced by token, NO clobbering of d_selected). Isolates whether the
@@ -6978,7 +8409,7 @@ pub fn serve_connection(
             let ev_t_dequeue = if ev_on { super::evtrace::now() } else { nan };
             let (ev_t_hdr, ev_t_frame) = if ev_on { (super::evtrace::inst_to_raw(t_first), t2 as f64) } else { (nan, nan) };
             let ev_idle_us = t_prev_ready.map_or(nan, |p| t_start.saturating_duration_since(p).as_secs_f64() * 1e6);
-            let ev_pf0 = if ev_on { shard.ev_pf_snapshot() } else { [nan; 12] };
+            let ev_pf0 = if ev_on { shard.ev_pf_snapshot() } else { [nan; 14] };
             let mut ev_promised = nan;
             if ev_on {
                 EV_CUR_SEQ.store(u64::from(hdr.seq), std::sync::atomic::Ordering::Relaxed);
@@ -7117,22 +8548,35 @@ pub fn serve_connection(
                 shard.pump_restore();
                 let ev_pin0 = shard.pin_counters();
                 let ev_sc0 = shard.stage_counters();
+                // LIKELY words (`REQ_FLAG_LIKELY`, design 3.2) are split off
+                // the PREFETCH block: no pin grant, no admission, applied at
+                // arrival by the early-page hook (`likely_words_in` is a no-op
+                // the second time) -- here only when the frame was never
+                // pulled while another request ran.
+                let (likely_a, plain_a) = proto::split_prefetch_words(req.flags, req.prefetch);
+                let (likely_b, plain_b) = match reqb.as_ref() {
+                    Some(rb) => proto::split_prefetch_words(rb.flags, rb.prefetch),
+                    None => (Vec::new(), Vec::new()),
+                };
                 // A prefill-shaped request's prefetch words are layer-major group
                 // prefetch, never pin grants (they would pin prefill experts).
-                shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { req.prefetch });
+                shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { &plain_a });
                 if let Some(rb) = reqb.as_ref() {
-                    shard.pin_apply_words(rb.release, if rb.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { rb.prefetch });
+                    shard.pin_apply_words(rb.release, if rb.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { &plain_b });
                 }
                 if let Some(rb) = reqb.as_ref() {
                     if !rb.hint_admit.is_empty() {
                         shard.hint_evict_first(rb.hint_admit);
                     }
-                    if !rb.prefetch.is_empty() {
+                    if !plain_b.is_empty() {
                         if rb.b > proto::PIN_DECODE_MAX_ROWS {
-                            shard.prefetch_words_prefill(rb.prefetch);
+                            shard.prefetch_words_prefill(&plain_b);
                         } else {
-                            shard.prefetch_words(rb.prefetch);
+                            shard.prefetch_words(&plain_b);
                         }
+                    }
+                    if let Some((hb, ..)) = partner.as_ref() {
+                        shard.likely_words_in(hb.seq, &likely_b);
                     }
                 }
                 // Paging THIS request did on our own NVMe. `run_path` calls
@@ -7144,13 +8588,16 @@ pub fn serve_connection(
                 if !req.hint_admit.is_empty() {
                     shard.hint_evict_first(req.hint_admit);
                 }
-                if !req.prefetch.is_empty() {
+                if !plain_a.is_empty() {
                     if req.b > proto::PIN_DECODE_MAX_ROWS {
-                        shard.prefetch_words_prefill(req.prefetch);
+                        shard.prefetch_words_prefill(&plain_a);
                     } else {
-                        shard.prefetch_words(req.prefetch);
+                        shard.prefetch_words(&plain_a);
                     }
                 }
+                shard.likely_words_in(hdr.seq, &likely_a);
+                let ev_nc0 = shard.nursery_counters().0;
+                let ev_tp0 = shard.two_phase_stats();
                 let ev_t_hints = if ev_on { super::evtrace::now() } else { nan };
                 let ev_pd0 = shard.layer_page_detail(req.layer);
                 let ev_pw0 = shard.prefetch_wait_ns;
@@ -7207,12 +8654,19 @@ pub fn serve_connection(
                             return;
                         }
                         shard.note_early_paged(hdr.seq, nreq.layer, nreq.sel);
-                        let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
-                        for &e in nreq.sel {
-                            if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
-                                let w = (nreq.layer << 16) | e as u32;
-                                if !words.contains(&w) { words.push(w); }
-                            }
+                        // Its nursery-resident picks get no certain read below:
+                        // keep them from being recycled until it is served.
+                        shard.note_nursery_protect(hdr.seq, nreq.layer, nreq.sel);
+                        // The frame's LIKELY words at ARRIVAL (design 3.2: the
+                        // b2q tail), queued behind its own certain reads.
+                        let (likely, _) = proto::split_prefetch_words(nreq.flags, nreq.prefetch);
+                        // Its non-resident picks: certain whole reads; its picks in
+                        // PARTIAL slots: certain down-only reads (design 3.4).
+                        let (words, down_words) = early_page_plan(nreq.layer, nreq.sel, |e| shard.is_resident_pool(nreq.layer, e), |e| shard.is_partial_pool(nreq.layer, e));
+                        if !down_words.is_empty() {
+                            shard.pinned = cur_pins.clone();
+                            shard.prefetch_down_words(&down_words);
+                            shard.pinned.clear();
                         }
                         if !words.is_empty() {
                             shard.pinned = cur_pins.clone();
@@ -7222,6 +8676,7 @@ pub fn serve_connection(
                             shard.prefetch_words_cls(&words, true, pf_class);
                             shard.pinned.clear();
                         }
+                        shard.likely_words_in(hdr.seq, &likely);
                     };
                     let pull = |shard: &mut ExpertShard, pending: &mut std::collections::VecDeque<Inbound>| {
                         while let Ok(m) = rx_in_ref.try_recv() {
@@ -7413,10 +8868,12 @@ pub fn serve_connection(
                 // what was missing when ITS frame arrived, not its lane mate's).
                 let mut paged = timing.paged;
                 let mut paged_b = timing.paged;
+                shard.nursery_protect_done(hdr.seq);
                 if req.flags & proto::REQ_FLAG_PIN != 0 {
                     or_words(&mut paged, &shard.take_early_paged(hdr.seq));
                 }
                 if let (Some(rb), Some((hb, ..))) = (reqb.as_ref(), partner.as_ref()) {
+                    shard.nursery_protect_done(hb.seq);
                     if rb.flags & proto::REQ_FLAG_PIN != 0 {
                         or_words(&mut paged_b, &shard.take_early_paged(hb.seq));
                     }
@@ -7434,6 +8891,15 @@ pub fn serve_connection(
                         proto::append_residency(&mut resp, &shard.residency_words(req.layer));
                     }
                     None => {}
+                }
+                // NURSERY block (design 3.2): on every reply to a `REQ_FLAG_LIKELY`
+                // request while the nursery is on, words or none (the capability).
+                if req.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
+                    proto::append_nursery(&mut resp, &shard.nursery_words(req.layer));
+                }
+                // SOFT-HELD map: on every decode reply the hub asked for it.
+                if req.flags2 & proto::REQ2_FLAG_SOFT != 0 && req.flags & proto::REQ_FLAG_DECODE != 0 {
+                    proto::append_soft(&mut resp, &shard.soft_words(req.layer));
                 }
                 // The partner's reply: rows [b, b + bb) of the same pass. Page
                 // time and miss count are reported on THIS request only, so the
@@ -7463,6 +8929,12 @@ pub fn serve_connection(
                                 proto::append_residency(&mut resp_b, &shard.residency_words(rb.layer));
                             }
                             None => {}
+                        }
+                        if rb.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
+                            proto::append_nursery(&mut resp_b, &shard.nursery_words(rb.layer));
+                        }
+                        if rb.flags2 & proto::REQ2_FLAG_SOFT != 0 && rb.flags & proto::REQ_FLAG_DECODE != 0 {
+                            proto::append_soft(&mut resp_b, &shard.soft_words(rb.layer));
                         }
                         proto::patch_len(&mut resp_b);
                         let t_ready_b = Instant::now();
@@ -7566,6 +9038,12 @@ pub fn serve_connection(
                     v.push(pf1[11]);
                     v.extend_from_slice(&ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &paged));
                     v.extend_from_slice(&ev_stage_fields(ev_sc0, shard.stage_counters()));
+                    // LIKELY readers at dequeue, this request's LIKELY words, the
+                    // nursery deltas across the request and the occupied level.
+                    v.extend_from_slice(&ev_pf0[12..14]);
+                    v.push(likely_a.len() as f64);
+                    v.extend_from_slice(&ev_nursery_fields(ev_nc0, shard.nursery_counters()));
+                    v.extend_from_slice(&ev_partial_fields(ev_tp0, shard.two_phase_stats()));
                     super::evtrace::emit(&super::evtrace_kinds::B2_REQ, &v);
                     // The merged partner: same pass, its own identity and arrival.
                     if let (Some(rb), Some((hb, _, tfb, _, t2b))) = (reqb.as_ref(), partner.as_ref()) {
@@ -7593,6 +9071,10 @@ pub fn serve_connection(
                             ("pin_drops_no_victim", nan), ("pin_evictions", nan),
                             ("n_paged", paged_b.iter().map(|w| w.count_ones()).sum::<u32>() as f64),
                             ("stage_claims", nan), ("stage_hits", nan), ("stage_spills", nan),
+                            ("n_likely_words", likely_b.len() as f64), ("nursery_lands", nan), ("nursery_hits", nan),
+                            ("nursery_recycled", nan), ("nursery_drops", nan), ("nursery_shrunk", nan),
+                            ("partial_lands", nan), ("partial_promotions", nan), ("partial_slots", nan), ("gateup_wait_us", nan), ("down_wait_us", nan),
+                            ("down_exposed", nan),
                         ] {
                             super::evtrace::set_named(k, &mut v, name, x);
                         }
@@ -7678,6 +9160,21 @@ pub fn serve_connection(
                                 pfs.push_str(&format!(
                                     " | stage {} claims={} hits={} spill_in={} spill_out={} drops={}",
                                     shard.stage_slots(), s.claims, s.hits, s.spill_in, s.spill_out, s.drops
+                                ));
+                            }
+                            if shard.nursery_on() {
+                                let (n, occupied) = shard.nursery_counters();
+                                pfs.push_str(&format!(
+                                    " | nursery lands={} hits={} recycled={} drops={} shrunk={} occupied={}",
+                                    n.lands, n.hits, n.recycled, n.drops, n.shrunk, occupied
+                                ));
+                            }
+                            if knobs::land_two_phase() || knobs::likely_gateup_only() {
+                                let (ns, pc, n_partial, ov) = shard.two_phase_stats();
+                                pfs.push_str(&format!(
+                                    " | two-phase partial_lands={} promotions={} completions={} evicted={} partial_now={} gateup_wait_ms={:.0} down_wait_ms={:.0} down_exposed={}/{}",
+                                    pc.partial_lands, pc.partial_promotions, pc.completions, pc.partial_evicted, n_partial,
+                                    ns[0] as f64 / 1e6, ns[1] as f64 / 1e6, ov[0], ov[0] + ov[1]
                                 ));
                             }
                             // `pread` here is the PROCESS-WIDE read counter differenced
@@ -7796,17 +9293,21 @@ fn serve_interleaved(
     shard.set_request_mode(req.flags);
     let ev_pin0 = shard.pin_counters();
     let ev_sc0 = shard.stage_counters();
-    shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { req.prefetch });
+    let (likely, plain) = proto::split_prefetch_words(req.flags, req.prefetch);
+    shard.pin_apply_words(req.release, if req.b > proto::PIN_DECODE_MAX_ROWS { &[][..] } else { &plain });
     if !req.hint_admit.is_empty() {
         shard.hint_evict_first(req.hint_admit);
     }
-    if !req.prefetch.is_empty() {
+    if !plain.is_empty() {
         if req.b > proto::PIN_DECODE_MAX_ROWS {
-            shard.prefetch_words_prefill(req.prefetch);
+            shard.prefetch_words_prefill(&plain);
         } else {
-            shard.prefetch_words(req.prefetch);
+            shard.prefetch_words(&plain);
         }
     }
+    shard.likely_words_in(hdr.seq, &likely);
+    let ev_nc0 = shard.nursery_counters().0;
+    let ev_tp0 = shard.two_phase_stats();
     let ev_pd0 = shard.layer_page_detail(req.layer);
     let ev_pw0 = shard.prefetch_wait_ns;
     let ev_t_run0 = if ev_on { super::evtrace::now() } else { f64::NAN };
@@ -7838,6 +9339,7 @@ fn serve_interleaved(
     // PAGED bits: the pass's own plus the early-page hook's at arrival (see
     // `serve_connection`).
     let mut paged = timing.paged;
+    shard.nursery_protect_done(hdr.seq);
     if req.flags & proto::REQ_FLAG_PIN != 0 {
         or_words(&mut paged, &shard.take_early_paged(hdr.seq));
     }
@@ -7852,6 +9354,12 @@ fn serve_interleaved(
         }
         None => {}
     }
+    if req.flags & proto::REQ_FLAG_LIKELY != 0 && shard.nursery_on() {
+        proto::append_nursery(&mut resp, &shard.nursery_words(req.layer));
+    }
+    if req.flags2 & proto::REQ2_FLAG_SOFT != 0 && req.flags & proto::REQ_FLAG_DECODE != 0 {
+        proto::append_soft(&mut resp, &shard.soft_words(req.layer));
+    }
     proto::patch_len(&mut resp);
     let t_ready = Instant::now();
     let t_server_us = (t_ready - t_done).as_micros() as u32;
@@ -7865,6 +9373,8 @@ fn serve_interleaved(
         let under = if g.0 == u64::MAX { f64::NAN } else { g.0 as f64 };
         let pf = ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &paged);
         let sf = ev_stage_fields(ev_sc0, shard.stage_counters());
+        let nf = ev_nursery_fields(ev_nc0, shard.nursery_counters());
+        let tp = ev_partial_fields(ev_tp0, shard.two_phase_stats());
         super::evtrace::emit_named(&super::evtrace_kinds::B2_REQ, &[
             ("pin_on", pf[0]), ("pin_pinned", pf[1]), ("pin_budget", pf[2]), ("pin_epoch", pf[3]),
             ("pin_release_words", pf[4]), ("pin_new", pf[5]), ("pin_denied", pf[6]), ("pin_drops_no_victim", pf[7]),
@@ -7883,6 +9393,10 @@ fn serve_interleaved(
             ("path_decode", f64::from(u8::from(timing.path_decode))), ("two_pass", f64::from(u8::from(timing.two_pass))),
             ("n_work_items", f64::from(timing.n_work_items)), ("n_missing", f64::from(timing.n_missing)),
             ("exec_h2d_us", timing.h2d.as_secs_f64() * 1e6), ("exec_gpu_us", timing.gpu.as_secs_f64() * 1e6),
+            ("n_likely_words", likely.len() as f64), ("nursery_lands", nf[0]), ("nursery_hits", nf[1]), ("nursery_recycled", nf[2]),
+            ("nursery_drops", nf[3]), ("nursery_shrunk", nf[4]), ("nursery_occupied", nf[5]),
+            ("partial_lands", tp[0]), ("partial_promotions", tp[1]), ("partial_slots", tp[2]), ("gateup_wait_us", tp[3]), ("down_wait_us", tp[4]),
+            ("down_exposed", tp[5]),
         ]);
     }
     resp.as_bytes_mut()[proto::HDR_LEN + 20..proto::HDR_LEN + 24].copy_from_slice(&t_server_us.to_le_bytes());
@@ -7987,6 +9501,9 @@ pub struct Ticket {
     pub flags: u32,
     pub n_hints: u32,
     pub n_pf_words: u32,
+    /// Predicted-miss hint words among `n_pf_words` (`het::lookahead`; 0
+    /// until slice B puts them on the wire).
+    pub n_hint_words: u32,
     /// Pin mode (`REQ_FLAG_PIN`): the sent picks the mirror HELD at submit
     /// (bit e = expert e of `layer`), for the surprise check on the reply.
     pub held: [u32; proto::RESID_WORDS],
@@ -8022,6 +9539,9 @@ pub struct RemotePartial {
     pub n_held: u32,
     pub n_surprise: u32,
     pub n_paged: u32,
+    /// Pin mode: the reply's PAGED bits (bit e = the pass had to page or wait
+    /// for expert e of `layer`); all zero without a pin block.
+    pub paged: [u32; proto::RESID_WORDS],
     frame: AlignedBuf,
 }
 
@@ -8163,6 +9683,8 @@ pub struct RemoteExpertClient {
     in_flight: std::collections::VecDeque<Ticket>,
     sel_scratch: Vec<i32>,
     ew_scratch: Vec<f32>,
+    /// The hint words a decode submit drains (`take_hint_words_into`), reused.
+    hint_scratch: Vec<u32>,
     clock: ClockSync,
     writer: Option<std::thread::JoinHandle<()>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -8320,6 +9842,7 @@ impl RemoteExpertClient {
             long_job: false,
             sel_scratch: vec![NO_PICK; info.max_batch as usize * nu],
             ew_scratch: vec![0.0; info.max_batch as usize * nu],
+            hint_scratch: Vec::with_capacity(128),
             clock,
             info,
             stream,
@@ -8507,13 +10030,79 @@ impl RemoteExpertClient {
         // actually sent (the surprise check on the reply).
         let pin_req = flags & proto::REQ_FLAG_PIN != 0;
         let rel = if pin_req { super::b2_mirror::take_release_words(128) } else { Vec::new() };
-        let mut pf = take_prefetch_words(128);
-        // RESTORE words fill the room the admission / look-ahead words leave,
-        // a few per request, and only once every release is on the wire: box
-        // 2 applies a request's releases before its prefetch grants, so a
-        // restore can never reach it before the release it undoes.
-        if pin_req && pf.len() < 128 && super::b2_mirror::releases_queued() == 0 {
-            pf.extend(take_restore_words((128 - pf.len()).min(super::b2_mirror::pin_restore_per_request())));
+        // PREDICTED-MISS HINT WORDS (`het::lookahead`, design 2.3): a decode
+        // request drains the hint queue first; the stale rule is applied there.
+        // The fresh words are counted (`lh2_dry_words`); under `dry`, or under
+        // `k1`/`k2` before box 2 has answered `RESP_FLAG_NURSERY`, they go no
+        // further. SLICE B (`Mode::wire`): they lead `pf` as `REQ_FLAG_LIKELY`
+        // words (`LIKELY_WORD_BIT`), ahead of admissions and restores, under
+        // the per-step budget and the abort bars; what cannot go is RE-QUEUED
+        // for the next submit, never dropped (design 2.4). `k1`/`k2` set the
+        // flag on EVERY decode request (words or none): the capability probe.
+        let lh2 = super::lookahead::cfg();
+        let asks = self.decode_phase && lh2.mode.asks();
+        let flags = if asks { flags | proto::REQ_FLAG_LIKELY } else { flags };
+        // A step that tripped a bar takes nothing more (else every later
+        // submit would re-take and re-queue the whole queue).
+        let hints: &[u32] = if self.decode_phase && lh2.mode.on() && !super::lookahead::bars_tripped() {
+            take_hint_words_into(lh2.step, layer as i32, 128, &mut self.hint_scratch);
+            super::lookahead::bump(super::lookahead::Stat::DryWords, self.hint_scratch.len() as u64);
+            if lh2.mode.wire() { &self.hint_scratch } else { &[] }
+        } else {
+            &[]
+        };
+        let mut n_hint_words = 0u32;
+        let mut pf = if lh2.spec_budget == 0 || !self.decode_phase {
+            // Today's rule (`V41_B2_SPEC_BUDGET=0`; and every prefill request:
+            // the budget is a decode-step quantity, and the layer-major group
+            // prefetch paces its own words through `PREFETCH_TAKE_CAP`). Hints
+            // first, up to the frame; the bars (design 5) count what GOES.
+            n_hint_words = super::lookahead::bars_allow(hints.len().min(128)) as u32;
+            let mut pf: Vec<u32> = hints[..n_hint_words as usize].iter().map(|&w| proto::mark_likely(w)).collect();
+            pf.extend(take_prefetch_words(128 - pf.len()));
+            // RESTORE words fill the room the admission / look-ahead words leave,
+            // a few per request, and only once every release is on the wire: box
+            // 2 applies a request's releases before its prefetch grants, so a
+            // restore can never reach it before the release it undoes.
+            if pin_req && pf.len() < 128 && super::b2_mirror::releases_queued() == 0 {
+                pf.extend(take_restore_words((128 - pf.len()).min(super::b2_mirror::pin_restore_per_request())));
+            }
+            pf
+        } else {
+            // PER-STEP SPECULATIVE BUDGET (design 2.4, `lookahead::SpecBudget`):
+            // hints, then admissions, then restores (~1 per request, a floor of
+            // 16 per step), at most `V41_B2_SPEC_BUDGET` words per step in all.
+            // What the budget holds back stays queued (`lh2_budget_deferred`);
+            // the release-before-restore rule above still holds.
+            let restores_ok = pin_req && super::b2_mirror::releases_queued() == 0;
+            let mut t = super::lookahead::budget_plan(
+                hints.len(), prefetch_words_queued(), if restores_ok { restore_words_queued() } else { 0 },
+                128, restores_ok, super::b2_mirror::pin_restore_per_request(),
+            );
+            // The bars count the words that GO (after the plan): a trip sends
+            // none and the budget is charged for none.
+            t.hints = super::lookahead::bars_allow(t.hints);
+            n_hint_words = t.hints as u32;
+            let mut pf: Vec<u32> = hints[..t.hints].iter().map(|&w| proto::mark_likely(w)).collect();
+            pf.extend(take_prefetch_words(t.admissions));
+            if restores_ok {
+                pf.extend(take_restore_words(t.restores));
+            }
+            super::lookahead::budget_commit(&t);
+            pf
+        };
+        if !hints.is_empty() {
+            let (sent, surplus) = hints.split_at(n_hint_words as usize);
+            mark_hint_words_sent(sent);
+            requeue_hint_words(surplus);
+            // `V41_B2_NURSERY_PRIOR` at R >= 2: the prior sees a hinted pick
+            // as INCOMING, so it does not swap it away and waste the entry.
+            if lh2.nursery_prior && lh2.rank >= 2 {
+                super::b2_mirror::note_incoming(sent);
+            }
+        }
+        if !asks {
+            debug_assert!(pf.iter().all(|&w| !proto::likely_word(w)));
         }
         let flags = if pf.is_empty() { flags } else { flags | proto::REQ_FLAG_PREFETCH };
         let (held, n_held) = if pin_req {
@@ -8536,9 +10125,14 @@ impl RemoteExpertClient {
             &mut buf, seq, layer, b as u32, flags, nu as u32, XQ_BYTES_PER_TOKEN as u32, xq,
             &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he), &pf, &rel,
         );
+        // The SOFT-HELD map (`REQ2_FLAG_SOFT`, `V41_B2_SOFT_MAP`): asked on
+        // every decode request; an older daemon never reads the word.
+        if self.decode_phase && super::b2_mirror::soft_map() {
+            proto::patch_request_flags2(&mut buf, proto::REQ2_FLAG_SOFT);
+        }
         let ticket = Ticket {
             seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now(),
-            flags, n_hints: (ha.len() + he.len()) as u32, n_pf_words: pf.len() as u32,
+            flags, n_hints: (ha.len() + he.len()) as u32, n_pf_words: pf.len() as u32, n_hint_words,
             held, n_held,
         };
         let sent = match self.tx_req.as_ref() {
@@ -8682,6 +10276,31 @@ impl RemoteExpertClient {
             super::b2_mirror::pin_reply_seen(pin.is_some());
             if let Some(p) = pin.as_ref() {
                 n_surprise = super::b2_mirror::check_surprises(m.layer, h.seq, &ticket.held, &p.paged);
+                // Tail recall (`lh2_paged_hinted`): a paged expert that had
+                // been hinted this step -- the hint was late, dropped, or
+                // recycled before the pick came.
+                let hinted_paged = (0..N_EXPERT as usize)
+                    .filter(|&e| (p.paged[e / 32] >> (e % 32)) & 1 == 1 && hint_word_sent((m.layer << 16) | e as u32))
+                    .count();
+                super::lookahead::bump(super::lookahead::Stat::PagedHinted, hinted_paged as u64);
+            }
+        }
+        // The SOFT-HELD map: the mirror's SOFT row for the layer (expires at
+        // its next reply or the phase switch), counted while a consumer or
+        // the prefetch knob is on (`lh2_soft_total`).
+        if let Some(words) = proto::response_soft(&buf, &m) {
+            super::b2_mirror::update_soft(m.layer, words);
+            if super::lookahead::scoring() {
+                super::lookahead::bump(super::lookahead::Stat::SoftTotal, words.iter().map(|w| u64::from(w.count_ones())).sum());
+            }
+        }
+        // The NURSERY block (design 3.2): the capability, and the mirror's
+        // NURSERY bits for the filter's dedup (never `held`).
+        if ticket.flags & proto::REQ_FLAG_LIKELY != 0 {
+            let nursery = proto::response_nursery(&buf, &m);
+            super::b2_mirror::nursery_reply_seen(nursery.is_some());
+            if let Some(words) = nursery {
+                super::b2_mirror::update_nursery(m.layer, words);
             }
         }
         // NTP quadruple for this exchange. t1 is what the WRITER stamped (echoed
@@ -8708,6 +10327,7 @@ impl RemoteExpertClient {
             n_held: ticket.n_held,
             n_surprise,
             n_paged: pin.as_ref().map_or(0, |p| p.paged.iter().map(|w| w.count_ones()).sum()),
+            paged: pin.as_ref().map_or([0; proto::RESID_WORDS], |p| p.paged),
             frame: buf,
         };
         // Every partial passes through here, so this is the one place the link
@@ -8915,7 +10535,7 @@ mod tests {
     fn prefetch_queue_priority_and_reservation() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, likely: false, roles: ROLES_ALL, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, false));
         q.push(job(2, false));
@@ -8955,6 +10575,133 @@ mod tests {
         drained.sort();
         assert_eq!(drained, vec![7, 8, 9]);
         assert!(q.pop().is_none());
+    }
+
+    /// The LIKELY class (design 3.2; review round 3, findings 1-2): queued
+    /// behind certain and ahead of speculative jobs; `running_likely +
+    /// running_spec < max_spec` (the certain reserve is never a LIKELY
+    /// reader); handed out while a certain job runs; speculative chunks pause
+    /// for a running LIKELY read, a LIKELY read's chunks pause for certain
+    /// reads only; `promote` / `reclassify_certain` turn Likely into Certain.
+    #[test]
+    fn likely_queue_order_cap_and_pause_rules() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let job = |e: u32, certain: bool, likely: bool| PfJob { layer: 4, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, likely, roles: ROLES_ALL, t_hint: Instant::now() };
+        // max_spec 2, 3 readers (one reserved for certain jobs).
+        let q = Arc::new(PfQueue::new(2));
+        q.push(job(1, false, false)); // spec
+        q.push(job(2, false, true)); // likely
+        q.push(job(3, true, false)); // certain
+        q.push(job(4, false, true)); // likely
+        q.push(job(5, false, false)); // spec
+        {
+            let g = q.inner.lock().unwrap();
+            let order: Vec<u32> = g.jobs.iter().map(|j| j.e).collect();
+            assert_eq!(order, vec![3, 2, 4, 1, 5], "certain, then LIKELY in push order, then speculative");
+        }
+        assert_eq!(q.counts(), [0.0, 0.0, 1.0, 2.0], "`counts` leaves LIKELY out");
+        assert_eq!(q.counts_likely(), [0.0, 2.0]);
+        // Certain first; then a LIKELY job pops ALTHOUGH a certain one runs
+        // (split mode), up to the cap, which it shares with speculative jobs.
+        let a = q.pop().unwrap();
+        assert_eq!((a.e, a.certain), (3, true));
+        let b = q.pop().unwrap();
+        assert_eq!((b.e, b.likely, b.certain), (2, true, false));
+        let c = q.pop().unwrap();
+        assert_eq!((c.e, c.likely), (4, true));
+        assert_eq!(q.counts_likely(), [2.0, 0.0]);
+        // Cap: 2 LIKELY running = max_spec -> the speculative job waits (and
+        // would even without the certain one).
+        let q2 = Arc::clone(&q);
+        let h = std::thread::spawn(move || q2.pop().map(|j| j.e));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "a speculative job ran past max_spec beside two LIKELY ones");
+        // Pause rules while a LIKELY read runs and no certain one does.
+        q.finished(true);
+        assert!(q.background_should_wait(4, 1), "speculative pauses for a running LIKELY read");
+        assert!(!q.background_should_wait_cls(4, 2, true), "LIKELY never pauses for LIKELY");
+        assert!(q.pause_token_roundtrip());
+        // One LIKELY finishes: the speculative job goes (no certain running).
+        q.finished_cls(false, true);
+        assert_eq!(h.join().unwrap(), Some(1));
+        assert_eq!((q.counts()[1], q.counts_likely()[0]), (1.0, 1.0));
+        // A certain job running: both classes' chunks pause, and a new
+        // speculative job waits while a new LIKELY one (cap allowing) does not.
+        q.push(job(6, true, false));
+        let _cert = q.pop().unwrap();
+        assert!(q.background_should_wait_cls(4, 4, true), "LIKELY pauses for a certain read");
+        assert!(q.background_should_wait(4, 1));
+        q.finished_cls(false, true); // LIKELY 4 done: running spec 1, likely 0
+        q.push(job(7, false, true));
+        let d = q.pop().unwrap();
+        assert_eq!((d.e, d.likely), (7, true), "LIKELY pops beside a running certain job");
+        let q3 = Arc::clone(&q);
+        let h = std::thread::spawn(move || q3.pop().map(|j| j.e));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "speculative 5 must wait for the certain job (and the cap)");
+        q.finished(true);
+        q.finished_cls(false, true);
+        assert_eq!(h.join().unwrap(), Some(5));
+        q.finished(false);
+        q.finished(false);
+        // promote: a queued LIKELY job becomes certain and moves to the front.
+        q.push(job(8, false, false));
+        q.push(job(9, false, true));
+        assert!(q.promote(4, 9));
+        let p = q.pop().unwrap();
+        assert_eq!((p.e, p.certain, p.likely), (9, true, false));
+        q.finished(true);
+        // reclassify from LIKELY moves the counters.
+        let l = q.pop().unwrap();
+        assert_eq!((l.e, l.likely), (8, false), "8 was speculative");
+        q.push(job(10, false, true));
+        let l = q.pop().unwrap();
+        assert!(l.likely);
+        q.reclassify_certain(true);
+        assert_eq!((q.counts()[0], q.counts_likely()[0]), (1.0, 0.0));
+        q.finished(true);
+        q.finished(false);
+        // Urgency routing: a LIKELY job records its key like a speculative one.
+        q.push(job(11, false, true));
+        let u = q.pop_mode(true).unwrap();
+        assert!(u.likely && q.spec_keys_snapshot().contains(&(4, 11)));
+        {
+            let _f = PfFinish { q: &q, certain: false, likely: true, spec_key: Some((4, 11)) };
+        }
+        assert!(q.spec_keys_snapshot().is_empty());
+        assert_eq!(q.counts_likely()[0], 0.0, "PfFinish released the LIKELY reader slot");
+        // Close drains LIKELY jobs too.
+        q.push(job(12, false, true));
+        q.close();
+        assert_eq!(q.pop().map(|j| j.e), Some(12));
+        assert!(q.pop().is_none());
+    }
+
+    /// The reserved staging-set pair (design 3.2): a LIKELY word takes one of
+    /// its own sets first, then a general set under the speculative rule;
+    /// speculative words never touch the pair; a certain word takes any
+    /// general set; `release_set` returns each set to its own list.
+    #[test]
+    fn likely_words_use_the_reserved_set_pair() {
+        let (mut free, mut likely) = (vec![0usize, 1, 2, 3], vec![4usize, 5]);
+        // reserve 1: speculative words leave the last 2 general sets.
+        assert_eq!(pick_set(&mut free, &mut likely, false, true, 1), Some(5));
+        assert_eq!(pick_set(&mut free, &mut likely, false, true, 1), Some(4));
+        assert_eq!(pick_set(&mut free, &mut likely, false, true, 1), Some(3), "pair busy: a general set under the speculative rule");
+        assert_eq!(pick_set(&mut free, &mut likely, false, false, 1), Some(2), "speculative: 3 general sets left > the 2 reserved");
+        assert_eq!(pick_set(&mut free, &mut likely, false, false, 1), None, "speculative: 2 left = the reserve");
+        assert_eq!(pick_set(&mut free, &mut likely, false, true, 1), None, "LIKELY too");
+        assert_eq!(pick_set(&mut free, &mut likely, true, false, 1), Some(1), "certain: any general set");
+        assert_eq!(pick_set(&mut free, &mut likely, true, true, 1), Some(0), "certain wins over likely");
+        likely.push(4);
+        free.push(9);
+        assert_eq!(pick_set(&mut free, &mut likely, false, false, 1), None, "speculative never takes the pair");
+        assert_eq!((free.clone(), likely.clone()), (vec![9], vec![4]));
+        // With the nursery off (no pair), a LIKELY word is a speculative one.
+        let mut none = Vec::new();
+        let mut g = vec![0usize, 1, 2];
+        assert_eq!(pick_set(&mut g, &mut none, false, true, 0), Some(2));
     }
 
     /// The wait decisions under urgency routing, as pure functions.
@@ -9004,21 +10751,21 @@ mod tests {
     fn prefetch_finish_releases_spec_key() {
         use std::time::Instant;
         let q = PfQueue::with_readers(2, 3);
-        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() });
+        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, likely: false, roles: ROLES_ALL, t_hint: Instant::now() });
         let j = q.pop_mode(true).unwrap();
         assert!(q.spec_keys_snapshot().contains(&(6, 1)));
         assert!(!q.promote(6, 1), "a running speculative key must not be promoted/urgent");
         assert!(!q.is_urgent(6, 1));
         assert_eq!(q.counts()[1], 1.0, "one speculative job running");
         {
-            let _f = PfFinish { q: &q, certain: j.certain, spec_key: Some((j.layer, j.e)) };
+            let _f = PfFinish { q: &q, certain: j.certain, likely: false, spec_key: Some((j.layer, j.e)) };
         }
         assert!(q.spec_keys_snapshot().is_empty());
         assert_eq!(q.counts()[1], 0.0, "PfFinish released the reader slot");
         // Urgency cap: max_spec 2 but 3 readers -> 2 may run; with 2 readers -> 1.
         let q2 = PfQueue::with_readers(2, 2);
         for e in 0..3 {
-            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() });
+            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, own_prefill: false, prefill: false, restore: 0, likely: false, roles: ROLES_ALL, t_hint: Instant::now() });
         }
         let _a = q2.pop_mode(true).unwrap();
         let g = q2.inner.lock().unwrap();
@@ -9034,7 +10781,7 @@ mod tests {
     fn prefetch_queue_urgency_routing() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: false, restore: 0, likely: false, roles: ROLES_ALL, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, true));
         q.push(job(2, false));
@@ -9151,6 +10898,215 @@ mod tests {
         assert!(proto::response_residency(&old, &m).is_some());
     }
 
+    /// `REQ_FLAG_LIKELY` / `LIKELY_WORD_BIT` / `RESP_FLAG_NURSERY` (design
+    /// 3.2): marked hint words ride the PREFETCH block and split off; the
+    /// NURSERY block sits after whatever of the residency map and pin block
+    /// is present, is length-checked, and an echoed request flag alone (an
+    /// older daemon) is no capability.
+    #[test]
+    fn likely_and_nursery_proto_roundtrip() {
+        let nu = N_EXPERT_USED;
+        let xq = vec![7u8; XQ_BYTES_PER_TOKEN];
+        let sel: Vec<i32> = (0..nu as i32).collect();
+        let ew = vec![0.25f32; nu];
+        let hint = |l: u32, e: u32| proto::mark_likely((l << 16) | e);
+        let pf = [hint(4, 5), hint(4, 9), (3u32 << 16) | 5, (6u32 << 16) | 1];
+        let mut buf = AlignedBuf::with_capacity(1 << 16);
+        let f = proto::REQ_FLAG_PIN | proto::REQ_FLAG_PREFETCH | proto::REQ_FLAG_LIKELY | proto::REQ_FLAG_DECODE;
+        proto::encode_request(&mut buf, 1, 3, 1, f, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &pf, &[]);
+        let r = proto::decode_request(&buf).unwrap();
+        assert_eq!(r.prefetch, &pf[..], "the wire carries the marks");
+        let (likely, plain) = proto::split_prefetch_words(r.flags, r.prefetch);
+        assert_eq!(likely, vec![(4 << 16) | 5, (4 << 16) | 9]);
+        assert_eq!(plain, vec![(3 << 16) | 5, (6 << 16) | 1]);
+        assert!(likely.iter().all(|&w| !proto::likely_word(w)));
+        // Without the flag a marked word stays marked (and out of range for the daemon).
+        let (l2, p2) = proto::split_prefetch_words(f & !proto::REQ_FLAG_LIKELY, r.prefetch);
+        assert!(l2.is_empty() && p2 == pf.to_vec());
+        assert!((p2[0] >> 16) as usize >= N_LAYER as usize, "an older daemon skips it by the layer check");
+
+        let (b, n) = (1usize, N_EMBD as usize);
+        let mut nursery = [proto::NURSERY_NONE; proto::NURSERY_WORDS];
+        nursery[0] = (3 << 16) | 7;
+        nursery[1] = (9 << 16) | 383;
+        let mut map = [0u32; proto::RESID_WORDS];
+        map[0] = 0b1001;
+        let paged = [0u32; proto::RESID_WORDS];
+        // After the residency map and pin block.
+        let mut resp = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut resp, 1, 3, b as u32, f | proto::REQ_FLAG_RESID, 0, 1, 2, N_EMBD, 2, 3, 4);
+        resp.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::append_residency(&mut resp, &map);
+        proto::append_pin(&mut resp, 5, 7, 9, &paged);
+        proto::append_nursery(&mut resp, &nursery);
+        proto::patch_len(&mut resp);
+        let m = proto::decode_response_meta(&resp).unwrap();
+        assert_ne!(m.flags & proto::RESP_FLAG_NURSERY, 0);
+        assert_eq!(proto::response_residency(&resp, &m).unwrap(), &map[..]);
+        assert_eq!(proto::response_pin(&resp, &m).unwrap().epoch, 5);
+        assert_eq!(proto::response_nursery(&resp, &m).unwrap(), &nursery[..2], "padding excluded");
+        // After the residency map alone; alone; and all-padding (the capability with no entry).
+        for (resid, words) in [(true, nursery), (false, nursery), (false, [proto::NURSERY_NONE; proto::NURSERY_WORDS])] {
+            let mut r2 = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+            proto::begin_response(&mut r2, 1, 3, b as u32, proto::REQ_FLAG_LIKELY, 0, 1, 2, N_EMBD, 2, 3, 4);
+            r2.resize(proto::RESP_DATA_OFF + n * 2);
+            if resid {
+                proto::append_residency(&mut r2, &map);
+            }
+            proto::append_nursery(&mut r2, &words);
+            proto::patch_len(&mut r2);
+            let m = proto::decode_response_meta(&r2).unwrap();
+            let got = proto::response_nursery(&r2, &m).unwrap();
+            assert_eq!(got.len(), words.iter().filter(|&&w| w != proto::NURSERY_NONE).count());
+            assert_eq!(proto::response_residency(&r2, &m).is_some(), resid);
+        }
+        // The length check: a flagged block that is not there fails the frame.
+        let mut bad = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut bad, 1, 3, b as u32, proto::RESP_FLAG_NURSERY, 0, 1, 2, N_EMBD, 2, 3, 4);
+        bad.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::patch_len(&mut bad);
+        assert!(proto::decode_response_meta(&bad).is_err());
+        // Older daemon: echoes REQ_FLAG_LIKELY, appends nothing -> no capability.
+        let mut old = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut old, 1, 3, b as u32, f, 0, 1, 2, N_EMBD, 2, 3, 4);
+        old.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::patch_len(&mut old);
+        let m = proto::decode_response_meta(&old).unwrap();
+        assert_ne!(m.flags & proto::REQ_FLAG_LIKELY, 0, "echoed");
+        assert!(proto::response_nursery(&old, &m).is_none());
+        // The flag bits are disjoint from the miss mask and the other flags.
+        assert_eq!(proto::RESP_FLAG_NURSERY & (proto::RESP_MISS_MASK | proto::RESP_FLAG_PIN | proto::RESP_FLAG_RESID | 0x7FF | proto::REQ_FLAG_LIKELY), 0);
+        assert_eq!(proto::REQ_FLAG_LIKELY, 2048);
+    }
+
+    /// The SOFT-HELD map on the wire: asked in the request's second flags
+    /// word (an older daemon never reads it, an older hub never sets it),
+    /// answered after every other block under `RESP_FLAG_SOFT` (never a
+    /// request flag, so an older daemon's echo leaves it clear); the daemon's
+    /// map = landed main, not pinned, not nursery.
+    #[test]
+    fn soft_map_proto_roundtrip_and_compatibility() {
+        let nu = N_EXPERT_USED;
+        let xq = vec![7u8; XQ_BYTES_PER_TOKEN];
+        let sel: Vec<i32> = (0..nu as i32).collect();
+        let ew = vec![0.25f32; nu];
+        let mut buf = AlignedBuf::with_capacity(1 << 16);
+        let f = proto::REQ_FLAG_PIN | proto::REQ_FLAG_RESID | proto::REQ_FLAG_DECODE;
+        proto::encode_request(&mut buf, 1, 3, 1, f, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &[], &[]);
+        assert_eq!(proto::decode_request(&buf).unwrap().flags2, 0, "an older hub: the reserved word is 0");
+        proto::patch_request_flags2(&mut buf, proto::REQ2_FLAG_SOFT);
+        let r = proto::decode_request(&buf).unwrap();
+        assert_eq!((r.flags2, r.flags, r.layer), (proto::REQ2_FLAG_SOFT, f, 3), "the first flags word is untouched");
+        assert_eq!(proto::RESP_FLAG_SOFT & (0xFFF | proto::RESP_FLAG_NURSERY | proto::RESP_FLAG_PIN | proto::RESP_FLAG_RESID | proto::RESP_MISS_MASK), 0);
+
+        let (b, n) = (1usize, N_EMBD as usize);
+        let mut map = [0u32; proto::RESID_WORDS];
+        map[0] = 0b1001;
+        let mut soft = [0u32; proto::RESID_WORDS];
+        soft[0] = 0b0110;
+        soft[11] = 1 << 31;
+        let paged = [0u32; proto::RESID_WORDS];
+        let nursery = [proto::NURSERY_NONE; proto::NURSERY_WORDS];
+        // New daemon, new hub: after the residency map, pin block and nursery block.
+        let mut resp = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 512);
+        proto::begin_response(&mut resp, 1, 3, b as u32, f | proto::REQ_FLAG_LIKELY, 0, 1, 2, N_EMBD, 2, 3, 4);
+        resp.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::append_residency(&mut resp, &map);
+        proto::append_pin(&mut resp, 5, 7, 9, &paged);
+        proto::append_nursery(&mut resp, &nursery);
+        proto::append_soft(&mut resp, &soft);
+        proto::patch_len(&mut resp);
+        let m = proto::decode_response_meta(&resp).unwrap();
+        assert_ne!(m.flags & proto::RESP_FLAG_SOFT, 0);
+        assert_eq!(proto::response_residency(&resp, &m).unwrap(), &map[..]);
+        assert_eq!(proto::response_pin(&resp, &m).unwrap().epoch, 5);
+        assert!(proto::response_nursery(&resp, &m).unwrap().is_empty());
+        assert_eq!(proto::response_soft(&resp, &m).unwrap(), &soft[..]);
+        // After the residency map alone.
+        let mut r2 = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut r2, 1, 3, b as u32, f, 0, 1, 2, N_EMBD, 2, 3, 4);
+        r2.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::append_residency(&mut r2, &map);
+        proto::append_soft(&mut r2, &soft);
+        proto::patch_len(&mut r2);
+        let m = proto::decode_response_meta(&r2).unwrap();
+        assert_eq!(proto::response_soft(&r2, &m).unwrap(), &soft[..]);
+        assert!(proto::response_nursery(&r2, &m).is_none());
+        // Old daemon, new hub: the request asked, the echo carries no bit 12, no block.
+        let mut old = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut old, 1, 3, b as u32, f, 0, 1, 2, N_EMBD, 2, 3, 4);
+        old.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::append_residency(&mut old, &map);
+        proto::patch_len(&mut old);
+        let m = proto::decode_response_meta(&old).unwrap();
+        assert!(proto::response_soft(&old, &m).is_none());
+        // The length check: a flagged map that is not there fails the frame.
+        let mut bad = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut bad, 1, 3, b as u32, proto::RESP_FLAG_SOFT, 0, 1, 2, N_EMBD, 2, 3, 4);
+        bad.resize(proto::RESP_DATA_OFF + n * 2);
+        proto::patch_len(&mut bad);
+        assert!(proto::decode_response_meta(&bad).is_err());
+    }
+
+    /// The daemon's SOFT map: landed main minus pinned minus nursery.
+    #[test]
+    fn soft_words_are_landed_main_minus_pinned_minus_nursery() {
+        let mut pool = nursery_pool(0.0);
+        // Layer 1: slots 0 (nursery entry (1,0)), 1-3 main; pin (1,1).
+        pool.pins.enable(8);
+        pool.pins.grant(1, 1);
+        let row = pool.remap_hosts[1].clone();
+        let _ = pool.pins.report(1, &row, pool.stage, &pool.nursery, &pool.partial);
+        assert!(pool.pins.is_pinned(1, 1));
+        let soft: Vec<u32> = (0..4).filter(|&e| landed_main(row[e as usize], &pool.nursery) && !pool.pins.is_pinned(1, e)).collect();
+        assert_eq!(soft, vec![2, 3], "0 is a nursery entry, 1 is pinned");
+        // The pin bitset `soft_words` subtracts agrees with `is_pinned`.
+        let pw = pool.pins.pinned_words(1);
+        assert_eq!(pw[0], 1 << 1);
+        assert_eq!(pool.pins.pinned_words(2), [0; proto::RESID_WORDS]);
+        assert_eq!(PinBook::off().pinned_words(1), [0; proto::RESID_WORDS]);
+    }
+
+    /// `nursery_words`: the reply layer's entries first, then other layers'
+    /// in rotation, padded; the cursor advances across calls.
+    #[test]
+    fn nursery_words_report_own_layer_first_then_rotate() {
+        let ids: Vec<u32> = (0..4).collect();
+        let mut pool = ShardPool::seeded(80, &[(1, 0, &ids), (2, 4, &ids)], 0.0);
+        assert_eq!(pool.carve_nursery(16), 16, "80 slots: a quarter");
+        for sl in 0..80 {
+            if pool.nursery[sl] {
+                let _ = pool.evict(sl as u32, 0);
+            }
+        }
+        // 3 entries of layer 7, 14 of layer 8 (one short of... 13 fit beside them? 12 words total).
+        let free: Vec<u32> = (0..80).filter(|&sl| pool.nursery[sl as usize]).collect();
+        for (i, &sl) in free.iter().enumerate() {
+            let key = if i < 3 { (7, i as u32) } else { (8, i as u32) };
+            pool.land_nursery(sl, key);
+        }
+        let w = pool.nursery_words(7);
+        assert!(w.iter().all(|&x| x != proto::NURSERY_NONE), "12 of 16 entries fit");
+        assert!(w[..3].iter().all(|&x| x >> 16 == 7), "{w:?}");
+        assert!(w[3..].iter().all(|&x| x >> 16 == 8));
+        let first: Vec<u32> = w[3..].to_vec();
+        let w2 = pool.nursery_words(7);
+        assert_ne!(w2[3..].to_vec(), first, "the rotation moved on");
+        let mut seen: std::collections::HashSet<u32> = w[3..].iter().copied().collect();
+        seen.extend(w2[3..].iter().copied());
+        assert_eq!(seen.len(), 13, "two reports cover every layer-8 entry");
+        // A layer with no entries: the others fill the block; an empty nursery is all padding.
+        assert!(pool.nursery_words(5).iter().all(|&x| x != proto::NURSERY_NONE));
+        let mut empty = ShardPool::seeded(8, &[(1, 0, &ids)], 0.0);
+        assert_eq!(empty.carve_nursery(2), 2);
+        for sl in 0..8 {
+            if empty.nursery[sl] {
+                let _ = empty.evict(sl as u32, 0);
+            }
+        }
+        assert_eq!(empty.nursery_words(1), [proto::NURSERY_NONE; proto::NURSERY_WORDS]);
+    }
+
     /// `PinBook`: eligibility, pin on report within budget (the pass's own
     /// grants first), a denial drops the grant, a grant expires after
     /// `PIN_GRANT_TTL` reports, release (every word advances the epoch),
@@ -9168,22 +11124,22 @@ mod tests {
         for e in [2, 3, 4, 5] {
             p.grant(1, e);
         }
-        let w = p.report(1, &row, u32::MAX);
+        let w = p.report(1, &row, u32::MAX, &[], &[]);
         assert_eq!(w[0], (1 << 2) | (1 << 3), "budget 2: the first two landed grants, in grant order");
         assert_eq!((p.pinned, p.c.new_pins, p.c.denied), (2, 2, 1));
         assert!(!p.is_pinned(1, 5), "5 is eligible but not landed");
-        let _ = p.report(1, &row, u32::MAX);
+        let _ = p.report(1, &row, u32::MAX, &[], &[]);
         assert_eq!(p.c.denied, 1, "a denial drops the grant: counted once per grant");
         // Resident but never used / granted: never pinned.
         row[6] = -7;
-        assert_eq!(p.report(1, &row, u32::MAX)[0] & (1 << 6), 0);
+        assert_eq!(p.report(1, &row, u32::MAX, &[], &[])[0] & (1 << 6), 0);
         // Release 2: epoch 1; 4 was denied (grant dropped) so the freed budget
         // stays free until it is granted again.
         p.release((1 << 16) | 2);
         assert_eq!((p.epoch, p.pinned), (1, 1));
-        assert_eq!(p.report(1, &row, u32::MAX)[0], 1 << 3);
+        assert_eq!(p.report(1, &row, u32::MAX, &[], &[])[0], 1 << 3);
         p.grant(1, 4);
-        assert_eq!(p.report(1, &row, u32::MAX)[0], (1 << 3) | (1 << 4));
+        assert_eq!(p.report(1, &row, u32::MAX, &[], &[])[0], (1 << 3) | (1 << 4));
         assert!(!p.is_pinned(1, 2), "a released expert needs a new grant to pin again");
         // Words for unknown / unpinned keys still advance the epoch.
         p.release((1 << 16) | 300);
@@ -9191,15 +11147,15 @@ mod tests {
         assert_eq!(p.epoch, 3);
         // 5 lands (still within its TTL): budget full, so its grant is dropped.
         row[5] = -9;
-        let _ = p.report(1, &row, u32::MAX);
+        let _ = p.report(1, &row, u32::MAX, &[], &[]);
         assert!(!p.is_pinned(1, 5));
         assert_eq!(p.c.denied, 2);
         assert!(p.on_evict(1, 3), "evicting a pinned expert is reported");
         assert_eq!((p.pinned, p.c.pinned_evictions), (1, 1));
         row[3] = 0;
-        assert_eq!(p.report(1, &row, u32::MAX)[0], 1 << 4, "5 needs a fresh grant");
+        assert_eq!(p.report(1, &row, u32::MAX, &[], &[])[0], 1 << 4, "5 needs a fresh grant");
         p.grant(1, 5);
-        assert_eq!(p.report(1, &row, u32::MAX)[0], (1 << 4) | (1 << 5));
+        assert_eq!(p.report(1, &row, u32::MAX, &[], &[])[0], (1 << 4) | (1 << 5));
         assert!(!p.on_evict(1, 6));
         assert_eq!(p.pinned, 2);
         // Enabling again keeps the state; `off` resets it.
@@ -9213,26 +11169,26 @@ mod tests {
         let mut row = vec![0i32; REMAP_LEN];
         q.grant(2, 7);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row, u32::MAX);
+            let _ = q.report(2, &row, u32::MAX, &[], &[]);
         }
         row[7] = -1;
-        assert_eq!(q.report(2, &row, u32::MAX)[0], 1 << 7, "landed on its last report: pinned");
+        assert_eq!(q.report(2, &row, u32::MAX, &[], &[])[0], 1 << 7, "landed on its last report: pinned");
         q.grant(2, 8);
         for _ in 0..PIN_GRANT_TTL {
-            let _ = q.report(2, &row, u32::MAX);
+            let _ = q.report(2, &row, u32::MAX, &[], &[]);
         }
         row[8] = -2;
-        assert_eq!(q.report(2, &row, u32::MAX)[0] & (1 << 8), 0, "expired: never pinned");
+        assert_eq!(q.report(2, &row, u32::MAX, &[], &[])[0] & (1 << 8), 0, "expired: never pinned");
         q.grant(2, 9);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row, u32::MAX);
+            let _ = q.report(2, &row, u32::MAX, &[], &[]);
         }
         q.grant(2, 9);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row, u32::MAX);
+            let _ = q.report(2, &row, u32::MAX, &[], &[]);
         }
         row[9] = -3;
-        assert_eq!(q.report(2, &row, u32::MAX)[0] & (1 << 9), 1 << 9, "re-granted: clock restarted");
+        assert_eq!(q.report(2, &row, u32::MAX, &[], &[])[0] & (1 << 9), 1 << 9, "re-granted: clock restarted");
         assert_eq!(q.c.denied, 0);
 
         // Fresh first: with one budget slot, the pass's own pick (300) beats an
@@ -9241,11 +11197,11 @@ mod tests {
         f.enable(1);
         let mut row = vec![0i32; REMAP_LEN];
         f.grant(3, 10);
-        let _ = f.report(3, &row, u32::MAX);
+        let _ = f.report(3, &row, u32::MAX, &[], &[]);
         row[10] = -1;
         row[300] = -2;
         f.grant(3, 300);
-        let w = f.report(3, &row, u32::MAX);
+        let w = f.report(3, &row, u32::MAX, &[], &[]);
         assert!(f.is_pinned(3, 300) && !f.is_pinned(3, 10), "{w:?}");
         assert_eq!((f.pinned, f.c.denied), (1, 1));
     }
@@ -9290,7 +11246,7 @@ mod tests {
             pool.pins.grant(1, e);
         }
         let row = pool.remap_hosts[1].clone();
-        let _ = pool.pins.report(1, &row, pool.stage);
+        let _ = pool.pins.report(1, &row, pool.stage, &pool.nursery, &pool.partial);
         assert!(pool.pins.is_pinned(1, 0) && pool.pins.is_pinned(1, 2));
         // Oldest slots are layer 1's (seeded first); 0-2 pinned, 3 is next.
         let (slot, ev) = pool.claim_miss(2, 10, &[10], &[], (4, 8), true, false, false).unwrap();
@@ -9324,7 +11280,7 @@ mod tests {
         pool.pins.grant(1, 0);
         pool.pins.grant(1, 1);
         let row = pool.remap_hosts[1].clone();
-        let _ = pool.pins.report(1, &row, pool.stage);
+        let _ = pool.pins.report(1, &row, pool.stage, &pool.nursery, &pool.partial);
         let v0 = PIN_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed);
         let (_, ev) = pool.claim_miss(1, 5, &[5], &[], (0, 2), true, false, false).expect("revoke, not fail");
         assert!(ev.is_some());
@@ -9875,7 +11831,7 @@ mod tests {
         pool.pins.grant(1, 41); // main
         pool.pins.grant(1, 20); // staged (a prefill claim)
         let row = pool.remap_hosts[1].clone();
-        let map = pool.pins.report(1, &row, pool.stage);
+        let map = pool.pins.report(1, &row, pool.stage, &pool.nursery, &pool.partial);
         assert!(pool.pins.is_pinned(1, 41) && map[1] & (1 << 9) != 0);
         assert!(!pool.pins.is_pinned(1, 40) && !pool.pins.is_pinned(1, 20), "never pinned in staging");
         assert_eq!(map[1] & (1 << 8), 0);
@@ -9905,7 +11861,7 @@ mod tests {
         }
         for l in 1..=3u32 {
             let row = pool.remap_hosts[l as usize].clone();
-            let _ = pool.pins.report(l, &row, pool.stage);
+            let _ = pool.pins.report(l, &row, pool.stage, &pool.nursery, &pool.partial);
         }
         assert_eq!(pool.pins.pinned, 8);
         let (slot, ev) = pool.claim_miss(2, 60, &[60], &[], (4, 8), true, false, false).unwrap();
@@ -9946,6 +11902,22 @@ mod tests {
             // band and hit there across chunks, never spilled out (STAGE >=
             // the union); the per-event invariants live in `Box2Sim`.
             assert!(s.sc.claims > 100 && s.sc.hits > 50 && s.sc.spill_out == 0, "seed {seed}: {s:?}");
+            // The nursery was exercised: LIKELY words landed, some were
+            // promoted on use, some recycled, blocks were reported and none
+            // of their entries was ever in the pin map; the per-event
+            // invariants live in `pin_sim`'s `check`.
+            assert!(s.nc.lands > 30 && s.nc.hits > 5 && s.nc.recycled > 5, "seed {seed}: nursery not exercised {s:?}");
+            assert!(s.nursery_reported > 50 && s.nursery_pin_violations == 0, "seed {seed}: {s:?}");
+            assert!(s.nursery_covered > 0, "seed {seed}: the mirror never deduped a hint");
+            // Two-phase landing on the odd seeds: partial entries landed, were
+            // promoted and completed by the pass (never served partial), or
+            // recycled; even seeds never make one.
+            if seed % 2 == 1 {
+                assert!(s.pc.partial_lands > 30 && s.pc.partial_promotions > 5 && s.partial_completed > 5, "seed {seed}: {:?}", s.pc);
+                assert_eq!(s.pc.completions, s.partial_completed, "seed {seed}");
+            } else {
+                assert_eq!((s.pc, s.partial_completed), (PartialCounters::default(), 0), "seed {seed}");
+            }
             eprintln!("pin sim seed {seed}: {s:?}");
         }
         // Mutation: a hub that applies maps without masking later releases.
@@ -9973,6 +11945,17 @@ mod tests {
         max_pinned: u32,
         /// The pool's prefill-staging counters at the end.
         sc: StageCounters,
+        /// The pool's nursery counters at the end; entries reported in
+        /// NURSERY blocks; reported entries found in the pin map (must be 0);
+        /// hub-side hints skipped because the NURSERY mirror had the entry.
+        nc: NurseryCounters,
+        nursery_reported: u64,
+        nursery_pin_violations: u64,
+        nursery_covered: u64,
+        /// Two-phase landing: the pool's partial counters at the end, and the
+        /// wanted partial slots `ensure` completed (its down reads).
+        pc: PartialCounters,
+        partial_completed: u64,
     }
 
     /// xorshift64.
@@ -9994,6 +11977,9 @@ mod tests {
         sel: Vec<i32>,
         prefetch: Vec<u32>,
         release: Vec<u32>,
+        /// The LIKELY words (`REQ_FLAG_LIKELY`, marks stripped): hints for
+        /// the next layer's picks.
+        likely: Vec<u32>,
         /// Hub side: the sent picks the ledger held at submit.
         held: [u32; proto::RESID_WORDS],
         /// Box 2 has pulled this frame off the wire (its arrival bits noted).
@@ -10008,6 +11994,8 @@ mod tests {
         pinned: u32,
         budget: u32,
         paged: [u32; proto::RESID_WORDS],
+        /// The NURSERY block (`RESP_FLAG_NURSERY`): `(layer, e)` entries.
+        nursery: Vec<(u32, u32)>,
     }
 
     /// Box 2 for `pin_sim`: the REAL `ShardPool` (victim search, choke point,
@@ -10016,8 +12004,9 @@ mod tests {
     struct Box2Sim {
         pool: ShardPool,
         /// Background reads in flight (prefetch words, early page, park), and
-        /// whether each is a PREFILL-shaped request's own (`PfJob::stage`).
-        bg: Vec<((u32, u32), bool)>,
+        /// whether each is a PREFILL-shaped request's own (`PfJob::stage`) /
+        /// a LIKELY hint (`PfJob::likely`: lands in the nursery).
+        bg: Vec<((u32, u32), bool, bool)>,
         budget: u32,
         per: u32,
         global: bool,
@@ -10026,6 +12015,9 @@ mod tests {
         /// Deterministic: always merge a same-layer front frame, never park,
         /// no early background reads (the scripted scenario tests).
         scripted: bool,
+        /// `likely_gateup_only` (design 3.4): LIKELY landings are PARTIAL and
+        /// `ensure` completes the wanted ones (its "down read").
+        gateup_only: bool,
         st: PinSimStats,
     }
 
@@ -10046,20 +12038,27 @@ mod tests {
             v
         }
 
-        /// `prefetch_words_cls`: skip resident / in flight; bounded sets.
-        fn queue_bg(&mut self, words: &[u32], stage: bool) {
+        /// `prefetch_words_cls` / `prefetch_words_likely`: skip resident / in
+        /// flight; bounded sets (LIKELY words have their reserved pair too).
+        fn queue_bg(&mut self, words: &[u32], stage: bool, likely: bool) {
             let stage = stage && self.pool.stage_slots() > 0;
+            let likely = likely && self.pool.nursery_target > 0;
             for &w in words {
                 let key = (w >> 16, w & 0xFFFF);
-                if !self.pool.slot_of.contains_key(&key) && !self.bg.iter().any(|b| b.0 == key) && self.bg.len() < Self::BG_SETS {
-                    self.bg.push((key, stage));
+                let cap = Self::BG_SETS + if likely { B2_LIKELY_SETS } else { 0 };
+                if !self.pool.slot_of.contains_key(&key) && !self.bg.iter().any(|b| b.0 == key) && self.bg.len() < cap {
+                    self.bg.push((key, stage, likely));
+                } else if likely && !self.pool.slot_of.contains_key(&key) && !self.bg.iter().any(|b| b.0 == key) {
+                    self.pool.nc.drops += 1;
                 }
             }
         }
 
         /// `admit_prefetched`: a random subset has completed; land it in random
         /// order, protecting `want` of `layer` and `extra`; drop the landing
-        /// when every victim is pinned (or, staged, when staging has none).
+        /// when every victim is pinned (or, staged, when staging has none). A
+        /// LIKELY read lands in the nursery (`nursery_victim`), or straight
+        /// into main as a land + hit when the pass wants it.
         fn admit(&mut self, rng: &mut SimRng, layer: u32, want: &[u32], extra: &[(u32, u32)]) {
             let mut i = 0;
             while i < self.bg.len() {
@@ -10068,8 +12067,31 @@ mod tests {
                     continue;
                 }
                 let j = i + rng.below((self.bg.len() - i) as u64) as usize;
-                let (key, stage) = self.bg.swap_remove(j);
+                let (key, stage, likely) = self.bg.swap_remove(j);
                 if self.pool.slot_of.contains_key(&key) {
+                    continue;
+                }
+                let wanted = key.0 == layer && want.contains(&key.1);
+                if likely && !wanted {
+                    match self.pool.nursery_victim(layer, want, extra, 2) {
+                        Some(v) => {
+                            assert!(self.pool.nursery[v as usize] && (v as u32) < self.pool.stage);
+                            assert!(!self.pool.owner_of[v as usize].is_some_and(|(l, e)| self.pool.pins.is_pinned(l, e)), "a pinned nursery entry");
+                            self.st.evictions += u64::from(self.pool.evict(v, layer).is_some());
+                            self.pool.land_nursery(v, key);
+                            if self.gateup_only {
+                                // Gate/up only: a PARTIAL entry (design 3.4).
+                                self.pool.mark_partial(v);
+                                self.pool.pc.partial_lands += 1;
+                            }
+                            self.pool.nursery_refill_free();
+                            self.st.bg_landed += 1;
+                        }
+                        None => {
+                            self.pool.nc.drops += 1;
+                            self.st.bg_dropped += 1;
+                        }
+                    }
                     continue;
                 }
                 let region = self.region(key.0);
@@ -10078,8 +12100,13 @@ mod tests {
                     Some(v) => {
                         // STAGING INVARIANT: a landing takes a slot of its own band.
                         assert_eq!(v >= self.pool.stage, stage, "landing of {key:?} (stage {stage}) at slot {v}");
+                        assert!(!self.pool.nursery[v as usize], "a main landing took nursery slot {v}");
                         self.st.evictions += u64::from(self.pool.evict(v, layer).is_some());
                         self.pool.land(v, key, stage);
+                        if likely {
+                            self.pool.nc.lands += 1;
+                            self.pool.nc.hits += 1;
+                        }
                         self.st.bg_landed += 1;
                     }
                     None => {
@@ -10100,9 +12127,29 @@ mod tests {
             let want = Self::distinct(sel);
             self.admit(rng, layer, &want, extra);
             let region = self.region(layer);
+            self.pool.note_serve(layer);
             let mut claims = Vec::new();
             for &e in &want {
+                let was_nursery = self.pool.in_nursery(layer, e);
                 if self.pool.touch_hit(layer, e, prefill) {
+                    if was_nursery {
+                        // Promoted: refill the nursery with the main pool's victim.
+                        let slots = self.pool.nursery_slots;
+                        let shrunk = self.pool.nc.shrunk;
+                        let v = self.pool.nursery_refill(region, self.global, layer, &want, extra, prefill);
+                        assert!(v.is_some() || self.pool.nc.shrunk == shrunk + 1 || slots >= self.pool.nursery_target);
+                        if let Some(v) = v {
+                            assert!(self.pool.nursery[v as usize] && self.pool.owner_of[v as usize].is_none() && (v as u32) < self.pool.stage);
+                            self.st.evictions += 1;
+                        }
+                    }
+                    // A PARTIAL slot wanted by the pass: its down role is read
+                    // now (design 3.4: `Full` completes it before the pass runs).
+                    if self.pool.is_partial(layer, e) {
+                        self.pool.complete(layer, e);
+                        self.st.partial_completed += 1;
+                    }
+                    assert!(!self.pool.is_partial(layer, e), "a pass runs on a partial slot");
                     continue;
                 }
                 let sc0 = self.pool.sc;
@@ -10142,8 +12189,9 @@ mod tests {
             w
         }
 
-        /// A request's words at service: `pin_enable`, `pin_apply_words`, then
-        /// the prefetch readers.
+        /// A request's words at service: `pin_enable`, `pin_apply_words`
+        /// (plain words only: a LIKELY word is never a grant), then the
+        /// prefetch readers (LIKELY words as LIKELY jobs).
         fn words_in(&mut self, r: &SimReq) {
             self.pool.pins.enable(self.budget);
             for &w in &r.release {
@@ -10152,7 +12200,26 @@ mod tests {
             for &w in &r.prefetch {
                 self.pool.pins.grant(w >> 16, w & 0xFFFF);
             }
-            self.queue_bg(&r.prefetch, false);
+            self.queue_bg(&r.prefetch, false, false);
+            self.queue_bg(&r.likely, false, true);
+        }
+
+        /// The reply's NURSERY block, checked at report time: every entry is a
+        /// resident nursery entry and none is in the pin map.
+        fn nursery_block(&mut self, layer: u32, map: &[u32; proto::RESID_WORDS]) -> Vec<(u32, u32)> {
+            if self.pool.nursery_target == 0 {
+                return Vec::new();
+            }
+            let words = self.pool.nursery_words(layer);
+            let ents: Vec<(u32, u32)> = words.iter().filter(|&&w| w != proto::NURSERY_NONE).map(|&w| (w >> 16, w & 0xFFFF)).collect();
+            for &(l, e) in &ents {
+                assert!(self.pool.in_nursery(l, e), "reported nursery entry L{l} e{e} is not one");
+                if l == layer && map[e as usize / 32] >> (e % 32) & 1 == 1 {
+                    self.st.nursery_pin_violations += 1;
+                }
+            }
+            self.st.nursery_reported += ents.len() as u64;
+            ents
         }
 
         /// `pin_grant` for each decode-shaped request of a pass, then ONE
@@ -10169,7 +12236,7 @@ mod tests {
                 }
             }
             let row = self.pool.remap_hosts[layer as usize].clone();
-            let map = self.pool.pins.report(layer, &row, self.pool.stage);
+            let map = self.pool.pins.report(layer, &row, self.pool.stage, &self.pool.nursery, &self.pool.partial);
             let p = &self.pool.pins;
             (map, p.epoch, p.pinned, p.budget)
         }
@@ -10184,9 +12251,10 @@ mod tests {
                 }
             }
             let row = self.pool.remap_hosts[r.layer as usize].clone();
-            let map = self.pool.pins.report(r.layer, &row, self.pool.stage);
-            let p = &self.pool.pins;
-            SimReply { seq: r.seq, layer: r.layer, map, epoch: p.epoch, pinned: p.pinned, budget: p.budget, paged }
+            let map = self.pool.pins.report(r.layer, &row, self.pool.stage, &self.pool.nursery, &self.pool.partial);
+            let (epoch, pinned, budget) = (self.pool.pins.epoch, self.pool.pins.pinned, self.pool.pins.budget);
+            let nursery = self.nursery_block(r.layer, &map);
+            SimReply { seq: r.seq, layer: r.layer, map, epoch, pinned, budget, paged, nursery }
         }
 
         /// Serve the wire's front request as `serve_connection` does: words in
@@ -10219,8 +12287,11 @@ mod tests {
             if let Some(nx) = wire.front() {
                 if !self.scripted && rng.below(2) == 0 {
                     let w: Vec<u32> = Self::distinct(&nx.sel).into_iter().map(|e| (nx.layer << 16) | e).collect();
-                    // The early-page hook: a prefill frame's reads are staged.
-                    self.queue_bg(&w, nx.b > 16);
+                    // The early-page hook: a prefill frame's reads are staged;
+                    // its LIKELY words are applied at arrival too.
+                    let likely = nx.likely.clone();
+                    self.queue_bg(&w, nx.b > 16, false);
+                    self.queue_bg(&likely, false, true);
                 }
             }
             let mut sel = a.sel.clone();
@@ -10234,7 +12305,7 @@ mod tests {
                 let parked: Vec<(u32, u32)> = Self::distinct(&sel).into_iter().map(|e| (a.layer, e)).collect();
                 let w: Vec<u32> = parked.iter().filter(|k| !self.pool.slot_of.contains_key(k)).map(|k| (k.0 << 16) | k.1).collect();
                 // The park hook: a parked prefill chunk's reads are staged.
-                self.queue_bg(&w, a.b > 16);
+                self.queue_bg(&w, a.b > 16, false);
                 for _ in 0..1 + rng.below(3) {
                     if wire.front().is_some_and(|nx| nx.b <= PARK_MAX_ROWS) {
                         let c = wire.pop_front().unwrap();
@@ -10277,8 +12348,9 @@ mod tests {
             // grants first, then the layer's report, reused by the partner.
             if let Some(b) = partner.as_ref() {
                 let (map, epoch, pinned, budget) = self.report_pass(a.layer, &[(&a, dec(&a)), (b, dec(b))]);
-                replies.push(SimReply { seq: a.seq, layer: a.layer, map, epoch, pinned, budget, paged: paged_a });
-                replies.push(SimReply { seq: b.seq, layer: b.layer, map, epoch, pinned, budget, paged: paged_b });
+                let nursery = self.nursery_block(a.layer, &map);
+                replies.push(SimReply { seq: a.seq, layer: a.layer, map, epoch, pinned, budget, paged: paged_a, nursery: nursery.clone() });
+                replies.push(SimReply { seq: b.seq, layer: b.layer, map, epoch, pinned, budget, paged: paged_b, nursery });
             } else {
                 let r = self.reply(&a, &a.sel, dec(&a), paged_a);
                 replies.push(r);
@@ -10307,6 +12379,7 @@ mod tests {
             global: true,
             early: EarlyPaged::default(),
             scripted: true,
+            gateup_only: false,
             st: PinSimStats::default(),
         };
         let mut rng = SimRng(7);
@@ -10314,7 +12387,7 @@ mod tests {
         let e = 20i32;
         let row = |first: i32| -> Vec<i32> { vec![first, 0, 1, 2, 3, 4] };
         let req = |seq: u32, b: usize, sel: Vec<i32>, held: [u32; proto::RESID_WORDS]| SimReq {
-            seq, layer: 0, b, sel, prefetch: Vec::new(), release: Vec::new(), held, pulled: false,
+            seq, layer: 0, b, sel, prefetch: Vec::new(), release: Vec::new(), likely: Vec::new(), held, pulled: false,
         };
         let none = [0u32; proto::RESID_WORDS];
         let r = req(1, 1, vec![e, 21, 22, 23, 24, 25], none);
@@ -10381,19 +12454,30 @@ mod tests {
         };
         let region_ids: Vec<u32> = (0..PER).collect();
         let regions: Vec<(u32, u32, &[u32])> = (0..L).map(|l| (l, l * PER, &region_ids[..])).collect();
+        // The NURSERY (design 3.2): 4 slots carved from the main band, out of
+        // the pin budget; the hub hints the NEXT layer's picks as LIKELY words.
+        const NURSERY: usize = 4;
         let mut pool = ShardPool::seeded(N, &regions, 0.0);
         assert_eq!(pool.set_stage(STAGE), STAGE);
+        assert_eq!(pool.carve_nursery(NURSERY), NURSERY);
         let mut b2 = Box2Sim {
             pool,
             bg: Vec::new(),
-            budget: (N - STAGE - R) as u32,
+            budget: (N - STAGE - R - NURSERY) as u32,
             per: PER,
             global: seed % 2 == 1,
             early: EarlyPaged::default(),
             scripted: false,
+            // Odd seeds: gate/up-only LIKELY landings (design 3.4).
+            gateup_only: seed % 2 == 1,
             st: PinSimStats::default(),
         };
+        let occ0 = b2.pool.nursery_occupied() as i64;
         let mut ledger = PinLedger::new();
+        // The hub's NURSERY mirror (`b2_mirror` NURSERY bits): a reply replaces
+        // its layer's row; the filter skips an expert the mirror has.
+        let mut nursery_mirror: std::collections::HashSet<(u32, u32)> = Default::default();
+        let mut nursery_covered = 0u64;
         let mut wire: std::collections::VecDeque<SimReq> = Default::default();
         let mut replies: Vec<SimReply> = Vec::new();
         let mut sent: Vec<SimReq> = Vec::new();
@@ -10403,7 +12487,8 @@ mod tests {
         let mut held_checked = 0u64;
         let mut stale_maps = 0u64;
 
-        // held ⊆ pinned ⊆ landed, and the pinned count / budget.
+        // held ⊆ pinned ⊆ landed, and the pinned count / budget; the nursery's
+        // `lands = hits + recycled + delta(occupied)` and "never pinned".
         let check = |b2: &mut Box2Sim, ledger: &PinLedger, subset_violations: &mut u64| {
             let mut n_pinned = 0u32;
             for l in 0..L {
@@ -10417,13 +12502,32 @@ mod tests {
                     assert!(!pinned || r != 0, "pinned but not landed: L{l} e{e}");
                     // STAGING INVARIANT: pinned => landed in the MAIN band.
                     assert!(!pinned || ((-r - 1) as u32) < b2.pool.stage, "pinned in staging: L{l} e{e} slot {}", -r - 1);
+                    // NURSERY INVARIANT: pinned => not a nursery slot.
+                    assert!(!pinned || !b2.pool.nursery[(-r - 1) as usize], "pinned in the nursery: L{l} e{e} slot {}", -r - 1);
+                    // PARTIAL INVARIANT (design 3.4): pinned => whole; a partial
+                    // slot is never in a residency map and never held by the hub.
+                    assert!(!pinned || !b2.pool.partial[(-r - 1) as usize], "pinned a partial slot: L{l} e{e}");
+                    // The hub holding a partial slot is a `held ⊆ pinned` break
+                    // (a partial slot is never pinned): counted with the subset
+                    // violations, so the epoch-ignoring MUTATION run (which
+                    // holds stale entries on purpose) is caught, not panicked.
+                    if ledger.held(l, e) && r != 0 && b2.pool.partial[(-r - 1) as usize] {
+                        *subset_violations += 1;
+                    }
                 }
             }
+            assert!(b2.pool.pc.partial_promotions <= b2.pool.pc.partial_lands);
+            assert!(b2.pool.pc.completions + b2.pool.pc.partial_evicted <= b2.pool.pc.partial_lands + b2.pool.pc.demand_partial);
             if b2.pool.pins.on {
                 assert_eq!(n_pinned, b2.pool.pins.pinned, "pinned count drifted");
                 assert!(b2.pool.pins.pinned <= b2.pool.pins.budget);
             }
             b2.st.max_pinned = b2.st.max_pinned.max(b2.pool.pins.pinned);
+            let nc = b2.pool.nc;
+            let occ = b2.pool.nursery_occupied() as i64;
+            assert_eq!(nc.lands as i64, nc.hits as i64 + nc.recycled as i64 + (occ - occ0), "nursery invariant: {nc:?} occupied {occ} from {occ0}");
+            assert_eq!(b2.pool.nursery.iter().filter(|&&f| f).count() as u32, b2.pool.nursery_slots);
+            assert!(b2.pool.nursery_slots <= NURSERY as u32);
         };
 
         for _step in 0..300 {
@@ -10473,8 +12577,24 @@ mod tests {
                         .map(|e| (layer << 16) | e)
                         .collect();
                     let release = if pin_active { ledger.take_words(128) } else { Vec::new() };
+                    // LIKELY words: the hub's predicted-miss hints for the NEXT
+                    // layer -- its Zipf picks the ledger does not hold and the
+                    // NURSERY mirror does not already have (the filter's dedup).
+                    let nl = (layer + 1) % L;
+                    let mut likely: Vec<u32> = Vec::new();
+                    for _ in 0..rng.below(3) {
+                        let e = zipf(rng.below(u64::MAX), nl);
+                        if ledger.held(nl, e) {
+                            continue;
+                        }
+                        if nursery_mirror.contains(&(nl, e)) {
+                            nursery_covered += 1;
+                            continue;
+                        }
+                        likely.push((nl << 16) | e);
+                    }
                     seq += 1;
-                    let r = SimReq { seq, layer, b, sel, prefetch, release, held, pulled: false };
+                    let r = SimReq { seq, layer, b, sel, prefetch, release, likely, held, pulled: false };
                     sent.push(r.clone());
                     wire.push_back(r);
                     // Box 2 and the hub's reply consumption interleave at random;
@@ -10495,6 +12615,13 @@ mod tests {
                             let _ = ledger.apply_map(rp.layer, &rp.map, epoch);
                             surprises += surprise_count(&q.held, &rp.paged);
                             pin_active = true;
+                            // The NURSERY block: replace the reply layer's row,
+                            // add the other layers' entries; never a held one.
+                            nursery_mirror.retain(|&(l, _)| l != rp.layer);
+                            for &(l, e) in &rp.nursery {
+                                assert!(!(l == rp.layer && ledger.held(l, e)), "a nursery entry reported held: L{l} e{e}");
+                                nursery_mirror.insert((l, e));
+                            }
                         } else if act == 0 && !must {
                             break;
                         }
@@ -10510,7 +12637,464 @@ mod tests {
             held_checked,
             stale_maps,
             sc: b2.pool.sc,
+            nc: b2.pool.nc,
+            nursery_covered,
+            pc: b2.pool.pc,
             ..b2.st
+        }
+    }
+
+    // ---- the nursery (design 3.2, section 7 gates) ----
+
+    /// Three layers x 4 seeded slots; two nursery slots carved (spread: slots
+    /// 0 and 6, occupants (1,0) and (2,2) become entries).
+    fn nursery_pool(floor_frac: f32) -> ShardPool {
+        let ids: Vec<u32> = (0..4).collect();
+        let mut pool = ShardPool::seeded(12, &[(1, 0, &ids), (2, 4, &ids), (3, 8, &ids)], floor_frac);
+        assert_eq!(pool.carve_nursery(2), 2);
+        pool
+    }
+
+    fn occupied(pool: &ShardPool) -> u32 {
+        pool.nursery_occupied()
+    }
+
+    /// Carving relabels occupants into entries (counts move `held` ->
+    /// `nursery_held`); no victim search ever returns a nursery slot; the
+    /// recycle order is free, then unused (served `>= lanes` passes since the
+    /// landing), then the oldest landing; never a wanted slot; a landing
+    /// recycles (`recycled`, `on_evict` false) and maps the entry.
+    #[test]
+    fn nursery_carve_victims_and_recycle_order() {
+        let mut pool = nursery_pool(0.0);
+        assert_eq!((pool.nursery_slots, pool.nursery_target), (2, 2));
+        assert!(pool.nursery[0] && pool.nursery[6]);
+        assert_eq!((pool.held[1], pool.nursery_held[1], pool.held[2], pool.nursery_held[2]), (3, 1, 3, 1));
+        assert_eq!(occupied(&pool), 2);
+        assert!(pool.in_nursery(1, 0) && pool.in_nursery(2, 2) && !pool.in_nursery(1, 1));
+        // Claims of a fourth layer take every main slot in turn, never 0 or 6.
+        let want: Vec<u32> = (100..110).collect();
+        for &e in &want {
+            let (v, _) = pool.claim_miss(5, e, &want, &[], (0, 12), true, false, false).expect("a victim");
+            assert!(v != 0 && v != 6, "claim took nursery slot {v}");
+            pool.commit(5, e, v);
+        }
+        assert!(pool.claim_miss(5, 110, &want, &[], (0, 12), true, false, false).is_none(), "10 main slots, all wanted");
+        assert!(pool.pick_victim_any((0, 12), true, Band::Main, 5, &[], &[], 5, true, false).is_some_and(|v| v != 0 && v != 6));
+        // Recycle order: both entries are fresh (no pass since they landed):
+        // the oldest landing (tick 0 both) -> the lowest slot.
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0));
+        // Layer 2 served twice: (2,2) in slot 6 is UNUSED and goes first.
+        pool.note_serve(2);
+        pool.note_serve(2);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(6));
+        assert_eq!(pool.nursery_victim(9, &[], &[], 3), Some(0), "lanes 3: not yet unused");
+        // Never a wanted slot: the pass wants (2,2) -> slot 0; wants both -> none.
+        assert_eq!(pool.nursery_victim(2, &[2], &[], 2), Some(0));
+        assert_eq!(pool.nursery_victim(2, &[2], &[(1, 0)], 2), None);
+        // Landing: evict the occupant (recycled; never pinned so no violation),
+        // map the entry, count the land; the layer goes dirty by the landing.
+        let v = pool.nursery_victim(9, &[], &[], 2).unwrap();
+        assert_eq!(v, 6);
+        pool.dirty[7] = false;
+        assert_eq!(pool.evict(v, 9), Some((2, 2)));
+        assert_eq!((pool.nc.recycled, pool.nursery_held[2], pool.held[2]), (1, 0, 0), "layer 2's main slots went to the layer-5 claims above");
+        assert!(!pool.pins.on_evict(2, 2), "a nursery entry is never pinned");
+        pool.land_nursery(v, (7, 3));
+        assert_eq!(pool.nc.lands, 1);
+        assert_eq!(pool.slot_of.get(&(7, 3)), Some(&6));
+        assert_eq!(pool.remap_hosts[7][3], -7);
+        assert!(pool.dirty[7] && pool.in_nursery(7, 3));
+        assert_eq!((pool.nursery_held[7], pool.held[7]), (1, 0), "an entry is not in `held`");
+        assert_eq!(pool.last_use[6], 0, "0-class stamp");
+        // A free nursery slot goes first.
+        assert_eq!(pool.evict(0, 9), Some((1, 0)));
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0), "free first");
+        assert_eq!(occupied(&pool), 1);
+        assert_eq!(pool.nc, NurseryCounters { lands: 1, hits: 0, recycled: 2, drops: 0, shrunk: 0 });
+    }
+
+    /// Review of slices B+C, finding 2: an ARRIVED frame's nursery entries
+    /// (no certain read was issued for them) are not recycled by another
+    /// pass's LIKELY landing until that frame is served -- whether fresh or
+    /// "unused"; released per seq; the ring is bounded.
+    #[test]
+    fn nursery_entries_an_arrived_frame_relies_on_are_not_recycled() {
+        let mut pool = nursery_pool(0.0);
+        // R2 (seq 7) arrived wanting (1,0), a nursery entry in slot 0; make it
+        // "unused" too (layer 1 served twice since it landed).
+        pool.note_serve(1);
+        pool.note_serve(1);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0), "unprotected: the unused entry goes first");
+        pool.protect_nursery(7, &[(1, 0)]);
+        assert!(pool.nursery_protected((1, 0)) && !pool.nursery_protected((2, 2)));
+        // R1's ensure lands a LIKELY read: it must take the OTHER slot.
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(6));
+        pool.protect_nursery(8, &[(2, 2)]);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), None, "both entries relied on: the landing is dropped");
+        // R2 served: its entry is fair game again; R1's (seq 8) still protected.
+        pool.unprotect_nursery(7);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0));
+        pool.unprotect_nursery(8);
+        assert_eq!(pool.nursery_victim(9, &[], &[], 2), Some(0));
+        // Empty key lists are not kept; the ring is bounded to `EarlyPaged::MAX`.
+        pool.protect_nursery(9, &[]);
+        assert!(pool.nursery_protect.is_empty());
+        for s in 0..(EarlyPaged::MAX as u32 + 5) {
+            pool.protect_nursery(100 + s, &[(1, 0)]);
+        }
+        assert_eq!(pool.nursery_protect.len(), EarlyPaged::MAX);
+        assert_eq!(pool.nursery_protect[0].0, 105, "the oldest were dropped");
+        pool.unprotect_nursery(999);
+        assert!(pool.nursery_protected((1, 0)));
+    }
+
+    /// `SeqRing` (`likely_words_in`): a frame's LIKELY words are applied at
+    /// its first sight only; the ring is bounded, the oldest seq forgotten.
+    #[test]
+    fn seq_ring_dedups_by_seq_and_evicts_the_oldest() {
+        let mut r = SeqRing::new(3);
+        assert!(r.is_empty());
+        assert!(r.insert(10) && !r.insert(10), "second sight of 10 is a no-op");
+        assert!(r.insert(11) && r.insert(12));
+        assert_eq!(r.len(), 3);
+        assert!(r.insert(13), "a 4th seq evicts the oldest (10)");
+        assert!(r.insert(10), "10 was forgotten: seen again");
+        assert!(!r.insert(12) && !r.insert(13));
+        r.clear();
+        assert!(r.insert(12));
+        assert_eq!(SeqRing::new(0).cap, 1, "never a zero-capacity ring");
+    }
+
+    /// Two-phase landing (design 3.4): the PARTIAL state machine on the pool
+    /// -- a gate/up-only landing is resident for the kernel (`slot_of`,
+    /// `is_resident_pool`) but never pinnable, never in a residency / soft
+    /// map, not resident for pass A, PAGED for the reply; `complete` ends it,
+    /// a full landing or an eviction clears it; promotions are counted.
+    #[test]
+    fn partial_slots_are_masked_until_completed() {
+        let mut pool = nursery_pool(0.0);
+        assert_eq!((ROLES_GATEUP, ROLES_ALL, ROLE_DOWN), (3, 7, 4));
+        assert!(role_in(ROLES_GATEUP, 0) && role_in(ROLES_GATEUP, 1) && !role_in(ROLES_GATEUP, 2) && role_in(ROLE_DOWN, 2));
+        // A LIKELY gate/up-only landing into the nursery (slot 6 after a recycle).
+        assert_eq!(pool.evict(6, 9), Some((2, 2)));
+        pool.land_nursery(6, (7, 3));
+        pool.mark_partial(6);
+        pool.pc.partial_lands += 1;
+        assert!(pool.is_partial(7, 3) && pool.in_nursery(7, 3) && pool.slot_of.contains_key(&(7, 3)));
+        assert_eq!(pool.partial_count(), 1);
+        // Masked: not whole, not pinnable (even granted), the paged predicate sees it.
+        let row = pool.remap_hosts[7].clone();
+        assert!(landed_main(row[3], &pool.nursery) || pool.nursery[6], "a nursery slot is masked by landed_main already");
+        pool.pins.enable(8);
+        // Promote on use: the entry stays PARTIAL (the pass reads its down).
+        assert!(pool.touch_hit(7, 3, false));
+        assert!(pool.is_partial(7, 3) && !pool.in_nursery(7, 3));
+        assert_eq!(pool.pc.partial_promotions, 1);
+        let row = pool.remap_hosts[7].clone();
+        assert!(landed_main(row[3], &pool.nursery), "promoted: a main slot");
+        assert!(!landed_whole(row[3], &pool.nursery, &pool.partial), "... but partial: not in any residency map");
+        pool.pins.grant(7, 3);
+        let map = pool.pins.report(7, &row, pool.stage, &pool.nursery, &pool.partial);
+        assert_eq!(map[0] & (1 << 3), 0, "a partial slot is never pinned");
+        assert!(!pool.pins.is_pinned(7, 3));
+        // The phase plan: a partial wanted expert is a down-only read (Full /
+        // Down), untouched by GateUp; a miss is read under Full / GateUp only.
+        let resident = |e: u32| e == 1;
+        let partial = |e: u32| e == 3;
+        assert_eq!(phase_plan(&[1, 3, 5], resident, partial, EnsurePhase::Full), (vec![5], vec![3]));
+        assert_eq!(phase_plan(&[1, 3, 5], resident, partial, EnsurePhase::GateUp), (vec![5], vec![]));
+        assert_eq!(phase_plan(&[1, 3, 5], resident, partial, EnsurePhase::Down), (vec![], vec![3]));
+        // Completion (the down role landed): whole, pinnable at the next report.
+        pool.complete(7, 3);
+        assert!(!pool.is_partial(7, 3) && pool.pc.completions == 1 && pool.partial_count() == 0);
+        assert!(landed_whole(row[3], &pool.nursery, &pool.partial));
+        pool.pins.grant(7, 3);
+        let map = pool.pins.report(7, &row, pool.stage, &pool.nursery, &pool.partial);
+        assert_ne!(map[0] & (1 << 3), 0);
+        pool.complete(7, 3);
+        assert_eq!(pool.pc.completions, 1, "completing a whole slot is a no-op");
+        // Eviction of a partial slot clears the state and counts it.
+        pool.pins.release((7 << 16) | 3);
+        pool.mark_partial(6);
+        assert_eq!(pool.evict(6, 9), Some((7, 3)));
+        assert!(!pool.partial[6] && pool.pc.partial_evicted == 1);
+        // A full landing over a partial slot clears it; a claim rollback too.
+        pool.nursery[6] = false;
+        pool.nursery_slots -= 1;
+        pool.mark_partial(6);
+        pool.land(6, (8, 8), false);
+        assert!(!pool.partial[6]);
+        let (v, _) = pool.claim_miss(9, 9, &[9], &[], (0, 12), true, false, false).unwrap();
+        pool.mark_partial(v);
+        pool.unclaim(9, 9, v);
+        assert!(!pool.partial[v as usize]);
+        // Invariants: promotions <= lands, completions + evicted <= lands + promotions' worth.
+        assert!(pool.pc.partial_promotions <= pool.pc.partial_lands);
+        assert_eq!(pool.pc, PartialCounters { partial_lands: 1, partial_promotions: 1, completions: 1, partial_evicted: 1, demand_partial: 0 });
+    }
+
+    /// The early-page hook's plan under partial slots (review of 9f713ac,
+    /// finding 3): a queued frame's pick in a PARTIAL slot gets a certain
+    /// DOWN-only read; a non-resident pick a whole read; a whole-resident or
+    /// out-of-range pick nothing; duplicates once.
+    #[test]
+    fn early_page_plan_issues_down_reads_for_partial_entries() {
+        let resident = |e: u32| e == 1 || e == 3; // 3 is partial (resident for the hook)
+        let partial = |e: u32| e == 3;
+        let (words, down) = early_page_plan(5, &[1, 3, 7, 3, -1, 7, 400], resident, partial);
+        assert_eq!(words, vec![(5 << 16) | 7], "7 not resident; 1 whole; 3 partial");
+        assert_eq!(down, vec![(5 << 16) | 3]);
+        // The daemon's down-only word path: a down-only read is for a partial
+        // entry only (the dedup in `prefetch_words_core`).
+        let pool = nursery_pool(0.0);
+        assert!(!pool.is_partial(1, 1));
+    }
+
+    /// Review of 9f713ac, finding 2: GateUp + Down leave the pool's serve
+    /// clock exactly as one Full pass (the Down phase runs no prologue), and
+    /// the stripe plan covers a span exactly, aligned, on the right drives.
+    #[test]
+    fn two_phase_accounting_equals_one_full_pass_and_stripes_cover_the_span() {
+        // The serve clock: what `ensure` does per phase (mirrors the gating in
+        // `ensure_layer_inner`: `note_serve` and the request / hit accounting
+        // only when the phase is not Down).
+        let mut a = nursery_pool(0.0);
+        let mut b = nursery_pool(0.0);
+        for phase in [EnsurePhase::GateUp, EnsurePhase::Down] {
+            if phase != EnsurePhase::Down {
+                a.note_serve(1);
+            }
+        }
+        b.note_serve(1); // one Full pass
+        assert_eq!(a.serves[1], b.serves[1]);
+        assert_eq!(a.serves[1], 1, "two-phase advanced the clock once");
+        // `likely_gateup_only` needs `land_two_phase`.
+        assert!(knobs::LIKELY_GATEUP_ONLY.set("1") && knobs::LAND_TWO_PHASE.set("0"));
+        assert!(!knobs::likely_gateup_only(), "gate/up-only hints are forced off without the two-phase landing");
+        assert!(knobs::LAND_TWO_PHASE.set("1"));
+        assert!(knobs::likely_gateup_only());
+        assert!(knobs::LIKELY_GATEUP_ONLY.set("0") && knobs::LAND_TWO_PHASE.set("0"));
+        assert!(matches!(knobs::ROLE_STRIPES.kind, crate::knobs::Kind::Int { default: 3, .. }));
+        // The stripe plan.
+        use v4flash_core::safetensors::stripe_plan;
+        let a4 = 4096;
+        let plan = stripe_plan(12 * a4, 5 * a4, 3);
+        assert_eq!(plan, vec![(0, 4 * a4, false), (4 * a4, a4, false), (5 * a4, 3 * a4, true), (8 * a4, 4 * a4, true)], "the piece straddling the cut is split at it");
+        let cover: usize = plan.iter().map(|p| p.1).sum();
+        assert_eq!(cover, 12 * a4);
+        assert!(plan.iter().all(|p| p.0 % a4 == 0 && p.1 % a4 == 0));
+        assert_eq!(stripe_plan(12 * a4, 0, 3), vec![(0, 4 * a4, true), (4 * a4, 4 * a4, true), (8 * a4, 4 * a4, true)], "mirror only");
+        assert_eq!(stripe_plan(12 * a4, 12 * a4, 3).iter().filter(|p| p.2).count(), 0, "primary only");
+        assert_eq!(stripe_plan(2 * a4, a4, 8).len(), 2, "never more pieces than blocks");
+        assert_eq!(stripe_plan(12 * a4, 6 * a4, 1), vec![(0, 6 * a4, false), (6 * a4, 6 * a4, true)], "1 stripe = the split read's two halves");
+    }
+
+    /// `touch_hit` on an entry RELABELS it (main `held`, decode-hit stamp,
+    /// flag off, `hits`), and the refill takes the main pool's victim --
+    /// never a hub pin, never a wanted slot, `me_account`ed -- else shrinks;
+    /// a shrunk nursery refills from a free main slot.
+    #[test]
+    fn nursery_promote_on_hit_relabels_and_refills() {
+        let mut pool = nursery_pool(0.0);
+        let tick0 = pool.tick;
+        // The hit: a decode pass of layer 1 wanting 0 and 1.
+        assert!(pool.touch_hit(1, 0, false));
+        assert!(!pool.nursery[0] && !pool.in_nursery(1, 0));
+        assert_eq!((pool.held[1], pool.nursery_held[1], pool.nursery_slots), (4, 0, 1));
+        assert_eq!(pool.nc.hits, 1);
+        assert_eq!(pool.last_use[0], tick0 + 1 + PREFILL_AGE, "exactly a demand hit's stamp");
+        assert_eq!(pool.remap_hosts[1][0], -1, "no remap write: it already points here");
+        assert!(!pool.dirty[1], "no dirty by the relabel");
+        // Refill: LRU main slot that is not wanted. Layer 1's slots are the
+        // oldest; 0 was just touched and 1 is wanted -> slot 2 ((1,2)).
+        assert_eq!(pool.nursery_refill((0, 4), true, 1, &[0, 1], &[], false), Some(2));
+        assert!(pool.nursery[2] && pool.owner_of[2].is_none());
+        assert_eq!((pool.nursery_slots, pool.held[1], pool.nc.shrunk), (2, 3, 0));
+        assert!(!pool.slot_of.contains_key(&(1, 2)), "the refill victim was evicted");
+        assert_eq!(pool.nursery_refill((0, 4), true, 1, &[], &[], false), None, "at target: nothing to do");
+        // Pins: pin every main slot but one; the refill takes that one; with
+        // every candidate pinned it SHRINKS (never revokes a hub pin).
+        pool.pins.enable(64);
+        for sl in 0..12 {
+            if let Some((l, e)) = pool.owner_of[sl] {
+                if !pool.nursery[sl] && (l, e) != (3, 3) {
+                    pool.pins.grant(l, e);
+                }
+            }
+        }
+        for l in 1..=3 {
+            let row = pool.remap_hosts[l as usize].clone();
+            let _ = pool.pins.report(l, &row, pool.stage, &pool.nursery, &pool.partial);
+        }
+        assert_eq!(pool.pins.pinned, 9, "10 main occupants (slot 0 promoted, slot 2 now nursery) minus (3,3)");
+        assert!(pool.touch_hit(2, 2, false), "promote the other entry");
+        assert_eq!(pool.nursery_refill((4, 8), true, 2, &[2], &[], false), Some(11), "the only unpinned main slot");
+        assert_eq!(pool.pins.c.pinned_evictions, 0);
+        pool.pins.grant(3, 3);
+        // Land a hint in the free slot 11, promote it, and now every main slot is pinned.
+        pool.land_nursery(11, (8, 1));
+        pool.pins.grant(8, 1);
+        let row = pool.remap_hosts[8].clone();
+        let _ = pool.pins.report(8, &row, pool.stage, &pool.nursery, &pool.partial);
+        assert!(!pool.pins.is_pinned(8, 1), "granted but still a nursery entry: not pinnable");
+        assert!(pool.touch_hit(8, 1, false));
+        pool.pins.grant(8, 1); // the request's own `pin_grant` (no promotion grant)
+        let _ = pool.pins.report(8, &row, pool.stage, &pool.nursery, &pool.partial);
+        assert!(pool.pins.is_pinned(8, 1), "promoted: pinnable at the next report");
+        // (2,2), promoted above into slot 6, is the last unpinned main slot: pin it too.
+        pool.pins.grant(2, 2);
+        let row2 = pool.remap_hosts[2].clone();
+        let _ = pool.pins.report(2, &row2, pool.stage, &pool.nursery, &pool.partial);
+        assert!(pool.pins.is_pinned(2, 2));
+        assert_eq!(pool.nursery_refill((0, 12), true, 8, &[1], &[], false), None, "every main slot pinned: shrink, never revoke");
+        assert_eq!((pool.nc.shrunk, pool.nursery_slots), (1, 1));
+        // A free main slot refills a shrunk nursery.
+        pool.pins.release((8 << 16) | 1);
+        assert_eq!(pool.evict(11, 8), Some((8, 1)));
+        assert_eq!(pool.pins.c.pinned_evictions, 0);
+        pool.nursery_refill_free();
+        assert_eq!(pool.nursery_slots, 2);
+        assert!(pool.nursery[11]);
+        // `me_account` ran on the refill victim: a prefill-mode refill in a
+        // prefill phase counts its decode victim.
+        let mut p2 = nursery_pool(0.0);
+        p2.enable_mode_evict(10);
+        p2.me_note_request(true);
+        assert!(p2.touch_hit(1, 0, true));
+        let before = p2.me.c;
+        assert!(p2.nursery_refill((0, 4), true, 1, &[0], &[], true).is_some());
+        assert_ne!(p2.me.c, before, "the refill victim was accounted");
+    }
+
+    /// `held` excludes nursery entries: a layer whose MAIN slots are at its
+    /// floor keeps them against a foreign claim even though one of its
+    /// experts sits in the nursery (counting it would let a main slot go).
+    #[test]
+    fn nursery_entries_do_not_count_toward_the_floor() {
+        // floor 3 of 4 per layer; layer 1 has 3 main + 1 nursery entry.
+        let mut pool = nursery_pool(0.75);
+        assert_eq!((pool.floor[1], pool.held[1], pool.nursery_held[1]), (3, 3, 1));
+        // Layer 2: 3 main (slot 6 is a nursery entry) -> also at its floor.
+        // Layer 3: 4 main > floor 3: the ONLY foreign victim is one of layer
+        // 3's; after it every layer is at its floor and a second claim finds
+        // nothing -- although layers 1 and 2 each hold 4 experts counting
+        // their nursery entries.
+        let want = [100u32, 101];
+        let (v, ev) = pool.claim_miss(5, 100, &want, &[], (0, 12), true, false, false).expect("victim");
+        assert!((8..12).contains(&v) && ev.is_some_and(|(l, _)| l == 3), "slot {v} from {ev:?}");
+        pool.commit(5, 100, v);
+        assert_eq!(pool.held[3], 3, "layer 3 stopped at its floor");
+        assert!(pool.claim_miss(5, 101, &want, &[], (0, 12), true, false, false).is_none(), "layers 1-2's main slots stayed protected");
+        // The nursery entries themselves are still resident and promotable.
+        assert!(pool.in_nursery(1, 0) && pool.in_nursery(2, 2));
+    }
+
+    /// Maps: `PinBook::report` never pins a nursery slot (a granted, landed
+    /// entry is treated as a staging slot: aged, not pinned, not in the map);
+    /// `residency_words`' predicate masks a nursery slot.
+    #[test]
+    fn nursery_slots_are_never_pinnable_and_are_masked() {
+        let mut p = PinBook::off();
+        p.enable(8);
+        let mut row = vec![0i32; REMAP_LEN];
+        row[2] = -1; // slot 0, a nursery slot
+        row[3] = -2; // slot 1, main
+        let mut nursery = vec![false; 4];
+        nursery[0] = true;
+        p.grant(1, 2);
+        p.grant(1, 3);
+        let w = p.report(1, &row, 4, &nursery, &[]);
+        assert_eq!(w[0], 1 << 3, "only the main slot's expert is pinned");
+        assert!(!p.is_pinned(1, 2) && p.is_pinned(1, 3));
+        assert!(!p.on_evict(1, 2), "evicting (recycling) a nursery entry is never a violation");
+        assert_eq!(p.pinned, 1);
+        // The same row with the slot promoted (flag off) pins it.
+        nursery[0] = false;
+        p.grant(1, 2);
+        assert_eq!(p.report(1, &row, 4, &nursery, &[])[0], (1 << 2) | (1 << 3));
+        // `residency_words`: landed in main only.
+        let n = [true, false];
+        assert!(!landed_main(0, &n), "not landed");
+        assert!(!landed_main(-1, &n), "slot 0 is a nursery slot");
+        assert!(landed_main(-2, &n));
+        assert!(landed_main(-3, &n), "a slot past the mask is main");
+    }
+
+    /// `lands = hits + recycled + delta(occupied)` over a random sequence of
+    /// landings, hits (with refills, some of which shrink) and shrink refills.
+    #[test]
+    fn nursery_lands_invariant() {
+        for seed in 1..=6u64 {
+            let mut rng = SimRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let ids: Vec<u32> = (0..6).collect();
+            let mut pool = ShardPool::seeded(24, &[(1, 0, &ids), (2, 6, &ids), (3, 12, &ids), (4, 18, &ids)], 0.0);
+            assert_eq!(pool.carve_nursery(4), 4);
+            pool.pins.enable(12);
+            let occ0 = pool.nursery_occupied();
+            let check = |pool: &ShardPool, step: usize| {
+                let occ = pool.nursery_occupied() as i64;
+                assert_eq!(pool.nc.lands as i64, pool.nc.hits as i64 + pool.nc.recycled as i64 + (occ - occ0 as i64), "seed {seed} step {step}: {:?} occupied {occ} (from {occ0})", pool.nc);
+                assert_eq!(pool.nursery.iter().filter(|&&f| f).count() as u32, pool.nursery_slots, "seed {seed} step {step}: flag count");
+                let nh: u32 = (0..24).filter(|&sl| pool.nursery[sl] && pool.owner_of[sl].is_some()).count() as u32;
+                assert_eq!(nh, pool.nursery_held.iter().sum::<u32>(), "seed {seed} step {step}: nursery_held");
+                let mh: u32 = (0..24).filter(|&sl| !pool.nursery[sl] && pool.owner_of[sl].is_some()).count() as u32;
+                assert_eq!(mh, pool.held.iter().sum::<u32>(), "seed {seed} step {step}: held");
+            };
+            let (mut hits, mut lands, mut shrunk) = (0, 0, 0);
+            for step in 0..2000 {
+                let layer = 1 + rng.below(4) as u32;
+                let e = rng.below(12) as u32;
+                match rng.below(4) {
+                    0 | 1 => {
+                        // A hint lands (skipping keys already resident, as the readers do).
+                        if pool.slot_of.contains_key(&(layer, e)) {
+                            continue;
+                        }
+                        let want = [rng.below(12) as u32];
+                        if let Some(v) = pool.nursery_victim(layer, &want, &[], 2) {
+                            let _ = pool.evict(v, layer);
+                            pool.land_nursery(v, (layer, e));
+                            lands += 1;
+                        } else {
+                            pool.nc.drops += 1;
+                        }
+                    }
+                    2 => {
+                        // A pass of `layer` wanting e (hit or claim), refill on a promotion.
+                        pool.note_serve(layer);
+                        let was = pool.in_nursery(layer, e);
+                        if pool.touch_hit(layer, e, false) {
+                            if was {
+                                hits += 1;
+                                let s0 = pool.nc.shrunk;
+                                pool.nursery_refill((0, 24), true, layer, &[e], &[], false);
+                                shrunk += pool.nc.shrunk - s0;
+                            }
+                        } else if let Some((v, _)) = pool.claim_miss(layer, e, &[e], &[], (0, 24), true, false, false) {
+                            pool.commit(layer, e, v);
+                        }
+                        // Pin a few of the layer's experts at its report (never a nursery one).
+                        if rng.below(3) == 0 {
+                            pool.pins.grant(layer, e);
+                            let row = pool.remap_hosts[layer as usize].clone();
+                            let _ = pool.pins.report(layer, &row, pool.stage, &pool.nursery, &pool.partial);
+                            assert!(!pool.in_nursery(layer, e) || !pool.pins.is_pinned(layer, e), "pinned a nursery entry");
+                        }
+                    }
+                    _ => {
+                        if rng.below(4) == 0 {
+                            pool.pins.release((layer << 16) | e);
+                        }
+                        pool.nursery_refill_free();
+                    }
+                }
+                check(&pool, step);
+            }
+            assert_eq!((pool.nc.lands, pool.nc.hits), (lands, hits), "seed {seed}");
+            assert_eq!(pool.nc.shrunk, shrunk);
+            assert!(lands > 200 && hits > 10 && pool.nc.recycled > 50, "seed {seed}: not exercised {:?}", pool.nc);
+            assert_eq!(pool.pins.c.pinned_evictions, 0, "seed {seed}");
         }
     }
 

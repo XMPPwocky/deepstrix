@@ -7,7 +7,7 @@ use super::evtrace::Kind;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Every hub/box-2 kind (added to `evtrace`'s header list).
-pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED];
+pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED, &HUB_LH2];
 
 // ---- hub: step context for per-request records ----
 
@@ -64,6 +64,9 @@ pub static HUB_REQ: Kind = Kind {
         // page anyway (SURPRISES: must be 0), box 2's paged experts for the
         // pass, and its pinned count / release epoch.
         "n_held", "n_surprise", "n_paged", "pinned", "pin_epoch",
+        // predicted-miss hint words on the frame (`het::lookahead`; 0 until
+        // slice B puts them on the wire)
+        "n_hint_words",
     ],
 };
 
@@ -133,12 +136,97 @@ pub static HUB_STEP: Kind = Kind {
         "lh_excl", "lh_audit", "lh_remap_h2d", "lh_work_items_sync", "lh_remote_wait", "lh_pager_sync_igpu", "lh_engram_join",
         "lh_work_items_count", "lh_sel_d2h", "lh_sub", "lh_wic_busy_x1e3", "lh_wic_idle_x1e3", "lh_seld2h_busy_x1e3",
         "lh_seld2h_idle_x1e3", "lh_remote_sync", "lh_remote_upload",
+        // predicted-miss look-ahead host cost (`het::lookahead`; design 2.6):
+        // the two dGPU launches in the chain enqueue, and the filter + dry
+        // matching + queue at Route
+        "lh_look_launch", "lh_look_filter",
         ;
         // context
         "pos_min", "pos_max",
         // Tier B (see above)
         "dev_skipped", "t_fwd_sync",
     ),
+};
+
+/// Per-step counters of the predicted-miss look-ahead prefetch
+/// (`V41_B2_MISS_PREFETCH`, `het::lookahead`; design section 6) and of the
+/// per-step speculative budget (`V41_B2_SPEC_BUDGET`): one record per decode
+/// step while either is on, joined to `hub_step` by `step` (`hub_step` is at
+/// its field limit). Per R in 1..=3, summed over the step's lane-layers:
+/// box-2-owned predicted picks of rank `<= R`, distinct per LANE-layer only
+/// (two or three lanes predicting one expert for one layer count two or three
+/// times, and a step's 40 layers each count their own; the hint WORDS are
+/// deduped across lanes and the step) (`cand`), the mirror-non-resident ones among them
+/// (`nonres`), and of THOSE the ones in the SAME lane's own picks one
+/// lane-layer later (`dry_hits`: the live Step 0; `dry_hits_r1 / nonres_r1` is
+/// rank-1 recall, 0.71 in design section 1 -- a FLOOR: a hint the other lane's
+/// rows demand counts as a miss, so the bar is conservative). `dry_words` = hint
+/// words at the knob's R and cap the queue handed a decode submit (slice A:
+/// counted, kept off the wire -- the volume the absolute abort bar of section
+/// 5 reads); `hints_sent` = words on the wire (0 in slice A); `dropped_cap`,
+/// `stale` = words the per-request cap / the stale rule dropped;
+/// `budget_deferred` = admission / restore words the budget held back vs
+/// today's per-request rule, summed over the step's requests. SLICE B (hints
+/// on the wire under `k1`/`k2` once box 2 answers `RESP_FLAG_NURSERY`):
+/// `demanded` = sent hints whose expert the SAME lane picked at the target
+/// layer (`demanded_prot`: of rank `<= V41_SUB_PROTECT`, i.e. a read the prior
+/// could not have avoided), `paged_hinted` = paged experts in pin replies that
+/// had been hinted this step (tail recall: the hint was late or dropped),
+/// `nursery_covered` = would-be hints already in box 2's nursery per the
+/// mirror (deduped), `look_late` = 0 under `PLACE=before` (reserved for
+/// `after`), `bar_trips` = steps that hit an abort bar (design 5) and went dry.
+/// SLICE A AMENDMENT (10-06): `dry_hits_prot_rN` = of the non-resident
+/// predictions of rank `<= N`, the ones whose own pick at the target layer
+/// is at ACTUAL rank `<= V41_SUB_PROTECT` (the prior cannot swap it: the
+/// precision that matters is `dry_hits_prot_r1 / nonres_r1`; `dry_hits_rN`
+/// is the any-rank diagnostic); `nonres_m{k}` = non-resident predicted
+/// rank-1 picks with a gate margin `>= 0 / 0.1 / 0.2 / 0.3` over the predicted
+/// rank 2, and `hits_prot_m{k}` the protected hits among them: one dry run
+/// picks `V41_B2_MISS_PREFETCH_MARGIN`.
+pub static HUB_LH2: Kind = Kind {
+    id: 15,
+    name: "hub_lh2",
+    fields: &[
+        "step", "rows",
+        "lh2_cand_r1", "lh2_cand_r2", "lh2_cand_r3", "lh2_nonres_r1", "lh2_nonres_r2", "lh2_nonres_r3",
+        "lh2_dry_hits_r1", "lh2_dry_hits_r2", "lh2_dry_hits_r3", "lh2_dry_words", "lh2_hints_sent", "lh2_dropped_cap", "lh2_stale",
+        "lh2_budget_deferred",
+        "lh2_demanded", "lh2_demanded_prot", "lh2_paged_hinted", "lh2_nursery_covered", "lh2_look_late", "lh2_bar_trips",
+        "lh2_dry_hits_prot_r1", "lh2_dry_hits_prot_r2", "lh2_dry_hits_prot_r3",
+        "lh2_nonres_m0", "lh2_nonres_m1", "lh2_nonres_m2", "lh2_nonres_m3",
+        "lh2_hits_prot_m0", "lh2_hits_prot_m1", "lh2_hits_prot_m2", "lh2_hits_prot_m3",
+        // The REFINED OBJECTIVE (owner 10-06, design section 6): of the
+        // protected dry hits, the ones the lane-layer's reply PAGED (per R, per
+        // margin bucket) and of those the ones whose reply the lane STALLED on
+        // (Post found it not ready); `prot_paged_late_total` = the request's
+        // protected non-resident picks that were paged AND late, hinted or
+        // not = the reads the step blocked on (the recall denominator).
+        "lh2_hits_prot_paged_r1", "lh2_hits_prot_paged_r2", "lh2_hits_prot_paged_r3",
+        "lh2_hits_prot_paged_m0", "lh2_hits_prot_paged_m1", "lh2_hits_prot_paged_m2", "lh2_hits_prot_paged_m3",
+        "lh2_hits_prot_late_r1", "lh2_hits_prot_late_r2", "lh2_hits_prot_late_r3",
+        "lh2_hits_prot_late_m0", "lh2_hits_prot_late_m1", "lh2_hits_prot_late_m2", "lh2_hits_prot_late_m3",
+        "lh2_prot_paged_late_total",
+        // ANY-rank (owner 10-06: every paged read stalls the lane; recall
+        // against the reads we block on is the metric, R up to 6 in play):
+        // per predicted R in 1..=6, hinted (non-resident) words the same
+        // lane's reply at the target layer PAGED at any actual rank, and of
+        // those the late ones; the rank-1 ones per margin bucket. Then the
+        // step's denominators from the decode replies' PAGED bitsets: all
+        // paged experts, on late replies, the mirror-held ones at submit
+        // (surprises, ~0 under pins), the mirror-non-resident ones (the
+        // hintable misses: minus the predictor's hits = what its top-R missed).
+        "lh2_hits_paged_any_r1", "lh2_hits_paged_any_r2", "lh2_hits_paged_any_r3", "lh2_hits_paged_any_r4", "lh2_hits_paged_any_r5", "lh2_hits_paged_any_r6",
+        "lh2_hits_late_any_r1", "lh2_hits_late_any_r2", "lh2_hits_late_any_r3", "lh2_hits_late_any_r4", "lh2_hits_late_any_r5", "lh2_hits_late_any_r6",
+        "lh2_hits_paged_any_m0", "lh2_hits_paged_any_m1", "lh2_hits_paged_any_m2", "lh2_hits_paged_any_m3",
+        "lh2_hits_late_any_m0", "lh2_hits_late_any_m1", "lh2_hits_late_any_m2", "lh2_hits_late_any_m3",
+        "lh2_paged_total", "lh2_paged_late_total", "lh2_paged_mirror_held", "lh2_paged_mirror_nonres",
+        // The SOFT-HELD map (`V41_B2_SOFT_MAP`): soft experts received per
+        // step (summed over the decode replies), paged experts the mirror had
+        // as soft at submit (evicted between the reply and the pick), and --
+        // under `V41_B2_SOFT_PRIOR` -- plain box-2 picks resident only by
+        // softness (what the prior would have treated as missing).
+        "lh2_soft_total", "lh2_paged_mirror_soft", "sub_soft_unswapped",
+    ],
 };
 
 /// One decode step's device time on one device, from the Tier B thread
@@ -223,6 +311,24 @@ pub static B2_REQ: Kind = Kind {
         // claim into staging, or a prefill claim into main; 0 by design at the
         // default sizes).
         "stage_claims", "stage_hits", "stage_spills",
+        // the NURSERY (docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md 3.2, 6):
+        // LIKELY readers running / queued at dequeue; the request's LIKELY
+        // (`REQ_FLAG_LIKELY`) words; nursery counter deltas across the request
+        // -- lands, hits (promotions), recycled (unused entries a later hint
+        // evicted = wrong hints), drops (no staging set / no nursery slot),
+        // shrunk (a promotion found no refill victim) -- and the occupied
+        // level after it. Per step: `lands = hits + recycled + delta(occupied)`.
+        "pf_run_likely", "pf_q_likely", "n_likely_words",
+        "nursery_lands", "nursery_hits", "nursery_recycled", "nursery_drops", "nursery_shrunk", "nursery_occupied",
+        // TWO-PHASE LANDING (design 3.4, `land_two_phase` / `likely_gateup_only`):
+        // gate/up-only landings and their promotions across the request, the
+        // PARTIAL slots after it, and the us the request's `ensure` phases
+        // waited on the gate/up reads and on the down reads (under two-phase
+        // the down wait overlaps the gate/up kernels).
+        // `down_exposed`: the share of the request's two-phase passes whose
+        // down read ended after the gate/up kernels (1 = fully exposed, 0 =
+        // hidden under them; NaN = no two-phase pass).
+        "partial_lands", "partial_promotions", "partial_slots", "gateup_wait_us", "down_wait_us", "down_exposed",
     ],
 };
 
@@ -250,7 +356,8 @@ pub static B2_ENSURE: Kind = Kind {
 
 /// One expert read on box 2. `src`: 0 demand miss (`ensure`), 1 background
 /// read popped as certain, 2 popped speculative but made certain before its
-/// read, 3 speculative. Demand: emitted after its repack (`t_hint` = the
+/// read, 3 speculative, 4 LIKELY (a hub predicted-miss hint, landing in the
+/// nursery; `victim_*` = the recycled entry). Demand: emitted after its repack (`t_hint` = the
 /// ensure start, `t_pop` = its chunk start). Background: emitted when the
 /// compute thread LANDS it (`t_recv` = received, `t_land_*` = victim + repack
 /// + commit). `rK_start/end` = the three role reader threads; `pause_ns` =

@@ -3770,6 +3770,11 @@ struct RbLayout {
     packed: bool,
     sel: Option<(u32, u32)>,
     look: Option<(u32, u32)>,
+    /// Layer L+1's look-ahead gate WEIGHTS (`sd.look_ew`, `[rows][n_used]`,
+    /// rank order, normalized to the row's top-k sum): the predicted-miss
+    /// prefetch's margin filter (`het::lookahead::Pred::margin`). L+2's are
+    /// not packed (`RB_PACK_MAX_SEG`; k2 is slice E).
+    look_ew: Option<(u32, u32)>,
     look2: Option<(u32, u32)>,
     alts: Option<(u32, u32)>,
     alt_w: Option<(u32, u32)>,
@@ -3832,6 +3837,10 @@ pub struct PreMoeCarry {
     /// (`router_alts()`, or 0 on a hash-router layer, whose picks come from
     /// the host and leave `d_alts` stale).
     n_alt: u32,
+    /// Predicted-miss prefetch (`V41_B2_MISS_PREFETCH`): the step's knob
+    /// snapshot `pre_moe_chain` decided the look-ahead launches and the pack's
+    /// `look` segments from; `pre_moe_route` reads the same copy.
+    mp: super::lookahead::Cfg,
     /// Readback pack layout for this lane-layer (`packed == false`: the copy batch).
     rb: RbLayout,
     // route -> prep
@@ -3974,6 +3983,7 @@ impl HeterogeneousEngine {
         // Decode-phase link window (the rows are decode rows of live streams).
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
+        super::lookahead::begin_step(super::b2_mirror::step(), tokens.len());
         let slots = rows.slots();
         let b = tokens.len();
         if b == 0 {
@@ -4075,6 +4085,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<(RowTables, RowTables)> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
+        super::lookahead::begin_step(super::b2_mirror::step(), tokens.len());
         let slots = rows.slots();
         let b = tokens.len();
         if b < 2 {
@@ -4267,6 +4278,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
+        super::lookahead::begin_step(super::b2_mirror::step(), tokens.len());
         let slots = rows.slots();
         let b = tokens.len();
         let n = lanes.len();
@@ -4419,6 +4431,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
+        super::lookahead::begin_step(super::b2_mirror::step(), tokens.len());
         let slots = rows.slots();
         let b = tokens.len();
         let n = lanes.len();
@@ -4499,6 +4512,9 @@ impl HeterogeneousEngine {
                 stage(self, bd, l, lo, hi - lo)?;
                 let t = &tables[i];
                 let sev = &self.sync_events_lane(i).layers[l];
+                // `lh.pre_moe` on the arena driver = the chain enqueue's host
+                // time (the verify path's `LH_PRE` scopes never ran here).
+                let _t_pre = LayerHostTimer::start(&LH_PRE);
                 let mut c = arena.state.with_kv_source(l, |ls| {
                     let rl = RowLayout::Arena { tables: t, dev: &**dev, next_router: weights.dgpu_layers.get(l + 1), next_router2: weights.dgpu_layers.get(l + 2) };
                     self.pre_moe_chain(bd, bi, sd, si, ls, &weights.dgpu_layers[l], &weights.igpu_layers[l], 0, &tokens[lo..hi], None, None,
@@ -4641,6 +4657,16 @@ impl HeterogeneousEngine {
                                 }
                             },
                         };
+                        if ready && lanes[i].0.remote_ticket.is_some() {
+                            // LATE (`het::lookahead`, b2tail's definition): the reply
+                            // is consumed after the lane-layer's MoE end, i.e. the
+                            // `moe_arrived` event is already complete when the Post
+                            // finds the reply ready (a non-blocking query; an error
+                            // reads as "not late"). Checked at the first Post that
+                            // finds it ready, so within the loop's polling grain.
+                            let moe_done = self.sync_events_lane(i).layers[l].moe_arrived.query().ok();
+                            lanes[i].0.remote_late = super::lookahead::late_at_ready(true, moe_done);
+                        }
                         // TEST: hold lane 0 until lane 1 has posted this layer.
                         let ready = ready && !(hold_lane0 && i == 0 && posted[1] <= l);
                         if ready {
@@ -8310,17 +8336,25 @@ impl HeterogeneousEngine {
         // rows keep exp_probs_b / tid2eid, bit-identical to before.
         }
         cap.end()?;
-        // Look-ahead routing (arena only, opt-in `V41_LOOKAHEAD_PREFETCH=1`): the
-        // NEXT layer's router on THIS layer's router input, read back with the
-        // picks below and sent to box 2 as prefetch words. MEASURED 2026-09-22
-        // on live agent traffic: 62% (encoder) / 75% (decoder) of next-layer
-        // picks predicted; break-even is ~40%.
+        // Look-ahead routing (arena only): the NEXT layer's router on THIS
+        // layer's router input, read back with the picks below. MEASURED
+        // 2026-09-22 on live agent traffic: 62% (encoder) / 75% (decoder) of
+        // next-layer picks predicted; break-even is ~40%. Under the
+        // predicted-miss prefetch knob `V41_B2_MISS_PREFETCH` (`het::lookahead`,
+        // design 2.1) and/or the legacy opt-in `V41_LOOKAHEAD_PREFETCH=1`;
+        // layer+2 only under `k2` (or the legacy var's depth with the knob
+        // off). `mp` is this STEP's knob snapshot, carried to `pre_moe_route`:
+        // the readback pack below and its reader decide the `look` segments
+        // from the same copy (a live knob flipping between them would leave
+        // the pack and its reader disagreeing).
+        let mp = super::lookahead::cfg();
+        let (g_next, g_next2) = super::lookahead::look_gates(mp.mode, lookahead_prefetch(), lookahead_depth());
         let look_next: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router, .. } if g_next => next_router.filter(|nl| !nl.is_hash_router),
             _ => None,
         };
         let look_next2: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router2, .. } if g_next2 => next_router2.filter(|nl| !nl.is_hash_router),
             _ => None,
         };
         // Router alternatives (`V41_ROUTER_ALTS`) only where they are used: decode
@@ -8368,7 +8402,18 @@ impl HeterogeneousEngine {
                         {
                             let dst = &mut bd.prior_pin.as_mut_slice()[slot..slot + ne];
                             for (e, d) in dst.iter_mut().enumerate() {
-                                let held = if super::expert_pager::partition_box2(layer, e as u32) {
+                                // HOT SPLIT 3.2: held by the box that will SERVE it
+                                // (the route's `serve_on_box2`; only a MOVING id can
+                                // differ from its home).
+                                let home2 = super::expert_pager::partition_box2(layer, e as u32);
+                                let on2 = if super::expert_pager::hot_set::moving(layer, e as u32) {
+                                    let r = super::b2_mirror::lookup(layer, e as u32);
+                                    let (h, inc) = r.map_or((false, false), |r| (r.held, r.incoming));
+                                    super::expert_pager::hot_set::serve_on_box2(layer, e as u32, home2, pg.is_resident(layer, e as u32), h, inc)
+                                } else {
+                                    home2
+                                };
+                                let held = if on2 {
                                     super::b2_mirror::resident(layer, e as u32) == Some(true)
                                 } else {
                                     pg.is_resident(layer, e as u32)
@@ -8397,6 +8442,9 @@ impl HeterogeneousEngine {
                     n_alt,
                     alt_w: if n_alt > 0 { Some(&mut bd.d_alt_w) } else { None },
                     prior: if prior_on { Some(&bd.d_prior) } else { None },
+                    // Live (`V41_SUB_PROTECT`): a kernel scalar, valid only because this
+                    // launch is never captured. Capturing it would bake the value in --
+                    // move it into `d_prior` (copied per layer) first.
                     n_protect: super::b2_mirror::protect(),
                     prior_dry: super::b2_mirror::dry(),
                     orig_sel: if sub3 { Some(&mut bd.d_orig_sel) } else { None },
@@ -8520,6 +8568,16 @@ impl HeterogeneousEngine {
         // layer L+1's or L+2's). Same stream, still ahead of the readback pack.
         // Outside the hash-router branch too: a hash layer whose next layer is
         // not hashed has a `look_next`, and the pack shipped stale `look_sel`.
+        // `lh.look_launch`: the host cost of these launches sits in the chain
+        // enqueue on the ready-first thread (design 2.6; slice A prices it).
+        let _t_look = if look_next.is_some() || look_next2.is_some() {
+            if layer_host_timing() {
+                LH_LOOK_LAUNCH_N.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+            }
+            LayerHostTimer::start(&LH_LOOK_LAUNCH)
+        } else {
+            None
+        };
         if let Some(nl) = look_next {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
             de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
@@ -8532,6 +8590,7 @@ impl HeterogeneousEngine {
             de.router_topk.launch_batched(&de.compute, &mut sd.look_sel2, &mut sd.look_ew2, &sd.router_logits, nl.router_bias_dev.as_ref(),
                 N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
         }
+        drop(_t_look);
         drop(_t_router);
         let remote_owns_layer = self
             .remote
@@ -8586,6 +8645,12 @@ impl HeterogeneousEngine {
             l.sel = Some(plan.push(PackSeg::words(&bd.d_selected, n_sel)?));
             if look_next.is_some() {
                 l.look = Some(plan.push(PackSeg::words(&sd.look_sel, n_sel)?));
+                // + the weights, for the margin filter (slice A amendment 10-06:
+                // ~90% of predicted rank-1 non-resident picks land at ranks 2-6
+                // where the prior swaps them away; the gate margin tells).
+                if mp.mode.on() {
+                    l.look_ew = Some(plan.push(PackSeg::words(&sd.look_ew, n_sel)?));
+                }
             }
             if look_next2.is_some() {
                 l.look2 = Some(plan.push(PackSeg::words(&sd.look_sel2, n_sel)?));
@@ -8833,6 +8898,7 @@ impl HeterogeneousEngine {
             sub3,
             prior_on,
             rb,
+            mp,
             ..Default::default()
         })
     }
@@ -8852,7 +8918,7 @@ impl HeterogeneousEngine {
         rows: &RowLayout<'_>,
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Chained, PreMoePhase::Routed)? { return Ok(()); }
-        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, sub3, prior_on, rb, .. } = *c;
+        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, sub3, prior_on, rb, mp, .. } = *c;
         let _ = (cs_n_embd, split_cap, moe_group_bound);
         // `V41_SUB_DEFER_ACCEPTED`: in a speculative step this lane's admissions,
         // hot-set picks and pin wants are recorded by row POSITION and applied
@@ -8871,12 +8937,15 @@ impl HeterogeneousEngine {
         let _row_pos_guard = RowPosGuard;
         let deferring = !defer_pos.is_empty();
         let _ = &self.dgpu;
+        // The same gates as `pre_moe_chain`'s, from the carried snapshot `mp`
+        // (the pack's `look` segments exist iff these do).
+        let (g_next, g_next2) = super::lookahead::look_gates(mp.mode, lookahead_prefetch(), lookahead_depth());
         let look_next: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router, .. } if g_next => next_router.filter(|nl| !nl.is_hash_router),
             _ => None,
         };
         let look_next2: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router2, .. } if g_next2 => next_router2.filter(|nl| !nl.is_hash_router),
             _ => None,
         };
         let mut sel_host_remote: Vec<i32> = Vec::new();
@@ -8967,12 +9036,16 @@ impl HeterogeneousEngine {
                 // Look-ahead picks only where they are used: `sd.look_sel*` is
                 // SHARED, and in the lane drivers (which run with look-ahead hints
                 // off) the other lane's queued chain can overwrite it under an
-                // async copy. (The pack reads it in stream order, so its copy is
-                // always this lane's; the gate stays for the copy path.)
-                let (look_on, look_on2) = (lookahead_hints_ok && look_next.is_some(), lookahead_hints_ok && look_next2.is_some());
+                // async copy. The pack reads it in stream order, so its copy is
+                // always this lane's: under `V41_B2_MISS_PREFETCH` the PACKED
+                // words are read whatever the driver's `lookahead_hints_ok`
+                // (design 8.A leaves that flag as it is in slice A); the gate
+                // stays for the copy path.
+                let look_ok = lookahead_hints_ok || (rb.packed && mp.mode.on());
+                let (look_on, look_on2) = (look_ok && look_next.is_some(), look_ok && look_next2.is_some());
                 #[allow(clippy::type_complexity)]
-                let (mut sel_host, look_host, look_host2, alts_host, alt_w_host, orig_host, range_host, ew_read, mut xq_read): (
-                    Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>, Option<Vec<u8>>,
+                let (mut sel_host, look_host, look_host2, alts_host, alt_w_host, orig_host, range_host, ew_read, mut xq_read, look_ew_host): (
+                    Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>, Option<Vec<u8>>, Vec<f32>,
                 ) = if rb.packed {
                     // READBACK PACK: the words landed in `rb_pack` ahead of
                     // `selected_ready`, which the wait above covered. Each
@@ -8982,6 +9055,8 @@ impl HeterogeneousEngine {
                     let f32s = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
                     let sel = i32s(RbLayout::seg(w, rb.sel, "sel", n_sel)?);
                     let look = if look_on { i32s(RbLayout::seg(w, rb.look, "look", n_sel)?) } else { Vec::new() };
+                    // The weights ride only under the knob (packed beside `look`).
+                    let look_ew = if look_on && rb.look_ew.is_some() { f32s(RbLayout::seg(w, rb.look_ew, "look_ew", n_sel)?) } else { Vec::new() };
                     let look2 = if look_on2 { i32s(RbLayout::seg(w, rb.look2, "look2", n_sel)?) } else { Vec::new() };
                     // Ranks 7..6+n_alt per row.
                     let (alts, alt_w) = if na > 0 {
@@ -9006,7 +9081,7 @@ impl HeterogeneousEngine {
                     } else {
                         None
                     };
-                    (sel, look, look2, alts, alt_w, orig, range, ew, xq)
+                    (sel, look, look2, alts, alt_w, orig, range, ew, xq, look_ew)
                 } else {
                     // Staging offsets: i32 [sel | look | look2 | alts | orig],
                     // f32 [alt_w | range | ew].
@@ -9064,7 +9139,7 @@ impl HeterogeneousEngine {
                     let ew: Vec<f32> = rf[o_ew..o_ew + n_sel].to_vec();
                     let xq: Option<Vec<u8>> =
                         if want_xq { bd.rb_u8.as_ref().map(|p| p.as_slice()[..xq_bytes_rb].to_vec()) } else { None };
-                    (sel, look, look2, alts, alt_w, orig, range, ew, xq)
+                    (sel, look, look2, alts, alt_w, orig, range, ew, xq, Vec::new())
                 };
                 // Cache-prior (`V41_SUB=3`): the picks without the prior
                 // (`orig_host`), and the score ranges that feed the layer's
@@ -9180,11 +9255,24 @@ impl HeterogeneousEngine {
                     // `predicted`, `avoided`, `blocked` count box-2 misses; `slots`
                     // counts every displaced pick, box 1's included.
                     let mut predicted: Vec<i32> = Vec::new();
+                    let mut soft_kept: Vec<i32> = Vec::new();
                     for &e in plain {
                         if box2_missing(e) && !predicted.contains(&e) {
                             predicted.push(e);
                         }
+                        // `V41_B2_SOFT_PRIOR`: a plain pick resident ONLY by the
+                        // SOFT map -- what the prior would have treated as missing
+                        // (and may have swapped) without it (`sub_soft_unswapped`).
+                        if super::b2_mirror::soft_prior()
+                            && (0..N_EXPERT as i32).contains(&e)
+                            && super::expert_pager::partition_box2(layer, e as u32)
+                            && !soft_kept.contains(&e)
+                            && super::b2_mirror::lookup(layer, e as u32).is_some_and(|r| r.soft && !r.held && !r.pending && !r.incoming)
+                        {
+                            soft_kept.push(e);
+                        }
                     }
+                    super::lookahead::bump(super::lookahead::Stat::SubSoftUnswapped, soft_kept.len() as u64);
                     let mut slots = 0u32;
                     let mut admit: Vec<u32> = Vec::new();
                     let mut touch: Vec<u32> = Vec::new();
@@ -9415,6 +9503,9 @@ impl HeterogeneousEngine {
                 let mut seen = vec![false; N_EXPERT as usize];
                 let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
                 let mut skipped_remote = 0usize;
+                // HOT SPLIT 3.2: the holder fallback serves decode rows only
+                // (prefill and verify chunks keep the home rule).
+                let holder_rows = matches!(rows, RowLayout::Arena { .. });
                 // Under a live cache-prior, rank the hot set by the ROUTER's picks,
                 // not the prior's (held experts would inflate their own rank and
                 // lock box 1's set in).
@@ -9460,8 +9551,26 @@ impl HeterogeneousEngine {
                         // keeps `V41_REPLAY_OFFLOAD` off is a property of the CED
                         // replay's 162-wide union at B=128, not of a verify.
                         if remote_split_on && super::expert_pager::t2_partition() {
-                            // Box 2's share: always hers.
-                            if super::expert_pager::partition_box2(layer as i32, sv as u32) {
+                            // Box 2's share: always hers -- except a MOVING id of a
+                            // decode row, served by whichever box holds it until its
+                            // new home does (HOT SPLIT 3.2, `serve_on_box2`).
+                            let home2 = super::expert_pager::partition_box2(layer as i32, sv as u32);
+                            let on2 = if holder_rows && super::expert_pager::hot_set::moving(layer as i32, sv as u32) {
+                                let b1_has = pg.is_resident(layer as i32, sv as u32);
+                                let r = super::b2_mirror::lookup(layer as i32, sv as u32);
+                                let (h, inc) = r.map_or((false, false), |r| (r.held, r.incoming));
+                                if (home2 && h) || (!home2 && b1_has) {
+                                    super::expert_pager::hot_set::clear_moving(layer as i32, sv as u32);
+                                }
+                                let on2 = super::expert_pager::hot_set::serve_on_box2(layer as i32, sv as u32, home2, b1_has, h, inc);
+                                if on2 != home2 {
+                                    super::expert_pager::hot_set::note_holder(on2);
+                                }
+                                on2
+                            } else {
+                                home2
+                            };
+                            if on2 {
                                 extra_remote[sv as usize] = true;
                                 continue;
                             }
@@ -9507,12 +9616,101 @@ impl HeterogeneousEngine {
                         ids.push(sv as u32);
                     }
                 }
-                // `sd.look_sel`/`look_sel2` are SHARED dGPU scratch, so in the
+                // PREDICTED-MISS LOOK-AHEAD PREFETCH (`V41_B2_MISS_PREFETCH`,
+                // `het::lookahead`; docs/v41/B2_PREDICTED_MISS_PREFETCH_DESIGN.md
+                // 2.1-2.3). It REPLACES the old word block below, which survives
+                // only under the legacy `V41_LOOKAHEAD_PREFETCH=1` with the knob
+                // off (`lookahead::legacy_words`). Host bookkeeping only, on this
+                // lane's `look_host*` as the readback PACK captured them (stream
+                // order: always this lane's; `look_ok` above):
+                //  (a) the prediction this lane made for THIS layer one lane-layer
+                //      ago, against the router's OWN picks (`sel_orig` under a live
+                //      cache prior, else `sel_host` -- what the hot set ranks by):
+                //      `lh2_dry_hits_rN`, the live Step 0 of design section 1;
+                //  (b) this layer's prediction for L+1 (and L+2 under `k2`):
+                //      distinct box-2-owned picks by best rank, residency from the
+                //      mirror by the `n_pred_miss` predicate (the `hub_req` block
+                //      below), counted per R and kept on `bd` for (a); the words
+                //      at the knob's R and cap are queued (`MISS_HINT_WORDS`) for
+                //      the next decode submit -- SLICE A drains and counts them
+                //      and NEVER calls `push_prefetch_words` or puts them on a
+                //      frame. Nothing here touches a pick, weight or kernel input
+                //      (I1/I2, design section 7). Decode rows only (design 5).
+                // The `n_pred_miss` predicate (`b2_mirror::lookup`, not `resident()`),
+                // with the SOFT-HELD map under `V41_B2_SOFT_HINT` (the filter) /
+                // `V41_B2_SOFT_PRIOR` (the miss count).
+                let nonres_at = |nl: i32, e: u32| super::b2_mirror::lookup(nl, e).is_some_and(|r| super::b2_mirror::nonres_for_hint(&r));
+                let nonres_miss = |nl: i32, e: u32| super::b2_mirror::lookup(nl, e).is_some_and(|r| super::b2_mirror::nonres_for_miss(&r));
+                if mp.mode.on() && remote_split_on && matches!(rows, RowLayout::Arena { .. }) {
+                    let _t_look = LayerHostTimer::start(&LH_LOOK_FILTER);
+                    if layer_host_timing() {
+                        LH_LOOK_FILTER_N.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    use super::lookahead as lh2;
+                    // Same lane, next layer, same step: anything else (a new step
+                    // at layer 0, a hash-router layer with no look-ahead in
+                    // between) is dropped without a count, on purpose.
+                    if bd.lh2.take_pending(layer as i32, mp.step) {
+                        let own: &[i32] = if sel_orig.is_empty() { &sel_host } else { &sel_orig };
+                        // Slice B: of the predictions in the own picks, the
+                        // ones SENT as hints (`lh2_demanded`; `_prot` = of a
+                        // rank the prior protects, `V41_SUB_PROTECT`).
+                        // Slice A amendment (10-06): the PROTECTED set -- an own
+                        // pick at ACTUAL rank <= `V41_SUB_PROTECT` -- is what a
+                        // hint can hide; per margin bucket too.
+                        let d = bd.lh2.dry_hits_demanded(own, super::remote_experts::hint_word_sent, super::b2_mirror::protect());
+                        lh2::count_dry_hits(&d);
+                        lh2::bump(lh2::Stat::Demanded, u64::from(d.demanded));
+                        lh2::bump(lh2::Stat::DemandedProt, u64::from(d.demanded_prot));
+                    } else {
+                        // No prediction for this layer: nothing to score at its reply.
+                        bd.lh2.prot_hits.clear();
+                        bd.lh2.reply_preds.clear();
+                    }
+                    // Ownership of layer `nl`: the partition's rule (the live path),
+                    // else box 2's HELLO bitmap FOR `nl` (`owns_remote` above is
+                    // layer L's), resolved once per lane-layer under the client
+                    // lock. Residency: `b2_mirror::lookup` with the `n_pred_miss`
+                    // predicate, not `resident()` (round 1, finding 5).
+                    let t2 = super::expert_pager::t2_partition();
+                    let owns_next: [Option<Vec<bool>>; 2] = if t2 || owns_remote.is_none() {
+                        [None, None]
+                    } else {
+                        let c = self.remote.as_ref().and_then(|r| r.lock().ok());
+                        let for_layer = |nl: i32| c.as_ref().map(|c| (0..N_EXPERT).map(|e| c.owns(nl as u32, e as i32)).collect::<Vec<bool>>());
+                        [(!look_host.is_empty()).then(|| for_layer(layer as i32 + 1)).flatten(), (!look_host2.is_empty()).then(|| for_layer(layer as i32 + 2)).flatten()]
+                    };
+                    let nonres = nonres_at;
+                    for (k, lh) in [(1i32, &look_host), (2, &look_host2)] {
+                        if lh.is_empty() {
+                            continue;
+                        }
+                        let nl = layer as i32 + k;
+                        let owns = owns_next[(k - 1) as usize].as_deref();
+                        // (A MOVING id may be served by box 1 meanwhile: no hint for it.)
+                        let is_box2 = |e: u32| if t2 { super::expert_pager::partition_box2(nl, e) && !super::expert_pager::hot_set::moving(nl, e) } else { owns.is_some_and(|o| o[e as usize]) };
+                        // L+1's gate weights (the pack) give each rank-1
+                        // prediction its margin over rank 2; L+2's are not packed.
+                        let lw: &[f32] = if k == 1 && look_ew_host.len() == lh.len() { &look_ew_host } else { &[] };
+                        bd.lh2.classify_w(lh, lw, cs_n_used, is_box2, |e| nonres(nl, e));
+                        if k == 1 {
+                            // The per-R counters and the dry match are L+1's only.
+                            lh2::count_preds(&bd.lh2.preds);
+                            bd.lh2.set_pending(nl, mp.step);
+                        }
+                        let (_queued, dropped) = super::remote_experts::queue_hint_words(mp.step, nl, &bd.lh2.preds, mp.rank, mp.cap as usize, mp.margin());
+                        lh2::bump(lh2::Stat::DroppedCap, u64::from(dropped));
+                    }
+                } else if !mp.mode.on() {
+                    bd.lh2.pending = None;
+                }
+                // LEGACY (`V41_LOOKAHEAD_PREFETCH=1`, the knob off; 09-21: measured a
+                // loss). `sd.look_sel`/`look_sel2` are SHARED dGPU scratch, so in the
                 // pipelined order the other lane's chain has overwritten them by
                 // the time we read them (same hazard as `remote_xq`, but these
                 // only steer box-2 PREFETCH hints, so the pipelined driver does
                 // not emit them; default OFF anyway and measured a loss).
-                if lookahead_hints_ok && remote_split_on && (!look_host.is_empty() || !look_host2.is_empty()) {
+                if super::lookahead::legacy_words(mp.mode, lookahead_prefetch(), lookahead_hints_ok) && remote_split_on && (!look_host.is_empty() || !look_host2.is_empty()) {
                     // Rank cut (`V41_LOOKAHEAD_TOPK`): the look-ahead picks come
                     // back in descending selection order and their precision
                     // falls with rank -- decoder 0.97/0.92/0.83/0.72/0.57/0.43
@@ -9647,6 +9845,23 @@ impl HeterogeneousEngine {
                 {
                     {
                         let _t_remote = LayerHostTimer::start(&LH_REMOTE);
+                        // The refined objective's denominators (design section 6),
+                        // BEFORE the submit marks the sent picks PENDING on the
+                        // mirror (`note_submitted`; dry run 3's `prot_paged_late_total`
+                        // was 0 for that reason): this request's PROTECTED box-2
+                        // picks (actual rank <= `V41_SUB_PROTECT`) the mirror calls
+                        // non-resident, and the non-resident bitset over all its
+                        // sent picks; scored at the reply against the PAGED bits.
+                        if super::lookahead::scoring() {
+                            let sent_sel: &[i32] = if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote };
+                            super::lookahead::protected_nonres(sent_sel, cs_n_used, super::b2_mirror::protect(), |e| nonres_miss(layer as i32, e), &mut bd.lh2.prot_nonres);
+                            super::lookahead::nonres_bits(sent_sel, |e| nonres_miss(layer as i32, e), &mut bd.lh2.nonres_bits);
+                            super::lookahead::pick_bits(sent_sel, |e| super::b2_mirror::soft(layer as i32, e), &mut bd.lh2.soft_bits);
+                        } else {
+                            bd.lh2.prot_nonres.clear();
+                            bd.lh2.nonres_bits = [0; super::lookahead::PAGED_WORDS];
+                            bd.lh2.soft_bits = [0; super::lookahead::PAGED_WORDS];
+                        }
                         let n_sel = (b as usize) * cs_n_used;
                         let xq_bytes = (b as usize)
                             * (crate::config::BLOCKS_Q8K_GATE_IN as usize)
@@ -9722,7 +9937,7 @@ impl HeterogeneousEngine {
                             let (mut miss, mut inc, mut pend) = (0u32, 0u32, 0u32);
                             for &e in &ids {
                                 if let Some(r) = super::b2_mirror::lookup(layer, e as u32) {
-                                    miss += u32::from(!r.held && !r.pending && !r.incoming);
+                                    miss += u32::from(super::b2_mirror::nonres_for_miss(&r));
                                     inc += u32::from(!r.held && r.incoming);
                                     pend += u32::from(!r.held && r.pending);
                                 }
@@ -9811,6 +10026,7 @@ impl HeterogeneousEngine {
                         // `remote.expert (host)` track IS the overlap we bought.
                         bd.remote_ticket = ticket;
                         bd.remote_ffn_moe_layer = layer as i32;
+                        bd.remote_late = false;
                         if let Some(pf) = self.perfetto.as_ref() {
                             if let Ok(pf) = pf.lock() {
                                 let _ = pf.emit_host_slice(
@@ -11317,7 +11533,7 @@ impl HeterogeneousEngine {
             let layer = bd.remote_ffn_moe_layer;
             let t_wait = super::perfetto::now_ns();
             let ev_wait_enter = super::evtrace::now();
-            let ev_ticket = (t.seq, t.flags, t.n_hints, t.n_pf_words);
+            let ev_ticket = (t.seq, t.flags, t.n_hints, t.n_pf_words, t.n_hint_words);
             let remote = self
                 .remote
                 .as_ref()
@@ -11326,6 +11542,31 @@ impl HeterogeneousEngine {
                 .lock()
                 .map_err(|_| eyre!("remote expert client mutex poisoned"))?
                 .wait(t)?;
+            // Refined objective (design section 6): the lane-layer's protected
+            // dry hits and protected non-resident picks against this reply's
+            // PAGED bits and whether the lane stalled on it (`remote_post_spun`).
+            // Also the ANY-rank sets (every paged read stalls the lane, not only
+            // a rank-1 one) and the step's denominators: paged experts in all,
+            // on late replies, the mirror-held ones (surprises) and the
+            // mirror-non-resident ones (the hintable misses). `paged` counts
+            // REPLY-experts: an expert read once for lane A and waited on by
+            // lane B is paged in both replies (as b2tail's `b2_paged_replies`).
+            if partial.pin.is_some() && partial.layer as i32 == layer && t.flags & super::remote_experts::proto::REQ_FLAG_DECODE != 0 {
+                let late = bd.remote_late;
+                if super::lookahead::scoring() {
+                    super::lookahead::bump(super::lookahead::Stat::PagedMirrorSoft, u64::from(super::lookahead::paged_soft(&partial.paged, &bd.lh2.soft_bits)));
+                    if !bd.lh2.prot_hits.is_empty() || !bd.lh2.prot_nonres.is_empty() {
+                        super::lookahead::count_reply_hits(&super::lookahead::reply_hits(&bd.lh2.prot_hits, &bd.lh2.prot_nonres, &partial.paged, late));
+                    }
+                    if !bd.lh2.reply_preds.is_empty() {
+                        super::lookahead::count_reply_hits_any(&super::lookahead::reply_hits_any(&bd.lh2.reply_preds, &partial.paged, late));
+                    }
+                    super::lookahead::count_paged_totals(&super::lookahead::paged_totals(&partial.paged, &t.held, &bd.lh2.nonres_bits, late));
+                }
+            }
+            bd.lh2.prot_hits.clear();
+            bd.lh2.prot_nonres.clear();
+            bd.lh2.reply_preds.clear();
             // SLACK PROBE site `remote`: hold the partial back by a known
             // amount, i.e. pretend box 2 (or the link) was slower. Regressing
             // the step against it gives the box-2 leg's share of the critical
@@ -11343,7 +11584,7 @@ impl HeterogeneousEngine {
                     Some(c) => (c.t1 as f64, c.t2 as f64, c.t3 as f64, c.t4 as f64, c.offset_ns() as f64, c.delay_ns() as f64),
                     None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
                 };
-                let (seq, flags, n_hints, n_pf) = ev_ticket;
+                let (seq, flags, n_hints, n_pf, n_hint_words) = ev_ticket;
                 super::evtrace::emit(&super::evtrace_kinds::HUB_REQ, &[
                     e[0], e[1], t1, t4, ev_wait_enter, ev_exit, t2, t3,
                     super::evtrace_kinds::step_f64(),
@@ -11362,6 +11603,7 @@ impl HeterogeneousEngine {
                     partial.pin.map_or(f64::NAN, |_| f64::from(partial.n_paged)),
                     partial.pin.map_or(f64::NAN, |p| f64::from(p.1)),
                     partial.pin.map_or(f64::NAN, |p| f64::from(p.0)),
+                    f64::from(n_hint_words),
                 ]);
                 bd.ev_req = [f64::NAN; 9];
             }
@@ -11591,6 +11833,11 @@ impl HeterogeneousEngine {
 /// track idle and the real work at ~5.6 ms/layer — i.e. ~18 ms/layer running
 /// nowhere and covered by no `events.stage()` scope. These attribute it to the
 /// three host calls the loop actually makes. `V41_LAYER_HOST_TIMING=1`.
+///
+/// `LH_PRE` (`lh.pre_moe`) on the ARENA drivers: 0 until the predicted-miss
+/// prefetch slice A (2026-10-06), since then the ready-first chain enqueue
+/// (`pre_moe_chain`, look-ahead launches included) per lane-layer. Compare it
+/// across deploys only within binaries from that commit on.
 pub static LH_POST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_PRE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_ENGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -11661,6 +11908,16 @@ pub static LH_REMOTE_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// Box-2 miss substitution (`het::b2_mirror`): the weights readback, planning,
 /// and the picks/weights write-back, per lane-layer.
 pub static LH_SUB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Predicted-miss look-ahead prefetch (`het::lookahead`; design 2.6, the host
+/// cost slice A prices): the two look-ahead router launches in the chain
+/// enqueue (`pre_moe_chain`), and the filter + dry matching + queue at Route
+/// (`pre_moe_route`). Both on the ready-first thread.
+pub static LH_LOOK_LAUNCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_LOOK_FILTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lane-layers that ran them (+1000 each, the `_x1e3` trick above), so the
+/// `ms.stage` rollup can price them PER LANE-LAYER (`lh2.look_*_us_per_ll`).
+pub static LH_LOOK_LAUNCH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_LOOK_FILTER_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// EXPOSED-WAIT PROBE (2026-09-22). `lh.work_items_count` (90.7 ms/step) and
 /// `lh.sel_d2h` (39.4) are blocking readbacks, and a blocking readback costs one
 /// of two things that need OPPOSITE fixes: real device work we depend on
@@ -11716,6 +11973,10 @@ pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
         ("lh.seld2h_idle_x1e3", LH_SEL_D2H_IDLE.swap(0, Relaxed)),
         ("lh.remote_sync", LH_REMOTE_SYNC.swap(0, Relaxed)),
         ("lh.remote_upload", LH_REMOTE_UPLOAD.swap(0, Relaxed)),
+        ("lh.look_launch", LH_LOOK_LAUNCH.swap(0, Relaxed)),
+        ("lh.look_filter", LH_LOOK_FILTER.swap(0, Relaxed)),
+        ("lh.look_launch_n_x1e3", LH_LOOK_LAUNCH_N.swap(0, Relaxed)),
+        ("lh.look_filter_n_x1e3", LH_LOOK_FILTER_N.swap(0, Relaxed)),
     ]
 }
 
