@@ -13,6 +13,14 @@
       };
       rocm = pkgs.rocmPackages;
 
+      # CLR with the device-kernarg decision made PER DEVICE (DEBUG_CLR_KERNARG_DEV_ARCHS; see the
+      # patch header): the process-wide HDP-flush kernarg path speeds the gfx1201 dGPU and doubles
+      # every gfx1151 iGPU kernel. Only the joined tree below uses it (nothing else is rebuilt); the
+      # hub's RUNPATH points at that tree, so its libamdhip64 is this one.
+      clr = rocm.clr.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ [ ./nix/patches/clr-kernarg-per-device.patch ];
+      });
+
       # Unified ROCM_PATH tree. ds4's Makefile uses $(ROCM_PATH)/bin/hipcc
       # and -L$(ROCM_PATH)/lib -lhipblas, expecting one /opt/rocm-like prefix.
       # Nix splits these across several derivations, so we symlinkJoin them
@@ -20,7 +28,7 @@
       rocmJoin = pkgs.symlinkJoin {
         name = "rocm-merged-deepstrix";
         paths = [
-          rocm.clr
+          clr
           rocm.hipcc
           rocm.hipblas
           rocm.hipblas-common
@@ -53,7 +61,7 @@
           # rocmJoin already pulls these into a single tree, but listing
           # them here makes them appear in PATH and pkg-config separately
           # so non-ds4 paths still work.
-          rocm.clr
+          clr
           rocm.hipcc
           rocm.hipblas
           rocm.rocblas
@@ -83,7 +91,7 @@
           # under rocmJoin/include become visible automatically.
           export CPATH=${rocmJoin}/include''${CPATH:+:$CPATH}
           export LIBRARY_PATH=${rocmJoin}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}
-          echo "deepstrix dev shell — ROCm ${rocm.clr.version}, hipcc ${rocm.hipcc.version}, rustc $(rustc --version)"
+          echo "deepstrix dev shell — ROCm ${clr.version}, hipcc ${rocm.hipcc.version}, rustc $(rustc --version)"
           echo "Devices:" && rocminfo 2>/dev/null | grep -E '^\s*Name:\s*gfx' | sort -u || echo "  rocminfo failed — check /dev/kfd"
         '';
       };
