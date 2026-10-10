@@ -39,9 +39,73 @@ fn role_kr(which: &str) -> (u64, u64) {
 /// recently each slot was used. Plain host data, kept apart from the HIP
 /// buffers in `ExpertPager` so the claim / evict / roll-back rules are
 /// unit-testable without a GPU.
+/// `slot_of` with a per-layer residency BITMAP kept in step with every insert / remove /
+/// clear (the only mutations), so `ExpertPager::is_resident` -- called 384 times per decode
+/// lane-layer by the cache prior's held mask, plus the route -- is a bit test instead of a
+/// SipHash lookup (docs/v41/DGPU_BUNDLE_DESIGN.md 2). Keys outside (layer 0..N_LAYER,
+/// expert 0..N_EXPERT) have no bit and fall back to the map.
+struct SlotOf {
+    map: HashMap<(i32, u32), u32>,
+    bits: Vec<u64>,
+}
+
+const SLOT_BITS_W: usize = (N_EXPERT as usize).div_ceil(64);
+
+impl SlotOf {
+    fn new() -> Self {
+        SlotOf { map: HashMap::new(), bits: vec![0; crate::config::N_LAYER as usize * SLOT_BITS_W] }
+    }
+    #[inline]
+    fn bit(k: &(i32, u32)) -> Option<(usize, u64)> {
+        (k.0 >= 0 && k.0 < crate::config::N_LAYER && k.1 < N_EXPERT)
+            .then(|| (k.0 as usize * SLOT_BITS_W + k.1 as usize / 64, 1u64 << (k.1 % 64)))
+    }
+    fn insert(&mut self, k: (i32, u32), v: u32) -> Option<u32> {
+        if let Some((i, b)) = Self::bit(&k) {
+            self.bits[i] |= b;
+        }
+        self.map.insert(k, v)
+    }
+    fn remove(&mut self, k: &(i32, u32)) -> Option<u32> {
+        let r = self.map.remove(k);
+        if r.is_some() {
+            if let Some((i, b)) = Self::bit(k) {
+                self.bits[i] &= !b;
+            }
+        }
+        r
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bits.iter_mut().for_each(|w| *w = 0);
+    }
+    fn contains_key(&self, k: &(i32, u32)) -> bool {
+        self.map.contains_key(k)
+    }
+    fn get(&self, k: &(i32, u32)) -> Option<&u32> {
+        self.map.get(k)
+    }
+    /// The bitmap's answer (= `contains_key` for in-range keys).
+    #[inline]
+    fn has(&self, layer: i32, e: u32) -> bool {
+        match Self::bit(&(layer, e)) {
+            Some((i, b)) => self.bits[i] & b != 0,
+            None => self.map.contains_key(&(layer, e)),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a SlotOf {
+    type Item = (&'a (i32, u32), &'a u32);
+    type IntoIter = std::collections::hash_map::Iter<'a, (i32, u32), u32>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
 struct Residency {
     /// (layer, global expert id) -> resident slot.
-    slot_of: HashMap<(i32, u32), u32>,
+    slot_of: SlotOf,
     /// slot -> the key it currently holds (None = free).
     slot_key: Vec<Option<(i32, u32)>>,
     /// Eviction order as a TICK STAMP per slot, not an ordered list. Was a
@@ -60,7 +124,7 @@ struct Residency {
 
 impl Residency {
     fn new(n_slots: usize) -> Self {
-        Residency { slot_of: HashMap::new(), slot_key: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0 }
+        Residency { slot_of: SlotOf::new(), slot_key: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0 }
     }
 
     #[inline]
@@ -3591,7 +3655,7 @@ impl ExpertPager {
     /// everything else to box 2, so a hub miss never blocks on the hub's
     /// (dm-crypt) disk. Pure lookup — does NOT page and does NOT touch the LRU.
     pub fn is_resident(&self, layer: i32, e: u32) -> bool {
-        self.res.slot_of.contains_key(&(layer, e))
+        self.res.slot_of.has(layer, e)
     }
 
     /// Mark `(layer, e)` most-recently-used if resident; returns whether it was.
@@ -3855,8 +3919,18 @@ impl std::ops::Sub for PagerCounters {
 mod residency_tests {
     use super::*;
 
-    /// Every `slot_of` entry is backed by `slot_key` and vice versa.
+    /// Every `slot_of` entry is backed by `slot_key` and vice versa, and the
+    /// residency bitmap has exactly the in-range keys' bits.
     fn consistent(r: &Residency) {
+        let mut in_range = 0u32;
+        for (k, _) in &r.slot_of {
+            if SlotOf::bit(k).is_some() {
+                in_range += 1;
+                assert!(r.slot_of.has(k.0, k.1), "{k:?} in slot_of without its bit");
+            }
+        }
+        let set: u32 = r.slot_of.bits.iter().map(|w| w.count_ones()).sum();
+        assert_eq!(set, in_range, "residency bitmap has stray bits");
         for (k, &s) in &r.slot_of {
             assert_eq!(r.slot_key[s as usize], Some(*k), "slot_of {k:?} -> {s} not backed by slot_key");
         }
