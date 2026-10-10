@@ -516,14 +516,16 @@ mod lane_env {
         LazyLock::new(|| std::env::var("IQ2_HYBRID_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
     pub static WINDOW_DBG: LazyLock<bool> = LazyLock::new(|| is("V41_WINDOW_DBG", "1"));
     pub static COMP_POS_DBG: LazyLock<bool> = LazyLock::new(|| set("V41_COMP_POS_DBG"));
+    /// `V41_PREFILL_F32_MATVEC`: Some(false) / Some(true) / None (unset or other).
+    pub static PREFILL_F32_MATVEC: LazyLock<Option<bool>> = LazyLock::new(|| match std::env::var("V41_PREFILL_F32_MATVEC").ok().as_deref() {
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        _ => None,
+    });
 }
 
 fn prefill_f32_matvec(b: u32) -> bool {
-    match std::env::var("V41_PREFILL_F32_MATVEC").ok().as_deref() {
-        Some("0") => false,
-        Some("1") => true,
-        _ => b <= 64,
-    }
+    lane_env::PREFILL_F32_MATVEC.unwrap_or(b <= 64)
 }
 
 /// Rows at or below which q_b / wo_a / wo_b keep the dp4a arm under
@@ -544,11 +546,10 @@ const REPLAY_F16X_DP4A_MAX: u32 = 16;
 fn prefill_f32_matvec_qb_wo(b: u32) -> bool {
     static D: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_REPLAY_F16X").as_deref() != Ok("0"));
-    match std::env::var("V41_PREFILL_F32_MATVEC").ok().as_deref() {
-        Some("0") => false,
-        Some("1") => true,
-        _ if *D => b <= REPLAY_F16X_DP4A_MAX,
-        _ => b <= 64,
+    match *lane_env::PREFILL_F32_MATVEC {
+        Some(v) => v,
+        None if *D => b <= REPLAY_F16X_DP4A_MAX,
+        None => b <= 64,
     }
 }
 
@@ -3973,9 +3974,10 @@ impl HeterogeneousEngine {
     /// next step); falls back to the blocking copy when off or the slot does not fit.
     pub fn stage_engram_rows_async(&self, bd: &mut BatchDgpuScratch, rows: &[f32], table: usize) -> eyre::Result<()> {
         let n = rows.len();
-        let cap = bd.engram_rows.len();
+        // Slot stride = the pinned staging's per-table share (decode-sized, `batch_scratch`).
+        let cap = bd.engram_pin.len() / crate::config::ENGRAM_LAYERS.len().max(1);
         let slot = table * cap;
-        if !crate::knobs::DGPU_ENGRAM_ASYNC.on() || n == 0 || n % ENGRAM_IN as usize != 0 || n > cap || bd.engram_pin.len() < slot + n {
+        if !crate::knobs::DGPU_ENGRAM_ASYNC.on() || n == 0 || n % ENGRAM_IN as usize != 0 || n > cap || n > bd.engram_rows.len() || bd.engram_pin.len() < slot + n {
             return self.stage_engram_rows_batch(bd, rows);
         }
         self.set_current_cached(self.dgpu.device)?;
@@ -12513,6 +12515,9 @@ impl<'scope> LazyEngramRows<'scope> {
         Ok(self.table_rows.get(i).and_then(|r| r.as_deref()))
     }
     pub fn get(&mut self) -> eyre::Result<Option<&[Vec<f32>]>> {
+        if !self.tables.is_empty() {
+            return Err(eyre!("LazyEngramRows::get: per-table gathers -- use table(i)"));
+        }
         if let Some(h) = self.pending.take() {
             let t = std::time::Instant::now();
             let rows = h.join().map_err(|_| eyre!("engram gather thread panicked"))??;

@@ -2002,8 +2002,26 @@ impl Sched {
             let ec: &crate::engine_worker::EngramCtx = engram.as_ref().expect("engram_on");
             let live = &live;
             // One gather per table, each joined at its own layer (dGPU bundle slice 1).
+            // Tables gathered IN ORDER (review round 2 #2): each gather is bound by its own
+            // reader rounds, so running both at once made the layer-1 join wait as long as for
+            // both; table 0 alone finishes first and table i+1 starts when table i ends, still
+            // far ahead of its layer (1 -> 14).
             ENGRAM_GATHER_US.store(0, Ordering::Relaxed);
-            LazyEngramRows::pending_tables((0..n_tables).map(|li| sc.spawn(move || gather_engram_table(ec, live, b, li))).collect())
+            let mut hs = Vec::with_capacity(n_tables);
+            let mut prev: Option<std::sync::mpsc::Receiver<()>> = None;
+            for li in 0..n_tables {
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                let wait = prev.replace(rx);
+                hs.push(sc.spawn(move || {
+                    if let Some(w) = wait {
+                        let _ = w.recv();
+                    }
+                    let r = gather_engram_table(ec, live, b, li);
+                    let _ = tx.send(());
+                    r
+                }));
+            }
+            LazyEngramRows::pending_tables(hs)
         } else if engram_on {
             // Every live row is DEAD (image rows): zero rows, no reads.
             LazyEngramRows::ready(Some(vec![vec![0f32; b * ein]; n_tables]))
@@ -2495,7 +2513,9 @@ impl Sched {
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
             head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff,
             chain_waits, chain_wait_us, ring_settle_ms = format!("{ring_settle_ms:.2}"),
-            engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, draft_ms = format!("{draft_wall_ms:.1}"), "ms.step");
+            engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3),
+            engram_t0_ms = format!("{:.2}", ENGRAM_TABLE_US[0].swap(0, Ordering::Relaxed) as f64 / 1e3),
+            engram_t1_ms = format!("{:.2}", ENGRAM_TABLE_US[1].swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, draft_ms = format!("{draft_wall_ms:.1}"), "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),
@@ -2781,6 +2801,9 @@ fn engram_threads() -> usize {
 
 /// Wall time (us) of the last decode-step Engram gather (`ms.step`).
 static ENGRAM_GATHER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Per-table gather wall of the last decode step (us; table 0 = layer 1, 1 = layer 14): the
+/// `ms.step` fields `engram_t0_ms` / `engram_t1_ms`.
+static ENGRAM_TABLE_US: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// One Engram table's rows for a decode step, on its own thread so the step joins each table at
 /// its own layer (dGPU bundle slice 1; was one gather of every table joined at layer 1). `ENGRAM_GATHER_US` = the slowest table.
@@ -2800,6 +2823,7 @@ fn gather_engram_table(
         out[r * ein..(r + 1) * ein].copy_from_slice(&tmp[k * ein..(k + 1) * ein]);
     }
     ENGRAM_GATHER_US.fetch_max(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    ENGRAM_TABLE_US[li.min(1)].store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
     Ok(out)
 }
 

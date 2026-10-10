@@ -1251,8 +1251,10 @@ impl BatchDgpuScratch {
             split: mk_f32(HC_MIX_DIM as usize)?,
             hc_pre_carry: mk_f32(HC_MIX_DIM as usize)?,
             engram_rows: if cfg!(feature = "v41") { mk_f32(ENGRAM_IN as usize)? } else { DeviceBuffer::new(id, 32)? },
+            // Sized for DECODE lanes (<= 16 rows; prefill lanes are B_MAX/2 = 512 rows): a bigger
+            // lane-layer takes the blocking copy (`stage_engram_rows_async`'s fit check).
             engram_pin: v4flash_hip::PinnedBuffer::new(if cfg!(feature = "v41") {
-                crate::config::ENGRAM_LAYERS.len().max(1) * b * ENGRAM_IN as usize
+                crate::config::ENGRAM_LAYERS.len().max(1) * b.min(16) * ENGRAM_IN as usize
             } else {
                 32
             })?,
