@@ -1,4 +1,4 @@
-# Prefill dGPU VRAM loan: 1024-row prefill lanes from decode-idle memory (design rev 1, 2026-10-10)
+# Prefill dGPU VRAM loan: 1024-row prefill lanes from decode-idle memory (design rev 2, 2026-10-10)
 
 Status: DESIGN, nothing built. Owner 10-10: "we need to build the dgpu vram loan system" + "don't even fall back -- instead,
 swap out decode KV basically". Code map: read-only scoping 10-10 (paths under `crates/`, HEAD dfc868aa).
@@ -85,3 +85,54 @@ at startup) -> 2.1 + 2.2 + 2.3. Off = today exactly.
 4. Can the swap be avoided when live KV fits outside the placement (free runs after compaction cover the prefill set's
    arena part)? Worth it in rev 1, or later?
 5. Host staging: pageable (simple, ~3 GB/s) vs pinned (RAM).
+
+
+## 5. REV 2 (Fable round 1 = REVISE; findings and dispositions)
+
+### 5.1 Loan lifetime: prefill ACTIVITY, not `ms.phase` (finding 1, BLOCKER: deadlock with no live streams)
+Rev 1 deferred admission to the next Prefill->Decode switch; with no live streams the scheduler returns early
+(`ms:1085-1088`) before the phase logic, the phase never leaves Prefill, the loan never returns, and the parked retry
+(`ms:883-891`) defers again forever. REV 2 has NO deferral table:
+* **Lend** right before a prefill unit of a LONG job (`remote_long_job()`; >= 2 windows) runs, if no loan is out.
+* **Return** (swap-in if anything was swapped; device-wide sync first) at the TOP of every arena-mutating call --
+  `try_admit` (-> `grow` / `fill_reserved`), `compact_stores`, `grow` from a decode step -- and before any decode step.
+  A guard object (`ArenaLoan`) is the only way to obtain arena write access while lent; its `end()` is idempotent; a
+  panic with the loan out aborts (as `LoanOut`).
+* Back-to-back long prefills keep the loan out (no arena op between their units); a short request's admission ends it
+  (one swap-in), the next long unit re-lends. Per-request cost: at most one return + one re-lend.
+
+### 5.2 Compaction-first, swap only the overlap (alternative (e), owner's "swap decode KV out" made conditional)
+* Placement is FIXED at startup: the prefill set's arena part sits at the END of each store buffer (`comp_kv` x4,
+  `index_k` x4); the views (`DeviceBuffer::from_raw_parts`, `is_view`) and the prefill `BatchDgpuScratch` x2 +
+  `BatchDgpuShared` are built ONCE and never `register_static`'d.
+* **Lend** = `compact_stores` (allowed: the loan is not out yet) -> every store's live rows are `[0, next_base)`; for each
+  store, the live rows overlapping its reserved end range `[cap - lent_rows, cap)` are D2H'd to host staging
+  (`(slot, store, base, n)` recorded) -- typically NONE (free tail 2.5-2.8 GB, 10-09 census).
+* While lent, the free lists must not hand out rows in the lent end ranges for data: `reserve` (bookkeeping) is allowed
+  anywhere, but any DATA write (fill/grow/compaction) ends the loan first (5.1), so no overlap can be written while lent.
+* **Return** = H2D the recorded rows still live with the SAME base (finding 6: a released slot's rows may be re-reserved).
+
+### 5.3 Memory (findings 2, 3)
+* Pool = the resident shrink ONLY (~2.0 GB), keeping the ~0.5 GB free that lazily instantiated graphs need.
+* Itemised placement computed at startup from the buffer size lists (`BatchDgpuScratch` / `BatchDgpuShared` size
+  functions at `V41_PREFILL_LANE_ROWS`), first-fit-decreasing into: pool (r1_arena 1512, lm_store/idx 344, then fill),
+  then the 8 store end ranges, with a `Carver` per donor (`bs:1623-1636`; `LoanAlloc::over` hands out ONE buffer per
+  donor). If it does not fit, the loan is DISABLED with a loud startup error (no silent fallback mid-run). The script
+  version of the placement is checked before building.
+
+### 5.4 Smaller (findings 4-7)
+* `DECODE_ROWS_MAX` = the arena driver's `rows_cap` (`n_slots x ARENA_ROWS_PER_STREAM`), not a constant.
+* CED replay at `prefill_job_finish`, the DSpark ring seed (`ms:1431`, `1441`) and `mtp_capture_rows` (`ms:347-349`) use
+  the PREFILL set.
+* Pre-swap sync is device-wide (`de.compute`, `de.xfer`, `de.hc`, `rb_stream`); raw `kv_cache` and the per-slot
+  `state_kv`/`state_score` blocks (`ka:494-509`) are not donors (invariant: no prefill view overlaps them).
+* Staging: pageable first (RAM-safe); pinned later if the swap shows up.
+
+### 5.5 Staging
+0. **Probe (no new code)**: `V41_PREFILL_LANE_ROWS=768` fits the arena donors alone? No -- it needs the prefill set
+   SEPARATE from the resident set too; the probe is only possible as "resident lanes at 768" if 768-row resident lanes
+   fit the card (+~1.1 GB): they do not (0.5 GB free). Skip; the loan is the enabler.
+1. Resident shrink + pool (static knob), prefill set built over the pool + fixed store end ranges, loan guard with
+   compaction-first and overlap swap; unit tests for the placement and the swap bookkeeping (CPU), a GPU test of
+   lend/return round-trip bit-identity of live KV.
+2. Gate A at 1024-row lanes (chunked vs layer-outer at the same lane size) + a live A/B.
