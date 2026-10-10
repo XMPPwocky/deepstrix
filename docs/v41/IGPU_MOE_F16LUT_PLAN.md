@@ -191,6 +191,14 @@ share the experts more evenly (the hub is ~50% idle at 21 of 40 ms) on top of th
     the cost is decode-class slots displaced after a prefill. Second: a prefill-time routing mode that does not send mirrored
     picks to box 2 (shrinks its set toward 119-234/layer). Third: background whole-layer prefetch (`V41_LM_PREFETCH=1` is already ON
     in the hub env and hints only the last window's demand reads; extend to "all box-2-owned experts of layer L+k").
+* **Streaming-budget arithmetic (owner follow-up 10-10: "with streaming the budget should be tiny").** Resident slots needed =
+  lookahead layers x per-layer set (read ~1.5 s vs ~0.4 s compute per layer -> ~3-4 layers ahead -> ~4 x 234 ~ 1,000 slots).
+  Two caveats: (1) the loop is GROUP-major, so a group (layers 2-7) re-runs its six layers per sub-chunk and must keep 6 x 234 ~ 1,400
+  resident across the 4 sub-chunks; strict layer-outer order (macro-lanes) removes that. (2) Pure streaming re-reads the whole box-2
+  encoder set every window: ~4,700 experts x 18.8 MB ~ 88 GB per pass = ~11 GB/s at a 4096-row/8 s window vs 2.8-4 GB/s measured
+  (8.5 GB/s theoretical, 2 drives). Bytes per pass are constant, so it only fits with LONGER windows (16K rows ~32 s -> ~2.8 GB/s;
+  lm_store ~1.3 GB from the lent arena tail) or a smaller set. Shrinking box-2's prefill set to its static ~119/layer (2,400 experts,
+  45 GB) fits resident under the 3,500 budget with zero steady-state reads; streaming then only refills after decode bursts.
 * Partial compute already exists: box 2 runs `V41_B2_HITS_FIRST=1` (resident experts first, misses read meanwhile, a second pass for
   the landed ones), so a request is not blocked by one missing expert; the reply simply cannot complete until the LAST miss lands
   and its pass runs. `n_missing` in the trace is only the count of non-resident experts when the pass starts. The measured
