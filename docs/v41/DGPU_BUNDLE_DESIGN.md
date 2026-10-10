@@ -118,3 +118,17 @@ lone DSpark r3-r6 -7.6..-8.2% (r4 69.4 -> 64.9, r6 90.1 -> 82.7), lone plain r1 
 also differs). The PCIe LCLK pin A/B (12 blocks before the window) was null (auto/pin 1.005): the
 slow-xfer mode is copy-beside-compute, which zero-copy removes. Next: per-turn A/B of `V41_DGPU_ZC_PUSH`
 (attribution + plain3 r3), then slice 3 after Step 0c.
+
+## 11. Zero-copy per-turn A/B (2026-10-10 09:00-12:00 UTC, 176 turns) and the queued fix
+
+`V41_DGPU_ZC_PUSH` 1 vs 0, ms.step p50: lone DSpark r3-r6 0.982-0.996 (faster), plain 3/4/5 streams
+0.978-0.990 (faster; plain3 r3 0.990 -- so the deploy's plain3 r3 +1.5% is not zero-copy), two-stream DSpark
+r4-r12 1.003-1.030 (slower; 5 cells above the 1.01 bar). Net ~ -0.5%. Reading: zero-copy puts THREE copy
+operations on the iGPU's in-order `ie.compute` (the peer push left one, `xq_recv -> d_xq_q8k`); two-stream
+DSpark is the iGPU-bound regime (both streams' drafters + the larger MoE), where queue operations on the
+iGPU cost the step; in the dGPU-bound regimes removing the dGPU's SDMA copies wins.
+
+**Owner 10-10: keep zero-copy ON everywhere; queue the fix as part of slice 3:** one copy per lane-layer --
+lay sel / ew / xq out contiguously in the readback pack AND in the iGPU landing scratch (one contiguous
+allocation with typed views), so a single host->device copy fills all three; then re-A/B, two-stream cells
+first.
