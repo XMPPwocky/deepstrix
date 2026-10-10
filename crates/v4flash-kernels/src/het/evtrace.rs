@@ -62,7 +62,13 @@ pub static META: Kind = Kind {
 /// Periodic system sample (`V41_EVTRACE_SYS_MS`, default 100). `dK_*` are the
 /// cumulative /proc/diskstats counters of the K-th NVMe whole disk (names in
 /// the header's `sys_devices`); `psi_*` cumulative /proc/pressure totals (us);
-/// `self_*` this process (/proc/self/io, /proc/self/status).
+/// `self_*` this process (/proc/self/io, /proc/self/status). `tb_*` (appended
+/// after `sample_us`) = cumulative counters of the Thunderbolt network
+/// interface (`/sys/class/net/<iface>/statistics/{rx,tx}_{bytes,packets}`,
+/// `rx_dropped`, `rx_missed_errors`; NaN when the box has none); the interface
+/// is the first `thunderbolt*` entry of /sys/class/net, named in the header's
+/// `sys_net`, and `sys_link` holds the trained link's `rx_speed` / `tx_speed` /
+/// `rx_lanes` / `tx_lanes` strings (null when unreadable).
 pub static SYS: Kind = Kind {
     id: 1,
     name: "sys",
@@ -76,6 +82,7 @@ pub static SYS: Kind = Kind {
         "mem_avail_kb", "cached_kb", "dirty_kb", "writeback_kb",
         "self_read_bytes", "self_write_bytes", "self_rchar", "self_threads",
         "self_vol_ctxsw", "self_invol_ctxsw", "ctxt_total", "sample_us",
+        "tb_rx_bytes", "tb_tx_bytes", "tb_rx_packets", "tb_tx_packets", "tb_rx_dropped", "tb_rx_missed",
     ],
 };
 
@@ -370,6 +377,56 @@ fn nvme_disks() -> Vec<String> {
     v
 }
 
+/// The Thunderbolt network interface: the first `/sys/class/net` entry (sorted)
+/// whose name starts with `thunderbolt`.
+fn thunderbolt_iface() -> Option<String> {
+    let mut v: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("thunderbolt"))
+        .collect();
+    v.sort();
+    v.into_iter().next()
+}
+
+/// The trained Thunderbolt link (`/sys/bus/thunderbolt/devices/*/{rx,tx}_{speed,lanes}`):
+/// the first device (sorted) that has all four, as strings; None when there is none.
+fn thunderbolt_link() -> Option<serde_json::Value> {
+    let mut dirs: Vec<std::path::PathBuf> =
+        std::fs::read_dir("/sys/bus/thunderbolt/devices").ok()?.filter_map(|e| Some(e.ok()?.path())).collect();
+    dirs.sort();
+    dirs.into_iter().find_map(|d| {
+        let rd = |f: &str| std::fs::read_to_string(d.join(f)).ok().map(|s| s.trim().to_string());
+        let (rs, ts, rl, tl) = (rd("rx_speed")?, rd("tx_speed")?, rd("rx_lanes")?, rd("tx_lanes")?);
+        Some(serde_json::json!({
+            "device": d.file_name().map(|n| n.to_string_lossy().into_owned()),
+            "rx_speed": rs, "tx_speed": ts, "rx_lanes": rl, "tx_lanes": tl,
+        }))
+    })
+}
+
+/// Index into the header's `sys_devices` of the NVMe whole disk that holds
+/// `path` (stat `st_dev` -> `/sys/dev/block/MAJ:MIN` -> the `nvmeXnY` component
+/// of its resolved sysfs path, so a partition maps to its disk). NaN when the
+/// file system is not directly on an NVMe disk (btrfs/zfs/dm/tmpfs ...) or the
+/// disk is not in `sys_devices`. Slow (sysfs reads): call once at init, never
+/// on a hot path.
+pub fn dev_index_for_path(path: &std::path::Path) -> f64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = std::fs::metadata(path) else { return f64::NAN };
+    let d = md.dev();
+    let major = ((d >> 8) & 0xfff) | ((d >> 32) & !0xfff);
+    let minor = (d & 0xff) | ((d >> 12) & !0xff);
+    let Ok(real) = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")) else { return f64::NAN };
+    let disks = nvme_disks();
+    real.components()
+        .find_map(|c| {
+            let n = c.as_os_str().to_str()?;
+            disks.iter().position(|x| x == n)
+        })
+        .map_or(f64::NAN, |i| i as f64)
+}
+
 /// Start the trace if `V41_EVTRACE_DIR` is set: `role` names the files
 /// ("hub", "b2"), `extras` goes into the header verbatim (config worth
 /// knowing at analysis time). Idempotent; errors disable the trace with a
@@ -385,6 +442,7 @@ pub fn init(role: &str, extras: serde_json::Value) {
         return;
     }
     let disks = nvme_disks();
+    let net = thunderbolt_iface();
     let kinds_json: Vec<serde_json::Value> = kinds()
         .iter()
         .map(|k| serde_json::json!({ "id": k.id, "name": k.name, "fields": k.fields }))
@@ -398,6 +456,8 @@ pub fn init(role: &str, extras: serde_json::Value) {
         "t_mono_raw_at_open": monotonic_raw_ns(),
         "t_realtime_at_open": realtime_ns(),
         "sys_devices": disks,
+        "sys_net": net,
+        "sys_link": thunderbolt_link(),
         "kinds": kinds_json,
         "extras": extras,
     });
@@ -425,7 +485,7 @@ pub fn init(role: &str, extras: serde_json::Value) {
     if period > 0 {
         let _ = std::thread::Builder::new()
             .name("evtrace-sys".into())
-            .spawn(move || sys_sampler(Duration::from_millis(period), disks));
+            .spawn(move || sys_sampler(Duration::from_millis(period), disks, net));
     }
     tracing::info!(role, "evtrace: on");
 }
@@ -617,7 +677,12 @@ fn kv_field(s: &str, key: &str) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-fn sys_sampler(period: Duration, disks: Vec<String>) {
+fn sys_sampler(period: Duration, disks: Vec<String>, net: Option<String>) {
+    // Resolve the statistics paths once; each tick only re-reads the tiny files.
+    let net_files: Option<[std::path::PathBuf; 6]> = net.map(|n| {
+        let d = std::path::Path::new("/sys/class/net").join(n).join("statistics");
+        ["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "rx_dropped", "rx_missed_errors"].map(|f| d.join(f))
+    });
     loop {
         if !enabled() {
             return;
@@ -658,7 +723,17 @@ fn sys_sampler(period: Duration, disks: Vec<String>) {
         v.push(kv_field(&st, "voluntary_ctxt_switches:"));
         v.push(kv_field(&st, "nonvoluntary_ctxt_switches:"));
         v.push(kv_field(&stat, "ctxt"));
+        // Six tiny sysfs reads (NaN when the box has no thunderbolt interface);
+        // appended AFTER `sample_us`, which covers them.
+        let tb: Vec<f64> = match &net_files {
+            Some(fs) => fs
+                .iter()
+                .map(|p| std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(f64::NAN))
+                .collect(),
+            None => vec![f64::NAN; 6],
+        };
         v.push(t0.elapsed().as_secs_f64() * 1e6);
+        v.extend(tb);
         emit(&SYS, &v);
         std::thread::sleep(period.saturating_sub(t0.elapsed()));
     }

@@ -475,7 +475,7 @@ Checked against `het/evtrace.rs`, `het/evtrace_kinds.rs`, `het/evtrace_ring.rs`,
 `het/evtrace_dev.rs`, `scripts/trace_now.sh` and `scripts/evt_dump_now.sh`.
 
 **Kinds** (`evtrace::kinds()`: `meta` 0, `sys` 1, `str` 3, `site` 4, `knob` 5, `dev` 6, `cal` 7,
-plus `evtrace_kinds::ALL`: `hub_req` 10, `hub_step` 11, `hub_phase` 12, `step_dev` 13,
+plus `evtrace_kinds::ALL`: `hub_req` 10, `hub_step` 11, `hub_phase` 12, `step_dev` 13, `hub_embed` 14, `hub_lh2` 15, `b1_read` 16,
 `b2_req` 20, `b2_read` 21, `b2_ensure` 22, `b2_write` 23):
 - `str` (3) packs **six** bytes per f64, as an exact integer (byte i at bit 8i), not eight —
   raw bit patterns could form NaNs a reader might not preserve.
@@ -485,6 +485,17 @@ plus `evtrace_kinds::ALL`: `hub_req` 10, `hub_step` 11, `hub_phase` 12, `step_de
 - `step_dev` is id **13**, not 32.
 - `cal` (7) is new: one device-clock calibration anchor per record (`t, device, ok, spin_us,
   q_us, resid_us, tol_us, slope_ppm, slope_q_ppm, link_ms, anchors`).
+- 2026-10-10 (perfetto system trace; `scripts/evt2perfetto.py`): `sys` gained six fields after
+  `sample_us` -- `tb_rx_bytes, tb_tx_bytes, tb_rx_packets, tb_tx_packets, tb_rx_dropped,
+  tb_rx_missed`, cumulative `/sys/class/net/<iface>/statistics/*` of the first `thunderbolt*`
+  interface (NaN without one) -- and the header gained `sys_net` (the interface name or null) and
+  `sys_link` (the trained link's `rx_speed`/`tx_speed`/`rx_lanes`/`tx_lanes` strings, or null).
+  `hub_step` gained a last field `spec_streams` (streams that speculated this step; 0 on a plain
+  step). New hub kind `b1_read` (16): one record per box-1 pager expert read (gate+up+down of one
+  `(layer, expert)`): `t_read_start, t_read_end, layer, expert, bytes, src, dev` -- `src` 0 = a
+  demand miss read, 1 = the `b1-prefetch` thread; `dev` is NaN (the pager does not resolve the
+  drive). Prefill window loads are not emitted. Files written before these changes lack the
+  fields; readers must treat them as missing.
 - `span` (30) and `instant` (33) do not exist (P2 not built). `site` (4) is defined but nothing
   registers span callsites yet.
 
@@ -506,6 +517,20 @@ plus `evtrace_kinds::ALL`: `hub_req` 10, `hub_step` 11, `hub_phase` 12, `step_de
   `RING=` overrides the dir, windows older than `DUMP_MAX_S`, default 150 s, get none). The box-2
   dump is opt-in (`B2DUMP=1`, `B2DUMP_MAX_S`). A box-2 dump is **not** deleted after the pull; only
   the script's temp dirs are removed.
+- 2026-10-10 (perfetto system trace): `trace_now.sh` `TWO=1` picks the window inside the latest run of
+  2-stream DSpark steps (`evt2perfetto.py window --two`: `live == 2` and `spec_streams >= 2`, or
+  `rows >= 4` in a file without that field; a gap of <= 2 steps or < 1 s is bridged; the run and its
+  qualifying fraction are on stderr); default output `~/traces/dspark2-<utc>.json.gz`. The converter
+  adds the process groups "box 1 disks + system" / "box 2 disks + system" (per-NVMe MB/s, IOPS,
+  latency, queue depth, util from `sys` deltas; PSI, procs, dirty; the pagers' SSD reads per drive),
+  and "Thunderbolt link (box 1 <-> box 2)" (per-request wire legs from the NTP stamps, derived link
+  MB/s, NIC counters, flow arrows). Wire legs are ~30 us against an offset bound of tens of us: a
+  leg under 2 us (or negative) is drawn 2 us wide with `clock_clamped=1` and counted on stderr.
+  Disk models come from `lsblk` on each box (`--disk-models-hub/-b2`); `cut` records which disks the
+  expert dir and the mirror dir sit on (`extras.route_devices`; `b2_read.route` 1 = mirror, 2 =
+  primary) and keeps `sys` samples 5 s before the window for the deltas. Files without the new
+  fields (`tb_*`, `spec_streams`, `b1_read`) convert; each skipped track is listed on stderr.
+  Selftest: `scripts/test_evt2perfetto_system.py`.
 
 **Production state.** Code default `V41_EVTRACE_DEV=1` (`knobs::EVTRACE_DEV`, live). Production
 sets `V41_EVTRACE_DEV=0` (hub env 2026-10-04): since 2026-10-02 03:34 UTC, after Tier B device

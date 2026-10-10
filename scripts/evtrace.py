@@ -442,6 +442,12 @@ def cmd_report(a):
             for f in ('psi_io_some', 'psi_io_full', 'psi_cpu_some'):
                 rate = [(q[f] - p[f]) / ((q['t'] - p['t']) / 1e3) for p, q in zip(g, g[1:]) if q['t'] > p['t']]
                 show(f'  {f} (fraction stalled)', rate, hist=False)
+            # Thunderbolt NIC (tb_* fields; files from before 2026-10-10 lack them).
+            for f, lab in (('tb_rx_bytes', 'rx'), ('tb_tx_bytes', 'tx')):
+                rate = [(q[f] - p[f]) / (q['t'] - p['t']) * 1e3 for p, q in zip(g, g[1:])
+                        if f in p and f in q and q['t'] > p['t'] and q[f] == q[f] and p[f] == p[f] and q[f] >= p[f]]
+                if rate:
+                    show(f'  thunderbolt {lab} MB/s', rate, hist=False)
     meta = recs.get('meta', [])
     if meta:
         print(f"\nmeta: dropped={max(m['dropped'] for m in meta):.0f} written={max(m['written'] for m in meta):.0f}")

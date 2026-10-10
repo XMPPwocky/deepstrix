@@ -2522,7 +2522,8 @@ impl Sched {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),
                 ("fwd_ms", fwd_only_ms), ("fwd_all_ms", fwd_ms), ("engram_ms", engram_ms), ("sample_ms", sample_ms),
-                ("step_ms", t0.elapsed().as_secs_f64() * 1e3), ("rf_chain_waits", chain_waits as f64), ("rf_chain_wait_us", chain_wait_us as f64)] {
+                ("step_ms", t0.elapsed().as_secs_f64() * 1e3), ("rf_chain_waits", chain_waits as f64), ("rf_chain_wait_us", chain_wait_us as f64),
+                ("spec_streams", spec_outs.iter().flatten().count() as f64)] {
                 ev.insert(k.into(), v);
             }
             ev.entry("profiled".into()).or_insert(0.0);

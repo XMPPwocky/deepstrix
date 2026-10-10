@@ -7,7 +7,7 @@ use super::evtrace::Kind;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Every hub/box-2 kind (added to `evtrace`'s header list).
-pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED, &HUB_LH2];
+pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED, &HUB_LH2, &B1_READ];
 
 // ---- hub: step context for per-request records ----
 
@@ -106,6 +106,9 @@ macro_rules! with_dev_fields {
 /// fields are NaN here and come in `step_dev` records (the readers merge
 /// them); `dev_skipped` = this step found no free event buffer (no device
 /// data), `t_fwd_sync` = the forward's final dGPU sync returned (RAW).
+/// `spec_streams` (last field) = streams that speculated this step (0 on a
+/// plain step; 2 = two-stream DSpark, `V41_MS_DSPARK_STREAMS`); NaN in files
+/// written before it existed.
 pub static HUB_STEP: Kind = Kind {
     id: 11,
     name: "hub_step",
@@ -145,6 +148,10 @@ pub static HUB_STEP: Kind = Kind {
         "pos_min", "pos_max",
         // Tier B (see above)
         "dev_skipped", "t_fwd_sync",
+        // how many streams speculated this step (drafted K >= 1 rows and went
+        // through the block verify; the count behind the `ms.step` log's
+        // `spec_streams=K/accepted/emitted,...` list); 0 on a plain step
+        "spec_streams",
     ),
 };
 
@@ -248,6 +255,24 @@ pub static STEP_DEV: Kind = Kind {
         "t_start", "step", "device", "pairs", "deferred", "dropped", "viol_a", "viol_b", "checked_b", "q_us_max", "lag_ms", "tierb_us",
         ;
     ),
+};
+
+/// One box-1 pager SSD read of an expert (hub kinds 10..19), emitted by the
+/// reading thread when the read finishes: gate + up + down of one `(layer,
+/// expert)` -- the whole per-expert read, repack included on the CPU-repack
+/// route. `src`: 0 demand miss (the decode `ensure` miss readers, batched or
+/// not), 1 prefetch / background (`b1-prefetch` thread). `dev` = index into
+/// the header's `sys_devices` of the drive the weights dir lives on (resolved
+/// once at `start_prefetcher` / `start_readahead`, so NaN if neither runs or the
+/// file system is not directly on an NVMe disk -- e.g. btrfs on LUKS, as on
+/// both boxes today; the converter then draws the reads on a "drive unknown"
+/// track).
+/// Not emitted: prefill window loads (`load_layer_window`, sequential
+/// whole-layer sweeps), whose disk traffic the `sys` samples still show.
+pub static B1_READ: Kind = Kind {
+    id: 16,
+    name: "b1_read",
+    fields: &["t_read_start", "t_read_end", "layer", "expert", "bytes", "src", "dev"],
 };
 
 /// Scheduler phase change (multistream `ms.phase`). Phases: 0 Decode,
@@ -367,7 +392,7 @@ pub static B2_ENSURE: Kind = Kind {
 /// `demand_reads_at_start` is NaN for demand reads (only their own thread
 /// changes it). Demand: `set` = its staging set (= index in the chunk),
 /// `chunk_idx` = the chunk's number. `route` = the drives it read from:
-/// 0 split (both), 1 mirror only (SN5000), 2 primary only (E100). `wanted`/`blocked_on` = the request being served
+/// 0 split (both), 1 mirror only (V41_EXPERT_MIRROR_DIR's drive), 2 primary only (the --model dir's drive). `wanted`/`blocked_on` = the request being served
 /// needed it / the compute thread was blocked waiting for it.
 pub static B2_READ: Kind = Kind {
     id: 21,

@@ -25,6 +25,30 @@ use crate::mxfp4_repack::Mxfp4Repack;
 use crate::weight_contract;
 use crate::weights::DeviceWeight;
 
+/// Index into the trace header's `sys_devices` of the drive the weights dir
+/// lives on, resolved once by [`note_weights_dir`] (NaN until then / unknown).
+static B1_DEV: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// Resolve [`B1_DEV`] from the weights dir. Only does work when the trace is
+/// on (sysfs reads), and only the first call counts; the hot path just reads
+/// the `OnceLock`.
+fn note_weights_dir(dir: &std::path::Path) {
+    if super::evtrace::enabled() {
+        let _ = B1_DEV.set(super::evtrace::dev_index_for_path(dir));
+    }
+}
+
+/// One `b1_read` evtrace record (`evtrace_kinds::B1_READ`): `t0` = the read's
+/// start stamp (taken only when the trace is on), the end stamp is now. `dev`
+/// is the weights dir's drive when [`note_weights_dir`] resolved it, else NaN.
+fn emit_b1_read(t0: f64, layer: i32, expert: u32, bytes: usize, src: u8) {
+    let dev = B1_DEV.get().copied().unwrap_or(f64::NAN);
+    super::evtrace::emit(
+        &super::evtrace_kinds::B1_READ,
+        &[t0, super::evtrace::now(), layer as f64, expert as f64, bytes as f64, src as f64, dev],
+    );
+}
+
 /// One role's byte geometry (gate / up / down differ only in k×rows order).
 fn role_kr(which: &str) -> (u64, u64) {
     // load_experts_packed: down is [n_ff → n_embd]; gate/up are [n_embd → n_ff].
@@ -1607,6 +1631,7 @@ impl ExpertPager {
             return Ok(());
         }
         let (tx, rx) = std::sync::mpsc::sync_channel::<(i32, u32)>(READAHEAD_QUEUE);
+        note_weights_dir(dir);
         let dir = dir.to_path_buf();
         std::thread::Builder::new()
             .name("b1-readahead".into())
@@ -1697,6 +1722,7 @@ impl ExpertPager {
             self.routed.up_bytes_per_expert,
             self.routed.down_bytes_per_expert,
         ];
+        note_weights_dir(dir);
         let gpu_repack = self.repack.is_some();
         let dir = dir.to_path_buf();
         std::thread::Builder::new()
@@ -1725,6 +1751,8 @@ impl ExpertPager {
                         format!("blk.{layer}.ffn_down_exps.weight"),
                     ];
                     let mut bufs = [vec![0u8; sizes[0]], vec![0u8; sizes[1]], vec![0u8; sizes[2]]];
+                    // After the allocations: the slice is the SSD read, not the malloc.
+                    let t0 = super::evtrace::enabled().then(super::evtrace::now);
                     let mut ok = true;
                     for (name, dst) in names.iter().zip(bufs.iter_mut()) {
                         let Some(t) = src.tensor(name) else { ok = false; break };
@@ -1738,6 +1766,9 @@ impl ExpertPager {
                             ok = false;
                             break;
                         }
+                    }
+                    if let (Some(t0), true) = (t0, ok) {
+                        emit_b1_read(t0, layer, id, sizes.iter().sum(), 1);
                     }
                     if !ok {
                         bufs = [Vec::new(), Vec::new(), Vec::new()];
@@ -2609,6 +2640,8 @@ impl ExpertPager {
                     sc.spawn(move || {
                         let src = WeightSrc::from(owner);
                         let id = ms[i].0 as usize;
+                        let t0 = super::evtrace::enabled().then(super::evtrace::now);
+                        let bytes = gs.len() + us.len() + ds.len();
                         for (name, dst) in [(&names[0], gs), (&names[1], us), (&names[2], ds)] {
                             match src.tensor(name) {
                                 None => {
@@ -2628,6 +2661,9 @@ impl ExpertPager {
                                     }
                                 }
                             }
+                        }
+                        if let Some(t0) = t0 {
+                            emit_b1_read(t0, layer, id as u32, bytes, 0);
                         }
                     });
                 }
@@ -3211,9 +3247,32 @@ impl ExpertPager {
     }
     /// Read ONE missing expert into a staging set (pure I/O + CPU repack; runs
     /// for several misses concurrently under `V41_PAGER_MISS_PAR`). Returns the
-    /// coalesced offsets when the two-pread path was taken.
+    /// coalesced offsets when the two-pread path was taken. Emits one `b1_read`
+    /// (demand) when the evtrace is on; `bpe` = the expert's true byte size
+    /// (gate + up + down), since the stage buffers can be larger (coalesced
+    /// sizing adds a whole expert plus alignment padding).
     #[allow(clippy::too_many_arguments)]
     fn read_miss_into(
+        owner: &V41HfWeights,
+        gpu_repack: bool,
+        layer: i32,
+        id: u32,
+        names: &[String; 3],
+        b0: &mut [u8],
+        b1: &mut [u8],
+        b2: &mut [u8],
+        bpe: usize,
+    ) -> eyre::Result<Option<[(usize, usize, u32, u32); 3]>> {
+        let t0 = super::evtrace::enabled().then(super::evtrace::now);
+        let r = Self::read_miss_into_untraced(owner, gpu_repack, layer, id, names, b0, b1, b2);
+        if let (Some(t0), true) = (t0, r.is_ok()) {
+            emit_b1_read(t0, layer, id, bpe, 0);
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_miss_into_untraced(
         owner: &V41HfWeights,
         gpu_repack: bool,
         layer: i32,
@@ -3561,13 +3620,16 @@ impl ExpertPager {
                 let owner = &self.owner;
                 let stages = &mut self.stages;
                 let names = &names;
+                let bpe = self.routed.gate_bytes_per_expert
+                    + self.routed.up_bytes_per_expert
+                    + self.routed.down_bytes_per_expert;
                 std::thread::scope(|sc| {
                     let mut hs = Vec::with_capacity(chunk.len());
                     for (&(id, _), st) in chunk.iter().zip(stages.iter_mut()) {
                         let [p0, p1, p2] = st;
                         let (b0, b1, b2) = (p0.as_mut_slice(), p1.as_mut_slice(), p2.as_mut_slice());
                         hs.push(sc.spawn(move || -> R {
-                            Self::read_miss_into(owner, gpu_repack, layer, id, names, b0, b1, b2)
+                            Self::read_miss_into(owner, gpu_repack, layer, id, names, b0, b1, b2, bpe)
                                 .map_err(|e| format!("{e:#}"))
                         }));
                     }
