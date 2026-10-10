@@ -172,6 +172,33 @@ Revised estimate of what steps 1-3 buy on a 8.0 s steady window: kill paging -> 
 ~4.3 s; gaps 1.9 -> ~0.8 s -> ~3.2-3.5 s, i.e. **~1.2K rows/s** from box-2-side work alone. 2K needs the hub and box 2 to
 share the experts more evenly (the hub is ~50% idle at 21 of 40 ms) on top of that.
 
+### WHY box 2 pages in a pure prefill: its working set exceeds the prefill budget (owner prompt 10-10: "just fetch every expert, many layers ahead"; data analysis `pf2/rereads2.py` on the 16:44 job's 51,509 box-2 reads)
+
+* Only **30% of box-2's reads are experts in its static range (265-383)**; 70% are experts outside it (hot-split interleave /
+  mirror routing: `V41_B1_HOT_POLICY=interleave` live since 10-09 19:16 UTC, `IL_PER_LAYER` 115, plus `mirror_frac` 0.70).
+  Distinct experts box 2 touched per encoder layer in the job: L0 266, L1 264, L8 262, L9 264, mid layers ~190-230 (119 range +
+  ~115 interleaved = ~234, consistent). Over the 20 encoder layers that is **~4,000-4,700 experts = ~the whole 4,740-slot pool and
+  above `prefill_budget` 3,500**. Cycling a >budget working set through an LRU thrashes every window: observed **1,146 reads (~21 GB)
+  per 4096-row window** = ~half the set re-read each window. Victims are 95% ENCODER-layer experts (self-eviction), only 5%
+  decoder layers; 2,022 experts read once, 1,606 twice, a tail of ~100 experts read 10+ times.
+* So the user's idea is right, and the reason it does not already work is CAPACITY, not prediction: whole-layer prefetch many
+  layers ahead needs no routing knowledge (layer-major + long context touch ~every expert), but prefetching a set larger than the
+  budget just evicts what the next window needs. Make the set fit first, then prefetch it in layer order:
+  - total encoder experts = 20 x 384 = 7,680; hub pool 5,425 + box-2 pool 4,740 = 10,165 slots, so a STATIC expert->box
+    partition during prefill (each encoder expert resident in exactly one pool) fits with ~2.5K slack and needs NO steady-state
+    paging; today both boxes hold overlapping hot sets (mirror) and box 2 also serves 70% non-owned picks.
+  - cheaper first: `prefill_budget` 3,500 -> ~4,400 (live knob-file key on box 2) tests the capacity hypothesis directly;
+    the cost is decode-class slots displaced after a prefill. Second: a prefill-time routing mode that does not send mirrored
+    picks to box 2 (shrinks its set toward 119-234/layer). Third: background whole-layer prefetch (`V41_LM_PREFETCH=1` is already ON
+    in the hub env and hints only the last window's demand reads; extend to "all box-2-owned experts of layer L+k").
+* Partial compute already exists: box 2 runs `V41_B2_HITS_FIRST=1` (resident experts first, misses read meanwhile, a second pass for
+  the landed ones), so a request is not blocked by one missing expert; the reply simply cannot complete until the LAST miss lands
+  and its pass runs. `n_missing` in the trace is only the count of non-resident experts when the pass starts. The measured
+  run-time growth (19.6 -> 26.1 -> 47.5 -> 79.6 ms) is the tail of those reads (3 ms/miss at p50 demand, background reads 7.4 ms p50
+  under queueing) outlasting the ~15 ms of hits compute.
+* Open question the 10-10 01:41 summary left: "check whether interleave slowed prefill". This is circumstantial evidence it did
+  (box-2 set 119 -> ~234/layer). A pre-interleave long-prefill trace (before 10-09 19:16 UTC) would confirm.
+
 ### Box-2 "serve the other lane under park": scoping (read-only, 2026-10-10)
 
 What exists. Box 2 (`remote_experts.rs`, expertd compute loop ~8340-8840) already PARKS a request that must page
