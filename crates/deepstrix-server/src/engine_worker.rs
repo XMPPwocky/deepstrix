@@ -1160,7 +1160,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // rows of a chunk (forward_prompt_batch_v2_pipelined), so size the
     // per-lane scratch at that instead of the full chunk. The shared set
     // (one instance, alternating between lanes) is sized the same.
-    let lane_rows = B_MAX.div_ceil(2);
+    let lane_rows = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
     let bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
@@ -2077,7 +2077,7 @@ fn probe_fingerprint(state: &WorkerState) -> eyre::Result<Vec<(String, u64)>> {
     )));
     for (li, l) in state.state.layers.iter().enumerate() {
         // Raw SWA window, active region only.
-        let total_rows = v4flash_kernels::het::state::KV_CACHE_ROWS;
+        let total_rows = v4flash_kernels::het::state::kv_cache_rows();
         let row = l.kv_cache.len() / total_rows.max(1);
         if row > 0 && l.n_raw > 0 {
             let off = (l.raw_off as usize) * row;

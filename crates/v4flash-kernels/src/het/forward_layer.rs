@@ -810,7 +810,7 @@ impl HeterogeneousEngine {
                 Ok(())
             })?;
             debug_assert!(
-                ((ls.raw_off + ls.n_raw) as usize) < super::state::KV_CACHE_ROWS,
+                ((ls.raw_off + ls.n_raw) as usize) < super::state::kv_cache_rows(),
                 "kv monotonic append OOB (qkv_chain): raw_off={} n_raw={}",
                 ls.raw_off,
                 ls.n_raw
@@ -924,7 +924,7 @@ impl HeterogeneousEngine {
                 let _t = de.events.stage("k.kv_chain.kv_append", &de.compute)?;
                 let slot = ls.raw_off + ls.n_raw;
                 debug_assert!(
-                    (slot as usize) < super::state::KV_CACHE_ROWS,
+                    (slot as usize) < super::state::kv_cache_rows(),
                     "kv monotonic append OOB: raw_off={} n_raw={}",
                     ls.raw_off,
                     ls.n_raw
@@ -934,7 +934,7 @@ impl HeterogeneousEngine {
                     &mut ls.kv_cache,
                     &dgpu_scratch.kv_normed,
                     slot,
-                    super::state::KV_CACHE_ROWS as u32,
+                    super::state::kv_cache_rows() as u32,
                     N_HEAD_DIM,
                 )?;
             }
@@ -948,7 +948,7 @@ impl HeterogeneousEngine {
         // Wrap (~once per B_MAX tokens per layer): eviction-down copy of
         // the live window to slots [0..W) via scratch (overlap-safe two-hop,
         // same pattern as prefill's post-chunk eviction), then reset.
-        if (ls.raw_off + SWA_WINDOW) as usize >= super::state::KV_CACHE_ROWS {
+        if (ls.raw_off + SWA_WINDOW) as usize >= super::state::kv_cache_rows() {
             let head_dim = N_HEAD_DIM as usize;
             let win_len = (ls.n_raw as usize) * head_dim;
             let src_off = (ls.raw_off as usize) * head_dim;

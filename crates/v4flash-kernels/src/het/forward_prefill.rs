@@ -42,7 +42,7 @@ use super::prefill_stats::PrefillStats;
 use super::scratch::{DgpuScratch, IgpuScratch};
 use super::arena_ctx::slot;
 use crate::config::{ENGRAM_CHUNK, ENGRAM_IN, ENGRAM_OUT};
-use super::state::{CompKvStore, HetLayerState, HetModelState, KV_CACHE_ROWS};
+use super::state::{CompKvStore, HetLayerState, HetModelState, kv_cache_rows};
 use super::kv_arena::{store_index_of, KvArena, RowTables, RowTablesDev};
 use super::step_rows::StepRows;
 use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
@@ -1042,7 +1042,7 @@ impl PrefillJob {
             engram_rows,
             image_spans: spans.to_vec(),
             pos0,
-            chunk_rows: chunk_rows.clamp(1, B_MAX),
+            chunk_rows: chunk_rows.clamp(1, super::batch_scratch::chunk_rows_cap()),
             chunk_start: 0,
             chunk_idx: 0,
             replay: std::collections::VecDeque::new(),
@@ -5961,10 +5961,10 @@ impl HeterogeneousEngine {
         } else {
         let append_at = ls.raw_off + n_raw_before;
         assert!(
-            (append_at + b) as usize <= KV_CACHE_ROWS,
+            (append_at + b) as usize <= kv_cache_rows(),
             "kv_append OOB: raw_off={} + n_raw_before={n_raw_before} + b={b} >              KV_CACHE_ROWS={}",
             ls.raw_off,
-            KV_CACHE_ROWS,
+            kv_cache_rows(),
         );
         de.kv_append.launch_batched(
             &de.compute,
