@@ -22,9 +22,9 @@
 //! Who writes which ring row: every row a step KEEPS goes into the slot's
 //! `Backlog` (host), and so do the prefill's seed rows; the backlog is written
 //! into the ring (`write_backlog`: the latest window of it, in position order,
-//! once) after every step that writes rings, and at the latest when the
-//! stream drafts (`fill`: the transition to drafting, from a prefill or from a
-//! stretch of more live streams than may draft). A draft from
+//! once) after a ring-writing step when it holds just that step's rows, else
+//! when the stream next drafts (`fill`: the transition to drafting, from a
+//! prefill or from a stretch of more live streams than may draft). A draft from
 //! position `pos` reads the ring INCLUDING row `pos` and its forward writes row
 //! `pos` itself; when that row is already the ring's latest write the counter
 //! is wound back by one first, so the forward rewrites it with the same values
