@@ -159,3 +159,34 @@ goes from 3 queue operations to 2 (`xq` lands in the shared `si.d_xq_q8k`, `sel`
 `bi`). The penalty it targets is ~0.4% overall (two-stream DSpark only). Option 3's other variant does it
 fully: zero-copy stays OFF in steps where >= 2 streams speculate (`STEP_MULTI_SPEC`, set by the scheduler
 after drafting; `V41_DGPU_ZC_MULTI_SPEC=1` re-enables it there). Behaviour of lone / plain steps unchanged.
+
+## 14. Slice 3a/3b deployed; why a graph replay costs device time; kernargs in VRAM (2026-10-10)
+
+**Deploys.** 3a (4efe41f, hub 85fc7275, 16:28 UTC): `V41_MS_GRAPHS` live + the ZC regime gate. 3b
+(b00eadd, hub c18af233, 19:58 UTC): the fused router (`V41_DGPU_ROUTER_X2`, default on: layer l's gate
+matvec and the k1 look-ahead's in one `f16_matvec_batched_h20_x2` launch, direct path only; dGPU 12.2 ->
+8.0 us at b = 1, 27.5 -> 24.4 at b = 8) + env `DEBUG_CLR_KERNARG_HDP_FLUSH_WA=1`. Every gate bit-identical
+to the deployed source (244 logits files, 132,989 picks); proofs `ZC: zc_pulls`, `RX2: router_x2`, and
+CLR's `Using dev kernel arg wa = 3` on both GPUs. `AMD_LOG_MASK` is parsed as DECIMAL: `0x800` prints
+nothing, `2048` is LOG_INIT. A gate that turns graphs off must not assert G6's capture counts.
+
+**Graphs A/B on 85fc7275 (147 turns).** Lone DSpark: graphs ON +1.7..2.1% step (r3-r5, thousands of
+steps per cell); plain 3-7 streams ~neutral (plain3 r3 +1.7..5%); two-stream DSpark: ON 2-3% faster
+(small n). Device-bound cost model: 4 replays x 40 layers x ~6.5 us = ~1 ms per stream per step
+(lone measured +0.9..1.2 ms, plain3 +3.4); graphs pay only where the host enqueue is the bottleneck.
+
+**Why a replay costs device time (CLR rocm-7.2.3 source).** `hipGraphLaunch` on a linear kernel-only
+graph (`EnqueueGraphWithSingleList`, packets pre-built at instantiate under the default
+`DEBUG_CLR_GRAPH_PACKET_CAPTURE=1`) adds TWO barrier-AND packets per replay: the accumulate command and an
+unconditional callback marker (`hip_graph_internal.cpp:747-815, 1141-1150`), each with a host-memory
+interrupt completion signal; scopes NONE (no cache flush). The CP drains the queue at each (~3 us).
+Bench (`bench_graph_replay`, beside the live hub, paired): interrupts off / queue ring in VRAM change
+nothing; `DEBUG_CLR_GRAPH_PACKET_CAPTURE=0` removes one barrier (-4.6 us/replay) but sends nodes down the
+per-node host path (not adopted). No instantiate / stream flag removes the marker: fewer replays (merge
+the 4 stage graphs) is the only graph-side lever.
+
+**Kernargs.** Direct launches read their kernargs from HOST memory over PCIe: on a PCIe dGPU,
+`HIP_FORCE_DEV_KERNARG=1` alone is a no-op (`rocsettings.cpp:239-267`: device kernargs need the HDP-flush
+workaround, `DEBUG_CLR_KERNARG_HDP_FLUSH_WA`, default false). With both: mode 3 (DeviceKernelArgsHDP),
+direct launches -0.66 us/kernel on the dGPU (7 kernels 28.4 -> 23.8 us); graphs unchanged (their kernargs
+already live in a VRAM pool). Graphs re-A/B'd on c18af233 from 20:00 UTC (direct launches are now cheaper).
