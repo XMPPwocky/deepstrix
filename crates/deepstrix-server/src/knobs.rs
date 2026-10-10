@@ -128,6 +128,11 @@ v4flash_kernels::knobs! {
     pub static MS_DSPARK_DRAFTS = Knob::choice("V41_MS_DSPARK_DRAFTS", 0, &[&["sampled"], &["argmax"]]);
     /// `V41_MS_DSPARK_RING_ASYNC` (default on).
     pub static MS_DSPARK_RING_ASYNC = Knob::flag("V41_MS_DSPARK_RING_ASYNC", true);
+    /// `V41_MS_DSPARK_FILL` (default on): rows a ring did not take (the
+    /// prefill's seed, steps of more live streams than may draft) are held and
+    /// filled in when the stream drafts (`ms_dspark::Backlog`, KNOWN_BUGS #57);
+    /// off = the seed is written at once and unwritten rows are dropped.
+    pub static MS_DSPARK_FILL = Knob::flag("V41_MS_DSPARK_FILL", true);
     /// `V41_LONG_PREFILL_TOKENS` (default 16384): a prefill job longer than this
     /// flags its box-2 requests `REQ_FLAG_LONG_JOB` (box 2's phase keeps the
     /// job's experts: `knobs::prefill_budget_long` there); 0 = never.
