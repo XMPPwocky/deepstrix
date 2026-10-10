@@ -281,3 +281,20 @@ R8 whether the dGPU chain / hub MoE becomes the pole after P1 (unknown).
 R9 post-job decode warmth: is "head inside the prefill share" enough, or does decode-class LRU on the hub still evict it during the job
    (decode steps interleaved every 120 s/30 s)?
 R10 replay/decoder layers unaffected by the encoder split (verify).
+
+## 11. Implementation status (2026-10-10, branch worktree-igpu-wmma-moe)
+* **P1** (310d76f): `prefill_split.rs` (frozen split, 6 CPU tests), consumers via `home2_or_partition`, `V41_PAGER_NO_DENSE` reclaim, job-start log.
+  Knobs `V41_PREFILL_SPLIT=1`, `V41_PREFILL_B1_FILLER`, `V41_PAGER_NO_DENSE=1` (needs `V41_PREFILL_UNIFIED_POOL=1`). NOT run on a GPU.
+* **P2a** (3bdec76 + fix): `lm_schedule.rs` (pure schedule, 4 CPU tests incl. odd U / KvSourceOnly / equality with today's loop at U=2) and
+  `prefill_job_lm_pass` in `forward_prefill.rs`, behind `V41_LM_LAYER_OUTER=1` (needs `V41_LM_PREFILL=1`), quantum `V41_LM_QUANTUM_LAYERS`
+  (default 4). Server needs NO change: the first pass's `next_chunk_range` is the whole window, so `chunk_inputs` builds the window's
+  embeddings + Engram rows (P2a-alone cost: that prep now precedes the first quantum; P2b's producer thread removes it).
+  Commit 3bdec76's message said the CPU tests passed; they did NOT compile (a test built `LmWindow` literally); fixed in the follow-up commit.
+  233 lib tests now pass; `lm_prefill_bitexact`, `multistream_step`, `v41_golden_gate` compile. NOT run on a GPU.
+* **GPU gate for P2a (server DOWN, one weight load, per `reference_gpu_gate_windows`):**
+  `V41_LM_PREFILL=1 V41_LM_LAYER_OUTER=1 cargo test --release -p v4flash-kernels --features v41 --test lm_prefill_bitexact -- --ignored --nocapture`
+  (cases fresh,multi,restored,lazy; the test's lazy path + foreign interleaved units already exercise the new window contract and the
+  lane sharing; it has no box-2 client, so per-task `remote_ticket` ordering still needs a live-window golden with box 2 attached).
+  Split OFF for this gate (invariant I1). Expect: all cases bit-identical to chunked, `lm_windows_run() > 0`.
+* Not started: P2b (window-input producer thread + Engram ownership refactor), P3 (landing-rank fix, refill words), P4 (deferred-submit pair
+  merge), P0 (f16 arm into dispatch), P1b (hub-heavy).

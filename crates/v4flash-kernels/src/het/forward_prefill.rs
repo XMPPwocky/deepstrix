@@ -13034,7 +13034,7 @@ mod lm_tests {
         let mut job = PrefillJob::new(vec![1; 5000], Vec::new(), None, None, 0, 1024).unwrap();
         assert!(!job.lm_mid_group(), "no window");
         let subs = lm_plan_window(0, 0, 5000, 1024, (512, 512), &[], 4096).unwrap().unwrap();
-        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default() });
+        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(), lo: false, lo_layer: 0, saved: Vec::new() });
         assert!(!job.lm_mid_group(), "window open, group not begun");
         for sub in 1..4 {
             job.lm.as_mut().unwrap().sub = sub;
