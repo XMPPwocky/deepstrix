@@ -193,10 +193,13 @@ share the experts more evenly (the hub is ~50% idle at 21 of 40 ms) on top of th
     partition during prefill (each encoder expert resident in exactly one pool) fits with ~2.5K slack and needs NO steady-state
     paging; today both boxes hold overlapping hot sets (mirror) and box 2 also serves 70% non-owned picks.
   - (RETRACTED: raising `prefill_budget` would not help long jobs, see the correction above; for long jobs the unlimited
-    `prefill_budget_long` already applies.) First: find out why only ~3.5K of the 4,740 slots are usable (hub pins held on box 2:
-    its page-stats line shows `pins 3789/4232`; staging off; foreign-layer floors) -- if pins are the reason, releasing/limiting
-    hub pins during a long prefill gives capacity for free. Second: a prefill-time routing mode that does not send mirrored
-    picks to box 2 (shrinks its set toward 119-234/layer). Third: background whole-layer prefetch (`V41_LM_PREFETCH=1` is already ON
+    `prefill_budget_long` already applies.) PINS ARE NOT THE CAUSE (checked): `pins 3789/4232` is the decode-time pinned/budget
+    figure (hub-requested "never evict" slots, REQ_FLAG_PIN/RELEASE); on every prefill entry the hub releases the coldest pins
+    to `budget - V41_B2_PIN_PREFILL_BAND` and the hub runs BAND=4096, so ~136 stay pinned (matches the trace) and a long job gets
+    ~4,600 of the 4,740 slots. So the long job's real TOUCHED set is ~5.2-5.8K (the code's own 10-03 measurement: 5,161 distinct
+    experts for a 229K job; reads only reveal the missed ones, hence my earlier 4.0-4.7K undercount): ~1,146 re-reads/window =
+    set - capacity. First fix: a prefill-time routing mode that does not send mirrored/interleaved picks to box 2 (shrink its set by
+    ~1.2K = ~60 experts/layer; the pool cannot grow on the 96 GB box). Third (renumbered below): background whole-layer prefetch (`V41_LM_PREFETCH=1` is already ON
     in the hub env and hints only the last window's demand reads; extend to "all box-2-owned experts of layer L+k").
 * **Streaming-budget arithmetic (owner follow-up 10-10: "with streaming the budget should be tiny").** Resident slots needed =
   lookahead layers x per-layer set (read ~1.5 s vs ~0.4 s compute per layer -> ~3-4 layers ahead -> ~4 x 234 ~ 1,000 slots).
