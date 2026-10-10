@@ -99,3 +99,27 @@ not apply (the gap categories need re-deriving from pass boundaries: look at `pr
   f16-rounded). No inf/NaN logged. Substitution is decode-only. Test: a restart with `V41_PREFILL_F16_REPLIES=0`, then the
   same null pair. Gate A stays the fidelity proof for layer-outer.
 * Harness bug fixed mid-run: same-prompt snapshots share hashes, so the per-arm trash dir name must be unique (arm suffix).
+
+## 7. Restart 21:32-21:36 UTC + repeat arms + PRODUCTION ON (owner OK, 2026-10-10)
+
+* Hub `f9fa7f87` (main 316182e3: f16-WMMA arm wired, default off) with `V41_PAGER_NO_DENSE=1` (pager: `prefill dense = 0`,
+  LRU = all 5425 slots) and `V41_PREFILL_F16_REPLIES=0` (box-2 prefill partials f32). 3 min 17 s down: a `# comment` line
+  appended to the env file was exec'd by `env -i` and the supervisor died at once (fixed: `launch_hub.sh`).
+* **Repeat arms** (same 82K prompt; `--out ~/gateb_20261010b`):
+
+  | arm | median window s | rows/s |
+  |---|---|---|
+  | a0_2 / a0n_2 / a0_3 (group-major) | 6.70 / 9.94 / 8.21 | 611 / 412 / 499 |
+  | split_lo_2 / split_lo_3 | 3.83 / 4.03 | 1069 / 1015 |
+  | split_lo_f16 (+ `V41_MOE_WMMA_F16=1`, hub only) | 3.49 | 1172 (one sample, lighter load) |
+
+* **Fidelity, live:** the `split` (group-major) and `split_lo` (layer-outer) records of the first session are
+  BIT-IDENTICAL (dump records 6 and 7, ~3 min apart, live traffic): with the same frozen partition, layer-outer reproduces
+  group-major exactly on the live hub. The ~0.3-nat run-to-run spread is NOT the f16 replies (with f32 replies the null
+  is still 0.29 / 0.47 nats): any partition change (hot-set refresh between jobs; the split is built from the live hot set
+  at job start) perturbs f32 association, and at 82K tokens a near-tie in the router top-6 / indexer top-k flips and
+  compounds. A live KLD gate at long context has no power below ~0.3 nats; bit-identity under a fixed partition is the gate.
+  `scratch/prefill_trace/dump_find.py` recovers a prompt's records from a busy dump by top-5 signature.
+* **PRODUCTION 22:0x UTC:** `V41_LM_LAYER_OUTER=1`, `V41_PREFILL_SPLIT=1` in `/dev/shm/deepstrix-knobs.txt` AND the hub env
+  file (code defaults stay off). Revert: delete the two lines from the knob file (next window / next long job) and the
+  env file (`.pre-lo-split-20261010` backup). `V41_PREFILL_LOGITS_DUMP` is on this launch only (~0.5 MB per prefill).
