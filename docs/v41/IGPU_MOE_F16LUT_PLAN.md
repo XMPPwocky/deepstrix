@@ -121,7 +121,59 @@ Constraints found while scoping:
 * **Latency.** Prefill units interleave with decode bursts (scheduler); a longer non-preemptible MoE batch delays
   decode streams. Keep the batch <= ~2048 rows (~1 unit-equivalent in time) and A/B decode p90 with it.
 
-Steps (each gated; nothing GPU beyond the harness until a window is agreed):
+### POST-MOVE BREAKDOWN (evtrace, measured 2026-10-10; supersedes the 10-01 numbers above)
+
+Source: read-only analysis by a subagent over hub `hub-20261010-162836-3651418-000.evt` joined (seq,t2) with box-2
+`b2-20261010-*-07{3,4}.evt`; main job = a 192K-token cold prefill, 10-10 16:44-16:52 UTC (47 windows x 4096 rows, 160
+requests/window = 20 layers x 4 sub-chunks x 2 lanes x 512 rows; 7,560 requests, all joined). Scripts/extracts in the
+job tmp `pf2/` (`join_1644.txt`). Its 10-01 re-run reproduced the old note (8.77 s, 467 rows/s), so the method is sound.
+
+* **Steady window (<=100 hub-visible box-2 misses, 19 windows): 8.02 s = 511 rows/s** (10-01: 8.77 s, 467). Hub blocked on
+  box 2 53%, hub busy 22%, Engram/G0 prep gaps 16% (1.25 s/window, 3 x 0.42 s), other group-boundary gaps 8% (0.63 s).
+  Mid (100-800 misses) 470 rows/s; heavy paging (first window / right after a decode burst) 304; the 11:31 job on the
+  previous binary 587 (cause of the job-to-job spread unknown).
+* **Per 512-row request (steady, p50, ms):** wire out 2.7 (3.01 MB, 1.13 GB/s) + wire back 4.4 (5.24 MB, 1.18 GB/s) = **7.1
+  total (was 28)**; **box-2 queue behind the other lane 8.6 (lane 1 ~28-32)**; **box-2 run 28.4 (floor 18.4 with 0 missing
+  experts, rises with `n_missing`)**; D2H 0.35; RTT 56.8 (was ~47-50); hub reply->next-submit **10.4 (was 25-30)**.
+* **Box-2 run by experts not yet landed (`n_missing`): 0-2: 19.6 ms (29% of requests) | 3-6: 26.1 (34%) | 7-12: 47.5
+  (22%) | 13+: 79.6 (15%).** Run time = GPU waiting on page reads (corr 0.93). Mean n_missing 7.1 now vs 2.2 on 10-01;
+  requests with 0 missing 7% vs 38%; **box-2 pool 4,740 slots now (`--experts L0-L39:265-383`) vs 6,160** (the 96 GB
+  machine; -23%), pinned 136 vs 1,584. The pool shrink is the INFERRED cause of the extra paging.
+* **Box 2 serves the two lanes strictly serially**: `served_under` is set on 0 of 5,968 prefill requests (decode 159 of
+  3,018), yet 5,599 prefill requests park >1 ms -> while one lane's GPU waits on pages, the other lane queues and the GPU
+  idles. Floor period (<=2 missing) = 40.3 ms = 2 x 19.4 ms of box-2 GPU back to back (executor ~96% busy there); the hub's
+  21 ms/unit-layer and the 7 ms wire are hidden UNDER box 2. Unit-layer period: p50 66.5 / mean 69.3 steady (10-01: 78 /
+  80); by total missing: 40 ms (<=2), 47 (3-6), 62 (7-12), 82 (13-20), 108 (21-40), 181 (41+).
+* Pipeline depth (steady): 0 in flight 24.8%, 1: 27.4%, 2: 47.7%, >=3 never. Box-2 executor busy 72% (GPU compute ~37%);
+  box-2 disk 2.8 GB/s (io-util 22-35%, NOT saturated; 68% of the time no read in flight, 17.5% >=4 in flight: page-ins
+  are requested late and in bursts). Wire: 14% busy.
+* **Verdict: the wall is BOX 2 (kernel floor + paging + serial service), no longer the wire or the hub.** Inferred
+  ceiling if every unit-layer ran at the <=2-missing period (43 ms): 80 x 43 ms = 3.5 s + 1.9 s gaps = ~5.4 s (-33%).
+* Not determinable from the trace (`V41_EVTRACE_DEV=0` on both boxes): dGPU chain vs iGPU MoE inside the hub's 10.4 ms; true
+  box-2 GPU busy; the composition of the 0.42 s G0 prep; why the 11:31 job was faster.
+
+**What this does to the plan (re-ranked):**
+1. **Box-2 paging** (up to ~-33% window): restore pool slots (memory budget on the 96 GB box), prefill-mode resident pool /
+   prefetch (`V41_LM_PREFETCH`, group prefetch), and above all **let the other lane run while one is parked** (serve
+   prefill requests under park like decode; today 0 of 5,968). Overlapping park with the other lane's compute attacks
+   the ~30 ms/unit-layer of GPU idle directly.
+2. **Box-2 MoE floor 19.4 ms per 512-row request (x2 lanes serial = the 40 ms floor)**: THIS is where the MoE batching and
+   the f16 arm pay. Merge the two lanes into ONE box-2 pass (existing `V41_B2_MERGE`/`REQ_FLAG_PARTNER`, needs both lanes'
+   requests submitted together; the hub's staggered pipeline is mostly hidden under box 2 anyway, so losing the stagger is
+   cheap) or 1024-row lanes: one read of each expert's weights serves 1024 members. f16 arm: -15..26% of kernel time. Both
+   boxes' kernels are the same file, so the hub side gets it too.
+3. **Hub-only gaps 23% of the window** (Engram/G0 prep 1.25 s + boundaries 0.63 s) while box 2 idles: Engram overlap and
+   cross-group overlap; ~-1 s of 8.
+4. Wire (Gen3 cable): ~3-4 ms of 57 ms, last. Hub-side kernel work (hub 21 ms/unit-layer) only matters once box 2 is
+   faster than ~40 ms/unit-layer (it then becomes the floor).
+5. Instrumentation: enable `V41_EVTRACE_DEV` (Tier B regressed decode 10-02: use a short prefill-only window) for the
+   dGPU/iGPU split.
+Revised estimate of what steps 1-3 buy on a 8.0 s steady window: kill paging -> ~5.4 s; box-2 floor 19 -> ~13 ms ->
+~4.3 s; gaps 1.9 -> ~0.8 s -> ~3.2-3.5 s, i.e. **~1.2K rows/s** from box-2-side work alone. 2K needs the hub and box 2 to
+share the experts more evenly (the hub is ~50% idle at 21 of 40 ms) on top of that.
+
+Steps (each gated; nothing GPU beyond the harness until a window is agreed). NOTE: the step order below was written before
+the breakdown above; use the re-ranked list above for priority (step 1 here, MoE batching, is item 2 there):
 
 1. **MoE-side batching across lanes/sub-chunks.** Design + code-site map: see "Cross-sub-chunk MoE batching: design"
    below. Knob `V41_PREFILL_MOE_ROWS` (default OFF/0 = today), target 2048. Gate: bit-compatible routing (same experts
