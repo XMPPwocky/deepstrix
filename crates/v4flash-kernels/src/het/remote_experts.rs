@@ -4045,6 +4045,27 @@ impl ShardPool {
         ignore_hub_pins: bool,
         prefill_mode: bool,
     ) -> Option<u32> {
+        self.pick_victim_ranked(range, want_layer, want, extra, for_layer, for_layer, ignore_hub_pins, prefill_mode)
+    }
+
+    /// [`Self::pick_victim`] with the sweep RANK taken at `rank_layer` instead of `for_layer` (`for_layer` stays the layer
+    /// taking the slot, i.e. the floor exemption). A background prefetch LANDING for a word of layer `W` must rank victims
+    /// by where the pass IS (`cur_layer`), not where the word's layer is: ranking at `W` made `own_sweep_rank` /
+    /// `sweep_rank` treat the layers between the pass and `W` as already passed and evict exactly the pages the pass
+    /// reaches next (design review r1 BLOCKER, `docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md` 5a). Demand claims keep
+    /// `rank_layer == for_layer == want_layer` (the pass's own layer), unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn pick_victim_ranked(
+        &self,
+        range: std::ops::Range<u32>,
+        want_layer: u32,
+        want: &[u32],
+        extra: ExtraPins<'_>,
+        for_layer: u32,
+        rank_layer: u32,
+        ignore_hub_pins: bool,
+        prefill_mode: bool,
+    ) -> Option<u32> {
         let n = self.owner_of.len() as u32;
         let range = range.start.min(n)..range.end.min(n);
         // Mode-aware eviction: a prefill-mode search in a prefill phase ranks by
@@ -4079,10 +4100,10 @@ impl ShardPool {
             let key = if tiered {
                 let tier = self.me.tier(sl, t, self.owner_of[sl as usize].is_none());
                 if tier == 3 && self.me.long {
-                    let (rank, dist) = own_sweep_rank(self.owner_of[sl as usize], for_layer);
+                    let (rank, dist) = own_sweep_rank(self.owner_of[sl as usize], rank_layer);
                     (tier, rank, dist)
                 } else {
-                    (tier, sweep_rank(enc_first, tier, self.owner_of[sl as usize], for_layer), t)
+                    (tier, sweep_rank(enc_first, tier, self.owner_of[sl as usize], rank_layer), t)
                 }
             } else {
                 (0, 0, t)
@@ -4111,14 +4132,32 @@ impl ShardPool {
         ignore_hub_pins: bool,
         prefill_mode: bool,
     ) -> Option<u32> {
+        self.pick_victim_any_ranked(region, global, band, want_layer, want, extra, for_layer, for_layer, ignore_hub_pins, prefill_mode)
+    }
+
+    /// [`Self::pick_victim_any`] with a separate sweep-rank layer (see [`Self::pick_victim_ranked`]).
+    #[allow(clippy::too_many_arguments)]
+    fn pick_victim_any_ranked(
+        &self,
+        region: (u32, u32),
+        global: bool,
+        band: Band,
+        want_layer: u32,
+        want: &[u32],
+        extra: ExtraPins<'_>,
+        for_layer: u32,
+        rank_layer: u32,
+        ignore_hub_pins: bool,
+        prefill_mode: bool,
+    ) -> Option<u32> {
         let n = self.owner_of.len() as u32;
         match band {
             Band::Main => {
                 let first = if global { 0..self.stage } else { region.0.min(self.stage)..region.1.min(self.stage) };
-                self.pick_victim(first, want_layer, want, extra, for_layer, ignore_hub_pins, prefill_mode)
-                    .or_else(|| self.pick_victim(0..self.stage, want_layer, want, extra, for_layer, ignore_hub_pins, prefill_mode))
+                self.pick_victim_ranked(first, want_layer, want, extra, for_layer, rank_layer, ignore_hub_pins, prefill_mode)
+                    .or_else(|| self.pick_victim_ranked(0..self.stage, want_layer, want, extra, for_layer, rank_layer, ignore_hub_pins, prefill_mode))
             }
-            Band::Stage => self.pick_victim(self.stage..n, want_layer, want, extra, for_layer, ignore_hub_pins, prefill_mode),
+            Band::Stage => self.pick_victim_ranked(self.stage..n, want_layer, want, extra, for_layer, rank_layer, ignore_hub_pins, prefill_mode),
         }
     }
 
@@ -5669,12 +5708,13 @@ impl ExpertShard {
                     }
                 }
             } else {
-                pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, false, prefill_landing)
+                // Rank at the pass's CURRENT layer (landing-rank fix, design 5a): `for_layer` stays the word's layer.
+                pool.pick_victim_any_ranked(region, global, band, cur_layer, want, &pinned, d.layer, cur_layer, false, prefill_landing)
             };
             let Some(victim) = victim else {
                 if d.stage {
                     pool.sc.drops += 1;
-                } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, true, prefill_landing).is_some() {
+                } else if pool.pins.on && pool.pick_victim_any_ranked(region, global, band, cur_layer, want, &pinned, d.layer, cur_layer, true, prefill_landing).is_some() {
                     pool.pins.c.no_victim_drops += 1;
                 }
                 pf.release_set(d.set);
@@ -11417,6 +11457,38 @@ mod tests {
         assert_eq!(off.me.budget_left, 5);
     }
 
+    /// Landing-rank fix (design review r1 BLOCKER, docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md 5a): a background prefetch LANDING
+    /// for a word of layer 7 while the long pass is at layer 4 must evict a layer the pass has already PASSED (3), not the layer
+    /// it reaches next (5). Ranking at the word's layer (the old behaviour) evicts exactly layer 5.
+    #[test]
+    fn long_phase_landing_ranks_victims_at_the_passes_layer_not_the_words() {
+        let ids: Vec<u32> = (0..6).collect();
+        let mut pool = ShardPool::seeded(6, &[(30, 0, &ids)], 0.0);
+        pool.enable_mode_evict(0);
+        pool.me.long_budget = 100;
+        pool.me_note_request(true);
+        pool.me_note_long();
+        assert!(pool.me.long);
+        // The phase's own pages: encoder layers 1, 3, 5 (two each).
+        for (l, e) in [(1u32, 10u32), (1, 11), (3, 10), (3, 11), (5, 10), (5, 11)] {
+            let (slot, _) = pool.claim_miss(l, e, &[e], &[], (0, 6), true, true, true).unwrap();
+            pool.commit(l, e, slot);
+        }
+        let owner = |pool: &ShardPool, v: u32| pool.owner_of[v as usize].map(|(l, _)| l);
+        let (cur, word_layer) = (4u32, 7u32);
+        // OLD: rank at the word's layer (7): passed layers 5 (dist 2), 3 (4), 1 (6) -> layer 5 first.
+        let old = pool.pick_victim_any((0, 6), true, Band::Main, cur, &[], &[], word_layer, false, true).unwrap();
+        assert_eq!(owner(&pool, old), Some(5), "the old ranking cannibalises the layer the pass reaches next");
+        // NEW: rank at the pass's layer (4): layer 3 (just passed) first, then 1, then the layers ahead (5 last-but-one).
+        let new = pool.pick_victim_any_ranked((0, 6), true, Band::Main, cur, &[], &[], word_layer, cur, false, true).unwrap();
+        assert_eq!(owner(&pool, new), Some(3), "the landing takes a layer the pass has already passed");
+        // A demand claim of the pass itself is unchanged: rank == for_layer == cur.
+        let demand = pool.pick_victim_any((0, 6), true, Band::Main, cur, &[], &[], cur, false, true).unwrap();
+        assert_eq!(owner(&pool, demand), Some(3));
+        let same = pool.pick_victim_any_ranked((0, 6), true, Band::Main, cur, &[], &[], cur, cur, false, true).unwrap();
+        assert_eq!(same, demand);
+    }
+
     /// Farthest next use first within a long phase's own pages.
     #[test]
     fn own_sweep_rank_orders_by_next_use() {
@@ -12101,7 +12173,7 @@ mod tests {
                 }
                 let region = self.region(key.0);
                 let band = if stage { Band::Stage } else { Band::Main };
-                match self.pool.pick_victim_any(region, self.global, band, layer, want, extra, key.0, false, false) {
+                match self.pool.pick_victim_any_ranked(region, self.global, band, layer, want, extra, key.0, layer, false, false) {
                     Some(v) => {
                         // STAGING INVARIANT: a landing takes a slot of its own band.
                         assert_eq!(v >= self.pool.stage, stage, "landing of {key:?} (stage {stage}) at slot {v}");
@@ -12117,7 +12189,7 @@ mod tests {
                     None => {
                         if stage {
                             self.pool.sc.drops += 1;
-                        } else if self.pool.pick_victim_any(region, self.global, band, layer, want, extra, key.0, true, false).is_some() {
+                        } else if self.pool.pick_victim_any_ranked(region, self.global, band, layer, want, extra, key.0, layer, true, false).is_some() {
                             self.pool.pins.c.no_victim_drops += 1;
                         }
                         self.st.bg_dropped += 1;
