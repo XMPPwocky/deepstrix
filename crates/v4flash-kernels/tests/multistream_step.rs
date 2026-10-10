@@ -264,6 +264,8 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     impl Drop for ZcReport {
         fn drop(&mut self) {
             eprintln!("ZC: zc_pulls={}", v4flash_kernels::het::forward_prefill::ZC_PULLS.load(std::sync::atomic::Ordering::Relaxed));
+            // dGPU bundle slice 3: lane-layers whose router + look-ahead ran fused (`V41_DGPU_ROUTER_X2`).
+            eprintln!("RX2: router_x2={}", v4flash_kernels::het::forward_prefill::ROUTER_X2_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed));
         }
     }
     let _zc_report = ZcReport;

@@ -527,6 +527,9 @@ mod lane_env {
 /// Lane-layers whose iGPU inputs came by the zero-copy pull (`V41_DGPU_ZC_PUSH`), since start: the
 /// gate's proof that the path ran.
 pub static ZC_PULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lane-layers whose router + look-ahead matvecs ran as ONE fused launch (`V41_DGPU_ROUTER_X2`), since
+/// start: the gate's proof that the path ran.
+pub static ROUTER_X2_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// This decode step has >= 2 speculating streams (set by the scheduler before the forward):
 /// zero-copy stays off then unless `V41_DGPU_ZC_MULTI_SPEC`.
 pub static STEP_MULTI_SPEC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -8427,6 +8430,9 @@ impl HeterogeneousEngine {
                             N_EMBD,
                             b,
                         )?;
+                        if look_fused {
+                            ROUTER_X2_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
                 if !look_fused {
