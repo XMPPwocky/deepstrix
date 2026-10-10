@@ -142,6 +142,19 @@ Construction (deterministic, frozen for the job even if `hot_set` refreshes mid-
   15-255 slack under `top`, ~0 under interleave; (ii) accept the residual: **expected steady re-reads = max(0, share2 - usable2) per
   window** (0 to ~400, vs 1,146 today), logged per job as share1/share2/usable2; (iii) grow the pool if hub RAM allows (~6 GB free: no).
   If the hot set is not warm, hash split at the same sizes.
+**Variant P1H "hub-heavy" (owner 10-10: why keep the decoder-hot head resident during a LONG prefill?).** It need not stay: decode does
+not run during a prefill burst, replay touches only 128 rows, and in the unified LRU pool those ids are the LRU-oldest, so a filler
+larger than the free slots simply EVICTS them (no special mechanism). Dropping the decoder-layer hot head (2,060-2,300 ids) frees
+~2,100 slots + the dense window 384: filler up to ~150/layer ~ the balanced split of the MoE-leg model (sec 8: both legs ~16 ms,
+-36% vs ~25 ms). The PRICE is the re-warm at the next decode burst: ~2,100 experts ~ 40 GB ~ 10 s of hub disk (~6 s with a Gen4-class
+SSD), hottest-first (top-25/layer = ~50% of decode picks), during which decode steps take synchronous misses (6.8 ms each,
+`ep:3446-3548`); burst cadence 120 s prefill / 30 s decode => maybe 15-25% of each burst's throughput while a long job is in flight
+(inferred). Needs a hottest-first BULK async re-warm at decode entry (the hub only prewarms 2 interleave newcomers/step today,
+`take_prewarm`, `ms:1667-1682`; box 2 already does release/restore for pins). Middle option P1M: keep the top ~50/layer decoder-hot
+(~1,000 ids, ~70% of decode mass), drop the rest. Knob `V41_PREFILL_B1_FILLER` (conservative default = live free slots) and
+`V41_PREFILL_KEEP_DECODER_HOT` (all / top-N / none). Gate: decode p90 over the first 60 s of each burst after a long job, and
+prefill rows/s, both vs the conservative setting.
+
 Cold fill (stated honestly): box 1 pages ONLY its filler synchronously (`ensure`; 22-46/layer x 20 = 440-920 experts ~8-17 GB, 2-4 s at
 4.2 GB/s); box 2 fills its set (<= ~79 GB, 20-26 s) as today's windows 1-2 do. After each decode burst some prefill-class pages are
 lost on both boxes and re-read: measure (gate).
