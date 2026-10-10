@@ -22,22 +22,26 @@ Cases `fresh,multi,restored,lazy` (env `LM_CASES` selects; `LM_ROWS` = window ro
 group-major still passes (regression guard for the shared edits). Split and NO_DENSE stay OFF (the test has no box-2 client; invariant I1 is for a fixed partition).
 If it fails ONLY in `restored` (device seed at pos0 > 0) or `lazy` (window prediction + whole-window inputs) those are the two paths no CPU test covers.
 
-## 2. GATE B -- P2a live window with box 2 attached (per-task remote ticket ordering is untested by Gate A)
-Hub env (append to the hub env file; backup it): `V41_LM_LAYER_OUTER=1` (`V41_LM_PREFILL=1` is already production). Restart the hub only.
-Run ONE long cold prompt (>= 64K tokens) twice, layer-outer vs group-major, and compare the last-token logits with
-`V41_PREFILL_LOGITS_DUMP=<path>` (appends raw f32 per prompt; byte-compare). Log lines to see: `prefill_lm_window open ... layer_outer=true`,
-`prefill_lm_window done ... layer_outer = true`, and the one-time `V41_LM_PREFETCH is a no-op for layer-outer windows` warning.
-Watch decode p90 of other streams while it runs (a pass is atomic, ~1-2 s).
+## 2. LIVE ARMS WITH ONE HUB RESTART (owner 10-10: "stay up as long as possible")
+The four P1/P2a knobs are LIVE (commit after 9460a08e): `V41_LM_LAYER_OUTER`, `V41_LM_QUANTUM_LAYERS`, `V41_PREFILL_SPLIT`, `V41_PREFILL_B1_FILLER`.
+Put them in the hub knob file `/dev/shm/deepstrix-knobs.txt` (`NAME=value` lines, re-read every second, every change is logged as `knob changed`,
+the effective table is written to `<file>.effective`; write a temp file and `mv` it, an empty file is ignored). Layer-outer is decided per WINDOW
+(next window onwards), the split per LONG JOB (next long job onwards). So after ONE restart onto the new binary (with NO new env vars) every
+arm below is a file edit, no restart:
+* **Arm 0 baseline:** knob file without the new keys = today's behaviour (group-major, decode partition).
+* **Gate B (live golden, box 2 attached):** the same >= 64K-token cold prompt twice with `V41_PREFILL_LOGITS_DUMP=<path>` set in the hub env at that single
+  restart (it appends the last-token logits per prompt): once with the file lacking the key, once with `V41_LM_LAYER_OUTER=1`; byte-compare the two
+  dumps. Log lines: `prefill_lm_window open ... layer_outer=true`, `... done ... layer_outer = true`, one-time `V41_LM_PREFETCH is a no-op for layer-outer windows`.
+  Decode p90 of other streams during the run (a pass is atomic, ~1-2 s).
+* **P1 arm:** add `V41_PREFILL_SPLIT=1` (and optionally `V41_PREFILL_B1_FILLER=n`) and run a long cold prompt; the job-start line
+  `prefill split: frozen encoder-layer expert split for a long job` prints warm, lru_slots, owned_now, filler, head_min/max, share1, share2,
+  share2_per_layer, usable2, expected_rereads_per_window. Without `V41_PAGER_NO_DENSE=1` (STATIC, a startup env: add it only at a restart you
+  would do anyway) the filler is 46/22 per layer and box 2's share overflows by 130-400 experts: expect most, not all, of the gain.
+* **Combine:** `V41_LM_LAYER_OUTER=1` + `V41_PREFILL_SPLIT=1` together, same prompt.
+Revert any arm by deleting its line. If a layer-outer window misbehaves, delete `V41_LM_LAYER_OUTER` and the NEXT window runs group-major.
+Gate: golden/KLD for the partition change (f32 association only) before leaving the split on.
 
-## 3. A/B -- P1 frozen split (+ reclaim)
-Hub env: `V41_PREFILL_SPLIT=1`, `V41_PAGER_NO_DENSE=1` (needs `V41_PREFILL_UNIFIED_POOL=1`, already production), optional `V41_PREFILL_B1_FILLER=64`
-(the effective filler is `min(knob, live free LRU slots / 20)`). Restart the hub.
-The job-start log line `prefill split: frozen encoder-layer expert split for a long job` prints warm, lru_slots, owned_now, filler, head_min/max,
-share1, share2, share2_per_layer, usable2, expected_rereads_per_window. Expect (design sec 4): with the reclaim, filler 65/41 (top/interleave),
-share2 216/228 per layer = 4,320/4,560 vs ~4,570 usable. PASS criteria: steady 4096-row window wall (baseline 8.02 s = 511 rows/s), box-2 reads
-per window (baseline ~1,146) via the trace scripts below, `n_missing` distribution, hub `ensure` stall in window 1, and decode p90 over the
-60 s after a long job vs the same traffic before.
-Gate: golden/KLD for the partition change (f32 association only) before leaving it on.
+## 3. (merged into section 2)
 
 ## 4. Trace analysis (scratch/prefill_trace/, stdlib python; the 2026-10-10 pipeline)
 Files: hub `~/logs/evtrace/hub-*.evt` (box 1), box 2 `~/logs/evtrace/b2-*.evt` (run the box-2 filters ON box 2, nice/ionice; do not copy GB files).
@@ -52,6 +56,10 @@ fields still work for per-request decomposition, `split3.py`/`agg3.py` window wa
 not apply (the gap categories need re-deriving from pass boundaries: look at `prefill_job_progress` / `prefill_lm_window` timestamps).
 `V41_EVTRACE_DEV` (short prefill-only window, Tier B regressed decode 10-02) is needed for the dGPU-chain vs iGPU-MoE split inside the hub's time.
 
-## 5. Order of operations for one GPU window (suggested)
-Gate A (group-major, then layer-outer) -> restart hub with P2a on -> Gate B -> restart with P1 on (and P2a) -> A/B on a long prompt -> if good, leave
-P1 on and run the golden/KLD. Revert `miss_par` before step 3 unless intentionally shared.
+## 5. Order of operations (minimising downtime)
+0. (hub UP, niced/pinned, memory-watched) pre-build the release test binary and server+expertd into `target-gate/` (see the build log).
+1. Server DOWN, ~17-20 min: Gate A with `LM_CASES=lazy,restored` (the two cases that exercise the window prediction, multi-window, the saved-indexer
+   flag in both states, foreign interleave, and the device seed at pos0 > 0; `fresh`/`multi` are covered by `lazy`'s eager layer-major run). The full four
+   cases are ~31 min (measured 10-01); run them at a quieter time if you want the complete gate.
+2. ONE hub restart onto the new binary (3-5 min, box 2 stays warm), then everything in section 2 live, no more restarts. Revert `miss_par` on box 2
+   (live, ~1 s) before the P1 arm unless you intentionally keep it as the shared baseline.

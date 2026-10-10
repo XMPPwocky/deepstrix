@@ -806,18 +806,16 @@ pub fn f16_bits_to_f32(h: u16) -> f32 {
 
 /// `V41_LM_LAYER_OUTER=1` (default off; needs `V41_LM_PREFILL=1`): run each layer-major window LAYER-OUTER -- layer L for
 /// every lane unit of the window, then L+1 -- as one continuous software pipeline (`prefill_job_lm_pass`,
-/// docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 3) instead of group-major (group x sub-chunk). Read when a window opens.
+/// docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 3) instead of group-major (group x sub-chunk). LIVE (knob file); decided once
+/// per WINDOW (`PrefillJob::lo_decision` latches it between the window prediction and the window open).
 pub fn lm_layer_outer() -> bool {
-    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_LM_LAYER_OUTER").as_deref() == Ok("1"));
-    *B
+    crate::knobs::LM_LAYER_OUTER.on()
 }
 
-/// `V41_LM_QUANTUM_LAYERS` (default 4): layers per scheduler-visible pass of a layer-outer window (decode may interleave
+/// `V41_LM_QUANTUM_LAYERS` (default 4; live): layers per scheduler-visible pass of a layer-outer window (decode may interleave
 /// between passes; the pipeline drains at each). The `KvSourceOnly` layer is always a pass of its own.
 pub fn lm_quantum_layers() -> usize {
-    static N: std::sync::LazyLock<usize> =
-        std::sync::LazyLock::new(|| std::env::var("V41_LM_QUANTUM_LAYERS").ok().and_then(|v| v.parse().ok()).filter(|&q| q > 0).unwrap_or(4));
-    *N
+    crate::knobs::LM_QUANTUM_LAYERS.usize().max(1)
 }
 
 /// `V41_LM_PREFILL=1`: layer-major CED prefill (see the block comment above).
@@ -1033,6 +1031,10 @@ pub struct PrefillJob {
     /// (`V41_PREFILL_SPLIT=1`), installed around every unit by `prefill_split::install`. `split_tried`: build once.
     split: Option<std::sync::Arc<super::prefill_split::PrefillSplit>>,
     split_tried: bool,
+    /// `V41_LM_LAYER_OUTER` is LIVE, but `next_chunk_range` (which predicts the window's input rows) and `lm_open_window` (which
+    /// opens it) must agree for ONE window. 0 = undecided, 1 = group-major, 2 = layer-outer. Set by the first
+    /// `next_chunk_range` with no window open (or by `lm_open_window`), consumed (reset to 0) when the window opens.
+    lo_latch: std::sync::atomic::AtomicU8,
     /// LAZY inputs: when `input_hcs` is empty the caller supplies the next
     /// chunk's rows through `set_chunk_inputs` right before `prefill_job_chunk`
     /// (embeddings + Engram rows for `next_chunk_range()` only). A 135K-token
@@ -1085,6 +1087,7 @@ impl PrefillJob {
             lm_windows: 0,
             split: None,
             split_tried: false,
+            lo_latch: std::sync::atomic::AtomicU8::new(0),
             chunk_inputs: None,
         })
     }
@@ -1159,7 +1162,23 @@ impl PrefillJob {
     /// `[start, end)` token indices (into `tokens()`) of the chunk the next
     /// `prefill_job_chunk` will run, given the lane capacities it will see.
     pub fn next_chunk_range(&self, lane_caps: (usize, usize)) -> eyre::Result<(usize, usize)> {
-        self.next_chunk_range_impl(lane_caps, lm_layer_outer())
+        // With a window OPEN the answer comes from the window itself (`w.lo`); with none open this is the prediction of the
+        // NEXT window, and the layer-outer decision is latched so `lm_open_window` opens exactly what was predicted.
+        let lo = if self.lm.is_none() { self.lo_decision() } else { false };
+        self.next_chunk_range_impl(lane_caps, lo)
+    }
+    /// The layer-outer decision for the window being predicted/opened (latched; see `lo_latch`).
+    fn lo_decision(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.lo_latch.load(Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let v = lm_layer_outer();
+                self.lo_latch.store(if v { 2 } else { 1 }, Relaxed);
+                v
+            }
+        }
     }
     fn next_chunk_range_impl(&self, lane_caps: (usize, usize), layer_outer: bool) -> eyre::Result<(usize, usize)> {
         // Layer-major: inputs (embeddings, Engram rows) are consumed by the
@@ -1256,6 +1275,9 @@ impl HeterogeneousEngine {
         let t = job.tokens.len();
         let min_cap = 2 * chunk_size;
         let mut cap = job.lm_rows.max(min_cap);
+        // The layer-outer decision for THIS window: the one the input prediction used (latched), then reset for the next window.
+        let lo = job.lo_decision();
+        job.lo_latch.store(0, std::sync::atomic::Ordering::Relaxed);
         loop {
             // Plan FIRST: the store is only worth VRAM for a window that opens.
             let Some(subs) = lm_plan_window(job.pos0, job.chunk_start, t, chunk_size, lane_caps, &job.image_spans, cap)? else {
@@ -1270,7 +1292,7 @@ impl HeterogeneousEngine {
             // `plan_chunk` cut shorter chunks, so fewer rows fit under `cap`
             // here), in which case the store is reallocated -- it holds nothing
             // live between windows.
-            let want_idx = lm_layer_outer();
+            let want_idx = lo;
             if job.lm_store.as_ref().is_none_or(|st| st.2 < rows) || (want_idx && job.lm_idx.as_ref().is_none_or(|x| x.2 < rows)) {
                 job.lm_store = None;
                 job.lm_idx = None;
@@ -1304,15 +1326,15 @@ impl HeterogeneousEngine {
                     }
                 }
             }
-            if lm_layer_outer() && lm_prefetch_enabled() {
+            if lo && lm_prefetch_enabled() {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| tracing::warn!("V41_LM_PREFETCH is a no-op for layer-outer windows (group prefetch is group-major only; rolling prefetch is P3)"));
             }
-            tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap, layer_outer = lm_layer_outer(),
+            tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap, layer_outer = lo,
                 tokens_done = start, tokens_total = t, "prefill_lm_window open");
             job.lm = Some(LmWindow {
                 start, end, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(),
-                lo: lm_layer_outer(), lo_layer: 0, saved: Vec::new(),
+                lo, lo_layer: 0, saved: Vec::new(),
             });
             return Ok(true);
         }

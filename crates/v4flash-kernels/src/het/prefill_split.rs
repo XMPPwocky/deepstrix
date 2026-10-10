@@ -24,16 +24,13 @@ const NL_ENC: usize = CED_DECODER_START;
 
 /// `V41_PREFILL_SPLIT=1` (default off): use the frozen split for long jobs.
 pub fn enabled() -> bool {
-    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_PREFILL_SPLIT").as_deref() == Ok("1"));
-    *B
+    crate::knobs::PREFILL_SPLIT.on()
 }
 
 /// `V41_PREFILL_B1_FILLER` (default 64): ceiling on the per-layer hash filler box 1 adds to its decode-hot head. The
 /// effective filler is `min(this, free_lru_slots / encoder_layers)` from live counts (see [`SplitCfg::filler`]).
 pub fn filler_max() -> usize {
-    static N: std::sync::LazyLock<usize> =
-        std::sync::LazyLock::new(|| std::env::var("V41_PREFILL_B1_FILLER").ok().and_then(|v| v.parse().ok()).unwrap_or(64));
-    *N
+    crate::knobs::PREFILL_B1_FILLER.usize()
 }
 
 /// `V41_PREFILL_B2_USABLE` (default 4570): box 2's usable pool slots during a long prefill, used ONLY for the job-start

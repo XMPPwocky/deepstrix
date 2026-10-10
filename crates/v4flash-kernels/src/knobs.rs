@@ -694,6 +694,19 @@ crate::knobs! {
     /// (`PrefillJob::new`; a job keeps the mode it started with). Live; the
     /// 10-01 `V41_MS_LM_FILE` file still works.
     pub static LM_PREFILL = Knob::flag("V41_LM_PREFILL", false).legacy("V41_MS_LM_FILE");
+    /// `V41_LM_LAYER_OUTER` (default off; LIVE): run each layer-major window LAYER-OUTER (`prefill_job_lm_pass`,
+    /// docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 3) instead of group-major. Decided once per WINDOW (latched between
+    /// `next_chunk_range`'s prediction and `lm_open_window`); needs `V41_LM_PREFILL`. A flip takes effect at the next window.
+    pub static LM_LAYER_OUTER = Knob::flag("V41_LM_LAYER_OUTER", false).live();
+    /// `V41_LM_QUANTUM_LAYERS` (default 4, 1..=20; live): layers per scheduler-visible pass of a layer-outer window. Read per
+    /// pass from the window's layer cursor, so a change is safe mid-window.
+    pub static LM_QUANTUM_LAYERS = Knob::int("V41_LM_QUANTUM_LAYERS", 4, 1, 20).live();
+    /// `V41_PREFILL_SPLIT` (default off; LIVE): the frozen encoder-layer expert split of a LONG job
+    /// (`prefill_split`, design sec 4). Read once per job at its first unit; a flip affects the next long job only.
+    pub static PREFILL_SPLIT = Knob::flag("V41_PREFILL_SPLIT", false).live();
+    /// `V41_PREFILL_B1_FILLER` (default 64, 0..=384; live): ceiling on the per-layer hash filler box 1 adds to its decode-hot
+    /// head (the effective filler is `min(this, live free LRU slots / encoder layers)`). Read at each job's split build.
+    pub static PREFILL_B1_FILLER = Knob::int("V41_PREFILL_B1_FILLER", 64, 0, 384).live();
     /// `V41_SUB_LAMBDA` (default 0.1, 0..=1): the cache prior's strength
     /// (`b2_mirror::lambda`). Live; `V41_SUB_LAMBDA_FILE` still works.
     pub static SUB_LAMBDA = Knob::real("V41_SUB_LAMBDA", 0.1, 0.0, 1.0).legacy("V41_SUB_LAMBDA_FILE");
