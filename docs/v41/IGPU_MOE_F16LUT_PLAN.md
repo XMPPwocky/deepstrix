@@ -103,10 +103,21 @@ Constraints found while scoping:
   * Consequence for this plan: attention-side lanes CAN grow in prefill (the two-lane dGPU set is ~885 MiB at 512-row
     lanes per `batch_scratch.rs`; it scales ~linearly, so 1024-row lanes are ~1.8 GB and 2048-row lanes ~3.5 GB), so both "bigger lanes" and MoE-side staging are
     open. (iGPU GTT has room too: ~20 GB, but system RAM is tight, ~6 GB available.)
-* **Wire.** Bigger requests do not cut wire BYTES (f16 replies are 10 KB/row/layer whatever the request size); they cut
-  per-request latency, hub turnaround and box-2 kernel time. The link is Gen2-trained (2 lanes x 10 Gb/s per sysfs,
-  owner says the cable is Gen3) -- fixing that is free wire and should land in parallel; without it the box-2 round
-  trip stays the wall and batching shows little e2e. Measure the wire first when the link is fixed.
+* **Wire (measured 2026-10-10; this CORRECTS the RTT breakdown above).** Bigger requests do not cut wire BYTES (f16
+  replies are 10 KB/row/layer whatever the request size); they cut per-request latency, hub turnaround and box-2
+  kernel time. Facts: `thunderbolt0` is a `usb4` link trained at **2 lanes x 10 Gb/s = 20 Gb/s on BOTH ends** (sysfs
+  `rx_speed`/`tx_speed`; owner says the cable should be Gen3 = 2 x 20; the kernel cannot see the cable; no typec class).
+  iperf3 over the Thunderbolt addresses, 3 s each: **10.1 Gb/s (1.26 GB/s) box1->box2, 9.1 Gb/s (1.13 GB/s) reverse, 0
+  retransmits; 4 parallel streams 9.7 Gb/s total** (no gain), i.e. ~half the Gen2 line rate, typical of the
+  `thunderbolt-net` software path. Live decode traffic is ~10-50 MB/s with 0 rx misses/s; the cumulative 840K rx
+  "missed" on box 1 (0.24% of packets; box 2: 51) happens in bursts under bulk load; the current hub connection has had
+  1 retransmit in 94 GB. THE STALE PART: the "wire 28 ms = 10 out + 18 back" of the 10-01 time split is 3.0 MB / 10 ms
+  and 5.24 MB / 18 ms = 293 MB/s = the **2.5 GbE** link of that day (the hub moved to Thunderbolt on 10-03). At the
+  measured 1.1-1.3 GB/s the pure transfer is ~2.5 + 4.4 = ~7 ms per round trip, so the 78 ms unit-layer breakdown is
+  OUT OF DATE (no post-move breakdown exists; pull evtrace for one). Consequences: a Gen3 link (if it lifts the
+  software path ~2x as line-rate scaling suggests; unverified) saves only ~3-4 ms of the round trip, not ~14; the wire
+  is a small part of the wall today; at 2K tok/s the bulk traffic is ~640 MB/s = ~50% of the measured 1.2 GB/s cap, so
+  it only becomes binding above ~2.5K tok/s.
 * **Latency.** Prefill units interleave with decode bursts (scheduler); a longer non-preemptible MoE batch delays
   decode streams. Keep the batch <= ~2048 rows (~1 unit-equivalent in time) and A/B decode p90 with it.
 
