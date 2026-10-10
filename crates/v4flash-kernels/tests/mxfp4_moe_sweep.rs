@@ -501,3 +501,107 @@ fn wmma_f16_arm_exact_over_its_whole_scale_range() -> eyre::Result<()> {
     eprintln!("PASS: f16 arm no worse than the int8 arm at uniform e8 114 / 137 and over the model's range [115, 128]");
     Ok(())
 }
+
+/// REAL weights: 8 experts from each of 10 layers of the V4.1-Flash checkpoint (engine form, `read_expert_into`), Q8_K
+/// activations, B = 512 / 3072 rows: the f16 arm vs the int8 arm, both vs kwide / kwide2. Gate for `V41_MOE_WMMA_F16` at
+/// kernel level: the int8 arm passed the end-to-end golden gate (09-26 sweep), so "f16 no worse than int8 on real weights"
+/// is the claim. Reads ~1.5 GB from the checkpoint; runs beside a live hub (iGPU only, ~0.5 GB device).
+///   V41_MODEL=<hf snapshot dir> (default ~/.cache/deepstrix/models/dsv4.1f)
+#[test]
+#[ignore]
+fn wmma_f16_arm_on_real_weights() -> eyre::Result<()> {
+    use v4flash_core::{V41HfWeights, WeightSrc};
+    install_panic_handler()?;
+    let Some(dev) = pick_igpu()? else {
+        eprintln!("SKIP: no gfx1151 device");
+        return Ok(());
+    };
+    dev.set_current()?;
+    let arch = dev.properties()?.gcn_arch_name;
+    let id = dev.id;
+    let e = DeviceEngine::for_arch(dev, &arch)?;
+    if !e.mxfp4pair.has_wmma_f16() || !e.mxfp4.has_wmma_f16() {
+        return Err(eyre!("gfx1151 engine without the f16 WMMA module"));
+    }
+    let dir = std::env::var("V41_MODEL")
+        .unwrap_or_else(|_| format!("{}/.cache/deepstrix/models/dsv4.1f", std::env::var("HOME").unwrap()));
+    let hf = V41HfWeights::open(&dir, None)?;
+    let src = WeightSrc::from(&hf);
+    let s = Stream::new(id)?;
+    let mut rng = Lcg(0x5EED_4EA1);
+    let nu = N_EXPERT_USED;
+    const N_PHYS: usize = 8;
+    const CHUNK: usize = 32;
+    let (gnr, gnb) = (N_FF_EXP as usize, BLOCKS_Q8K_GATE_IN as usize);
+    let (dnr, dnb) = (N_EMBD as usize, BLOCKS_Q8K_DOWN_IN as usize);
+    let gbpe = gnr * gnb * SUPER_MXFP4_BYTES;
+    let dbpe = dnr * dnb * SUPER_MXFP4_BYTES;
+    let load = |layer: u32, which: &str, bpe: usize, experts: &[usize]| -> eyre::Result<(Vec<u8>, u8, u8)> {
+        let name = format!("blk.{layer}.ffn_{which}_exps.weight");
+        let t = src.tensor(&name).ok_or_else(|| eyre!("{name}"))?;
+        let mut host = vec![0u8; experts.len() * bpe];
+        for (k, &x) in experts.iter().enumerate() {
+            src.read_expert_into(t, x, &mut host[k * bpe..(k + 1) * bpe])?;
+        }
+        let (mut lo, mut hi) = (255u8, 0u8);
+        for sb in host.chunks_exact(SUPER_MXFP4_BYTES) {
+            for &e8 in &sb[128..136] {
+                lo = lo.min(e8);
+                hi = hi.max(e8);
+            }
+        }
+        Ok((host, lo, hi))
+    };
+    let (mut worst16, mut worst8) = ([0f64; 2], [0f64; 2]);
+    for &layer in &[0u32, 2, 5, 9, 13, 17, 19, 24, 31, 39] {
+        let experts: Vec<usize> = (0..N_PHYS).map(|k| (k * 48 + layer as usize * 7) % 384).collect();
+        let (gh, glo, ghi) = load(layer, "gate", gbpe, &experts)?;
+        let (uh, ulo, uhi) = load(layer, "up", gbpe, &experts)?;
+        let (dh, dlo, dhi) = load(layer, "down", dbpe, &experts)?;
+        let (gate, up, down) = (upload(id, &gh)?, upload(id, &uh)?, upload(id, &dh)?);
+        for &(b, n_virt) in &[(512usize, 48u32), (3072, 48)] {
+            let g = build_groups(&mut rng, b, nu, n_virt, N_PHYS, CHUNK);
+            let (gc, em) = (upload(id, &g.gc)?, upload(id, &g.em)?);
+            let n_wi = g.wi.len();
+            let wi = upload(id, &g.wi)?;
+            let xq = upload(id, &q8k_blocks(&mut rng, b * gnb))?;
+            let ew = upload(id, &(0..b * nu).map(|i| 0.05 + 0.01 * (i % 17) as f32).collect::<Vec<f32>>())?;
+            let n_mid = b * nu * gnr;
+            let mut m = [upload(id, &vec![SENTINEL; n_mid])?, upload(id, &vec![SENTINEL; n_mid])?, upload(id, &vec![SENTINEL; n_mid])?];
+            e.mxfp4pair.launch_fused_swiglu_kwide_ex(&s, &mut m[0], &gate, &up, &xq, &ew, &gc, &em, &wi, n_wi as u32,
+                gbpe as u32, gbpe as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, SWIGLU_CLAMP_EXP, gnr as u32, gnb as u32, None)?;
+            for (k, f16) in [(1usize, false), (2, true)] {
+                e.mxfp4pair.launch_fused_swiglu_wmma_arm(f16, &s, &mut m[k], &gate, &up, &xq, &ew, &gc, &em, &wi, n_wi as u32,
+                    gbpe as u32, gbpe as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, SWIGLU_CLAMP_EXP, gnr as u32, gnb as u32, None)?;
+            }
+            let midq = upload(id, &q8k_blocks(&mut rng, b * nu * dnb))?;
+            let slot_stride = dnb * BLOCK_Q8_K_BYTES;
+            let n_part = b * nu * dnr;
+            let mut p = [upload(id, &vec![SENTINEL; n_part])?, upload(id, &vec![SENTINEL; n_part])?, upload(id, &vec![SENTINEL; n_part])?];
+            e.mxfp4.launch_by_expert_kwide2_ex(&s, &mut p[0], &down, &midq, &gc, &em, &wi, n_wi as u32, dbpe as u32, slot_stride as u32,
+                nu as u32, g.max_per_expert as u32, CHUNK as u32, dnr as u32, dnb as u32, None)?;
+            for (k, f16) in [(1usize, false), (2, true)] {
+                e.mxfp4.launch_by_expert_wmma_arm(f16, &s, &mut p[k], &down, &midq, &gc, &em, &wi, n_wi as u32, dbpe as u32,
+                    slot_stride as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, dnr as u32, dnb as u32, None)?;
+            }
+            s.synchronize()?;
+            let mr: Vec<Vec<f32>> = m.iter().map(|x| download(x, n_mid)).collect::<eyre::Result<_>>()?;
+            let pr: Vec<Vec<f32>> = p.iter().map(|x| download(x, n_part)).collect::<eyre::Result<_>>()?;
+            for (r, name, out) in [(0usize, "gate+up", &mr), (1, "down", &pr)] {
+                let (s8, s16) = (stats(&out[0], &out[1]), stats(&out[0], &out[2]));
+                eprintln!("L{layer:2} B={b:4} {name:7} e8 g[{glo},{ghi}] u[{ulo},{uhi}] d[{dlo},{dhi}]: f16 rel_rmse {:.3e} max_abs {:.3e} | int8 {:.3e} max_abs {:.3e}",
+                    s16.rel_rmse, s16.max_abs, s8.rel_rmse, s8.max_abs);
+                assert_eq!(s16.written_mismatch, 0);
+                assert_eq!(s16.non_finite, 0);
+                assert!(s16.rel_rmse <= 1.25 * s8.rel_rmse.max(2e-7),
+                    "L{layer} B={b} {name}: f16 rel_rmse {:.3e} worse than int8 {:.3e}", s16.rel_rmse, s8.rel_rmse);
+                worst16[r] = worst16[r].max(s16.rel_rmse);
+                worst8[r] = worst8[r].max(s8.rel_rmse);
+            }
+        }
+    }
+    eprintln!("PASS real weights (10 layers x 8 experts, B 512/3072): worst rel_rmse vs kwide -- f16 gate+up {:.3e} down {:.3e}; \
+int8 gate+up {:.3e} down {:.3e}", worst16[0], worst16[1], worst8[0], worst8[1]);
+    Ok(())
+}
+

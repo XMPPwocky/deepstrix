@@ -26,6 +26,8 @@ ARMS = {
     "a0": {}, "a0n": {}, "lo": {"V41_LM_LAYER_OUTER": "1"},
     "split": {"V41_PREFILL_SPLIT": "1"}, "split_lo": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1"}, "a0e": {},
     "split_lo_f16": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1", "V41_MOE_WMMA_F16": "1"},
+    "i8": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1"},
+    "f16": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1", "V41_MOE_WMMA_F16": "1"},
 }
 
 
@@ -139,6 +141,8 @@ def main():
     ap.add_argument("--chars", type=int, default=260000)
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--no-miss-par", action="store_true", help="do not touch box 2's miss_par")
+    ap.add_argument("--final", default="", help="knobs to leave set at the end, e.g. V41_LM_LAYER_OUTER=1,V41_PREFILL_SPLIT=1 "
+                    "(PRODUCTION's values since 10-10 22:05 UTC: the default '' strips them)")
     a = ap.parse_args()
     globals()["OUT"] = a.out
     os.makedirs(OUT, exist_ok=True)
@@ -173,8 +177,9 @@ def main():
                         "moved": moved})
         json.dump({"runs": summary}, open(sp, "w"), indent=1)
         time.sleep(5)
-    set_knobs({})
-    log("knobs restored (our keys removed); box 2 miss_par left at 1")
+    final = dict(kv.split("=", 1) for kv in a.final.split(",") if kv)
+    set_knobs(final)
+    log(f"knobs restored to {final or 'our keys removed'}")
     # Gate B: KLD vs the arm-0 null
     res = {}
     for fn in sorted(os.listdir(OUT)):

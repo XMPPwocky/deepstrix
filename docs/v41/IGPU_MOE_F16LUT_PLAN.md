@@ -453,3 +453,15 @@ are tile-composition-independent per row (reduces to f32 association only if so)
   needs ~48 members/expert (B ~3072). Next lever: batch the MoE across a layer-outer window's units (4096 rows/window ->
   ~100+ members/expert on box 1) -- the cross-sub-chunk batching design below, now natural under layer-outer.
 * Still owed: the golden/KLD gate (server down) before it goes default-on; an e2e A/B (live knob, no restart).
+* **REAL WEIGHTS (10-10 22:0x UTC, `wmma_f16_arm_on_real_weights`, 32 s beside the live hub):** 8 real experts from each of
+  layers 0/2/5/9/13/17/19/24/31/39 (e8 117..125 in the loaded experts), B = 512 and 3072, f16 and int8 arms vs kwide/kwide2:
+  f16 worst rel_rmse gate+up 1.90e-7 / down 9.1e-8, int8 3.73e-7 / 1.68e-7 -- the f16 arm has ~HALF the int8 arm's error
+  on every layer (max_abs 2-3x smaller). The int8 arm passed the end-to-end golden gate (09-26), so the f16 arm is gated by
+  dominance at kernel level.
+* **Live A/B (2.5K-token prompt, i8/i8/f16/f16/i8 under layer-outer + split):** no power -- the int8 A/A null is already
+  0.19-0.25 nats (no two runs share a partition: the hot set refreshes ~every minute under traffic); f16 vs int8 0.08-0.36,
+  inside the null. Records recovered from the busy dump by top-5 cluster + per-arm record counts.
+* **ON in production 10-10 ~22:20 UTC (hub only):** `V41_MOE_WMMA_F16=1` in the hub knob file + env file (owner, after
+  "that's a long time" for the ~35-min golden gate). Revert: delete the line (live, next MoE launch). Box 2 still runs
+  the int8 arm (needs an expertd redeploy + `V41_MOE_WMMA_F16=1` in ~/expertd-knobs.txt). The end-to-end golden gate
+  (`tests/v41_golden_gate.rs`, server down, ~30-40 min for off/on in one process) can ride the next restart.
