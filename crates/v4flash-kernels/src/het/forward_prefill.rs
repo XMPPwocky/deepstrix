@@ -3888,6 +3888,12 @@ pub struct PreMoeCarry {
     /// `pre_moe_prep` pushed the dGPU's Q8_K (`bi.xq_recv`) instead of the f32
     /// rows (`V41_PUSH_XQ`); `pre_moe_launch` copies it in place of quantizing.
     xq_pushed: bool,
+    /// dGPU bundle slice 2 (`V41_DGPU_ZC_PUSH`): prep skipped the peer push; `pre_moe_launch` copies
+    /// sel / ew / xq from the pinned readback pack on `ie.compute` instead.
+    zc_push: bool,
+    /// The route rewrote `d_selected` / `d_ew` from the host after the readback pack (mode-2
+    /// substitution): the pack is stale for the iGPU, so no zero-copy.
+    picks_rewritten: bool,
     hot_active: bool,
     max_per_expert: u32,
     chunk_size: u32,
@@ -9479,6 +9485,7 @@ impl HeterogeneousEngine {
                         self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
                         bd.d_selected.slice_view_mut(0, n_sel).copy_from_host(&sel_sub)?;
                         bd.d_ew.slice_view_mut(0, n_sel).copy_from_host(&ew_sub)?;
+                        c.picks_rewritten = true;
                         if !admit.is_empty() && super::remote_experts::push_prefetch_words(&admit) {
                             super::b2_mirror::note_incoming(&admit);
                             super::b2_mirror::note_admits(&admit);
@@ -10456,6 +10463,18 @@ impl HeterogeneousEngine {
                 super::dispatch::igpu_moe_wmma_env_enabled(),
             );
         let xq_bytes = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
+        // dGPU bundle slice 2 (`V41_DGPU_ZC_PUSH`): the pack already holds this lane-layer's sel /
+        // ew / xq in pinned host memory (written before `selected_ready`): the iGPU copies them from
+        // there (`pre_moe_launch`), no SDMA beside the shared expert. `selected_pushed` is still
+        // recorded on `de.xfer` after its wait on `selected_ready`, so the iGPU's wait is unchanged.
+        let zc = crate::knobs::DGPU_ZC_PUSH.on()
+            && xq_pushed
+            && !c.picks_rewritten
+            && c.rb.packed
+            && c.rb.sel.is_some_and(|(_, n)| n as usize == (b as usize) * cs_n_used)
+            && c.rb.ew.is_some_and(|(_, n)| n as usize == (b as usize) * cs_n_used)
+            && c.rb.xq.is_some_and(|(_, n)| n as usize * 4 >= xq_bytes);
+        c.zc_push = zc;
         // Single batched peer-push of all B activations + routing.
         let ain_v = bd
             .ffn_input_norm
@@ -10469,7 +10488,7 @@ impl HeterogeneousEngine {
             .d_selected
             .slice_view_mut(0, (b as usize) * cs_n_used);
         let mut bi_ew = bi.d_ew.slice_view_mut(0, (b as usize) * cs_n_used);
-        {
+        if !zc {
             let _t_peer_ain = de.events.stage("dgpu.peer_push_ffn_input_norm", &de.xfer)?;
             if xq_pushed {
                 let _t = de.events.stage("k.peer_push.xq", &de.xfer)?;
@@ -10734,6 +10753,28 @@ impl HeterogeneousEngine {
         if wmma_path {
             let _t_cast = ie.events.stage("igpu.cast_f16_pre_moe", &ie.compute)?;
             ie.q8k.launch_cast_f16(&ie.compute, &mut si.d_x16, &bi.ffn_input_norm_recv, N_EMBD * b)?;
+        } else if c.zc_push {
+            // dGPU bundle slice 2 (`V41_DGPU_ZC_PUSH`): sel / ew / xq straight from this lane's
+            // pinned readback pack (complete at `selected_ready`, which `selected_pushed` follows),
+            // copied on `ie.compute` where the peer push used to land them. The next layer's pack
+            // overwrites it only after post(l) waited for this MoE (`moe_arrived`) on `de.compute`.
+            let _t_zc = ie.events.stage("igpu.zc_pull", &ie.compute)?;
+            let words = bd.rb_pack.as_slice();
+            let (so, sn) = c.rb.sel.expect("zc_push checked sel");
+            let (eo, en) = c.rb.ew.expect("zc_push checked ew");
+            let (xo, _) = c.rb.xq.expect("zc_push checked xq");
+            let n_xq = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
+            // SAFETY: the pack's words are plain 32-bit lanes of i32 / f32 / bytes written by
+            // `rb_pack` (`PackSeg::words` / `PackSeg::bytes`); reinterpreting them is a bit copy.
+            let sel_w = &words[so as usize..(so + sn) as usize];
+            let ew_w = &words[eo as usize..(eo + en) as usize];
+            let xq_w = &words[xo as usize..];
+            let sel_i: &[i32] = unsafe { std::slice::from_raw_parts(sel_w.as_ptr() as *const i32, sel_w.len()) };
+            let ew_f: &[f32] = unsafe { std::slice::from_raw_parts(ew_w.as_ptr() as *const f32, ew_w.len()) };
+            let xq_u8: &[u8] = unsafe { std::slice::from_raw_parts(xq_w.as_ptr() as *const u8, n_xq) };
+            bi.d_selected.slice_view_mut(0, sn as usize).copy_from_host_async(sel_i, &ie.compute)?;
+            bi.d_ew.slice_view_mut(0, en as usize).copy_from_host_async(ew_f, &ie.compute)?;
+            si.d_xq_q8k.slice_view_mut(0, n_xq).copy_from_host_async(xq_u8, &ie.compute)?;
         } else if xq_pushed {
             // `V41_PUSH_XQ`: the dGPU's Q8_K of these rows landed in this lane's
             // `xq_recv` (covered by `selected_pushed`, waited above). Copy it

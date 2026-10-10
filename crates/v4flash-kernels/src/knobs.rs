@@ -798,6 +798,14 @@ crate::knobs! {
     /// `V41_B2_SOFT_HINT` (default off; live): the look-ahead filter treats a soft-held expert as
     /// resident (no hint for it).
     pub static B2_SOFT_HINT = Knob::flag("V41_B2_SOFT_HINT", false).live();
+    /// `V41_DGPU_ZC_PUSH` (default OFF until the window's microbench + gate; live, read per lane-layer):
+    /// dGPU bundle slice 2 (docs/v41/DGPU_BUNDLE_DESIGN.md 3) -- the iGPU takes this lane-layer's picks,
+    /// weights and Q8_K rows straight from the pinned readback pack (`bd.rb_pack`, written before
+    /// `selected_ready`) with copies on `ie.compute`, instead of three SDMA peer pushes on `de.xfer` that
+    /// run beside the shared expert (the slow-xfer mode: push 43 -> ~155 us, shared expert +2.4x). Only
+    /// where the pack holds sel + ew + xq and the host did not rewrite the picks after it (mode-2
+    /// substitution); everything else keeps the peer push.
+    pub static DGPU_ZC_PUSH = Knob::flag("V41_DGPU_ZC_PUSH", false).live();
     /// `V41_DGPU_ENGRAM_ASYNC` (default on; live, read per Engram lane-layer): dGPU bundle slice 1 --
     /// the decode drivers stage Engram rows through a pinned per-table slot and an async copy on
     /// `de.compute` instead of a blocking null-stream `hipMemcpy` that waited for every queued dGPU op
