@@ -63,17 +63,24 @@ pred 0.846 / acc 0.845 over 1.58M drafts).
 
 Fix ("fill on the transition to drafting", owner 2026-10-10): every kept row
 and the prefill's seed go into a per-slot host `Backlog` (consecutive
-positions, the latest `MTP_WINDOW` rows). A ring-writing step writes the backlog
-(`write_backlog`, the latest window of it, batched and async as before), and
-`MsDspark::draft` first `fill`s whatever the ring is missing -- from a prefill
-or from a 3+ stretch -- and syncs it, so the K policy's `draft_ms` excludes the
-fill. Ring contents and order are then those of a ring written every step; a
-stream that never drafts again never pays the write. Cost: one batched write of
-up to 128 rows per transition (a 128-row seed measured 14-15 ms), `fill_ms` on
-the blocks line. New `ms dspark: blocks` fields: `fills`, `fill_rows`,
-`fill_ms`, `backlog_dropped` (expected 0). Host memory: up to 128 x `HIDDEN`
-f32 per slot. Tests: `backlog_*`, `ring_skip_*` (host). Owed: a GPU check that
-a filled ring equals an every-step ring (`mtp_ring_async` style; issue #3
+positions, the latest `MTP_WINDOW` rows). A ring-writing step writes a backlog
+of one step's rows (`write_backlog`, batched and async as before); a bigger one
+(a held seed, a 3+ stretch) waits, and `MsDspark::draft` first `fill`s it and
+syncs, so neither the K policy's `draft_ms` nor any step's `step_ms` (cost
+fits, stage-1 gain) carries the catch-up. The ring then holds what a ring
+written every step holds (same rows and positions; for a gap longer than a
+window at other ring slots -- attention is order-free); a stream that never
+drafts again never pays the write. Cost: one batched write of up to 128 rows
+per transition (a 128-row seed measured 14-15 ms; each 8-row chunk's blocking
+upload drains every blocking iGPU stream, so watch it against in-flight
+prefetch copies). New `ms dspark: blocks` fields: `fills`, `fill_rows`,
+`fill_ms` (excluded from `draft_ms`, included in `tok_per_s`),
+`backlog_dropped` (expected 0); `ms dspark: ring seeded` gains `deferred`.
+Host memory: up to 128 x `HIDDEN` f32 (6-8 MB) per slot until it is reseeded.
+Rollback: `V41_MS_DSPARK_FILL=0` (static; seed written at once, unwritten rows
+dropped) -- `V41_MS_DSPARK_RING=all` is the other cure (writes every step).
+Tests: `backlog_*`, `ring_skip_*` (host). Owed: a GPU check that a filled ring
+matches an every-step ring by POSITION SET (`mtp_ring_async` style; issue #3
 finding 9), then a production read of E over the 128 rows after a gap.
 
 ### 56. FIXED (found and fixed 2026-10-06) — `KvArena` switched the current device behind the het engine's cache: `hipErrorInvalidHandle` in the drafter right after an in-step reservation grow

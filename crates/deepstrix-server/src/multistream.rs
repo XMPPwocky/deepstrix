@@ -1442,7 +1442,9 @@ impl Sched {
                 dsp.seed(engine, m, pf.slot, rows, last)
             });
             match seeded {
-                Ok(n) => tracing::info!(slot = pf.slot, seeded = n, last, ms = t.elapsed().as_millis() as u64, "ms dspark: ring seeded"),
+                // `deferred`: the rows are held and written by the first draft
+                // (`ms_dspark::fill`; `ms` is then the host hold time only).
+                Ok(n) => tracing::info!(slot = pf.slot, seeded = n, last, ms = t.elapsed().as_millis() as u64, deferred = ms_dspark::fill_on(), "ms dspark: ring seeded"),
                 Err(e) => {
                     let _ = dsp.reset(pf.slot);
                     tracing::warn!(slot = pf.slot, error = %e, "ms dspark: ring seeding failed; the stream drafts once it has decoded a row");

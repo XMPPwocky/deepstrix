@@ -129,7 +129,8 @@ struct SlotDraft {
 /// 2026-10-10 those rows were simply lost: a stream drafting again read a
 /// window missing its newest rows (production 10-06..10-10: E 2.4 over the
 /// 128 rows after a gap of 33+ rows vs 3.3 after them; 83% of the E < 2.0
-/// rollups). Host cost: at most `MTP_WINDOW` rows of `HIDDEN` f32 per slot.
+/// rollups). Host cost: at most `MTP_WINDOW` rows of `HIDDEN` f32 per slot
+/// (6-8 MB), kept until the slot is reseeded.
 #[derive(Default)]
 struct Backlog {
     /// Position of `rows[0]`.
@@ -169,6 +170,10 @@ impl Backlog {
         self.rows.is_empty()
     }
 
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
     fn clear(&mut self) {
         self.rows.clear();
     }
@@ -176,7 +181,8 @@ impl Backlog {
 
 /// How many leading rows of the run `pos0..pos0 + n` NOT to ring-write: the
 /// ones the ring already holds (at or before `last_ring_pos`) and the ones
-/// older than the run's last window.
+/// older than the run's last window (a `Backlog` never holds more than a
+/// window; the second term is a guard, not a path).
 fn ring_skip(last_ring_pos: Option<u32>, pos0: u32, n: usize) -> usize {
     let held = match last_ring_pos {
         Some(p) if p >= pos0 => (p - pos0) as usize + 1,
@@ -189,6 +195,13 @@ fn ring_skip(last_ring_pos: Option<u32>, pos0: u32, n: usize) -> usize {
 /// (default: enqueued without a sync, overlapping the step's host tail).
 fn ring_async() -> bool {
     crate::knobs::MS_DSPARK_RING_ASYNC.on()
+}
+
+/// `V41_MS_DSPARK_FILL=0`: no `Backlog` beyond one step -- the seed is
+/// written at once and rows a step does not ring-write are dropped (the
+/// behaviour before KNOWN_BUGS #57).
+pub fn fill_on() -> bool {
+    crate::knobs::MS_DSPARK_FILL.on()
 }
 
 /// Initial `gain` of a stream: optimistic, so it drafts until measured.
@@ -231,9 +244,10 @@ struct Stats {
     explored_two: u64,
     /// Blocks by rows (index rows - 1): on one lane, on two.
     lanes_by_rows: [[u64; 2]; CELLS],
-    /// Backlog writes of more rows than one step keeps (`write_backlog`: a
-    /// prefill's seed, or the rows of a stretch the ring was not written),
-    /// their rows, and the wall time of the ones `fill` ran before a draft.
+    /// `fill`s that wrote rows before a draft (a prefill's seed, or the rows
+    /// of a stretch the ring was not written), their rows and wall time.
+    /// `draft_ms` excludes `fill_ms`; `tok_per_s` charges both (the per-step
+    /// `ms.step` `draft_ms` includes the fill).
     fills: u64,
     fill_rows: u64,
     fill_ms: f64,
@@ -707,10 +721,13 @@ impl MsDspark {
     }
 
     /// Record the consecutive rows `pos0..pos0 + rows.len()` of `slot`'s stream
-    /// as kept: they join its `Backlog`, the last row's residual feeds the next
-    /// draft, and with `write_ring` the backlog goes into the ring now
-    /// (`write_backlog`). Without it (more live streams than may draft, under
-    /// `V41_MS_DSPARK_RING=solo`) the rows wait for the next write or `fill`.
+    /// as kept: they join its `Backlog` and the last row's residual feeds the
+    /// next draft. With `write_ring` a backlog of one step's rows goes into
+    /// the ring now (`write_backlog`, under the step's host tail); a bigger one
+    /// -- a held seed, or the rows of a stretch with more live streams than may
+    /// draft (`V41_MS_DSPARK_RING=solo`) -- waits for `fill`, so a step's time
+    /// (`step_ms`, the cost fits, the stage-1 gain) never carries a catch-up
+    /// write. `V41_MS_DSPARK_FILL=0`: rows not ring-written are dropped.
     pub fn keep_rows(
         &mut self,
         engine: &HeterogeneousEngine,
@@ -729,9 +746,17 @@ impl MsDspark {
         let t = Instant::now();
         let last = pos0 + rows.len() as u32 - 1;
         let h = rows.last().expect("non-empty").clone();
-        let dropped = self.slot(slot)?.backlog.hold(pos0, rows);
+        let fill = fill_on();
+        let sd = self.slot(slot)?;
+        let dropped = if write_ring || fill {
+            sd.backlog.hold(pos0, rows)
+        } else {
+            sd.backlog.clear();
+            0
+        };
+        let write = write_ring && (!fill || sd.backlog.len() <= MTP_BLOCK + 1);
         self.stats.backlog_dropped += dropped as u64;
-        if write_ring {
+        if write {
             self.write_backlog(engine, mtp, slot)?;
         }
         self.stats.keeps += 1;
@@ -747,21 +772,24 @@ impl MsDspark {
     /// (`V41_MS_DSPARK_RING_ASYNC`, default on): they run under the step's
     /// host tail, the next draft's blocking upload finds them done, and the
     /// event goes to `settle_writes`. Ring contents and order are those of a
-    /// ring written every step.
-    fn write_backlog(&mut self, engine: &HeterogeneousEngine, mtp: &mut MtpCtx, slot: u32) -> eyre::Result<()> {
+    /// ring written every step (a backlog of a gap longer than a window lands
+    /// at other ring slots than every-step writes would: same rows, same
+    /// positions, attention is order-free). Returns the rows written.
+    fn write_backlog(&mut self, engine: &HeterogeneousEngine, mtp: &mut MtpCtx, slot: u32) -> eyre::Result<usize> {
         let Some((pos0, rows)) = self.slot(slot)?.backlog.take() else {
-            return Ok(());
+            return Ok(0);
         };
         // The uploads below block on the iGPU: settle every slot's write
         // first, so an async fault is charged to the slot that issued it.
         self.settle_writes();
         let skip = ring_skip(self.slot(slot)?.last_ring_pos, pos0, rows.len());
         let n = rows.len() - skip;
-        if n > MTP_BLOCK + 1 {
-            self.stats.fills += 1;
-            self.stats.fill_rows += n as u64;
-        }
         let asynchronous = ring_async();
+        // Chunks share ONE staging buffer (`MtpState::rows_in`): chunk c + 1's
+        // upload is a blocking hipMemcpy, which waits for chunk c's kernels
+        // only because `igpu.compute` is a BLOCKING stream (`Stream::new`). A
+        // non-blocking compute stream would let it overwrite rows chunk c is
+        // still reading.
         for (c, chunk) in rows[skip..].chunks(RING_ROWS_MAX).enumerate() {
             let p = pos0 + (skip + c * RING_ROWS_MAX) as u32;
             let flat: Vec<f32> = chunk.concat();
@@ -778,7 +806,7 @@ impl MsDspark {
         if n > 0 {
             self.slot(slot)?.last_ring_pos = Some(pos0 + rows.len() as u32 - 1);
         }
-        Ok(())
+        Ok(n)
     }
 
     /// The transition to drafting: before `slot`'s stream drafts, write
@@ -792,10 +820,17 @@ impl MsDspark {
             return;
         }
         let t = Instant::now();
-        if let Err(e) = self.write_backlog(engine, mtp, slot) {
-            tracing::warn!(slot, error = %e, "ms dspark: ring fill failed; the stream's ring restarts");
-            self.stats.ring_errors += 1;
-            let _ = self.reset(slot);
+        match self.write_backlog(engine, mtp, slot) {
+            Ok(0) => {}
+            Ok(n) => {
+                self.stats.fills += 1;
+                self.stats.fill_rows += n as u64;
+            }
+            Err(e) => {
+                tracing::warn!(slot, error = %e, "ms dspark: ring fill failed; the stream's ring restarts");
+                self.stats.ring_errors += 1;
+                let _ = self.reset(slot);
+            }
         }
         self.settle_writes();
         self.stats.fill_ms += t.elapsed().as_secs_f64() * 1e3;
@@ -828,7 +863,7 @@ impl MsDspark {
         }
         let run: Vec<Vec<f32>> = (first..=last).map(|p| rows.remove(&p).expect("contiguous run")).collect();
         let n = run.len();
-        self.keep_rows(engine, mtp, slot, first, run, false)?;
+        self.keep_rows(engine, mtp, slot, first, run, !fill_on())?;
         Ok(n)
     }
 
@@ -950,7 +985,7 @@ impl MsDspark {
                 accept_rate = format!("{:.3}", s.accepted as f64 / (s.drafts_verified as f64).max(1.0)),
                 draft_ms = format!("{:.1}", s.draft_ms / n),
                 step_ms = format!("{:.1}", s.step_ms / n),
-                tok_per_s = format!("{:.2}", s.emitted as f64 / ((s.draft_ms + s.step_ms) / 1e3).max(1e-9)),
+                tok_per_s = format!("{:.2}", s.emitted as f64 / ((s.draft_ms + s.fill_ms + s.step_ms) / 1e3).max(1e-9)),
                 k_hist = ?s.k_hist,
                 no_hidden = s.no_hidden,
                 skipped_steps = s.skipped,
