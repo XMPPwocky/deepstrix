@@ -798,6 +798,12 @@ crate::knobs! {
     /// `V41_B2_SOFT_HINT` (default off; live): the look-ahead filter treats a soft-held expert as
     /// resident (no hint for it).
     pub static B2_SOFT_HINT = Knob::flag("V41_B2_SOFT_HINT", false).live();
+    /// `V41_DGPU_ENGRAM_ASYNC` (default on; live, read per Engram lane-layer): dGPU bundle slice 1 --
+    /// the decode drivers stage Engram rows through a pinned per-table slot and an async copy on
+    /// `de.compute` instead of a blocking null-stream `hipMemcpy` that waited for every queued dGPU op
+    /// (`de.compute` is a blocking stream), the other lane's chain included. Same bytes. Off = the
+    /// blocking copy (`stage_engram_rows_batch`), as before.
+    pub static DGPU_ENGRAM_ASYNC = Knob::flag("V41_DGPU_ENGRAM_ASYNC", true).live();
     /// `V41_DGPU_COMBINE3` (default on; live, read per decode lane-layer): dGPU bundle slice 1
     /// (docs/v41/DGPU_BUNDLE_DESIGN.md 2) -- the post-MoE `ffn_moe += ffn_shared` vec_add is folded
     /// into the combine (`hc_post_from_split_batched_add2` with box 2's partial, or `_add` with the

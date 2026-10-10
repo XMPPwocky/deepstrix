@@ -3960,6 +3960,26 @@ impl HeterogeneousEngine {
         self.stage_engram_rows_batch(bd, &buf[off * ein..(off + n) * ein])
     }
 
+    /// Decode-arena twin of [`Self::stage_engram_rows_batch`] (dGPU bundle slice 1,
+    /// `V41_DGPU_ENGRAM_ASYNC`): the rows go through this lane's pinned slot for Engram table `table`
+    /// (`bd.engram_pin`) and an async copy on `de.compute`, ordered before the Engram kernels on the
+    /// same stream. Only for drivers that synchronize `de.compute` at step end (the slots are reused
+    /// next step); falls back to the blocking copy when off or the slot does not fit.
+    pub fn stage_engram_rows_async(&self, bd: &mut BatchDgpuScratch, rows: &[f32], table: usize) -> eyre::Result<()> {
+        let n = rows.len();
+        let cap = bd.engram_rows.len();
+        let slot = table * cap;
+        if !crate::knobs::DGPU_ENGRAM_ASYNC.on() || n == 0 || n % ENGRAM_IN as usize != 0 || n > cap || bd.engram_pin.len() < slot + n {
+            return self.stage_engram_rows_batch(bd, rows);
+        }
+        self.set_current_cached(self.dgpu.device)?;
+        bd.engram_pin.as_mut_slice()[slot..slot + n].copy_from_slice(rows);
+        let pin = &bd.engram_pin;
+        bd.engram_rows.slice_view_mut(0, n).copy_from_host_async(&pin.as_slice()[slot..slot + n], &self.dgpu.compute)?;
+        bd.engram_rows_ready = true;
+        Ok(())
+    }
+
     pub fn stage_engram_rows_batch(&self, bd: &mut BatchDgpuScratch, rows: &[f32]) -> eyre::Result<()> {
         if rows.is_empty() || rows.len() % ENGRAM_IN as usize != 0 || rows.len() > bd.engram_rows.len() {
             return Err(eyre!("stage_engram_rows_batch: {} floats (ENGRAM_IN {}, capacity {})", rows.len(), ENGRAM_IN, bd.engram_rows.len()));
@@ -4059,7 +4079,7 @@ impl HeterogeneousEngine {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
                 let rows = match li { Some(i) => engram_rows.table(i)?, None => None };
                 match rows {
-                    Some(r) if r.len() >= b * ein => self.stage_engram_rows_batch(bd, &r[..b * ein])?,
+                    Some(r) if r.len() >= b * ein => self.stage_engram_rows_async(bd, &r[..b * ein], li.unwrap_or(0))?,
                     _ => return Err(eyre!("forward_step_arena: layer {layer} needs Engram rows for {b} rows")),
                 }
             }
@@ -4166,7 +4186,7 @@ impl HeterogeneousEngine {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
                 let rows = match li { Some(i) => engram_rows.table(i)?, None => None };
                 match rows {
-                    Some(r) if r.len() >= (off + n) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + n) * ein])?,
+                    Some(r) if r.len() >= (off + n) * ein => this.stage_engram_rows_async(bd, &r[off * ein..(off + n) * ein], li.unwrap_or(0))?,
                     _ => return Err(eyre!("forward_step_arena_pipelined: layer {layer} needs Engram rows for {n} rows")),
                 }
             }
@@ -4363,7 +4383,7 @@ impl HeterogeneousEngine {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
                 let rows = match li { Some(i) => engram_rows.table(i)?, None => None };
                 match rows {
-                    Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + nrows) * ein])?,
+                    Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_async(bd, &r[off * ein..(off + nrows) * ein], li.unwrap_or(0))?,
                     _ => return Err(eyre!("forward_step_arena_lanes: layer {layer} needs Engram rows for {nrows} rows")),
                 }
             }
@@ -4525,7 +4545,7 @@ impl HeterogeneousEngine {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
                 let rows = match li { Some(i) => engram_rows.table(i)?, None => None };
                 match rows {
-                    Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + nrows) * ein])?,
+                    Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_async(bd, &r[off * ein..(off + nrows) * ein], li.unwrap_or(0))?,
                     _ => return Err(eyre!("forward_step_arena_ready_first: layer {layer} needs Engram rows for {nrows} rows")),
                 }
             }

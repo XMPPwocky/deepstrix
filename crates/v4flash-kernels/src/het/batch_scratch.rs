@@ -271,6 +271,10 @@ pub struct BatchDgpuScratch {
     /// V4.1 Engram prefill: staged rows `[B, ENGRAM_IN]` f32
     /// (`stage_engram_rows_batch`) and per-`ENGRAM_CHUNK` Q8 / wkv-output scratch.
     pub engram_rows: DeviceBuffer<f32>,
+    /// Pinned host staging for `engram_rows`, one slot of `engram_rows.len()` per Engram table
+    /// (dGPU bundle slice 1, `stage_engram_rows_async`): layer 14's host write never races layer 1's
+    /// pending async copy, and the next step reuses the slots after its step-end synchronize.
+    pub engram_pin: v4flash_hip::PinnedBuffer<f32>,
     pub engram_xq: DeviceBuffer<i8>,
     pub engram_xscale: DeviceBuffer<f32>,
     pub engram_kv: DeviceBuffer<f32>,
@@ -1247,6 +1251,11 @@ impl BatchDgpuScratch {
             split: mk_f32(HC_MIX_DIM as usize)?,
             hc_pre_carry: mk_f32(HC_MIX_DIM as usize)?,
             engram_rows: if cfg!(feature = "v41") { mk_f32(ENGRAM_IN as usize)? } else { DeviceBuffer::new(id, 32)? },
+            engram_pin: v4flash_hip::PinnedBuffer::new(if cfg!(feature = "v41") {
+                crate::config::ENGRAM_LAYERS.len().max(1) * b * ENGRAM_IN as usize
+            } else {
+                32
+            })?,
             // Rows per Engram pass: ENGRAM_CHUNK, or 2x under `V41_ENGRAM_CHUNK128`
             // (forward_prefill::engram_chunk_rows; +6.6 MB here at 128 rows).
             engram_xq: DeviceBuffer::new(id, if cfg!(feature = "v41") { (super::forward_prefill::engram_chunk_rows() * ENGRAM_IN) as usize } else { 32 })?,
