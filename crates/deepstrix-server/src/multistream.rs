@@ -2445,6 +2445,10 @@ impl Sched {
             // flip of `V41_MS_DSPARK_STREAMS` (the per-turn A/B) must find every
             // stream's ring dense, or the knob-2 arm would draft from rings with
             // the knob-1 steps missing (the 10-01 gap bug; review rounds 2-3).
+            // A skipped step's rows are not lost: they wait in the slot's
+            // backlog, and the stream's next ring write or draft fills them in
+            // (`ms_dspark::Backlog`; before 2026-10-10 a stream leaving a
+            // stretch of 3+ live streams drafted from a window with a hole).
             let write = dsp.ring_all() || self.streams.len() <= ms_dspark::ring_streams(spec_max);
             for (i, s) in self.streams.iter().enumerate() {
                 if done.iter().any(|&(d, _)| d == i) {
