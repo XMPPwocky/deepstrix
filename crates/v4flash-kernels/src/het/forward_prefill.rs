@@ -871,9 +871,11 @@ impl Drop for PrefetchCapGuard {
 /// reported are skipped (no residency to go on).
 fn lm_prefetch_words(layers: std::ops::Range<usize>, split: usize) -> Vec<u32> {
     let mut words = Vec::new();
+    // The same ownership the pick loop uses (the frozen prefill split of a long job, else the decode partition).
+    let psplit = super::prefill_split::current();
     for l in layers.filter(|&l| l != split) {
         for e in 0..crate::config::N_EXPERT {
-            if super::expert_pager::partition_box2(l as i32, e) && super::b2_mirror::resident(l as i32, e) == Some(false) {
+            if super::prefill_split::home2_or_partition(psplit.as_ref(), l as i32, e) && super::b2_mirror::resident(l as i32, e) == Some(false) {
                 words.push(((l as u32) << 16) | e);
             }
         }
@@ -1004,6 +1006,10 @@ pub struct PrefillJob {
     lm_store: Option<(DeviceBuffer<f32>, DeviceBuffer<f32>, usize)>,
     /// Layer-major windows this job has completed (tests assert it ran).
     lm_windows: usize,
+    /// P1 (docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 4): the frozen prefill split of a LONG job, built at its first unit
+    /// (`V41_PREFILL_SPLIT=1`), installed around every unit by `prefill_split::install`. `split_tried`: build once.
+    split: Option<std::sync::Arc<super::prefill_split::PrefillSplit>>,
+    split_tried: bool,
     /// LAZY inputs: when `input_hcs` is empty the caller supplies the next
     /// chunk's rows through `set_chunk_inputs` right before `prefill_job_chunk`
     /// (embeddings + Engram rows for `next_chunk_range()` only). A 135K-token
@@ -1053,6 +1059,8 @@ impl PrefillJob {
             lm: None,
             lm_store: None,
             lm_windows: 0,
+            split: None,
+            split_tried: false,
             chunk_inputs: None,
         })
     }
@@ -1150,6 +1158,40 @@ impl HeterogeneousEngine {
     /// drafter's -- must not write them again.
     fn emit_prefill_perfetto(&self) -> eyre::Result<()> {
         self.flush_perfetto()
+    }
+
+    /// P1: build the frozen prefill split for `job`, or `None` when it does not apply (knob off, short job, no CED, no box 2,
+    /// not under the T2 partition, no pager). Logs share1/share2/filler and the expected steady re-reads per window
+    /// (`max(0, share2 - usable2)`), which the P1 A/B gates on (docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 4).
+    fn build_prefill_split(
+        &self,
+        job: &PrefillJob,
+        pager: Option<&super::expert_pager::ExpertPager>,
+    ) -> Option<std::sync::Arc<super::prefill_split::PrefillSplit>> {
+        use super::prefill_split as ps;
+        if !ps::enabled() || !job.ced || self.remote.is_none() || !super::expert_pager::t2_partition() {
+            return None;
+        }
+        if job.total() <= ps::long_tokens() {
+            return None;
+        }
+        let pg = pager?;
+        let cfg = ps::SplitCfg {
+            lru_slots: pg.lru_slots(),
+            filler_max: ps::filler_max(),
+            cold_head_per_layer: super::expert_pager::hot_set::per_layer(),
+        };
+        let split = ps::PrefillSplit::build(&cfg, &|l, e| super::expert_pager::hot_set::box1_owns(l, e));
+        let st = &split.stats;
+        let usable2 = ps::b2_usable_estimate();
+        tracing::info!(
+            tokens = job.total(), warm = st.warm, lru_slots = cfg.lru_slots, owned_now = st.owned_now, filler = st.filler,
+            head_min = st.head_min, head_max = st.head_max, share1 = st.share1, share2 = st.share2,
+            share2_per_layer = st.share2 / crate::config::CED_DECODER_START, usable2,
+            expected_rereads_per_window = st.expected_rereads(usable2),
+            "prefill split: frozen encoder-layer expert split for a long job"
+        );
+        Some(std::sync::Arc::new(split))
     }
 
     /// Layer-major: is a window open (opening one if at least two chunks fit)?
@@ -1449,6 +1491,13 @@ impl HeterogeneousEngine {
         super::b2_mirror::expire_incoming();
         let lane_caps = (bd_a.rows, bd_b.rows);
         let chunk_size = job.chunk_rows.min(lane_caps.0 + lane_caps.1);
+        // P1: the frozen prefill split of a LONG job. Built once at the job's first unit from the LIVE hub pool and
+        // hot-set counts, installed for this unit only (decode steps, verifies and the replay see `None`).
+        if !job.split_tried {
+            job.split_tried = true;
+            job.split = self.build_prefill_split(job, pager.as_deref());
+        }
+        let _split_guard = super::prefill_split::install(job.split.clone());
         if job.ced && job.lm_rows > 0 && self.lm_open_window(job, lane_caps, chunk_size)? {
             return self.prefill_job_lm_unit(job, bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, pager);
         }
@@ -9602,6 +9651,10 @@ impl HeterogeneousEngine {
                 let mut seen = vec![false; N_EXPERT as usize];
                 let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
                 let mut skipped_remote = 0usize;
+                // P1 (docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 4): the frozen prefill split of a LONG job, installed
+                // around the prefill unit (`prefill_split::install`); `None` for decode steps, verifies and the replay.
+                // Cloned ONCE per call, not locked per pick.
+                let psplit = super::prefill_split::current();
                 // HOT SPLIT 3.2: the holder fallback serves decode rows only
                 // (prefill and verify chunks keep the home rule).
                 let holder_rows = matches!(rows, RowLayout::Arena { .. });
@@ -9653,7 +9706,7 @@ impl HeterogeneousEngine {
                             // Box 2's share: always hers -- except a MOVING id of a
                             // decode row, served by whichever box holds it until its
                             // new home does (HOT SPLIT 3.2, `serve_on_box2`).
-                            let home2 = super::expert_pager::partition_box2(layer as i32, sv as u32);
+                            let home2 = super::prefill_split::home2_or_partition(psplit.as_ref(), layer as i32, sv as u32);
                             let on2 = if holder_rows && super::expert_pager::hot_set::moving(layer as i32, sv as u32) {
                                 let b1_has = pg.is_resident(layer as i32, sv as u32);
                                 let r = super::b2_mirror::lookup(layer as i32, sv as u32);
@@ -10338,8 +10391,9 @@ impl HeterogeneousEngine {
                     // The SAME ownership predicate the target layer's dispatch
                     // will use, or the hint warms bytes box 2 reads.
                     let split = remote_split_on && super::expert_pager::t2_partition();
+                    let psplit_ra = super::prefill_split::current();
                     pg.readahead_layer(ahead, |e| {
-                        split && super::expert_pager::partition_box2(ahead, e)
+                        split && super::prefill_split::home2_or_partition(psplit_ra.as_ref(), ahead, e)
                     });
                 }
                 if remote_split_on && !owns_eff.is_empty() {

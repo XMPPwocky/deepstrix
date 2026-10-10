@@ -23,7 +23,7 @@ use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_EMBD, N_HC, N_VOCAB};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, DgpuScratch, ExecMode,
     HetModelState, HetModelWeights,
-    HeterogeneousEngine, IgpuScratch, SampleMode, B_MAX,
+    HeterogeneousEngine, IgpuScratch, SampleMode,
 };
 use v4flash_kernels::sampler::SamplerRng;
 use v4flash_kernels::RopeParams;
