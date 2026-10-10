@@ -557,3 +557,35 @@ Branch binary ce52ee3c (21b43bf). Script and logs in the job's tmp dir: `window2
 | 16,384 tokens | 18.7 s | identical | cos 0.999998 |
 
 A long input's phase is attention-bound (quadratic) and blocks chat for its whole length. llama.cpp's CPU embedding could not be the reference here: at 11K tokens it took box 1 from 9.7 to 1.7 GB available in 5 s while the hub ran (a guard killed it), so the CPU oracle (26 and 52 min at nice 19) stood in.
+
+## 18. Attention: the full-group packed kernel at G = 4 (design, 2026-10-10)
+
+**Problem.** Long inputs are attention-bound. From the production phases (§17 addendum), with the weight matmuls at the 55 TFLOPS the batched phase shows:
+
+| Input | fwd | matmuls | attention | causal attention FLOPs | rate |
+|---|---|---|---|---|---|
+| 11,412 | 9.12 s | 1.51 s | 7.61 s | 3.84e13 | 5.0 TFLOPS |
+| 16,384 | 17.94 s | 2.16 s | 15.78 s | 7.92e13 | 5.0 TFLOPS |
+
+5 TFLOPS is 2.6 % of the 194 TFLOPS f16 WMMA peak. The forward calls `prefill_flash_wmma_fa2` (§5.2): one 128-thread WG per (query head, 32-row tile). Qwen3-4B has kv_group 4, so each K/V tile is staged and each softmax pass run 4 times, once per query head (the MHA regime, 2–7 % of peak in our earlier measurements).
+
+**Roofline.** Causal attention per layer is `8192 · T²` FLOPs (32 heads × 128 dims, QK and PV, half the square). On gfx1201 the ceiling for parity-exact dense prefill attention is about 14 % of peak: `fa2_hg_packed` measured 14.1 % at G = 6, and a from-scratch llama.cpp-style rewrite lost 1.75× to it (2026-07-26 post-mortem, `docs/laguna/PREFILL_ATTN_ROWPAR_DESIGN.md` §10). So no new kernel: the target is that kernel at G = 4.
+
+**Change.**
+
+1. `kernels/gqa_attention_g4.hip` = `#define HGP_G 4u` + `#include "gqa_attention.hip"`: the same source compiled a second time (`HGP_G` is `#ifndef`-guarded and the kernel body is generic in it). `gqa_attention.hip` is not edited, so the existing module, and every kernel in it, is unchanged.
+2. `GqaAttention` carries its packing factor (`hgp_g`: 6 from `for_arch`, 4 from the new `for_arch_group4`) instead of the `FLASH_HGP_G` constant. G = 6 behaves exactly as before.
+3. The embed kernels load the G = 4 module (it holds `fa2` too) and pick per call: `hg_packed` when `kv_group % 4 == 0` and the live knob `V41_EMBED_ATTN` is `packed`, else `fa2`. The default stays `fa2` until the gates below pass; a live knob lets the window and production compare both on one binary.
+
+At G = 4 the kernel's work divides evenly: 8 score tasks over 8 waves (G = 6: 12, so 4 waves ran 2) and 256 softmax slots over 256 threads (G = 6: 384). LDS falls from 61,568 to about 46,600 B: still one WG per CU, the same occupancy as G = 6. O stays in registers (`O_reg[4]`, 32 VGPRs instead of 48).
+
+**Expected.** At 10–14 % of peak, 16K attention takes 3–4 s instead of 15.8 s and the phase about 6–7 s instead of 18.7 s; at 11,412 tokens about 4 s instead of 9.85 s. Short inputs (≤ 1K) are matmul-bound and should not move.
+
+**Gates (GPU window).**
+
+- G1 kernel parity: `gqa_attn_prefill_packed_g4_correctness`, packed G = 4 vs the CPU reference at the Qwen shape (32 / 8 / 128) and at kv_group 8 (n_subgroup 2): q_offset 0, 100, 1024; B 7, 77, 130, 1024; max abs < 2e-3 (the existing tolerance).
+- G2 baseline first: `gqa_attn_prefill_qwen_bench`, `fa2` vs packed G = 4 at B = 1024 (the embed sub-batch) and depths 1K, 4K, 8K, 16K, in µs and effective TFLOPS. If `fa2` is not near 5 TFLOPS here, §18 is re-priced before anything ships.
+- G3 the forward: `tiny_gpu_matches_cpu` and `real_gpu_matches_cpu` with `V41_EMBED_ATTN=packed`.
+- G4 in production, via the live knob: `long_ref.py check` on the 11,412 / 16,384 texts against the hub's `fa2` vectors (themselves 0.999998+ vs the CPU oracle) and `e2e_smoke` against the llama.cpp reference, then the phase times.
+
+**Risks.** The packed kernel has run only in Laguna tests (env-gated off there). Its numerics differ from `fa2` at f16 rounding (G1/G3 bound it). A kernel fault on the production GPU would take the hub down, hence G1–G3 in a window before the knob is flipped live.
