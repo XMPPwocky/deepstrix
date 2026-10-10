@@ -136,3 +136,14 @@ Rev 1 deferred admission to the next Prefill->Decode switch; with no live stream
    compaction-first and overlap swap; unit tests for the placement and the swap bookkeeping (CPU), a GPU test of
    lend/return round-trip bit-identity of live KV.
 2. Gate A at 1024-row lanes (chunked vs layer-outer at the same lane size) + a live A/B.
+
+## 6. Review round 2: APPROVE (2026-10-10)
+Fable r2 verified the 5.1 chokepoints (`ms:1026` compact_stores, `ms:1487`/`1591` grow, `ms:1499` fill_reserved,
+`ms:1153` decode_step entry; bookkeeping-only: reserve/release/rebuild_free_lists), compaction-at-lend safety (row tables
+rebuilt per step, stage_b bakes only store bases) and the itemised 1024-row set: lane 573 MB x2, `sd'` 3,233 MB, total
+4,379 MB; pool 2,048 (r1 1,513 + lm_store/idx 344 + candidate_block_score 189); typical post-compaction tails 2,788 MB
+(live KV 0.8 GB) vs 2,772 needed outside the pool -> **16 MB slack** with the dead `verify_scores` excluded. Placement
+script: job tmp `review/placement.py` (copy into the repo with the build). Minors folded into the build:
+compact only if live rows overlap the lent ranges (`overlaps_lent()`); exclude `verify_scores` from the prefill set;
+token/flag-enforced arena writes. Overlap swap is a REGULAR path (live KV > ~0.8 GB); largest buffers in comp_kv1's end
+range; reclaiming the dead `verify_scores` (94 MB) + `DgpuScratch.attn_scores` (190 MB) would give ~300 MB slack.
