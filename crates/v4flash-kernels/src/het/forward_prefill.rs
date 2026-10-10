@@ -13103,6 +13103,21 @@ mod lm_tests {
         job.ced = true;
         job.lm_rows = 0;
         assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 1024));
+        // Derived, not literal: the end of the predicted range must equal the window `lm_open_window` plans with ITS formula
+        // (`chunk_size = chunk_rows.min(lane caps)`, `cap = lm_rows.max(2 * chunk_size)`), so a future edit to either side that
+        // changes the cap or chunk size is caught here (review r6 N1).
+        job.lm_rows = 4096;
+        for start in [0usize, 1024, 4096, 8192, 9_000, 9_500] {
+            job.chunk_start = start;
+            let chunk_size = job.chunk_rows.min(caps.0 + caps.1);
+            let opened = lm_plan_window(job.pos0, start, job.tokens.len(), chunk_size, caps, &[], job.lm_rows.max(2 * chunk_size)).unwrap();
+            let want = match opened {
+                Some(subs) => (start, subs.last().unwrap().1),
+                None => (start, job.next_chunk_range_impl(caps, false).unwrap().1),
+            };
+            assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), want, "start {start}");
+        }
+        job.chunk_start = 0;
         // An OPEN layer-outer window: the first pass (layer 0) takes the whole window, later passes none.
         job.lm_rows = 4096;
         let subs = lm_plan_window(0, 0, 10_000, 1024, caps, &[], 4096).unwrap().unwrap();
