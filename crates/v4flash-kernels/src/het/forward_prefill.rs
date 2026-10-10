@@ -1604,9 +1604,13 @@ impl HeterogeneousEngine {
 }
 
 /// `V41_MS_GRAPHS=0` disables the per-stage HIP graphs of the arena (decode)
-/// lane-layer. Default ON: at 1-8 rows the batched driver is host-launch-bound
-/// (~40 kernels per lane-layer at 20-40 us each for a few us of GPU work), and
-/// a captured stage replays as one launch.
+/// lane-layer (`knobs::MS_GRAPHS`, LIVE since 2026-10-10: decided at each stage's start, so a
+/// flip never splits a capture). Default ON: at 1-8 rows the batched driver was host-launch-bound
+/// (~40 kernels per lane-layer at 20-40 us each for a few us of GPU work), and a captured stage
+/// replays as one launch. RE-MEASURED 2026-10-10 (tests/bench_graph_replay.rs, dGPU beside the
+/// live hub): a direct launch now costs < 1 us of host and a graph replay ~6.5 us of fixed DEVICE
+/// time, so 7 direct launches take 28.7 us on the device vs 37.5 for today's 5+2-node graphs --
+/// the dGPU bundle A/Bs graphs off (docs/v41/DGPU_BUNDLE_DESIGN.md 12).
 /// `V41_LOOKAHEAD_PREFETCH=1` enables look-ahead routing prefetch (default off;
 /// see the router stage of `forward_layer_pre_moe_v2`).
 /// `V41_LOOKAHEAD_DEPTH`: layers of routing lead sent as prefetch words
@@ -1912,9 +1916,7 @@ pub fn lookahead_prefetch() -> bool {
 }
 
 pub fn ms_graphs() -> bool {
-    static B: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("V41_MS_GRAPHS").as_deref() != Ok("0"));
-    *B
+    crate::knobs::MS_GRAPHS.on()
 }
 
 /// One stage's capture-or-replay handle (see `HeterogeneousEngine::stage_cap`).

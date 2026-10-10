@@ -132,3 +132,21 @@ iGPU cost the step; in the dGPU-bound regimes removing the dGPU's SDMA copies wi
 lay sel / ew / xq out contiguously in the readback pack AND in the iGPU landing scratch (one contiguous
 allocation with typed views), so a single host->device copy fills all three; then re-A/B, two-stream cells
 first.
+
+## 12. Step 0c result (2026-10-10, tests/bench_graph_replay.rs, dGPU beside the live hub)
+
+Seven small kernels (vec_add over b x N_EMBD), paired random order, 1500 rounds, 95% CIs < +-0.05 us:
+
+| b = 4 | device (queued) | device (cold) | host submit |
+|---|---|---|---|
+| 7 direct launches | 28.7 us | 25.8 | 4.7 |
+| one 7-node graph (q+kv merged) | 31.0 | 28.1 | 2.5 |
+| 5-node + 2-node graphs (today) | 37.5 | 34.7 | 4.4 |
+| seven 1-node graphs | 68.6 | 68.4 | 12.1 |
+
+(b = 1 the same within 1.5 us.) A graph replay costs ~6.5 us of FIXED device time; a direct launch < 1 us
+of host. The `V41_MS_GRAPHS` default's premise ("~40 kernels per lane-layer at 20-40 us each") no longer
+holds. Production replays four stage graphs per lane-layer (q_chain, kv_chain, output_proj, shared): if
+the real stages behave like this, graphs cost ~26 us of dGPU time per lane-layer (~2 ms/step) on the
+critical path. **Plan:** `V41_MS_GRAPHS` made LIVE (decided at each stage's start) so the next deploy
+A/Bs graphs off vs on per turn; the q+kv merge (-6.5 us) only matters if graphs stay on.

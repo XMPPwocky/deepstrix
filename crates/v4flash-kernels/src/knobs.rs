@@ -798,6 +798,11 @@ crate::knobs! {
     /// `V41_B2_SOFT_HINT` (default off; live): the look-ahead filter treats a soft-held expert as
     /// resident (no hint for it).
     pub static B2_SOFT_HINT = Knob::flag("V41_B2_SOFT_HINT", false).live();
+    /// `V41_MS_GRAPHS` (default on; live since 2026-10-10, read at each arena stage's start):
+    /// `forward_prefill::ms_graphs` -- the arena stage graphs; off = direct launches. Step 0c
+    /// (tests/bench_graph_replay.rs) measured ~6.5 us of device time per graph replay vs < 1 us of
+    /// host per direct launch: the dGPU bundle A/Bs it per turn.
+    pub static MS_GRAPHS = Knob::flag("V41_MS_GRAPHS", true).live();
     /// `V41_DGPU_ZC_PUSH` (default OFF until the window's microbench + gate; live, read per lane-layer):
     /// dGPU bundle slice 2 (docs/v41/DGPU_BUNDLE_DESIGN.md 3) -- the iGPU takes this lane-layer's picks,
     /// weights and Q8_K rows straight from the pinned readback pack (`bd.rb_pack`, written before
