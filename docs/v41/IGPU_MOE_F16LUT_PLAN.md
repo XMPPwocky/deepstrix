@@ -1,7 +1,12 @@
 # iGPU prefill MoE: what is left after the int8-WMMA arm (plan, 2026-10-10)
 
-Status: ANALYSIS + compile-only experiments + a CPU proof. Nothing here ran on a GPU (live hub up,
-no GPU scheduler running, other agents active). No production code changed.
+Status (updated same day): the f16 kernel is BUILT and measured in the B_moe_prefill harness on the iGPU,
+beside the live hub (owner: "slot beside live traffic"; ~2.7 GB, seconds per run, no profiler).
+**Results are at the end of this file.** No production code changed; not wired into dispatch.
+
+CORRECTION: the first compile table below ("3 tiles 233 VGPR, free") was measured on a generated file whose
+3-tile dispatch was dead (it only existed under `WM_NTMAX >= 4`, so NTMAX=3 silently ran the 1-tile path).
+The real numbers are in the results section.
 
 ## Where we are
 
@@ -80,3 +85,51 @@ super-block**, so there is no per-block epilogue at all:
 * Box 2's iGPU is identical, but it runs the same kernels through the same dispatch; the xq rows it receives
   already carry the data this needs (int8 q + yd).
 * NPU / dGPU are not touched by this.
+
+## RESULTS (2026-10-10, gfx1151 iGPU, harness `scratch/kernel_ideas/B_moe_prefill`, beside live hub traffic)
+
+Files: `mid_f16.inc` (the kernel arm) + `cand_wide.hip` (shared scaffold) -> `cand_f16.hip` via
+`mkf16.py` (`build_f16abl.sh` calls it and builds the timing-only ablations). `cand_f16.hip` is committed too.
+Same entry names/args as the shipped arm, so the harness swaps it in with `KB_CAND`. Harness additions: `KB_CHUNK`
+(candidate work-item chunk), `abx` mode (shipped arm vs two candidates interleaved in one process), `run_f16.sh`.
+
+**Resources (hipcc gfx1151, no spills anywhere):**
+
+| | gate+up VGPR / LDS | down VGPR |
+|---|---|---|
+| shipped int8 arm (2 tiles) | 230 / 10.1 KB | 133 |
+| f16, 2 tiles (32 members) | 179 / 17.3 KB | 123 |
+| f16, 3 tiles (48 members) | 224 / 25.9 KB | 159 |
+
+Static mix per super-block (`isa_mix.py`): VALU per WMMA 51.2 -> 29.6 (gate+up), 49.1 -> 28.5 (down) at 2 tiles.
+
+**Correctness** (`cmp`, vs production kwide/kwide2, real harness inputs): gate+up rel_rmse 3.9e-7, down 1.1e-7
+at 2 tiles B=512, and the same at 3 tiles / chunk 48 / B=3072 (max_group 68, so chunking is exercised). The shipped
+int8 arm is 5.4e-7 / 1.7e-7, so the f16 arm is at least as close. The baseline itself matches the CPU reference
+to 4e-6 / 1.7e-6. Not bit-exact (f32 reassociation, same class as the shipped arm): still needs the golden/KLD gate.
+
+**Speed, interleaved in one process** (`abx`, B=3072, 48 experts = 48.5 members/expert, 12 rounds; the hub is
+live so absolute numbers move 9-16 ms between runs for the SAME kernel; only same-process ratios are usable):
+
+| comparison (vs shipped int8 arm) | gate+up med (p10) | down med (p10) |
+|---|---|---|
+| f16, 2 tiles, chunk 32 | 9.42 vs 15.99 ms = **1.70x** (9.05 vs 12.82 = 1.42x) | 4.66 vs 5.39 = 1.16x (4.56 vs 5.02) |
+| f16, 3 tiles, chunk 48 | 7.57 vs 11.22 ms = **1.48x** (7.28 vs 10.57 = 1.45x) | 5.57 vs 5.44 = tie (3.43 vs 4.02 = 1.17x) |
+| (f16 3 tiles vs f16 2 tiles, from the two runs) | ~1.24x | ~1.0x |
+
+So the scale-in-LUT f16 arm is a real **~1.4-1.7x on gate+up** over what ships, and ~1.15-1.2x on down (down was
+already near its DRAM roof). Wider chunks add a further ~1.2x on gate+up. At B=1024 / 16.5 members per expert the
+two arms tie on gate+up (memory/latency bound there), as predicted: this lever only matters at big windows.
+
+**Ablation (f16, 2 tiles, gate+up, B=3072):** removing the activation global loads: 8.9 ms (vs 9.2); weight loads:
+8.1 (p10 6.8); both: 8.7 (p10 6.8). So even with ALL global loads removed the kernel sits at ~6.8 ms = 16 TFLOP/s =
+28% of the ~57 TOPS peak: the WMMA pipe is ~1/3 busy, and it is NOT instruction count (VALU/WMMA fell 42% for ~1.4x)
+nor memory. Suspects, untested: two `__syncthreads` per super-block with stage->barrier->compute serialisation
+(no overlap inside a WG), LDS fragment reads (4 ds_read_b128 per tile-block), only 4 independent accumulator chains
+per wave. Next experiments: double-buffered staging (stage sb+1 while computing sb), PMC (`SQ_BUSY_CYCLES`,
+`SQ_INSTS_LDS`, ONE counter per pass, iGPU PMC only via the flake-pinned rocprofiler, NEVER ATT on the iGPU).
+
+**Not yet done:** driver integration (a `V41_MOE_WMMA_F16` knob in `het::dispatch`, chunk 48 into the work-item builder,
+rust wrappers, `build.rs` registration, expected default OFF), the golden/KLD gate (needs the hub down), e2e prefill
+A/B, box 2 (same binary), and a scan of the remaining layers' E8M0 range (only layers 2 and 7 sampled; the kernel
+clamps to e8 in [114,137], a weight outside that would silently flush/saturate).

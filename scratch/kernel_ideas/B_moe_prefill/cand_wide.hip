@@ -314,7 +314,10 @@ __device__ __forceinline__ void wm_body(
     if (n_tiles >= 4u) {
         wm_mainloop<4, MATS, DOWN>(acc, sm, w_row0, w_row1, xq, row_stride_b, row_stride_slot,
                                    n_members, n_blocks, row_valid, tid, l16, hi);
-    } else if (n_tiles == 3u) {
+    } else
+#endif
+#if WM_NTMAX >= 3
+    if (n_tiles == 3u) {
         wm_mainloop<3, MATS, DOWN>(acc, sm, w_row0, w_row1, xq, row_stride_b, row_stride_slot,
                                    n_members, n_blocks, row_valid, tid, l16, hi);
     } else
