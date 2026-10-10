@@ -492,6 +492,7 @@ pub(crate) fn rb_pack_max_rows() -> u32 {
 /// Process-static env reads on the decode lane path, read ONCE (docs/v41/DGPU_BUNDLE_DESIGN.md 2: ~19
 /// `getenv` per lane-layer -- each takes std's env lock and allocates). Only names no harness flips
 /// mid-process: `DEEPSTRIX_COMP_GEMM` (tests/compressor_gather_ab.rs flips it between arms),
+/// `IQ2_VARIANT` / `Q2K_VARIANT` (tests/forward_prompt_batch_matches_sequential.rs sets them in-process),
 /// `INDEXER_SCORE_VARIANT` / `INDEXER_TOPK_SELECT` (in-process sweeps) and the compressor / capture-time
 /// variants stay per call.
 mod lane_env {
@@ -511,10 +512,8 @@ mod lane_env {
     pub static PAGER_SYNC_IGPU_OFF: LazyLock<bool> = LazyLock::new(|| is("V41_PAGER_SYNC_IGPU", "0"));
     pub static SPARSE_REMAP_SYNC: LazyLock<bool> = LazyLock::new(|| is("V41_SPARSE_REMAP_SYNC", "1"));
     pub static PAGER_SYNC_AFTER_ENSURE: LazyLock<bool> = LazyLock::new(|| set("V41_PAGER_SYNC_AFTER_ENSURE"));
-    pub static IQ2_VARIANT: LazyLock<String> = LazyLock::new(|| std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into()));
     pub static IQ2_HYBRID_THRESHOLD: LazyLock<u32> =
         LazyLock::new(|| std::env::var("IQ2_HYBRID_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
-    pub static Q2K_VARIANT: LazyLock<String> = LazyLock::new(|| std::env::var("Q2K_VARIANT").unwrap_or_else(|_| "kwide2".into()));
     pub static WINDOW_DBG: LazyLock<bool> = LazyLock::new(|| is("V41_WINDOW_DBG", "1"));
     pub static COMP_POS_DBG: LazyLock<bool> = LazyLock::new(|| set("V41_COMP_POS_DBG"));
 }
@@ -10433,7 +10432,7 @@ impl HeterogeneousEngine {
                 routed_src.gate.dtype,
                 routed_src.down.dtype,
                 self.igpu.is_gfx11,
-                &*lane_env::IQ2_VARIANT,
+                &std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into()),
                 super::dispatch::igpu_moe_wmma_env_enabled(),
             );
         let xq_bytes = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
@@ -10699,7 +10698,7 @@ impl HeterogeneousEngine {
         ie.compute.wait_event(&sev.selected_pushed)?;
         // f16 WMMA MoE path (2026-09-08): f16 activations end to end, no
         // Q8_K quantize on either side of the gate/up. See dispatch.rs.
-        let variant_peek = lane_env::IQ2_VARIANT.clone();
+        let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into());
         let wmma_path = super::dispatch::igpu_moe_wmma_selected(
             routed_src.gate.dtype,
             routed_src.down.dtype,
@@ -11230,7 +11229,7 @@ impl HeterogeneousEngine {
             // by_expert. kwide/by_expert/bxn stay opt-in.
             let down_dt = routed_src.down.dtype;
             let q2k_variant = if down_dt == v4flash_core::gguf::GgufType::Q2_K {
-                lane_env::Q2K_VARIANT.clone()
+                std::env::var("Q2K_VARIANT").unwrap_or_else(|_| "kwide2".into())
             } else {
                 // IQ3_XXS / MXFP4 implement only the kwide2 shape; the
                 // env variants are Q2_K-only.
