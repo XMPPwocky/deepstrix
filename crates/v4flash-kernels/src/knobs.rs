@@ -811,6 +811,12 @@ crate::knobs! {
     /// where the pack holds sel + ew + xq and the host did not rewrite the picks after it (mode-2
     /// substitution); everything else keeps the peer push.
     pub static DGPU_ZC_PUSH = Knob::flag("V41_DGPU_ZC_PUSH", false).live();
+    /// `V41_DGPU_ZC_MULTI_SPEC` (default OFF; live): zero-copy also in steps where >= 2 streams
+    /// speculate (two-stream DSpark). The 10-10 per-turn A/B (docs/v41/DGPU_BUNDLE_DESIGN.md 11):
+    /// zero-copy is 0.4-2.2% faster on lone / plain steps and 0.3-3.0% SLOWER on two-stream DSpark,
+    /// the iGPU-bound regime, where its three copies on the iGPU's queue cost the step. Off = those
+    /// steps keep the peer push (design 13).
+    pub static DGPU_ZC_MULTI_SPEC = Knob::flag("V41_DGPU_ZC_MULTI_SPEC", false).live();
     /// `V41_DGPU_ENGRAM_ASYNC` (default on; live, read per Engram lane-layer): dGPU bundle slice 1 --
     /// the decode drivers stage Engram rows through a pinned per-table slot and an async copy on
     /// `de.compute` instead of a blocking null-stream `hipMemcpy` that waited for every queued dGPU op

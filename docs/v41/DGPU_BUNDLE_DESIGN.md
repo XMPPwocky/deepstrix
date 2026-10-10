@@ -150,3 +150,12 @@ holds. Production replays four stage graphs per lane-layer (q_chain, kv_chain, o
 the real stages behave like this, graphs cost ~26 us of dGPU time per lane-layer (~2 ms/step) on the
 critical path. **Plan:** `V41_MS_GRAPHS` made LIVE (decided at each stage's start) so the next deploy
 A/Bs graphs off vs on per turn; the q+kv merge (-6.5 us) only matters if graphs stay on.
+
+## 13. The zero-copy fix: regime gate instead of one contiguous copy
+
+A true single copy needs either fixed-offset padding in the readback pack (its segments are dense) or
+re-pointing ~8 destructure sites in `pre_moe_launch` at typed views of one landing buffer -- and it only
+goes from 3 queue operations to 2 (`xq` lands in the shared `si.d_xq_q8k`, `sel` / `ew` in per-lane
+`bi`). The penalty it targets is ~0.4% overall (two-stream DSpark only). Option 3's other variant does it
+fully: zero-copy stays OFF in steps where >= 2 streams speculate (`STEP_MULTI_SPEC`, set by the scheduler
+after drafting; `V41_DGPU_ZC_MULTI_SPEC=1` re-enables it there). Behaviour of lone / plain steps unchanged.

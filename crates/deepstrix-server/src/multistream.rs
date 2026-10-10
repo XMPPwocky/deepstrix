@@ -1804,6 +1804,8 @@ impl Sched {
             }
         }
         let draft_wall_ms = t_draft.elapsed().as_secs_f64() * 1e3;
+        // dGPU bundle (design 13): zero-copy stays off in steps where >= 2 streams speculate.
+        v4flash_kernels::het::forward_prefill::STEP_MULTI_SPEC.store(multi_drafted.len() >= 2, Ordering::Relaxed);
         let spec = drafts.iter().any(|d| !d.is_empty());
         // `V41_SUB_DEFER_ACCEPTED`: a lone stream's speculative block records its
         // cache-prior admissions / pin wants / hot-set picks by row position and

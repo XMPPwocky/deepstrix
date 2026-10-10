@@ -527,6 +527,9 @@ mod lane_env {
 /// Lane-layers whose iGPU inputs came by the zero-copy pull (`V41_DGPU_ZC_PUSH`), since start: the
 /// gate's proof that the path ran.
 pub static ZC_PULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// This decode step has >= 2 speculating streams (set by the scheduler before the forward):
+/// zero-copy stays off then unless `V41_DGPU_ZC_MULTI_SPEC`.
+pub static STEP_MULTI_SPEC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn prefill_f32_matvec(b: u32) -> bool {
     lane_env::PREFILL_F32_MATVEC.unwrap_or(b <= 64)
@@ -10476,6 +10479,7 @@ impl HeterogeneousEngine {
         // there (`pre_moe_launch`), no SDMA beside the shared expert. `selected_pushed` is still
         // recorded on `de.xfer` after its wait on `selected_ready`, so the iGPU's wait is unchanged.
         let zc = crate::knobs::DGPU_ZC_PUSH.on()
+            && (!STEP_MULTI_SPEC.load(std::sync::atomic::Ordering::Relaxed) || crate::knobs::DGPU_ZC_MULTI_SPEC.on())
             && xq_pushed
             && !c.picks_rewritten
             && c.rb.packed
