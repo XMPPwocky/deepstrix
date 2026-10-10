@@ -507,15 +507,27 @@ pub fn mxfp4_gateup_wmma_selected(e: &DeviceEngine, dt: GgufType, rows: u32) -> 
         && moe_wmma_gateup_for(rows)
 }
 
-/// [`pair_prefill_stage`] for a pass of `rows` on `e`: `igpu.pair_wmma_i8` when
-/// the MXFP4 gate+up takes the int8-WMMA arm.
+/// `V41_MOE_WMMA_F16` (live, default off): a WMMA-arm MoE launch on an engine
+/// that has the f16 module runs the f16-WMMA kernels instead of the int8 ones.
+/// Read per launch, so a knob-file flip applies to the next MoE pass.
+pub fn moe_wmma_f16_on() -> bool {
+    crate::knobs::MOE_WMMA_F16.on()
+}
+
+/// [`pair_prefill_stage`] for a pass of `rows` on `e`: `igpu.pair_wmma_i8` /
+/// `igpu.pair_wmma_f16` when the MXFP4 gate+up takes a WMMA arm.
 pub fn pair_prefill_stage_rows(e: &DeviceEngine, dt: GgufType, rows: u32) -> &'static str {
-    if mxfp4_gateup_wmma_selected(e, dt, rows) { "igpu.pair_wmma_i8" } else { pair_prefill_stage(dt) }
+    if mxfp4_gateup_wmma_selected(e, dt, rows) {
+        if moe_wmma_f16_on() && e.mxfp4pair.has_wmma_f16() { "igpu.pair_wmma_f16" } else { "igpu.pair_wmma_i8" }
+    } else {
+        pair_prefill_stage(dt)
+    }
 }
 
 /// [`moe_gate_up_chunked_ex`] for a pass of `rows` (the caller's batch rows,
 /// NOT the work-item count): MXFP4 with the kwide kernel selected takes the
-/// int8-WMMA arm at `rows >= 256` (`V41_MOE_WMMA_GATEUP`, gfx1151); everything
+/// int8-WMMA arm at `rows >= 256` (`V41_MOE_WMMA_GATEUP`, gfx1151; the f16-WMMA
+/// arm instead with `V41_MOE_WMMA_F16`); everything
 /// else is exactly `moe_gate_up_chunked_ex`. Serves box 1's prefill / decode
 /// lanes (forward_prefill) and box 2's batched pass (remote_experts).
 #[allow(clippy::too_many_arguments)]
@@ -544,8 +556,9 @@ pub fn moe_gate_up_chunked_rows(
     rows: u32,
 ) -> eyre::Result<bool> {
     if mxfp4_gateup_wmma_selected(e, dt, rows) {
-        e.mxfp4pair.launch_fused_swiglu_wmma_ex(
-            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+        let f16 = moe_wmma_f16_on() && e.mxfp4pair.has_wmma_f16();
+        e.mxfp4pair.launch_fused_swiglu_wmma_arm(
+            f16, s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
             gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks, n_wi_dev,
         )?;
         return Ok(true);
@@ -557,7 +570,8 @@ pub fn moe_gate_up_chunked_rows(
 }
 
 /// The MXFP4 by-expert down launch for a pass of `rows` (the caller's batch
-/// rows): the int8-WMMA arm at `rows >= 128` (`V41_MOE_WMMA_DOWN`, gfx1151),
+/// rows): the int8-WMMA arm at `rows >= 128` (`V41_MOE_WMMA_DOWN`, gfx1151;
+/// the f16-WMMA arm instead with `V41_MOE_WMMA_F16`),
 /// the small-b twin at `rows <= 8` (`V41_MOE_DOWN_DN2`; only for the compiled
 /// n_blocks_in = 9 and n_rows % 16 == 0), else kwide2 -- all with kwide2's
 /// arguments, device-count contract and partials set. Serves box 1
@@ -584,8 +598,9 @@ pub fn moe_down_mxfp4(
     rows: u32,
 ) -> eyre::Result<()> {
     if e.mxfp4.has_wmma() && moe_wmma_down_for(rows) {
-        return e.mxfp4.launch_by_expert_wmma_ex(
-            s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
+        let f16 = moe_wmma_f16_on() && e.mxfp4.has_wmma_f16();
+        return e.mxfp4.launch_by_expert_wmma_arm(
+            f16, s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
             dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
         );
     }

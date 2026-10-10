@@ -1442,7 +1442,9 @@ impl Sched {
                 dsp.seed(engine, m, pf.slot, rows, last)
             });
             match seeded {
-                Ok(n) => tracing::info!(slot = pf.slot, seeded = n, last, ms = t.elapsed().as_millis() as u64, "ms dspark: ring seeded"),
+                // `deferred`: the rows are held and written by the first draft
+                // (`ms_dspark::fill`; `ms` is then the host hold time only).
+                Ok(n) => tracing::info!(slot = pf.slot, seeded = n, last, ms = t.elapsed().as_millis() as u64, deferred = ms_dspark::fill_on(), "ms dspark: ring seeded"),
                 Err(e) => {
                     let _ = dsp.reset(pf.slot);
                     tracing::warn!(slot = pf.slot, error = %e, "ms dspark: ring seeding failed; the stream drafts once it has decoded a row");
@@ -2445,6 +2447,10 @@ impl Sched {
             // flip of `V41_MS_DSPARK_STREAMS` (the per-turn A/B) must find every
             // stream's ring dense, or the knob-2 arm would draft from rings with
             // the knob-1 steps missing (the 10-01 gap bug; review rounds 2-3).
+            // A skipped step's rows are not lost: they wait in the slot's
+            // backlog, and the stream's next draft fills them in
+            // (`ms_dspark::Backlog`; before 2026-10-10 a stream leaving a
+            // stretch of 3+ live streams drafted from a window with a hole).
             let write = dsp.ring_all() || self.streams.len() <= ms_dspark::ring_streams(spec_max);
             for (i, s) in self.streams.iter().enumerate() {
                 if done.iter().any(|&(d, _)| d == i) {

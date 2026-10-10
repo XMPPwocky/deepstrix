@@ -15,6 +15,7 @@ looked at in that pass.
 
 | entry | status | note |
 |---|---|---|
+| #57 | ~~FIXED~~ 2026-10-10, GPU check passed, **not deployed** | `RING=solo`: a stream leaving a stretch of 3+ live streams drafted from a ring missing its newest rows (E 2.4 vs 3.3 for 128 rows) |
 | #56 | ~~FIXED~~ 2026-10-06 | `KvArena` switched the current device behind the engine's cache; one failed draft after an in-step `grow` (an instance of #10) |
 | #53 | **OPEN** | f16 box-2 prefill partials are on by default with no fidelity gate (new 2026-10-04) |
 | #54 | **OPEN** | `V41_SUB=1/2` substitution runs after the fidelity pin; production's mode 3 is unaffected (new 2026-10-04) |
@@ -38,6 +39,69 @@ looked at in that pass.
 ---
 
 ## Recent entries (newest first; most are FIXED)
+
+### 57. FIXED (found and fixed 2026-10-10, not yet deployed) — under `V41_MS_DSPARK_RING=solo` a stream that lived through 3+ live streams drafted again from a ring with a hole
+
+Production runs `V41_MS_DSPARK_RING=solo` (every hub 10-06..10-10; the code
+default is `all`). A step with more live streams than may draft
+(`ms_dspark::ring_streams`, 2) wrote no drafter ring (`multistream.rs`
+`write = ring_all || live <= ring_streams`), and the rows it kept were dropped.
+When the stream next drafted, its 128-row window (ring indexed by write count)
+was missing every row of that stretch -- the 10-01 gap bug, reintroduced for 3+
+live streams. A stream ADMITTED into such a stretch had its prefill seed
+written at once and then went stale the same way.
+
+Found by the 2026-10-10 acceptance audit (workflow, logs 10-06 23:32 .. 10-10
+20:15 UTC, ~900K blocks): 2,483 gaps of 33+ rows (929 mid-session, 1,554
+admitted into a 3+ stretch). Over the first 128 rows after a gap E is 2.41-2.51
+(acc/K 0.65) vs 3.33-3.61 (0.80) over rows 128-320 of the same events; a no-gap
+control is flat (3.46 vs 3.49); accept climbs from 0.48 (rows 0-16) to 0.76
+(rows 128-144) and stays flat. 83% of the rollups with E < 2.0 are mostly
+post-gap blocks. About 0.4-0.7% of all tokens, -25..45% E per episode. The
+confidence head, the drafter and the K policy are otherwise fine (calibration
+pred 0.846 / acc 0.845 over 1.58M drafts).
+
+Fix ("fill on the transition to drafting", owner 2026-10-10): every kept row
+and the prefill's seed go into a per-slot host `Backlog` (consecutive
+positions, the latest `MTP_WINDOW` rows). A ring-writing step writes a backlog
+of one step's rows (`write_backlog`, batched and async as before); a bigger one
+(a held seed, a 3+ stretch) waits, and `MsDspark::draft` first `fill`s it and
+syncs, so neither the K policy's `draft_ms` nor any step's `step_ms` (cost
+fits, stage-1 gain) carries the catch-up. The ring then holds what a ring
+written every step holds (same rows and positions; for a gap longer than a
+window at other ring slots -- attention is order-free); a stream that never
+drafts again never pays the write. Cost: one batched write of up to 128 rows
+per transition (a 128-row seed measured 14-15 ms; each 8-row chunk's blocking
+upload drains every blocking iGPU stream, so watch it against in-flight
+prefetch copies). New `ms dspark: blocks` fields: `fills`, `fill_rows`,
+`fill_ms` (excluded from `draft_ms`, included in `tok_per_s`),
+`backlog_dropped` (expected 0); `ms dspark: ring seeded` gains `deferred`.
+Host memory: up to 128 x `HIDDEN` f32 (6-8 MB) per slot until it is reseeded.
+Rollback: `V41_MS_DSPARK_FILL=0` (static; seed written at once, unwritten rows
+dropped) -- `V41_MS_DSPARK_RING=all` is the other cure (writes every step).
+Tests: `backlog_*`, `ring_skip_*` (host); `tests/mtp_ring_fill.rs` (GPU, hub
+down, PASSED 2026-10-10 22:31 UTC on the real drafter): every-step vs fill vs
+the pre-#57 drop vs a rotation-only control (every-step with a 28-row bigger
+first seed). Gaps within a window: fill BIT-IDENTICAL to every-step (24 drafts,
+ring bytes; up to 14 unsynced chunks back to back); drop differs on 17/24
+(||dh||/||h|| 0.6-1.2). A gap longer than a window: the filled window holds the
+same rows by position; fill's deviation from every-step (<= 0.48) is that of
+slot rotation alone (<= 0.32), drop's 1.3. Owed: a production read of E over
+the 128 rows after a gap.
+
+Side finding, RESOLVED as not a bug (2026-10-10): the drafter's output moves
+2-30% (||dh||/||h||) when the same rows sit at rotated ring slots. The attention
+is order-free (`tests/attn_mixed_ring_rotation.rs`, beside the hub: rotation
+moves `attention_mixed_score` + `softmax_wsum` by 1.2e-7, both orders within
+1.3e-7 of an f64 reference). The drafter is deterministic (identical rerun: 0)
+and a THRESHOLD amplifier: it Q8-quantizes activations before every matvec, so
+a 1-ULP nudge that flips no int8 rounding changes nothing (one float: 0 on 24
+drafts; every float: 0 until a draft hits a flip), and once one rounding flips
+the output lands on another realization of its Q8 noise -- 2.8e-2, or 0.1-0.3
+with a routing flip (`drafter_sensitivity_to_one_ulp`), the same spread as the
+rotation control. Rotation is just one ~1e-7 perturbation that crosses the
+threshold. Unbiased noise, not a slot-order error; drafter parity vs the
+reference stands (E 4.348 vs 4.382).
 
 ### 56. FIXED (found and fixed 2026-10-06) — `KvArena` switched the current device behind the het engine's cache: `hipErrorInvalidHandle` in the drafter right after an in-step reservation grow
 

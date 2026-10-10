@@ -563,8 +563,9 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
 | `V41_MS_DSPARK` | `off` (`0`/`off`, `accept`/`1`/`on`) | `accept` | DSpark on the arena; loads the drafter |
 | `V41_MS_DSPARK_STREAMS` | 2 (1..=2; since b5def35, was 1), live | 2 (knob file) | speculate while at most this many streams are live |
 | `V41_MS_DSPARK_DRAFTS` | `sampled` | | `argmax` = point-mass drafts for every request |
-| `V41_MS_DSPARK_RING` | `all` | `solo` | `all`: every live stream's kept rows are ring-written each step; `solo`: only while the live-stream count is within the speculation limit (`ms_dspark::ring_streams`: 1, or 2 once `V41_MS_DSPARK_STREAMS` has been above 1) |
+| `V41_MS_DSPARK_RING` | `all` | `solo` | `all`: every live stream's kept rows are ring-written each step; `solo`: only while the live-stream count is within the speculation limit (`ms_dspark::ring_streams`: 1, or 2 once `V41_MS_DSPARK_STREAMS` has been above 1); the skipped steps' rows are held and filled in at the stream's next draft (KNOWN_BUGS #57) |
 | `V41_MS_DSPARK_RING_ASYNC` | on | | kept-row ring writes without a sync |
+| `V41_MS_DSPARK_FILL` | on | | rows a ring did not take (the seed, 3+ live steps) are held and filled in at the stream's next draft (KNOWN_BUGS #57); off = seed written at once, unwritten rows dropped |
 | `V41_MS_DSPARK_MIN_GAIN` | 1.0 | | stage-1 draft-or-not bar |
 | `V41_MS_DSPARK_EXPLORE` / `_EXPLORE_SEED` | 1/32 / entropy | | epsilon-uniform K exploration |
 | `V41_MS_DSPARK_COST_LIVE` | on | | live cost fit (`0` = the configured ladder as given) |

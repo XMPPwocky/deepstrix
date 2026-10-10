@@ -31,7 +31,7 @@ pub static HC_PRE_ONEHOT: [f32; HC_MIX_DIM as usize] = {
 /// `B_MAX` rows of [`HC_PRE_ONEHOT`] for the batched (prefill) layer-0 reset.
 pub fn hc_pre_onehot_rows() -> &'static [f32] {
     static ROWS: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
-    ROWS.get_or_init(|| HC_PRE_ONEHOT.repeat(super::batch_scratch::B_MAX))
+    ROWS.get_or_init(|| HC_PRE_ONEHOT.repeat(super::batch_scratch::chunk_rows_cap()))
 }
 
 /// Rows the batched head handles in one `matvec_bpack` call. Bounds `logits_b`

@@ -19,6 +19,13 @@ use crate::het::batch_scratch::B_MAX;
 /// Outside of prefill chunks only the first SWA_WINDOW rows are used.
 pub const KV_CACHE_ROWS: usize = SWA_WINDOW as usize + B_MAX;
 
+/// Raw KV rows actually allocated per layer: `SWA_WINDOW` plus the largest prefill chunk this
+/// process is configured for (`batch_scratch::chunk_rows_cap`; = [`KV_CACHE_ROWS`] unless
+/// `V41_PREFILL_LANE_ROWS` raised the lanes). All non-test code uses this, not the const.
+pub fn kv_cache_rows() -> usize {
+    SWA_WINDOW as usize + crate::het::batch_scratch::chunk_rows_cap()
+}
+
 /// Storage of a compressor's cumulative pooled cache.
 ///
 /// `F16`: `[n_comp_max, head_dim]` f16 (held as `u16`) — the ratio-128
@@ -317,12 +324,13 @@ impl HetModelState {
         // step (decode's own wrap path). Refuse loudly rather than corrupt.
         for (i, (n_raw, raw_off)) in mark.per_layer.iter().copied().enumerate() {
             if mark.slid
-                && (raw_off + n_raw) as usize + crate::het::mtp::MTP_BLOCK > KV_CACHE_ROWS
+                && (raw_off + n_raw) as usize + crate::het::mtp::MTP_BLOCK > kv_cache_rows()
             {
                 return Err(eyre!(
                     "rollback_kv: layer {i} slid append pointer {} within MTP_BLOCK of cache \
-                     capacity {KV_CACHE_ROWS} — needs compaction (not yet wired for accept)",
-                    raw_off + n_raw
+                     capacity {} — needs compaction (not yet wired for accept)",
+                    raw_off + n_raw,
+                    kv_cache_rows()
                 ));
             }
         }
@@ -537,9 +545,10 @@ impl KvMark {
                 // append pointer must still lie inside it. Past the end means
                 // the verify already wrote out of bounds.
                 assert!(
-                    (end as usize) <= KV_CACHE_ROWS,
+                    (end as usize) <= kv_cache_rows(),
                     "KvMark::advanced_by: append pointer {end} (raw_off {off} + n_raw {nr} + \
-                     keep {keep}) exceeds raw KV capacity {KV_CACHE_ROWS}"
+                     keep {keep}) exceeds raw KV capacity {}",
+                    kv_cache_rows()
                 );
                 let new_nr = end.min(SWA_WINDOW);
                 (new_nr, end - new_nr)
@@ -811,7 +820,7 @@ impl HetModelState {
             // the prior+current boundary. After each chunk the last
             // SWA_WINDOW rows are evicted back down to slot [0..W).
             dgpu_device.set_current()?;
-            let raw_rows = KV_CACHE_ROWS as u32;
+            let raw_rows = kv_cache_rows() as u32;
             layers.push(HetLayerState {
                 kv_cache: DeviceBuffer::<u16>::new(
                     dgpu_device.id,

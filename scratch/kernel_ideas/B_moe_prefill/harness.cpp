@@ -13,7 +13,12 @@
 #include <cstdint>
 #include <random>
 
-static const unsigned N_EMBD = 5120, N_FF = 2304, N_USED = 6, N_VIRT = 384, CHUNK = 32;
+static const unsigned N_EMBD = 5120, N_FF = 2304, N_USED = 6, N_VIRT = 384;
+// KB_CHUNK: members per work item (default 32 = production). >32 is for the wide f16 candidates ONLY; the kwide
+// baselines then read a chunk they do not support, so read the candidate rows only.
+// In "cmp" the baseline runs at 32 and the candidate then at KB_CHUNK (work items rebuilt); in "ab" KB_CHUNK applies to all.
+static unsigned CHUNK = 32u;
+static unsigned CAND_CHUNK = []{ const char* e = getenv("KB_CHUNK"); return e ? (unsigned)atoi(e) : 32u; }();
 static const unsigned NB_GATE = 20, NB_DOWN = 9, SB_BYTES = 136, Q8K_BYTES = 292;
 static const float CLAMP = 10.0f;
 static const unsigned GBPE = N_FF * NB_GATE * SB_BYTES;    // 6,266,880
@@ -304,6 +309,14 @@ int main(int argc, char** argv) {
             f.down_wmma = m_cand->fn("mxfp4_matvec_par_by_expert_wmma");
         }
     }
+    // KB_CAND2: second candidate for the interleaved 3-way "abx" mode (own chunk via KB_CHUNK_B; A uses KB_CHUNK_A).
+    kb::Module* m_c2 = nullptr;
+    hipFunction_t gu2 = nullptr, dn2 = nullptr;
+    if (const char* e2 = getenv("KB_CAND2")) {
+        m_c2 = new kb::Module(dir + "/" + e2 + "_gfx1151.hsaco");
+        gu2 = m_c2->fn("mxfp4_pair_matvec_fused_swiglu_wmma");
+        dn2 = m_c2->fn("mxfp4_matvec_par_by_expert_wmma");
+    }
     kb::Module* m_abl = nullptr;
     std::vector<std::pair<std::string, hipFunction_t>> abl_fns;
     {
@@ -361,6 +374,9 @@ int main(int argc, char** argv) {
     } else if (mode == "cmp") {
         if (!f.gu_wmma) { fprintf(stderr, "no candidate module\n"); return 3; }
         spot_check(f, c, seed);
+        CHUNK = CAND_CHUNK;                       // candidate chunk: rebuild the work items (grid bound from chunk 32 is an upper bound)
+        l_builders(f, c, 0);
+        KB_CHECK(hipDeviceSynchronize());
         // gate/up: candidate writes mid2 from the same xq/groups
         l_gu_wmma(f.gu_wmma, c, c.mid2, c.n_wi_bound, c.n_wi_dev, 0);
         KB_CHECK(hipDeviceSynchronize());
@@ -377,7 +393,8 @@ int main(int argc, char** argv) {
             snprintf(tag, sizeof tag, "down_wmma vs kwide2 B=%u", B);
             kb::print_cmp(tag, kb::compare_f32(a.data(), b.data(), a.size()));
         }
-        // exact-grid launch must give the same result as the bound grid
+        // exact-grid launch must give the same result as the bound grid (exact count is for chunk 32 only)
+        if (CHUNK == 32u) {
         l_gu_wmma(f.gu_wmma, c, c.mid2, c.n_wi_exact, (const int*)nullptr, 0);
         l_down_wmma(f.down_wmma, c, c.partials2, c.n_wi_exact, (const int*)nullptr, 0);
         KB_CHECK(hipDeviceSynchronize());
@@ -386,8 +403,34 @@ int main(int argc, char** argv) {
             snprintf(tag, sizeof tag, "gu_wmma(exact grid) vs kwide B=%u", B);
             kb::print_cmp(tag, kb::compare_f32(a.data(), b.data(), a.size()));
         }
+        }
+    } else if (mode == "abx") {
+        if (!f.gu_wmma || !gu2) { fprintf(stderr, "abx needs KB_CAND and KB_CAND2\n"); return 3; }
+        const char* ea = getenv("KB_CHUNK_A"); const char* eb = getenv("KB_CHUNK_B");
+        const unsigned chA = ea ? (unsigned)atoi(ea) : 32u, chB = eb ? (unsigned)atoi(eb) : 48u;
+        auto setc = [&](unsigned ch, hipStream_t s) { CHUNK = ch; l_wib_only(f, c, s); };
+        std::vector<kb::Variant> vs = {
+            {"kwide gate+up (prod, chunk 32)", [&](hipStream_t s) { setc(32, s); l_kwide(f.kwide, c, c.mid, c.n_wi_bound, c.n_wi_dev, s); }, gu_bytes, gu_flops},
+            {"A gate+up (KB_CAND)", [&](hipStream_t s) { setc(chA, s); l_gu_wmma(f.gu_wmma, c, c.mid, c.n_wi_bound, c.n_wi_dev, s); }, gu_bytes, gu_flops},
+            {"B gate+up (KB_CAND2)", [&](hipStream_t s) { setc(chB, s); l_gu_wmma(gu2, c, c.mid, c.n_wi_bound, c.n_wi_dev, s); }, gu_bytes, gu_flops},
+        };
+        kb::AbOpts o; o.rounds = rounds; o.inner = 2;
+        snprintf(tag, sizeof tag, "abx gate+up B=%u n_exp=%u members=%u chunkA=%u chunkB=%u", B, n_exp, c.members_total, chA, chB);
+        o.tag = tag;
+        kb::ab(vs, o);
+        std::vector<kb::Variant> vd = {
+            {"kwide2 down (prod, chunk 32)", [&](hipStream_t s) { setc(32, s); l_kwide2(f.kwide2, c, c.partials, c.n_wi_bound, c.n_wi_dev, s); }, d_bytes, d_flops},
+            {"A down (KB_CAND)", [&](hipStream_t s) { setc(chA, s); l_down_wmma(f.down_wmma, c, c.partials, c.n_wi_bound, c.n_wi_dev, s); }, d_bytes, d_flops},
+            {"B down (KB_CAND2)", [&](hipStream_t s) { setc(chB, s); l_down_wmma(dn2, c, c.partials, c.n_wi_bound, c.n_wi_dev, s); }, d_bytes, d_flops},
+        };
+        snprintf(tag, sizeof tag, "abx down B=%u n_exp=%u members=%u chunkA=%u chunkB=%u", B, n_exp, c.members_total, chA, chB);
+        o.tag = tag;
+        kb::ab(vd, o);
     } else if (mode == "ab") {
         if (!f.gu_wmma) { fprintf(stderr, "no candidate module\n"); return 3; }
+        if (CAND_CHUNK != 32u) {   // wide candidates: all rows run at KB_CHUNK; only the cand rows are meaningful
+            CHUNK = CAND_CHUNK; l_builders(f, c, 0); KB_CHECK(hipDeviceSynchronize());
+        }
         std::vector<kb::Variant> vs = {
             {"kwide gate+up (prod)", [&](hipStream_t s) { l_kwide(f.kwide, c, c.mid, c.n_wi_bound, c.n_wi_dev, s); }, gu_bytes, gu_flops},
             {"gu_wmma gate+up (cand)", [&](hipStream_t s) { l_gu_wmma(f.gu_wmma, c, c.mid, c.n_wi_bound, c.n_wi_dev, s); }, gu_bytes, gu_flops},

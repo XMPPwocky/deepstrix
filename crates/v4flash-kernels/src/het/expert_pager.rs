@@ -1427,6 +1427,18 @@ pub fn pager_union_prefill() -> bool {
     *U
 }
 
+/// `V41_PAGER_NO_DENSE=1` (default off): reserve NO dense prefill window. `V41_PAGER_WINDOWS=0` still keeps one
+/// 384-slot rotating window (`Some(0) => 1`), which production's `V41_PREFILL_UNIFIED_POOL=1` never uses (prefill goes
+/// through the sparse LRU `ensure`), so those 384 slots sit idle: ~7% of the hub's 5,425-slot pool. With this set the
+/// decode/unified LRU region is the WHOLE pool (`lru_lo = 0`). Needs the unified pool: the dense entry points
+/// (`ensure_layer_dense` / `ensure_layer_union`) return an error if anything still reaches them
+/// (docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md, review r2 finding 1; AUDIT B12).
+pub fn pager_no_dense() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_PAGER_NO_DENSE").as_deref() == Ok("1"));
+    *B
+}
+
 fn pager_read_batch() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("V41_PAGER_READ_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
@@ -2071,10 +2083,21 @@ impl ExpertPager {
                     .clamp(1, total_windows.saturating_sub(1).max(1))
             }
         };
+        // `V41_PAGER_NO_DENSE=1`: no dense window at all (the unified pool never uses it).
+        let dense_windows = if pager_no_dense() {
+            if !crate::het::forward_prefill::prefill_unified_pool() {
+                return Err(eyre!(
+                    "expert pager: V41_PAGER_NO_DENSE=1 needs V41_PREFILL_UNIFIED_POOL=1 (without it prefill needs the dense windows)"
+                ));
+            }
+            0
+        } else {
+            dense_windows
+        };
         let gb = gate_bpe * pager_read_batch();
         let ub = up_bpe * pager_read_batch();
         let db = down_bpe * pager_read_batch();
-        let lru_lo = dense_windows.saturating_sub(1) * window_stride + N_EXPERT;
+        let lru_lo = if dense_windows == 0 { 0 } else { dense_windows.saturating_sub(1) * window_stride + N_EXPERT };
         // The hot set must fit what this pool keeps resident for decode.
         hot_set::set_capacity(n_slots.saturating_sub(lru_lo) as usize);
         eprintln!(
@@ -2310,6 +2333,12 @@ impl ExpertPager {
         self.n_slots
     }
 
+    /// Slots of the LRU region (the whole pool minus any dense window): what decode-hot ids and a long prefill's share
+    /// compete for. `prefill_split` sizes its filler from this and the live hot-set ownership.
+    pub fn lru_slots(&self) -> usize {
+        (self.n_slots as usize).saturating_sub(self.dense_slots())
+    }
+
     /// Page ALL `N_EXPERT` experts of `layer` into slot == expert id (a dense
     /// per-layer window), making the pool a drop-in for a resident `routed`
     /// buffer that is indexed by RAW expert id.
@@ -2327,6 +2356,9 @@ impl ExpertPager {
     /// host readback of `d_selected` on the critical path.
     pub fn ensure_layer_dense(&mut self, layer: i32) -> eyre::Result<()> {
         self.cur_layer = layer;
+        if self.dense_windows == 0 {
+            return Err(eyre!("expert pager: L{layer} reached ensure_layer_dense with V41_PAGER_NO_DENSE=1 (no dense windows)"));
+        }
         if self.n_slots < N_EXPERT {
             return Err(eyre!(
                 "expert pager: dense layer window needs >= {N_EXPERT} slots, pool has {}",
@@ -2843,6 +2875,9 @@ impl ExpertPager {
     /// `window_layer` alone.
     pub fn ensure_layer_union(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<()> {
         self.cur_layer = layer;
+        if self.dense_windows == 0 {
+            return Err(eyre!("expert pager: L{layer} reached ensure_layer_union with V41_PAGER_NO_DENSE=1 (no dense windows)"));
+        }
         if self.n_slots < N_EXPERT {
             return Err(eyre!(
                 "expert pager: dense layer window needs >= {N_EXPERT} slots, pool has {}",
@@ -3151,6 +3186,9 @@ impl ExpertPager {
     }
 
     fn dense_slots(&self) -> usize {
+        if self.dense_windows == 0 {
+            return 0; // V41_PAGER_NO_DENSE: the whole pool is the LRU region
+        }
         let lo = self.pinned_windows() as usize * self.window_stride as usize
             + N_EXPERT as usize;
         lo.min(self.n_slots as usize)

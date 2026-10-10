@@ -42,7 +42,7 @@ use super::prefill_stats::PrefillStats;
 use super::scratch::{DgpuScratch, IgpuScratch};
 use super::arena_ctx::slot;
 use crate::config::{ENGRAM_CHUNK, ENGRAM_IN, ENGRAM_OUT};
-use super::state::{CompKvStore, HetLayerState, HetModelState, KV_CACHE_ROWS};
+use super::state::{CompKvStore, HetLayerState, HetModelState, kv_cache_rows};
 use super::kv_arena::{store_index_of, KvArena, RowTables, RowTablesDev};
 use super::step_rows::StepRows;
 use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
@@ -804,6 +804,20 @@ pub fn f16_bits_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// `V41_LM_LAYER_OUTER=1` (default off; needs `V41_LM_PREFILL=1`): run each layer-major window LAYER-OUTER -- layer L for
+/// every lane unit of the window, then L+1 -- as one continuous software pipeline (`prefill_job_lm_pass`,
+/// docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 3) instead of group-major (group x sub-chunk). LIVE (knob file); decided once
+/// per WINDOW (`PrefillJob::lo_decision` latches it between the window prediction and the window open).
+pub fn lm_layer_outer() -> bool {
+    crate::knobs::LM_LAYER_OUTER.on()
+}
+
+/// `V41_LM_QUANTUM_LAYERS` (default 4; live): layers per scheduler-visible pass of a layer-outer window (decode may interleave
+/// between passes; the pipeline drains at each). The `KvSourceOnly` layer is always a pass of its own.
+pub fn lm_quantum_layers() -> usize {
+    crate::knobs::LM_QUANTUM_LAYERS.usize() // the knob's range is 1..=20
+}
+
 /// `V41_LM_PREFILL=1`: layer-major CED prefill (see the block comment above).
 /// A LIVE knob (`crate::knobs::LM_PREFILL`), read when a job is created: a job
 /// keeps the mode it started with.
@@ -871,9 +885,11 @@ impl Drop for PrefetchCapGuard {
 /// reported are skipped (no residency to go on).
 fn lm_prefetch_words(layers: std::ops::Range<usize>, split: usize) -> Vec<u32> {
     let mut words = Vec::new();
+    // The same ownership the pick loop uses (the frozen prefill split of a long job, else the decode partition).
+    let psplit = super::prefill_split::current();
     for l in layers.filter(|&l| l != split) {
         for e in 0..crate::config::N_EXPERT {
-            if super::expert_pager::partition_box2(l as i32, e) && super::b2_mirror::resident(l as i32, e) == Some(false) {
+            if super::prefill_split::home2_or_partition(psplit.as_ref(), l as i32, e) && super::b2_mirror::resident(l as i32, e) == Some(false) {
                 words.push(((l as u32) << 16) | e);
             }
         }
@@ -919,6 +935,11 @@ struct LmWindow {
     /// keeps saying `Some(false)` for words box 2 already has or is reading).
     /// Cleared when the group changes.
     pf_sent: std::collections::HashSet<u32>,
+    /// P2 (`V41_LM_LAYER_OUTER`): this window runs layer-outer (`prefill_job_lm_pass`). `lo_layer` = the next layer to run;
+    /// `saved` = per lane-unit `indexer_saved_store` flag (see the pass).
+    lo: bool,
+    lo_layer: usize,
+    saved: Vec<i32>,
 }
 
 /// Plan a layer-major window from `start`: the chunks `plan_chunk` would cut
@@ -1002,8 +1023,18 @@ pub struct PrefillJob {
     /// The layer-major device store: rows entering the next group, `(residual
     /// [cap * HC_DIM], carry [cap * HC_MIX_DIM], cap)`. Kept across windows.
     lm_store: Option<(DeviceBuffer<f32>, DeviceBuffer<f32>, usize)>,
+    /// Layer-outer (P2): the per-window-row saved indexer selection `(sel [cap * INDEXER_TOP_K] i32, nsparse [cap] i32, cap)`.
+    lm_idx: Option<(DeviceBuffer<i32>, DeviceBuffer<i32>, usize)>,
     /// Layer-major windows this job has completed (tests assert it ran).
     lm_windows: usize,
+    /// P1 (docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 4): the frozen prefill split of a LONG job, built at its first unit
+    /// (`V41_PREFILL_SPLIT=1`), installed around every unit by `prefill_split::install`. `split_tried`: build once.
+    split: Option<std::sync::Arc<super::prefill_split::PrefillSplit>>,
+    split_tried: bool,
+    /// `V41_LM_LAYER_OUTER` is LIVE, but `next_chunk_range` (which predicts the window's input rows) and `lm_open_window` (which
+    /// opens it) must agree for ONE window. 0 = undecided, 1 = group-major, 2 = layer-outer. Set by the first
+    /// `next_chunk_range` with no window open (or by `lm_open_window`), consumed (reset to 0) when the window opens.
+    lo_latch: std::sync::atomic::AtomicU8,
     /// LAZY inputs: when `input_hcs` is empty the caller supplies the next
     /// chunk's rows through `set_chunk_inputs` right before `prefill_job_chunk`
     /// (embeddings + Engram rows for `next_chunk_range()` only). A 135K-token
@@ -1042,7 +1073,7 @@ impl PrefillJob {
             engram_rows,
             image_spans: spans.to_vec(),
             pos0,
-            chunk_rows: chunk_rows.clamp(1, B_MAX),
+            chunk_rows: chunk_rows.clamp(1, super::batch_scratch::chunk_rows_cap()),
             chunk_start: 0,
             chunk_idx: 0,
             replay: std::collections::VecDeque::new(),
@@ -1052,7 +1083,11 @@ impl PrefillJob {
             lm_rows: if lm_prefill_enabled() && ced_enabled() { lm_rows() } else { 0 },
             lm: None,
             lm_store: None,
+            lm_idx: None,
             lm_windows: 0,
+            split: None,
+            split_tried: false,
+            lo_latch: std::sync::atomic::AtomicU8::new(0),
             chunk_inputs: None,
         })
     }
@@ -1097,6 +1132,8 @@ impl PrefillJob {
         }
         self.lm_rows = rows;
         self.lm_store = None;
+        self.lm_idx = None;
+        self.lo_latch.store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     /// May `state` be CHECKPOINTED now? Not while a layer-major window is open:
@@ -1126,13 +1163,46 @@ impl PrefillJob {
     /// `[start, end)` token indices (into `tokens()`) of the chunk the next
     /// `prefill_job_chunk` will run, given the lane capacities it will see.
     pub fn next_chunk_range(&self, lane_caps: (usize, usize)) -> eyre::Result<(usize, usize)> {
+        // With a window OPEN the answer comes from the window itself (`w.lo`); with none open this is the prediction of the
+        // NEXT window, and the layer-outer decision is latched so `lm_open_window` opens exactly what was predicted.
+        // Only a job that can open a window latches (review r8: a chunked-only job never holds a latch).
+        let lo = if self.lm.is_none() && self.ced && self.lm_rows > 0 { self.lo_decision() } else { false };
+        self.next_chunk_range_impl(lane_caps, lo)
+    }
+    /// The layer-outer decision for the window being predicted/opened (latched; see `lo_latch`).
+    fn lo_decision(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.lo_latch.load(Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let v = lm_layer_outer();
+                self.lo_latch.store(if v { 2 } else { 1 }, Relaxed);
+                v
+            }
+        }
+    }
+    fn next_chunk_range_impl(&self, lane_caps: (usize, usize), layer_outer: bool) -> eyre::Result<(usize, usize)> {
         // Layer-major: inputs (embeddings, Engram rows) are consumed by the
         // group-0 unit of each sub-chunk only; every other unit takes none.
         if let Some(w) = self.lm.as_ref() {
+            // Layer-outer: the FIRST pass (layers from 0) takes the whole window's inputs; later passes take none.
+            if w.lo {
+                return Ok(if w.lo_layer == 0 { (w.start, w.end) } else { (self.chunk_start, self.chunk_start) });
+            }
             return Ok(if w.group == 0 { (w.subs[w.sub].0, w.subs[w.sub].1) } else { (self.chunk_start, self.chunk_start) });
         }
         let t = self.tokens.len();
         let chunk_size = self.chunk_rows.min(lane_caps.0 + lane_caps.1);
+        // LAYER-OUTER: the scheduler asks for the next inputs BEFORE `prefill_job_chunk` opens the window (the previous one
+        // is closed), and the first pass needs the WHOLE window's rows. Predict exactly what `lm_open_window` will plan
+        // (same cap, chunk size and early-outs); `None` (fewer than two chunks fit) falls through to one chunk.
+        if self.ced && self.lm_rows > 0 && layer_outer && single_lane_max() == 0 {
+            let cap = self.lm_rows.max(2 * chunk_size);
+            if let Some(subs) = lm_plan_window(self.pos0, self.chunk_start, t, chunk_size, lane_caps, &self.image_spans, cap)? {
+                return Ok((self.chunk_start, subs.last().expect("two or more").1));
+            }
+        }
         let (end, _) = image_spans::plan_chunk(self.pos0, self.chunk_start, t, chunk_size, Some(lane_caps), &self.image_spans)?;
         Ok((self.chunk_start, end))
     }
@@ -1152,6 +1222,43 @@ impl HeterogeneousEngine {
         self.flush_perfetto()
     }
 
+    /// P1: build the frozen prefill split for `job`, or `None` when it does not apply (knob off, short job, no CED, no box 2,
+    /// not under the T2 partition, no pager). Logs share1/share2/filler and the expected steady re-reads per window
+    /// (`max(0, share2 - usable2)`), which the P1 A/B gates on (docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 4).
+    fn build_prefill_split(
+        &self,
+        job: &PrefillJob,
+        pager: Option<&super::expert_pager::ExpertPager>,
+    ) -> Option<std::sync::Arc<super::prefill_split::PrefillSplit>> {
+        use super::prefill_split as ps;
+        if !ps::enabled() || !job.ced || self.remote.is_none() || !super::expert_pager::t2_partition() {
+            return None;
+        }
+        // LONG = the scheduler's own flag for this unit (`remote_set_long_job`: live knob, `> 0` guard), not a second parse.
+        if !self.remote_long_job() {
+            return None;
+        }
+        let pg = pager?;
+        let cfg = ps::SplitCfg {
+            lru_slots: pg.lru_slots(),
+            filler_max: ps::filler_max(),
+            // Cold (hot set not warm yet): size the head for the policy that will warm it. INTERLEAVE (live in production)
+            // owns `B1_HOT_IL_PER_LAYER` ids/layer, more than the `top` head.
+            cold_head_per_layer: super::expert_pager::hot_set::per_layer().max(crate::knobs::B1_HOT_IL_PER_LAYER.usize()),
+        };
+        let split = ps::PrefillSplit::build(&cfg, &|l, e| super::expert_pager::hot_set::box1_owns(l, e));
+        let st = &split.stats;
+        let usable2 = ps::b2_usable_estimate();
+        tracing::info!(
+            tokens = job.total(), warm = st.warm, lru_slots = cfg.lru_slots, owned_now = st.owned_now, filler = st.filler,
+            head_min = st.head_min, head_max = st.head_max, share1 = st.share1, share2 = st.share2,
+            share2_per_layer = st.share2 / crate::config::CED_DECODER_START, usable2,
+            expected_rereads_per_window = st.expected_rereads(usable2),
+            "prefill split: frozen encoder-layer expert split for a long job"
+        );
+        Some(std::sync::Arc::new(split))
+    }
+
     /// Layer-major: is a window open (opening one if at least two chunks fit)?
     /// Allocates the device store on first use, halving `V41_LM_ROWS` down to two
     /// chunks if VRAM is short; with no store at all the job falls back to
@@ -1165,11 +1272,17 @@ impl HeterogeneousEngine {
         if single_lane_max() > 0 {
             job.lm_rows = 0;
             job.lm_store = None;
+            // No window ever opens for this job: clear any pending prediction (invariant: latch != 0 <=> a prediction is
+            // pending for a window about to open; review r8).
+            job.lo_latch.store(0, std::sync::atomic::Ordering::Relaxed);
             return Ok(false);
         }
         let t = job.tokens.len();
         let min_cap = 2 * chunk_size;
         let mut cap = job.lm_rows.max(min_cap);
+        // The layer-outer decision for THIS window: the one the input prediction used (latched), then reset for the next window.
+        let lo = job.lo_decision();
+        job.lo_latch.store(0, std::sync::atomic::Ordering::Relaxed);
         loop {
             // Plan FIRST: the store is only worth VRAM for a window that opens.
             let Some(subs) = lm_plan_window(job.pos0, job.chunk_start, t, chunk_size, lane_caps, &job.image_spans, cap)? else {
@@ -1184,12 +1297,25 @@ impl HeterogeneousEngine {
             // `plan_chunk` cut shorter chunks, so fewer rows fit under `cap`
             // here), in which case the store is reallocated -- it holds nothing
             // live between windows.
-            if job.lm_store.as_ref().is_none_or(|st| st.2 < rows) {
+            let want_idx = lo;
+            if job.lm_store.as_ref().is_none_or(|st| st.2 < rows) || (want_idx && job.lm_idx.as_ref().is_none_or(|x| x.2 < rows)) {
                 job.lm_store = None;
+                job.lm_idx = None;
                 self.set_current_cached(self.dgpu.device)?;
                 let id = self.dgpu.device.id;
                 let got = DeviceBuffer::<f32>::new(id, rows * HC_DIM as usize)
                     .and_then(|r| DeviceBuffer::<f32>::new(id, rows * HC_MIX_DIM as usize).map(|c| (r, c)));
+                // Layer-outer also needs the per-window-row saved indexer selection (2 KB/row): the SAME OOM policy as the
+                // store (halve the window, else chunked), so a 97%-full dGPU cannot fail a request in the middle of a pass.
+                let got = got.and_then(|(r, c)| {
+                    if want_idx {
+                        let top_k = crate::indexer::INDEXER_TOP_K as usize;
+                        let sel = DeviceBuffer::<i32>::new(id, rows * top_k)?;
+                        let nsp = DeviceBuffer::<i32>::new(id, rows)?;
+                        job.lm_idx = Some((sel, nsp, rows));
+                    }
+                    Ok((r, c))
+                });
                 match got {
                     Ok((r, c)) => job.lm_store = Some((r, c, rows)),
                     Err(e) if cap / 2 >= min_cap => {
@@ -1205,9 +1331,16 @@ impl HeterogeneousEngine {
                     }
                 }
             }
-            tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap,
+            if lo && lm_prefetch_enabled() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("V41_LM_PREFETCH is a no-op for layer-outer windows (group prefetch is group-major only; rolling prefetch is P3)"));
+            }
+            tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap, layer_outer = lo,
                 tokens_done = start, tokens_total = t, "prefill_lm_window open");
-            job.lm = Some(LmWindow { start, end, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default() });
+            job.lm = Some(LmWindow {
+                start, end, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(),
+                lo, lo_layer: 0, saved: Vec::new(),
+            });
             return Ok(true);
         }
     }
@@ -1421,6 +1554,252 @@ impl HeterogeneousEngine {
         Ok(end - start)
     }
 
+    /// P2 LAYER-OUTER pass (`V41_LM_LAYER_OUTER`, docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 3): run one QUANTUM of layers
+    /// `[a, b)` of the open window over ALL its lane units, as the flat task list of `lm_schedule` (layer-outer, 2-deep
+    /// software pipeline, lane scratch alternating by task). Per task the existing `forward_layer_pre_moe_v2` /
+    /// `forward_layer_post_moe_v2` do the math unchanged; this function only relocates the state that used to live in the
+    /// lane scratch across a group: the residual and mHC carry (`lm_store`), the saved indexer selection and its flag
+    /// (`lm_idx` + `LmWindow.saved`), the compressor lending (once per layer), the Engram staging and the per-task
+    /// position uploads. Drains and stores before returning (decode shares the lanes). Returns the window's rows when this
+    /// pass closed it (layer `CED_DECODER_START` done), else 0.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_job_lm_pass(
+        &self,
+        job: &mut PrefillJob,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<usize> {
+        use super::lm_schedule as sch;
+        let split = crate::config::CED_DECODER_START;
+        let (h, m, ein) = (HC_DIM as usize, HC_MIX_DIM as usize, ENGRAM_IN as usize);
+        let top_k = crate::indexer::INDEXER_TOP_K as usize;
+        let (win_start, win_end, a, subs) = {
+            let w = job.lm.as_ref().ok_or_else(|| eyre!("layer-outer: no open window"))?;
+            (w.start, w.end, w.lo_layer, w.subs.clone())
+        };
+        let win_rows = win_end - win_start;
+        let units = sch::units(&subs, win_start);
+        let u_count = units.len();
+        if u_count < 2 {
+            return Err(eyre!("layer-outer: a window needs >= 2 lane units, has {u_count}"));
+        }
+        let b_end = if a == split { split + 1 } else { (a + lm_quantum_layers()).min(split) };
+        let kv_only = b_end == split + 1;
+        let lazy = job.lazy_inputs();
+        // ---- inputs: the FIRST pass takes the whole window's embeddings (+ Engram rows); later passes take none ----
+        let taken = job.chunk_inputs.take();
+        let mut hcs_lazy: Option<Vec<Vec<f32>>> = None;
+        if a == 0 {
+            if lazy {
+                let (mut hcs, mut eng) = taken.ok_or_else(|| eyre!("layer-outer: lazy job has no inputs for window rows [{win_start}, {win_end})"))?;
+                // The inputs were produced for the window `next_chunk_range` PREDICTED; `lm_open_window` may have halved it
+                // since (store OOM), so take a prefix and drop the surplus (the server regathers the next window).
+                if hcs.len() < win_rows || eng.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() < win_rows * ein)) {
+                    return Err(eyre!("layer-outer: inputs for {} rows, window is {win_rows}", hcs.len()));
+                }
+                hcs.truncate(win_rows);
+                if let Some(rs) = eng.as_mut() {
+                    rs.iter_mut().for_each(|r| r.truncate(win_rows * ein));
+                }
+                job.lm.as_mut().expect("open window").engram = eng;
+                hcs_lazy = Some(hcs);
+            }
+        } else if taken.as_ref().is_some_and(|(hcs, _)| !hcs.is_empty()) {
+            return Err(eyre!("layer-outer: inputs handed to a pass starting at layer {a} (only the first pass takes them)"));
+        }
+        // ---- per-window device stores ----
+        if job.lm_store.is_none() {
+            return Err(eyre!("layer-outer: no device store"));
+        }
+        if job.lm_idx.as_ref().is_none_or(|x| x.2 < win_rows) {
+            return Err(eyre!("layer-outer: no saved-indexer store for {win_rows} rows (allocated by lm_open_window)"));
+        }
+        let mut saved: Vec<i32> = if a == 0 { vec![-1; u_count] } else { std::mem::take(&mut job.lm.as_mut().expect("open window").saved) };
+        if saved.len() != u_count {
+            saved = vec![-1; u_count];
+        }
+        let engram_win: Option<Vec<Vec<f32>>> = job.lm.as_mut().expect("open window").engram.take();
+
+        if a == 0 {
+            let elapsed_s = job.started.elapsed().as_secs_f32();
+            tracing::info!(chunk = job.chunk_idx, chunk_pos0 = job.pos0 + win_start as u32, tokens_done = job.chunk_start,
+                tokens_total = job.tokens.len(), elapsed_s = format!("{elapsed_s:.1}"), "prefill_job_progress");
+        }
+        self.dgpu.events.reset();
+        self.igpu.events.reset();
+        let _unit = super::trace::ctx_unit(super::trace::next_unit());
+        // A previous error may have leaked a lent compressor (the lending is not exception safe): repair at entry.
+        state.restore_compressor_lending();
+        self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
+        self.set_current_cached(self.dgpu.device)?;
+
+        let n_tasks = (b_end - a) * u_count;
+        let ops = sch::ops(n_tasks, |t| sch::task(t, a, u_count).0 != split);
+        let pos0_job = job.pos0;
+        let job_tokens: &[i32] = &job.tokens;
+        let spans: &[ImageSpan] = &job.image_spans;
+        let input_hcs: &[Vec<f32>] = &job.input_hcs;
+        let engram_job: Option<&[Vec<f32>]> = job.engram_rows.as_deref();
+        let (res, carry, _) = job.lm_store.as_mut().expect("checked above");
+        let (sel_store, nsp_store, _) = job.lm_idx.as_mut().expect("allocated above");
+        let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch); 2] = [(bd_a, bi_a), (bd_b, bi_b)];
+        let mode_of = |l: usize| if l == split { CedMode::KvSourceOnly } else { CedMode::Exact };
+        let de = &self.dgpu;
+
+        let mut exec = |op: sch::Op| -> eyre::Result<()> {
+            match op {
+                sch::Op::Pre(t) => {
+                    let (l, u) = sch::task(t, a, u_count);
+                    let un = units[u];
+                    let lane = t % 2;
+                    let (bd, bi) = &mut lanes[lane];
+                    check_scratch_rows("layer-outer lane unit", un.rows, bd, bi, sd, si)?;
+                    // Compressor lending (reuse layers borrow their KV source's store): once per layer, around its pres.
+                    let lend_src = crate::config::kv_source_of(l);
+                    if u == 0 {
+                        if let Some(src) = lend_src {
+                            let st = state.layers[src].compressor.take();
+                            state.layers[l].compressor = st;
+                        }
+                    }
+                    let pos0_u = pos0_job + un.tok0 as u32;
+                    let vis = chunk_visibility(pos0_u, un.rows, spans)?;
+                    // -- residual / carry in --
+                    // HAZARD (review r5 #2): the layer-0 seed below is a BLOCKING `copy_from_host`. It is ordered after
+                    // Post(t-2)'s async store_out (which READS this lane's `bd.residual`/`hc_pre_carry`) ONLY because
+                    // `de.compute` is a BLOCKING stream (`Stream::new`, engine.rs:217): the null-stream memcpy waits for
+                    // everything queued on it. Make `de.compute` non-blocking and unit u's seed silently corrupts unit u-2's
+                    // store rows. The same holds for `stage_engram_lane` (layers 1 and 14). P2b-2 replaces both with a
+                    // pinned async path.
+                    if l == 0 {
+                        for i in 0..un.rows {
+                            let src: &Vec<f32> = match hcs_lazy.as_ref() {
+                                Some(x) => &x[un.row0 + i],
+                                None => &input_hcs[un.tok0 + i],
+                            };
+                            bd.residual.slice_view_mut(i * h, h).copy_from_host(src)?;
+                        }
+                    } else {
+                        bd.residual.slice_view_mut(0, un.rows * h).copy_from_buffer_async(&res.slice_view(un.row0 * h, un.rows * h), &de.compute)?;
+                        bd.hc_pre_carry.slice_view_mut(0, un.rows * m).copy_from_buffer_async(&carry.slice_view(un.row0 * m, un.rows * m), &de.compute)?;
+                    }
+                    // -- positions --
+                    // (pageable host Vec dropped right after: safe because HIP stages pageable H2D synchronously, as the range driver
+                    // relies on at `pipelined_range_impl`; not verified on this ROCm, review r5 #7)
+                    let pos: Vec<i32> = (0..un.rows).map(|i| (pos0_u + i as u32) as i32).collect();
+                    bd.pos_per_b.slice_view_mut(0, un.rows).copy_from_host_async(&pos, &de.compute)?;
+                    // -- saved indexer selection: the per-unit flag, and the selection itself for a reuse layer --
+                    bd.indexer_saved_store = saved[u];
+                    let is_src = super::forward_layer::is_index_source_layer(l as i32);
+                    if !is_src && saved[u] >= 0 {
+                        bd.indexer_sel_saved.slice_view_mut(0, un.rows * top_k).copy_from_buffer_async(&sel_store.slice_view(un.row0 * top_k, un.rows * top_k), &de.compute)?;
+                        bd.indexer_nsparse_saved.slice_view_mut(0, un.rows).copy_from_buffer_async(&nsp_store.slice_view(un.row0, un.rows), &de.compute)?;
+                    }
+                    // -- Engram rows (layers 1 and 14) --
+                    match (lazy, engram_win.as_deref()) {
+                        (true, w) => self.stage_engram_lane(bd, l, w, un.row0, un.rows)?,
+                        (false, _) => self.stage_engram_lane(bd, l, engram_job, un.tok0, un.rows)?,
+                    }
+                    let tokens_u = &job_tokens[un.tok0..un.tok0 + un.rows];
+                    self.forward_layer_pre_moe_v2(
+                        bd, bi, sd, si,
+                        &mut state.layers[l], &weights.dgpu_layers[l], &weights.igpu_layers[l],
+                        pos0_u, tokens_u, vis.as_deref(), None,
+                        &self.sync_events_lane(lane).layers[l],
+                        pager.as_deref_mut(), mode_of(l), RowLayout::Contiguous,
+                    )?;
+                    // -- an index source publishes its selection: remember the flag and the selection for the reuse layers --
+                    if is_src && l < split {
+                        saved[u] = bd.indexer_saved_store;
+                        if saved[u] >= 0 {
+                            sel_store.slice_view_mut(un.row0 * top_k, un.rows * top_k).copy_from_buffer_async(&bd.indexer_sel_saved.slice_view(0, un.rows * top_k), &de.compute)?;
+                            nsp_store.slice_view_mut(un.row0, un.rows).copy_from_buffer_async(&bd.indexer_nsparse_saved.slice_view(0, un.rows), &de.compute)?;
+                        }
+                    }
+                    if u == u_count - 1 {
+                        if let Some(src) = lend_src {
+                            let st = state.layers[l].compressor.take();
+                            state.layers[src].compressor = st;
+                        }
+                    }
+                }
+                sch::Op::Post(t) => {
+                    let (l, u) = sch::task(t, a, u_count);
+                    let un = units[u];
+                    let lane = t % 2;
+                    let hot = prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], &*lanes[0].0, sd);
+                    let (bd, _bi) = &mut lanes[lane];
+                    self.forward_layer_post_moe_v2(bd, un.rows as u32, &self.sync_events_lane(lane).layers[l], hot)?;
+                    std::mem::swap(&mut bd.residual, &mut bd.residual_next);
+                    // -- residual / carry out (the next layer of this unit reads them from the store) --
+                    res.slice_view_mut(un.row0 * h, un.rows * h).copy_from_buffer_async(&bd.residual.slice_view(0, un.rows * h), &de.compute)?;
+                    carry.slice_view_mut(un.row0 * m, un.rows * m).copy_from_buffer_async(&bd.hc_pre_carry.slice_view(0, un.rows * m), &de.compute)?;
+                }
+            }
+            Ok(())
+        };
+        let mut result: eyre::Result<()> = Ok(());
+        for op in ops {
+            if let Err(e) = exec(op) {
+                result = Err(e);
+                break;
+            }
+        }
+        drop(exec);
+        // Drain: the store must hold every unit's rows and the lanes must be idle before decode may use them.
+        let sync = self.dgpu.compute.synchronize();
+        state.restore_compressor_lending();
+        result?;
+        sync?;
+        {
+            let w = job.lm.as_mut().expect("open window");
+            w.saved = saved;
+            w.lo_layer = b_end;
+            // Engram rows of layers already passed are dead; keep the later ones for the next pass.
+            w.engram = engram_win.map(|mut rs| {
+                for (li, r) in rs.iter_mut().enumerate() {
+                    if crate::config::ENGRAM_LAYERS.get(li).is_some_and(|&el| (el as usize) < b_end) {
+                        *r = Vec::new();
+                    }
+                }
+                rs
+            });
+        }
+        self.emit_prefill_perfetto()?;
+        if !kv_only {
+            return Ok(0);
+        }
+        // ---- the window is closed: the CED replay window = the last SWA_WINDOW rows ENTERING layer `split`, which the
+        // store holds (the pass over `split` leaves residual and carry as they entered) ----
+        let take = win_rows.min(SWA_WINDOW as usize);
+        let (res, carry, _) = job.lm_store.as_ref().expect("checked above");
+        self.set_current_cached(self.dgpu.device)?;
+        for i in win_rows - take..win_rows {
+            let mut row = ReplayRow { tok: job.tokens[win_start + i], hc: vec![0f32; h], carry: vec![0f32; m] };
+            res.slice_view(i * h, h).copy_to_host(&mut row.hc)?;
+            carry.slice_view(i * m, m).copy_to_host(&mut row.carry)?;
+            job.replay.push_back(row);
+            if job.replay.len() > SWA_WINDOW as usize {
+                job.replay.pop_front();
+            }
+        }
+        let n_sub = subs.len();
+        job.lm = None;
+        job.lm_windows += 1;
+        job.chunk_start = win_end;
+        job.chunk_idx += n_sub;
+        tracing::info!(rows = win_rows, sub_chunks = n_sub, tokens_done = win_end, tokens_total = job.tokens.len(),
+            elapsed_s = format!("{:.1}", job.started.elapsed().as_secs_f32()), layer_outer = true, "prefill_lm_window done");
+        Ok(win_rows)
+    }
+
     /// Run the job's next chunk (at most `chunk_rows` rows, split across the two
     /// lanes as the pipelined prefill does). Returns the rows processed, 0 when
     /// the chunks are already done. Under layer-major (`V41_LM_PREFILL`) it runs
@@ -1449,7 +1828,17 @@ impl HeterogeneousEngine {
         super::b2_mirror::expire_incoming();
         let lane_caps = (bd_a.rows, bd_b.rows);
         let chunk_size = job.chunk_rows.min(lane_caps.0 + lane_caps.1);
+        // P1: the frozen prefill split of a LONG job. Built once at the job's first unit from the LIVE hub pool and
+        // hot-set counts, installed for this unit only (decode steps, verifies and the replay see `None`).
+        if !job.split_tried {
+            job.split_tried = true;
+            job.split = self.build_prefill_split(job, pager.as_deref());
+        }
+        let _split_guard = super::prefill_split::install(job.split.clone());
         if job.ced && job.lm_rows > 0 && self.lm_open_window(job, lane_caps, chunk_size)? {
+            if job.lm.as_ref().is_some_and(|w| w.lo) {
+                return self.prefill_job_lm_pass(job, bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, pager);
+            }
             return self.prefill_job_lm_unit(job, bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, pager);
         }
         let split = crate::config::CED_DECODER_START;
@@ -1457,9 +1846,15 @@ impl HeterogeneousEngine {
         let chunk_b = chunk_end - job.chunk_start;
         let is_last_chunk = chunk_end == t;
         let (lazy_hcs, lazy_engram) = match job.chunk_inputs.take() {
-            Some((h, e)) => {
-                if h.len() != chunk_b || e.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() != chunk_b * ENGRAM_IN as usize)) {
+            Some((mut h, mut e)) => {
+                // A SURPLUS is a prefix to keep: `next_chunk_range` predicted a layer-outer window and `lm_open_window` fell back
+                // to chunked prefill (store OOM / fewer than two chunks left).
+                if h.len() < chunk_b || e.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() < chunk_b * ENGRAM_IN as usize)) {
                     return Err(eyre!("prefill_job_chunk: chunk inputs for {} rows, chunk is {chunk_b}", h.len()));
+                }
+                h.truncate(chunk_b);
+                if let Some(rs) = e.as_mut() {
+                    rs.iter_mut().for_each(|r| r.truncate(chunk_b * ENGRAM_IN as usize));
                 }
                 (Some(h), e)
             }
@@ -5961,10 +6356,10 @@ impl HeterogeneousEngine {
         } else {
         let append_at = ls.raw_off + n_raw_before;
         assert!(
-            (append_at + b) as usize <= KV_CACHE_ROWS,
+            (append_at + b) as usize <= kv_cache_rows(),
             "kv_append OOB: raw_off={} + n_raw_before={n_raw_before} + b={b} >              KV_CACHE_ROWS={}",
             ls.raw_off,
-            KV_CACHE_ROWS,
+            kv_cache_rows(),
         );
         de.kv_append.launch_batched(
             &de.compute,
@@ -9602,6 +9997,10 @@ impl HeterogeneousEngine {
                 let mut seen = vec![false; N_EXPERT as usize];
                 let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
                 let mut skipped_remote = 0usize;
+                // P1 (docs/v41/LM_LAYER_OUTER_PREFILL_DESIGN.md sec 4): the frozen prefill split of a LONG job, installed
+                // around the prefill unit (`prefill_split::install`); `None` for decode steps, verifies and the replay.
+                // Cloned ONCE per call, not locked per pick.
+                let psplit = super::prefill_split::current();
                 // HOT SPLIT 3.2: the holder fallback serves decode rows only
                 // (prefill and verify chunks keep the home rule).
                 let holder_rows = matches!(rows, RowLayout::Arena { .. });
@@ -9653,7 +10052,7 @@ impl HeterogeneousEngine {
                             // Box 2's share: always hers -- except a MOVING id of a
                             // decode row, served by whichever box holds it until its
                             // new home does (HOT SPLIT 3.2, `serve_on_box2`).
-                            let home2 = super::expert_pager::partition_box2(layer as i32, sv as u32);
+                            let home2 = super::prefill_split::home2_or_partition(psplit.as_ref(), layer as i32, sv as u32);
                             let on2 = if holder_rows && super::expert_pager::hot_set::moving(layer as i32, sv as u32) {
                                 let b1_has = pg.is_resident(layer as i32, sv as u32);
                                 let r = super::b2_mirror::lookup(layer as i32, sv as u32);
@@ -10338,8 +10737,9 @@ impl HeterogeneousEngine {
                     // The SAME ownership predicate the target layer's dispatch
                     // will use, or the hint warms bytes box 2 reads.
                     let split = remote_split_on && super::expert_pager::t2_partition();
+                    let psplit_ra = super::prefill_split::current();
                     pg.readahead_layer(ahead, |e| {
-                        split && super::expert_pager::partition_box2(ahead, e)
+                        split && super::prefill_split::home2_or_partition(psplit_ra.as_ref(), ahead, e)
                     });
                 }
                 if remote_split_on && !owns_eff.is_empty() {
@@ -12703,12 +13103,63 @@ mod lm_tests {
         }
     }
 
+    /// Review r5 finding 1 (BLOCKER): the scheduler asks `next_chunk_range` BEFORE `prefill_job_chunk` opens the window. For a
+    /// layer-outer job it must already return the WHOLE window the pass will plan, not one chunk.
+    #[test]
+    fn layer_outer_next_chunk_range_predicts_the_window_before_it_opens() {
+        let caps = (512, 512);
+        let mut job = PrefillJob::new(vec![1; 10_000], Vec::new(), None, None, 0, 1024).unwrap();
+        job.ced = true;
+        job.lm_rows = 4096;
+        // Group-major (or layer-outer off): one chunk.
+        assert_eq!(job.next_chunk_range_impl(caps, false).unwrap(), (0, 1024));
+        // Layer-outer: the 4096-row window (4 sub-chunks), the same rows `lm_open_window` plans.
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 4096));
+        // After a window closed (chunk_start advanced) the next window is predicted from there.
+        job.chunk_start = 4096;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (4096, 8192));
+        // The tail: 1,808 rows left = two chunks fit => a window of exactly the tail; < 2 chunks => one chunk.
+        job.chunk_start = 8192;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (8192, 10_000));
+        job.chunk_start = 9_500;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (9_500, 10_000));
+        // Not CED or no LM rows: never a window.
+        job.chunk_start = 0;
+        job.ced = false;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 1024));
+        job.ced = true;
+        job.lm_rows = 0;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 1024));
+        // Derived, not literal: the end of the predicted range must equal the window `lm_open_window` plans with ITS formula
+        // (`chunk_size = chunk_rows.min(lane caps)`, `cap = lm_rows.max(2 * chunk_size)`), so a future edit to either side that
+        // changes the cap or chunk size is caught here (review r6 N1).
+        job.lm_rows = 4096;
+        for start in [0usize, 1024, 4096, 8192, 9_000, 9_500] {
+            job.chunk_start = start;
+            let chunk_size = job.chunk_rows.min(caps.0 + caps.1);
+            let opened = lm_plan_window(job.pos0, start, job.tokens.len(), chunk_size, caps, &[], job.lm_rows.max(2 * chunk_size)).unwrap();
+            let want = match opened {
+                Some(subs) => (start, subs.last().unwrap().1),
+                None => (start, job.next_chunk_range_impl(caps, false).unwrap().1),
+            };
+            assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), want, "start {start}");
+        }
+        job.chunk_start = 0;
+        // An OPEN layer-outer window: the first pass (layer 0) takes the whole window, later passes none.
+        job.lm_rows = 4096;
+        let subs = lm_plan_window(0, 0, 10_000, 1024, caps, &[], 4096).unwrap().unwrap();
+        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(), lo: true, lo_layer: 0, saved: Vec::new() });
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 4096));
+        job.lm.as_mut().unwrap().lo_layer = 4;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (job.chunk_start, job.chunk_start));
+    }
+
     #[test]
     fn lm_mid_group_only_between_a_groups_sub_chunks() {
         let mut job = PrefillJob::new(vec![1; 5000], Vec::new(), None, None, 0, 1024).unwrap();
         assert!(!job.lm_mid_group(), "no window");
         let subs = lm_plan_window(0, 0, 5000, 1024, (512, 512), &[], 4096).unwrap().unwrap();
-        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default() });
+        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(), lo: false, lo_layer: 0, saved: Vec::new() });
         assert!(!job.lm_mid_group(), "window open, group not begun");
         for sub in 1..4 {
             job.lm.as_mut().unwrap().sub = sub;

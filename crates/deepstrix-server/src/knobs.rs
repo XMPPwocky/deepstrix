@@ -128,6 +128,11 @@ v4flash_kernels::knobs! {
     pub static MS_DSPARK_DRAFTS = Knob::choice("V41_MS_DSPARK_DRAFTS", 0, &[&["sampled"], &["argmax"]]);
     /// `V41_MS_DSPARK_RING_ASYNC` (default on).
     pub static MS_DSPARK_RING_ASYNC = Knob::flag("V41_MS_DSPARK_RING_ASYNC", true);
+    /// `V41_MS_DSPARK_FILL` (default on): rows a ring did not take (the
+    /// prefill's seed, steps of more live streams than may draft) are held and
+    /// filled in when the stream drafts (`ms_dspark::Backlog`, KNOWN_BUGS #57);
+    /// off = the seed is written at once and unwritten rows are dropped.
+    pub static MS_DSPARK_FILL = Knob::flag("V41_MS_DSPARK_FILL", true);
     /// `V41_LONG_PREFILL_TOKENS` (default 16384): a prefill job longer than this
     /// flags its box-2 requests `REQ_FLAG_LONG_JOB` (box 2's phase keeps the
     /// job's experts: `knobs::prefill_budget_long` there); 0 = never.
@@ -237,9 +242,9 @@ mod tests {
             "V41_B2_MISS_PREFETCH", "V41_B2_MISS_PREFETCH_CAP", "V41_B2_MISS_PREFETCH_MARGIN", "V41_B2_MISS_PREFETCH_MAX_PER_LL_X10",
             "V41_B2_MISS_PREFETCH_MAX_WORDS_STEP", "V41_B2_MISS_PREFETCH_RANK", "V41_B2_NURSERY_PRIOR", "V41_B2_PIN_PREFILL_BAND",
             "V41_B2_SOFT_HINT", "V41_B2_SOFT_MAP", "V41_B2_SOFT_PRIOR", "V41_B2_SPEC_BUDGET", "V41_DGPU_COMBINE3", "V41_DGPU_ENGRAM_ASYNC", "V41_DGPU_ROUTER_X2", "V41_DGPU_ZC_MULTI_SPEC", "V41_DGPU_ZC_PUSH",
-            "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
-            "V41_MS_CTX_CHECK", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPHS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
-            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_PROFILE", "V41_MS_PROFILE_SAMPLE", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
+            "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_LAYER_OUTER", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL", "V41_LM_QUANTUM_LAYERS",
+            "V41_MOE_WMMA_F16", "V41_MS_CTX_CHECK", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPHS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
+            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_PROFILE", "V41_MS_PROFILE_SAMPLE", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS", "V41_PREFILL_B1_FILLER", "V41_PREFILL_SPLIT",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA", "V41_SUB_PROTECT",
         ]);
         // The parses these knobs had before.

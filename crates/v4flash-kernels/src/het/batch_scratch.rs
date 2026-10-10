@@ -58,6 +58,33 @@ use super::scratch::{DgpuScratch, IgpuScratch};
 /// the same chunk.
 pub const B_MAX: usize = 1024;
 
+/// Upper bound for `V41_PREFILL_LANE_ROWS` (a 1024-row lane = a 2048-row chunk).
+pub const LANE_ROWS_MAX: usize = 1024;
+
+/// `V41_PREFILL_LANE_ROWS` (default `B_MAX.div_ceil(2)` = 512, max [`LANE_ROWS_MAX`]): rows per
+/// prefill pipeline LANE. Read once at startup by the server's scratch allocation; the prefill
+/// chunk is two lanes, so 1024 gives 2048-row chunks and 1024-row MoE calls (2x the members per
+/// expert; plan: docs/v41/IGPU_MOE_F16LUT_PLAN.md, step 1). Costs dGPU VRAM (~+885 MiB of lane
+/// + shared scratch, +~42 MB raw-KV rows per `HetModelState`) that the dGPU does not have free:
+/// a probe must shrink `V41_MS_CTX_ROWS` (KV arena) by >= ~1.0M rows. Unset = today's shape.
+pub fn prefill_lane_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let d = B_MAX.div_ceil(2);
+        std::env::var("V41_PREFILL_LANE_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(d, |v| v.clamp(d, LANE_ROWS_MAX))
+    })
+}
+
+/// Largest prefill chunk (two lanes) the process was configured for: `B_MAX` unless
+/// `V41_PREFILL_LANE_ROWS` raised the lanes. Sizes everything that used to be `B_MAX`
+/// because a chunk lands in it (raw KV rows, `PrefillJob` clamp, layer-0 one-hot rows).
+pub fn chunk_rows_cap() -> usize {
+    (2 * prefill_lane_rows()).max(B_MAX)
+}
+
 /// Diagnostic toggle (env `DEEPSTRIX_F32_SCORES=1`): route the batched-
 /// prefill attention through the **f32-scores** kernel pair instead of
 /// the production f16-scores one. Used to test whether long-ctx
@@ -172,7 +199,7 @@ pub const F16_PAD: u32 = 64;
 pub const fn f16_pitch(dim: u32) -> u32 { dim + F16_PAD }
 
 fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
-    eyre::ensure!(rows > 0 && rows <= B_MAX, "{who} rows={rows} out of (0, B_MAX]");
+    eyre::ensure!(rows > 0 && rows <= chunk_rows_cap(), "{who} rows={rows} out of (0, chunk_rows_cap()={}]", chunk_rows_cap());
     Ok(())
 }
 

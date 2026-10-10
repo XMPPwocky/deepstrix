@@ -12,6 +12,9 @@ const MXFP4_PAIR_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MXFP4_PAIR_MATVEC_
 /// sweep B_moe_prefill). gfx1151 only: the RDNA3 WMMA intrinsic; the gfx12 build
 /// of that file traps, so it is never loaded there.
 pub(crate) const MXFP4_MOE_WMMA_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MXFP4_MOE_WMMA_GFX1151"));
+/// `kernels/mxfp4_moe_wmma_f16.hip` (the f16-WMMA arm, 2026-10-10): same entry
+/// names / args / chunk as the int8 arm, selected per launch (`V41_MOE_WMMA_F16`).
+pub(crate) const MXFP4_MOE_WMMA_F16_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MXFP4_MOE_WMMA_F16_GFX1151"));
 
 /// Members per work item the WMMA kernels stage (`WM_MAX_CHUNK`; the kernel
 /// silently clamps a larger chunk, which would DROP members, so the launchers
@@ -38,6 +41,8 @@ pub struct Mxfp4PairMatvec {
     module: Module,
     /// The int8-WMMA module (gfx1151 only), see [`Self::launch_fused_swiglu_wmma_ex`].
     wmma: Option<Module>,
+    /// The f16-WMMA module (gfx1151 only), see [`Self::launch_fused_swiglu_wmma_arm`].
+    wmma_f16: Option<Module>,
 }
 
 /// Warps per workgroup (= rows per workgroup, one row each) for the decode
@@ -64,20 +69,23 @@ impl Mxfp4PairMatvec {
             return Err(eyre!("unsupported arch for mxfp4_pair_matvec: {arch}"));
         };
         let module = Module::load_data(image)?;
-        let wmma = if arch.starts_with("gfx1151") {
-            Some(Module::load_data(MXFP4_MOE_WMMA_GFX1151)?)
+        let (wmma, wmma_f16) = if arch.starts_with("gfx1151") {
+            (Some(Module::load_data(MXFP4_MOE_WMMA_GFX1151)?), Some(Module::load_data(MXFP4_MOE_WMMA_F16_GFX1151)?))
         } else {
-            None
+            (None, None)
         };
-        Ok(Self { module, wmma })
+        Ok(Self { module, wmma, wmma_f16 })
     }
 
     /// Whether the int8-WMMA gate+up kernel exists on this device (gfx1151).
     pub fn has_wmma(&self) -> bool { self.wmma.is_some() }
+    /// Whether the f16-WMMA gate+up kernel exists on this device (gfx1151).
+    pub fn has_wmma_f16(&self) -> bool { self.wmma_f16.is_some() }
 
     /// The loaded modules (tests: explicit-symbol launches).
     pub fn module(&self) -> &Module { &self.module }
     pub fn wmma_module(&self) -> Option<&Module> { self.wmma.as_ref() }
+    pub fn wmma_f16_module(&self) -> Option<&Module> { self.wmma_f16.as_ref() }
 
     fn check(mid: &DeviceBuffer<f32>, n_used: u32, n_rows: u32, n_blocks: u32) -> eyre::Result<()> {
         if n_rows % 8 != 0 {
@@ -435,7 +443,41 @@ impl Mxfp4PairMatvec {
         n_blocks: u32,
         n_work_items_dev: Option<&DeviceBuffer<i32>>,
     ) -> eyre::Result<()> {
-        let module = self.wmma.as_ref().ok_or_else(|| eyre!("mxfp4 pair wmma: no WMMA module on this arch (gfx1151 only)"))?;
+        self.launch_fused_swiglu_wmma_arm(
+            false, stream, mid, gate_w_base, up_w_base, xq, expert_w, group_count, expert_members, work_items,
+            n_work_items, gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks, n_work_items_dev,
+        )
+    }
+
+    /// [`Self::launch_fused_swiglu_wmma_ex`] on the int8 (`f16 = false`) or the f16-WMMA arm
+    /// (kernels/mxfp4_moe_wmma_f16.hip: same symbol, args, grid and 32-member chunk; NOT bit-exact vs the int8 arm,
+    /// f32 re-association). Selected by `dispatch::moe_gate_up_chunked_rows` (`V41_MOE_WMMA_F16`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_wmma_arm(
+        &self,
+        f16: bool,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items_dev: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let module = if f16 { self.wmma_f16.as_ref() } else { self.wmma.as_ref() }
+            .ok_or_else(|| eyre!("mxfp4 pair wmma (f16={f16}): no WMMA module on this arch (gfx1151 only)"))?;
         if n_work_items_dev.is_some() && n_work_items as usize > work_items.len() {
             return Err(eyre!("mxfp4 pair wmma: grid bound {n_work_items} > work_items {}", work_items.len()));
         }

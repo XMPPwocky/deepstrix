@@ -54,7 +54,7 @@ also loads the embed phase (`--embed-gguf`, Qwen3-Embedding-4B Q8_0;
 | `V41_MS_DSPARK` | off | accept | arena DSpark |
 | `V41_MS_DSPARK_STREAMS` | 2 (since b5def35; was 1) | 2 (knob file, since 2026-10-06) | streams that may speculate at once (max 2; `MS_DSPARK_STREAMS_DESIGN.md`) |
 | `V41_MS_GRAPH_KEYS` | stage_b (since b5def35; was legacy) | stage_b (knob file) | arena stage graphs keyed by (stage, rows) (`GRAPH_KEYS_DESIGN.md`) |
-| `V41_MS_DSPARK_RING` | all | solo | drafter ring writes only while speculation is possible |
+| `V41_MS_DSPARK_RING` | all | solo | drafter ring writes only while speculation is possible; the rows in between are filled in when the stream drafts again (KNOWN_BUGS #57; `V41_MS_DSPARK_FILL=0` rolls that back) |
 | `V41_MS_DSPARK_DRAFT_MS` / `_COST` | 20 / unset | 12 / 8-point one-lane ladder (ms for 1..8 rows) | starting estimates for the live cost cells (`_COST_LIVE`, default on) |
 | `V41_MTP_MOE_GROUPED` / `V41_MTP_EXPERT_STATS` | 0 / 0 | 1 / 1 | drafter MoE grouping / stats |
 | `V41_SUB` | 0 | 3 | cache-prior router bias (`BOX2_MISS_SUBSTITUTION.md`) |
