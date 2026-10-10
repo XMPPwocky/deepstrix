@@ -178,8 +178,13 @@ share the experts more evenly (the hub is ~50% idle at 21 of 40 ms) on top of th
   mirror routing: `V41_B1_HOT_POLICY=interleave` live since 10-09 19:16 UTC, `IL_PER_LAYER` 115, plus `mirror_frac` 0.70).
   Distinct experts box 2 touched per encoder layer in the job: L0 266, L1 264, L8 262, L9 264, mid layers ~190-230 (119 range +
   ~115 interleaved = ~234, consistent). Over the 20 encoder layers that is **~4,000-4,700 experts = ~the whole 4,740-slot pool and
-  above `prefill_budget` 3,500**. Cycling a >budget working set through an LRU thrashes every window: observed **1,146 reads (~21 GB)
-  per 4096-row window** = ~half the set re-read each window. Victims are 95% ENCODER-layer experts (self-eviction), only 5%
+  at/above what the pool can give a prefill**. (CORRECTION, same day: `prefill_budget` is NOT a cap on prefill-resident slots; it
+  is the number of DECODE-class victims one prefill phase may take before it evicts its own oldest pages, 3,500 default, and it
+  applies to jobs <= `V41_LONG_PREFILL_TOKENS` = 16,384. The 192K job is a LONG job: `prefill_budget_long` = unlimited, own pages
+  evicted farthest-next-use first (`own_sweep_rank`). So the limit that bites is the pool itself, 4,740 slots minus whatever is
+  pinned or otherwise protected, vs a long job's own set: the code's own 10-03 measurement says 4,304 distinct experts for a 58K job
+  and 5,161 for a 229K job.) With farthest-next-use eviction a set larger than the usable capacity costs ~(set - capacity) re-reads
+  per sweep: observed **1,146 reads (~21 GB) per 4096-row window** => usable capacity ~3.5K of a ~4.7K set. Victims are 95% ENCODER-layer experts (self-eviction), only 5%
   decoder layers; 2,022 experts read once, 1,606 twice, a tail of ~100 experts read 10+ times.
 * So the user's idea is right, and the reason it does not already work is CAPACITY, not prediction: whole-layer prefetch many
   layers ahead needs no routing knowledge (layer-major + long context touch ~every expert), but prefetching a set larger than the
@@ -187,8 +192,10 @@ share the experts more evenly (the hub is ~50% idle at 21 of 40 ms) on top of th
   - total encoder experts = 20 x 384 = 7,680; hub pool 5,425 + box-2 pool 4,740 = 10,165 slots, so a STATIC expert->box
     partition during prefill (each encoder expert resident in exactly one pool) fits with ~2.5K slack and needs NO steady-state
     paging; today both boxes hold overlapping hot sets (mirror) and box 2 also serves 70% non-owned picks.
-  - cheaper first: `prefill_budget` 3,500 -> ~4,400 (live knob-file key on box 2) tests the capacity hypothesis directly;
-    the cost is decode-class slots displaced after a prefill. Second: a prefill-time routing mode that does not send mirrored
+  - (RETRACTED: raising `prefill_budget` would not help long jobs, see the correction above; for long jobs the unlimited
+    `prefill_budget_long` already applies.) First: find out why only ~3.5K of the 4,740 slots are usable (hub pins held on box 2:
+    its page-stats line shows `pins 3789/4232`; staging off; foreign-layer floors) -- if pins are the reason, releasing/limiting
+    hub pins during a long prefill gives capacity for free. Second: a prefill-time routing mode that does not send mirrored
     picks to box 2 (shrinks its set toward 119-234/layer). Third: background whole-layer prefetch (`V41_LM_PREFETCH=1` is already ON
     in the hub env and hints only the last window's demand reads; extend to "all box-2-owned experts of layer L+k").
 * **Streaming-budget arithmetic (owner follow-up 10-10: "with streaming the budget should be tiny").** Resident slots needed =
