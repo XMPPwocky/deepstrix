@@ -1,182 +1,186 @@
-# Layer-outer prefill, static expert split, rolling prefetch: design (rev 1, 2026-10-10)
+# Layer-outer prefill, frozen expert split, bounded prefetch: design (rev 2, 2026-10-10, after review round 1)
 
-Status: DESIGN FOR REVIEW. No production code written for it. Everything here is derived from reading the code and from the
-measurements in `IGPU_MOE_F16LUT_PLAN.md` (POST-MOVE BREAKDOWN, ROOT CAUSE, streaming arithmetic). Numbers marked (inferred)
-are NOT measured. Owner direction (10-10): "rebuild around layer-outer"; for long prefills changing the expert->box allocation
-is acceptable; static split + rolling prefetch preferred over cache tuning.
+Status: DESIGN FOR REVIEW (round 2). No production code written for it. Derived from reading the code and from the measurements in
+`IGPU_MOE_F16LUT_PLAN.md` (POST-MOVE BREAKDOWN, ROOT CAUSE, streaming arithmetic). Numbers marked (inferred) are NOT measured.
+Owner direction (10-10): rebuild around layer-outer; for long prefills changing the expert->box allocation is acceptable.
 
-## 0. Why (measured, one paragraph each)
+## Review round 1 (Fable reviewer, verdict NEEDS REWORK) -> dispositions
+| # | sev | finding | disposition in rev 2 |
+|---|---|---|---|
+| 1 | BLOCKER | background prefetch LANDINGS rank victims with `for_layer = word's layer` (`re:5672`, `own_sweep_rank` `re:4081`), so a landing for layer L+k evicts layers L+1..L+k-1 first; Belady-correct only for demand at the current layer | ACCEPTED. P3 is no longer hub-only: box-2 landing-rank fix (rank with the pass's CURRENT layer; `(cur, word_layer]` = "ahead") + loopback test; the existing `V41_LM_PREFETCH` has the same flaw (likely why it measured "not worth enabling") |
+| 2 | MAJOR | hash split makes box 1's prefill half a random half => LRU evicts box 1's whole decode hot set; post-job decode misses are SYNCHRONOUS dm-crypt reads on the critical path; no re-warm path | ACCEPTED. Split = box 1 takes its decode-hot encoder head UNION a hash filler sized to its free slots, FROZEN per job (sec 4); measured displacement budget and a post-job decode-p90 gate |
+| 3 | MAJOR | box 1 has NO async residency in the prefill pipeline: `ensure` is synchronous; `b1_page_misses` short-circuits `b1_prefetch`; `drain_prefetched` once per tick | ACCEPTED. P1 cold fill on box 1 is a synchronous, bounded stall (filler only, ~24 GB ~6 s) and is stated as such; in-pipeline admission is an explicit P3 sub-item with its own gate |
+| 4 | MAJOR | `bd.indexer_saved_store` (host i32 on lane scratch, retracted to -1 when the source does not fire) missed: bit-identity would break silently | ACCEPTED. Added to the inventory as a per-lane-unit field (sec 3.2) |
+| 5 | MAJOR | capacity: floors/reserve/nursery | CHECKED: box-2 startup line "pin budget 4232 = 4760 - 0 - reserve 480 - floors 0 - nursery 48"; global pool floor 0.00. Usable for a long prefill ~ 4,760 - ~136 pinned - nursery 48 ~ 4,570. Reserve is a guarantee, not lost space. Sizing in sec 4 uses 4,570 |
+| 6 | MAJOR | pair merge never fires: partner arrives >= 10 ms later (> 400 us wait) | ACCEPTED. P4 needs DEFERRED submit (route first, submit the pair together) or a long wait; gate is golden/KLD, not bitexact (WMMA row-composition independence unverified) |
+| 7 | MAJOR | arithmetic: 2K rows/s at 16K windows needs 8.8 GB/s/box (> 4 GB/s); streaming cannot reach the 2K target | ACCEPTED, big windows CUT. W stays 4096 (8192 only if the existing halve-on-OOM store allows). Arena-tail lend removed (R5 gone). The resident regime (P1) is the only path; P3's value is bounded refill |
+| 8 | MAJOR | `lm_prefetch_words`, the look-ahead word builder, `wants_for_box2` select with `partition_box2` | ACCEPTED. One frozen `PrefillSplit` object consulted by every prefill-path consumer (sec 4) |
+| 9 | MAJOR | `EngramAhead` runs one block per scheduler tick; `chunk_inputs` builds HC on the scheduler thread | ACCEPTED. Sec 6: continuous producer thread + device-side HC build (P2b) |
+| 10 | MINOR | replay-row capture unspecified | ACCEPTED, sec 3.5 |
+| 11 | MINOR | U odd / empty lane B | ACCEPTED; simulator covers it; parity flips per layer, harmless once all per-unit state is relocated |
+| 12 | MINOR | per-task re-uploads (`pos_per_b`, vis, tokens slice, SYNC Engram `copy_from_host` ~12.6 MB at layers 1,14, `dump_layer_pos`, `events.reset()`/perfetto flush) | ACCEPTED, sec 3.2 table + 3.6 |
+| 13 | MINOR | `layer <= CED_DECODER_START` includes layer 20 | FIXED: encoder split uses `layer < CED_DECODER_START` |
+| 14 | MINOR | f16 arm P0 estimate wrong at 8 members/expert | ACCEPTED; P0 sequenced last, estimate removed |
+| 15 | MINOR | lending not exception safe | ACCEPTED: `restore_compressor_lending()` at quantum entry/exit + guard |
+| 16 | MINOR | bitexact oracle: split OFF for the P2 arm; it has no box-2 client | ACCEPTED, sec 9 |
+| 17 | NIT | quantum time 2.1 s today (~1.0 s at the P1 target) | FIXED |
 
-* **Wall.** Steady 4096-row window = 8.02 s (511 rows/s, 10-10 16:44 cold 192K job). The hub is not the wall (reply->next submit
-  10.4 ms, wire 7 ms/round trip); box 2 is: it serves the two 512-row lanes serially (19.4 ms kernel floor each => 40 ms period
-  floor) and parks ~30 ms/unit-layer on page-ins (mean 7 missing experts/request; run 19.6/26.1/47.5/79.6 ms at 0-2/3-6/7-12/13+ missing).
+## 0. Why (measured)
+* **Wall.** Steady 4096-row window 8.02 s (511 rows/s; 10-10 16:44 cold 192K job). The hub is not the wall (reply->next submit
+  10.4 ms; wire 7 ms/round trip); box 2 is: two 512-row lanes served serially at a 19.4 ms kernel floor (40 ms period floor) plus
+  ~30 ms/unit-layer parked on page-ins (mean 7 missing experts/request; run 19.6/26.1/47.5/79.6 ms at 0-2/3-6/7-12/13+ missing).
   Hub-only gaps (Engram/G0 prep 1.25 s + group boundaries 0.63 s) are 23% of the window while box 2 idles.
-* **Paging is a partition problem.** `expert_pager::partition_box2` = box 1 owns each layer's hottest ~103-115 ids by DECODE
-  pick mass, box 2 everything else (~270/layer). Prefill touches ~every expert, so box 2's set is ~5.2-5.8K vs ~4.6K usable slots
-  => ~1,146 re-reads (~21 GB) per window. Pins/budget ruled out (hub BAND=4096 releases pins to ~136 on prefill entry;
-  `prefill_budget` is a decode-victim allowance and long jobs use `prefill_budget_long`=unlimited).
-* **Streaming is bandwidth, not latency.** Each box streaming its half of the encoder weights = 72 GB/pass: needs window time
-  >= 72 GB / disk rate (8K rows at ~900 rows/s needs ~8 GB/s per box; 16K rows ~4 GB/s). So: resident (set fits) at 4K windows,
-  streaming at >= 8-16K windows.
-* **The loop order forces big residency.** Today's unit = (layer GROUP, sub-chunk): a group's up-to-6 layers are re-run per
-  sub-chunk, so the group's whole expert set must stay resident across 4 sub-chunks, and the prefetch lookahead is a whole group.
+* **Paging is a partition problem.** `partition_box2` = box 1 owns each layer's hottest ~103-115 ids by DECODE pick mass, box 2 the
+  rest (~270/layer); prefill touches ~every expert => box 2's set ~5.2-5.8K vs ~4.57K usable => ~1,146 re-reads/window.
+* **Streaming cannot reach the target; residency can.** Streaming a box's half (72 GB/pass) needs window time >= 72 GB / disk rate:
+  at 2K rows/s a 16K window needs 8.8 GB/s per box (> 4 GB/s measured, 4.2 box 1). Only a RESIDENT set removes steady-state reads.
 
-## 1. Goals / non-goals
+## 1. Goals / non-goals (each phase behind a default-OFF knob, one-flip rollback; OFF = today's code path, I7)
+P1 **Frozen prefill split** (hub-only). P2 **Layer-outer window driver** + window-input producer. P3 **Bounded refill prefetch**
+(box-2 landing-rank fix; plan-based words; optional box-1 in-pipeline admission). P4 **Pair merge** with deferred submit. P0 **f16
+MoE arm** into dispatch (last: it ties at <= ~16 members/expert, i.e. 512-row lanes of a ~200-expert share).
+Non-goals: decode, DSpark, KV arena, CED/replay semantics, weight format, big windows, arena-tail lending.
 
-Goals (each independently shippable behind a default-OFF knob, one-flip rollback):
-1. **P1 Static prefill split** (hub-only): a capacity/bandwidth-balanced expert->box assignment for ENCODER layers of LONG jobs.
-2. **P2 Layer-outer window driver**: for a window of W rows, run layer L for ALL lane-units, then layer L+1, as one continuous
-   2-deep pipeline; removes group structure, fill/drain per group, and makes input prep overlappable.
-3. **P3 Rolling whole-layer prefetch + larger windows** (8-16K): data-independent, lookahead 2-4 layers, both boxes stream
-   their own share; window store lent from the idle KV-arena tail.
-4. **P4 MoE batching**: box-2 pair merge (existing PARTNER mechanism) first; hub-side merged MoE later.
-Non-goals: changing decode, DSpark, the KV arena, the CED/replay semantics, or the on-disk weight format. No expert requant.
-
-## 2. Invariants that must hold (the review should attack these)
-
-I1. **Row math unchanged.** For a fixed expert->box partition, layer-outer output (KV bytes, logits) is BIT-IDENTICAL to chunked
-    prefill (the existing GPU gate `tests/lm_prefill_bitexact.rs` is the oracle; today's group-major LM already passes it).
-I2. **Per-layer unit order unchanged.** For every layer L, lane-units execute their attention/KV-append/eviction in increasing
-    position order (A_0, B_0, A_1, B_1, ...). This is exactly the order chunked prefill and group-major LM produce at that layer.
-I3. **Dependency legality.** pre(L,u) needs only post(L-1,u) (own rows) and layer L's KV/ring/compressor after pre(L,u-1). Never
-    post(L,u-1). (Verified by reading `pipelined_range_impl`; the review should re-verify against `pre_moe_chain`.)
-I4. **No cross-task scratch dependence.** Everything in lane scratch (`BatchDgpuScratch`/`BatchIgpuScratch`) and shared scratch
-    (`BatchDgpuShared`/`BatchIgpuShared`) is produced and consumed within ONE task's pre..post, except the items in section 4.
-I5. **Decode safety.** Lane scratch is shared with decode steps (`prefill_job_lm_unit` already syncs and copies to the store before
-    returning). The new driver drains and stores before ANY return to the scheduler.
-I6. **Checkpoints/snapshots only between windows** (`checkpoint_ok`), unchanged.
-I7. **Default OFF = byte-for-byte today's behaviour** (new knobs unset => existing code path).
+## 2. Invariants (the review verified I1,I2,I3,I5,I6,I7; I4 was false as written and is restated with the full inventory)
+I1. For a FIXED expert->box partition, layer-outer output (KV bytes, logits) is bit-identical to chunked prefill (oracle:
+    `tests/lm_prefill_bitexact.rs`, run with the prefill split OFF for the P2 arm).
+I2. For every layer, lane-units run in increasing position order (A_0 B_0 A_1 ...), exactly as chunked.
+I3. pre(L,u) needs only post(L-1,u), layer L's KV/ring/compressor after pre(L,u-1); never post(L,u-1). (Verified r1.)
+I4. Everything in lane/shared scratch is produced and consumed within one task's pre..post EXCEPT the items in sec 3.2 (relocated).
+I5. Lane scratch is shared with decode: the driver drains, stores, and restores compressor lending before ANY return.
+I6. Checkpoints/snapshots only between windows. I7. Knobs unset => existing path byte-for-byte.
 
 ## 3. The layer-outer driver (P2)
+### 3.1 Tasks and schedule
+Window of W rows (`lm_plan_window`/`plan_chunk` cuts, lane cut = `plan_chunk`'s, assert kept). Lane-units in position order
+u = 0..U-1 (A_0 B_0 A_1 ...; **U is NOT always 2n**: an empty lane B (`b_b == 0`, tiny or span-cut chunk) drops its unit, so U can be
+odd and `lane(t mod 2)` flips parity between layers; harmless because all per-unit state is relocated to per-unit homes).
+Tasks T[t] = (L,u), t = (L-a)*U + u, lane scratch = `lane(t mod 2)`, sync events `sync_events.layers[L]` (even) /
+`sync_events_t1.layers[L]` (odd), as today. Schedule (the existing steady state generalised; at U=2 it IS the existing loop):
 
-### 3.1 Task list and pipeline schedule
-A window of W rows is cut by the existing `lm_plan_window`/`plan_chunk` into sub-chunks `(s,e,b_a)`; each sub-chunk gives two
-lane-units (A: rows [s, s+b_a), B: rows [s+b_a, e)). With n sub-chunks there are U = 2n lane-units in position order
-u = 0..U-1 (A_0, B_0, A_1, ...). **The lane cut stays exactly `plan_chunk`'s** (image spans are cut around by `lane_split`; the
-code asserts the range returns the same cut: "lane cut != planned").
+    warm:  pre(T[0]); pre(T[1])
+    step:  for t in 2..N: post(T[t-2]); store_out(T[t-2]); pre(T[t])      (N = U*(b-a); store_in(T[t]) is the first thing pre(T[t]) does)
+    drain: post(T[N-2]); post(T[N-1]); store_out both
 
-Tasks are T[t] = (L, u) in layer-major order for a quantum of layers [a, b): t = (L-a)*U + u. Lane scratch for task t is
-`lane(t mod 2)` (bd_a/bi_a or bd_b/bi_b), and per-layer sync events are `sync_events.layers[L]` for even lanes,
-`sync_events_t1.layers[L]` for odd (as today). The schedule is the existing steady state generalised:
+Legality for U >= 2 (verified r1): pre(L,u) needs only post(L-1,u) = task t-U <= t-2. `sync_events` reuse is safe (post(L,u) enqueues
+its wait before pre(L,u+2) re-records).
 
-    warm:   pre(T[0]); pre(T[1])
-    step t: post(T[t-2]); (store out T[t-2]); pre(T[t])        for t = 2 .. N-1      (N = U*(b-a))
-    drain:  post(T[N-2]); post(T[N-1])  (+ store out)
-
-Today's steady state IS this with U=2: `post_A(L); pre_A(L+1); post_B(L); pre_B(L+1)`.
-Legality for any U >= 2: pre(t) is issued right after post(t-2); the only data pre(L,u) needs from earlier tasks is
-post(L-1,u) = task t-U <= t-2. For U >= 2 this is satisfied (equality at U=2).
-
-### 3.2 State relocation (the full cross-task inventory; reviewer: find what I missed)
+### 3.2 Relocated / per-task state inventory (incl. round-1 additions)
 | state | today | layer-outer |
 |---|---|---|
-| residual [rows x HC_DIM f32] and `hc_pre_carry` [rows x HC_MIX_DIM] | lane scratch, swapped residual<->residual_next between layers | **`lm_store`** (exists: 82 KB/row): task start = async D2D copy-in to `bd.residual`/`bd.hc_pre_carry` (layers > a); task end (after post and the residual swap) = async D2D copy-out. ~0.14 ms per 512-row task each way (42 MB read + 42 MB write at ~600 GB/s) |
-| layer-0 seed | host `hcs` copied to `bd.residual` (`RangeSeed::Host`) | unchanged for layer 0 tasks; hc_pre_carry reset via `hc_pre_onehot_rows` as today |
-| compressor store lending (KV-source -> reuse layers) | `state.layers[L+1].compressor = state.layers[src].compressor.take()` before post_A(L)/pre_A(L+1), returned after pre_B(L+1) | bracket **per layer's pre-span**: take before the first pre of layer L+1 (task index (L+1-a)*U), return after its last pre (post never touches compressor state); with the skewed pipeline pre(L+1,u) tasks interleave with post(L,u') so the bracket spans from first to last pre(L+1,*) |
-| `indexer_sel_saved`, `indexer_nsparse_saved`, `indexer_saved_store` (lane scratch; produced at index-source layers 2, 8, 14, written for the next up-to-5 reuse layers) | per-lane scratch, valid because the group cut guarantees the next sub-chunk does not overwrite it before the group ends | **per-window-row store** `idx_sel_store [W x 512 i32]` (2 KB/row = 8 MB @4096) + nsparse: copy-out at the end of an index-source task, copy-in at the start of each reuse-layer task. Exact field list and sizes to be fixed from `BatchDgpuScratch` when implementing |
-| KV ring / raw SWA / compressor caches / index keys | `state.layers[L]`, positional | unchanged (per layer, positional; unit order I2) |
-| Engram rows | host, staged per (lane, layer) right before the chain (`stage_engram_lane`); window copy `LmWindow.engram` | unchanged staging; source = the window input ring (section 6) |
-| MTP capture / `mtp_lane_cut` | decode-only | n/a |
-| `split`, `after_attn_hc`, `ffn_shared`, `ffn_input_norm`, `remote_*`, tickets | lane scratch, pre->post of one task | unchanged (I4) |
-| per-layer `sync_events` | per layer x 2 lane sets, reused each layer | reused across units of the same lane parity at the same layer; safe because post(t-2) precedes pre(t) |
-| pager state, `b2_mirror` windows, prefetch queue | global, time-ordered | unchanged; the ORDER of requests to box 2 changes (all units of layer L together) |
+| residual [rows x HC_DIM], `hc_pre_carry` [rows x HC_MIX_DIM] | lane scratch, swapped residual<->residual_next | `lm_store` (82 KB/row, exists): store_in = async D2D into `bd.residual`/`bd.hc_pre_carry` (layers > a); store_out after post+swap. ~0.14 ms per 512-row task |
+| layer-0 seed | host `hcs` -> `bd.residual`; carry reset via `hc_pre_onehot_rows` | unchanged for layer-0 tasks |
+| compressor lending (KV-source -> reuse layers) | take before post_A(L)/pre_A(L+1), return after pre_B(L+1) | bracket per layer's pre-span: take before pre(L+1, first), return after pre(L+1, last); post never touches it; **`restore_compressor_lending()` at quantum entry and on every error path (guard)** |
+| `bd.indexer_sel_saved` [rows x 512 i32], `indexer_nsparse_saved` | lane scratch, valid inside a group | per-window-row store (2 KB/row + nsparse): out at index-source tasks, in at reuse tasks |
+| **`bd.indexer_saved_store` (host i32 flag, retracted to -1 when the source does not fire; read by `s2_reuse`)** | lane scratch; written `fp:7511-7515`, retracted `fp:7566-7568`, read `fp:6874-6880` | **per-lane-unit flag** `saved_store[u]` on the job (a `Vec<i32>`, U entries), written by the source task of unit u, read by the reuse tasks of unit u. Without it unit 0 would read unit 14's flag at layer 3 (fresh prompt, units with pos < ~2048 do not fire) |
+| `pos_per_b` (device), `vis_a/vis_b`, tokens slice, `pos0` | once per range | per task: tiny async uploads (<= 4 KB) before store_in |
+| Engram rows staging (`stage_engram_lane`, SYNC `copy_from_host` ~12.6 MB at layers 1 and 14) | per (lane, layer) | per task; make the layer-1/14 copy async from pinned (as decode slice 1e did) or it blocks the pipeline 2x per unit |
+| `events.reset()` + perfetto flush (`emit_prefill_perfetto`) | per unit | **per task** (a whole quantum of stage events overflows the pool) |
+| KV ring / raw SWA / compressor caches / index keys | `state.layers[L]`, positional | unchanged (I2) |
+| `split`, `after_attn_hc`, `ffn_shared`, `ffn_input_norm`, `remote_*`, tickets | lane scratch pre->post | unchanged (I4) |
+| pager / `b2_mirror` windows / prefetch queue / `expire_incoming` / `remote_set_phase_busy_poll` | per range call | per quantum (global, time-ordered) |
+| MTP capture / `mtp_lane_cut` | decode / non-CED only | n/a (verified r1) |
+(Reviewer: find what is STILL missing.)
 
 ### 3.3 Quantum and scheduler interface
-The scheduler calls the LM driver once per *quantum* instead of once per (group, sub-chunk): `prefill_job_lm_pass(job, a, b)` runs
-layers [a, b) over ALL lane-units of the open window and returns, after the drain+store, the rows completed (W when b is the end
-of the window's last layer, else 0). Default quantum `V41_LM_QUANTUM_LAYERS` = 4 (inferred: ~1.5 s, drain+store ~50 ms => ~3%).
-Quantum boundaries replace group boundaries as the points at which decode may interleave; `lm_mid_group()` ("finish the group
-before letting decode in", `V41_MS_FINISH_GROUP`) becomes "quantum in progress" and is vacuous because a quantum is atomic.
-Layer 20 (`KvSourceOnly`, no MoE) is a quantum of one layer: pre only, no post, no residual change.
-**The quantum is a scheduling unit only; the pipeline is continuous inside it.**
+`prefill_job_lm_pass(job, a, b)` runs layers [a,b) over ALL lane-units of the open window and returns, after drain+store,
+the rows completed (W when b is the window's last layer, else 0). Default quantum `V41_LM_QUANTUM_LAYERS` = 4: ~2.1 s today
+(4 x 8 x 66.5 ms), ~1.0 s at the P1 target; drain+store ~50 ms (~2-5%). Layer 20 (`KvSourceOnly`, `PreMoePhase::Skipped`) is a
+one-layer quantum: pre only, no post, residual untouched (r1 verified). `lm_mid_group` / `V41_MS_FINISH_GROUP` become vacuous
+(a quantum is atomic); sticky open-window job (`ms:1287-1294`) kept; checkpoints only when no window is open (I6).
 
-### 3.4 What gets deleted/replaced
-`lm_groups` (group cuts) and the per-group `pf_sent` machinery are replaced by the quantum/layer plan; `prefill_job_lm_unit` is
-replaced by `prefill_job_lm_pass`. The group-major driver stays in the tree, selected when `V41_LM_LAYER_OUTER` is off (I7).
+### 3.4 Replaces / keeps
+Replaces `prefill_job_lm_unit`, `lm_groups` cuts and `pf_sent` for the new path; the group-major driver stays when
+`V41_LM_LAYER_OUTER` is off (I7).
 
-## 4. Static prefill split (P1) and why it is separable
+### 3.5 Replay capture
+Today the last 128 rows ENTERING layer 20 are copied from the lanes (`fp:1380-1395`). Layer-outer: after post(19, *) the store
+holds every row's layer-20 input, so the replay rows are read from `lm_store` rows [W-128, W) (residual + carry, host copy) at the
+layer-20 quantum; token ids from the job. (Same bytes as today's lane read.)
 
-`home2 = expert_pager::partition_box2(layer, e)` at the pick loop (`forward_prefill.rs` ~9610-9630). Add
-`prefill_home2(layer, e)`: for encoder layers (layer <= `CED_DECODER_START`) of a LONG job (tokens > `V41_LONG_PREFILL_TOKENS`)
-and `V41_PREFILL_SPLIT` set, a **deterministic hash split** with box-2 share s2 (`V41_PREFILL_B2_SHARE`, default 0.5, weight by
-disk bandwidth x pool capacity when the drives change), identical for every unit/layer/window of the job; decoder layers (replay)
-keep the decode rule. Box 1 pages its half from its own disk (`V41_B1_PAGE_MISSES=1`, `V41_PAGER_MISS_PAR=8`) and the
-decode "holder" fallbacks stay decode-only. Hub-only change; box 2 serves what it is sent (`--paged`).
-Resident fit (inferred): box 2 20 x 192 = 3.8K <= ~4.6K usable; box 1 3.8K of 5,425 (plus ~700 decode-hot displaced, re-warmed after).
-Numerics: which box sums which expert changes => f32 association only (same class as any partition change); I1 is stated
-"for a fixed partition"; the partition change itself is gated by golden/KLD.
+### 3.6 Per-task hygiene
+Per-task `events.reset()`; stage-event pool bounded per task; evtrace unit id per quantum (the pf2 join keys by seq: unaffected);
+`dump_layer_pos` per task.
 
-## 5. Rolling prefetch (P3)
+## 4. Frozen prefill split (P1)
+Today: `home2 = partition_box2(layer, e)` in the pick loop (`fp` ~9610-9630) and in `lm_prefetch_words` (`fp:866-876`), the look-ahead
+word builder (`fp:9788`), `wants_for_box2` (`fp:9837`). **One object** `PrefillSplit` (per job, built at job start, long jobs only:
+tokens > `V41_LONG_PREFILL_TOKENS`, `V41_PREFILL_SPLIT=1`), a bitmap `box2[layer][e]` for encoder layers (`layer < CED_DECODER_START`;
+layer 20 excluded), consulted by ALL four sites; decoder layers (replay) keep `partition_box2`.
+Construction (deterministic, frozen for the job even if `hot_set` refreshes mid-job):
+* box 1 = its decode-hot encoder head at job start (`hot_set::box1_owns`: ~103-115/layer, 2.2K ids) UNION a hash filler of
+  `V41_PREFILL_B1_FILLER` ids/layer (default 64, = its ~1,300 free slots / 20 layers; hub pool 5,425 = `V41_PAGER_POOL_GB`=95 in the hub env;
+  decode hot 4,120 + dense window 384) so the displaced decode-hot set is ~0 by construction;
+* box 2 = the rest ~205-215/layer x 20 = ~4.1-4.3K vs ~4,570 usable (90-94%): tight; if the hot set is not warm, hash split at the
+  same sizes. Re-check against the box-2 startup "pin budget" line; the knob can raise the filler if the hub has slots.
+Cold fill (stated honestly): box 1 pages ONLY its filler synchronously (`ensure`, ~1,300 experts ~24 GB ~6 s at 4.2 GB/s); box 2 fills
+its set (<= ~79 GB, 20-26 s) as today's windows 1-2 do. After each decode burst some prefill-class pages are lost on both boxes and
+re-read: measure (gate).
+Post-job: box 1's decode head was never evicted (it is inside the prefill share) so decode starts warm; gate = decode p90 over the
+first 60 s after a long job vs the same traffic before.
+Numerics: which box sums which expert changes => f32 association only; golden/KLD gate for the partition change.
 
-Plan, not prediction: for each layer L in the quantum, the hub knows both boxes' encoder shares (section 4) => the full list
-of experts each box must have. At task (L,u), the hub issues prefetch for layer L+k:
-* box 2: prefetch words `(layer<<16)|e` carried on the request frames (existing `push_prefetch_words`/`set_prefetch_take_cap`;
-  take cap raised so ~192 words/layer are drained over the U requests of a layer: >= ~24 words/request). Box 2's existing
-  `own_sweep_rank` eviction (pages of layers the pass has gone past first) is exactly the rolling policy.
-* box 1: `pg.prefetch_hint(layer, e)` + the async fill machinery (`b1_prefetch`).
-Lookahead k (layers): k = 1 + ceil(u_disk) jitter margin, ~2 at disk utilisation <= 0.5, 3-4 at 0.8 (inferred). Resident need
-= (k+1) x 192 x 18.8 MB ~ 11-18 GB per box. Layer-outer is what makes k small; group-major needs a whole group (~43 GB).
-Disk need: 72 GB/pass/box; feasible when window time >= 72 GB / rate => W >= ~8K at ~900 rows/s (~8 GB/s/box), ~16K at 2K rows/s.
-Box-1 second SSD: owner will fit a 9100 Pro 1 TB (check the slot's PCIe generation; put the encoder-layer experts on a
-PLAINTEXT partition: box 1 reads through dm-crypt today).
-Larger windows: `lm_store` W x 82 KB (8K = 672 MB, 16K = 1.34 GB), `idx_sel_store` +16-32 MB. dGPU has ~0.5 GB free at rest, so P3
-needs the phase lend of the idle KV-arena tail (2.5-2.8 GB typical; census 10-09 dgpu-fusion session) or, as a stopgap, a
-smaller `V41_MS_CTX_ROWS`. Fallback = the existing halve-on-OOM in `lm_open_window`.
-Fully resident mode (P1 only, 4K windows) needs no prefetch beyond the cold fill; P3 is for fills after decode bursts and big windows.
+## 5. Bounded refill prefetch (P3) -- small k, no big windows
+Purpose: refill the resident set after decode bursts and the cold start; not steady-state streaming (sec 0).
+5a. **Box-2 landing-rank fix (BLOCKER r1).** `pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, ..)` for
+    background landings (`re:5672`) ranks tier 3 by `own_sweep_rank(owner, d.layer)`. Change: landings rank with the pass's CURRENT
+    layer, treating layers in `(cur_layer, d.layer]` as "ahead" (never evicted before pages of layers already passed). Needs a box-2
+    redeploy (two-box restart order) and a loopback test for the landing rank. Also repairs `V41_LM_PREFETCH`.
+5b. **Plan-based words** from `PrefillSplit` for layers L+1..L+k (k = 2-3), carried on request frames (queue cap 4,096, per-request
+    take cap, unsent dropped at unit end: r1 verified the rate: ~12 words/request x 8 requests/layer covers ~96 words/layer; raise
+    the take cap for the refill case). Words filtered by the box-2 residency mirror as today.
+5c. **Box-1 in-pipeline admission (optional, own gate).** Victim search that skips the other lane's in-flight picks (as the code
+    itself proposes at `fp:10169-10178`) + a per-task drain; until then P1's box-1 fill is the synchronous bounded stall of sec 4,
+    and `b1_page_misses` keeps short-circuiting `b1_prefetch`.
+Lookahead arithmetic (inferred): k ~ 2-3 layers; resident need ~(k+1) x ~205 experts x 18.8 MB ~ 11-16 GB per box.
 
-## 6. Input pipeline (kills the 23% hub-only gaps)
+## 6. Window-input producer (P2b)
+The 23% hub-only gaps are input prep (embeddings->HC, Engram gather: disk-latency-bound) between units. Inputs depend only on token ids.
+A **continuous producer thread per job** (not scheduler-tick driven: `EngramAhead` does one block per tick, ~5 ticks/window with
+quanta) builds window n+1's inputs during window n's compute into a ring (host RAM ~0.4-0.5 GB at 4K: HC 80 KB/row built
+synchronously today on the scheduler thread, `ms:2703-2742`). Slice P2b-1: producer thread + whole-window `set_window_inputs`
+(replaces per-sub-chunk `set_chunk_inputs`). Slice P2b-2: build HC on the device from the embedding rows (replicate x4 at the layer-0
+seed) to cut host RAM/memcpy. First window of a job pays the prep once (~1.5 s).
 
-Layer 0/1 need, per sub-chunk, the embedding HCs and Engram rows (Engram gather is disk-latency-bound: 1.7 ms/24 cold rows).
-Today they are prepared between units (G0 prep 1.25 s/window + 0.63 s boundaries). Inputs depend only on token ids, not on compute:
-a background producer fills a **ring of per-sub-chunk inputs for window n+1 while window n computes** (host RAM: HC 80 KB/row
-= 336 MB/4K window, so for W >= 8K produce HC on the device from token embeddings instead; Engram rows ~24 KB/row/table).
-Scheduler API: `set_window_inputs` (whole window, lazy mode) replaces the per-sub-chunk `set_chunk_inputs`; `engram_ahead` already
-exists as the producer and moves from "next sub-chunk" to "next window".
+## 7. Pair merge (P4) -- deferred submit, golden gate
+Pairs `pre(2j); pre(2j+1); post(2j-2); post(2j-1)` need the two requests to reach box 2 within `V41_B2_MERGE_WAIT_US` (400 us); today
+the partner follows its own dGPU chain + router readback drain (>= 10 ms later) so no merge fires. Options: (a) split `pre_moe_route`
+so the first request's `submit_dispatch` is DEFERRED until the second is routed and submitted back to back (new plumbing for xq/
+sel/ew/ticket/PinNote/evtrace per lane); (b) raise the wait to ~20 ms (box 2 idles per pair). +2 lane scratch sets (~290 MiB) for
+depth 4. Gate = golden/KLD (row-composition independence of the WMMA kernels is UNVERIFIED), not bitexact. Do after P1-P3 if box 2's
+19 ms floor is still the pole.
 
-## 7. MoE batching (P4)
-
-7a. **Box-2 pair merge.** Change the schedule from depth-2 singles to depth-4 PAIRS: `pre(2j); pre(2j+1); post(2j-2); post(2j-1)`
-with `partner_follows` on the first of each pair so the two requests (same layer, consecutive units) coalesce in box 2's existing
-merge path (`REQ_FLAG_PARTNER`, `V41_B2_MERGE`, 400 us wait) into ONE 1024-row pass: one read of each expert's weights serves both.
-Needs two extra lane-scratch sets (+~290 MiB: dGPU 128 MiB + iGPU 16 MiB each; `sd`/`si` are first-written/last-read inside pre, so
-they stay single). Box-2 `--max-batch` is already 1024. Inferred: box-2 floor per pair ~28 ms vs 2 x 19.4.
-7b. **Hub-side merged MoE** (iGPU kernel sees 1024+ rows): `si`/`bi` resized, merged work-items; larger change, later. The f16 MoE
-arm (`cand_f16.hip`, 1.4-1.7x gate+up at >= 48 members/expert, ~15-26% at 8) is independent and lands in dispatch whenever.
-
-## 8. Phases, gates, estimates (all estimates inferred from the 10-10 breakdown; steady window 8.02 s = 511 rows/s today)
-
+## 8. Phases, gates, estimates (inferred; steady window 8.02 s = 511 rows/s today)
 | phase | change | gate | rollback | estimate (steady window / rows/s) |
 |---|---|---|---|---|
-| P0 | f16 MoE arm into `het::dispatch` (`V41_MOE_WMMA_F16`) | oracle + golden/KLD | knob | -4..-5% |
-| P1 | static prefill split (long jobs) | `verify_routing_exactly_once`, golden/KLD vs old partition, one long A/B with the same evtrace analysis; hub `ensure` stalls in window 1 | knob | ~4.5-5.4 s / 760-900 |
-| P2 | layer-outer driver at W=4096 + input ring | `lm_prefill_bitexact` extended with a layer-outer arm (4 cases), tail-latency of decode interleave | knob | -1..-1.5 s more: ~3.3-3.8 s / 1.1-1.2K |
-| P3 | rolling prefetch + W 8-16K + arena-tail lend | bitexact at W=8192; decode p90; arena reserve/admit races (the lend rules) | knobs | robustness, enables decode-optimal ownership again; ~same or better |
-| P4a | pair merge on box 2 | bitexact (merge is a box-2 pass; f32 association only) | knob | box-2 floor -25%: another -10..-15% |
-Target region after P0-P4a: ~1.3-1.8K rows/s (inferred); 2K needs the dGPU chain and the hub MoE to keep up (no data: device
-timing is off; enable `V41_EVTRACE_DEV` for a short prefill-only window first).
+| P1 | frozen split, all consumers via `PrefillSplit` (long jobs) | `verify_routing_exactly_once`; golden/KLD vs old partition; one long-job A/B with the pf2 evtrace analysis (`n_missing`, window wall); hub `ensure` stall in window 1; decode p90 of the FOLLOWING burst | knob | ~5.0-5.6 s / 730-820 |
+| P2a | layer-outer driver, W=4096 (+ fixes 4,10,12,15) | extended `lm_prefill_bitexact` (split OFF) with a layer-outer arm; live-window golden with box 2 attached (per-task `remote_ticket` ordering) | knob | -0.7 s (boundaries+fill/drain) |
+| P2b | window-input producer | no output change; rows/s | knob | -1.0..-1.2 s |
+| P3 | landing-rank fix + refill words (+5c optional) | loopback landing-rank test; bitexact unaffected; post-decode-burst re-read counts | knobs; box-2 redeploy | robustness (refill) |
+| P4 | deferred-submit pair merge | golden/KLD | knob | box-2 floor -25%: -10..-15% |
+| P0 | f16 MoE arm | oracle + golden/KLD | knob | pays only with 7b/bigger batches |
+Target after P1+P2: ~3.6-4.1 s / 1.0-1.1K rows/s (inferred). 2K is NOT reachable by these alone; it additionally needs the box-2 kernel
+floor, the hub dGPU chain and iGPU MoE to keep up (no device timing in the trace: enable `V41_EVTRACE_DEV` for a short prefill-only window).
 
 ## 9. Test plan
-* CPU (no GPU): a pure task-schedule generator + simulator: for random U (2..16), quantum sizes, layers: assert every (L,u)
-  executes once, I2 order per layer, pre(t) strictly after post(t-2), residual flow (each pre reads the output of its own
-  post(L-1,u)), compressor lend brackets balanced and non-overlapping, drain leaves nothing in flight, quantum boundaries
-  resume correctly (state machine: window open -> quanta -> close).
-* GPU (server DOWN): `lm_prefill_bitexact` + a `layer_outer` arm: fresh / multi-window / restored / lazy+foreign. Compare KV
-  bytes and logits to chunked prefill (same partition). Then a W=8192 case.
-* GPU live-window A/B: evtrace join (the `pf2` scripts), steady-window rows/s, decode p90 across a prefill.
-* Existing guards to keep green: `verify_routing_exactly_once`, the loopback tests for any box-2 change (P4a only needs flags).
+* CPU: task-schedule simulator: random U in 2..16 INCLUDING odd U and empty lane B, quantum sizes, layers: every (L,u) once, I2 order,
+  pre(t) strictly after post(t-2), residual flow, per-unit index-selection/`saved_store` flow (reuse reads its own unit's source write),
+  compressor bracket balanced, drain leaves nothing in flight, window open->quanta->close, replay rows = store rows [W-128, W).
+* GPU (server down): `lm_prefill_bitexact` + `layer_outer` arm (fresh / multi-window / restored / lazy+foreign; split OFF); then W=8192.
+  The test builds its own engine/pager and has no box-2 client, so add a loopback remote or a live-window golden with box 2 attached
+  (reference_gpu_gate_windows: box 2 must be attached).
+* Live A/B: pf2 evtrace join, steady-window rows/s, decode p90 during and after a prefill; box-2 `n_missing`; box-1 `ensure` stalls.
+* P3: loopback test for the landing rank; pin/restore tests unchanged (decode-keyed, r1 verified).
 
-## 10. Risks / open questions (reviewer: please be adversarial here)
-R1. **Drain cost** at quantum ends and any hidden per-task host sync that serialises the pipeline (e.g. `drain_before_ensure`).
-R2. **`indexer_*_saved` exact inventory** and whether reuse layers read them for rows other than the current task's.
-R3. **Compressor lending bracket under the skewed schedule** (pre(L+1,*) interleaves with post(L,*)): confirm post never touches
-    compressor state and that `compressor.take()` while a prior task's kernels are still queued on `dgpu.compute` is safe
-    (the move is of the Rust Option, not device memory; kernels hold device pointers).
-R4. **Image spans / lane cuts**: units must reproduce `plan_chunk` cuts; spans crossing lane or sub-chunk boundaries.
-R5. **dGPU VRAM** for W >= 8K and the lend protocol with `reserve`/`grow`/compaction/`fill_reserved`/parked `try_admit`.
-R6. **Hub pager capacity** under P1 (prefill set ~3.8K + decode hot ~2.3K > 5,425), and hub `ensure` becoming a synchronous
-    stall on box 1's dm-crypt disk in window 1.
-R7. **Scheduler**: `FINISH_GROUP`, burst timing, `checkpoint_ok`, admission of other prefill jobs, `lm_rows`/`lm_store` lifetime.
-R8. **Numerics of the partition change** and of the f16 arm vs the golden gate (already owed for f16 box-2 replies).
-R9. **Whether the hub's dGPU chain or iGPU MoE becomes the pole after P1** (unknown: no device timing in the trace).
-R10. **Replay/decoder layers** keep the decode partition: confirm replay (128 rows through layers 20-39) is unaffected and that
-    its expert residency (decode-hot) is not destroyed by the prefill split.
+## 10. Risks / open questions (round 2: attack these)
+R1 drain cost and hidden per-task host syncs (`drain_before_ensure` `fp:10184-10189`; sync Engram copy).
+R2 completeness of the 3.2 inventory beyond `indexer_saved_store` (every field of `BatchDgpuScratch`/`BatchIgpuScratch` that survives a task).
+R3 P1 capacity margin 90-94% and the box-2 landing/tier behaviour when the set barely fits; filler sizing if the hub pool is not 5,425.
+R4 image spans / lane cuts under layer-outer (units reproduce `plan_chunk`).
+R5 hub `ensure` synchronous stalls (window 1 and after decode bursts).
+R6 scheduler: FINISH_GROUP removal, other prefill jobs, `lm_store` lifetime, producer thread lifecycle and RAM.
+R7 numerics: partition change (golden/KLD), box-2 f16 replies still ungated.
+R8 whether the dGPU chain / hub MoE becomes the pole after P1 (unknown).
+R9 post-job decode warmth: is "head inside the prefill share" enough, or does decode-class LRU on the hub still evict it during the job
+   (decode steps interleaved every 120 s/30 s)?
+R10 replay/decoder layers unaffected by the encoder split (verify).
