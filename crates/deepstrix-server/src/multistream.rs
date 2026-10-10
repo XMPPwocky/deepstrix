@@ -2001,7 +2001,9 @@ impl Sched {
         let mut engram_rows = if engram_on && !live.is_empty() {
             let ec: &crate::engine_worker::EngramCtx = engram.as_ref().expect("engram_on");
             let live = &live;
-            LazyEngramRows::pending(sc.spawn(move || gather_engram_rows(ec, live, b)))
+            // One gather per table, each joined at its own layer (dGPU bundle slice 1).
+            ENGRAM_GATHER_US.store(0, Ordering::Relaxed);
+            LazyEngramRows::pending_tables((0..n_tables).map(|li| sc.spawn(move || gather_engram_table(ec, live, b, li))).collect())
         } else if engram_on {
             // Every live row is DEAD (image rows): zero rows, no reads.
             LazyEngramRows::ready(Some(vec![vec![0f32; b * ein]; n_tables]))
@@ -2780,38 +2782,25 @@ fn engram_threads() -> usize {
 /// Wall time (us) of the last decode-step Engram gather (`ms.step`).
 static ENGRAM_GATHER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn gather_engram_rows(
+/// One Engram table's rows for a decode step, on its own thread so the step joins each table at
+/// its own layer (dGPU bundle slice 1; was one gather of every table joined at layer 1). `ENGRAM_GATHER_US` = the slowest table.
+fn gather_engram_table(
     ec: &crate::engine_worker::EngramCtx,
     live: &[(usize, [[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS])],
     b: usize,
-) -> eyre::Result<Vec<Vec<f32>>> {
+    li: usize,
+) -> eyre::Result<Vec<f32>> {
     let t0 = Instant::now();
-    let threads = engram_threads();
     let ein = ENGRAM_IN as usize;
-    let mut rows = vec![vec![0f32; b * ein]; ec.tables.len()];
-    std::thread::scope(|sc| {
-        let hs: Vec<_> = rows
-            .iter_mut()
-            .enumerate()
-            .map(|(li, out)| {
-                sc.spawn(move || -> eyre::Result<()> {
-                    let flat: Vec<i64> = live.iter().flat_map(|(_, h)| h[li]).collect();
-                    let mut tmp = vec![0f32; live.len() * ein];
-                    ec.tables[li].gather(&ec.st, &flat, &mut tmp, threads)?;
-                    for (k, (r, _)) in live.iter().enumerate() {
-                        out[r * ein..(r + 1) * ein].copy_from_slice(&tmp[k * ein..(k + 1) * ein]);
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-        for h in hs {
-            h.join().map_err(|_| eyre!("engram gather thread panicked"))??;
-        }
-        Ok::<(), eyre::Report>(())
-    })?;
-    ENGRAM_GATHER_US.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Ok(rows)
+    let mut out = vec![0f32; b * ein];
+    let flat: Vec<i64> = live.iter().flat_map(|(_, h)| h[li]).collect();
+    let mut tmp = vec![0f32; live.len() * ein];
+    ec.tables[li].gather(&ec.st, &flat, &mut tmp, engram_threads())?;
+    for (k, (r, _)) in live.iter().enumerate() {
+        out[r * ein..(r + 1) * ein].copy_from_slice(&tmp[k * ein..(k + 1) * ein]);
+    }
+    ENGRAM_GATHER_US.fetch_max(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    Ok(out)
 }
 
 #[cfg(test)]

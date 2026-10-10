@@ -4057,7 +4057,7 @@ impl HeterogeneousEngine {
             let _ctx = super::trace::ctx_layer(layer, 0);
             if weights.dgpu_layers[layer].engram.is_some() {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
+                let rows = match li { Some(i) => engram_rows.table(i)?, None => None };
                 match rows {
                     Some(r) if r.len() >= b * ein => self.stage_engram_rows_batch(bd, &r[..b * ein])?,
                     _ => return Err(eyre!("forward_step_arena: layer {layer} needs Engram rows for {b} rows")),
@@ -4164,7 +4164,7 @@ impl HeterogeneousEngine {
         let mut stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, n: usize| -> eyre::Result<()> {
             if weights.dgpu_layers[layer].engram.is_some() {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
+                let rows = match li { Some(i) => engram_rows.table(i)?, None => None };
                 match rows {
                     Some(r) if r.len() >= (off + n) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + n) * ein])?,
                     _ => return Err(eyre!("forward_step_arena_pipelined: layer {layer} needs Engram rows for {n} rows")),
@@ -4361,7 +4361,7 @@ impl HeterogeneousEngine {
         let mut stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, nrows: usize| -> eyre::Result<()> {
             if weights.dgpu_layers[layer].engram.is_some() {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
+                let rows = match li { Some(i) => engram_rows.table(i)?, None => None };
                 match rows {
                     Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + nrows) * ein])?,
                     _ => return Err(eyre!("forward_step_arena_lanes: layer {layer} needs Engram rows for {nrows} rows")),
@@ -4523,7 +4523,7 @@ impl HeterogeneousEngine {
         let mut stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, nrows: usize| -> eyre::Result<()> {
             if weights.dgpu_layers[layer].engram.is_some() {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
+                let rows = match li { Some(i) => engram_rows.table(i)?, None => None };
                 match rows {
                     Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + nrows) * ein])?,
                     _ => return Err(eyre!("forward_step_arena_ready_first: layer {layer} needs Engram rows for {nrows} rows")),
@@ -12410,19 +12410,46 @@ pub(crate) fn emit_remote_page_slice(
 /// (profile audit 2026-09-21); layers 1 and 14 are the only consumers, so the
 /// SSD reads can hide under layer 0. `get()` joins at most once and counts the
 /// exposed wait into `lh.engram_join`.
+///
+/// PER-TABLE (dGPU bundle slice 1, docs/v41/DGPU_BUNDLE_DESIGN.md 2): with `pending_tables` each
+/// Engram table is gathered on its own thread and joined at ITS layer (`table(i)`), so the layer-14
+/// table hides under 13 more layers instead of blocking the host thread -- both lanes -- at layer 1.
 pub struct LazyEngramRows<'scope> {
     ready: Option<Vec<Vec<f32>>>,
     pending: Option<std::thread::ScopedJoinHandle<'scope, eyre::Result<Vec<Vec<f32>>>>>,
+    tables: Vec<Option<std::thread::ScopedJoinHandle<'scope, eyre::Result<Vec<f32>>>>>,
+    table_rows: Vec<Option<Vec<f32>>>,
 }
 
 impl<'scope> LazyEngramRows<'scope> {
     /// Rows already in hand (or `None` when the model has no Engram layers).
     pub fn ready(rows: Option<Vec<Vec<f32>>>) -> Self {
-        Self { ready: rows, pending: None }
+        Self { ready: rows, pending: None, tables: Vec::new(), table_rows: Vec::new() }
     }
     /// Rows still being gathered on a scoped thread.
     pub fn pending(h: std::thread::ScopedJoinHandle<'scope, eyre::Result<Vec<Vec<f32>>>>) -> Self {
-        Self { ready: None, pending: Some(h) }
+        Self { ready: None, pending: Some(h), tables: Vec::new(), table_rows: Vec::new() }
+    }
+    /// One gather thread per Engram table (index = `config::ENGRAM_LAYERS` position).
+    pub fn pending_tables(hs: Vec<std::thread::ScopedJoinHandle<'scope, eyre::Result<Vec<f32>>>>) -> Self {
+        let n = hs.len();
+        Self { ready: None, pending: None, tables: hs.into_iter().map(Some).collect(), table_rows: vec![None; n] }
+    }
+    /// Table `i`'s rows (`[b * ENGRAM_IN]`), joining only that table's gather (timed into
+    /// `lh.engram_join`); `None` when the model has no Engram layers.
+    pub fn table(&mut self, i: usize) -> eyre::Result<Option<&[f32]>> {
+        if self.tables.is_empty() {
+            return Ok(self.get()?.and_then(|rs| rs.get(i)).map(|v| v.as_slice()));
+        }
+        if let Some(h) = self.tables.get_mut(i).and_then(|h| h.take()) {
+            let t = std::time::Instant::now();
+            let rows = h.join().map_err(|_| eyre!("engram gather thread panicked"))??;
+            if layer_host_timing() {
+                LH_ENGRAM_JOIN.fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.table_rows[i] = Some(rows);
+        }
+        Ok(self.table_rows.get(i).and_then(|r| r.as_deref()))
     }
     pub fn get(&mut self) -> eyre::Result<Option<&[Vec<f32>]>> {
         if let Some(h) = self.pending.take() {
