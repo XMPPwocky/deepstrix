@@ -70,3 +70,32 @@ not apply (the gap categories need re-deriving from pass boundaries: look at `pr
    cases are ~31 min (measured 10-01); run them at a quieter time if you want the complete gate.
 2. ONE hub restart onto the new binary (3-5 min, box 2 stays warm), then everything in section 2 live, no more restarts. Revert `miss_par` on box 2
    (live, ~1 s) before the P1 arm unless you intentionally keep it as the shared baseline.
+
+## 6. RESULTS 2026-10-10 (window 20:42-20:56 UTC, live arms 20:57-21:18 UTC)
+
+* **Gate A PASSED** (14.5 min down incl. restart): `lazy` (2 windows, lazy + foreign interleave) and `restored` (1 window,
+  pos0 1500) BIT-IDENTICAL to chunked prefill (state + logits + 3 decode steps, null clean). Layer-outer verified by pass
+  counts: 13 / 6 units (group-major would be 11 / 5: 5 groups vs 6 quanta per window). Hub on `fc67a363` (b8323821).
+* **Live arms** (one 82,056-token cold prompt per arm; `arms_p1p2a.py`, `arm_windows.py`; window = 4096 rows):
+
+  | arm | wall s | median window s | rows/s | decode stream live |
+  |---|---|---|---|---|
+  | a0 (group-major) | 161.7 | 6.18 | 663 | no |
+  | a0n (null) | 262.0 | 9.49 | 432 | yes |
+  | lo (layer-outer) | 139.7 | 4.95 | 828 | yes |
+  | split (P1) | 216.3 | 7.49 | 547 | yes |
+  | split_lo (P1 + layer-outer) | 119.4 | **3.98** | **1029** | yes |
+  | a0e (group-major) | 253.4 | 9.33 | 439 | yes |
+
+  Group-major windows run ~50% slower whenever another stream is decoding (a0 alone 6.2 s vs 9.3-9.5 s); layer-outer
+  arms held 4.0-4.9 s under the same load. Wall times also carry 20-30 s queueing behind a decode burst and a 30 s burst
+  mid-prefill (scheduler 120 s prefill / 30 s decode). ONE run per arm: repeat before defaulting on.
+  P1 split at job start: lru_slots 5041, owned_now 4485, filler 27 (capped by free LRU; `V41_PAGER_NO_DENSE` would raise
+  it), head 107-115, share2 4894 vs usable2 4570, expected re-reads 324/window (vs ~1146 measured group-major).
+* **Gate B has NO POWER on the live hub.** The arm-0 null itself: KLD(a0 || a0n) 0.275 nats, a0e 0.360, argmax flips;
+  lo 0.306 (inside the null), split_lo 0.532 (above it; one sample). Prefill is not run-to-run reproducible on the live
+  hub by far more than f32 re-association: the leading suspect is box 2's f16 PREFILL replies (`V41_PREFILL_F16_REPLIES`,
+  default on since 10-01, never gated) combined with the live partition moving between runs (it decides which picks get
+  f16-rounded). No inf/NaN logged. Substitution is decode-only. Test: a restart with `V41_PREFILL_F16_REPLIES=0`, then the
+  same null pair. Gate A stays the fidelity proof for layer-outer.
+* Harness bug fixed mid-run: same-prompt snapshots share hashes, so the per-arm trash dir name must be unique (arm suffix).

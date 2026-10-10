@@ -86,7 +86,7 @@ def tokens_of(d):
         return f.read()
 
 
-def move_my_snapshots(t0, n_prompt):
+def move_my_snapshots(t0, n_prompt, arm):
     """Move the full-prompt save (newest dir since t0 with token_count in [n-2, n]) and every dir since t0 whose tokens.bin is a
     prefix of it. Returns the moved names."""
     new = []
@@ -107,7 +107,9 @@ def move_my_snapshots(t0, n_prompt):
     moved = []
     for name, d, n in new:
         if ft.startswith(tokens_of(d)):
-            shutil.move(d, os.path.join(TRASH, name))
+            dst = os.path.join(TRASH, f"{name}.{arm}")
+            assert not os.path.exists(dst), dst
+            os.rename(d, dst)
             moved.append((name[:12], n))
     log(f"  moved my snapshots: {moved}")
     return moved
@@ -130,7 +132,9 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     prompt = build_prompt(a.chars)
     log(f"prompt {len(prompt)} chars")
-    recs, summary = {}, []
+    recs = {}
+    sp = os.path.join(OUT, "summary.json")
+    summary = json.load(open(sp))["runs"] if os.path.exists(sp) else []
     for arm in a.arms.split(","):
         if arm == "split":
             b2_miss_par(1)  # owner: revert miss_par before the P1 arm
@@ -152,14 +156,19 @@ def main():
             recs[arm] = rec
         else:
             log("  AMBIGUOUS dump (other traffic prefilled meanwhile): this arm has no logits")
-        moved = move_my_snapshots(t0, usage.get("prompt_tokens", 0))
+        moved = move_my_snapshots(t0, usage.get("prompt_tokens", 0), arm)
         summary.append({"arm": arm, "knobs": ARMS[arm], "t0": t0, "wall_s": dt, "usage": usage, "dump_records": n_new,
                         "moved": moved})
+        json.dump({"runs": summary}, open(sp, "w"), indent=1)
         time.sleep(5)
     set_knobs({})
     log("knobs restored (our keys removed); box 2 miss_par left at 1")
     # Gate B: KLD vs the arm-0 null
     res = {}
+    for fn in sorted(os.listdir(OUT)):
+        if fn.endswith(".f32") and fn[:-4] not in recs:
+            with open(os.path.join(OUT, fn), "rb") as f:
+                recs[fn[:-4]] = list(struct.unpack(f"<{NV}f", f.read(REC)))
     ref = recs.get("a0")
     if ref:
         for arm, r in recs.items():
@@ -168,7 +177,7 @@ def main():
             am = max(range(NV), key=lambda i: r[i])
             res[arm] = {"kld_vs_a0": kld(ref, r), "argmax": am, "argmax_a0": max(range(NV), key=lambda i: ref[i])}
             log(f"  KLD(a0 || {arm}) = {res[arm]['kld_vs_a0']:.3e}  argmax {am} (a0 {res[arm]['argmax_a0']})")
-    json.dump({"runs": summary, "gate_b": res}, open(os.path.join(OUT, "summary.json"), "w"), indent=1)
+    json.dump({"runs": summary, "gate_b": res}, open(sp, "w"), indent=1)
     log(f"summary -> {OUT}/summary.json")
 
 
