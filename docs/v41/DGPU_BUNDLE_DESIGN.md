@@ -1,106 +1,103 @@
 # dGPU bundle: cut the per-lane-layer dGPU critical path (design, 2026-10-10)
 
-Status: DRAFT rev 1, branch `worktree-dgpu-bundle` (from main 1a95637 = production source). Owner 10-10:
-"Let's go dGPU bundle. Remember, btw -- the dGPU is always on the critical path, because all attention runs
-there, blocking later layers!"
-
-Sources: the 10-06 sweep (`DECODE_IDEAS_SWEEP_2026-10-06.md` lever #4), the 10-10 code map of one decode
-lane-layer's dGPU work and the 10-10 critical-path measurement on interleave traffic (job scratch
-`~/.claude/jobs/749c61d3/tmp/dgpu/measure/`; numbers below are from it unless cited).
+Status: DRAFT rev 2 (review round 1 folded in, section 9), branch `worktree-dgpu-bundle` (from main 1a95637 =
+production source). Owner 10-10: "Let's go dGPU bundle. Remember, btw -- the dGPU is always on the critical
+path, because all attention runs there, blocking later layers!"
 
 ## 0. Decisions
 
-1. **Target: per-lane-layer dGPU WALL latency** (enqueue -> readback ready, and the next chain's start), not
-   busy time or bytes alone. Each lane's cycle is serial: chain -> route -> MoE -> post -> next chain.
-2. **Bit-identical first.** Slices 1-3 change no arithmetic (same kernels, same order of every reduction);
-   each is gated by `multistream_step` G5 bit-exact vs the deployed binary (G-top style). Slice 4 changes a
-   GEMV's row grouping and is judged by KL.
-3. **Every slice behind a live knob** (default ON once gated, so a rollback is one knob line), and every slice
-   measurable: the sampled profile (`V41_MS_PROFILE_SAMPLE`, bundle 0, committed a81d16d) brings `ms.stage`
-   back at ~1/20 of the cost.
-4. **Hub only.** No box-2 change.
+1. **Target: per-lane-layer dGPU WALL latency** (each lane's cycle is serial: chain -> route -> MoE -> post ->
+   next chain), not busy time or bytes alone.
+2. **Bit-identical first**: slices 1-3 change no arithmetic and are gated bit-exact against the deployed source
+   (comparator G5, as the hot split's G-top). A slice that changes picks (not arithmetic) is called out.
+3. **Every change behind a live knob** where it has a runtime alternative; rollback = one knob line.
+4. **Hub only.**
+5. **Measure before folding**: no new graph capture until Step 0c prices multi-node replay overhead.
 
-## 1. The measured picture (interleave traffic, 10-09/10)
+## 1. Baseline -- what we know after review round 1
 
-- dGPU device chain ~510-560 us per lane-layer, unchanged by the hot split; the iGPU MoE leg shrank 10-17%.
-- At <= 4 rows per lane the dGPU side is the LARGEST leg: plain r3 ~912 us (HOL + device + tail) vs iGPU
-  719 vs box 2 684; lone r4 882 / 815 / 702. dGPU share of the cycle 41% weighted, ~50% at low rows.
-- Inside the chain (lone r4, us/lane-layer): q_chain 116 (byte floor 86), output_proj 160 (134), shared
-  expert 87 (63), router 51 (THREE router matvecs since k1: +18), kv_chain 27 (5), attention 35 + indexer 34
-  amortized, mhc_pre_attn 20 + Engram 15 amortized, mix_late 22, combine 19, kv_append 18, mhc post/pre_ffn
-  10 each, rb_pack 9; peer push 43 on `de.xfer` (gates the iGPU MoE).
-- Latency floor 36-41% of `de.compute` work (224-293 us per lane-layer), up from 10-06's 33%.
-- Host: chain enqueue (`lh.pre_moe`) 82-102 us per lane-layer for ~520 us of device work; route block 19-35;
-  the one-lane driver blocks in `sel_sync` for the whole chain (~3% of traffic); the Engram join blocks the
-  single host thread 1.5-3.2 ms per step.
-- A **slow-xfer mode** on 25-48% of steps (peer push 43 -> ~155 us, shared expert ~90 -> ~230 us, +3.9
-  ms/step matched) -- suspected PCIe LCLK DPM; a live pin-vs-auto A/B runs 10-10 02:47-06:47 UTC
-  (`~/scratch-ms/ab_pcie_pin.py`). Not code; listed for completeness (section 6).
-- DES (recalibrated, -4%): handoff -50% +3.4%, launches -30% +2.2%, dense bytes -50% +4.1%, all +7.7%.
+- The 10-10 measurement ran with `V41_MS_PROFILE=1`: ~28 `hipEventRecord` per dGPU lane-layer on every step.
+  **Measured tax** (production, interleave; profile on 10-09 23:40 -> 10-10 02:23 UTC vs off since the 02:24
+  restart, PCIe-pin A/B `auto` blocks only): lone r3 70.4 -> 64.3 ms (-8.7%), r4 76.7 -> 69.9 (-8.9%), r5 85.5
+  -> 81.7 (-4.4%), r6 ~0. Banked by turning it off; `V41_MS_PROFILE_SAMPLE` (bundle 0, a81d16d) brings
+  `ms.stage` back at 1/20 of it. Section 1 of rev 1 (chain 510-560 us, host enqueue 82-102 us, floor 36-41%,
+  DES +7.7%) is inflated by that tax; **re-baseline (Step 0a)** at the bundle's restart: profiled vs
+  unprofiled steps at matched rows (the tax per lane-layer) and `V41_LAYER_HOST_TIMING=1` without events.
+- Unaffected by the tax (relative facts): the hot split cut the iGPU MoE leg 10-17%; at <= 4 rows per lane the
+  dGPU side is the largest leg.
+- The **slow-xfer mode** (25-48% of steps): only the shared expert (excess over its byte floor 22 -> ~140 us)
+  and the SDMA peer push (43 -> ~155 us) stretch; q/out/kv and `rb_pack` (kernel stores over PCIe) do not. The
+  shared expert runs on `de.compute` exactly while the push runs on `de.xfer` -- the 09-25 copy-beside-compute
+  signature (rb_stream copies beside the shared expert slowed it 2.4x; the kernel pack fixed it). The PCIe LCLK
+  pin A/B (running 10-10 02:47-06:47 UTC) tests the other explanation.
 
-## 2. Slice 1: host handoff (bit-identical)
+## 2. Slice 1: cheap host work (bit-identical)
 
-Per lane-layer host work that does not need to exist or can leave the lane path:
+| item | change | note |
+|---|---|---|
+| getenv on the lane path | read once (`lane_env`) for names nobody flips in-process | DONE 17018ca / 1361670 |
+| cache-prior fill loop (FP ~8396-8423: 384 x `partition_box2` + `hot_set::moving` + mirror lookup (5 atomics) + SipHash `pg.is_resident`, ~15-25 us/lane-layer) | per-layer residency BITSETS kept incrementally (pager slot map changes, mirror map updates, hot-set refresh) and the mask built with word ops; the device prior stays a float array (`held ? boost : 0`), filled from the mask | same values, same kernel; top-k stays DIRECT (its live scalars) |
+| post: `vec_add` (moe + shared) then `hc_post_add` (+ remote) | one 3-input combine with the `(moe + shared) + remote` order where `fuse_remote_add` holds; a 2-input `+shared` twin where no remote partial | bit-identical by construction (`hc_post.hip:104-136`); the moe+shared add moves behind box 2's `wait()` (harmless) |
+| `expert_sel_count` (separate kernel + mutex; feeds M62 placement + `REQ_TOUCHED_PF`) | fold the count into `rb_pack` (it already reads `d_selected` / `d_orig_sel`) | consumers unchanged |
+| Engram: both tables joined at layer 1 on the lane path (1.5-3.2 ms/step host block); a blocking null-stream `hipMemcpy` (a device-wide drain) | per-table handle (layer-14 table joins at layer 14); ready-first's Chain(1)/Chain(14) poll `is_finished()` and serve other lanes meanwhile; gather threads write pinned per-(lane, layer) buffers -> `hipMemcpyAsync` on `de.compute` (step-end sync covers lifetime). NEVER enqueue chain(1) before the copy is recorded (an event waited before it is recorded does not wait) | gate with `V41_MS_CTX_CHECK=1` + race probes (the null-stream drain was an implicit sync) |
+| step prologue: per-row blocking null-stream `input_hcs` uploads + pageable `dev.upload` / `pos_per` copies | one pinned batch upload | |
 
-| item | where | change | gain |
-|---|---|---|---|
-| ~20 uncached `getenv` per lane-layer | FP 6810, 7526, 8972, 9151, 9490, 9755, 9781, 9802, 9911, 10087, 10127, 10132, 10171, 10214, 10409, 10675, 10894, 11209, 11652, 11713; `prefill_f32_matvec()` 492 | `LazyLock` / knobs (static ones stay static; none is meant live) | ~20 x ~0.3-1 us |
-| `verify_routing_exactly_once` (prep audit) | FP ~10242 | keep the cheap per-pick ownership count; the O(N_EXPERT) audit only under `V41_ROUTE_AUDIT=1` (debug) | O(384) scan per lane-layer |
-| `Vec` allocations in route (`seen`, `ids`, masks, `sel_wants`, ...) | FP route | per-lane scratch reused across layers | allocator churn |
-| cache-prior `d_prior` H2D (384 f32 from a per-layer pinned slot) | FP 8396-8424 | the prior is exactly `boost x held`: pass a 48-byte held bitmask + the boost scalar as kernel ARGUMENTS of `router_topk` (it is uncaptured) | 1 H2D + 384-float host fill per lane-layer, off the router path |
-| `expert_sel_count` (stats kernel + mutex) | FP 8687 / engine.rs 1801 | skip on decode rows (`DEEPSTRIX_SEL_STATS` stays for prefill) | 1 launch + 1 mutex |
-| post `vec_add` (moe + shared) then `hc_post_add` | FP 11519 / 11797 | one 3-input combine kernel keeping the `(moe + shared) + remote` order (bit-identical by construction: same f32 adds, same order) | 1 launch |
-| Engram rows: blocking null-stream `hipMemcpy` (waits for ALL queued dGPU work incl. the other lane's chain) | FP 3939 | pinned staging + `hipMemcpyAsync` on `de.compute` + an event | removes a device-wide drain twice per step |
-| Engram join on the lane path (`LazyEngramRows::get`, 12352) | FP 4494/4512 | join on a helper / before the step's first chain enqueue (the gather started at sampling, 10-06 sweep #3) | 1.5-3.2 ms/step host block |
-| one-lane driver blocks in `sel_sync` | FP 3968 / 9012 | poll `selected_ready` like ready-first, doing the next chain's host prep meanwhile | ~3% of traffic |
+Dropped from rev 1: the route-audit downgrade (it is O(picks), < 1 us, and guards exactly-once routing),
+one-lane `sel_sync` polling (no host work to overlap in that driver).
 
-Knob: `V41_DGPU_HANDOFF` (default on after gate; off = today's code paths kept verbatim for the A/B).
-Gate: G5a-h + G6 bit-exact, and the deployed-source comparator bit-identical (as G-top).
+## 3. Slice 2 (ranked up): zero-copy peer push
 
-## 3. Slice 2: launch folding (bit-identical)
+The iGPU MoE reads xq / selections / weights straight from the pinned `rb_pack` buffer (or its existing
+`xq_recv -> d_xq_q8k` copy reads from it), waiting on `selected_ready`, instead of three `hipMemcpyPeerAsync`
+on `de.xfer` -- which removes the copy that runs beside the shared expert (the slow-xfer suspect) and 43-155 us
+off the iGPU's start. Per lane-layer predicate with the peer-push FALLBACK when: `b2_mirror::mode() == 2` (route
+rewrites `d_selected` / `d_ew` on the host after the pack), the pack is absent (`rb_pack_on && b <= max rows &&
+pager union`), `xq` is not in the pack (`remote_split_on && rb_u8`), or the f32 `ain` path (WMMA MoE /
+`!xq_pushed`). Overwrite safety by stream order (rb_pack(l+1) follows post(l)'s wait on moe_arrived(l)).
+**Microbench first (window)**: the iGPU has the `hipHostMalloc(0)` allocation mapped, reads are coherent across
+layers (no stale L2), and its read latency/bandwidth on it. Knob `V41_DGPU_ZC_PUSH`.
 
-- **Router block:** the router matvec for l and the k1 look-ahead's for l+1 (and l+2 under k2) are three
-  launches reading three weight matrices with the same input; one kernel with a layer loop (or a grid over
-  layers) does the same arithmetic per output. Then top-k (+ prior bitmask, slice 1), look-ahead top-k, xq
-  quantize and `rb_pack`: with `n_protect` / `dry` moved into device memory (the code comment at FP ~8445
-  says so) the whole block is capturable as ONE graph per (rows, prior on/off, look-ahead on/off, layer 39).
-- **q_chain + kv_chain:** adjacent graphs with no host code between (FP 5338 / 5606): one graph. Also carry
-  the context entry on the previous layer's `hc_post_add` so `mhc_pre_attn` becomes its first node (layer 0
-  keeps today's path).
-- **Attention block:** `attn_meta` (FP 6844) per lane-layer -> a once-per-step device table indexed by
-  (layer class, row); then kv_append, the optional gather, `attn_dec`, output_proj, hc_post and mhc_pre_ffn
-  become one graph per topology class (window-only / dense compressed / gathered top-k). KV-source layers and
-  layers where the indexer fires stay direct (host-decided boundary rows and top-k grids).
-- Folding, not single captures: a one-node graph replay costs +6.7 us GPU vs a direct launch
-  (GRAPH_KEYS_DESIGN 2.11).
-Knobs: `V41_DGPU_FOLD_ROUTER`, `V41_DGPU_FOLD_QKV`, `V41_DGPU_FOLD_ATTN` (live; graphs re-key on change).
+## 4. Slice 3: kernel fusion + graph merge (bit-identical)
 
-## 4. Slice 3: peer push -> zero-copy
+- **Step 0c microbench (window)**: N direct launches vs an N-node replay of the real stage bodies at b = 1/4/8,
+  and a `V41_MS_GRAPHS=0` window arm. Decides whether multi-node graph replay has per-replay overhead.
+- q_chain + kv_chain into one graph (one replay fewer; a pure win if overhead is per replay).
+- Router: the main router matvec and the k1 look-ahead's (2 under k1) in ONE kernel with a layer dimension
+  (each output's reduction unchanged; needs a second logits buffer: the look-ahead overwrites
+  `sd.router_logits` today); main + look-ahead top-k in one launch. Top-k stays direct.
+- Router-block / attention-block CAPTURE only if 0c and the context-slot budget allow (16 of 32 ArenaCtx
+  slots free; a router block needs ~19-20, an attention block 5-6 more; the attention graph must key
+  `eff_n_total_max` / dec_fused eligibility / indexer firing -- the dense class changes every token).
 
-`rb_pack` already lands xq + selections + weights in a pinned host buffer (batch_scratch 1300). The iGPU MoE
-reads it directly (waiting on `selected_ready`) instead of three `hipMemcpyPeerAsync` on `de.xfer` (43 us,
-~155 us in slow-xfer mode, on the iGPU's start). Overwrite safety by stream order (the next `rb_pack` comes
-after the device waits on `moe_arrived`). Unverified: iGPU read bandwidth/latency on that pinned memory and
-coherence -- a microbench gates it. Knob `V41_DGPU_ZC_PUSH`.
+## 5. Slice 4 (last or cut): shared expert merged across lanes
 
-## 5. Slice 4: shared expert merged across lanes (KL-judged)
+Bit-identical only when b_A + b_B <= 8 (dp4a tB arms; above 8 the WMMA f16x arm changes numerics); couples the
+lanes (A's combine behind B's chain enqueue). ~30-40 us per lane-layer when it applies. A/B it last.
 
-The only workable merged-GEMV form (full lockstep measured worse 09-22): hold lane A's shared expert at layer
-l until lane B's router(l), run one pass over [A | B] rows (one 38 MB weight read instead of two), each lane's
-combine reads its slice. Needs a joint row buffer, a graph keyed by b_A + b_B, and changes nothing else.
-Changes the GEMV's row grouping only (each row's dot products are the same per-row reductions in the dp4a /
-WMMA kernels -- verify; if per-row results are bit-identical it is a bit-exact slice). Knob
-`V41_DGPU_SHARED_MERGE`.
+## 6. Missing lever (review #11): host head-of-line in ready-first
 
-## 6. Not code
+The single host thread cannot route/post the other lane while it enqueues a chain (~90 us under the profile).
+Measure `selected_ready -> route start` and `remote ready -> post`; if material, split `chain!` in two phases
+(through `mhc_pre_ffn`, then router onward) and poll the other lanes between them.
 
-- PCIe LCLK pin (the slow-xfer mode): the live A/B decides; persisting needs a NixOS module (udev/oneshot).
-- `GPU_MAX_HW_QUEUES` 4 is full; a side stream for shared+mix (sim +0.5%) needs a queue: not in this bundle.
+## 7. Not code
 
-## 7. Gates and rollout
+- PCIe LCLK pin: the live A/B decides; persisting needs a NixOS module.
+- `GPU_MAX_HW_QUEUES` is full; a shared-expert side stream needs a queue: not in this bundle.
 
-1. Slices built in order, each with host tests; one hub restart window (owner go) gating all built slices:
-   comparator G5 (deployed source) vs the new binary with all bit-identical slices ON = bit-identical; G5a-h
-   + G6 per slice knob off/on; slice 4 under KL bars.
-2. Live: per-slice knob A/B per turn where the effect is per step (no placement state): the per-turn
-   ab_knob.py works here, unlike the hot split.
+## 8. Gates and rollout
+
+One hub restart window (owner go): Step 0a (profile tax re-baseline: sampled profile live), 0c (graph replay
+microbench) and the zero-copy microbench; comparator G5 (deployed source vs new binary, all bit-identical
+slices ON) bit-identical; G5a-h + G6 with each slice knob off/on; `V41_MS_CTX_CHECK=1` arm; a kernel unit test
+for every fused kernel (old vs new on random inputs, exact). Live: per-turn knob A/B (`ab_knob.py`) per slice.
+
+## 9. Review round 1 (2026-10-10, NEEDS REWORK) -> rev 2
+
+1 audit downgrade dropped. 2 baseline re-measured (profile tax, section 1) + Step 0a. 3 zero-copy ranked up
+(section 3). 4 zero-copy fallbacks + microbench. 5 router-block capture conflicts with the prior bitmask arg ->
+top-k stays direct, fusion instead. 6 slot budget stated. 7 slice 4 capped / last. 8 attention-graph keys. 9
+Step 0c before captures. 10 Engram per-table join + poll + pinned async. 11 head-of-line lever (section 6). 12
+incremental residency bitsets. 13 sel_count folded into rb_pack. 14 combine scope + 2-input twin. 15 unit tests
+for fused kernels (gate coverage without box 2). 16 one-lane polling dropped. 17 step prologue batch. 18 k1 = 2
+router matvecs. 19 IQ2/Q2K variants back to per call.
