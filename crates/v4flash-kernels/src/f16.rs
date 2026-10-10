@@ -593,6 +593,47 @@ impl F16Matvec {
         self.matvec_batched_sym(stream, out, weight, x, n_rows, k, batch, sym)
     }
 
+    /// dGPU bundle slice 3 (`V41_DGPU_ROUTER_X2`): `out0 = W0 x` and `out1 = W1 x` (this layer's router
+    /// and the look-ahead's) in ONE `f16_matvec_batched_h20_x2` launch, bit-identical to two
+    /// [`Self::matvec_batched_router`] calls -- only where those take the `_h20` kernel (not z16, h20
+    /// eligible). Returns false (nothing launched) otherwise: the caller runs the two plain launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_batched_router_x2(
+        &self,
+        stream: &Stream,
+        out0: &mut DeviceBuffer<f32>,
+        out1: &mut DeviceBuffer<f32>,
+        w0: &DeviceBuffer<u8>,
+        w1: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<bool> {
+        if batch == 0 || (f16_mv_z16_on() && batch > Z16_ROUTER_MIN_B) || !router_mv_h20_for(k) {
+            return Ok(false);
+        }
+        let expected_weight_bytes = (n_rows as usize) * (k as usize) * 2;
+        if w0.byte_len() != expected_weight_bytes || w1.byte_len() != expected_weight_bytes {
+            return Err(eyre!("f16 matvec_batched_router_x2 weight bytes: have {} / {}, expected {expected_weight_bytes}", w0.byte_len(), w1.byte_len()));
+        }
+        if x.len() < (batch as usize) * (k as usize) {
+            return Err(eyre!("f16 matvec_batched_router_x2 x too small: {}", x.len()));
+        }
+        let need = (batch as usize) * (n_rows as usize);
+        if out0.len() < need || out1.len() < need {
+            return Err(eyre!("f16 matvec_batched_router_x2 out too small: {} / {}", out0.len(), out1.len()));
+        }
+        let function = self.wide.get_function("f16_matvec_batched_h20_x2")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows.div_ceil(GEMV_ROWS_PER_BLOCK), 1, 2 * batch),
+            block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [out0.raw(), out1.raw(), w0.raw(), w1.raw(), x.raw(), k, n_rows, batch])?;
+        Ok(true)
+    }
+
     /// [`Self::matvec_batched`] with the grid.z = ceil(batch / NB) kernels under
     /// `V41_F16_MV_Z16` (see [`f16_mv_z16_on`]); identical outputs, else the
     /// production grid.z = batch launch.

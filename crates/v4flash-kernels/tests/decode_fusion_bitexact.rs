@@ -12,6 +12,9 @@
 //!      `quantize_input_batched(32768)` (heads, xq, xscale).
 //!   5. `HcPost::launch_from_split_batched_add` vs `VecAddInplace::launch` ->
 //!      `HcPost::launch_from_split_batched`.
+//!   6. `HcPost::launch_from_split_batched_add2` (dGPU bundle slice 1).
+//!   7. `F16Matvec::matvec_batched_router_x2` vs two `matvec_batched_router` (dGPU bundle slice 3,
+//!      the router shape 384 x 5120 at b = 1..16 and 48).
 //!
 //! Run: `cargo test --release --features v41 -p v4flash-kernels --test
 //! decode_fusion_bitexact -- --ignored --test-threads=1 --nocapture`.
@@ -20,7 +23,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::fp4_kv::Fp4KvQuant;
 use v4flash_kernels::q8_0::Q8_0Matvec;
-use v4flash_kernels::{HcPost, RmsNorm, RopeParams, RopeTail, VecAddInplace};
+use v4flash_kernels::{F16Matvec, HcPost, RmsNorm, RopeParams, RopeTail, VecAddInplace};
 
 fn pick_dgpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -91,6 +94,7 @@ fn decode_fusions_match_their_chains() -> eyre::Result<()> {
     let q8 = Q8_0Matvec::for_arch(&arch)?;
     let hcp = HcPost::for_arch(&arch)?;
     let vadd = VecAddInplace::for_arch(&arch)?;
+    let f16 = F16Matvec::for_arch(&arch)?;
     let mut rng = Lcg(0x5EED_D00D);
     const BMAX: usize = 16;
     let eps = 1e-6f32;
@@ -201,6 +205,58 @@ fn decode_fusions_match_their_chains() -> eyre::Result<()> {
         assert_eq!(f32_diff(&download(&o2a)?, &download(&o2f)?), 0, "hc_post_add (shared) differs at b={b}");
         eprintln!("b={b}: kv / q copy / heads (plain + yarn), q_a rms_quant, hc_post_add, hc_post_add2 bit-exact");
     }
-    eprintln!("PASS: {cases} rope-param cases + 16 rms_quant / hc_post_add / hc_post_add2 batches bit-exact");
+    // 7. the fused router (`V41_DGPU_ROUTER_X2`): this layer's and the look-ahead's gate matvec.
+    let (n_exp, k) = (384u32, 5120u32);
+    let w16 = |rng: &mut Lcg| -> Vec<u8> {
+        (0..n_exp * k)
+            .flat_map(|_| {
+                let r = rng.next();
+                // sign | exponent 6..21 (|w| ~ 2^-9 .. 2^6) | mantissa
+                let h = ((r >> 31) << 15) as u16 | ((6 + (r >> 10) % 16) << 10) as u16 | (r & 0x3FF) as u16;
+                h.to_le_bytes()
+            })
+            .collect()
+    };
+    let w0 = upload(id, &w16(&mut rng))?;
+    let w1 = upload(id, &w16(&mut rng))?;
+    for b in (1..=BMAX as u32).chain([48]) {
+        let x = upload(id, &(0..b * k).map(|_| rng.val(2.0)).collect::<Vec<f32>>())?;
+        let mut a0 = upload(id, &vec![f32::NAN; (b * n_exp) as usize])?;
+        let mut a1 = upload(id, &vec![f32::NAN; (b * n_exp) as usize])?;
+        let mut f0 = upload(id, &vec![f32::INFINITY; (b * n_exp) as usize])?;
+        let mut f1 = upload(id, &vec![f32::INFINITY; (b * n_exp) as usize])?;
+        f16.matvec_batched_router(&stream, &mut a0, &w0, &x, n_exp, k, b)?;
+        f16.matvec_batched_router(&stream, &mut a1, &w1, &x, n_exp, k, b)?;
+        assert!(f16.matvec_batched_router_x2(&stream, &mut f0, &mut f1, &w0, &w1, &x, n_exp, k, b)?, "x2 declined at b={b}");
+        stream.synchronize()?;
+        assert_eq!(f32_diff(&download(&a0)?, &download(&f0)?), 0, "router_x2 out0 differs at b={b}");
+        assert_eq!(f32_diff(&download(&a1)?, &download(&f1)?), 0, "router_x2 out1 differs at b={b}");
+        if b <= 8 || b == 48 {
+            // Paired timing (device + launch, back to back, 200 reps each, alternating order).
+            let reps = 200;
+            let (mut t2, mut t1) = (0f64, 0f64);
+            for round in 0..4 {
+                for arm in [round % 2, 1 - round % 2] {
+                    stream.synchronize()?;
+                    let t = std::time::Instant::now();
+                    for _ in 0..reps {
+                        if arm == 0 {
+                            f16.matvec_batched_router(&stream, &mut a0, &w0, &x, n_exp, k, b)?;
+                            f16.matvec_batched_router(&stream, &mut a1, &w1, &x, n_exp, k, b)?;
+                        } else {
+                            f16.matvec_batched_router_x2(&stream, &mut f0, &mut f1, &w0, &w1, &x, n_exp, k, b)?;
+                        }
+                    }
+                    stream.synchronize()?;
+                    let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                    if round > 0 {
+                        if arm == 0 { t2 += us } else { t1 += us }
+                    }
+                }
+            }
+            eprintln!("b={b}: router_x2 bit-exact; two launches {:.1} us, x2 {:.1} us", t2 / 3.0, t1 / 3.0);
+        }
+    }
+    eprintln!("PASS: {cases} rope-param cases + 16 rms_quant / hc_post_add / hc_post_add2 batches + 17 router_x2 batches bit-exact");
     Ok(())
 }

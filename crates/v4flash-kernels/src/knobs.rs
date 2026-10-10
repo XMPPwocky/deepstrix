@@ -798,6 +798,12 @@ crate::knobs! {
     /// `V41_B2_SOFT_HINT` (default off; live): the look-ahead filter treats a soft-held expert as
     /// resident (no hint for it).
     pub static B2_SOFT_HINT = Knob::flag("V41_B2_SOFT_HINT", false).live();
+    /// `V41_DGPU_ROUTER_X2` (default on; live, read per lane-layer): dGPU bundle slice 3 -- this
+    /// layer's router matvec and the k1 look-ahead's (layer l+1) in ONE launch over the same input
+    /// (`F16Matvec::matvec_batched_router_x2`), bit-identical; only on the DIRECT (uncaptured) router path
+    /// (stage_b's R1 at decode rows), so a captured / replayed router never disagrees with the look-ahead
+    /// site about who computed layer l+1's logits.
+    pub static DGPU_ROUTER_X2 = Knob::flag("V41_DGPU_ROUTER_X2", true).live();
     /// `V41_MS_GRAPHS` (default on; live since 2026-10-10, read at each arena stage's start):
     /// `forward_prefill::ms_graphs` -- the arena stage graphs; off = direct launches. Step 0c
     /// (tests/bench_graph_replay.rs) measured ~6.5 us of device time per graph replay vs < 1 us of

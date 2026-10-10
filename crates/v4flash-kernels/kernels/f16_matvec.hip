@@ -220,13 +220,15 @@ __device__ __forceinline__ float mv_row_hoisted(const __half* __restrict__ wr, c
     return acc;
 }
 
+// One output row of batch row `bz` (`mv_body` = grid.z is the batch row; the `_x2` kernel maps
+// grid.z to (weight, batch row) and runs this same body).
 template <unsigned CH>
-__device__ __forceinline__ void mv_body(float* __restrict__ out, const __half* __restrict__ weight,
-                                        const float* __restrict__ x, unsigned int k, unsigned int n_rows) {
+__device__ __forceinline__ void mv_body_bz(float* __restrict__ out, const __half* __restrict__ weight,
+                                           const float* __restrict__ x, unsigned int k, unsigned int n_rows,
+                                           uint32_t bz) {
     uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
     uint32_t lane = threadIdx.x & 31u;
     if (row >= n_rows) return;
-    const uint32_t bz = blockIdx.z;
     const __half* wr = weight + (size_t)row * (size_t)k;
     const float* xb = x + (size_t)bz * (size_t)k;
     float acc;
@@ -240,6 +242,12 @@ __device__ __forceinline__ void mv_body(float* __restrict__ out, const __half* _
     if (lane == 0) out[(size_t)bz * (size_t)n_rows + row] = acc;
 }
 
+template <unsigned CH>
+__device__ __forceinline__ void mv_body(float* __restrict__ out, const __half* __restrict__ weight,
+                                        const float* __restrict__ x, unsigned int k, unsigned int n_rows) {
+    mv_body_bz<CH>(out, weight, x, k, n_rows, blockIdx.z);
+}
+
 extern "C" __global__ __launch_bounds__(256) void f16_matvec_batched_h20(
         float          * __restrict__ out,        // [B, n_rows]
         const __half   * __restrict__ weight,     // [n_rows, k]
@@ -247,6 +255,28 @@ extern "C" __global__ __launch_bounds__(256) void f16_matvec_batched_h20(
         unsigned int     k,
         unsigned int     n_rows) {
     mv_body<20>(out, weight, x, k, n_rows);       // 8 chunks of 20 at k = 5120
+}
+
+// f16_matvec_batched_h20_x2 — dGPU bundle slice 3 (`V41_DGPU_ROUTER_X2`): TWO weights over the SAME
+// input in one launch -- this layer's router and the predicted-miss look-ahead's (layer l+1) -- grid
+// (ceil(n_rows/8), 1, 2 * batch): z < batch -> (w0, out0) row z, else (w1, out1) row z - batch. Each
+// output runs `mv_body_bz<20>` -- `mv_body<20>`'s own body, so out0 / out1 are BIT-IDENTICAL
+// to two `f16_matvec_batched_h20` launches.
+extern "C" __global__ __launch_bounds__(256) void f16_matvec_batched_h20_x2(
+        float          * __restrict__ out0,       // [B, n_rows]
+        float          * __restrict__ out1,       // [B, n_rows]
+        const __half   * __restrict__ w0,         // [n_rows, k]
+        const __half   * __restrict__ w1,         // [n_rows, k]
+        const float    * __restrict__ x,          // [B, k]
+        unsigned int     k,
+        unsigned int     n_rows,
+        unsigned int     batch) {
+    const uint32_t z = blockIdx.z;
+    if (z < batch) {
+        mv_body_bz<20>(out0, w0, x, k, n_rows, z);
+    } else {
+        mv_body_bz<20>(out1, w1, x, k, n_rows, z - batch);
+    }
 }
 
 // f16_matvec_batched_z16_n<NB> — f16_matvec_batched with the batch split into

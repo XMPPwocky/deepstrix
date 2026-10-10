@@ -734,6 +734,9 @@ pub struct BatchDgpuShared {
     /// `[B, N_EXPERT]` — gate logits; read by router_topk (P9) which
     /// writes the per-lane `d_selected` / `d_ew`.
     pub router_logits: DeviceBuffer<f32>,
+    /// The look-ahead's (layer l+1) logits when the fused router launch computed them
+    /// (`V41_DGPU_ROUTER_X2`); the unfused look-ahead reuses `router_logits`.
+    pub router_logits2: DeviceBuffer<f32>,
     /// Look-ahead routing (multistream prefetch): next layer's top-k on this
     /// layer's router input. `[B_MAX * N_EXPERT_USED]`.
     pub look_sel: DeviceBuffer<i32>,
@@ -1755,6 +1758,7 @@ impl BatchDgpuShared {
             attn_out,
 
             router_logits: mk_f32(N_EXPERT as usize)?,
+            router_logits2: mk_f32(N_EXPERT as usize)?,
             look_sel: mk_i32(N_EXPERT_USED)?,
             look_ew: mk_f32(N_EXPERT_USED)?,
             look_sel2: mk_i32(N_EXPERT_USED)?,

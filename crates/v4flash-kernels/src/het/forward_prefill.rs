@@ -1944,6 +1944,11 @@ pub struct StageCap<'a> {
 }
 
 impl<'a> StageCap<'a> {
+    /// The stage body launches straight onto the stream: neither replayed (`skip`) nor captured.
+    pub fn is_direct(&self) -> bool {
+        !self.skip && !self.capturing
+    }
+
     /// Finish: on a fresh capture, instantiate, store and launch it.
     pub fn end(mut self) -> eyre::Result<()> {
         if self.capturing {
@@ -8337,7 +8342,31 @@ impl HeterogeneousEngine {
         // wide when n_rows >= 64 (N_EXPERT=256 ≥ 64); a future wide-
         // batched variant could remove the per-token launch overhead.)
         // ========================================================
+        // Look-ahead routing (arena only): the NEXT layer's router on THIS
+        // layer's router input, read back with the picks below. MEASURED
+        // 2026-09-22 on live agent traffic: 62% (encoder) / 75% (decoder) of
+        // next-layer picks predicted; break-even is ~40%. Under the
+        // predicted-miss prefetch knob `V41_B2_MISS_PREFETCH` (`het::lookahead`,
+        // design 2.1) and/or the legacy opt-in `V41_LOOKAHEAD_PREFETCH=1`;
+        // layer+2 only under `k2` (or the legacy var's depth with the knob
+        // off). `mp` is this STEP's knob snapshot, carried to `pre_moe_route`:
+        // the readback pack below and its reader decide the `look` segments
+        // from the same copy (a live knob flipping between them would leave
+        // the pack and its reader disagreeing).
+        let mp = super::lookahead::cfg();
+        let (g_next, g_next2) = super::lookahead::look_gates(mp.mode, lookahead_prefetch(), lookahead_depth());
+        let look_next: Option<&DgpuLayerWeights> = match &rows {
+            RowLayout::Arena { next_router, .. } if g_next => next_router.filter(|nl| !nl.is_hash_router),
+            _ => None,
+        };
+        let look_next2: Option<&DgpuLayerWeights> = match &rows {
+            RowLayout::Arena { next_router2, .. } if g_next2 => next_router2.filter(|nl| !nl.is_hash_router),
+            _ => None,
+        };
         let _t_router = de.events.stage("dgpu.router", &de.compute)?;
+        // dGPU bundle slice 3 (`V41_DGPU_ROUTER_X2`): the look-ahead's matvec rode this layer's router
+        // launch (into `sd.router_logits2`); the look-ahead site below then only runs its top-k.
+        let mut look_fused = false;
         // 2.11 R1: one fp32 gate matvec (no WMMA at b <= 64) -> direct under `stage_b`.
         let r1_router = ctx.is_some() && !router_wmma_for(b);
         let cap = self.stage_cap(de, "g.router_matvec", layer as usize, b, lane_ptr, cap_ok && !r1_router)?;
@@ -8384,16 +8413,34 @@ impl HeterogeneousEngine {
                     b,
                 )?;
             } else {
-                // `V41_ROUTER_MV_H20` (f16.rs): hoisted-load twin, bit-identical.
-                de.f16.matvec_batched_router(
-                    &de.compute,
-                    &mut sd.router_logits,
-                    &dlw.ffn_gate_inp.buffer,
-                    &bd.ffn_input_norm,
-                    N_EXPERT,
-                    N_EMBD,
-                    b,
-                )?;
+                // Fused with the look-ahead's matvec only on the direct (uncaptured) path.
+                if crate::knobs::DGPU_ROUTER_X2.on() && cap.is_direct() {
+                    if let Some(nl) = look_next {
+                        look_fused = de.f16.matvec_batched_router_x2(
+                            &de.compute,
+                            &mut sd.router_logits,
+                            &mut sd.router_logits2,
+                            &dlw.ffn_gate_inp.buffer,
+                            &nl.ffn_gate_inp.buffer,
+                            &bd.ffn_input_norm,
+                            N_EXPERT,
+                            N_EMBD,
+                            b,
+                        )?;
+                    }
+                }
+                if !look_fused {
+                    // `V41_ROUTER_MV_H20` (f16.rs): hoisted-load twin, bit-identical.
+                    de.f16.matvec_batched_router(
+                        &de.compute,
+                        &mut sd.router_logits,
+                        &dlw.ffn_gate_inp.buffer,
+                        &bd.ffn_input_norm,
+                        N_EXPERT,
+                        N_EMBD,
+                        b,
+                    )?;
+                }
             }
         }
         // Vision-Exp: contiguous runs of image rows (token id >= N_VOCAB,
@@ -8402,27 +8449,6 @@ impl HeterogeneousEngine {
         // rows keep exp_probs_b / tid2eid, bit-identical to before.
         }
         cap.end()?;
-        // Look-ahead routing (arena only): the NEXT layer's router on THIS
-        // layer's router input, read back with the picks below. MEASURED
-        // 2026-09-22 on live agent traffic: 62% (encoder) / 75% (decoder) of
-        // next-layer picks predicted; break-even is ~40%. Under the
-        // predicted-miss prefetch knob `V41_B2_MISS_PREFETCH` (`het::lookahead`,
-        // design 2.1) and/or the legacy opt-in `V41_LOOKAHEAD_PREFETCH=1`;
-        // layer+2 only under `k2` (or the legacy var's depth with the knob
-        // off). `mp` is this STEP's knob snapshot, carried to `pre_moe_route`:
-        // the readback pack below and its reader decide the `look` segments
-        // from the same copy (a live knob flipping between them would leave
-        // the pack and its reader disagreeing).
-        let mp = super::lookahead::cfg();
-        let (g_next, g_next2) = super::lookahead::look_gates(mp.mode, lookahead_prefetch(), lookahead_depth());
-        let look_next: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router, .. } if g_next => next_router.filter(|nl| !nl.is_hash_router),
-            _ => None,
-        };
-        let look_next2: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router2, .. } if g_next2 => next_router2.filter(|nl| !nl.is_hash_router),
-            _ => None,
-        };
         // Router alternatives (`V41_ROUTER_ALTS`) only where they are used: decode
         // rows (box-2 miss substitution) or when the pick trace records them.
         // Prefill chunks otherwise skip the extra argmax passes and readbacks.
@@ -8646,8 +8672,11 @@ impl HeterogeneousEngine {
         };
         if let Some(nl) = look_next {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
-            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
-            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel, &mut sd.look_ew, &sd.router_logits, nl.router_bias_dev.as_ref(),
+            if !look_fused {
+                de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
+            }
+            let logits = if look_fused { &sd.router_logits2 } else { &sd.router_logits };
+            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel, &mut sd.look_ew, logits, nl.router_bias_dev.as_ref(),
                 N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
         }
         if let Some(nl) = look_next2 {
