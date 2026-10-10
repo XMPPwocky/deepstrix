@@ -48,10 +48,12 @@ fn bench_graph_replay() -> eyre::Result<()> {
     install_panic_handler()?;
     let rounds: usize = std::env::var("BENCH_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
     let b: usize = std::env::var("BENCH_B").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    // `BENCH_ARCH=gfx1151` runs it on the iGPU (beside the live hub: plain events, never ATT there).
+    let want = std::env::var("BENCH_ARCH").unwrap_or_else(|_| "gfx1201".into());
     let dev = Device::all()?
         .into_iter()
-        .find(|d| d.properties().map(|p| p.gcn_arch_name.starts_with("gfx1201")).unwrap_or(false))
-        .ok_or_else(|| eyre!("no gfx1201"))?;
+        .find(|d| d.properties().map(|p| p.gcn_arch_name.starts_with(want.as_str())).unwrap_or(false))
+        .ok_or_else(|| eyre!("no {want}"))?;
     let arch = dev.properties()?.gcn_arch_name;
     dev.set_current()?;
     let id = dev.id;

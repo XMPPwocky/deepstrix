@@ -190,3 +190,11 @@ the 4 stage graphs) is the only graph-side lever.
 workaround, `DEBUG_CLR_KERNARG_HDP_FLUSH_WA`, default false). With both: mode 3 (DeviceKernelArgsHDP),
 direct launches -0.66 us/kernel on the dGPU (7 kernels 28.4 -> 23.8 us); graphs unchanged (their kernargs
 already live in a VRAM pool). Graphs re-A/B'd on c18af233 from 20:00 UTC (direct launches are now cheaper).
+
+**CORRECTION (2026-10-10 20:34 UTC): VRAM kernargs REVERTED.** The flag is process-wide, and on the iGPU
+(gfx1151, kernargs in the DRAM carve-out + an HDP flush per launch) mode 3 roughly DOUBLES every kernel's
+device time (`BENCH_ARCH=gfx1151 bench_graph_replay`, two runs: 7 direct 20.6 -> 40-41 us, 5+2 graphs
+30.5 -> 54-58), ~+2.8 us/kernel on the MoE's critical path, vs the dGPU's ~-1.2. Env line removed (hub
+c18af233 unchanged otherwise). Do NOT set `DEBUG_CLR_KERNARG_HDP_FLUSH_WA` until CLR decides it per device
+(planned: patch `Settings::setKernelArgImpl`, which runs per device with the device's `isa`, in the nix
+flake; gate on the ISA, not `apuSystem_`, which is set only for full-profile agents).
