@@ -489,6 +489,36 @@ pub(crate) fn rb_pack_max_rows() -> u32 {
     *N
 }
 
+/// Process-static env reads on the decode lane path, read ONCE (docs/v41/DGPU_BUNDLE_DESIGN.md 2: ~19
+/// `getenv` per lane-layer -- each takes std's env lock and allocates). Only names no harness flips
+/// mid-process: `DEEPSTRIX_COMP_GEMM` (tests/compressor_gather_ab.rs flips it between arms),
+/// `INDEXER_SCORE_VARIANT` / `INDEXER_TOPK_SELECT` (in-process sweeps) and the compressor / capture-time
+/// variants stay per call.
+mod lane_env {
+    use std::sync::LazyLock;
+    fn is(name: &str, val: &str) -> bool {
+        std::env::var(name).as_deref() == Ok(val)
+    }
+    fn set(name: &str) -> bool {
+        std::env::var(name).is_ok()
+    }
+    pub static GROUP_AUDIT_VERBOSE: LazyLock<bool> = LazyLock::new(|| is("V41_GROUP_AUDIT_VERBOSE", "1"));
+    pub static REMOTE_DBG: LazyLock<bool> = LazyLock::new(|| set("V41_REMOTE_DBG"));
+    pub static INDEXER_FORCE: LazyLock<bool> = LazyLock::new(|| is("V41_INDEXER_FORCE", "1"));
+    pub static ATTN_FUSED: LazyLock<bool> = LazyLock::new(|| std::env::var_os("ATTN_FUSED").is_some());
+    pub static SMALL_B_CATCHALL_HALF: LazyLock<u32> =
+        LazyLock::new(|| std::env::var("V41_SMALL_B_CATCHALL_HALF").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0));
+    pub static PAGER_SYNC_IGPU_OFF: LazyLock<bool> = LazyLock::new(|| is("V41_PAGER_SYNC_IGPU", "0"));
+    pub static SPARSE_REMAP_SYNC: LazyLock<bool> = LazyLock::new(|| is("V41_SPARSE_REMAP_SYNC", "1"));
+    pub static PAGER_SYNC_AFTER_ENSURE: LazyLock<bool> = LazyLock::new(|| set("V41_PAGER_SYNC_AFTER_ENSURE"));
+    pub static IQ2_VARIANT: LazyLock<String> = LazyLock::new(|| std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into()));
+    pub static IQ2_HYBRID_THRESHOLD: LazyLock<u32> =
+        LazyLock::new(|| std::env::var("IQ2_HYBRID_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    pub static Q2K_VARIANT: LazyLock<String> = LazyLock::new(|| std::env::var("Q2K_VARIANT").unwrap_or_else(|_| "kwide2".into()));
+    pub static WINDOW_DBG: LazyLock<bool> = LazyLock::new(|| is("V41_WINDOW_DBG", "1"));
+    pub static COMP_POS_DBG: LazyLock<bool> = LazyLock::new(|| set("V41_COMP_POS_DBG"));
+}
+
 fn prefill_f32_matvec(b: u32) -> bool {
     match std::env::var("V41_PREFILL_F32_MATVEC").ok().as_deref() {
         Some("0") => false,
@@ -5801,7 +5831,7 @@ impl HeterogeneousEngine {
                     let offset = causal_end.saturating_sub(SWA_WINDOW);
                     // KNOWN_BUGS #0b: does the verify attend the SAME slots as
                     // decode? Arithmetic, so cheap to settle. V41_WINDOW_DBG=1.
-                    if i == 0 && std::env::var("V41_WINDOW_DBG").as_deref() == Ok("1") {
+                    if i == 0 && *lane_env::WINDOW_DBG {
                         tracing::info!(
                             layer, pos0, n_raw_before, causal_end, n_per, offset,
                             "window.prefill row0"
@@ -6556,7 +6586,7 @@ impl HeterogeneousEngine {
                 let want = (pos_at(k as u32) + 1) / ratio;
                 if n_comp_after[k] != want {
                     COMP_POS_MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if std::env::var("V41_COMP_POS_DBG").is_ok() {
+                    if *lane_env::COMP_POS_DBG {
                         tracing::warn!(
                             layer, row = k, b, pos0, ratio,
                             got = n_comp_after[k], want,
@@ -6807,7 +6837,7 @@ impl HeterogeneousEngine {
             .as_ref()
             .and_then(|c| c.index_k.as_ref())
             .filter(|_| index_k_enabled() && is_index_source_layer(layer));
-        let v41_force = std::env::var("V41_INDEXER_FORCE").as_deref() == Ok("1");
+        let v41_force = *lane_env::INDEXER_FORCE;
         // A non-source layer may reuse the last source's selection iff it shares the
         // same compressed store AND this lane actually has one saved.
         let s2_reuse = index_k_enabled()
@@ -7523,7 +7553,7 @@ impl HeterogeneousEngine {
                 (comp_kv_buf, n_total_max, 0u32)
             };
 
-            let fused = std::env::var_os("ATTN_FUSED").is_some();
+            let fused = *lane_env::ATTN_FUSED;
             let f32_scores = super::batch_scratch::use_f32_scores();
             // Per-(row, head) stride of `sd.attn_scores` for THIS launch pair.
             // Derived from the buffer's real capacity at this batch, not from
@@ -8969,7 +8999,7 @@ impl HeterogeneousEngine {
             // At large B the union really is ~everything, and there the dense
             // path's single contiguous H2D per role beats 3*|ids| scattered
             // copies, so keep using it. V41_PAGER_UNION=0 forces dense always.
-            if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[pager-stage] L{layer} b={b} union={} unified={} sparse_resid_layer={sparse_resid_layer} bound={moe_group_bound}", super::expert_pager::pager_union_prefill(), prefill_unified_pool()); }
+            if *lane_env::GROUP_AUDIT_VERBOSE { eprintln!("[pager-stage] L{layer} b={b} union={} unified={} sparse_resid_layer={sparse_resid_layer} bound={moe_group_bound}", super::expert_pager::pager_union_prefill(), prefill_unified_pool()); }
             if super::expert_pager::pager_union_prefill() {
                 let _t_pager = LayerHostTimer::start(&LH_PAGER);
                 // Per-layer miss histogram. Box 1 pins ENCODER windows only
@@ -9148,7 +9178,7 @@ impl HeterogeneousEngine {
                     super::b2_mirror::observe_range(layer, &range_host);
                 }
                 drop(_t_d2h);
-                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
+                if *lane_env::GROUP_AUDIT_VERBOSE { eprintln!("[trace] L{layer} A after readback"); }
                 // BOX-2 MISS SUBSTITUTION (`V41_SUB`, het::b2_mirror,
                 // docs/v41/BOX2_MISS_SUBSTITUTION.md). A pick bound for box 2 that the
                 // mirror says box 2 will not hold is swapped for the row's best-ranked
@@ -9487,10 +9517,7 @@ impl HeterogeneousEngine {
                 // <=36. The 170-slot objection that keeps `V41_REPLAY_OFFLOAD`
                 // off is a property of the CED replay's 162-wide union at B=128,
                 // not of a verify.
-                let half = std::env::var("V41_SMALL_B_CATCHALL_HALF")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(0);
+                let half = *lane_env::SMALL_B_CATCHALL_HALF;
                 let in_half = match half {
                     1 => (layer as usize) < crate::config::CED_DECODER_START,
                     2 => (layer as usize) >= crate::config::CED_DECODER_START,
@@ -9736,7 +9763,7 @@ impl HeterogeneousEngine {
                     }
                     super::remote_experts::push_prefetch_words(&words);
                 }
-                if skipped_remote > 0 && std::env::var("V41_REMOTE_DBG").is_ok() {
+                if skipped_remote > 0 && *lane_env::REMOTE_DBG {
                     eprintln!(
                         "[c3-dbg] L{layer} paging {} experts, skipped {skipped_remote} owned by box 2",
                         ids.len()
@@ -9752,7 +9779,7 @@ impl HeterogeneousEngine {
                 // decoder-layer MoE and page nothing here. Box 2's per-layer capacity
                 // must be >= the replay union (162 at B=128) or `ensure_layer` cannot
                 // make them all resident at once for the dispatch.
-                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} B after pick loop"); }
+                if *lane_env::GROUP_AUDIT_VERBOSE { eprintln!("[trace] L{layer} B after pick loop"); }
                 let replay_offload = replay_offload_enabled()
                     && remote_split_on
                     && (layer as usize) >= crate::config::CED_DECODER_START;
@@ -9778,7 +9805,7 @@ impl HeterogeneousEngine {
                     sel_wants = super::b2_mirror::wants_for_box2(&sel_orig, |e| super::expert_pager::partition_box2(layer, e));
                 }
                 sel_host_remote = sel_host;
-                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} C before remote submit: remote_split_on={remote_split_on} remote={} replay_offload={} ids={}", self.remote.is_some(), replay_offload, ids.len()); }
+                if *lane_env::GROUP_AUDIT_VERBOSE { eprintln!("[trace] L{layer} C before remote submit: remote_split_on={remote_split_on} remote={} replay_offload={} ids={}", self.remote.is_some(), replay_offload, ids.len()); }
                 if group_audit() {
                     sel_host_audit = sel_host_remote.clone();
                 }
@@ -9799,7 +9826,7 @@ impl HeterogeneousEngine {
                         };
                         drop(_t_owns);
                         let dry = !remote_exclude();
-                        if std::env::var("V41_REMOTE_DBG").is_ok() {
+                        if *lane_env::REMOTE_DBG {
                             let n_owned = owns.iter().filter(|&&o| o).count();
                             let picks_remote = sel_host_remote
                                 .iter()
@@ -9908,7 +9935,7 @@ impl HeterogeneousEngine {
                         drop(_t_rsync);
                         // Hash what box 1 SENDS. If xq repeats across layers, the stale
                         // value is box 1's own `ffn_input_norm`, not anything remote.
-                        if std::env::var("V41_REMOTE_DBG").is_ok() {
+                        if *lane_env::REMOTE_DBG {
                             let mut hx: u64 = 0xcbf29ce484222325;
                             for &v in xq_host.iter().step_by(37) {
                                 hx ^= v as u64;
@@ -10084,7 +10111,7 @@ impl HeterogeneousEngine {
         if let Some(pg) = pager.as_deref_mut() {
             if super::expert_pager::pager_union_prefill() {
                 let _t_pager = LayerHostTimer::start(&LH_PAGER);
-                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} D at ensure site"); }
+                if *lane_env::GROUP_AUDIT_VERBOSE { eprintln!("[trace] L{layer} D at ensure site"); }
                 // RACE GUARD (see the note at the top of this block), now paid
                 // ONLY when this `ensure` can actually write (2026-09-22).
                 //
@@ -10124,12 +10151,12 @@ impl HeterogeneousEngine {
                 // come back for these picks with the wait already over.
                 let ensure_may_evict = !replay_offload
                     && (!sparse_resid || ids.iter().any(|&e| !pg.is_resident(layer as i32, e)));
-                if drain_before_ensure && ensure_may_evict && std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
+                if drain_before_ensure && ensure_may_evict && !*lane_env::PAGER_SYNC_IGPU_OFF {
                     let _t_isync = LayerHostTimer::start(&LH_PAGER_SYNC_IGPU);
                     self.igpu.compute.synchronize()?;
                 }
                 let _t_ensure = LayerHostTimer::start(&LH_ENSURE);
-                let audit_v = std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1");
+                let audit_v = *lane_env::GROUP_AUDIT_VERBOSE;
                 if audit_v {
                     eprintln!("[ensure-audit] L{layer} b={b} replay_offload={replay_offload} sparse_resid={sparse_resid} ids={} first={:?} owns_remote={} remote_split_on={remote_split_on}",
                         ids.len(), ids.first(), owns_remote_some);
@@ -10168,7 +10195,7 @@ impl HeterogeneousEngine {
                     // layer L's MoE is still queued, layer L's kernel reads
                     // L+1's remap: right expert ids, wrong weights, no error.
                     // That asymmetry is exactly why only the sparse view breaks.
-                    if std::env::var("V41_SPARSE_REMAP_SYNC").as_deref() == Ok("1") {
+                    if *lane_env::SPARSE_REMAP_SYNC {
                         self.igpu.compute.synchronize()?;
                         self.dgpu.compute.synchronize()?;
                     }
@@ -10211,7 +10238,7 @@ impl HeterogeneousEngine {
                 // DIAGNOSTIC (multi-stream harness): `V41_PAGER_SYNC_AFTER_ENSURE=1`
                 // drains BOTH devices after paging, before the MoE dispatch reads
                 // the pool — tests whether missed experts can be read before they land.
-                if std::env::var("V41_PAGER_SYNC_AFTER_ENSURE").is_ok() {
+                if *lane_env::PAGER_SYNC_AFTER_ENSURE {
                     self.igpu.device.set_current()?;
                     self.igpu.device.synchronize()?;
                     self.dgpu.device.set_current()?;
@@ -10290,7 +10317,7 @@ impl HeterogeneousEngine {
                     pg.sync_remap_async(layer as i32, &self.igpu.compute)?;
                 }
             } else {
-                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[pager-stage] L{layer} b={b} -> ensure_layer_dense (union off)"); }
+                if *lane_env::GROUP_AUDIT_VERBOSE { eprintln!("[pager-stage] L{layer} b={b} -> ensure_layer_dense (union off)"); }
                 pg.ensure_layer_dense(layer as i32)?;
                 // Non-union branch: same one stream-ordered upload.
                 pg.sync_remap_async(layer as i32, &self.igpu.compute)?;
@@ -10406,7 +10433,7 @@ impl HeterogeneousEngine {
                 routed_src.gate.dtype,
                 routed_src.down.dtype,
                 self.igpu.is_gfx11,
-                &std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into()),
+                &*lane_env::IQ2_VARIANT,
                 super::dispatch::igpu_moe_wmma_env_enabled(),
             );
         let xq_bytes = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
@@ -10672,7 +10699,7 @@ impl HeterogeneousEngine {
         ie.compute.wait_event(&sev.selected_pushed)?;
         // f16 WMMA MoE path (2026-09-08): f16 activations end to end, no
         // Q8_K quantize on either side of the gate/up. See dispatch.rs.
-        let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into());
+        let variant_peek = lane_env::IQ2_VARIANT.clone();
         let wmma_path = super::dispatch::igpu_moe_wmma_selected(
             routed_src.gate.dtype,
             routed_src.down.dtype,
@@ -10833,7 +10860,7 @@ impl HeterogeneousEngine {
                     // builder filled and, for row 0's picks, id / remap / pager slot /
                     // a checksum of the slot's gate bytes — the per-history diff of the
                     // batched MoE's bookkeeping.
-                    if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") {
+                    if *lane_env::GROUP_AUDIT_VERBOSE {
                         let groups: Vec<(usize, i32)> = gc.iter().enumerate().filter(|(_, &c)| c != 0).map(|(g, &c)| (g, c)).collect();
                         eprintln!("[group-audit] L{layer} b={b} enqueued={enqueued} expected={expected} bound={moe_group_bound} max_per_expert={max_per_expert} groups(slot:count)={groups:?}");
                         if let Some(pg) = pager.as_deref() {
@@ -10891,10 +10918,7 @@ impl HeterogeneousEngine {
         // assigns it inside its else-branch, hybrid path leaves it 0 (which
         // is fine — Q2K_VARIANT=by_expert is forbidden with hybrid below).
         let mut n_work_items: u32 = 0;
-        let threshold: u32 = std::env::var("IQ2_HYBRID_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let threshold: u32 = *lane_env::IQ2_HYBRID_THRESHOLD;
         if variant == "hybrid" && routed_src.gate.dtype != v4flash_core::gguf::GgufType::IQ2_XXS {
             return Err(eyre!(
                 "IQ2_VARIANT=hybrid unsupported on a layer with {:?} gate/up \
@@ -11206,7 +11230,7 @@ impl HeterogeneousEngine {
             // by_expert. kwide/by_expert/bxn stay opt-in.
             let down_dt = routed_src.down.dtype;
             let q2k_variant = if down_dt == v4flash_core::gguf::GgufType::Q2_K {
-                std::env::var("Q2K_VARIANT").unwrap_or_else(|_| "kwide2".into())
+                lane_env::Q2K_VARIANT.clone()
             } else {
                 // IQ3_XXS / MXFP4 implement only the kwide2 shape; the
                 // env variants are Q2_K-only.
@@ -11649,7 +11673,7 @@ impl HeterogeneousEngine {
                 // artifact. This distinguishes "box 2 sent the same bytes for
                 // two layers" (a routing bug) from "box 1 read stale device
                 // memory" (a stream-ordering artifact).
-                if std::env::var("V41_REMOTE_DBG").is_ok() {
+                if *lane_env::REMOTE_DBG {
                     let mut h: u64 = 0xcbf29ce484222325;
                     for &v in src.iter().step_by(97) {
                         h ^= v.to_bits() as u64;
@@ -11710,7 +11734,7 @@ impl HeterogeneousEngine {
         // push OVERWRITES the addition — which is exactly what happened: the
         // buffer measurably changed (34.71 -> 35.76) and the logits came out
         // BIT-IDENTICAL to not adding at all.
-        if std::env::var("V41_REMOTE_DBG").is_ok() && bd.remote_ffn_moe.is_some() {
+        if *lane_env::REMOTE_DBG && bd.remote_ffn_moe.is_some() {
             // Does the exclusion actually remove mass from the local leg, and is
             // the remote's partial the right size to replace it? If the local
             // norm here matches a no-split run, the iGPU never skipped anything
@@ -11755,7 +11779,7 @@ impl HeterogeneousEngine {
                 remote,
                 b * N_EMBD,
             )?;
-            if std::env::var("V41_REMOTE_DBG").is_ok() {
+            if *lane_env::REMOTE_DBG {
                 // Did the add actually change the buffer hc_post reads? If
                 // after == before, the vec_add is dead and everything upstream
                 // of it is irrelevant.
