@@ -21,11 +21,20 @@ OUT = "/home/claude-code/gateb_20261010"
 NV = 129280
 REC = NV * 4
 B2 = "10.43.0.95"
-OURS = ("V41_LM_LAYER_OUTER", "V41_PREFILL_SPLIT")
+OURS = ("V41_LM_LAYER_OUTER", "V41_PREFILL_SPLIT", "V41_MOE_WMMA_F16")
 ARMS = {
     "a0": {}, "a0n": {}, "lo": {"V41_LM_LAYER_OUTER": "1"},
     "split": {"V41_PREFILL_SPLIT": "1"}, "split_lo": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1"}, "a0e": {},
+    "split_lo_f16": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1", "V41_MOE_WMMA_F16": "1"},
 }
+
+
+def arm_knobs(arm):
+    """`a0_2`, `split_lo_3`, ...: a repeat of the base arm (unique name for its logits file and snapshot trash)."""
+    if arm in ARMS:
+        return ARMS[arm]
+    base = arm.rsplit("_", 1)[0]
+    return ARMS[base]
 
 
 def log(*a):
@@ -128,7 +137,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default="a0,a0n,lo,split,split_lo,a0e")
     ap.add_argument("--chars", type=int, default=260000)
+    ap.add_argument("--out", default=OUT)
+    ap.add_argument("--no-miss-par", action="store_true", help="do not touch box 2's miss_par")
     a = ap.parse_args()
+    globals()["OUT"] = a.out
     os.makedirs(OUT, exist_ok=True)
     prompt = build_prompt(a.chars)
     log(f"prompt {len(prompt)} chars")
@@ -136,10 +148,10 @@ def main():
     sp = os.path.join(OUT, "summary.json")
     summary = json.load(open(sp))["runs"] if os.path.exists(sp) else []
     for arm in a.arms.split(","):
-        if arm == "split":
+        if arm == "split" and not a.no_miss_par:
             b2_miss_par(1)  # owner: revert miss_par before the P1 arm
-        log(f"== arm {arm}: {ARMS[arm]}")
-        set_knobs(ARMS[arm])
+        log(f"== arm {arm}: {arm_knobs(arm)}")
+        set_knobs(arm_knobs(arm))
         sz0 = os.path.getsize(DUMP) if os.path.exists(DUMP) else 0
         t0 = time.time()
         dt, usage, text = chat(prompt)
@@ -157,7 +169,7 @@ def main():
         else:
             log("  AMBIGUOUS dump (other traffic prefilled meanwhile): this arm has no logits")
         moved = move_my_snapshots(t0, usage.get("prompt_tokens", 0), arm)
-        summary.append({"arm": arm, "knobs": ARMS[arm], "t0": t0, "wall_s": dt, "usage": usage, "dump_records": n_new,
+        summary.append({"arm": arm, "knobs": arm_knobs(arm), "t0": t0, "wall_s": dt, "usage": usage, "dump_records": n_new,
                         "moved": moved})
         json.dump({"runs": summary}, open(sp, "w"), indent=1)
         time.sleep(5)
