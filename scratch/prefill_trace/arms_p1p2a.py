@@ -28,6 +28,7 @@ ARMS = {
     "split_lo_f16": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1", "V41_MOE_WMMA_F16": "1"},
     "i8": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1"},
     "f16": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1", "V41_MOE_WMMA_F16": "1"},
+    "f16_dev": {"V41_PREFILL_SPLIT": "1", "V41_LM_LAYER_OUTER": "1", "V41_MOE_WMMA_F16": "1"},
 }
 
 
