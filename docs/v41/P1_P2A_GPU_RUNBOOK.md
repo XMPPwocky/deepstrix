@@ -29,10 +29,17 @@ the effective table is written to `<file>.effective`; write a temp file and `mv`
 (next window onwards), the split per LONG JOB (next long job onwards). So after ONE restart onto the new binary (with NO new env vars) every
 arm below is a file edit, no restart:
 * **Arm 0 baseline:** knob file without the new keys = today's behaviour (group-major, decode partition).
-* **Gate B (live golden, box 2 attached):** the same >= 64K-token cold prompt twice with `V41_PREFILL_LOGITS_DUMP=<path>` set in the hub env at that single
-  restart (it appends the last-token logits per prompt): once with the file lacking the key, once with `V41_LM_LAYER_OUTER=1`; byte-compare the two
-  dumps. Log lines: `prefill_lm_window open ... layer_outer=true`, `... done ... layer_outer = true`, one-time `V41_LM_PREFETCH is a no-op for layer-outer windows`.
-  Decode p90 of other streams during the run (a pass is atomic, ~1-2 s).
+* **Gate B (live, box 2 attached) -- a STATISTICAL gate, not bit identity (review r8).** On the live hub the expert->box partition
+  is the box-1 hot set, which `multistream` refreshes from live decode picks every `V41_B1_HOT_REFRESH` (500, a STATIC knob) ticks and
+  swaps ids under interleave; box 2's same-layer merge can also coalesce differently run to run. So two dumps of the same prompt taken
+  minutes apart legitimately differ in f32 summation order whatever the prefill driver: a byte-compare would fail a correct layer-outer.
+  Byte identity is Gate A's job (`lm_prefill_bitexact`, fixed partition). Gate B instead: with `V41_PREFILL_LOGITS_DUMP=<path>` set in the
+  single restart's env, run the SAME >= 64K-token cold prompt THREE times back to back, as little other traffic in between as you can
+  arrange: arm 0 (file without the key), arm 0 again (the NULL), then `V41_LM_LAYER_OUTER=1`. Compare per-prompt last-token logits as
+  KLD and argmax: PASS = KLD(layer-outer, arm 0) within the null's KLD(arm 0, arm 0') spread and the same argmax (the null must match
+  the marginal: if the null itself shows a large KLD, the comparison has no power; rerun quieter). Log lines to see:
+  `prefill_lm_window open ... layer_outer=true`, `... done ... layer_outer = true`, and the one-time
+  `V41_LM_PREFETCH is a no-op for layer-outer windows`. Watch decode p90 of other streams during it (a pass is atomic, ~1-2 s).
 * **P1 arm:** add `V41_PREFILL_SPLIT=1` (and optionally `V41_PREFILL_B1_FILLER=n`) and run a long cold prompt; the job-start line
   `prefill split: frozen encoder-layer expert split for a long job` prints warm, lru_slots, owned_now, filler, head_min/max, share1, share2,
   share2_per_layer, usable2, expected_rereads_per_window. Without `V41_PAGER_NO_DENSE=1` (STATIC, a startup env: add it only at a restart you

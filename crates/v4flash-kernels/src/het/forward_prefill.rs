@@ -815,7 +815,7 @@ pub fn lm_layer_outer() -> bool {
 /// `V41_LM_QUANTUM_LAYERS` (default 4; live): layers per scheduler-visible pass of a layer-outer window (decode may interleave
 /// between passes; the pipeline drains at each). The `KvSourceOnly` layer is always a pass of its own.
 pub fn lm_quantum_layers() -> usize {
-    crate::knobs::LM_QUANTUM_LAYERS.usize().max(1)
+    crate::knobs::LM_QUANTUM_LAYERS.usize() // the knob's range is 1..=20
 }
 
 /// `V41_LM_PREFILL=1`: layer-major CED prefill (see the block comment above).
@@ -1133,6 +1133,7 @@ impl PrefillJob {
         self.lm_rows = rows;
         self.lm_store = None;
         self.lm_idx = None;
+        self.lo_latch.store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     /// May `state` be CHECKPOINTED now? Not while a layer-major window is open:
@@ -1164,7 +1165,8 @@ impl PrefillJob {
     pub fn next_chunk_range(&self, lane_caps: (usize, usize)) -> eyre::Result<(usize, usize)> {
         // With a window OPEN the answer comes from the window itself (`w.lo`); with none open this is the prediction of the
         // NEXT window, and the layer-outer decision is latched so `lm_open_window` opens exactly what was predicted.
-        let lo = if self.lm.is_none() { self.lo_decision() } else { false };
+        // Only a job that can open a window latches (review r8: a chunked-only job never holds a latch).
+        let lo = if self.lm.is_none() && self.ced && self.lm_rows > 0 { self.lo_decision() } else { false };
         self.next_chunk_range_impl(lane_caps, lo)
     }
     /// The layer-outer decision for the window being predicted/opened (latched; see `lo_latch`).
@@ -1270,6 +1272,9 @@ impl HeterogeneousEngine {
         if single_lane_max() > 0 {
             job.lm_rows = 0;
             job.lm_store = None;
+            // No window ever opens for this job: clear any pending prediction (invariant: latch != 0 <=> a prediction is
+            // pending for a window about to open; review r8).
+            job.lo_latch.store(0, std::sync::atomic::Ordering::Relaxed);
             return Ok(false);
         }
         let t = job.tokens.len();
