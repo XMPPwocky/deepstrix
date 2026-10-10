@@ -217,6 +217,35 @@ share the experts more evenly (the hub is ~50% idle at 21 of 40 ms) on top of th
 * Open question the 10-10 01:41 summary left: "check whether interleave slowed prefill". This is circumstantial evidence it did
   (box-2 set 119 -> ~234/layer). A pre-interleave long-prefill trace (before 10-09 19:16 UTC) would confirm.
 
+### ROOT CAUSE: the expert->box partition is tuned for DECODE and applied unchanged to prefill (read-only code trace, 2026-10-10)
+
+* `forward_prefill.rs` ~9610-9630: under `V41_T2_PARTITION=1` a pick's box is `home2 = expert_pager::partition_box2(layer, e)`
+  (the decode-pick-mass holder fallback `hot_set::serve_on_box2` is for ARENA/decode rows only: `holder_rows`); `owns_eff` =
+  `extra_remote[e] || ...` is then built from that. `partition_box2` (expert_pager.rs ~571): once the hot set is warm, **box 1 owns
+  each layer's hottest ids by measured DECODE pick mass (`V41_B1_HOT_PER_LAYER`=103, interleave `V41_B1_HOT_IL_PER_LAYER`=115, target
+  0.60) and EVERYTHING ELSE is box 2's** (~270 of 384 per layer). `mirror_frac` is NOT ownership (it is the disk-read mirror fraction).
+  Decode picks are Zipfian, so that split is right for decode; prefill touches nearly every expert, so it hands box 2 ~270/layer x 20
+  encoder layers = **~5,400 experts vs ~4,600 usable slots**, which is the ~1,146 re-reads/window, the 70% of reads outside box-2's
+  advertised range, and the 266 distinct experts read at L0. It also loads box 2's kernel with ~70% of the experts while the hub
+  holds only ~30% (hub busy 22% of the window, its disk idle).
+* **Fix (hub-only, no box-2 change, no new protocol): a PREFILL partition for the encoder layers (<= `CED_DECODER_START`), long jobs
+  only.** Balance by capacity instead of decode mass: box 1 (pool 5,425) takes its resident hot head PLUS the next-ranked ids up to
+  ~190/layer, box 2 the other ~194/layer (20 x 194 = ~3,900 <= 4,600 usable, ~85%); decoder layers (replay) keep the decode rule.
+  Deterministic (rank by the existing `hot_set` counts, hash fallback when cold). Knob e.g. `V41_PREFILL_B1_PER_LAYER` (default 0 =
+  today); gate on the job being LONG (> `V41_LONG_PREFILL_TOKENS`) so short prefills do not pay a cold fill: box 1 pages its own half
+  from its idle disk (`V41_B1_PAGE_MISSES=1`, `V41_PAGER_MISS_PAR=8`; ~3.9K experts = 73 GB ~ 17 s once at 4.2 GB/s, then resident).
+  Where: a `partition_box2_prefill(layer, e)` consulted at the `home2` site when the rows are prefill-shaped and layer <= 20.
+* Risks: (1) hub pager residency: its prefill set (~3.9K) plus the decode hot head of the 20 decoder layers (~2.3K) exceeds 5,425
+  slots, so a prefill displaces ~700 decode-hot slots on the hub (re-warmed from its own disk after, ~3 s); watch hub `ensure` stalls
+  in the first long window. (2) f32 association changes (which box sums which expert): same class as every partition change; needs the
+  golden/KLD gate, and `lm_prefill_bitexact`'s reference assumes today's partition. (3) The group-prefetch hints (`V41_LM_PREFETCH`)
+  follow box-2 reads, so they follow the new split automatically; verify. (4) `verify_routing_exactly_once` must still pass (owns_eff
+  is built from the same `extra_remote`).
+* Expected (INFERRED, not measured): box 2's steady paging -> ~0 after the first window; its run floor ~19 -> ~14 ms (fewer
+  experts per request); hub work per lane-layer ~11 -> ~16 ms (its share 30% -> ~50%), now balanced against box 2 at ~30 ms per
+  unit-layer: window ~80 x 32 ms + 1.9 s gaps = ~4.5 s = **~900 rows/s (+75% over 511)**, before any gap/overlap work. Needs a hub
+  restart (static env knob) and one long-prefill A/B with the same evtrace analysis.
+
 ### Box-2 "serve the other lane under park": scoping (read-only, 2026-10-10)
 
 What exists. Box 2 (`remote_experts.rs`, expertd compute loop ~8340-8840) already PARKS a request that must page
