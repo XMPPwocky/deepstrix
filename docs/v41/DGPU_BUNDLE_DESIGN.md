@@ -101,3 +101,20 @@ Step 0c before captures. 10 Engram per-table join + poll + pinned async. 11 head
 incremental residency bitsets. 13 sel_count folded into rb_pack. 14 combine scope + 2-input twin. 15 unit tests
 for fused kernels (gate coverage without box 2). 16 one-lane polling dropped. 17 step prologue batch. 18 k1 = 2
 router matvecs. 19 IQ2/Q2K variants back to per call.
+
+## 10. Deployed (2026-10-10 04:20 UTC, hub 04739a1f = 5809521) and first result
+
+Window (owner "ok"): hub down 03:45 -> 04:20 UTC. G5 from the deployed source a37a799 (now with
+`V41_PUSH_XQ=1`, as production: no earlier window had set it, so production's xq-push path was never
+gated) == the new source with slices 1a-1e ON and zero-copy OFF bit for bit (244 logits files, 132,989
+pick lines); == zero-copy ON bit for bit (34,240 lane-layers through the pull); `V41_MS_CTX_CHECK=1`
+PASS. Env: `V41_MS_PROFILE=1` + `V41_MS_PROFILE_SAMPLE=20` + `V41_DGPU_ZC_PUSH=1` (backup
+`.pre-dgpu-20261010`).
+
+First 2.5 h of traffic vs the profile-OFF baseline on hub fd655378 (10-10 02:53-03:44 UTC), ms.step p50:
+lone DSpark r3-r6 -7.6..-8.2% (r4 69.4 -> 64.9, r6 90.1 -> 82.7), lone plain r1 -6.9%, two-stream r4-r12
+-3..-8%, plain3 r3 +1.5% (n 4173 vs 6084: watch -- suspect zero-copy at 1-row lanes); traffic-weighted
+0.950 (understates: the sampled profile, ~0.5%, is back). Lone DSpark 40.9 -> 48.2 tok/s (acceptance
+also differs). The PCIe LCLK pin A/B (12 blocks before the window) was null (auto/pin 1.005): the
+slow-xfer mode is copy-beside-compute, which zero-copy removes. Next: per-turn A/B of `V41_DGPU_ZC_PUSH`
+(attribution + plain3 r3), then slice 3 after Step 0c.
