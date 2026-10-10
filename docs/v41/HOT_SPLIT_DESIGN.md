@@ -380,3 +380,27 @@ the cache prior's re-steering, k1 coverage under the new placement.
 **First live settings:** `V41_B1_HOT_IL_PER_LAYER=115` (11 spare slots per layer; 124 gains only
 0.2 pt more and has no prefill margin), `V41_B1_HOT_B2HEAD=60`, `V41_B1_HOT_TARGET=0.60`,
 `V41_B1_HOT_MOVES=6`, REP 0. Then 124 and REP 10 as their own A/Bs.
+
+## 15. Live result and the stopped block A/B (2026-10-09/10)
+
+Deployed 10-09 19:09 UTC (hub fd655378 = a37a799; G-top bit-identical, G-il PASS; hub down 24 min),
+`interleave` flipped live 19:16 UTC with N1 115, P2 60, target 0.60, MOVES 6. Converged in ~9 min (share1
+0.601 at 19:25:57, 5 refreshes from 0.777, as the sim said); box-1 holder serving of moved ids faded as
+KEEP pins landed; steady box-1 newcomers ~80-127 per refresh.
+
+The ABBA block A/B (75-min blocks, 20-min discard) started 19:32 UTC and was STOPPED 10-10 01:39 UTC by
+the owner: its `top` arm never measured `top`. Block 1 (top) spent the whole block in RETURN MODE --
+evening refreshes come every ~3-5 min, not the ~1 min the design assumed, so returning ~50 head ids per
+layer at MAX_CHANGE 3 takes > 75 min, and with the hysteresis off the boundary flaps (~230 changed per
+refresh) so the coverage exit never fired; block 2 (top) had no decode traffic. Indicative numbers
+(step p50, ms): interleave blocks 0/3 vs this morning's real `top` on the old hub -- lone r3 72.5/71.1
+vs 74.6, r4 78.4/78.2 vs 82.3, r5 87.0/86.0 vs 93.2 (-4..-7%, the sim's -6.8%); vs the return-mode
+block, -7..-15% (biased). Prefill per job looked slower under interleave (1-4K suffix 13.8 vs 11.1 s,
+4-16K 28.0 vs 16.4 s) on few `top` jobs (14-26) and a prefill noise of 1.3-1.6x: unresolved, watch it.
+
+**Owner 10-10: "Stop and continue in interleave. Persist and commit that."** Code defaults now match
+production: `V41_B1_HOT_POLICY=interleave`, `V41_B1_HOT_IL_PER_LAYER=115`, `V41_B1_HOT_MOVES=6` (the
+hub env file carries the same lines). Open: the return mode needs its own pace knob and a robust exit
+(e.g. per-layer coverage with a tolerance, or exit after N refreshes with the cap lifted) before any
+future top-vs-interleave A/B; the A/B itself must discard by refresh count, not minutes.
+

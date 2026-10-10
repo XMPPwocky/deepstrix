@@ -798,29 +798,30 @@ crate::knobs! {
     /// `V41_B2_SOFT_HINT` (default off; live): the look-ahead filter treats a soft-held expert as
     /// resident (no hint for it).
     pub static B2_SOFT_HINT = Knob::flag("V41_B2_SOFT_HINT", false).live();
-    /// `V41_B1_HOT_POLICY` (`top` default | `interleave`; live, read at each hot-set refresh): who owns
+    /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
     /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top
     /// `per_layer()` (today, bit-identical); `interleave` = box 1 holds `V41_B1_HOT_TARGET` of the
     /// mass, box 2 pins its head share (`hot_split::interleave_layer`). Back to `top` runs the RETURN
-    /// MODE (design 2.4) until box 1 owns exactly the top set again.
-    pub static B1_HOT_POLICY = Knob::choice("V41_B1_HOT_POLICY", 0, &[&["top"], &["interleave"]]).live();
+    /// MODE (design 2.4) until box 1 owns exactly the top set again. Owner 10-10: interleave stays (live since 10-09
+    /// 19:16 UTC; lone r3-r5 -4..-7% vs the morning's top, sim -6.8%; the block A/B was stopped: design 15).
+    pub static B1_HOT_POLICY = Knob::choice("V41_B1_HOT_POLICY", 1, &[&["top"], &["interleave"]]).live();
     /// `V41_B1_HOT_TARGET` (default 0.60; live): box 1's target share of each layer's
     /// non-replicated pick mass under `interleave`.
     pub static B1_HOT_TARGET = Knob::real("V41_B1_HOT_TARGET", 0.60, 0.0, 1.0).live();
     /// `V41_B1_HOT_TOL` (default 0.02; live): the balance tolerance around the target.
     pub static B1_HOT_TOL = Knob::real("V41_B1_HOT_TOL", 0.02, 0.0, 1.0).live();
-    /// `V41_B1_HOT_MOVES` (default 3; live): box-1 newcomers (vacancy fills + swaps) per layer per
+    /// `V41_B1_HOT_MOVES` (default 6 since 2026-10-10, design 14; live): box-1 newcomers (vacancy fills + swaps) per layer per
     /// refresh under `interleave`, and separately the replicated-set newcomers.
-    pub static B1_HOT_MOVES = Knob::int("V41_B1_HOT_MOVES", 3, 0, 384).live();
+    pub static B1_HOT_MOVES = Knob::int("V41_B1_HOT_MOVES", 6, 0, 384).live();
     /// `V41_B1_HOT_IL_HYST` (default 40; live): the interleave's region hysteresis in ranks (the top
     /// policy's `V41_B1_HOT_HYST` is 100 in production: too wide here, design 2 step 2).
     pub static B1_HOT_IL_HYST = Knob::int("V41_B1_HOT_IL_HYST", 40, 0, 384).live();
     /// `V41_B1_HOT_B2HEAD` (default 60; live): box 2's pinned head share per layer under
     /// `interleave` (clamped by box 2's pin budget, design 4).
     pub static B1_HOT_B2HEAD = Knob::int("V41_B1_HOT_B2HEAD", 60, 0, 384).live();
-    /// `V41_B1_HOT_IL_PER_LAYER` (default 0 = `hot_set::per_layer()`; live): box 1's owned +
+    /// `V41_B1_HOT_IL_PER_LAYER` (default 115 since 2026-10-10, design 14; 0 = `hot_set::per_layer()`; live): box 1's owned +
     /// replicated ids per layer under `interleave`, clamped to the decode LRU like `per_layer()`.
-    pub static B1_HOT_IL_PER_LAYER = Knob::int("V41_B1_HOT_IL_PER_LAYER", 0, 0, 384).live();
+    pub static B1_HOT_IL_PER_LAYER = Knob::int("V41_B1_HOT_IL_PER_LAYER", 115, 0, 384).live();
     /// `V41_B1_HOT_MAX_CHANGE` (default 0 = unlimited; production env 3; live since the hot split):
     /// the `top` policy's newcomers per layer per refresh (`hot_set::refresh`), also the return
     /// mode's pace.
