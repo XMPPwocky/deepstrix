@@ -79,9 +79,21 @@ prefetch copies). New `ms dspark: blocks` fields: `fills`, `fill_rows`,
 Host memory: up to 128 x `HIDDEN` f32 (6-8 MB) per slot until it is reseeded.
 Rollback: `V41_MS_DSPARK_FILL=0` (static; seed written at once, unwritten rows
 dropped) -- `V41_MS_DSPARK_RING=all` is the other cure (writes every step).
-Tests: `backlog_*`, `ring_skip_*` (host). Owed: a GPU check that a filled ring
-matches an every-step ring by POSITION SET (`mtp_ring_async` style; issue #3
-finding 9), then a production read of E over the 128 rows after a gap.
+Tests: `backlog_*`, `ring_skip_*` (host); `tests/mtp_ring_fill.rs` (GPU, hub
+down, PASSED 2026-10-10 22:31 UTC on the real drafter): every-step vs fill vs
+the pre-#57 drop vs a rotation-only control (every-step with a 28-row bigger
+first seed). Gaps within a window: fill BIT-IDENTICAL to every-step (24 drafts,
+ring bytes; up to 14 unsynced chunks back to back); drop differs on 17/24
+(||dh||/||h|| 0.6-1.2). A gap longer than a window: the filled window holds the
+same rows by position; fill's deviation from every-step (<= 0.48) is that of
+slot rotation alone (<= 0.32), drop's 1.3. Owed: a production read of E over
+the 128 rows after a gap.
+
+Side finding (OPEN, not #57): the drafter's output moves 2-30% (||dh||/||h||)
+when the SAME rows sit at rotated ring slots -- far beyond f32 reassociation of
+an order-free softmax. Production rotates slots by history (seed size, gaps), so
+some drafter noise rides on ring layout; the attention path
+(`attention_mixed_*` over `[ring ++ block]`) is the first suspect.
 
 ### 56. FIXED (found and fixed 2026-10-06) — `KvArena` switched the current device behind the het engine's cache: `hipErrorInvalidHandle` in the drafter right after an in-step reservation grow
 
