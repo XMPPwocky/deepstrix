@@ -212,6 +212,18 @@ depth 4. Gate = golden/KLD (row-composition independence of the WMMA kernels is 
 P1 estimate is 5.0-5.6 s only after the dense-window reclaim of sec 4; without it box 2's share overflows by 130-400 experts (~150-400
 re-reads/window) and the window is nearer 5.5-6.0 s. Target after P1+P2a+P2b: ~3.6-4.1 s / 1.0-1.1K rows/s (inferred).
 
+**MoE-leg model (owner, 10-10): leg time = max(hub iGPU MoE, box-2 queue + run + wire) per lane-layer.** Measured (16:44 job, 6,008
+prefill requests of 512 rows): box 2 receives n_sel p50 1,344 of 3,072 picks = **44% of picks** (hub already ~56%), over n_distinct p50
+147 experts (~9 members each; ~270 owned). Both boxes are weight-bandwidth-bound at these member counts, so leg time ~ distinct
+experts touched x ~0.09-0.125 ms: hub ~115 hot experts ~ 10 ms (matches the 10.4 ms reply->submit), box 2 147 ~ 18.4 ms floor + 7 wire
+(= ~25 ms; lane 1 also queues ~8.6 ms behind lane 0). Moving f (box-2-owned, ~54%-touched) experts/layer to the hub: hub ~ 9.7 +
+0.049 f ms, box 2 leg ~ (147 - 0.54 f) x 0.125 + 7 ms. Residency-capped f = 46: box 2 leg 22.3 ms (-12%, -17% on the serial pair);
+balanced f ~ 135/layer (hub 250, box 2 135): both ~16.3 ms (-36%). So the hub's RESIDENT-EXPERT CAPACITY is the lever (f is capped
+at ~22-46 by free slots, ~70 with the dense window; ~135 would need ~2,700 more hub-resident encoder experts = ~51 GB, i.e. dropping the
+decoder-hot head during long prefills, which costs ~43 GB of re-warm per decode burst: not viable at a 120 s/30 s burst cadence). The
+cost-per-expert coefficients are from two points (inferred). CORRECTION to earlier text in these docs: "box 2 does ~70% of the work"
+was a count of EXPERTS; by picks it is 44%.
+
 **Is the hub's compute used? (owner question 10-10)** Yes, but at ~22% busy: 1.75 s of the 8.02 s window (hub work ~21 ms per
 unit-layer vs a ~66 ms period; blocked on box 2 53%, gaps 24%). Its dGPU runs attention/dense for every row; its iGPU runs only the
 experts it owns (~30% today: the decode-hot head), and what limits that share is hub RESIDENCY (5,041 LRU slots, 441-921 free beyond the
