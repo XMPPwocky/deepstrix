@@ -1291,6 +1291,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let expert_stats_path = crate::expert_stats::ExpertStatsAgg::path_for(&cfg.snapshot_root);
     let expert_stats =
         crate::expert_stats::ExpertStatsAgg::load_or_fresh(&expert_stats_path, &fingerprint);
+    expert_stats.publish_prefill_prior();
 
     // M7 expert pager. Takes ownership of the HF source: its mmap must outlive the
     // model, since every routed expert is read from it on demand for the life of

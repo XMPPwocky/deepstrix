@@ -114,6 +114,16 @@ impl ExpertStatsAgg {
     ) {
         self.prefill.merge(prefill_counts, prefill_tokens);
         self.decode.merge(decode_counts, decode_tokens);
+        if prefill_tokens > 0 {
+            self.publish_prefill_prior();
+        }
+    }
+
+    /// Hand the prefill bank to the long-job expert split (`prefill_split::set_prior`, used when
+    /// `V41_PREFILL_SPLIT_PRIOR` is on): at load and after every merge that added prefill tokens.
+    pub fn publish_prefill_prior(&self) {
+        #[cfg(feature = "v41")]
+        v4flash_kernels::het::prefill_split::set_prior(&self.prefill.counts, self.prefill.tokens);
     }
 
     /// Atomic write (tmp + rename).

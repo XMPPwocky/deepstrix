@@ -707,6 +707,10 @@ crate::knobs! {
     /// `V41_PREFILL_B1_FILLER` (default 64, 0..=384; live): ceiling on the per-layer hash filler box 1 adds to its decode-hot
     /// head (the effective filler is `min(this, live free LRU slots / encoder layers)`). Read at each job's split build.
     pub static PREFILL_B1_FILLER = Knob::int("V41_PREFILL_B1_FILLER", 64, 0, 384).live();
+    /// `V41_PREFILL_SPLIT_PRIOR` (default off; LIVE): rank the split's filler -- and its head while the hot set is cold --
+    /// by the server's persisted prefill pick counts (`expert_stats.json`) instead of hash order (`prefill_split::Prior`).
+    /// Read at each long job's split build.
+    pub static PREFILL_SPLIT_PRIOR = Knob::flag("V41_PREFILL_SPLIT_PRIOR", false).live();
     /// `V41_MOE_WMMA_F16` (default off; LIVE): an MXFP4 MoE pass that takes the WMMA arm (`V41_MOE_WMMA_GATEUP` /
     /// `_DOWN` row thresholds) runs the f16-WMMA kernels (kernels/mxfp4_moe_wmma_f16.hip: E8M0 scale folded into the
     /// perm LUT, f16 x f16 -> f32) instead of the int8 ones. Same entry points, args and 32-member chunk; NOT bit-exact

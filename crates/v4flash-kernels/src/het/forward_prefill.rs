@@ -1246,11 +1246,12 @@ impl HeterogeneousEngine {
             // owns `B1_HOT_IL_PER_LAYER` ids/layer, more than the `top` head.
             cold_head_per_layer: super::expert_pager::hot_set::per_layer().max(crate::knobs::B1_HOT_IL_PER_LAYER.usize()),
         };
-        let split = ps::PrefillSplit::build(&cfg, &|l, e| super::expert_pager::hot_set::box1_owns(l, e));
+        let prior = ps::prior();
+        let split = ps::PrefillSplit::build_with_prior(&cfg, &|l, e| super::expert_pager::hot_set::box1_owns(l, e), prior.as_deref());
         let st = &split.stats;
         let usable2 = ps::b2_usable_estimate();
         tracing::info!(
-            tokens = job.total(), warm = st.warm, lru_slots = cfg.lru_slots, owned_now = st.owned_now, filler = st.filler,
+            tokens = job.total(), warm = st.warm, prior = st.prior, prior_tokens = prior.as_ref().map_or(0, |p| p.tokens), lru_slots = cfg.lru_slots, owned_now = st.owned_now, filler = st.filler,
             head_min = st.head_min, head_max = st.head_max, share1 = st.share1, share2 = st.share2,
             share2_per_layer = st.share2 / crate::config::CED_DECODER_START, usable2,
             expected_rereads_per_window = st.expected_rereads(usable2),
