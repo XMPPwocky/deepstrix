@@ -2,7 +2,8 @@
 
 Status (updated same day): the f16 kernel is BUILT and measured in the B_moe_prefill harness on the iGPU,
 beside the live hub (owner: "slot beside live traffic"; ~2.7 GB, seconds per run, no profiler).
-**Results are at the end of this file.** No production code changed; not wired into dispatch.
+**Results are at the end of this file.** WIRED INTO DISPATCH later on 10-10 (see "Driver integration (10-10)" at the end):
+`V41_MOE_WMMA_F16` live knob, default off.
 
 CORRECTION: the first compile table below ("3 tiles 233 VGPR, free") was measured on a generated file whose
 3-tile dispatch was dead (it only existed under `WM_NTMAX >= 4`, so NTMAX=3 silently ran the 1-tile path).
@@ -427,3 +428,28 @@ why the f16 arm's 48-member chunk (step 2) multiplies the batching gain.
 store views (avoids ~4 D2D copies of ~40 MB per unit-layer); `lm_prefill_bitexact` with `V41_SUB` / cache-prior off;
 whether the arena tail can be freed and reallocated; the wire width of `b` in the box-2 header; whether the WMMA kernels
 are tile-composition-independent per row (reduces to f32 association only if so).
+
+## Driver integration (10-10, evening)
+
+* `kernels/mxfp4_moe_wmma_f16.hip` = scratch `cand_f16.hip` (WM_NTMAX 2 = the int8 arm's 32-member chunk, so the work-item
+  builder is unchanged). Same entry names/args as `mxfp4_moe_wmma.hip`; loaded as a SECOND module on gfx1151
+  (`Mxfp4PairMatvec::wmma_f16`, `Mxfp4Matvec::wmma_f16`); `launch_fused_swiglu_wmma_arm` / `launch_by_expert_wmma_arm`
+  take `f16: bool` (the old `_ex` entry points = int8).
+* `het::dispatch`: a pass that takes the WMMA arm (`V41_MOE_WMMA_GATEUP` >= 256 rows / `_DOWN` >= 128) runs the f16 kernels
+  when `V41_MOE_WMMA_F16` is on (LIVE knob, default off, read per launch). Trace label `igpu.pair_wmma_f16`. Box 2 runs the
+  same dispatch, so it gets the arm with an expertd redeploy + `V41_MOE_WMMA_F16=1` in its knob file.
+* **E8M0 range: SAFE.** `scratch/kernel_ideas/B_moe_prefill/e8_scan.py` read every routed-expert scale tensor (47,232
+  tensors, 17.4 GB, 364 s): global e8 min 115, max 128; 0 bytes outside the LUT's exact [114, 137].
+* **GPU tests (tests/mxfp4_moe_sweep.rs, gfx1151, beside the live hub):** `wmma_arm_matches_kwide_within_reassociation`
+  now also runs the f16 arm and the dispatch with the knob on at B = 37/128/256/512/300: worst rel_rmse vs kwide gate+up
+  1.7e-7, down 9.0e-8 (int8 arm 3.0e-7 / 1.7e-7); dispatch routes to the f16 arm exactly at the WMMA thresholds.
+  `wmma_f16_arm_exact_over_its_whole_scale_range`: f16 vs int8 arm (both vs kwide) at uniform e8 114 (1.8e-7 vs 3.4e-7),
+  uniform 137 (1.2e-5 vs 1.9e-5: the gate outputs run far past the SwiGLU clamp, both arms), and the model's own range
+  115..128 mixed inside every super-block (4.3e-7 vs 4.8e-7; down 1.5e-7 vs 1.7e-7). Report-only: the 24-octave mix
+  [114,137] is 1.6e-5 vs 9.1e-6 -- the f16 arm accumulates a super-block's 8 blocks in one f32 chain; that spread does
+  not occur in this model.
+* **What it buys today: ~nothing until MoE calls get bigger.** Prefill MoE calls are one 512-row lane unit (~15 members
+  per expert on box 1, ~5 on box 2): the regime where the harness measured the two arms TIED. The 1.4-1.7x gate+up win
+  needs ~48 members/expert (B ~3072). Next lever: batch the MoE across a layer-outer window's units (4096 rows/window ->
+  ~100+ members/expert on box 1) -- the cross-sub-chunk batching design below, now natural under layer-outer.
+* Still owed: the golden/KLD gate (server down) before it goes default-on; an e2e A/B (live knob, no restart).

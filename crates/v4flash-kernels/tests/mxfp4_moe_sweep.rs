@@ -294,6 +294,7 @@ fn wmma_arm_matches_kwide_within_reassociation() -> eyre::Result<()> {
     let down = upload(id, &mxfp4_weights(&mut rng, N_PHYS, dnr, dnb, 118, 8))?;
     let mut worst_gu = 0f64;
     let mut worst_dn = 0f64;
+    let (mut worst_gu16, mut worst_dn16) = (0f64, 0f64);
     // (B, n_virt): n_virt = 48 -> ~B/8 members per expert (chunked at B >= 256);
     // n_virt = 8 -> 0.75 B members per expert (many work items per expert).
     for &(b, n_virt) in &[(37usize, 48u32), (128, 48), (256, 48), (512, 48), (300, 8)] {
@@ -337,6 +338,32 @@ fn wmma_arm_matches_kwide_within_reassociation() -> eyre::Result<()> {
             "dispatch gate+up at rows={b} took the wrong arm");
         worst_gu = worst_gu.max(st.rel_rmse);
 
+        // ---- f16-WMMA arm (V41_MOE_WMMA_F16): vs kwide, and dispatch takes it with the knob on
+        if e.mxfp4pair.has_wmma_f16() {
+            let mut m_f16 = upload(id, &vec![SENTINEL; n_mid])?;
+            e.mxfp4pair.launch_fused_swiglu_wmma_arm(true, &s, &mut m_f16, &gate, &up, &xq, &ew, &gc, &em, &wi, bound as u32,
+                gbpe as u32, gbpe as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, SWIGLU_CLAMP_EXP, gnr as u32, gnb as u32, Some(&cnt))?;
+            let mut m_d16 = upload(id, &vec![SENTINEL; n_mid])?;
+            assert!(v4flash_kernels::knobs::MOE_WMMA_F16.set("1"));
+            let handled = dispatch::moe_gate_up_chunked_rows(&e, GgufType::MXFP4, &s, &mut m_d16, &gate, &up, &xq, &ew, &gc, &em, &wi,
+                bound as u32, gbpe as u32, gbpe as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, SWIGLU_CLAMP_EXP,
+                gnr as u32, gnb as u32, Some(&cnt), b as u32);
+            assert!(v4flash_kernels::knobs::MOE_WMMA_F16.set("0"));
+            assert!(handled?);
+            s.synchronize()?;
+            let (f16, d16) = (download(&m_f16, n_mid)?, download(&m_d16, n_mid)?);
+            let st = stats(&old, &f16);
+            eprintln!("gate+up B={b} n_virt={n_virt}: f16 vs kwide rel_rmse={:.3e} max_abs={:.3e} non_finite={} written-set mismatch={}",
+                st.rel_rmse, st.max_abs, st.non_finite, st.written_mismatch);
+            assert_eq!(st.written_mismatch, 0, "f16 gate+up wrote a different set");
+            assert_eq!(st.non_finite, 0);
+            assert!(st.rel_rmse < 1e-5, "f16 gate+up rel_rmse {:.3e} >= 1e-5 at B={b}", st.rel_rmse);
+            let want = if dispatch::moe_wmma_gateup_for(b as u32) { &f16 } else { &old };
+            assert_eq!(want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), d16.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "dispatch gate+up (V41_MOE_WMMA_F16=1) at rows={b} took the wrong arm");
+            worst_gu16 = worst_gu16.max(st.rel_rmse);
+        }
+
         // ---- down: kwide2 vs WMMA vs dispatch(rows = b), on random midq
         let midq = upload(id, &q8k_blocks(&mut rng, b * nu * dnb))?;
         let slot_stride = dnb * BLOCK_Q8_K_BYTES;
@@ -362,7 +389,115 @@ fn wmma_arm_matches_kwide_within_reassociation() -> eyre::Result<()> {
         assert_eq!(want_disp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), disp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "dispatch down at rows={b} took the wrong arm");
         worst_dn = worst_dn.max(st.rel_rmse);
+
+        if e.mxfp4.has_wmma_f16() {
+            let mut p_f16 = upload(id, &vec![SENTINEL; n_part])?;
+            e.mxfp4.launch_by_expert_wmma_arm(true, &s, &mut p_f16, &down, &midq, &gc, &em, &wi, bound as u32, dbpe as u32,
+                slot_stride as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, dnr as u32, dnb as u32, Some(&cnt))?;
+            let mut p_d16 = upload(id, &vec![SENTINEL; n_part])?;
+            assert!(v4flash_kernels::knobs::MOE_WMMA_F16.set("1"));
+            let r = dispatch::moe_down_mxfp4(&e, &s, &mut p_d16, &down, &midq, &gc, &em, &wi, bound as u32, dbpe as u32,
+                slot_stride as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, dnr as u32, dnb as u32, Some(&cnt), b as u32);
+            assert!(v4flash_kernels::knobs::MOE_WMMA_F16.set("0"));
+            r?;
+            s.synchronize()?;
+            let (f16, d16) = (download(&p_f16, n_part)?, download(&p_d16, n_part)?);
+            let st = stats(&old, &f16);
+            eprintln!("down    B={b} n_virt={n_virt}: f16 vs kwide2 rel_rmse={:.3e} max_abs={:.3e} non_finite={} written-set mismatch={}",
+                st.rel_rmse, st.max_abs, st.non_finite, st.written_mismatch);
+            assert_eq!(st.written_mismatch, 0, "f16 down wrote a different set");
+            assert_eq!(st.non_finite, 0);
+            assert!(st.rel_rmse < 1e-5, "f16 down rel_rmse {:.3e} >= 1e-5 at B={b}", st.rel_rmse);
+            let want = if dispatch::moe_wmma_down_for(b as u32) { &f16 } else { &old };
+            assert_eq!(want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), d16.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "dispatch down (V41_MOE_WMMA_F16=1) at rows={b} took the wrong arm");
+            worst_dn16 = worst_dn16.max(st.rel_rmse);
+        }
     }
-    eprintln!("PASS: WMMA within f32 re-association: worst rel_rmse gate+up {worst_gu:.3e}, down {worst_dn:.3e}");
+    eprintln!("PASS: WMMA within f32 re-association: worst rel_rmse gate+up {worst_gu:.3e}, down {worst_dn:.3e}; \
+f16 arm gate+up {worst_gu16:.3e}, down {worst_dn16:.3e}");
+    Ok(())
+}
+
+/// The f16 arm folds the E8M0 scale into its perm LUT, exact for e8 in [114, 137] only (`wm_lut` clamps outside).
+/// Every scale in that range, uniformly, vs kwide / kwide2 (which scale in f32 and have no range limit).
+#[test]
+#[ignore]
+fn wmma_f16_arm_exact_over_its_whole_scale_range() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let Some(dev) = pick_igpu()? else {
+        eprintln!("SKIP: no gfx1151 device");
+        return Ok(());
+    };
+    dev.set_current()?;
+    let arch = dev.properties()?.gcn_arch_name;
+    let id = dev.id;
+    let e = DeviceEngine::for_arch(dev, &arch)?;
+    if !e.mxfp4pair.has_wmma_f16() || !e.mxfp4.has_wmma_f16() {
+        return Err(eyre!("gfx1151 engine without the f16 WMMA module"));
+    }
+    let s = Stream::new(id)?;
+    let mut rng = Lcg(0x5EED_F16F);
+    let nu = N_EXPERT_USED;
+    const N_PHYS: usize = 8;
+    const CHUNK: usize = 32;
+    let (gnr, gnb) = (N_FF_EXP as usize, BLOCKS_Q8K_GATE_IN as usize);
+    let (dnr, dnb) = (N_EMBD as usize, BLOCKS_Q8K_DOWN_IN as usize);
+    let gbpe = gnr * gnb * SUPER_MXFP4_BYTES;
+    let dbpe = dnr * dnb * SUPER_MXFP4_BYTES;
+    // (lo, span, label, asserted): the model's own range 115..128 (e8_scan.py over all 47,232 expert scale tensors,
+    // 2026-10-10) uniformly mixed inside every super-block is the worst REAL case; the 24-octave mix is printed only
+    // (the f16 arm accumulates a super-block's 8 blocks in one f32 chain, so it loses more there than the int8 arm).
+    for &(lo, span, label, asserted) in &[
+        (114u8, 1u32, "e8 = 114 (all)", true),
+        (137, 1, "e8 = 137 (all)", true),
+        (115, 14, "e8 in [115,128] mixed (the model's range)", true),
+        (114, 24, "e8 in [114,137] mixed (report only)", false),
+    ] {
+    let gate = upload(id, &mxfp4_weights(&mut rng, N_PHYS, gnr, gnb, lo, span))?;
+    let up = upload(id, &mxfp4_weights(&mut rng, N_PHYS, gnr, gnb, lo, span))?;
+    let down = upload(id, &mxfp4_weights(&mut rng, N_PHYS, dnr, dnb, lo, span))?;
+    let b = 512usize;
+    let g = build_groups(&mut rng, b, nu, 48, N_PHYS, CHUNK);
+    let (gc, em) = (upload(id, &g.gc)?, upload(id, &g.em)?);
+    let n_wi = g.wi.len();
+    let wi = upload(id, &g.wi)?;
+    let xq = upload(id, &q8k_blocks(&mut rng, b * gnb))?;
+    let ew = upload(id, &(0..b * nu).map(|i| 0.05 + 0.01 * (i % 17) as f32).collect::<Vec<f32>>())?;
+    let n_mid = b * nu * gnr;
+    let (mut m_ref, mut m_f16, mut m_i8) = (upload(id, &vec![SENTINEL; n_mid])?, upload(id, &vec![SENTINEL; n_mid])?, upload(id, &vec![SENTINEL; n_mid])?);
+    e.mxfp4pair.launch_fused_swiglu_kwide_ex(&s, &mut m_ref, &gate, &up, &xq, &ew, &gc, &em, &wi, n_wi as u32,
+        gbpe as u32, gbpe as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, SWIGLU_CLAMP_EXP, gnr as u32, gnb as u32, None)?;
+    e.mxfp4pair.launch_fused_swiglu_wmma_arm(true, &s, &mut m_f16, &gate, &up, &xq, &ew, &gc, &em, &wi, n_wi as u32,
+        gbpe as u32, gbpe as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, SWIGLU_CLAMP_EXP, gnr as u32, gnb as u32, None)?;
+    e.mxfp4pair.launch_fused_swiglu_wmma_arm(false, &s, &mut m_i8, &gate, &up, &xq, &ew, &gc, &em, &wi, n_wi as u32,
+        gbpe as u32, gbpe as u32, nu as u32, g.max_per_expert as u32, CHUNK as u32, SWIGLU_CLAMP_EXP, gnr as u32, gnb as u32, None)?;
+    let midq = upload(id, &q8k_blocks(&mut rng, b * nu * dnb))?;
+    let slot_stride = dnb * BLOCK_Q8_K_BYTES;
+    let n_part = b * nu * dnr;
+    let (mut p_ref, mut p_f16, mut p_i8) = (upload(id, &vec![SENTINEL; n_part])?, upload(id, &vec![SENTINEL; n_part])?, upload(id, &vec![SENTINEL; n_part])?);
+    e.mxfp4.launch_by_expert_kwide2_ex(&s, &mut p_ref, &down, &midq, &gc, &em, &wi, n_wi as u32, dbpe as u32, slot_stride as u32,
+        nu as u32, g.max_per_expert as u32, CHUNK as u32, dnr as u32, dnb as u32, None)?;
+    e.mxfp4.launch_by_expert_wmma_arm(true, &s, &mut p_f16, &down, &midq, &gc, &em, &wi, n_wi as u32, dbpe as u32, slot_stride as u32,
+        nu as u32, g.max_per_expert as u32, CHUNK as u32, dnr as u32, dnb as u32, None)?;
+    e.mxfp4.launch_by_expert_wmma_arm(false, &s, &mut p_i8, &down, &midq, &gc, &em, &wi, n_wi as u32, dbpe as u32, slot_stride as u32,
+        nu as u32, g.max_per_expert as u32, CHUNK as u32, dnr as u32, dnb as u32, None)?;
+    s.synchronize()?;
+    for (name, r, f, i) in [("gate+up", download(&m_ref, n_mid)?, download(&m_f16, n_mid)?, download(&m_i8, n_mid)?),
+                            ("down", download(&p_ref, n_part)?, download(&p_f16, n_part)?, download(&p_i8, n_part)?)] {
+        let (st, si) = (stats(&r, &f), stats(&r, &i));
+        eprintln!("{name} {label}: f16 vs kwide rel_rmse={:.3e} max_abs={:.3e} | int8 arm vs kwide rel_rmse={:.3e} max_abs={:.3e} | non_finite={} mismatch={}",
+            st.rel_rmse, st.max_abs, si.rel_rmse, si.max_abs, st.non_finite, st.written_mismatch);
+        assert_eq!(st.written_mismatch, 0);
+        assert_eq!(st.non_finite, 0);
+        // The LUT is exact for every e8 in range, so the f16 arm must never be worse than the int8 arm that ships. Absolute
+        // rel_rmse is NOT the bar here: at e8 = 137 the gate outputs run far past the SwiGLU clamp and BOTH arms sit near
+        // 1e-5 (measured 10-10: f16 1.2e-5, int8 1.9e-5); the 24-octave mixed case also loses small blocks to f32
+        // accumulation inside a super-block. Real weights span e8 115..128 (e8_scan.py, all 47K scale tensors).
+        assert!(!asserted || st.rel_rmse <= 1.25 * si.rel_rmse.max(2e-7),
+            "{name} {label}: f16 arm rel_rmse {:.3e} worse than the int8 arm's {:.3e}", st.rel_rmse, si.rel_rmse);
+    }
+    }
+    eprintln!("PASS: f16 arm no worse than the int8 arm at uniform e8 114 / 137 and over the model's range [115, 128]");
     Ok(())
 }
