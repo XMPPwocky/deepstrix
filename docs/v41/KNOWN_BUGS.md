@@ -15,7 +15,7 @@ looked at in that pass.
 
 | entry | status | note |
 |---|---|---|
-| #57 | ~~FIXED~~ 2026-10-10, **not deployed, GPU-unrun** | `RING=solo`: a stream leaving a stretch of 3+ live streams drafted from a ring missing its newest rows (E 2.4 vs 3.3 for 128 rows) |
+| #57 | ~~FIXED~~ 2026-10-10, GPU check passed, **not deployed** | `RING=solo`: a stream leaving a stretch of 3+ live streams drafted from a ring missing its newest rows (E 2.4 vs 3.3 for 128 rows) |
 | #56 | ~~FIXED~~ 2026-10-06 | `KvArena` switched the current device behind the engine's cache; one failed draft after an in-step `grow` (an instance of #10) |
 | #53 | **OPEN** | f16 box-2 prefill partials are on by default with no fidelity gate (new 2026-10-04) |
 | #54 | **OPEN** | `V41_SUB=1/2` substitution runs after the fidelity pin; production's mode 3 is unaffected (new 2026-10-04) |
