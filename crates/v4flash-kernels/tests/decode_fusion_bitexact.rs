@@ -179,8 +179,28 @@ fn decode_fusions_match_their_chains() -> eyre::Result<()> {
         hcp.launch_from_split_batched_add(&stream, &mut of, &bo_f, &rem, &rh, &sp, nw, ne, nh, b)?;
         stream.synchronize()?;
         assert_eq!(f32_diff(&download(&oa)?, &download(&of)?), 0, "hc_post_add differs at b={b}");
-        eprintln!("b={b}: kv / q copy / heads (plain + yarn), q_a rms_quant, hc_post_add bit-exact");
+
+        // 6. dGPU bundle slice 1 (`V41_DGPU_COMBINE3`): (moe + shared) + remote, then hc_post --
+        //    the production chain `vec_add(moe += shared)` -> `_add(+ remote)` vs `_add2`, and
+        //    `vec_add(moe += shared)` -> plain hc_post vs `_add(+ shared)` (no box-2 partial).
+        let sh = upload(id, &(0..b * ne).map(|_| rng.val(1.0)).collect::<Vec<f32>>())?;
+        let moe_h: Vec<f32> = (0..b * ne).map(|_| rng.val(1.0)).collect();
+        let mut moe_a = upload(id, &moe_h)?;
+        let moe_f = upload(id, &moe_h)?;
+        let mut o3a = upload(id, &vec![f32::NAN; (b * nh * ne) as usize])?;
+        let mut o3f = upload(id, &vec![f32::INFINITY; (b * nh * ne) as usize])?;
+        let mut o2a = upload(id, &vec![f32::NAN; (b * nh * ne) as usize])?;
+        let mut o2f = upload(id, &vec![f32::INFINITY; (b * nh * ne) as usize])?;
+        vadd.launch(&stream, &mut moe_a, &sh, b * ne)?;
+        hcp.launch_from_split_batched_add(&stream, &mut o3a, &moe_a, &rem, &rh, &sp, nw, ne, nh, b)?;
+        hcp.launch_from_split_batched_add2(&stream, &mut o3f, &moe_f, &sh, &rem, &rh, &sp, nw, ne, nh, b)?;
+        hcp.launch_from_split_batched(&stream, &mut o2a, &moe_a, &rh, &sp, nw, ne, nh, b)?;
+        hcp.launch_from_split_batched_add(&stream, &mut o2f, &moe_f, &sh, &rh, &sp, nw, ne, nh, b)?;
+        stream.synchronize()?;
+        assert_eq!(f32_diff(&download(&o3a)?, &download(&o3f)?), 0, "hc_post_add2 differs at b={b}");
+        assert_eq!(f32_diff(&download(&o2a)?, &download(&o2f)?), 0, "hc_post_add (shared) differs at b={b}");
+        eprintln!("b={b}: kv / q copy / heads (plain + yarn), q_a rms_quant, hc_post_add, hc_post_add2 bit-exact");
     }
-    eprintln!("PASS: {cases} rope-param cases + 16 rms_quant / hc_post_add batches bit-exact");
+    eprintln!("PASS: {cases} rope-param cases + 16 rms_quant / hc_post_add / hc_post_add2 batches bit-exact");
     Ok(())
 }

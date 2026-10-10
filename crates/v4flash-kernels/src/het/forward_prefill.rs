@@ -11536,7 +11536,11 @@ impl HeterogeneousEngine {
         // so the lane reads ~6 ms busy while the GPU is idle. Every "GPU busy %"
         // taken from that slice was inflated by the RPC wait. Bracket the two
         // halves separately instead, so the idle between them shows as idle.
-        {
+        // `V41_DGPU_COMBINE3` (dGPU bundle slice 1): the `+ shared` add is DEFERRED to the combine
+        // after box 2's wait (same f32 add, same order; nothing reads `ffn_moe_recv` in between
+        // but the `V41_REMOTE_DBG` dumps, which keep the old order).
+        let defer_shared = crate::knobs::DGPU_COMBINE3.on() && !*lane_env::REMOTE_DBG;
+        if !defer_shared {
             let _t_combine = de.events.stage("dgpu.ffn_combine.local", &de.compute)?;
             let _t = de.events.stage("k.ffn_combine.vec_add", &de.compute)?;
             de.vec_add.launch(
@@ -11762,6 +11766,19 @@ impl HeterogeneousEngine {
         // last add before hc_post (no resident-expert partial).
         let fuse_remote_add = bd.remote_ffn_moe_valid && !hot_active && dec_fuse(b)
             && bd.remote_ffn_moe.is_some();
+        // The deferred `+ shared` (above): into the combine when it is the combine's own add
+        // (`_add2` with box 2's partial, `_add` with shared alone when there is no partial), else
+        // here as the same vec_add the early path ran, before every other add.
+        let shared_in_combine = defer_shared && !hot_active && dec_fuse(b) && (fuse_remote_add || !bd.remote_ffn_moe_valid);
+        if defer_shared && !shared_in_combine {
+            let _t = de.events.stage("k.ffn_combine.vec_add", &de.compute)?;
+            de.vec_add.launch(
+                &de.compute,
+                &mut bd.ffn_moe_recv,
+                &bd.ffn_shared,
+                b * N_EMBD,
+            )?;
+        }
         if bd.remote_ffn_moe_valid && !fuse_remote_add {
             // Two-box split: the iGPU skipped every expert box 2 owns (its
             // remap entry was non-negative), so this partial is the rest of the
@@ -11811,7 +11828,42 @@ impl HeterogeneousEngine {
             // `V41_MS_MHC_SPLIT`: this layer's FFN mixes (split + carry) ran on `de.hc`.
             self.dgpu.compute.wait_event(&sev.hc_mixes_ffn)?;
         }
-        if fuse_remote_add {
+        if shared_in_combine && fuse_remote_add {
+            let _t = de.events.stage("k.ffn_combine.hc_post_add2", &de.compute)?;
+            let remote = bd
+                .remote_ffn_moe
+                .as_ref()
+                .expect("fuse_remote_add checked remote_ffn_moe");
+            de.hc_post.launch_from_split_batched_add2(
+                &de.compute,
+                &mut bd.residual_next,
+                &bd.ffn_moe_recv,
+                &bd.ffn_shared,
+                remote,
+                &bd.after_attn_hc,
+                &bd.split,
+                N_HC,
+                N_EMBD,
+                N_HC,
+                b,
+            )?;
+            bd.remote_ffn_moe_valid = false;
+        } else if shared_in_combine {
+            // No box-2 partial this layer: `+ shared` is the combine's only add.
+            let _t = de.events.stage("k.ffn_combine.hc_post_add", &de.compute)?;
+            de.hc_post.launch_from_split_batched_add(
+                &de.compute,
+                &mut bd.residual_next,
+                &bd.ffn_moe_recv,
+                &bd.ffn_shared,
+                &bd.after_attn_hc,
+                &bd.split,
+                N_HC,
+                N_EMBD,
+                N_HC,
+                b,
+            )?;
+        } else if fuse_remote_add {
             let _t = de.events.stage("k.ffn_combine.hc_post_add", &de.compute)?;
             let remote = bd
                 .remote_ffn_moe

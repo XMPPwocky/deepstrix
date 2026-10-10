@@ -798,6 +798,12 @@ crate::knobs! {
     /// `V41_B2_SOFT_HINT` (default off; live): the look-ahead filter treats a soft-held expert as
     /// resident (no hint for it).
     pub static B2_SOFT_HINT = Knob::flag("V41_B2_SOFT_HINT", false).live();
+    /// `V41_DGPU_COMBINE3` (default on; live, read per decode lane-layer): dGPU bundle slice 1
+    /// (docs/v41/DGPU_BUNDLE_DESIGN.md 2) -- the post-MoE `ffn_moe += ffn_shared` vec_add is folded
+    /// into the combine (`hc_post_from_split_batched_add2` with box 2's partial, or `_add` with the
+    /// shared expert as the addend when there is none): one launch fewer per lane-layer, out_hc
+    /// bit-identical. Off = the separate vec_add before box 2's wait, as before.
+    pub static DGPU_COMBINE3 = Knob::flag("V41_DGPU_COMBINE3", true).live();
     /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
     /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top
     /// `per_layer()` (today, bit-identical); `interleave` = box 1 holds `V41_B1_HOT_TARGET` of the

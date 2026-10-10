@@ -372,6 +372,45 @@ impl HcPost {
         ])
     }
 
+    /// `hc_post_from_split_batched_add2` (dGPU bundle slice 1, `V41_DGPU_COMBINE3`):
+    /// `block_out += a1` (the shared expert) + [`Self::launch_from_split_batched_add`] (`+ a2`, box 2's
+    /// partial) in one launch: the same two f32 adds in the same order, `out_hc` BIT-IDENTICAL.
+    /// `block_out` is left without either addend.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_from_split_batched_add2(
+        &self,
+        stream: &Stream,
+        out_hc: &mut DeviceBuffer<f32>,
+        block_out: &DeviceBuffer<f32>,
+        a1: &DeviceBuffer<f32>,
+        a2: &DeviceBuffer<f32>,
+        residual_hc: &DeviceBuffer<f32>,
+        split: &DeviceBuffer<f32>,
+        n_w: u32,
+        n_embd: u32,
+        n_hc: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let need = (batch as usize) * (n_embd as usize);
+        if a1.len() < need || a2.len() < need || block_out.len() < need {
+            return Err(eyre!("hc_post_from_split_batched_add2: block_out / addends too small"));
+        }
+        let function = self.module.get_function("hc_post_from_split_batched_add2")?;
+        let block_x = 256u32;
+        let grid_x = n_embd.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, n_hc, batch),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out_hc.raw(), block_out.raw(), a1.raw(), a2.raw(), residual_hc.raw(), split.raw(), n_w, n_embd, n_hc
+        ])
+    }
+
     /// `hc_post_from_split_batched_add` (2026-09-27 round 2, `V41_DEC_FUSE`):
     /// `VecAddInplace::launch(block_out += addend)` + [`Self::launch_from_split_batched`]
     /// in one launch; `out_hc` BIT-IDENTICAL (tests/decode_fusion_bitexact.rs).
