@@ -172,6 +172,44 @@ Revised estimate of what steps 1-3 buy on a 8.0 s steady window: kill paging -> 
 ~4.3 s; gaps 1.9 -> ~0.8 s -> ~3.2-3.5 s, i.e. **~1.2K rows/s** from box-2-side work alone. 2K needs the hub and box 2 to
 share the experts more evenly (the hub is ~50% idle at 21 of 40 ms) on top of that.
 
+### Box-2 "serve the other lane under park": scoping (read-only, 2026-10-10)
+
+What exists. Box 2 (`remote_experts.rs`, expertd compute loop ~8340-8840) already PARKS a request that must page
+(`park=1` in `~/expertd-knobs.txt`; the hub sets `REQ_FLAG_OOO` on every request, 10116): its misses go to the prefetch
+readers (`prefetch_words_cls`, up to `V41_B2_PREFETCH_SETS`=16 concurrent) and, until they land or `PARK_MAX` = 50 ms,
+box 2 serves OTHER queued frames on a second executor `exec2`. The limit that makes it a no-op for prefill:
+`servable()` accepts only `REQ_FLAG_OOO && b <= rows2` with `rows2 = PARK_MAX_ROWS` = **16** (the pin-reserve proof counts on
+it), and the design comment says outright "a prefill pass is never served inside a park" (~3123). A 512-row lane is
+never servable -> `served_under` 0 of 5,968, matching the trace.
+
+What it would take (box-2-only change, hub binary unchanged; replies already match by seq, OOO is supported):
+1. `servable()`: also accept a prefill-shaped frame (b <= 512) **only if its experts are already resident / landed**
+   (cheap predicate with the existing `prefetch_pending_any(&words)` + residency check on its `early_page`d words). If it
+   has misses, serving it inside the park would just read them synchronously on the same drives (`serve_interleaved`
+   comment ~9254) and gain nothing.
+2. `exec2` sized `exec_rows` (512) instead of 16 for this case: ~0.1-0.15 GB iGPU on box 2 (partials 123 KB/row + mid 55
+   KB/row ...); box 2 has ~15 GB available.
+3. Pin reserve: today `PIN_RESERVE_MIN` = 384 + 16*6 = 480 assumes W (<= 384) + P (parked, <= 96). With a parked PREFILL
+   P (<= 384) plus a served-inside PREFILL W (<= 384) the no-deadlock bound becomes R (+STAGE) >= 768
+   (`V41_B2_PIN_RESERVE`; prod runs `V41_B2_PREFILL_STAGE=0`; only 136 experts are pinned now, budget room is fine).
+4. Tests: the loopback tests (`remote_experts_*_loopback.rs`) need a prefill-under-park case; the order of RELEASE/pin
+   words ("served order = arrival order") must still hold.
+Expected gain (inferred from the trace timeline, not measured): lane 1 arrives ~21-25 ms after lane 0, i.e. while lane 0 is
+parked, and its early-page reads then run concurrently with lane 0's; if they land by the time lane 0 starts its kernel,
+lane 1's 18 ms kernel overlaps lane 0's (same GPU, so < 2x) instead of queueing 27 ms behind it. Rough period 66 -> 50-55 ms
+(-20%); the -33% ceiling needs the paging itself removed. Size: ~100-200 lines + tests, medium risk (pin-reserve proof).
+
+**Cheaper first experiment (live, reversible in ~1 s, NEEDS OWNER GO because it changes production box 2):** the park cost
+fits ~3 ms per missing expert (run 19.6 / 26.1 / 47.5 / 79.6 ms at 0-2 / 3-6 / 7-12 / 13+ missing) -- the signature of
+SERIALISED reads. `miss_par` is 1 in `~/expertd-knobs.txt` and the code comment says "MEASURED 2026-09-20 no gain at 4 ...
+kept for a faster drive" -- that was the old drive set; since the 10-03 move box 2 reads from SN5000 + 990 Pro, and the
+disk is only 22-35% busy in steady windows. The daemon is started with `V41_B2_MISS_PAR=4` (staging sets sized for 4) and
+the knob file can only LOWER it, so `miss_par=4` in the file (watched every second; or `kill -USR2`) raises demand-read
+concurrency 1 -> 4 with no restart. A/B it on one steady long prefill with the same evtrace analysis (n_missing vs run
+ms, window wall) and watch decode p90 (miss_par also applies to decode ensure). Revert = write `miss_par=1`.
+(`V41_B2_PREFETCH_SETS`=16 already governs the park/early-page reads, so this tests only the post-park demand path; if no
+change, the stall is read LATENCY/issue timing, and prefetch lead time is the next lever.)
+
 Steps (each gated; nothing GPU beyond the harness until a window is agreed). NOTE: the step order below was written before
 the breakdown above; use the re-ranked list above for priority (step 1 here, MoE batching, is item 2 there):
 
