@@ -149,18 +149,20 @@ Construction (deterministic, frozen for the job even if `hot_set` refreshes mid-
   The `Arc<PrefillSplit>` is cloned ONCE per `pre_moe_route` call, not locked per pick in the 384-wide loop.
   Note (review r3): prefill-class landing of frame-carried words is keyed on the request's ROW COUNT (`b > PIN_DECODE_MAX_ROWS` = 16,
   `re:8571-8596`), not the hub's phase flag; irrelevant for 512-row lanes, state it in the loopback test.
-**Variant P1H "hub-heavy" (owner 10-10: why keep the decoder-hot head resident during a LONG prefill?).** It need not stay: decode does
-not run during a prefill burst, replay touches only 128 rows, and in the unified LRU pool those ids are the LRU-oldest, so a filler
-larger than the free slots simply EVICTS them (no special mechanism). Dropping the decoder-layer hot head (2,060-2,300 ids) frees
-~2,100 slots + the dense window 384: filler up to ~150/layer ~ the balanced split of the MoE-leg model (sec 8: both legs ~16 ms,
--36% vs ~25 ms). The PRICE is the re-warm at the next decode burst: ~2,100 experts ~ 40 GB ~ 10 s of hub disk (~6 s with a Gen4-class
-SSD), hottest-first (top-25/layer = ~50% of decode picks), during which decode steps take synchronous misses (6.8 ms each,
-`ep:3446-3548`); burst cadence 120 s prefill / 30 s decode => maybe 15-25% of each burst's throughput while a long job is in flight
-(inferred). Needs a hottest-first BULK async re-warm at decode entry (the hub only prewarms 2 interleave newcomers/step today,
-`take_prewarm`, `ms:1667-1682`; box 2 already does release/restore for pins). Middle option P1M: keep the top ~50/layer decoder-hot
-(~1,000 ids, ~70% of decode mass), drop the rest. Knob `V41_PREFILL_B1_FILLER` (conservative default = live free slots) and
-`V41_PREFILL_KEEP_DECODER_HOT` (all / top-N / none). Gate: decode p90 over the first 60 s of each burst after a long job, and
-prefill rows/s, both vs the conservative setting.
+**P1H/P1M "hub-heavy" variants are NOT part of P1 (owner 10-10 asked why the hub's decoder-hot head must stay resident during a LONG
+prefill; review r4 answer).** Correctness: eviction of those ids is automatic and harmless (single-class hub LRU, `hot_set::box1_owns` is a
+routing promise independent of residency, pins/ledgers are box-2 state keyed on decode ownership). Cost: production runs
+`V41_B1_PAGE_MISSES=1`, which short-circuits the `b1_prefetch` hand-off ("give the pick to box 2 for this step, fill async",
+`fp:9644-9667`, AUDIT B6), so a decode miss on the hub is a SYNCHRONOUS read on the decode critical path: the first decode step after
+a hub-heavy prefill pays ~50-100 ms per decoder layer (~1-2 s for the step), ~2,100 x 18.8 MB = 40 GB = ~9.5 s of disk however it is
+scheduled, and the re-warm's claims evict the prefill share, so the next window re-pages ~2,100 in turn (~80 GB of hub disk per
+phase pair). The re-warm mechanism does not exist (`take_prewarm` = 2 newcomers/step, `B1_HOT_PREWARM_STEP`; a 24/step bulk re-warm =
+~88 steps ~17 s of a 30 s burst + ~31 ms/step admission work). Burst cadence is 120 s/30 s only unscaled: `V41_MS_BURST_SCALE`
+divides by (1 + live)/(1 + waiting) and a starvation rule overrides (`ms:1074-1084`): check the hub env. And with the corrected
+MoE-leg model the rationale (f ~ 135) is gone (balance ~ 80, hub becomes the pole beyond). **So: slice P1b, after the conservative P1
+lands, gated on (i) a measured hub iGPU MoE coefficient (`V41_EVTRACE_DEV` short window), (ii) a non-stalling re-warm path (revive
+the `b1_prefetch` hand-off or in-pipeline admission, 5c), (iii) its own decode-p90 gate.** In code the filler is capped at the live
+free slots (`SplitCfg::filler`), so no knob typo can reach it.
 
 Cold fill (stated honestly): box 1 pages ONLY its filler synchronously (`ensure`; 22-46/layer x 20 = 440-920 experts ~8-17 GB, 2-4 s at
 4.2 GB/s); box 2 fills its set (<= ~79 GB, 20-26 s) as today's windows 1-2 do. After each decode burst some prefill-class pages are
@@ -235,14 +237,17 @@ re-reads/window) and the window is nearer 5.5-6.0 s. Target after P1+P2a+P2b: ~3
 **MoE-leg model (owner, 10-10): leg time = max(hub iGPU MoE, box-2 queue + run + wire) per lane-layer.** Measured (16:44 job, 6,008
 prefill requests of 512 rows): box 2 receives n_sel p50 1,344 of 3,072 picks = **44% of picks** (hub already ~56%), over n_distinct p50
 147 experts (~9 members each; ~270 owned). Both boxes are weight-bandwidth-bound at these member counts, so leg time ~ distinct
-experts touched x ~0.09-0.125 ms: hub ~115 hot experts ~ 10 ms (matches the 10.4 ms reply->submit), box 2 147 ~ 18.4 ms floor + 7 wire
-(= ~25 ms; lane 1 also queues ~8.6 ms behind lane 0). Moving f (box-2-owned, ~54%-touched) experts/layer to the hub: hub ~ 9.7 +
-0.049 f ms, box 2 leg ~ (147 - 0.54 f) x 0.125 + 7 ms. Residency-capped f = 46: box 2 leg 22.3 ms (-12%, -17% on the serial pair);
-balanced f ~ 135/layer (hub 250, box 2 135): both ~16.3 ms (-36%). So the hub's RESIDENT-EXPERT CAPACITY is the lever (f is capped
-at ~22-46 by free slots, ~70 with the dense window; ~135 would need ~2,700 more hub-resident encoder experts = ~51 GB, i.e. dropping the
-decoder-hot head during long prefills, which costs ~43 GB of re-warm per decode burst: not viable at a 120 s/30 s burst cadence). The
-cost-per-expert coefficients are from two points (inferred). CORRECTION to earlier text in these docs: "box 2 does ~70% of the work"
-was a count of EXPERTS; by picks it is 44%.
+experts touched x a per-expert cost. **Box 2: 18.4 ms floor / 147 = 0.125 ms per expert (measured); + 7 ms wire = ~25 ms; lane 1 also
+queues ~8.6 ms behind lane 0. Hub: UNMEASURED** (review r4: the 10.4 ms reply->next submit I first used is HOST time: post_moe +
+the next lane-layer's dGPU chain launch + the router-readback drain; the hub's iGPU MoE is issued BEFORE the box-2 wait and runs
+hidden under the ~57 ms RTT, so the trace cannot show its length; `V41_EVTRACE_DEV=0`). The hub per-expert cost is bounded 0.082
+(DRAM roofline 18.8 MB / 230 GB/s) to ~0.18 ms (harness, 96 experts at B=512, 17.2 ms, beside live traffic = upper bound). Under a
+SYMMETRIC 0.125 ms/expert: hub leg = 14.4 + 0.0675 f, box-2 leg = 25.4 - 0.0675 f (f = box-2-owned experts moved to the hub per layer,
+~54% touched per request), balance at **f ~ 80/layer (both ~20 ms, -20%)**; beyond f ~ 80 the HUB becomes the pole. The residency-capped
+P1 point survives (it only uses the box-2 side): **f = 46: box-2 leg 22.3 ms (-12%, -17% on the serial pair)**. So past f ~ 60-80 the
+lever is kernel efficiency on both boxes (f16 arm, batching), not hub residency. Measure the hub iGPU MoE per lane-layer (short
+`V41_EVTRACE_DEV` prefill-only window) before any hub-heavy decision. CORRECTION to earlier text in these docs: "box 2 does ~70% of the
+work" was a count of EXPERTS; by picks it is 44%.
 
 **Is the hub's compute used? (owner question 10-10)** Yes, but at ~22% busy: 1.75 s of the 8.02 s window (hub work ~21 ms per
 unit-layer vs a ~66 ms period; blocked on box 2 53%, gaps 24%). Its dGPU runs attention/dense for every row; its iGPU runs only the
