@@ -579,13 +579,26 @@ A long input's phase is attention-bound (quadratic) and blocks chat for its whol
 
 At G = 4 the kernel's work divides evenly: 8 score tasks over 8 waves (G = 6: 12, so 4 waves ran 2) and 256 softmax slots over 256 threads (G = 6: 384). LDS falls from 61,568 to about 46,600 B: still one WG per CU, the same occupancy as G = 6. O stays in registers (`O_reg[4]`, 32 VGPRs instead of 48).
 
-**Expected.** At 10–14 % of peak, 16K attention takes 3–4 s instead of 15.8 s and the phase about 6–7 s instead of 18.7 s; at 11,412 tokens about 4 s instead of 9.85 s. Short inputs (≤ 1K) are matmul-bound and should not move.
+**Expected.** Stated as a ratio over `fa2`, which G2 measures; the absolute rate is uncertain. Per FLOP, G = 4 is within about ±15 % of G = 6 (review, finding 4): per key tile each wave issues 16 WMMAs instead of 28 and fewer LDS operand loads, but the fixed K/V staging and 3 barriers are amortized over 4 heads instead of 6. `fa2` also lacks the LDS skew, the K/V register prefetch and the head sharing, so a ≥ 3× ratio is credible even below 10 % of peak. K/V traffic does not stay in cache in production (each sub-batch's GEMMs stream ~120 MB of weights between attention calls): at 16K that is ~1.2 TB of K/V per input, ~2–4 s on its own. So: 16K attention about 3–5 s instead of 15.8 s, the phase about 6–8 s instead of 18.7 s; 11,412 tokens about 4–5 s instead of 9.85 s. The ship decision is the production phase time (G4), not the estimate.
 
-**Gates (GPU window).**
+**Gates.**
 
-- G1 kernel parity: `gqa_attn_prefill_packed_g4_correctness`, packed G = 4 vs the CPU reference at the Qwen shape (32 / 8 / 128) and at kv_group 8 (n_subgroup 2): q_offset 0, 100, 1024; B 7, 77, 130, 1024; max abs < 2e-3 (the existing tolerance).
-- G2 baseline first: `gqa_attn_prefill_qwen_bench`, `fa2` vs packed G = 4 at B = 1024 (the embed sub-batch) and depths 1K, 4K, 8K, 16K, in µs and effective TFLOPS. If `fa2` is not near 5 TFLOPS here, §18 is re-priced before anything ships.
-- G3 the forward: `tiny_gpu_matches_cpu` and `real_gpu_matches_cpu` with `V41_EMBED_ATTN=packed`.
-- G4 in production, via the live knob: `long_ref.py check` on the 11,412 / 16,384 texts against the hub's `fa2` vectors (themselves 0.999998+ vs the CPU oracle) and `e2e_smoke` against the llama.cpp reference, then the phase times.
+- G0 offline, before the window: the packed G = 4 kernel's code-object metadata: LDS 46,592 B, scratch 0, VGPRs ≤ 256 (a register spill would show here without a GPU).
+- G1 kernel parity: `gqa_attn_prefill_packed_g4_correctness`, packed G = 4 vs the CPU reference at the Qwen shape (32 / 8 / 128) and at kv_group 8 (n_subgroup 2): q_offset 0, 5, 100, 512, 1024; B 7, 77, 130, 1024; max abs < 2e-3 (the existing tolerance). And `gqa_attn_g4_module_fa2_identical_and_kv_tail_ignored`: `fa2` from the G = 4 module is bit-identical to `fa2` from the default module (the embed's default path changed modules), and with `kv_capacity` > `n_kv_total` and f16 NaN in the rows past it (the embed's call pattern) both kernels give bit-identical, finite outputs.
+- G2 baseline first: `gqa_attn_prefill_qwen_bench`, `fa2` vs packed G = 4, every call after a 256 MB cache flush and timed alone: B = 1024 at depths 1K, 4K, 8K, 16K (µs, effective TFLOPS, and the 36-layer sum for one 16,384-token input), plus inputs of 8, 64, 256 and 1024 tokens alone (few WGs when packed). Bar: the `fa2` 36-layer sum within ±20 % of the 15.8 s production shows; otherwise §18 is re-priced before anything ships. If packed loses on short inputs, the forward gets a per-call depth threshold.
+- G3 the forward: `tiny_gpu_packed_matches_cpu` (the tiny model at kv_group 4: packed vs the CPU oracle ≥ 0.9999, packed vs `fa2` ≥ 0.99999), and `tiny_gpu_matches_cpu` / `real_gpu_matches_cpu` with `QWEN3_EMBED_ATTN=packed` (≥ 0.9999).
+- G4 production, the same binary hash as the window: first with the knob at `fa2`, the 11,412 / 16,384-token texts (`long_ref.py`) and the 22-case corpus must give vectors bit-identical to today's hub. Then `V41_EMBED_ATTN=packed`: cosine ≥ 0.9999 against those `fa2` vectors (themselves 0.999998+ vs the CPU oracle), `e2e_smoke` ≥ 0.998 against llama.cpp, and the phase times for the same texts on both settings. The default flips to `packed` only on a shorter phase.
 
-**Risks.** The packed kernel has run only in Laguna tests (env-gated off there). Its numerics differ from `fa2` at f16 rounding (G1/G3 bound it). A kernel fault on the production GPU would take the hub down, hence G1–G3 in a window before the knob is flipped live.
+**G0 result (2026-10-10, offline, gfx1201 code objects):**
+
+| Kernel | LDS | scratch | VGPRs | spills |
+|---|---|---|---|---|
+| `hg_packed`, HGP_G = 6 (default module) | 61,568 B | 0 | 253 | 0 |
+| `hg_packed`, HGP_G = 4 (g4 module) | 46,592 B | 0 | 256 | 0 |
+| `fa2`, both modules | 31,104 B | 0 | 128 | 0 |
+
+`fa2` disassembles to identical instructions in both modules (3,094 lines), so the embed's default path cannot change from the module move. G = 4 uses every VGPR without spilling; the Q-in-registers follow-up has no headroom.
+
+**Risks.** The packed kernel is the default on Laguna's global layers (`laguna_het.rs`, commit 118c42d: chunked prefill with q_offset > 0 and a ring `kv_capacity`), but has not run at G = 4. Its numerics differ from `fa2` at f16 rounding (G1/G3/G4 bound it). A kernel fault on the production GPU would take the hub down, hence G0–G3 in a window before the knob is flipped live. Rolling back is the knob.
+
+**Review (2026-10-10): APPROVE WITH CHANGES**, all taken: G2's warm-cache timing (cache flush), bit-identity of the moved `fa2` path (G1, G4), the NaN-tail case (G1), G0, short-input rows, pass bars for G4, `#undef HGP_G` in the g4 file (a `-DHGP_G` in `DEEPSTRIX_KERNEL_CFLAGS` reaches both units), the packed wrapper requiring head_dim 128 (its epilogue writes all 128 dims), the stale "env-gated OFF" comments. Rejected as follow-ups, not needed to ship: two KV heads per WG (nothing shared across KV heads; LDS ~85 KB), HG_BR = 32 (16-row M tile hard-wired; LDS ~76 KB). Follow-ups after G2, each under an `#ifdef` in the g4 build only: b128 K/V staging loads, Q fragments held in registers (at G = 4 each wave keeps one score task; only with VGPR headroom), KV-first grid order.

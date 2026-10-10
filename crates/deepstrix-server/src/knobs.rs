@@ -196,6 +196,11 @@ v4flash_kernels::knobs! {
     /// `V41_EMBED_FAULT_LAYER` (gates only, live; default off): every embed phase's
     /// forward fails after this layer (design §10, gate E6).
     pub static EMBED_FAULT_LAYER = Knob::int("V41_EMBED_FAULT_LAYER", MAX, 0, MAX).live();
+    /// `V41_EMBED_ATTN` (live, default `fa2`, read per phase): the forward's
+    /// attention kernel. `fa2` = one WG per query head; `packed` = the full-group
+    /// packed kernel, 4 query heads per WG sharing one K/V staging and softmax
+    /// pass (design §18; a model with kv_group not a multiple of 4 stays on fa2).
+    pub static EMBED_ATTN = Knob::choice("V41_EMBED_ATTN", 0, &[&["fa2"], &["packed"]]).live();
 }
 
 #[cfg(test)]
@@ -237,7 +242,7 @@ mod tests {
             "V41_B2_MISS_PREFETCH", "V41_B2_MISS_PREFETCH_CAP", "V41_B2_MISS_PREFETCH_MARGIN", "V41_B2_MISS_PREFETCH_MAX_PER_LL_X10",
             "V41_B2_MISS_PREFETCH_MAX_WORDS_STEP", "V41_B2_MISS_PREFETCH_RANK", "V41_B2_NURSERY_PRIOR", "V41_B2_PIN_PREFILL_BAND",
             "V41_B2_SOFT_HINT", "V41_B2_SOFT_MAP", "V41_B2_SOFT_PRIOR", "V41_B2_SPEC_BUDGET", "V41_DGPU_COMBINE3", "V41_DGPU_ENGRAM_ASYNC", "V41_DGPU_ZC_PUSH",
-            "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
+            "V41_EMBED_ATTN", "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
             "V41_MS_CTX_CHECK", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
             "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_PROFILE", "V41_MS_PROFILE_SAMPLE", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA", "V41_SUB_PROTECT",

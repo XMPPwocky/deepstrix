@@ -30,6 +30,10 @@ use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const GQA_ATTENTION_GFX1201: &[u8] = include_bytes!(env!("KERNEL_GQA_ATTENTION_GFX1201"));
 const GQA_ATTENTION_GFX1151: &[u8] = include_bytes!(env!("KERNEL_GQA_ATTENTION_GFX1151"));
+/// The same source compiled with `HGP_G = 4` (`kernels/gqa_attention_g4.hip`):
+/// only `..._fa2_hg_packed` differs. gfx1201 only (the packed kernel is a stub
+/// elsewhere).
+const GQA_ATTENTION_G4_GFX1201: &[u8] = include_bytes!(env!("KERNEL_GQA_ATTENTION_G4_GFX1201"));
 
 /// Maximum `head_dim` the kernel's static LDS supports (mirrors
 /// `GQA_HEAD_DIM_MAX` in `kernels/gqa_attention.hip`).
@@ -50,8 +54,9 @@ fn flash_hg_g() -> u32 {
 }
 const FLASH_HG_BR: u32 = 16;
 const FLASH_HG_BLOCK: u32 = 256;
-/// Full-GQA-group packing factor for `..._fa2_hg_packed` (mirrors `HGP_G` in the
-/// `.hip`). Fixed at 6 = full-attn kv_group; one WG owns the whole group.
+/// Full-GQA-group packing factor of `..._fa2_hg_packed` in the default module
+/// (mirrors `HGP_G` in the `.hip`): 6 = Laguna's full-attn kv_group; one WG owns
+/// the whole group. `GqaAttention::for_arch_group4` loads the `HGP_G = 4` build.
 const FLASH_HGP_G: u32 = 6;
 /// Max `head_dim` the flash kernel's static LDS supports (mirrors `FD`).
 pub const FLASH_HEAD_DIM: u32 = 128;
@@ -162,6 +167,9 @@ pub fn decode_kv_splits_hg(n_kv: u32) -> u32 {
 
 pub struct GqaAttention {
     module: Module,
+    /// `HGP_G` the module was compiled with: query heads per WG in
+    /// `prefill_flash_wmma_fa2_hg_packed`.
+    hgp_g: u32,
 }
 
 impl GqaAttention {
@@ -174,7 +182,23 @@ impl GqaAttention {
             return Err(eyre!("unsupported arch for gqa attention: {arch}"));
         };
         let module = Module::load_data(image)?;
-        Ok(Self { module })
+        Ok(Self { module, hgp_g: FLASH_HGP_G })
+    }
+
+    /// The module compiled with `HGP_G = 4` (kv_group 4, e.g. Qwen3-Embedding-4B):
+    /// every kernel as in [`Self::for_arch`] except the packed one, which owns 4
+    /// query heads per WG. gfx1201 only.
+    pub fn for_arch_group4(arch: &str) -> eyre::Result<Self> {
+        if !arch.starts_with("gfx1201") {
+            return Err(eyre!("gqa attention HGP_G=4 is built for gfx1201 only, not {arch}"));
+        }
+        Ok(Self { module: Module::load_data(GQA_ATTENTION_G4_GFX1201)?, hgp_g: 4 })
+    }
+
+    /// Query heads per WG in [`Self::prefill_flash_wmma_fa2_hg_packed`]; it
+    /// needs `kv_group % packed_group() == 0`.
+    pub fn packed_group(&self) -> u32 {
+        self.hgp_g
     }
 
     /// Single-query GQA attention.
@@ -891,11 +915,14 @@ impl GqaAttention {
         ])
     }
 
-    /// FULL-GQA-group packed WMMA FA prefill (`..._fa2_hg_packed`, HGP_G=6). One
-    /// WG owns ALL `kv_group` query heads of a KV head, amortizing the K/V load +
-    /// softmax pass + barriers over the whole group (fa2_hg only packs 3 of 6).
-    /// Requires `kv_group % FLASH_HGP_G == 0` (global Laguna: 6). Same contract as
-    /// `fa2_hg`. Env-gated OFF (`LAGUNA_ATTN_HG_PACKED=1`) via the het path.
+    /// FULL-GQA-group packed WMMA FA prefill (`..._fa2_hg_packed`). One WG owns
+    /// [`Self::packed_group`] query heads of a KV head (the whole group when they
+    /// are equal), amortizing the K/V load + softmax pass + barriers over them
+    /// (fa2_hg only packs 3 of 6). Requires `kv_group % packed_group() == 0`
+    /// (Laguna global: 6, default module; Qwen3-Embedding: 4, `for_arch_group4`).
+    /// Same contract as `fa2_hg`, except `head_dim` must be exactly
+    /// `FLASH_HEAD_DIM` (the epilogue writes all 128 dims). Laguna's global
+    /// layers use it by default (`laguna_het.rs`, `LAGUNA_ATTN_HG_PACKED`).
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_flash_wmma_fa2_hg_packed(
         &self,
@@ -916,15 +943,15 @@ impl GqaAttention {
         if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!("gqa flash wmma fa2 hg packed: zero dim"));
         }
-        if head_dim > FLASH_HEAD_DIM {
-            return Err(eyre!("gqa flash wmma fa2 hg packed: head_dim={head_dim} > {FLASH_HEAD_DIM}"));
+        if head_dim != FLASH_HEAD_DIM {
+            return Err(eyre!("gqa flash wmma fa2 hg packed: head_dim={head_dim} != {FLASH_HEAD_DIM}"));
         }
         if n_head % n_kv_head != 0 {
             return Err(eyre!("gqa flash wmma fa2 hg packed: n_head={n_head} not div by n_kv_head={n_kv_head}"));
         }
         let kv_group = n_head / n_kv_head;
-        if kv_group % FLASH_HGP_G != 0 {
-            return Err(eyre!("gqa flash wmma fa2 hg packed: kv_group={kv_group} not div by HGP_G={FLASH_HGP_G}"));
+        if kv_group % self.hgp_g != 0 {
+            return Err(eyre!("gqa flash wmma fa2 hg packed: kv_group={kv_group} not div by HGP_G={}", self.hgp_g));
         }
         let n_kv_total = q_offset + batch;
         let want_q = (batch * n_head * head_dim) as usize;
@@ -936,7 +963,7 @@ impl GqaAttention {
             return Err(eyre!("gqa flash wmma fa2 hg packed: kv cache too small"));
         }
         let function = self.module.get_function("gqa_attn_prefill_flash_wmma_fa2_hg_packed")?;
-        let n_subgroup = kv_group / FLASH_HGP_G;
+        let n_subgroup = kv_group / self.hgp_g;
         let grid_x = n_kv_head * n_subgroup;
         let grid_y = batch.div_ceil(FLASH_HG_BR);
         let cfg = LaunchConfig {

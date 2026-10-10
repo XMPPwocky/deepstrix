@@ -10,9 +10,11 @@
 //! a plain allocation), carved in the order [`EmbedSizing::buffer_sizes`] lists.
 //!
 //! Projections: the production Q8_0 x f16 WMMA GEMM (`gemm_f16x`, gfx1201; the
-//! caller passes the engine's resident module). Attention: the Laguna-era
-//! `GqaAttention::prefill_flash_wmma_fa2` (kernel-tested at kv_group 6/9; gate
-//! E2 covers Qwen's 4), one launch per input segment of a sub-batch.
+//! caller passes the engine's resident module). Attention, one launch per input
+//! segment of a sub-batch, from the `HGP_G = 4` build of `gqa_attention.hip`:
+//! `prefill_flash_wmma_fa2` (one WG per query head; gate E2 covers Qwen's
+//! kv_group 4), or with [`Qwen3EmbedKernels::set_packed_attention`] the
+//! full-group packed kernel (4 query heads per WG; design §18).
 //! Everything else: `kernels/qwen3_embed.hip`. The modules here are loaded per
 //! phase and dropped after it.
 
@@ -50,18 +52,40 @@ const REPACK_MAX_BLOCKS: usize = 480;
 
 pub struct Qwen3EmbedKernels {
     module: Module,
+    /// The `HGP_G = 4` attention module: `fa2` plus the full-group packed kernel
+    /// at 4 query heads per WG (design §18).
     attn: GqaAttention,
+    /// Attention through `prefill_flash_wmma_fa2_hg_packed` (when kv_group is a
+    /// multiple of 4) instead of `prefill_flash_wmma_fa2`.
+    packed_attn: bool,
 }
 
 impl Qwen3EmbedKernels {
     /// The dGPU (gfx1201) only: the WMMA GEMM and attention have no fast path
-    /// elsewhere.
+    /// elsewhere. Attention starts on `fa2`; see [`Self::set_packed_attention`].
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         if !arch.starts_with("gfx1201") {
             return Err(eyre!("qwen3 embed forward needs gfx1201 (the dGPU), got {arch}"));
         }
         let _ = QWEN3_EMBED_GFX1151; // built for every target; never loaded there
-        Ok(Qwen3EmbedKernels { module: Module::load_data(QWEN3_EMBED_GFX1201)?, attn: GqaAttention::for_arch(arch)? })
+        Ok(Qwen3EmbedKernels {
+            module: Module::load_data(QWEN3_EMBED_GFX1201)?,
+            attn: GqaAttention::for_arch_group4(arch)?,
+            packed_attn: false,
+        })
+    }
+
+    /// Attention through the full-group packed kernel (4 query heads per WG,
+    /// one K/V staging and softmax pass for all of them) instead of `fa2` (one WG
+    /// per query head). A model whose kv_group is not a multiple of 4 stays on
+    /// `fa2` either way.
+    pub fn set_packed_attention(&mut self, on: bool) {
+        self.packed_attn = on;
+    }
+
+    /// Whether `cfg`'s attention runs packed (the setting and the shape agree).
+    pub fn attention_packed(&self, cfg: &Qwen3EmbedConfig) -> bool {
+        self.packed_attn && (cfg.n_head / cfg.n_kv_head) as u32 % self.attn.packed_group() == 0
     }
 
     /// In place: `rows` GGUF Q8_0 rows of `blocks` blocks starting at `w[0]`
@@ -549,6 +573,7 @@ fn layer(
     let w_down = w.slice_view(layout.down, layout.down_bytes);
     let scale = 1.0 / (c.head_dim as f32).sqrt();
     let sub = bufs.sizing.sub_rows;
+    let packed = k.attention_packed(c);
     let mut seg = 0usize; // first input that may overlap the sub-batch
     let mut r0 = 0;
     while r0 < t {
@@ -571,10 +596,13 @@ fn layer(
             let mut o = bufs.attn_out.slice_view_mut((a - r0) * qw, (b - a) * qw);
             let kc = bufs.kc.slice_view(s0 * kvw, len * kvw);
             let vc = bufs.vc.slice_view(s0 * kvw, len * kvw);
-            k.attn.prefill_flash_wmma_fa2(
-                st, &mut o, &q, &kc, &vc, (b - a) as u32, c.n_head as u32, c.n_kv_head as u32,
-                c.head_dim as u32, (a - s0) as u32, scale, 0, len as u32, true,
-            )?;
+            let (batch, q_off) = ((b - a) as u32, (a - s0) as u32);
+            let (nh, nkv, hd) = (c.n_head as u32, c.n_kv_head as u32, c.head_dim as u32);
+            if packed {
+                k.attn.prefill_flash_wmma_fa2_hg_packed(st, &mut o, &q, &kc, &vc, batch, nh, nkv, hd, q_off, scale, 0, len as u32)?;
+            } else {
+                k.attn.prefill_flash_wmma_fa2(st, &mut o, &q, &kc, &vc, batch, nh, nkv, hd, q_off, scale, 0, len as u32, true)?;
+            }
             s += 1;
         }
         k.cast_f16(st, &mut bufs.x16, pa as u32, &bufs.attn_out, qw as u32, rows as u32)?;

@@ -42,11 +42,30 @@ fn tmp(tag: &str) -> PathBuf {
     d
 }
 
+/// `QWEN3_EMBED_ATTN=packed`: the gates' forward runs attention on the
+/// full-group packed kernel (design §18) instead of `fa2`.
+fn packed_from_env() -> bool {
+    std::env::var("QWEN3_EMBED_ATTN").as_deref() == Ok("packed")
+}
+
 /// GPU embeddings of `inputs` (finished, full dims) with memory from one
-/// plain allocation.
+/// plain allocation; attention per `QWEN3_EMBED_ATTN`.
 fn gpu_embed(dev: Device, model: &Qwen3EmbedModel, file: &MappedGguf, inputs: &[Vec<u32>], sizing: EmbedSizing) -> eyre::Result<Vec<Vec<f32>>> {
+    gpu_embed_with(dev, model, file, inputs, sizing, packed_from_env())
+}
+
+fn gpu_embed_with(
+    dev: Device,
+    model: &Qwen3EmbedModel,
+    file: &MappedGguf,
+    inputs: &[Vec<u32>],
+    sizing: EmbedSizing,
+    packed: bool,
+) -> eyre::Result<Vec<Vec<f32>>> {
     dev.set_current()?;
-    let k = Qwen3EmbedKernels::for_arch("gfx1201")?;
+    let mut k = Qwen3EmbedKernels::for_arch("gfx1201")?;
+    k.set_packed_attention(packed);
+    eprintln!("attention: {}", if k.attention_packed(&model.cfg) { "packed" } else { "fa2" });
     // One plain allocation per planned buffer (the hub's come from the loan).
     let backing: Vec<DeviceBuffer<u8>> = sizing
         .buffer_sizes(&model.cfg, &model.layout)
@@ -101,6 +120,39 @@ fn tiny_gpu_matches_cpu() -> eyre::Result<()> {
     let alone = gpu_embed(dev, &model, &file, &inputs[3..4], EmbedSizing { phase_tokens: 128, sub_rows: 8 })?;
     let cs = cosine(&alone[0], &gpu[3]);
     assert!(cs >= 0.99999, "alone vs packed {cs}");
+    Ok(())
+}
+
+/// The tiny model at kv_group 4 (8 query heads over 2 KV heads, as Qwen3-4B's
+/// 32 / 8), so the full-group packed attention kernel runs (design §18, G3):
+/// packed vs the CPU oracle, and packed vs `fa2` on the GPU.
+#[test]
+#[ignore]
+fn tiny_gpu_packed_matches_cpu() -> eyre::Result<()> {
+    let dev = dgpu()?;
+    let p = tmp("tiny-g4").join("tiny-g4.gguf");
+    let mut cfg = testing::tiny_config();
+    cfg.n_head = 8;
+    testing::write_synthetic(&p, &cfg, 29)?;
+    let file = MappedGguf::open(&p)?;
+    let model = Qwen3EmbedModel::from_gguf(&file)?;
+    assert_eq!(model.cfg.n_head / model.cfg.n_kv_head, 4);
+    let eos = model.eos_id;
+    let inputs: Vec<Vec<u32>> = vec![
+        (1..20).chain([eos]).collect(),
+        vec![7, eos],
+        vec![eos],
+        (30..43).chain([eos]).collect(),
+        (100..125).chain([eos]).collect(),
+    ];
+    let sizing = EmbedSizing { phase_tokens: 128, sub_rows: 8 };
+    let cpu = cpu_forward(&model, &file, &inputs)?;
+    let packed = gpu_embed_with(dev, &model, &file, &inputs, sizing, true)?;
+    let min = compare(&packed, &cpu);
+    assert!(min >= 0.9999, "packed vs cpu: min cosine {min}");
+    let fa2 = gpu_embed_with(dev, &model, &file, &inputs, sizing, false)?;
+    let min = compare(&packed, &fa2);
+    assert!(min >= 0.99999, "packed vs fa2: min cosine {min}");
     Ok(())
 }
 

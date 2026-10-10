@@ -162,6 +162,8 @@ pub struct PhaseStats {
     pub nonfinite: usize,
     pub guard_violations: u32,
     pub ok: bool,
+    /// Attention ran on the packed kernel (`V41_EMBED_ATTN=packed`), else `fa2`.
+    pub attn_packed: bool,
 }
 
 /// The engine thread's embed state (`WorkerState::embed`).
@@ -543,6 +545,7 @@ impl EmbedCtx {
             wait_read_ms = st.wait_read_ms as u64, fwd_ms = st.fwd_ms as u64, return_ms = st.return_ms as u64,
             verify_ms = st.verify_ms as u64, pinned_ms = st.pinned_ms as u64, total_ms = st.total_ms as u64,
             nonfinite = st.nonfinite, guard_violations = st.guard_violations,
+            attn = if st.attn_packed { "packed" } else { "fa2" },
             lent_mib = self.loan.lent_bytes() >> 20, "ms.embed"
         );
         use v4flash_kernels::het::{evtrace, evtrace_kinds};
@@ -571,7 +574,9 @@ impl EmbedCtx {
         dgpu.set_current()?;
         // L1: nothing queued on the dGPU may still read a donor.
         dgpu.synchronize()?;
-        let k = Qwen3EmbedKernels::for_arch(&self.arch)?;
+        let mut k = Qwen3EmbedKernels::for_arch(&self.arch)?;
+        k.set_packed_attention(knobs::EMBED_ATTN.pick() == 1);
+        st.attn_packed = k.attention_packed(&self.model.cfg);
         let mut alloc = self.loan.allocator()?;
         let mut bufs = EmbedBuffers::carve(&mut alloc, self.sizing, &self.model.cfg, &self.model.layout)?;
         let inputs: Vec<&[u32]> = batch.iter().map(|(ri, ii)| self.active[*ri].inputs[*ii].as_slice()).collect();

@@ -1617,7 +1617,9 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_fp8(
 //   register-O is mandatory here; if it spills to scratch, G=6 is off the table.
 //   grid: (n_kv_head * (kv_group/6), ceil(B/HG_BR), 1)   block: (256,1,1)
 // Requires kv_group % 6 == 0 (global Laguna: 6). SWA layers (kv_group 9) stay on
-// fa2_hg. Env-gated OFF by default (LAGUNA_ATTN_HG_PACKED=1).
+// fa2_hg. The DEFAULT on Laguna's global layers (LAGUNA_ATTN_HG_PACKED=0 opts out).
+// kernels/gqa_attention_g4.hip compiles this file again with HGP_G = 4 (kv_group 4,
+// Qwen3-Embedding; docs/v41/EMBED_PHASE_DESIGN.md §18).
 // =============================================================================
 #ifndef HGP_G
 #define HGP_G 6u

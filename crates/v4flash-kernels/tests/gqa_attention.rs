@@ -23,7 +23,7 @@
 //!       --test gqa_attention -- --ignored --nocapture
 
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
+use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::iq2_xxs_tables::f16_to_f32;
 use v4flash_kernels::GqaAttention;
 
@@ -516,8 +516,9 @@ fn run_prefill_wmma_case(
         batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32,
         false,
     )?;
-    // Full-GQA-group packed variant (HGP_G=6) only when kv_group % 6 == 0.
-    let do_packed = kv_group % 6 == 0;
+    // Full-GQA-group packed variant only when kv_group is a multiple of the
+    // module's HGP_G (6 by default, 4 from `for_arch_group4`).
+    let do_packed = kv_group % kernel.packed_group() as usize == 0;
     let mut d_pk: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
     if do_packed {
         kernel.prefill_flash_wmma_fa2_hg_packed(
@@ -1336,5 +1337,201 @@ fn gqa_attn_prefill_swa_window_correctness() -> eyre::Result<()> {
         assert!(e2kv_vs_fa2 == 0.0, "wmma-fa2 KV-first must equal fa2 exactly, got {e2kv_vs_fa2:.3e}");
         assert!(e2hg < TOL_WMMA, "wmma-fa2 head-grouped windowed vs cpu {e2hg:.3e}");
     }
+    Ok(())
+}
+
+/// The full-group packed kernel at `HGP_G = 4` (`kernels/gqa_attention_g4.hip`,
+/// Qwen3-Embedding: 32 query heads over 8 KV heads, head_dim 128) against the CPU
+/// reference, with `fa2` and the LDS-O WMMA kernel from the same module alongside.
+/// kv_group 8 runs n_subgroup = 2. Design: docs/v41/EMBED_PHASE_DESIGN.md §18, G1.
+#[test]
+#[ignore]
+fn gqa_attn_prefill_packed_g4_correctness() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let device = pick_dgpu()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    let kernel = GqaAttention::for_arch_group4(&arch)?;
+    assert_eq!(kernel.packed_group(), 4);
+    let stream = Stream::new(device.id)?;
+    const TOL: f32 = 2.0e-3;
+    // (seed, q_offset, B, n_head): Qwen's shape at q_offset 0 / mid / a later
+    // sub-batch, partial tiles (7, 77, 130), full 1024-row sub-batches; kv_group 8
+    // (two WGs per KV head).
+    for &(seed, q_offset, batch, n_head) in &[
+        (0x51u64, 0usize, 130usize, 32usize),
+        (0x52, 100, 77, 32),
+        (0x53, 5, 7, 32),
+        (0x54, 1024, 1024, 32),
+        (0x55, 0, 1024, 32),
+        (0x56, 100, 77, 64),
+        (0x57, 512, 130, 64),
+    ] {
+        let e = run_prefill_wmma_case(&kernel, &device, &stream, seed, q_offset, batch, n_head, 8, 128)?;
+        assert!(e < TOL, "packed G=4 q_offset {q_offset} B {batch} n_head {n_head}: max_abs {e:.3e} >= {TOL:.3e}");
+    }
+    Ok(())
+}
+
+/// The embed's call pattern and the module swap (design §18, G1; review
+/// findings 2 and 3):
+/// - `fa2` from the `HGP_G = 4` module is BIT-identical to `fa2` from the default
+///   module (the embed's default path moved modules);
+/// - with `kv_capacity` > `n_kv_total` and the rows past `n_kv_total` holding f16
+///   NaN (the embed passes the whole input's K/V while later sub-batches' rows
+///   still hold the previous layer's), `fa2` and packed G = 4 give exactly what
+///   they give on an exact-length cache.
+#[test]
+#[ignore]
+fn gqa_attn_g4_module_fa2_identical_and_kv_tail_ignored() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let device = pick_dgpu()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    let (g6, g4) = (GqaAttention::for_arch(&arch)?, GqaAttention::for_arch_group4(&arch)?);
+    let stream = Stream::new(device.id)?;
+    let (n_head, n_kv_head, head_dim) = (32usize, 8usize, 128usize);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    for &(q_offset, batch, tail) in &[(0usize, 130usize, 900usize), (1024, 1024, 1000), (100, 77, 33)] {
+        let n_kv_total = q_offset + batch;
+        let row = n_kv_head * head_dim;
+        let mut rng = Lcg(0x7a11 ^ q_offset as u64 ^ (batch as u64) << 16);
+        let q_bits: Vec<u16> = (0..batch * n_head * head_dim).map(|_| round_f16(rng.next_f32()).0).collect();
+        let k_bits: Vec<u16> = (0..n_kv_total * row).map(|_| round_f16(rng.next_f32()).0).collect();
+        let v_bits: Vec<u16> = (0..n_kv_total * row).map(|_| round_f16(rng.next_f32()).0).collect();
+        let nan_tail = |b: &[u16]| -> Vec<u16> { b.iter().copied().chain(std::iter::repeat_n(0x7E00u16, tail * row)).collect() };
+        let up = |b: &[u16]| -> eyre::Result<DeviceBuffer<u16>> {
+            let mut d: DeviceBuffer<u16> = DeviceBuffer::new(device.id, b.len())?;
+            d.copy_from_host(b)?;
+            Ok(d)
+        };
+        let (d_q, d_k, d_v) = (up(&q_bits)?, up(&k_bits)?, up(&v_bits)?);
+        let (d_kt, d_vt) = (up(&nan_tail(&k_bits))?, up(&nan_tail(&v_bits))?);
+        let (b, nh, nkv, hd, qo) = (batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32);
+        let (exact, padded) = (n_kv_total as u32, (n_kv_total + tail) as u32);
+        let n_out = batch * n_head * head_dim;
+        let mut outs = Vec::new();
+        for which in 0..5 {
+            let mut d_o: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_out)?;
+            match which {
+                0 => g6.prefill_flash_wmma_fa2(&stream, &mut d_o, &d_q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, exact, true)?,
+                1 => g4.prefill_flash_wmma_fa2(&stream, &mut d_o, &d_q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, exact, true)?,
+                2 => g4.prefill_flash_wmma_fa2(&stream, &mut d_o, &d_q, &d_kt, &d_vt, b, nh, nkv, hd, qo, scale, 0, padded, true)?,
+                3 => g4.prefill_flash_wmma_fa2_hg_packed(&stream, &mut d_o, &d_q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, exact)?,
+                _ => g4.prefill_flash_wmma_fa2_hg_packed(&stream, &mut d_o, &d_q, &d_kt, &d_vt, b, nh, nkv, hd, qo, scale, 0, padded)?,
+            }
+            stream.synchronize()?;
+            let mut h = vec![0f32; n_out];
+            d_o.copy_to_host(&mut h)?;
+            assert!(h.iter().all(|x| x.is_finite()), "case q_offset {q_offset} B {batch}: output {which} not finite");
+            outs.push(h);
+        }
+        let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        assert!(same(&outs[0], &outs[1]), "q_offset {q_offset} B {batch}: fa2 differs between the G=6 and G=4 modules");
+        assert!(same(&outs[1], &outs[2]), "q_offset {q_offset} B {batch}: fa2 reads past n_kv_total");
+        assert!(same(&outs[3], &outs[4]), "q_offset {q_offset} B {batch}: packed G=4 reads past n_kv_total");
+        eprintln!("g4 module: q_offset {q_offset} B {batch} tail {tail}: fa2 bit-identical across modules; NaN tail ignored by fa2 and packed");
+    }
+    Ok(())
+}
+
+/// `fa2` vs the packed kernel at G = 4 on the embed phase's attention calls
+/// (Qwen3-Embedding-4B: 32 / 8 / 128; one 1024-row sub-batch at a time, causal
+/// over everything before it). Prints µs per call and effective TFLOPS (causal
+/// FLOPs), and the sum over the 16 sub-batches of one 16,384-token input x 36
+/// layers = that input's attention seconds (production fa2: ~15.8 s). Design §18, G2.
+///   nix develop -c cargo test --release -p v4flash-kernels --test gqa_attention \
+///       -- --ignored --nocapture gqa_attn_prefill_qwen_bench
+#[test]
+#[ignore]
+fn gqa_attn_prefill_qwen_bench() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let device = pick_dgpu()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    let kernel = GqaAttention::for_arch_group4(&arch)?;
+    let stream = Stream::new(device.id)?;
+    let (n_head, n_kv_head, head_dim) = (32usize, 8usize, 128usize);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let (batch, total) = (1024usize, 16384usize);
+    const ITERS: usize = 10;
+    const WARMUP: usize = 2;
+
+    let mut rng = Lcg(0x9e37);
+    let mut q_bits = vec![0u16; batch * n_head * head_dim];
+    for v in q_bits.iter_mut() {
+        *v = round_f16(rng.next_f32()).0;
+    }
+    let kv_len = total * n_kv_head * head_dim;
+    let mut k_bits = vec![0u16; kv_len];
+    let mut v_bits = vec![0u16; kv_len];
+    for i in 0..kv_len {
+        k_bits[i] = round_f16(rng.next_f32()).0;
+        v_bits[i] = round_f16(rng.next_f32()).0;
+    }
+    let mut d_q: DeviceBuffer<u16> = DeviceBuffer::new(device.id, q_bits.len())?;
+    d_q.copy_from_host(&q_bits)?;
+    let mut d_k: DeviceBuffer<u16> = DeviceBuffer::new(device.id, k_bits.len())?;
+    d_k.copy_from_host(&k_bits)?;
+    let mut d_v: DeviceBuffer<u16> = DeviceBuffer::new(device.id, v_bits.len())?;
+    d_v.copy_from_host(&v_bits)?;
+    let mut d_out: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
+
+    let (nh, nkv, hd, b, cap) = (n_head as u32, n_kv_head as u32, head_dim as u32, batch as u32, total as u32);
+    // Causal FLOPs of one call: QK and PV at 2 FLOPs per MAC; row i attends q_offset + i + 1 keys.
+    let flops = |q_offset: usize| 4.0 * (head_dim * n_head) as f64 * (batch * q_offset + batch * (batch + 1) / 2) as f64;
+    // Production never runs attention on a warm cache: each sub-batch's GEMMs
+    // stream ~120 MB of layer weights between attention calls, which flushes the
+    // 64 MB Infinity Cache. So every timed call follows a 256 MB write and is
+    // timed alone with events (review finding 1).
+    let mut flush: DeviceBuffer<u8> = DeviceBuffer::new(device.id, 256 << 20)?;
+    let (e0, e1) = (Event::new()?, Event::new()?);
+    let mut timed = |packed: bool, q_offset: usize, b: u32| -> eyre::Result<f64> {
+        let qo = q_offset as u32;
+        let rows = b as usize * n_head * head_dim;
+        let q = d_q.slice_view(0, rows);
+        let mut o = d_out.slice_view_mut(0, rows);
+        let mut total = 0.0;
+        for i in 0..WARMUP + ITERS {
+            flush.fill_zero_async(&stream)?;
+            e0.record(&stream)?;
+            if packed {
+                kernel.prefill_flash_wmma_fa2_hg_packed(&stream, &mut o, &q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, cap)?;
+            } else {
+                kernel.prefill_flash_wmma_fa2(&stream, &mut o, &q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, cap, true)?;
+            }
+            e1.record(&stream)?;
+            e1.synchronize()?;
+            if i >= WARMUP {
+                total += f64::from(Event::elapsed_ms(&e0, &e1)?) * 1e-3;
+            }
+        }
+        Ok(total / ITERS as f64)
+    };
+    // Short inputs: one launch per input segment, so a small B at depth B (the
+    // whole input) gets few WGs packed (B/16 x 8) vs fa2 (B/32 x 32).
+    for &small in &[8u32, 64, 256, 1024] {
+        let (a, p) = (timed(false, 0, small)?, timed(true, 0, small)?);
+        eprintln!("qwen attn, a {small:4}-token input alone: fa2 {:7.1} us | packed G=4 {:7.1} us | {:.2}x", a * 1e6, p * 1e6, a / p);
+    }
+    let (mut sum_fa2, mut sum_pk) = (0.0, 0.0);
+    for sb in 0..total / batch {
+        let q_offset = sb * batch;
+        let a = timed(false, q_offset, b)?;
+        let p = timed(true, q_offset, b)?;
+        sum_fa2 += a;
+        sum_pk += p;
+        if [0, 3, 7, 15].contains(&sb) {
+            let f = flops(q_offset);
+            eprintln!(
+                "qwen attn depth {:5}: fa2 {:8.0} us {:5.1} TFLOPS | packed G=4 {:8.0} us {:5.1} TFLOPS | {:.2}x",
+                q_offset + batch, a * 1e6, f / a / 1e12, p * 1e6, f / p / 1e12, a / p
+            );
+        }
+    }
+    eprintln!(
+        "qwen attn, one 16,384-token input x 36 layers: fa2 {:.2} s, packed G=4 {:.2} s ({:.2}x)",
+        sum_fa2 * 36.0, sum_pk * 36.0, sum_fa2 / sum_pk
+    );
     Ok(())
 }
