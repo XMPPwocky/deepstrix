@@ -9,8 +9,8 @@
 //! tests under `argmax`) and keeps the KV of the rows it emitted
 //! (`KvArena::accept`). With more live streams every step is a plain
 //! multistream step (K = 0), and under `V41_MS_DSPARK_RING=all` (the default)
-//! the rings are kept current so a stream that may speculate again drafts from
-//! a dense window.
+//! the rings are kept current each step; under `solo` those steps' rows are
+//! held (`Backlog`) and filled in when the stream drafts again.
 //!
 //! What lives here: one drafter ring per arena slot (`MtpState::rings` is the
 //! drafter's only state that persists across drafts; the rest of `MtpState`
@@ -19,13 +19,17 @@
 //! input of its next draft), seeding from the prefill's capture, and the
 //! confidence-gated K policy (plan section 6).
 //!
-//! Who writes which ring row: every row a step KEEPS is ring-written after
-//! the step (`ring_write_only`), in position order, once. A draft from
+//! Who writes which ring row: every row a step KEEPS goes into the slot's
+//! `Backlog` (host), and so do the prefill's seed rows; the backlog is written
+//! into the ring (`write_backlog`: the latest window of it, in position order,
+//! once) after every step that writes rings, and at the latest when the
+//! stream drafts (`fill`: the transition to drafting, from a prefill or from a
+//! stretch of more live streams than may draft). A draft from
 //! position `pos` reads the ring INCLUDING row `pos` and its forward writes row
 //! `pos` itself; when that row is already the ring's latest write the counter
 //! is wound back by one first, so the forward rewrites it with the same values
 //! (same residual, same position) instead of appending a duplicate key.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use color_eyre::eyre::{self, eyre};
@@ -113,6 +117,72 @@ struct SlotDraft {
     /// (`keep_rows`); `write_pending` until `settle_writes` has waited on it.
     write_done: v4flash_hip::Event,
     write_pending: bool,
+    /// Rows kept or seeded that the ring does not hold yet.
+    backlog: Backlog,
+}
+
+/// A slot's rows not yet in its ring: oldest first, at consecutive positions,
+/// at most a window (an older row would be overwritten by the newer ones
+/// anyway). Filled by every kept row and by the prefill's seed; emptied into
+/// the ring by `MsDspark::write_backlog`. Under `V41_MS_DSPARK_RING=solo` a
+/// step with more live streams than may draft writes no ring, and before
+/// 2026-10-10 those rows were simply lost: a stream drafting again read a
+/// window missing its newest rows (production 10-06..10-10: E 2.4 over the
+/// 128 rows after a gap of 33+ rows vs 3.3 after them; 83% of the E < 2.0
+/// rollups). Host cost: at most `MTP_WINDOW` rows of `HIDDEN` f32 per slot.
+#[derive(Default)]
+struct Backlog {
+    /// Position of `rows[0]`.
+    pos0: u32,
+    rows: VecDeque<Vec<f32>>,
+}
+
+impl Backlog {
+    /// Append the rows at `pos0..`; a run that does not continue the backlog
+    /// replaces it. Returns the rows dropped that way.
+    fn hold(&mut self, pos0: u32, rows: impl IntoIterator<Item = Vec<f32>>) -> usize {
+        let mut dropped = 0;
+        if !self.rows.is_empty() && self.pos0 + self.rows.len() as u32 != pos0 {
+            dropped = self.rows.len();
+            self.rows.clear();
+        }
+        if self.rows.is_empty() {
+            self.pos0 = pos0;
+        }
+        self.rows.extend(rows);
+        while self.rows.len() > MTP_WINDOW {
+            self.rows.pop_front();
+            self.pos0 += 1;
+        }
+        dropped
+    }
+
+    /// The whole backlog, `(position of the first row, rows)`.
+    fn take(&mut self) -> Option<(u32, Vec<Vec<f32>>)> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        Some((self.pos0, std::mem::take(&mut self.rows).into()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+    }
+}
+
+/// How many leading rows of the run `pos0..pos0 + n` NOT to ring-write: the
+/// ones the ring already holds (at or before `last_ring_pos`) and the ones
+/// older than the run's last window.
+fn ring_skip(last_ring_pos: Option<u32>, pos0: u32, n: usize) -> usize {
+    let held = match last_ring_pos {
+        Some(p) if p >= pos0 => (p - pos0) as usize + 1,
+        _ => 0,
+    };
+    held.max(n.saturating_sub(MTP_WINDOW)).min(n)
 }
 
 /// `V41_MS_DSPARK_RING_ASYNC=0`: kept-row ring writes synchronize as before
@@ -161,6 +231,14 @@ struct Stats {
     explored_two: u64,
     /// Blocks by rows (index rows - 1): on one lane, on two.
     lanes_by_rows: [[u64; 2]; CELLS],
+    /// Backlog writes of more rows than one step keeps (`write_backlog`: a
+    /// prefill's seed, or the rows of a stretch the ring was not written),
+    /// their rows, and the wall time of the ones `fill` ran before a draft.
+    fills: u64,
+    fill_rows: u64,
+    fill_ms: f64,
+    /// Backlog rows dropped because a run did not continue them (expected 0).
+    backlog_dropped: u64,
     /// Steps where two or more streams were offered drafts
     /// (`MsDspark::ks_for`; docs/v41/MS_DSPARK_STREAMS_DESIGN.md 2), of them
     /// steps that verified any draft, and the blocks verified in them.
@@ -328,7 +406,7 @@ impl MsDspark {
             let write_done = v4flash_hip::Event::new_no_timing()?;
             slots.push(SlotDraft {
                 rings, writes: 0, last_ring_pos: None, hidden: None, gates: [Gate::default(); 2], last_draft_ms: 0.0,
-                write_done, write_pending: false,
+                write_done, write_pending: false, backlog: Backlog::default(),
             });
         }
         // The threshold at startup shapes the two-lane line's prior and the
@@ -596,6 +674,7 @@ impl MsDspark {
         sd.writes = 0;
         sd.last_ring_pos = None;
         sd.hidden = None;
+        sd.backlog.clear();
         sd.gates = [Gate::default(); 2];
         Ok(())
     }
@@ -614,9 +693,7 @@ impl MsDspark {
         true
     }
 
-    /// Record row `pos` of `slot`'s stream as kept: its residual becomes the
-    /// next draft's input, and (if `write_ring` and not already there) it goes
-    /// into the ring.
+    /// Record row `pos` of `slot`'s stream as kept (`keep_rows` of one row).
     pub fn keep_row(
         &mut self,
         engine: &HeterogeneousEngine,
@@ -626,33 +703,21 @@ impl MsDspark {
         hidden: Vec<f32>,
         write_ring: bool,
     ) -> eyre::Result<()> {
-        if hidden.len() != HIDDEN {
-            return Err(eyre!("ms dspark: residual of {} floats, want {HIDDEN}", hidden.len()));
-        }
-        let fresh = self.slot(slot)?.last_ring_pos.is_none_or(|p| pos > p);
-        if write_ring && fresh {
-            self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_only(&mut m.state, &m.w, pos, &hidden))?;
-            self.slot(slot)?.last_ring_pos = Some(pos);
-        }
-        self.slot(slot)?.hidden = Some((pos, hidden));
-        Ok(())
+        self.keep_rows(engine, mtp, slot, pos, vec![hidden], write_ring)
     }
 
-    /// `keep_row` for the consecutive rows `pos0..pos0 + rows.len()` a step
-    /// kept: rows not yet in the ring go in with ONE batched write per
-    /// `RING_ROWS_MAX` (`MtpState::ring_write_rows`: one upload, one read of
-    /// each projection), and the last row's residual feeds the next draft. The
-    /// write is enqueued WITHOUT a sync (`V41_MS_DSPARK_RING_ASYNC`, default
-    /// on): it runs under the step's host tail, and the next draft's blocking
-    /// upload finds it done; its event goes to `settle_writes`. Ring contents,
-    /// order and the draft's rewind are unchanged.
+    /// Record the consecutive rows `pos0..pos0 + rows.len()` of `slot`'s stream
+    /// as kept: they join its `Backlog`, the last row's residual feeds the next
+    /// draft, and with `write_ring` the backlog goes into the ring now
+    /// (`write_backlog`). Without it (more live streams than may draft, under
+    /// `V41_MS_DSPARK_RING=solo`) the rows wait for the next write or `fill`.
     pub fn keep_rows(
         &mut self,
         engine: &HeterogeneousEngine,
         mtp: &mut MtpCtx,
         slot: u32,
         pos0: u32,
-        mut rows: Vec<Vec<f32>>,
+        rows: Vec<Vec<f32>>,
         write_ring: bool,
     ) -> eyre::Result<()> {
         if rows.is_empty() {
@@ -663,43 +728,87 @@ impl MsDspark {
         }
         let t = Instant::now();
         let last = pos0 + rows.len() as u32 - 1;
+        let h = rows.last().expect("non-empty").clone();
+        let dropped = self.slot(slot)?.backlog.hold(pos0, rows);
+        self.stats.backlog_dropped += dropped as u64;
         if write_ring {
-            // The upload below blocks on the iGPU: settle every slot's write
-            // first, so an async fault is charged to the slot that issued it.
-            self.settle_writes();
-            let skip = match self.slot(slot)?.last_ring_pos {
-                Some(p) if p >= pos0 => ((p - pos0) as usize + 1).min(rows.len()),
-                _ => 0,
-            };
-            let asynchronous = ring_async();
-            for (c, chunk) in rows[skip..].chunks(RING_ROWS_MAX).enumerate() {
-                let p = pos0 + (skip + c * RING_ROWS_MAX) as u32;
-                let flat: Vec<f32> = chunk.concat();
-                if asynchronous {
-                    self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows_async(&mut m.state, &m.w, p, &flat))?;
-                    // After the write in `igpu.compute` order: its completion.
-                    let sd = self.slot(slot)?;
-                    sd.write_done.record(&engine.igpu.compute)?;
-                    sd.write_pending = true;
-                } else {
-                    self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows(&mut m.state, &m.w, p, &flat))?;
-                }
-            }
-            if skip < rows.len() {
-                self.slot(slot)?.last_ring_pos = Some(last);
-            }
+            self.write_backlog(engine, mtp, slot)?;
         }
         self.stats.keeps += 1;
         self.stats.keep_ms += t.elapsed().as_secs_f64() * 1e3;
-        let h = rows.pop().expect("non-empty");
         self.slot(slot)?.hidden = Some((last, h));
         Ok(())
     }
 
-    /// Seed `slot`'s ring from a prefill's captured residuals (absolute
+    /// Write `slot`'s backlog into its ring: the rows it does not hold yet,
+    /// at most the latest window (`ring_skip`), with ONE batched write per
+    /// `RING_ROWS_MAX` (`MtpState::ring_write_rows`: one upload, one read of
+    /// each projection). The writes are enqueued WITHOUT a sync
+    /// (`V41_MS_DSPARK_RING_ASYNC`, default on): they run under the step's
+    /// host tail, the next draft's blocking upload finds them done, and the
+    /// event goes to `settle_writes`. Ring contents and order are those of a
+    /// ring written every step.
+    fn write_backlog(&mut self, engine: &HeterogeneousEngine, mtp: &mut MtpCtx, slot: u32) -> eyre::Result<()> {
+        let Some((pos0, rows)) = self.slot(slot)?.backlog.take() else {
+            return Ok(());
+        };
+        // The uploads below block on the iGPU: settle every slot's write
+        // first, so an async fault is charged to the slot that issued it.
+        self.settle_writes();
+        let skip = ring_skip(self.slot(slot)?.last_ring_pos, pos0, rows.len());
+        let n = rows.len() - skip;
+        if n > MTP_BLOCK + 1 {
+            self.stats.fills += 1;
+            self.stats.fill_rows += n as u64;
+        }
+        let asynchronous = ring_async();
+        for (c, chunk) in rows[skip..].chunks(RING_ROWS_MAX).enumerate() {
+            let p = pos0 + (skip + c * RING_ROWS_MAX) as u32;
+            let flat: Vec<f32> = chunk.concat();
+            if asynchronous {
+                self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows_async(&mut m.state, &m.w, p, &flat))?;
+                // After the write in `igpu.compute` order: its completion.
+                let sd = self.slot(slot)?;
+                sd.write_done.record(&engine.igpu.compute)?;
+                sd.write_pending = true;
+            } else {
+                self.with_ring(mtp, slot, false, |m| engine.dspark_ring_write_rows(&mut m.state, &m.w, p, &flat))?;
+            }
+        }
+        if n > 0 {
+            self.slot(slot)?.last_ring_pos = Some(pos0 + rows.len() as u32 - 1);
+        }
+        Ok(())
+    }
+
+    /// The transition to drafting: before `slot`'s stream drafts, write
+    /// whatever its ring is missing -- the prefill's seed, or the rows of a
+    /// stretch with more live streams than may draft -- and wait for it, so
+    /// the draft's own time (the K policy's `draft_ms`) excludes the fill. A
+    /// failed write restarts the slot's ring (the draft then finds no
+    /// residual and the step runs plain), as a failed kept-row write does.
+    fn fill(&mut self, engine: &HeterogeneousEngine, mtp: &mut MtpCtx, slot: u32) {
+        if self.slot(slot).map_or(true, |sd| sd.backlog.is_empty()) {
+            return;
+        }
+        let t = Instant::now();
+        if let Err(e) = self.write_backlog(engine, mtp, slot) {
+            tracing::warn!(slot, error = %e, "ms dspark: ring fill failed; the stream's ring restarts");
+            self.stats.ring_errors += 1;
+            let _ = self.reset(slot);
+        }
+        self.settle_writes();
+        self.stats.fill_ms += t.elapsed().as_secs_f64() * 1e3;
+    }
+
+    /// Seed `slot`'s stream from a prefill's captured residuals (absolute
     /// position -> row), `last` = the prompt's last position: the contiguous
     /// run ending at `last`, at most a window, every row including the last
-    /// (the first draft reads the ring through `last`).
+    /// (the first draft reads the ring through `last`). The rows are HELD
+    /// (`Backlog`), not written: `fill` writes them -- with any rows kept
+    /// meanwhile -- when the stream first drafts, so a stream admitted into a
+    /// stretch of more live streams than may draft pays no write it would
+    /// throw away.
     pub fn seed(
         &mut self,
         engine: &HeterogeneousEngine,
@@ -719,7 +828,7 @@ impl MsDspark {
         }
         let run: Vec<Vec<f32>> = (first..=last).map(|p| rows.remove(&p).expect("contiguous run")).collect();
         let n = run.len();
-        self.keep_rows(engine, mtp, slot, first, run, true)?;
+        self.keep_rows(engine, mtp, slot, first, run, false)?;
         Ok(n)
     }
 
@@ -740,6 +849,7 @@ impl MsDspark {
         token_row: &[f32],
         sampling: Option<&DraftSampling>,
     ) -> eyre::Result<Option<Drafted>> {
+        self.fill(engine, mtp, slot);
         let t = Instant::now();
         let (hidden, rewind) = {
             let sd = self.slot(slot)?;
@@ -862,6 +972,10 @@ impl MsDspark {
                 lanes_by_rows = s.lanes_by_rows.iter().enumerate().skip(1).map(|(i, h)| format!("{}:{}/{}", i + 1, h[0], h[1])).collect::<Vec<_>>().join(" "),
                 keep_ms = format!("{:.2}", s.keep_ms / (s.keeps as f64).max(1.0)),
                 ring_errors = s.ring_errors,
+                fills = s.fills,
+                fill_rows = s.fill_rows,
+                fill_ms = format!("{:.1}", s.fill_ms),
+                backlog_dropped = s.backlog_dropped,
                 draft_est_ms = format!("{:.1}", self.lanes.one.draft_ms()),
                 cost_samples = self.lanes.one.samples,
                 cost2_samples = self.lanes.two.samples,
@@ -2703,5 +2817,58 @@ mod tests {
         assert_eq!((s.blocks, s.emitted, s.k_hist[0], s.drafts_verified, s.accepted), (1, 1, 1, 0, 0));
         assert_eq!(s.lanes_by_rows[0], [1, 0]);
         assert_eq!(s.step_ms, 80.0);
+    }
+
+    fn row(tag: f32) -> Vec<f32> {
+        vec![tag; 2]
+    }
+
+    /// The backlog keeps a consecutive run, the latest window of it.
+    #[test]
+    fn backlog_holds_the_latest_window_of_a_consecutive_run() {
+        let mut b = Backlog::default();
+        assert!(b.take().is_none());
+        assert_eq!(b.hold(10, (10..13).map(|p| row(p as f32))), 0);
+        assert_eq!(b.hold(13, (13..15).map(|p| row(p as f32))), 0);
+        let (pos0, rows) = b.take().expect("held");
+        assert_eq!(pos0, 10);
+        assert_eq!(rows, (10..15).map(|p| row(p as f32)).collect::<Vec<_>>());
+        assert!(b.is_empty());
+        // A stretch longer than a window keeps only its last MTP_WINDOW rows.
+        let n = MTP_WINDOW as u32 + 40;
+        for p in 100..100 + n {
+            b.hold(p, [row(p as f32)]);
+        }
+        let (pos0, rows) = b.take().expect("held");
+        assert_eq!(pos0, 100 + n - MTP_WINDOW as u32);
+        assert_eq!(rows.len(), MTP_WINDOW);
+        assert_eq!(rows.last(), Some(&row((100 + n - 1) as f32)));
+    }
+
+    /// A run that does not continue the backlog replaces it (and says so).
+    #[test]
+    fn backlog_run_that_does_not_continue_it_replaces_it() {
+        let mut b = Backlog::default();
+        b.hold(5, [row(5.0), row(6.0)]);
+        assert_eq!(b.hold(9, [row(9.0)]), 2);
+        assert_eq!(b.take(), Some((9, vec![row(9.0)])));
+        b.hold(5, [row(5.0)]);
+        b.clear();
+        assert!(b.is_empty());
+    }
+
+    /// The rows to skip: those the ring holds, and those older than the
+    /// run's last window -- never more than the run.
+    #[test]
+    fn ring_skip_drops_held_rows_and_rows_older_than_a_window() {
+        assert_eq!(ring_skip(None, 0, 6), 0);
+        assert_eq!(ring_skip(Some(9), 10, 6), 0);
+        // A draft from position 10 wrote row 10 itself.
+        assert_eq!(ring_skip(Some(10), 10, 6), 1);
+        assert_eq!(ring_skip(Some(20), 10, 6), 6);
+        // A seed / backfill longer than the window: only its last window.
+        assert_eq!(ring_skip(None, 0, MTP_WINDOW + 40), 40);
+        assert_eq!(ring_skip(Some(49), 0, MTP_WINDOW + 40), 50);
+        assert_eq!(ring_skip(Some(5), 0, MTP_WINDOW + 40), 40);
     }
 }
