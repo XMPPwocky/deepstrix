@@ -141,7 +141,14 @@ Construction (deterministic, frozen for the job even if `hot_set` refreshes mid-
   hub 5,425 + box 2 4,570 = 9,995 slots vs 7,680 encoder experts + the hub's decoder-hot head 2,060-2,300 = 9,740-9,980 => fits with
   15-255 slack under `top`, ~0 under interleave; (ii) accept the residual: **expected steady re-reads = max(0, share2 - usable2) per
   window** (0 to ~400, vs 1,146 today), logged per job as share1/share2/usable2; (iii) grow the pool if hub RAM allows (~6 GB free: no).
-  If the hot set is not warm, hash split at the same sizes.
+  After the reclaim the live free slots are 5,425 - 4,120 = 1,305 (`top`) / 5,425 - 4,600 = 825 (interleave): filler 65 / 41 per layer,
+  box-1 share 168 / 156, **share2 = 216 / 228 per layer = 4,320 / 4,560 <= 4,570** (the numbers the job-start log line prints). Un-reclaimed
+  box-1 share is (103+46)/384 = 39% (`top`) or (115+22)/384 = 36% (interleave); reclaimed 44% / 41%: **36-44%**.
+  Cold hot set (`box1_owns == None`): share1 = `hot_set::per_layer()` (or `B1_HOT_IL_PER_LAYER` under interleave), filler computed with
+  `owned_now = per_layer x 40`, ALL chosen by hash (NOT `owned_now = 0`, which would give `n_slots/20` = 271/layer).
+  The `Arc<PrefillSplit>` is cloned ONCE per `pre_moe_route` call, not locked per pick in the 384-wide loop.
+  Note (review r3): prefill-class landing of frame-carried words is keyed on the request's ROW COUNT (`b > PIN_DECODE_MAX_ROWS` = 16,
+  `re:8571-8596`), not the hub's phase flag; irrelevant for 512-row lanes, state it in the loopback test.
 **Variant P1H "hub-heavy" (owner 10-10: why keep the decoder-hot head resident during a LONG prefill?).** It need not stay: decode does
 not run during a prefill burst, replay touches only 128 rows, and in the unified LRU pool those ids are the LRU-oldest, so a filler
 larger than the free slots simply EVICTS them (no special mechanism). Dropping the decoder-layer hot head (2,060-2,300 ids) frees
@@ -240,9 +247,9 @@ was a count of EXPERTS; by picks it is 44%.
 **Is the hub's compute used? (owner question 10-10)** Yes, but at ~22% busy: 1.75 s of the 8.02 s window (hub work ~21 ms per
 unit-layer vs a ~66 ms period; blocked on box 2 53%, gaps 24%). Its dGPU runs attention/dense for every row; its iGPU runs only the
 experts it owns (~30% today: the decode-hot head), and what limits that share is hub RESIDENCY (5,041 LRU slots, 441-921 free beyond the
-decode-hot head), not compute. P1 raises the hub's share to ~36-42%; a 50/50 pick split (the two iGPUs are identical) would need ~1,000
+decode-hot head), not compute. P1 raises the hub's expert share to 36-44%; a 50/50 EXPERT split (the two iGPUs are identical) would need +500-1,100
 more hub-resident encoder experts, i.e. hub streaming from its disk (the 9100 Pro helps) or temporarily dropping the decoder-hot head
-and re-warming. At ~1K rows/s the hub is fine (~50% busy); the 2K rows/s target needs <= ~12 ms of hub work per unit-layer vs ~21 ms now,
+and re-warming. At ~1K rows/s the hub is fine (~50% busy, inferred); the 2K rows/s target needs <= ~12 ms of hub work per unit-layer (inferred: half the 25.6 ms period) vs ~21 ms now,
 and the split between dGPU chain and iGPU MoE inside those 21 ms is UNKNOWN (device timing is off in the trace: enable
 `V41_EVTRACE_DEV` for a short prefill-only window). So 2K additionally needs the box-2 kernel floor AND the hub's per-unit-layer work to
 roughly halve; it is not reachable by P1-P4 alone.
