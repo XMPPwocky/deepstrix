@@ -1901,12 +1901,19 @@ impl Sched {
         // V41_MS_PROFILE=1: per-stage GPU busy time of the batched step (HIP
         // events per stage, ~100 us/layer), rolled up over V41_MS_PROFILE_EVERY
         // steps and logged as "ms.stage". Wall - busy = host / link / sync.
-        let profile = ms_profile();
+        // `V41_MS_PROFILE_SAMPLE`: one decode step in N (every step under Tier B, whose sums come
+        // back for the steps they cover). An unprofiled step records no timing events and runs no
+        // `lh.*` timers: back to the construction-time flags unless a perfetto trace owns the pools.
+        let profile = ms_profile()
+            && (step_id % knobs::MS_PROFILE_SAMPLE.get().max(1) == 0 || engine.dgpu.events.offloading());
         if profile {
             v4flash_kernels::het::forward_prefill::LH_FORCE.store(true, Ordering::Relaxed);
             let _ = v4flash_kernels::het::forward_prefill::take_layer_host_timing();
             engine.dgpu.events.set_enabled(true);
             engine.igpu.events.set_enabled(true);
+        } else if v4flash_kernels::het::forward_prefill::LH_FORCE.swap(false, Ordering::Relaxed) && !pf_on {
+            engine.dgpu.events.restore_defaults();
+            engine.igpu.events.restore_defaults();
         }
         // Under a perfetto trace too: the pools hold 16384 events and a full
         // one fails the step (everything before this point is exported).

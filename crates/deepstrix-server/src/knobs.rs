@@ -66,10 +66,18 @@ v4flash_kernels::knobs! {
     pub static MS_ENGRAM_AHEAD = Knob::flag("V41_MS_ENGRAM_AHEAD", true);
     /// `V41_B1_HOT_REFRESH` (default 500): ticks between box-1 hot-set refreshes.
     pub static B1_HOT_REFRESH = Knob::int("V41_B1_HOT_REFRESH", 500, 1, MAX);
-    /// `V41_MS_PROFILE` (`1`): per-stage GPU timing (`ms.stage`).
-    pub static MS_PROFILE = Knob::flag("V41_MS_PROFILE", false);
-    /// `V41_MS_PROFILE_EVERY` (default 20): steps per `ms.stage` rollup.
+    /// `V41_MS_PROFILE` (`1`; live since 2026-10-10): per-stage GPU timing (`ms.stage`), on the
+    /// steps `V41_MS_PROFILE_SAMPLE` picks.
+    pub static MS_PROFILE = Knob::flag("V41_MS_PROFILE", false).live();
+    /// `V41_MS_PROFILE_EVERY` (default 20): PROFILED steps per `ms.stage` rollup.
     pub static MS_PROFILE_EVERY = Knob::int("V41_MS_PROFILE_EVERY", 20, 1, MAX);
+    /// `V41_MS_PROFILE_SAMPLE` (default 20, 1 = every step as before; live): profile one decode step
+    /// in N. A profiled step records ~32 HIP timing events per dGPU lane-layer (every `dgpu.*` stage
+    /// scope, plus the iGPU's) and the `lh.*` host timers -- on the critical path of every lane-layer
+    /// (owner 10-10: the dGPU is always on it) -- so sampling keeps `ms.stage` at ~1/N of the cost.
+    /// With N = 20 a rollup covers 20 x 20 = 400 steps. Tier B (`V41_EVTRACE_DEV`) offloads every
+    /// step's buffers and profiles every step regardless.
+    pub static MS_PROFILE_SAMPLE = Knob::int("V41_MS_PROFILE_SAMPLE", 20, 1, MAX).live();
 
     // ---- multistream: decode step drivers (static)
     /// `V41_MS_PIPELINE` (default on; `0` = one lane always).
@@ -231,7 +239,7 @@ mod tests {
             "V41_B2_SOFT_HINT", "V41_B2_SOFT_MAP", "V41_B2_SOFT_PRIOR", "V41_B2_SPEC_BUDGET",
             "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_PREFETCH", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL",
             "V41_MS_CTX_CHECK", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
-            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
+            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_PROFILE", "V41_MS_PROFILE_SAMPLE", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA", "V41_SUB_PROTECT",
         ]);
         // The parses these knobs had before.
