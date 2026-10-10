@@ -89,11 +89,19 @@ same rows by position; fill's deviation from every-step (<= 0.48) is that of
 slot rotation alone (<= 0.32), drop's 1.3. Owed: a production read of E over
 the 128 rows after a gap.
 
-Side finding (OPEN, not #57): the drafter's output moves 2-30% (||dh||/||h||)
-when the SAME rows sit at rotated ring slots -- far beyond f32 reassociation of
-an order-free softmax. Production rotates slots by history (seed size, gaps), so
-some drafter noise rides on ring layout; the attention path
-(`attention_mixed_*` over `[ring ++ block]`) is the first suspect.
+Side finding, RESOLVED as not a bug (2026-10-10): the drafter's output moves
+2-30% (||dh||/||h||) when the same rows sit at rotated ring slots. The attention
+is order-free (`tests/attn_mixed_ring_rotation.rs`, beside the hub: rotation
+moves `attention_mixed_score` + `softmax_wsum` by 1.2e-7, both orders within
+1.3e-7 of an f64 reference). The drafter is deterministic (identical rerun: 0)
+and a THRESHOLD amplifier: it Q8-quantizes activations before every matvec, so
+a 1-ULP nudge that flips no int8 rounding changes nothing (one float: 0 on 24
+drafts; every float: 0 until a draft hits a flip), and once one rounding flips
+the output lands on another realization of its Q8 noise -- 2.8e-2, or 0.1-0.3
+with a routing flip (`drafter_sensitivity_to_one_ulp`), the same spread as the
+rotation control. Rotation is just one ~1e-7 perturbation that crosses the
+threshold. Unbiased noise, not a slot-order error; drafter parity vs the
+reference stands (E 4.348 vs 4.382).
 
 ### 56. FIXED (found and fixed 2026-10-06) — `KvArena` switched the current device behind the het engine's cache: `hipErrorInvalidHandle` in the drafter right after an in-step reservation grow
 

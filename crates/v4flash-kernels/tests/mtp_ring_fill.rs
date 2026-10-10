@@ -103,6 +103,9 @@ struct Arm<'a> {
     written: usize,
     /// Extra older rows on the FIRST seed (`Every` only): the rotation control.
     seed_extra: u32,
+    /// Nudge each draft's input residual by 1 ULP (the sensitivity probe):
+    /// 0 = off, 1 = one float, 2 = every float.
+    perturb: u8,
 }
 
 impl<'a> Arm<'a> {
@@ -113,7 +116,7 @@ impl<'a> Arm<'a> {
         }
         Ok(Self {
             e, w, mode, st, last_ring_pos: None, backlog: VecDeque::new(), slot_pos: vec![None; MTP_WINDOW],
-            pos: 0, outs: Vec::new(), windows: Vec::new(), written: 0, seed_extra: 0,
+            pos: 0, outs: Vec::new(), windows: Vec::new(), written: 0, seed_extra: 0, perturb: 0,
         })
     }
 
@@ -226,7 +229,13 @@ impl<'a> Arm<'a> {
         let w = self.st.ring_writes();
         self.st.set_ring_writes(w - usize::from(rewind && w > 0));
         let slot = self.st.ring_writes() % MTP_WINDOW;
-        self.st.inject_main_hidden(&hidden_of(pos))?;
+        let mut hin = hidden_of(pos);
+        match self.perturb {
+            1 => hin[0] = f32::from_bits(hin[0].to_bits() + 1),
+            2 => hin.iter_mut().for_each(|x| *x = f32::from_bits(x.to_bits() + 1)),
+            _ => {}
+        }
+        self.st.inject_main_hidden(&hin)?;
         self.st.forward(self.e, &self.e.compute, self.w, &mtp_rope(), pos, token_row, noise_row)?;
         self.e.compute.synchronize()?;
         self.slot_pos[slot] = Some(pos);
@@ -407,6 +416,54 @@ fn filled_ring_matches_an_every_step_ring() -> eyre::Result<()> {
     }
     if !failures.is_empty() {
         return Err(eyre!("{}", failures.join("; ")));
+    }
+    Ok(())
+}
+
+/// Diagnostic (no bar): how far the drafter's output moves when ONE float of
+/// each draft's input residual changes by 1 ULP -- no ring rotation, same
+/// slots, same rows otherwise. If this is as large as the rotation control's
+/// deviation in `filled_ring_matches_an_every_step_ring`, slot order is not
+/// special: the drafter amplifies any ~1e-7 perturbation (Q8 activation
+/// rounding, MoE routing near-ties).
+#[test]
+#[ignore]
+fn drafter_sensitivity_to_one_ulp() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let dir = std::env::var("V41_HF_DIR").unwrap_or_else(|_| HF_DIR_DEFAULT.to_string());
+    let hf = V41HfWeights::open(&dir, None)?;
+    let dev = pick_igpu()?;
+    dev.set_current()?;
+    let arch = dev.properties()?.gcn_arch_name;
+    let e = DeviceEngine::for_arch(dev, &arch)?;
+    let w = MtpWeights::load(&hf, dev, 40)?;
+    let script = scenario_a();
+    let mut base = Arm::new(&e, &w, &dev, Mode::Every)?;
+    base.run(&script)?;
+    let mut again = Arm::new(&e, &w, &dev, Mode::Every)?;
+    again.run(&script)?;
+    let mut nudged = Arm::new(&e, &w, &dev, Mode::Every)?;
+    nudged.perturb = 1;
+    nudged.run(&script)?;
+    let mut all = Arm::new(&e, &w, &dev, Mode::Every)?;
+    all.perturb = 2;
+    all.run(&script)?;
+    let n = base.outs.len();
+    let rerun: Vec<f64> = (0..n).map(|i| rel(&base.outs[i], &again.outs[i])).collect();
+    let ulp: Vec<f64> = (0..n).map(|i| rel(&base.outs[i], &nudged.outs[i])).collect();
+    let ulp_all: Vec<f64> = (0..n).map(|i| rel(&base.outs[i], &all.outs[i])).collect();
+    let fmt = |v: &[f64]| v.iter().map(|x| format!("{x:.1e}")).collect::<Vec<_>>().join(" ");
+    let med = |v: &[f64]| {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s[s.len() / 2]
+    };
+    println!(
+        "drafter sensitivity, {n} drafts, ||dh||/||h||\n  identical rerun: {}\n  1 ULP, 1 float:  {}\n  1 ULP, all:      {}\n  median: 1 float {:.2e}, all {:.2e}; max all {:.2e}",
+        fmt(&rerun), fmt(&ulp), fmt(&ulp_all), med(&ulp), med(&ulp_all), ulp_all.iter().cloned().fold(0.0, f64::max)
+    );
+    if rerun.iter().any(|&x| x != 0.0) {
+        return Err(eyre!("the drafter is not deterministic run to run"));
     }
     Ok(())
 }
