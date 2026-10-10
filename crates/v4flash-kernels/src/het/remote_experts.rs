@@ -9732,6 +9732,11 @@ impl RemoteExpertClient {
         self.long_job = long;
     }
 
+    /// The flag `set_long_job` last recorded (the scheduler sets it before every prefill unit).
+    pub fn long_job(&self) -> bool {
+        self.long_job
+    }
+
     /// Change the socket's `SO_BUSY_POLL` window (microseconds) in place; a
     /// plain `setsockopt`, safe from any thread while the reader spins. Returns
     /// whether the kernel accepted it. Above `net.core.busy_read` it is refused

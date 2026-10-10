@@ -298,3 +298,28 @@ R10 replay/decoder layers unaffected by the encoder split (verify).
   Split OFF for this gate (invariant I1). Expect: all cases bit-identical to chunked, `lm_windows_run() > 0`.
 * Not started: P2b (window-input producer thread + Engram ownership refactor), P3 (landing-rank fix, refill words), P4 (deferred-submit pair
   merge), P0 (f16 arm into dispatch), P1b (hub-heavy).
+
+### 11b. Code review round 5 (Fable reviewer, verdict NEEDS REWORK on the first P1/P2a code) -> dispositions
+Schedule, residual/carry relocation, layer-0 reset (keyed on `layer == 0`), KvSourceOnly layer 20, compressor lending, indexer flag/selection,
+replay capture, drain, window-close bookkeeping and `PrefillSplit::build` were VERIFIED on paper. Findings fixed:
+1. **BLOCKER (fixed)** the scheduler calls `next_chunk_range` BEFORE `prefill_job_chunk` opens the window, so the first layer-outer pass of
+   every lazy window would have got ONE chunk of inputs and errored ("inputs for 1024 rows, window is 4096"). `next_chunk_range` now
+   PREDICTS the window `lm_open_window` will plan (same cap/chunk size/early-outs; `layer_outer` is a parameter of an inner fn so the CPU
+   test `layer_outer_next_chunk_range_predicts_the_window_before_it_opens` covers it, incl. tail windows, not-CED, no-LM-rows and an open
+   window). The pass takes a PREFIX of the inputs (`lm_open_window` can halve the window after they were produced); the chunked fallback
+   does the same. GPU-gate note: the `lazy` case at 2048-row windows already needs a second window to exercise this.
+2. **MAJOR (documented hazard)** the layer-0 seed and `stage_engram_lane` are BLOCKING host->device copies; they are ordered after
+   Post(t-2)'s async store_out only because `de.compute` is a BLOCKING stream (`Stream::new`, engine.rs:217). Comment at the seed; if
+   `de.compute` ever becomes non-blocking, unit u's seed would silently corrupt unit u-2's store rows. Also a performance cost: the
+   host blocks at layers 0/1/14 (depth-2 overlap lost on 3 of 20 layers). Replacement = P2b-2 (pinned async seed / Engram staging).
+3. **MINOR (fixed)** long-job criterion: the kernel crate cannot read the server knob, so the split is gated on the scheduler's own per-unit
+   flag (`remote_set_long_job` -> new `HeterogeneousEngine::remote_long_job()`), i.e. the live knob with its `> 0` guard; the duplicate
+   env parse is deleted.
+4. **MINOR (fixed)** the 8 MB saved-indexer store is allocated in `lm_open_window` with the `lm_store` OOM policy (halve the window, else
+   chunked), not inside the pass.
+5. **MINOR (fixed)** cold hot-set head = `max(per_layer(), B1_HOT_IL_PER_LAYER)` (interleave, 115) so a job frozen before the first refresh
+   does not hand decode-hot ids to box 2.
+6. **MINOR (fixed)** one warning at window open that `V41_LM_PREFETCH` is a no-op for layer-outer windows.
+7. NIT pageable `pos_per_b` upload commented; 8. NIT the first pass holds both Engram tables' rows for the whole window (+~100 MB host vs
+   group-major): note for the P2b RAM budget.
+234 lib tests pass.

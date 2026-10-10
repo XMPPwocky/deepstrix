@@ -594,6 +594,13 @@ impl HeterogeneousEngine {
         c.set_long_job(long);
     }
 
+    /// Whether the scheduler flagged the prefill unit now running as part of a LONG job (`remote_set_long_job`): the one
+    /// criterion (live `V41_LONG_PREFILL_TOKENS`, `> 0` guard) shared with box 2's long-job handling and the prefill split.
+    pub fn remote_long_job(&self) -> bool {
+        let Some(m) = self.remote.as_ref() else { return false };
+        m.lock().map(|c| c.long_job()).unwrap_or(false)
+    }
+
     pub fn remote_drain_in_flight(&self) -> usize {
         self.remote
             .as_ref()

@@ -1159,6 +1159,9 @@ impl PrefillJob {
     /// `[start, end)` token indices (into `tokens()`) of the chunk the next
     /// `prefill_job_chunk` will run, given the lane capacities it will see.
     pub fn next_chunk_range(&self, lane_caps: (usize, usize)) -> eyre::Result<(usize, usize)> {
+        self.next_chunk_range_impl(lane_caps, lm_layer_outer())
+    }
+    fn next_chunk_range_impl(&self, lane_caps: (usize, usize), layer_outer: bool) -> eyre::Result<(usize, usize)> {
         // Layer-major: inputs (embeddings, Engram rows) are consumed by the
         // group-0 unit of each sub-chunk only; every other unit takes none.
         if let Some(w) = self.lm.as_ref() {
@@ -1170,6 +1173,15 @@ impl PrefillJob {
         }
         let t = self.tokens.len();
         let chunk_size = self.chunk_rows.min(lane_caps.0 + lane_caps.1);
+        // LAYER-OUTER: the scheduler asks for the next inputs BEFORE `prefill_job_chunk` opens the window (the previous one
+        // is closed), and the first pass needs the WHOLE window's rows. Predict exactly what `lm_open_window` will plan
+        // (same cap, chunk size and early-outs); `None` (fewer than two chunks fit) falls through to one chunk.
+        if self.ced && self.lm_rows > 0 && layer_outer && single_lane_max() == 0 {
+            let cap = self.lm_rows.max(2 * chunk_size);
+            if let Some(subs) = lm_plan_window(self.pos0, self.chunk_start, t, chunk_size, lane_caps, &self.image_spans, cap)? {
+                return Ok((self.chunk_start, subs.last().expect("two or more").1));
+            }
+        }
         let (end, _) = image_spans::plan_chunk(self.pos0, self.chunk_start, t, chunk_size, Some(lane_caps), &self.image_spans)?;
         Ok((self.chunk_start, end))
     }
@@ -1201,14 +1213,17 @@ impl HeterogeneousEngine {
         if !ps::enabled() || !job.ced || self.remote.is_none() || !super::expert_pager::t2_partition() {
             return None;
         }
-        if job.total() <= ps::long_tokens() {
+        // LONG = the scheduler's own flag for this unit (`remote_set_long_job`: live knob, `> 0` guard), not a second parse.
+        if !self.remote_long_job() {
             return None;
         }
         let pg = pager?;
         let cfg = ps::SplitCfg {
             lru_slots: pg.lru_slots(),
             filler_max: ps::filler_max(),
-            cold_head_per_layer: super::expert_pager::hot_set::per_layer(),
+            // Cold (hot set not warm yet): size the head for the policy that will warm it. INTERLEAVE (live in production)
+            // owns `B1_HOT_IL_PER_LAYER` ids/layer, more than the `top` head.
+            cold_head_per_layer: super::expert_pager::hot_set::per_layer().max(crate::knobs::B1_HOT_IL_PER_LAYER.usize()),
         };
         let split = ps::PrefillSplit::build(&cfg, &|l, e| super::expert_pager::hot_set::box1_owns(l, e));
         let st = &split.stats;
@@ -1255,12 +1270,25 @@ impl HeterogeneousEngine {
             // `plan_chunk` cut shorter chunks, so fewer rows fit under `cap`
             // here), in which case the store is reallocated -- it holds nothing
             // live between windows.
-            if job.lm_store.as_ref().is_none_or(|st| st.2 < rows) {
+            let want_idx = lm_layer_outer();
+            if job.lm_store.as_ref().is_none_or(|st| st.2 < rows) || (want_idx && job.lm_idx.as_ref().is_none_or(|x| x.2 < rows)) {
                 job.lm_store = None;
+                job.lm_idx = None;
                 self.set_current_cached(self.dgpu.device)?;
                 let id = self.dgpu.device.id;
                 let got = DeviceBuffer::<f32>::new(id, rows * HC_DIM as usize)
                     .and_then(|r| DeviceBuffer::<f32>::new(id, rows * HC_MIX_DIM as usize).map(|c| (r, c)));
+                // Layer-outer also needs the per-window-row saved indexer selection (2 KB/row): the SAME OOM policy as the
+                // store (halve the window, else chunked), so a 97%-full dGPU cannot fail a request in the middle of a pass.
+                let got = got.and_then(|(r, c)| {
+                    if want_idx {
+                        let top_k = crate::indexer::INDEXER_TOP_K as usize;
+                        let sel = DeviceBuffer::<i32>::new(id, rows * top_k)?;
+                        let nsp = DeviceBuffer::<i32>::new(id, rows)?;
+                        job.lm_idx = Some((sel, nsp, rows));
+                    }
+                    Ok((r, c))
+                });
                 match got {
                     Ok((r, c)) => job.lm_store = Some((r, c, rows)),
                     Err(e) if cap / 2 >= min_cap => {
@@ -1276,7 +1304,11 @@ impl HeterogeneousEngine {
                     }
                 }
             }
-            tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap,
+            if lm_layer_outer() && lm_prefetch_enabled() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("V41_LM_PREFETCH is a no-op for layer-outer windows (group prefetch is group-major only; rolling prefetch is P3)"));
+            }
+            tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap, layer_outer = lm_layer_outer(),
                 tokens_done = start, tokens_total = t, "prefill_lm_window open");
             job.lm = Some(LmWindow {
                 start, end, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(),
@@ -1539,9 +1571,15 @@ impl HeterogeneousEngine {
         let mut hcs_lazy: Option<Vec<Vec<f32>>> = None;
         if a == 0 {
             if lazy {
-                let (hcs, eng) = taken.ok_or_else(|| eyre!("layer-outer: lazy job has no inputs for window rows [{win_start}, {win_end})"))?;
-                if hcs.len() != win_rows || eng.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() != win_rows * ein)) {
+                let (mut hcs, mut eng) = taken.ok_or_else(|| eyre!("layer-outer: lazy job has no inputs for window rows [{win_start}, {win_end})"))?;
+                // The inputs were produced for the window `next_chunk_range` PREDICTED; `lm_open_window` may have halved it
+                // since (store OOM), so take a prefix and drop the surplus (the server regathers the next window).
+                if hcs.len() < win_rows || eng.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() < win_rows * ein)) {
                     return Err(eyre!("layer-outer: inputs for {} rows, window is {win_rows}", hcs.len()));
+                }
+                hcs.truncate(win_rows);
+                if let Some(rs) = eng.as_mut() {
+                    rs.iter_mut().for_each(|r| r.truncate(win_rows * ein));
                 }
                 job.lm.as_mut().expect("open window").engram = eng;
                 hcs_lazy = Some(hcs);
@@ -1554,12 +1592,7 @@ impl HeterogeneousEngine {
             return Err(eyre!("layer-outer: no device store"));
         }
         if job.lm_idx.as_ref().is_none_or(|x| x.2 < win_rows) {
-            job.lm_idx = None;
-            self.set_current_cached(self.dgpu.device)?;
-            let id = self.dgpu.device.id;
-            let sel = DeviceBuffer::<i32>::new(id, win_rows * top_k)?;
-            let nsp = DeviceBuffer::<i32>::new(id, win_rows)?;
-            job.lm_idx = Some((sel, nsp, win_rows));
+            return Err(eyre!("layer-outer: no saved-indexer store for {win_rows} rows (allocated by lm_open_window)"));
         }
         let mut saved: Vec<i32> = if a == 0 { vec![-1; u_count] } else { std::mem::take(&mut job.lm.as_mut().expect("open window").saved) };
         if saved.len() != u_count {
@@ -1612,6 +1645,12 @@ impl HeterogeneousEngine {
                     let pos0_u = pos0_job + un.tok0 as u32;
                     let vis = chunk_visibility(pos0_u, un.rows, spans)?;
                     // -- residual / carry in --
+                    // HAZARD (review r5 #2): the layer-0 seed below is a BLOCKING `copy_from_host`. It is ordered after
+                    // Post(t-2)'s async store_out (which READS this lane's `bd.residual`/`hc_pre_carry`) ONLY because
+                    // `de.compute` is a BLOCKING stream (`Stream::new`, engine.rs:217): the null-stream memcpy waits for
+                    // everything queued on it. Make `de.compute` non-blocking and unit u's seed silently corrupts unit u-2's
+                    // store rows. The same holds for `stage_engram_lane` (layers 1 and 14). P2b-2 replaces both with a
+                    // pinned async path.
                     if l == 0 {
                         for i in 0..un.rows {
                             let src: &Vec<f32> = match hcs_lazy.as_ref() {
@@ -1625,6 +1664,8 @@ impl HeterogeneousEngine {
                         bd.hc_pre_carry.slice_view_mut(0, un.rows * m).copy_from_buffer_async(&carry.slice_view(un.row0 * m, un.rows * m), &de.compute)?;
                     }
                     // -- positions --
+                    // (pageable host Vec dropped right after: safe because HIP stages pageable H2D synchronously, as the range driver
+                    // relies on at `pipelined_range_impl`; not verified on this ROCm, review r5 #7)
                     let pos: Vec<i32> = (0..un.rows).map(|i| (pos0_u + i as u32) as i32).collect();
                     bd.pos_per_b.slice_view_mut(0, un.rows).copy_from_host_async(&pos, &de.compute)?;
                     // -- saved indexer selection: the per-unit flag, and the selection itself for a reuse layer --
@@ -1778,9 +1819,15 @@ impl HeterogeneousEngine {
         let chunk_b = chunk_end - job.chunk_start;
         let is_last_chunk = chunk_end == t;
         let (lazy_hcs, lazy_engram) = match job.chunk_inputs.take() {
-            Some((h, e)) => {
-                if h.len() != chunk_b || e.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() != chunk_b * ENGRAM_IN as usize)) {
+            Some((mut h, mut e)) => {
+                // A SURPLUS is a prefix to keep: `next_chunk_range` predicted a layer-outer window and `lm_open_window` fell back
+                // to chunked prefill (store OOM / fewer than two chunks left).
+                if h.len() < chunk_b || e.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() < chunk_b * ENGRAM_IN as usize)) {
                     return Err(eyre!("prefill_job_chunk: chunk inputs for {} rows, chunk is {chunk_b}", h.len()));
+                }
+                h.truncate(chunk_b);
+                if let Some(rs) = e.as_mut() {
+                    rs.iter_mut().for_each(|r| r.truncate(chunk_b * ENGRAM_IN as usize));
                 }
                 (Some(h), e)
             }
@@ -13027,6 +13074,42 @@ mod lm_tests {
         for w in groups.windows(2) {
             assert_eq!(w[0].end, w[1].start);
         }
+    }
+
+    /// Review r5 finding 1 (BLOCKER): the scheduler asks `next_chunk_range` BEFORE `prefill_job_chunk` opens the window. For a
+    /// layer-outer job it must already return the WHOLE window the pass will plan, not one chunk.
+    #[test]
+    fn layer_outer_next_chunk_range_predicts_the_window_before_it_opens() {
+        let caps = (512, 512);
+        let mut job = PrefillJob::new(vec![1; 10_000], Vec::new(), None, None, 0, 1024).unwrap();
+        job.ced = true;
+        job.lm_rows = 4096;
+        // Group-major (or layer-outer off): one chunk.
+        assert_eq!(job.next_chunk_range_impl(caps, false).unwrap(), (0, 1024));
+        // Layer-outer: the 4096-row window (4 sub-chunks), the same rows `lm_open_window` plans.
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 4096));
+        // After a window closed (chunk_start advanced) the next window is predicted from there.
+        job.chunk_start = 4096;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (4096, 8192));
+        // The tail: 1,808 rows left = two chunks fit => a window of exactly the tail; < 2 chunks => one chunk.
+        job.chunk_start = 8192;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (8192, 10_000));
+        job.chunk_start = 9_500;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (9_500, 10_000));
+        // Not CED or no LM rows: never a window.
+        job.chunk_start = 0;
+        job.ced = false;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 1024));
+        job.ced = true;
+        job.lm_rows = 0;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 1024));
+        // An OPEN layer-outer window: the first pass (layer 0) takes the whole window, later passes none.
+        job.lm_rows = 4096;
+        let subs = lm_plan_window(0, 0, 10_000, 1024, caps, &[], 4096).unwrap().unwrap();
+        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(), lo: true, lo_layer: 0, saved: Vec::new() });
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 4096));
+        job.lm.as_mut().unwrap().lo_layer = 4;
+        assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (job.chunk_start, job.chunk_start));
     }
 
     #[test]

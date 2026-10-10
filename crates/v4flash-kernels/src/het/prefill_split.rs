@@ -44,13 +44,6 @@ pub fn b2_usable_estimate() -> usize {
     *N
 }
 
-/// `V41_LONG_PREFILL_TOKENS` (default 16384, the server knob of the same name): jobs longer than this are LONG.
-pub fn long_tokens() -> usize {
-    static N: std::sync::LazyLock<usize> =
-        std::sync::LazyLock::new(|| std::env::var("V41_LONG_PREFILL_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(16384));
-    *N
-}
-
 /// SplitMix64 finaliser: a stable, well-mixed order on `(layer, expert)`. Not `DefaultHasher` (not stable across
 /// builds).
 fn mix(layer: usize, e: usize) -> u64 {
