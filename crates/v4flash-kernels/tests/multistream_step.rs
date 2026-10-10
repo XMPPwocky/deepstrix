@@ -259,6 +259,14 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 #[ignore]
 fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     install_panic_handler()?;
+    // dGPU bundle slice 2: report how many lane-layers took the zero-copy pull (the window greps it).
+    struct ZcReport;
+    impl Drop for ZcReport {
+        fn drop(&mut self) {
+            eprintln!("ZC: zc_pulls={}", v4flash_kernels::het::forward_prefill::ZC_PULLS.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+    let _zc_report = ZcReport;
     if std::env::var("V41_PAGED_EXPERTS").is_err() {
         std::env::set_var("V41_PAGED_EXPERTS", "1");
     }

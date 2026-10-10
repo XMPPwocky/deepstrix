@@ -524,6 +524,10 @@ mod lane_env {
     });
 }
 
+/// Lane-layers whose iGPU inputs came by the zero-copy pull (`V41_DGPU_ZC_PUSH`), since start: the
+/// gate's proof that the path ran.
+pub static ZC_PULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn prefill_f32_matvec(b: u32) -> bool {
     lane_env::PREFILL_F32_MATVEC.unwrap_or(b <= 64)
 }
@@ -10761,6 +10765,7 @@ impl HeterogeneousEngine {
             // copied on `ie.compute` where the peer push used to land them. The next layer's pack
             // overwrites it only after post(l) waited for this MoE (`moe_arrived`) on `de.compute`.
             let _t_zc = ie.events.stage("igpu.zc_pull", &ie.compute)?;
+            ZC_PULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let words = bd.rb_pack.as_slice();
             let (so, sn) = c.rb.sel.expect("zc_push checked sel");
             let (eo, en) = c.rb.ew.expect("zc_push checked ew");
