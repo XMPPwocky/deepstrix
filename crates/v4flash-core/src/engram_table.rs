@@ -13,6 +13,88 @@ use crate::safetensors::{SafetensorsDir, StTensor};
 
 pub const ENGRAM_ROW_BYTES: u64 = ENGRAM_ROW_DIM as u64; // 1 B per fp8 element
 pub const ENGRAM_SCALE_BYTES: u64 = (ENGRAM_ROW_DIM / 32) as u64; // 8 e8m0 per row
+/// One RAW cached row: the 256 fp8 weights then the 8 e8m0 scales.
+const RAW_ROW: usize = ENGRAM_ROW_DIM + ENGRAM_SCALE_BYTES as usize;
+/// Approximate cache bytes per row (payload + index entry), for sizing by MB.
+const RAW_ROW_COST: usize = RAW_ROW + 32;
+
+/// Dequantise one RAW row (`RAW_ROW` bytes) into 256 f32 -- the exact formula the
+/// disk path always used, so cached and uncached rows are bit-identical.
+#[inline]
+fn dequant_raw(raw: &[u8], out: &mut [f32]) {
+    let (w, sc) = raw.split_at(ENGRAM_ROW_DIM);
+    for (j, o) in out.iter_mut().enumerate() {
+        *o = bf16_round(e4m3_to_f32(w[j]) * e8m0_to_f32(sc[j / 32]));
+    }
+}
+
+/// One generation of the raw-row cache: id -> slot, rows packed in `data`.
+#[derive(Default)]
+struct RowGen {
+    idx: std::collections::HashMap<i64, u32>,
+    data: Vec<u8>,
+}
+
+impl RowGen {
+    fn get(&self, id: i64) -> Option<&[u8]> {
+        self.idx.get(&id).map(|&i| &self.data[i as usize * RAW_ROW..(i as usize + 1) * RAW_ROW])
+    }
+    fn push(&mut self, id: i64, raw: &[u8]) {
+        let i = (self.data.len() / RAW_ROW) as u32;
+        self.data.extend_from_slice(raw);
+        self.idx.insert(id, i);
+    }
+    fn len(&self) -> usize {
+        self.idx.len()
+    }
+}
+
+/// RAW Engram row cache (owner 10-11): rows as their 264 stored bytes, ~15x denser
+/// than the page cache (a 4 KiB page per 264 B row) and ~4x denser than the old
+/// decoded-f32 cache. TWO GENERATIONS instead of clear-on-full: inserts go to
+/// `young`; when it holds `gen_cap` rows it becomes `old` (the previous `old` is
+/// dropped); a hit in `old` is copied into `young`. An LRU approximation with no
+/// per-access bookkeeping, bounded at ~2 x `gen_cap` rows.
+///
+/// WHY (measured 10-11, box 1): a 4096-token layer-major window gathers ~196K rows
+/// (4096 x 24 cols x 2 layers); with ~8 GB of page cache left beside 112 GB of GTT
+/// the 2 x 98 GB tables thrashed it -- window time tracked ~0.4-3 GB of ~10 KB reads
+/// per window (2.6 s + ~0.9 s/GB) and long jobs "ramped" as the conversation's rows
+/// warmed. The old 262K-row (256 MB) cache cleared itself every ~1.3 windows.
+struct RawRowCache {
+    young: RowGen,
+    old: RowGen,
+    gen_cap: usize,
+}
+
+impl RawRowCache {
+    fn new(cap_rows: usize) -> Self {
+        Self { young: RowGen::default(), old: RowGen::default(), gen_cap: (cap_rows / 2).max(1) }
+    }
+    /// Copy the row into `dst` if cached (promoting an `old` hit).
+    fn lookup(&mut self, id: i64, dst: &mut [u8]) -> bool {
+        if let Some(r) = self.young.get(id) {
+            dst.copy_from_slice(r);
+            return true;
+        }
+        let Some(r) = self.old.get(id) else { return false };
+        dst.copy_from_slice(r);
+        self.insert(id, dst);
+        true
+    }
+    fn insert(&mut self, id: i64, raw: &[u8]) {
+        if self.young.idx.contains_key(&id) {
+            return;
+        }
+        if self.young.len() >= self.gen_cap {
+            self.old = std::mem::take(&mut self.young);
+        }
+        self.young.push(id, raw);
+    }
+    fn rows(&self) -> usize {
+        self.young.len() + self.old.len()
+    }
+}
 
 /// Round an f32 to the nearest bf16 (ties to even) and back.
 #[inline]
@@ -41,13 +123,15 @@ pub struct EngramTable {
     /// Threads already hide some of it (24-way fan-out; narrowing it once cost decode
     /// 14.4 -> 11.9 tok/s) but cannot fix the granularity.
     ///
-    /// n-gram hashes repeat heavily within a conversation, so a small cache should take
-    /// most of that to zero. `ENGRAM_CACHE_ROWS=0` disables it; default 262144 rows
-    /// ~= 256 MB of f32 (or set it lower — 65536 is ~64 MB).
-    cache: std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<Vec<f32>>>>,
+    /// n-gram hashes repeat heavily within a conversation. RAW rows (`RawRowCache`),
+    /// sized by `ENGRAM_CACHE_MB` (default 1536 per table, ~5.2M rows) or
+    /// `ENGRAM_CACHE_ROWS` (rows; wins if set); `0` disables it.
+    cache: std::sync::Mutex<RawRowCache>,
     cache_cap: usize,
     pub cache_hits: std::sync::atomic::AtomicU64,
     pub cache_misses: std::sync::atomic::AtomicU64,
+    /// Stats line at most once a minute (`gather`).
+    last_log: std::sync::Mutex<std::time::Instant>,
 }
 
 impl EngramTable {
@@ -62,18 +146,31 @@ impl EngramTable {
         let cache_cap = std::env::var("ENGRAM_CACHE_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(262_144);
+            .unwrap_or_else(|| {
+                let mb = std::env::var("ENGRAM_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1536);
+                mb * (1 << 20) / RAW_ROW_COST
+            });
+        // No readahead on the tables (`ENGRAM_FADV_RANDOM`, default on): a row miss
+        // reads its page, not ~10 KB around it (measured 10-11: ~10 KB per IO during
+        // prefill windows). Advisory; a failure only loses the hint.
+        if std::env::var("ENGRAM_FADV_RANDOM").as_deref() != Ok("0") {
+            for t in [&weight, &scale] {
+                if let Err(e) = st.advise_random(t) {
+                    eprintln!("engram L{layer}: {e:#}");
+                }
+            }
+        }
+        eprintln!("engram L{layer}: raw row cache {} rows (~{} MB)", cache_cap, cache_cap * RAW_ROW_COST >> 20);
         Ok(Self {
             layer,
             rows: weight.shape[0],
             weight,
             scale,
-            cache: std::sync::Mutex::new(std::collections::HashMap::with_capacity(
-                cache_cap.min(1 << 16),
-            )),
+            cache: std::sync::Mutex::new(RawRowCache::new(cache_cap)),
             cache_cap,
             cache_hits: std::sync::atomic::AtomicU64::new(0),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
+            last_log: std::sync::Mutex::new(std::time::Instant::now()),
         })
     }
 
@@ -111,55 +208,106 @@ impl EngramTable {
         // `EngramCtx::rows_for_chunk`, which now issues one gather per layer per run
         // instead of one per position (289k spawns -> ~64, 530 -> 59 us/token) —
         // not to narrow the fan-out of an individual gather.
-        // Serve what the cache already has; only the misses go to disk.
+        // Serve what the cache already has (RAW rows); only the misses go to disk;
+        // every row is then dequantised (in parallel for big gathers).
         if self.cache_cap > 0 {
-            let mut need: Vec<i64> = Vec::new();
-            {
-                let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-                for (k, &id) in ids.iter().enumerate() {
-                    match c.get(&id) {
-                        Some(row) => {
-                            out[k * ENGRAM_ROW_DIM..(k + 1) * ENGRAM_ROW_DIM]
-                                .copy_from_slice(row);
-                            self.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        None => need.push(id),
-                    }
-                }
-            }
-            if need.is_empty() {
-                return Ok(());
-            }
-            need.sort_unstable();
-            need.dedup();
-            self.cache_misses
-                .fetch_add(need.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut fetched = vec![0f32; need.len() * ENGRAM_ROW_DIM];
-            self.gather_uncached(st, &need, &mut fetched, threads)?;
+            let mut raw = vec![0u8; ids.len() * RAW_ROW];
+            let mut miss_at: Vec<usize> = Vec::new();
             {
                 let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-                // Bounded, not LRU: n-gram locality is high and a clear is cheaper
-                // than per-access bookkeeping on the critical path.
-                if c.len() + need.len() > self.cache_cap {
-                    c.clear();
-                }
-                for (j, &id) in need.iter().enumerate() {
-                    c.insert(
-                        id,
-                        std::sync::Arc::new(
-                            fetched[j * ENGRAM_ROW_DIM..(j + 1) * ENGRAM_ROW_DIM].to_vec(),
-                        ),
-                    );
-                }
                 for (k, &id) in ids.iter().enumerate() {
-                    if let Some(row) = c.get(&id) {
-                        out[k * ENGRAM_ROW_DIM..(k + 1) * ENGRAM_ROW_DIM].copy_from_slice(row);
+                    if !c.lookup(id, &mut raw[k * RAW_ROW..(k + 1) * RAW_ROW]) {
+                        miss_at.push(k);
                     }
                 }
             }
+            self.cache_hits.fetch_add((ids.len() - miss_at.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+            if !miss_at.is_empty() {
+                let mut need: Vec<i64> = miss_at.iter().map(|&k| ids[k]).collect();
+                need.sort_unstable();
+                need.dedup();
+                self.cache_misses.fetch_add(need.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                let mut fetched = vec![0u8; need.len() * RAW_ROW];
+                self.read_raw(st, &need, &mut fetched, threads)?;
+                for &k in &miss_at {
+                    let j = need.binary_search(&ids[k]).expect("every miss was fetched");
+                    raw[k * RAW_ROW..(k + 1) * RAW_ROW].copy_from_slice(&fetched[j * RAW_ROW..(j + 1) * RAW_ROW]);
+                }
+                let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                for (j, &id) in need.iter().enumerate() {
+                    c.insert(id, &fetched[j * RAW_ROW..(j + 1) * RAW_ROW]);
+                }
+            }
+            Self::dequant_rows(&raw, out, threads);
+            self.maybe_log();
             return Ok(());
         }
         self.gather_uncached(st, ids, out, threads)
+    }
+
+    /// Dequantise `raw` (rows of `RAW_ROW`) into `out`; split over up to `threads`
+    /// scoped threads when there is enough work (a window gathers ~98K rows/layer).
+    fn dequant_rows(raw: &[u8], out: &mut [f32], threads: usize) {
+        let n = raw.len() / RAW_ROW;
+        let parts = if n >= 4096 { threads.clamp(1, 16).min(n / 2048).max(1) } else { 1 };
+        let per = n.div_ceil(parts);
+        if parts == 1 {
+            for (r, o) in raw.chunks_exact(RAW_ROW).zip(out.chunks_exact_mut(ENGRAM_ROW_DIM)) {
+                dequant_raw(r, o);
+            }
+            return;
+        }
+        std::thread::scope(|sc| {
+            for (rc, oc) in raw.chunks(per * RAW_ROW).zip(out.chunks_mut(per * ENGRAM_ROW_DIM)) {
+                sc.spawn(move || {
+                    for (r, o) in rc.chunks_exact(RAW_ROW).zip(oc.chunks_exact_mut(ENGRAM_ROW_DIM)) {
+                        dequant_raw(r, o);
+                    }
+                });
+            }
+        });
+    }
+
+    /// RAW rows for `ids` from disk into `dst` (`ids.len() * RAW_ROW`), `threads`
+    /// concurrent preads (each row: 256 B weight + 8 B scale).
+    fn read_raw(&self, st: &SafetensorsDir, ids: &[i64], dst: &mut [u8], threads: usize) -> eyre::Result<()> {
+        let threads = threads.clamp(1, ids.len().max(1));
+        let per = ids.len().div_ceil(threads);
+        let results: Vec<eyre::Result<()>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = ids
+                .chunks(per)
+                .zip(dst.chunks_mut(per * RAW_ROW))
+                .map(|(ids_c, dst_c)| {
+                    sc.spawn(move || -> eyre::Result<()> {
+                        for (&id, row) in ids_c.iter().zip(dst_c.chunks_exact_mut(RAW_ROW)) {
+                            let (w, s) = row.split_at_mut(ENGRAM_ROW_DIM);
+                            st.read_range_into_cached(&self.weight, id as u64 * ENGRAM_ROW_BYTES, w)?;
+                            st.read_range_into_cached(&self.scale, id as u64 * ENGRAM_SCALE_BYTES, s)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("engram read thread panicked")).collect()
+        });
+        results.into_iter().collect::<eyre::Result<Vec<()>>>()?;
+        Ok(())
+    }
+
+    /// At most once a minute: hits / misses since start and the rows held.
+    fn maybe_log(&self) {
+        let Ok(mut t) = self.last_log.try_lock() else { return };
+        if t.elapsed() < std::time::Duration::from_secs(60) {
+            return;
+        }
+        *t = std::time::Instant::now();
+        let h = self.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let m = self.cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+        let rows = self.cache.try_lock().map(|c| c.rows()).unwrap_or(0);
+        eprintln!(
+            "engram cache L{}: hits {h} misses {m} ({:.1}% hit) rows {rows}/{} ({} MB)",
+            self.layer, 100.0 * h as f64 / (h + m).max(1) as f64, self.cache_cap, rows * RAW_ROW_COST >> 20
+        );
     }
 
     /// The original disk path — unchanged; see `gather` for the cache in front of it.
@@ -236,6 +384,47 @@ mod tests {
         Ok(())
     }
 
+    /// Two generations: bounded at ~2 x gen_cap rows, an `old` hit is promoted, a row
+    /// two generations stale is gone; lookups return the inserted bytes.
+    #[test]
+    fn raw_row_cache_generations() {
+        let row = |id: i64| -> Vec<u8> { (0..RAW_ROW).map(|j| (id as usize * 7 + j) as u8).collect() };
+        let mut c = RawRowCache::new(8); // gen_cap 4
+        for id in 0..4 {
+            c.insert(id, &row(id));
+        }
+        let mut b = vec![0u8; RAW_ROW];
+        assert!(c.lookup(2, &mut b) && b == row(2));
+        for id in 4..8 {
+            c.insert(id, &row(id)); // 4 rotates young(0..4) to old
+        }
+        assert!(c.rows() <= 8);
+        assert!(c.lookup(1, &mut b) && b == row(1), "old hit");
+        for id in 8..16 {
+            c.insert(id, &row(id));
+        }
+        assert!(!c.lookup(0, &mut b), "two generations stale: gone");
+        assert!(c.rows() <= 8);
+        assert!(c.lookup(15, &mut b) && b == row(15));
+    }
+
+    /// The cached path's dequant == the disk path's formula, element for element, and
+    /// the parallel split covers every row.
+    #[test]
+    fn dequant_raw_matches_formula() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let n = 5000;
+        let raw: Vec<u8> = (0..n * RAW_ROW).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+        let mut out = vec![0f32; n * ENGRAM_ROW_DIM];
+        EngramTable::dequant_rows(&raw, &mut out, 8);
+        for (r, o) in raw.chunks_exact(RAW_ROW).zip(out.chunks_exact(ENGRAM_ROW_DIM)) {
+            for j in 0..ENGRAM_ROW_DIM {
+                let want = bf16_round(e4m3_to_f32(r[j]) * e8m0_to_f32(r[ENGRAM_ROW_DIM + j / 32]));
+                assert_eq!(o[j].to_bits(), want.to_bits());
+            }
+        }
+    }
+
     #[test]
     fn bf16_rounding() {
         assert_eq!(bf16_round(1.0), 1.0);
@@ -287,6 +476,12 @@ mod tests {
             eprintln!("L{layer}: {} rows gathered in {:.1} ms ({:.0} µs/row); {n_diff} of {} values differ, max |Δ| {max_abs:.3e}",
                 flat.len(), dt.as_secs_f64() * 1e3, dt.as_secs_f64() * 1e6 / flat.len() as f64, got.len());
             assert_eq!(n_diff, 0, "L{layer}: gathered rows differ from the reference");
+            // Again: now every row comes from the RAW row cache (when enabled).
+            let mut again = vec![0f32; flat.len() * ENGRAM_ROW_DIM];
+            tbl.gather(&st, &flat, &mut again, 32)?;
+            let n_diff2 = again.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            assert_eq!(n_diff2, 0, "L{layer}: cached rows differ from the reference");
+            assert!(tbl.cache_cap == 0 || tbl.cache_hits.load(std::sync::atomic::Ordering::Relaxed) >= flat.len() as u64);
         }
         Ok(())
     }
