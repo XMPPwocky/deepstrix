@@ -1369,10 +1369,6 @@ impl HeterogeneousEngine {
                     }
                 }
             }
-            if lo && lm_prefetch_enabled() {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| tracing::warn!("V41_LM_PREFETCH is a no-op for layer-outer windows (group prefetch is group-major only; rolling prefetch is P3)"));
-            }
             tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap, layer_outer = lo,
                 tokens_done = start, tokens_total = t, "prefill_lm_window open");
             job.lm = Some(LmWindow {
@@ -1733,6 +1729,28 @@ impl HeterogeneousEngine {
                 }
             }
         }
+        // Rolling prefetch (P3; `V41_LM_PREFETCH` + `V41_LM_PREFETCH_AHEAD`): each unit of layer `l` queues box 2's owned,
+        // non-resident experts of layers `l+1..=l+ahead` below the split, paced per request; what went out on a request is
+        // remembered for the window (`pf_sent`), and the pass drops its unsent words before returning (decode runs between
+        // passes and must not carry them).
+        let pf_ahead = if lm_prefetch_enabled() && self.remote.is_some() { crate::knobs::LM_PREFETCH_AHEAD.usize() } else { 0 };
+        let mut pf_sent: std::collections::HashSet<u32> = std::mem::take(&mut job.lm.as_mut().expect("open window").pf_sent);
+        let mut pf_queued: Vec<u32> = Vec::new();
+        let pf_prev_cap = (pf_ahead > 0).then(|| super::remote_experts::set_prefetch_take_cap(lm_prefetch_per_req()));
+        // Words of `queued` that left the queue went out on a request: move them to `sent`; the rest are pulled back.
+        let pf_settle = |queued: &mut Vec<u32>, sent: &mut std::collections::HashSet<u32>| {
+            if queued.is_empty() {
+                return;
+            }
+            let qs: std::collections::HashSet<u32> = queued.iter().copied().collect();
+            let unsent: std::collections::HashSet<u32> =
+                super::remote_experts::extract_prefetch_words(|w| qs.contains(&w)).into_iter().collect();
+            for w in queued.drain(..) {
+                if !unsent.contains(&w) {
+                    sent.insert(w);
+                }
+            }
+        };
         let n_tasks = (b_end - a) * u_count;
         let ops = sch::ops(n_tasks, |t| sch::task(t, a, u_count).0 != split);
         let pos0_job = job.pos0;
@@ -1823,6 +1841,16 @@ impl HeterogeneousEngine {
                             (false, _) => self.stage_engram_lane(bd, l, engram_job, un.tok0, un.rows)?,
                         }
                     }
+                    if pf_ahead > 0 {
+                        pf_settle(&mut pf_queued, &mut pf_sent);
+                        let hi = (l + pf_ahead + 1).min(split); // layers l+1..=l+ahead, below the split
+                        if l + 1 < hi {
+                            let words: Vec<u32> = lm_prefetch_words(l + 1..hi, split).into_iter().filter(|w| !pf_sent.contains(w)).collect();
+                            if super::remote_experts::push_prefetch_words(&words) {
+                                pf_queued = words;
+                            }
+                        }
+                    }
                     let tokens_u = &job_tokens[un.tok0..un.tok0 + un.rows];
                     self.forward_layer_pre_moe_v2(
                         bd, bi, sd, si,
@@ -1869,6 +1897,10 @@ impl HeterogeneousEngine {
             }
         }
         drop(exec);
+        if let Some(prev) = pf_prev_cap {
+            pf_settle(&mut pf_queued, &mut pf_sent);
+            super::remote_experts::set_prefetch_take_cap(prev);
+        }
         // Drain: the store must hold every unit's rows and the lanes must be idle before decode may use them.
         let sync = self.dgpu.compute.synchronize();
         state.restore_compressor_lending();
@@ -1878,6 +1910,7 @@ impl HeterogeneousEngine {
             let w = job.lm.as_mut().expect("open window");
             w.saved = saved;
             w.lo_layer = b_end;
+            w.pf_sent = pf_sent;
             // Engram rows of layers already passed are dead; keep the later ones for the next pass.
             w.engram = engram_win.map(|mut rs| {
                 for (li, r) in rs.iter_mut().enumerate() {
