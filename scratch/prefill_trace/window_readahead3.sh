@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# TWO-BOX DEPLOY of the CERTAIN-words-queue fix (owner 10-11 "right away"): worktree-igpu-wmma-moe a20b4270 =
+# TWO-BOX DEPLOY of the CERTAIN-words-queue fix (owner 10-11 "right away"): worktree-igpu-wmma-moe 060134d4 =
 #   box 2: certain background words (early page / park) never dropped: with no general set free they queue set-less and
 #          get the next freed general set (a 1024-row frame dropped ~200 early-page picks/request -> serial demand misses).
 #          Knob file unchanged in content.
-#   hub  : 3b7f3b9d (relink; same hub behaviour as e80554ae). Hub knob file: the read-ahead A/B restarts after.
-#   box 2: target-b2cq1011 expertd b7e4e393 <- target-b2rq1011 91f06086; hub 3b7f3b9d (target-gate) <- e80554ae.
+#   hub  : e8669c98 (relink; same hub behaviour as e80554ae). Hub knob file: the read-ahead A/B restarts after.
+#   box 2: target-b2cq1011 expertd 035242a5 <- target-b2rq1011 91f06086; hub e8669c98 (target-gate) <- e80554ae.
 #   gates (hub down, box 2 OLD): remote_experts_pin_loopback + nursery_loopback (~20 s).
 # ORDER: box 1 down, gates, box 2 down, box 2 up, box 1 up. Any failure -> both back on 91f06086 + e80554ae.
 #   window_readahead3.sh [deploy|rollback] > ~/window_readahead3_deploy.log 2>&1   (never a pipe)
@@ -14,7 +14,7 @@ WT=/home/claude-code/deepstrix/.claude/worktrees/igpu-wmma-moe
 W=/home/claude-code/scratch-ms
 PROD=/home/claude-code/deepstrix/target-v41/release/deepstrix-server
 HUB_NEW=$WT/target-gate/release/deepstrix-server
-HUB_NEW_MD5=3b7f3b9d
+HUB_NEW_MD5=e8669c98
 HUB_OLD_MD5=e80554ae
 HUB_BAK=$W/deepstrix-server.$HUB_OLD_MD5.bak
 MARK=/home/claude-code/logs/evtrace/deploy_markers.log
@@ -23,7 +23,7 @@ SUPPAT='^bash /home/claude-code/run_v41_server.sh'
 B2=10.43.0.95
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
 B2_NEW_BIN=/home/claude-code/deepstrix/target-b2cq1011/release/deepstrix-expertd
-B2_NEW_MD5=b7e4e393
+B2_NEW_MD5=035242a5
 B2_OLD_BIN=/home/claude-code/deepstrix/target-b2rq1011/release/deepstrix-expertd
 B2_OLD_MD5=91f06086
 B2_EXPERTS=L0-L39:265-383
@@ -149,8 +149,8 @@ if install_hub "$HUB_NEW" "$HUB_NEW_MD5" && hub_up; then
   sed 's/\x1b\[[0-9;]*m//g' ~/logs/v41-server.log | tail -800 | grep -aE 'remote experts:|prefill VRAM loan: prefill lane set built|UNTESTED|ERROR|panicked' | tail -5 | cut -c1-240
   $SSH $B2 "N=\$(grep -a -n '^=== ' $B2LOG | tail -1 | cut -d: -f1); tail -n +\${N:-1} $B2LOG | grep -a -E 'connection from|expert shard|nursery ON|ERROR|panicked' | tail -5 | cut -c1-240"
   $SSH $B2 "N=\$(grep -a -n '^=== ' $B2LOG | tail -1 | cut -d: -f1); tail -n +\${N:-1} $B2LOG | grep -a -E 'look-ahead prefetch ON|readahead' | tail -3 | cut -c1-240"
-  say "OK: hub $HUB_NEW_MD5 + box 2 $B2_NEW_MD5 (certain-words queue fix, a20b4270)"
-  mark "done: hub $HUB_NEW_MD5 + box 2 $B2_NEW_MD5 (readahead3 a20b4270)"
+  say "OK: hub $HUB_NEW_MD5 + box 2 $B2_NEW_MD5 (certain-words queue fix, 060134d4)"
+  mark "done: hub $HUB_NEW_MD5 + box 2 $B2_NEW_MD5 (readahead3 060134d4)"
   exit 0
 fi
 say "new hub unhealthy"
