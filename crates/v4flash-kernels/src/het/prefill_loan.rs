@@ -70,10 +70,15 @@ pub struct Plan {
 pub fn plan(items: &[Recorded], pool_cap: usize, stores: &[(usize, usize, usize, usize)]) -> eyre::Result<Plan> {
     // Bin ENDS aligned down to 256 B (review r3 finding 5: `index_k` is `rows_cap x 80` B, not a multiple of 256), so every
     // buffer carved downward from an end starts 256-aligned.
+    // The slack between the true end and the aligned end lies INSIDE the lent range (review r4 NEW-2): `lent_rows`
+    // counts it, so a live row there is compacted or swapped like any other overlap.
+    let slack: Vec<(usize, usize)> = stores.iter().map(|&(c, _, k, _)| (c % ALIGN, k % ALIGN)).collect();
     let stores: Vec<(usize, usize, usize, usize)> = stores.iter().map(|&(c, cr, k, kr)| (c / ALIGN * ALIGN, cr, k / ALIGN * ALIGN, kr)).collect();
     let stores = &stores[..];
+    // Must-persist (written) items FIRST (review r4 NEW-1: packed after the big unwritten ones they found the pool full),
+    // then first-fit-decreasing within each class.
     let mut order: Vec<usize> = (0..items.len()).collect();
-    order.sort_by_key(|&i| (std::cmp::Reverse(items[i].bytes), i));
+    order.sort_by_key(|&i| (!items[i].written, std::cmp::Reverse(items[i].bytes), i));
     // store bins, largest comp first, then keys largest first
     let mut comp_bins: Vec<usize> = (0..stores.len()).collect();
     comp_bins.sort_by_key(|&s| (std::cmp::Reverse(stores[s].0), s));
@@ -117,7 +122,11 @@ pub fn plan(items: &[Recorded], pool_cap: usize, stores: &[(usize, usize, usize,
         }
     }
     let lent_rows = (0..stores.len())
-        .map(|s| comp_used[s].div_ceil(stores[s].1).max(key_used[s].div_ceil(stores[s].3)) as u32)
+        .map(|s| {
+            let c = if comp_used[s] > 0 { comp_used[s] + slack[s].0 } else { 0 };
+            let k = if key_used[s] > 0 { key_used[s] + slack[s].1 } else { 0 };
+            c.div_ceil(stores[s].1).max(k.div_ceil(stores[s].3)) as u32
+        })
         .collect();
     Ok(Plan { at, pool_used, lent_rows })
 }
@@ -272,13 +281,13 @@ mod tests {
     #[test]
     fn persistent_items_only_go_to_the_pool() {
         let st = [(4096, 128, 1024, 16)];
-        // size order: 600 (#1, 768) -> pool; 300 (#2, 512) -> no room left in the pool -> comp; 100 written (#0, 256) -> pool
+        // written first: 100 (#0, 256) -> pool 0; then size order: 600 (#1, 768) -> pool 256; 300 (#2, 512) -> comp
         let p = plan(&[r(100, true), r(600, false), r(300, false)], 1024, &st).unwrap();
-        assert_eq!(p.at[1], (Bin::Pool, 0));
+        assert_eq!(p.at[0], (Bin::Pool, 0), "a written allocation stays in the pool");
+        assert_eq!(p.at[1], (Bin::Pool, 256));
         assert_eq!(p.at[2], (Bin::Comp(0), 4096 - 512));
-        assert_eq!(p.at[0], (Bin::Pool, 768), "a written allocation stays in the pool");
-        // a full pool refuses a written allocation instead of lending it
-        let e = plan(&[r(1024, false), r(100, true)], 1024, &st).unwrap_err().to_string();
+        // a written allocation the pool cannot hold is refused, never lent
+        let e = plan(&[r(2000, true)], 1024, &st).unwrap_err().to_string();
         assert!(e.contains("must persist"), "{e}");
     }
 
@@ -292,6 +301,25 @@ mod tests {
             assert!(off + 256 <= 768, "offset {off} past the aligned end");
         }
         assert!(plan(&[r(100, false); 4], 0, &[(0, 128, 1000, 80)]).is_err(), "a 4th slot would cross the aligned end");
+    }
+
+    /// Review r4 NEW-1: a small written item sorted after big unwritten ones still gets the pool.
+    #[test]
+    fn written_items_are_placed_first() {
+        // pool 1024: an unwritten 1000 (-> 1024) would fill it; the written 10 B must still land in the pool
+        let p = plan(&[r(1000, false), r(10, true)], 1024, &[(4096, 128, 0, 16)]).unwrap();
+        assert_eq!(p.at[1], (Bin::Pool, 0), "the written item goes first");
+        assert_eq!(p.at[0].0, Bin::Comp(0), "the big unwritten one moves to a store");
+    }
+
+    /// Review r4 NEW-2: with an unaligned key bin the lent rows cover the placed buffer, slack included.
+    #[test]
+    fn lent_rows_cover_the_alignment_slack() {
+        // keys bin 1000 B, 80 B rows: aligned end 768, slack 232; one 256 B buffer at [512, 768)
+        let p = plan(&[r(200, false)], 0, &[(0, 128, 1000, 80)]).unwrap();
+        assert_eq!(p.at[0], (Bin::Keys(0), 512));
+        let lent_from_byte = 1000 - p.lent_rows[0] as usize * 80;
+        assert!(lent_from_byte <= 512, "lent range starts at byte {lent_from_byte}, the buffer at 512");
     }
 
     #[test]

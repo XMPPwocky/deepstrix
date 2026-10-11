@@ -1220,8 +1220,8 @@ impl KvArena {
         self.streams.get(rec.slot).and_then(|s| s.as_ref()).is_some_and(|s| {
             let r = s.comp[rec.si];
             r.base == rec.base
-                && r.base + r.n_comp >= rec.lo + rec.n_comp_rows
-                && r.base + r.n_index_comp >= rec.lo + rec.n_key_rows
+                && (rec.n_comp_rows == 0 || r.base + r.n_comp >= rec.lo + rec.n_comp_rows)
+                && (rec.n_key_rows == 0 || r.base + r.n_index_comp >= rec.lo + rec.n_key_rows)
         })
     }
 
