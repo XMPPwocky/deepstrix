@@ -268,9 +268,9 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
         let sfx = &toks[pos0..];
         let hcs: Vec<Vec<f32>> = sfx.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
         let mut job = if lazy {
-            PrefillJob::new(sfx.to_vec(), Vec::new(), None, None, pos0 as u32, 1024)?
+            PrefillJob::new(sfx.to_vec(), Vec::new(), None, None, pos0 as u32, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?
         } else {
-            PrefillJob::new(sfx.to_vec(), hcs.clone(), Some(rows.clone()), None, pos0 as u32, 1024)?
+            PrefillJob::new(sfx.to_vec(), hcs.clone(), Some(rows.clone()), None, pos0 as u32, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?
         };
         job.set_layer_major_rows(lm)?;
         let mut units = 0usize;
@@ -288,7 +288,7 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
                 x_seq.push(t);
                 let pos = x_seq.len() - 1;
                 let xr = rows_for(pg.raw(), &x_seq, pos)?;
-                let mut xj = PrefillJob::new(vec![t], vec![embed(t)?], Some(xr), None, pos as u32, 1024)?;
+                let mut xj = PrefillJob::new(vec![t], vec![embed(t)?], Some(xr), None, pos as u32, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?;
                 xj.set_layer_major_rows(0)?;
                 while !xj.chunks_done() {
                     engine.prefill_job_chunk(&mut xj, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut x_state, &weights, Some(&mut *pg))?;
