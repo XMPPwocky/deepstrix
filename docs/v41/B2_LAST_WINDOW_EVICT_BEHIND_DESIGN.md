@@ -1,4 +1,4 @@
-# Box 2: evict behind the pass in a job's LAST prefill unit (design, rev 3, 2026-10-11)
+# Box 2: evict behind the pass in a job's LAST prefill unit (design, rev 3 APPROVED (Fable review r3), 2026-10-11)
 
 rev 2 = review r1 (REVISE): "last unit" decided inside the engine (2.1), the replay gain scoped to single-unit jobs
 (3), phase splits (2.4), flags2 OR + daemon gate (2.1/2.2), Q1 answered by measurement (4).
@@ -49,8 +49,10 @@ exceed a window `lm_open_window` halved on OOM, flagging a non-last window):
   `lm_open_window` makes, so a halved cap is accounted for; computed at window open, stored in `LmWindow`, applied to
   EVERY pass of that window. `w.end == tokens.len()` alone missed the window-plus-tail shape (a window then a <= 2048
   remainder run chunked): that window kept today's unlimited long budget and wiped the decoder layers before the tail;
-* chunked: a chunk run when no window can open from its start (the tail after the last window, or a chunked-only
-  job) is last; with >= 2 chunks remaining a window opens, so such a tail is always ONE chunk;
+* chunked: last iff `chunk_end == tokens.len()` (the existing `is_last_chunk`; review r3). It coincides with the
+  window rule whenever a window could have opened (the tail after the last window is ONE chunk: with >= 2 chunks
+  remaining a window opens) and stays right on the fallback paths where none ever can (`!ced`, `lm_rows == 0`,
+  `single_lane_max() > 0`: a multi-chunk chunked job keeps the long budget on its non-last chunks);
 * `prefill_job_finish` (the replay): unconditionally last.
 Set before the unit's first request, cleared when the unit returns (every path; an RAII guard like the split guard in
 `prefill_job_chunk`) AND by
