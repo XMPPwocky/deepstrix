@@ -1,0 +1,53 @@
+deepstrix: decide device kernel args PER DEVICE (DEBUG_CLR_KERNARG_DEV_ARCHS).
+
+HIP_FORCE_DEV_KERNARG / DEBUG_CLR_KERNARG_HDP_FLUSH_WA are process-wide. On our box the HDP-flush
+device-kernarg path makes the gfx1201 dGPU's launches ~1.2 us/kernel faster but doubles every
+kernel's device time on the gfx1151 iGPU (kernargs in the DRAM carve-out + a flush per launch).
+DEBUG_CLR_KERNARG_DEV_ARCHS=gfx1201 keeps every unlisted device on host kernel args. Empty (default)
+= upstream behaviour. Applies to direct launches, the kernarg pool and graphs alike: they all read
+the per-device Settings::kernel_arg_impl_ set here.
+
+diff -ru a/rocclr/device/rocm/rocsettings.cpp b/rocclr/device/rocm/rocsettings.cpp
+--- a/rocclr/device/rocm/rocsettings.cpp	2026-10-10 20:37:17.425045099 +0000
++++ b/rocclr/device/rocm/rocsettings.cpp	2026-10-10 20:37:29.487860294 +0000
+@@ -266,6 +266,27 @@
+     kernel_arg_impl_ = kernelArgImpl & (HIP_FORCE_DEV_KERNARG ? 0xF : 0x0);
+   }
+ 
++  // Per-device opt-in: the flags above are process-wide, but the right choice is not. Device kernel
++  // args (HDP-flush path) speed up a PCIe dGPU's launches and double every kernel's time on an
++  // integrated GPU, whose "device" memory is the same DRAM. Unlisted devices keep host kernel args.
++  if (DEBUG_CLR_KERNARG_DEV_ARCHS[0] != '\0' &&
++      kernel_arg_impl_ != KernelArgImpl::HostKernelArgs) {
++    const std::string name = isa.processorName();
++    const std::string list = DEBUG_CLR_KERNARG_DEV_ARCHS;
++    bool listed = false;
++    for (size_t pos = 0; pos <= list.size() && !listed;) {
++      size_t end = list.find(',', pos);
++      if (end == std::string::npos) end = list.size();
++      listed = list.compare(pos, end - pos, name) == 0;
++      pos = end + 1;
++    }
++    if (!listed) {
++      kernel_arg_impl_ = KernelArgImpl::HostKernelArgs;
++    }
++    ClPrint(amd::LOG_INFO, amd::LOG_INIT, "Device kernel args for %s: %s (DEBUG_CLR_KERNARG_DEV_ARCHS=%s)",
++            name.c_str(), listed ? "allowed" : "host", DEBUG_CLR_KERNARG_DEV_ARCHS);
++  }
++
+   ClPrint(amd::LOG_INFO, amd::LOG_INIT, "Using dev kernel arg wa = %d", kernel_arg_impl_);
+ }
+ }  // namespace amd::roc
+diff -ru a/rocclr/utils/flags.hpp b/rocclr/utils/flags.hpp
+--- a/rocclr/utils/flags.hpp	2026-10-10 20:37:17.423044964 +0000
++++ b/rocclr/utils/flags.hpp	2026-10-10 20:37:23.422450761 +0000
+@@ -265,6 +265,9 @@
+         "Enable/Disable multiple kern arg copies")                            \
+ release(bool, DEBUG_CLR_KERNARG_HDP_FLUSH_WA, false,                          \
+         "Toggle kernel arg copy workaround")                                  \
++release(cstring, DEBUG_CLR_KERNARG_DEV_ARCHS, "",                             \
++        "Comma-separated processor names (e.g. gfx1201) allowed device "      \
++        "kernel args; other devices keep host kernel args. Empty = all")      \
+ release(bool, DEBUG_HIP_DYNAMIC_QUEUES, false,                                \
+         "Forces dynamic queue management")                                    \
+ release(uint, HIP_SKIP_ABORT_ON_GPU_ERROR, true,                              \

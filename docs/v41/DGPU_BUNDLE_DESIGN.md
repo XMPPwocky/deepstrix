@@ -198,3 +198,13 @@ device time (`BENCH_ARCH=gfx1151 bench_graph_replay`, two runs: 7 direct 20.6 ->
 c18af233 unchanged otherwise). Do NOT set `DEBUG_CLR_KERNARG_HDP_FLUSH_WA` until CLR decides it per device
 (planned: patch `Settings::setKernelArgImpl`, which runs per device with the device's `isa`, in the nix
 flake; gate on the ISA, not `apuSystem_`, which is set only for full-profile agents).
+
+**Per-device kernargs DEPLOYED (2026-10-11 18:12 UTC, hub 7425ac13 = 7e2e0407 + the patched CLR).** `flake.nix` now
+builds CLR with `nix/patches/clr-kernarg-per-device.patch`: `DEBUG_CLR_KERNARG_DEV_ARCHS` (comma list of processor
+names) keeps every unlisted device on host kernel args, decided in `Settings::setKernelArgImpl` (direct launches,
+the kernarg pool and graphs all read that per-device field). Env: `HIP_FORCE_DEV_KERNARG=1`,
+`DEBUG_CLR_KERNARG_HDP_FLUSH_WA=1`, `DEBUG_CLR_KERNARG_DEV_ARCHS=gfx1201`. Paired bench (8 alternating pairs):
+dGPU direct launches -0.54 us/kernel, graphs unchanged; the iGPU logs `gfx1151: host` (same mode as before). Gates:
+bit-identical to the stock-CLR build (244 logits files, 132,993 picks). **These env lines are only safe on a hub
+built with this flake:** stock CLR ignores `DEV_ARCHS` and puts the iGPU in mode 3 (every kernel ~2x). Check
+`DEBUG_CLR_KERNARG_DEV_ARCHS` is in the hub's `libamdhip64` before deploying with them.
