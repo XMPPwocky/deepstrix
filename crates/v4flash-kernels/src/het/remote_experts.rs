@@ -1774,8 +1774,11 @@ impl PfQueue {
                 let mut job = g.jobs.remove(i).expect("index from position");
                 job.certain = true;
                 job.likely = false;
-                let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
-                g.jobs.insert(at, job);
+                // FRONT: a request is blocked on it now -- ahead of every queued
+                // certain job, incl. later frames' set-less early-page words,
+                // and first for the next freed set (`assign_waiting`; review r5
+                // MINOR-1).
+                g.jobs.push_front(job);
                 true
             }
             // A speculative read already running on the primary under urgency
@@ -1962,7 +1965,7 @@ impl PfQueue {
                 // with no set left is discarded (nothing waits on it any more).
                 let mut j = g.jobs.pop_front()?;
                 if j.set == NO_SET {
-                    match g.ra_free.pop().filter(|_| j.readahead) {
+                    match if j.readahead { g.ra_free.pop() } else { None } {
                         Some(set) => j.set = set,
                         None => continue,
                     }
