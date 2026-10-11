@@ -355,8 +355,31 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         (true, None) => { tracing::error!("multistream: V41_MS_DSPARK set but no drafter loaded; DSpark off"); None }
         _ => None,
     };
+    // Prefill VRAM loan (`V41_PREFILL_VRAM_LOAN=1`, docs/v41/PREFILL_VRAM_LOAN_DESIGN.md): the resident lanes are sized
+    // for decode (engine_worker); prefill runs on this set, built LAST (its pool takes the free dGPU memory minus the
+    // headroom). No fallback: a set that does not fit fails startup.
+    let loan = if v4flash_kernels::het::prefill_loan::enabled() {
+        let rows = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
+        let lm_bytes = v4flash_kernels::het::prefill_loan::lm_store_bytes(v4flash_kernels::het::forward_prefill::lm_rows());
+        match v4flash_kernels::het::prefill_loan::PrefillLoan::build(state.dgpu, rows, state.n_kv_max, &arena, lm_bytes) {
+            Ok(mut l) => {
+                if dsp.is_some() {
+                    let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
+                    l.bd_a.mtp_capture_rows = cap;
+                    l.bd_b.mtp_capture_rows = cap;
+                }
+                Some(l)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "multistream: prefill VRAM loan build failed (V41_PREFILL_VRAM_LOAN=1 has no fallback) -- aborting");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let plain_lanes = PlainLanes::from_env(n_slots as usize, pipeline_min_rows());
-    let mut sched = Sched { dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { loan, dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -700,6 +723,10 @@ fn summary(t: &TargetDist) -> (usize, f32) {
 }
 
 struct Sched {
+    /// The prefill VRAM loan (`V41_PREFILL_VRAM_LOAN=1`): prefill's own lane set over pool + lent arena store tails.
+    /// LENT right before a prefill unit, ENDED at the top of every arena-writing call (`try_admit`, admission
+    /// compaction) and of `decode_step` (`end_loan`).
+    loan: Option<v4flash_kernels::het::prefill_loan::PrefillLoan>,
     /// DSpark on the arena (`ms_dspark`); `None` = off.
     dsp: Option<MsDspark>,
     /// The plain multi-stream steps' lane choice (`LaneRule::Learned`).
@@ -1022,6 +1049,7 @@ impl Sched {
                 }
                 let reserved = (|| -> eyre::Result<u32> {
                     if !self.arena.fits_now(cap) {
+                        self.end_loan()?;
                         let t = Instant::now();
                         self.arena.compact_stores(&state.engine.dgpu.compute, &mut self.bounce_f16, &mut self.bounce_u8)?;
                         tracing::info!(ms = t.elapsed().as_millis() as u64, live = self.streams.len(), "multistream: stores compacted");
@@ -1353,7 +1381,39 @@ impl Sched {
 
     /// One chunk (or the finish + admit) of `pf`. On error returns the scratch
     /// state (if still owned) for recycling.
+    /// Lend the arena's store tails to the prefill set (no-op without a loan or if already lent).
+    fn lend_loan(&mut self, state: &WorkerState) -> eyre::Result<()> {
+        let Some(l) = self.loan.as_mut() else { return Ok(()) };
+        let t = Instant::now();
+        if let Some(st) = l.lend(&mut self.arena, &state.engine.dgpu.compute, &mut self.bounce_f16, &mut self.bounce_u8)? {
+            tracing::info!(compacted = st.compacted, swapped_rows = st.swapped_rows, swapped_mib = st.swapped_bytes >> 20,
+                live = self.streams.len(), ms = t.elapsed().as_millis() as u64, "prefill VRAM loan: lent");
+        }
+        Ok(())
+    }
+
+    /// End the loan (no-op without one or if not lent): restores swapped decode KV.
+    fn end_loan(&mut self) -> eyre::Result<()> {
+        let Some(l) = self.loan.as_mut() else { return Ok(()) };
+        let t = Instant::now();
+        if let Some(restored) = l.end(&mut self.arena)? {
+            tracing::info!(restored_mib = restored >> 20, ms = t.elapsed().as_millis() as u64, "prefill VRAM loan: returned");
+        }
+        Ok(())
+    }
+
+    /// The lane capacities prefill plans chunks for: the loan's set, else the resident lanes.
+    fn prefill_lane_caps(&self, state: &WorkerState) -> (usize, usize) {
+        match self.loan.as_ref() {
+            Some(l) => (l.bd_a.rows, l.bd_b.rows),
+            None => (state.bd_a.rows, state.bd_b.rows),
+        }
+    }
+
     fn prefill_job_tick(&mut self, state: &mut WorkerState, mut pf: Prefill, i: usize) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
+        if let Err(e) = self.lend_loan(state) {
+            return Err((Some(pf.kv), e));
+        }
         // Every unit of the job (chunks, finish, replay) says whether it is long.
         let long_min = crate::knobs::LONG_PREFILL_TOKENS.get() as usize;
         state.engine.remote_set_long_job(long_min > 0 && pf.job.total() > long_min);
@@ -1362,10 +1422,15 @@ impl Sched {
             if let Some(pg) = state.pager.as_mut() {
                 if let Err(e) = pg.drain_prefetched() { return Err((Some(pf.kv), e)); }
             }
-            if let Err(e) = chunk_inputs(&mut pf, state) { return Err((Some(pf.kv), e)); }
+            let caps = self.prefill_lane_caps(state);
+            if let Err(e) = chunk_inputs(&mut pf, state, caps) { return Err((Some(pf.kv), e)); }
             let inputs_ms = t.elapsed().as_millis() as u64;
             let ahead = engram_lookahead(&pf, state.pager.is_some() && state.engram.is_some());
             let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, engram, .. } = state;
+            let (bd_a, bd_b, sd) = match self.loan.as_mut() {
+                Some(l) => (&mut l.bd_a, &mut l.bd_b, &mut l.sd),
+                None => (bd_a, bd_b, sd),
+            };
             // The next block of Engram rows gathers BESIDE this unit (`EngramAhead`).
             let p0 = pf.job.pos0() as usize;
             let Prefill { job, kv, compressed, .. } = &mut pf;
@@ -1425,6 +1490,10 @@ impl Sched {
             }
         }
         let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, mtp, .. } = state;
+        let (bd_a, bd_b, sd) = match self.loan.as_mut() {
+            Some(l) => (&mut l.bd_a, &mut l.bd_b, &mut l.sd),
+            None => (bd_a, bd_b, sd),
+        };
         let kv = &mut pf.kv;
         // The CED replay runs layers 37-39 over the prompt's last window: it
         // captures exactly the rows a drafter ring holds.
@@ -1474,6 +1543,9 @@ impl Sched {
     /// that cannot hold even the first step and cannot grow parks the request
     /// (its scratch state stays with it) until a stream finishes.
     fn try_admit(&mut self, state: &mut WorkerState, mut pf: Prefill, logits: Vec<f32>) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
+        if let Err(e) = self.end_loan() {
+            return Err((Some(pf.kv), e));
+        }
         let pos = pf.prefix.len() as u32;
         let max_new = match effective_max_new(&pf.p.req, pos, state.n_kv_max) {
             Ok(m) => m,
@@ -1549,6 +1621,7 @@ impl Sched {
     /// One batched decode step over every live stream that has KV room for
     /// its next position (`take_stalled`).
     fn decode_step(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
+        self.end_loan()?;
         let stalled = self.take_stalled(state)?;
         let r = if self.streams.is_empty() {
             // Every stream is stalled behind an in-flight prefill's
@@ -2708,8 +2781,8 @@ fn stop_reason(s: &Stream, tok: i32) -> Option<FinishReason> {
 
 /// Lazy job inputs for the next chunk: layer-0 embeddings and Engram rows
 /// (batched gather over runs of live positions, as `EngramCtx::rows_for_chunk`).
-fn chunk_inputs(pf: &mut Prefill, state: &mut WorkerState) -> eyre::Result<()> {
-    let (a, z) = pf.job.next_chunk_range((state.bd_a.rows, state.bd_b.rows))?;
+fn chunk_inputs(pf: &mut Prefill, state: &mut WorkerState, lane_caps: (usize, usize)) -> eyre::Result<()> {
+    let (a, z) = pf.job.next_chunk_range(lane_caps)?;
     let toks = &pf.job.tokens()[a..z];
     let p0 = pf.job.pos0() as usize;
     let mut hcs: Vec<Vec<f32>> = Vec::with_capacity(toks.len());

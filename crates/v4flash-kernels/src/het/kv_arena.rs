@@ -466,6 +466,41 @@ pub struct KvArena {
     pub state: HetModelState,
     pub stores: Vec<CompStore>,
     streams: Vec<Option<StreamKv>>,
+    /// The prefill VRAM loan (docs/v41/PREFILL_VRAM_LOAN_DESIGN.md): `Some` while the END rows of the stores are lent to
+    /// a prefill pass. While lent, every call that writes or reads store DATA fails (`ensure_not_lent`); bookkeeping
+    /// (`reserve`, `release`, `rebuild_free_lists`) is allowed.
+    lent: Option<Lent>,
+}
+
+/// One live region's rows that overlapped the lent end range when the loan began, saved to host.
+#[derive(Debug)]
+struct SwapRec {
+    slot: usize,
+    si: usize,
+    /// The region's base at lend time (restored only if it is still live at this base).
+    base: u32,
+    /// First saved row (absolute store row).
+    lo: u32,
+    comp: Vec<u16>,
+    n_comp_rows: u32,
+    keys: Vec<u8>,
+    n_key_rows: u32,
+}
+
+#[derive(Debug)]
+struct Lent {
+    /// Rows lent at the END of each store (`[rows_cap - rows, rows_cap)`).
+    rows: Vec<u32>,
+    swapped: Vec<SwapRec>,
+}
+
+/// What a `lend` did (logged by the scheduler).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LendStats {
+    pub compacted: bool,
+    /// Live rows saved to host (comp rows + key rows, summed over stores).
+    pub swapped_rows: u64,
+    pub swapped_bytes: u64,
 }
 
 impl KvArena {
@@ -537,7 +572,7 @@ impl KvArena {
             layers.push(HetLayerState { kv_cache, n_raw: 0, raw_off: 0, compressor, indexer_compressor: None });
         }
         let state = HetModelState { layers, n_kv_max: cap_of(1) };
-        Ok(Self { dgpu, n_slots, state, stores, streams: vec![None; n_slots as usize] })
+        Ok(Self { dgpu, n_slots, state, stores, streams: vec![None; n_slots as usize], lent: None })
     }
 
     pub fn stream(&self, slot: u32) -> Option<&StreamKv> {
@@ -591,6 +626,7 @@ impl KvArena {
         pos: u32,
         stream: &Stream,
     ) -> eyre::Result<u32> {
+        self.ensure_not_lent()?;
         let (n_raw, n_raw_dec) = self.source_windows(src, pos)?;
         let slot = self.admit(ctx_cap.max(pos + 1), pos)?;
         // Any failure below must give the slot back: it used to stay allocated
@@ -618,6 +654,7 @@ impl KvArena {
     /// positions (`grow` it first otherwise). On error the slot stays
     /// reserved: it is the caller's to release.
     pub fn fill_reserved(&mut self, slot: u32, src: &HetModelState, pos: u32, stream: &Stream) -> eyre::Result<()> {
+        self.ensure_not_lent()?;
         let (n_raw, n_raw_dec) = self.source_windows(src, pos)?;
         let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not reserved"))?;
         if s.pos != 0 || s.n_raw != 0 || s.n_raw_dec != 0 || s.comp.iter().any(|r| r.n_comp != 0 || r.n_index_comp != 0) {
@@ -715,6 +752,7 @@ impl KvArena {
         bounce_f16: &mut DeviceBuffer<u16>,
         bounce_u8: &mut DeviceBuffer<u8>,
     ) -> eyre::Result<Option<GrowHow>> {
+        self.ensure_not_lent()?;
         let r = self.grow_inner(slot, ctx_cap, stream, bounce_f16, bounce_u8);
         if r.is_err() {
             self.rebuild_free_lists();
@@ -963,6 +1001,7 @@ impl KvArena {
     /// at rest (compressors on their source layers) and large enough. D2D on
     /// `stream`; the caller synchronizes.
     pub fn export_to_state(&self, slot: u32, dst: &mut HetModelState, stream: &Stream) -> eyre::Result<()> {
+        self.ensure_not_lent()?;
         let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?.clone();
         if dst.layers.len() != self.state.layers.len() {
             return Err(eyre!("kv arena: export target has {} layers, arena {}", dst.layers.len(), self.state.layers.len()));
@@ -1038,6 +1077,7 @@ impl KvArena {
     /// between steps, on the scheduler thread); `stream` is synchronized before
     /// return. Accumulator blocks are per slot and do not move.
     pub fn compact_stores(&mut self, stream: &Stream, bounce_f16: &mut DeviceBuffer<u16>, bounce_u8: &mut DeviceBuffer<u8>) -> eyre::Result<()> {
+        self.ensure_not_lent()?;
         let r = self.compact_stores_inner(stream, bounce_f16, bounce_u8);
         if r.is_err() {
             self.rebuild_free_lists();
@@ -1069,6 +1109,128 @@ impl KvArena {
         }
         stream.synchronize()?;
         Ok(())
+    }
+
+    /// Is the end of the stores lent to a prefill pass?
+    pub fn is_lent(&self) -> bool {
+        self.lent.is_some()
+    }
+
+    fn ensure_not_lent(&self) -> eyre::Result<()> {
+        if self.lent.is_some() {
+            return Err(eyre!("kv arena: store data accessed while the prefill VRAM loan is out (end the loan first)"));
+        }
+        Ok(())
+    }
+
+    /// The device buffers of store `si` (`comp_kv` f16 `[rows_cap, width]`, `index_k` `[rows_cap, E2M1_KEY_ROW_BYTES]`):
+    /// the donors of the prefill VRAM loan.
+    pub fn store_buffers(&self, si: usize) -> eyre::Result<(&DeviceBuffer<u16>, &DeviceBuffer<u8>)> {
+        let l = self.stores.get(si).ok_or_else(|| eyre!("kv arena: no store {si}"))?.layer;
+        let cs = self.state.layers[l].compressor.as_ref().ok_or_else(|| eyre!("kv arena: store {si} has no compressor"))?;
+        let comp = cs.comp_kv.f16().ok_or_else(|| eyre!("kv arena: store {si} is not f16"))?;
+        let keys = cs.index_k.as_ref().ok_or_else(|| eyre!("kv arena: store {si} has no index keys"))?;
+        Ok((comp, keys))
+    }
+
+    /// Live rows of store `si` that reach into `[lo, rows_cap)`: `(slot, base, live comp end, live key end)`.
+    fn live_tails(&self, si: usize, lo: u32) -> Vec<(usize, u32, u32, u32)> {
+        self.streams
+            .iter()
+            .enumerate()
+            .filter_map(|(sl, s)| s.as_ref().map(|s| (sl, s.comp[si])))
+            .map(|(sl, r)| (sl, r.base, r.base + r.n_comp, r.base + r.n_index_comp))
+            .filter(|&(_, _, ce, ke)| ce.max(ke) > lo)
+            .collect()
+    }
+
+    /// Does any live data sit in the end ranges `rows` (per store) would lend?
+    pub fn overlaps_lent(&self, rows: &[u32]) -> bool {
+        self.stores.iter().enumerate().any(|(si, st)| {
+            let n = rows.get(si).copied().unwrap_or(0).min(st.rows_cap);
+            n > 0 && !self.live_tails(si, st.rows_cap - n).is_empty()
+        })
+    }
+
+    /// LEND the last `rows[si]` rows of every store to a prefill pass (docs/v41/PREFILL_VRAM_LOAN_DESIGN.md 5.2):
+    /// compact first if live data sits there (`compact_stores`, the loan is not out yet), then save the live rows that
+    /// still overlap to host (D2H, synchronous) and mark the arena lent. The caller synchronized the whole device first.
+    /// No-op if already lent with the same rows.
+    pub fn lend(&mut self, rows: &[u32], stream: &Stream, bounce_f16: &mut DeviceBuffer<u16>, bounce_u8: &mut DeviceBuffer<u8>) -> eyre::Result<LendStats> {
+        if let Some(l) = &self.lent {
+            if l.rows == rows {
+                return Ok(LendStats::default());
+            }
+            return Err(eyre!("kv arena: already lent with different rows"));
+        }
+        if rows.len() != self.stores.len() {
+            return Err(eyre!("kv arena: lend needs {} store row counts, got {}", self.stores.len(), rows.len()));
+        }
+        let mut stats = LendStats::default();
+        if self.overlaps_lent(rows) {
+            self.compact_stores(stream, bounce_f16, bounce_u8)?;
+            stats.compacted = true;
+        }
+        let _cur = self.dgpu.scoped_current()?;
+        let mut swapped = Vec::new();
+        for si in 0..self.stores.len() {
+            let st = &self.stores[si];
+            let n = rows[si].min(st.rows_cap);
+            if n == 0 {
+                continue;
+            }
+            let lo = st.rows_cap - n;
+            let width = st.width as usize;
+            for (slot, base, ce, ke) in self.live_tails(si, lo) {
+                let a = base.max(lo);
+                let (comp_buf, key_buf) = self.store_buffers(si)?;
+                let n_c = ce.saturating_sub(a);
+                let n_k = ke.saturating_sub(a);
+                let mut comp = vec![0u16; n_c as usize * width];
+                if n_c > 0 {
+                    comp_buf.slice_view(a as usize * width, n_c as usize * width).copy_to_host(&mut comp)?;
+                }
+                let mut keys = vec![0u8; n_k as usize * E2M1_KEY_ROW_BYTES];
+                if n_k > 0 {
+                    key_buf.slice_view(a as usize * E2M1_KEY_ROW_BYTES, n_k as usize * E2M1_KEY_ROW_BYTES).copy_to_host(&mut keys)?;
+                }
+                stats.swapped_rows += (n_c + n_k) as u64;
+                stats.swapped_bytes += (comp.len() * 2 + keys.len()) as u64;
+                swapped.push(SwapRec { slot, si, base, lo: a, comp, n_comp_rows: n_c, keys, n_key_rows: n_k });
+            }
+        }
+        let _ = stream;
+        self.lent = Some(Lent { rows: rows.to_vec(), swapped });
+        Ok(stats)
+    }
+
+    /// END the loan: write the saved rows back (H2D, synchronous) for every region still live at the SAME base (a slot
+    /// released while lent may have been re-reserved: its saved rows are dropped). The caller synchronized the device
+    /// (the prefill pass's writes into the lent rows are done). Returns the bytes restored. No-op if not lent.
+    pub fn end_lend(&mut self) -> eyre::Result<u64> {
+        let Some(l) = self.lent.take() else { return Ok(0) };
+        let _cur = self.dgpu.scoped_current()?;
+        let mut restored = 0u64;
+        for rec in l.swapped {
+            let live = self.streams.get(rec.slot).and_then(|s| s.as_ref()).is_some_and(|s| s.comp[rec.si].base == rec.base);
+            if !live {
+                continue;
+            }
+            let width = self.stores[rec.si].width as usize;
+            let l_ = self.stores[rec.si].layer;
+            let cs = self.state.layers[l_].compressor.as_mut().expect("arena store");
+            if rec.n_comp_rows > 0 {
+                let buf = cs.comp_kv.f16_mut().expect("f16 store");
+                buf.slice_view_mut(rec.lo as usize * width, rec.n_comp_rows as usize * width).copy_from_host(&rec.comp)?;
+            }
+            if rec.n_key_rows > 0 {
+                let kb = cs.index_k.as_mut().expect("keys");
+                kb.slice_view_mut(rec.lo as usize * E2M1_KEY_ROW_BYTES, rec.n_key_rows as usize * E2M1_KEY_ROW_BYTES)
+                    .copy_from_host(&rec.keys)?;
+            }
+            restored += (rec.comp.len() * 2 + rec.keys.len()) as u64;
+        }
+        Ok(restored)
     }
 
     pub fn release(&mut self, slot: u32) -> eyre::Result<()> {
@@ -1103,6 +1265,7 @@ impl KvArena {
     /// (siblings, a non-prefix ancestry) needs ancestor-masked reads and
     /// per-node accumulator blocks first, and is refused here.
     pub fn tables(&self, rows: &StepRows) -> eyre::Result<RowTables> {
+        self.ensure_not_lent()?;
         if !rows.is_chain_layout() {
             return Err(eyre!("kv arena: the step's rows are not a chain layout (tree rows need ancestor-masked attention: not built)"));
         }
@@ -1233,6 +1396,7 @@ impl KvArena {
     /// Compact every stream of the step whose raw region cannot take its rows
     /// (`needs_compaction_rows`). Call before `tables`.
     pub fn compact_for_step(&mut self, rows: &StepRows, stream: &Stream, scratch: &mut DeviceBuffer<u16>) -> eyre::Result<()> {
+        self.ensure_not_lent()?;
         for (slot, _, n) in rows.streams() {
             if self.needs_compaction_rows(slot, n as u32) {
                 self.compact_raw(slot, stream, scratch)?;
@@ -1258,6 +1422,7 @@ impl KvArena {
     /// same two-hop copy `forward_layer` and `normalize_raw_windows` do, using
     /// `scratch` (>= `SWA_WINDOW * N_HEAD_DIM` f16) as the bounce buffer.
     pub fn compact_raw(&mut self, slot: u32, stream: &Stream, scratch: &mut DeviceBuffer<u16>) -> eyre::Result<()> {
+        self.ensure_not_lent()?;
         let (raw_off, n_raw, raw_off_dec, n_raw_dec) = {
             let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
             (s.raw_off, s.n_raw, s.raw_off_dec, s.n_raw_dec)
@@ -1311,6 +1476,7 @@ impl KvArena {
     /// kernels (same stream). A one-row step never copies (its group's block
     /// IS the first). `keep` must not exceed the rows the stream ran.
     pub fn accept(&mut self, slot: u32, keep: u32, stream: &Stream) -> eyre::Result<()> {
+        self.ensure_not_lent()?;
         if keep == 0 || keep > ARENA_ROWS_PER_STREAM {
             return Err(eyre!("kv arena: accept of {keep} rows for slot {slot}"));
         }
@@ -1515,7 +1681,37 @@ mod tests {
             state: HetModelState { layers: Vec::new(), n_kv_max: 0 },
             stores,
             streams: vec![None; n_slots as usize],
+            lent: None,
         }
+    }
+
+    /// The prefill VRAM loan's bookkeeping on a host arena: which live rows overlap the lent end ranges, and that every
+    /// data path refuses to run while the arena is lent (bookkeeping does not).
+    #[cfg(feature = "v41")]
+    #[test]
+    fn loan_overlap_and_data_paths_refused_while_lent() {
+        let mut a = host_arena(4, 1000);
+        let n = a.stores.len();
+        let s0 = a.reserve(800).unwrap(); // ratio 1: 800 rows, ratio 2: 400 rows; first-fit at row 0
+        // nothing written yet: a reservation reaching into the lent range is NOT an overlap
+        assert!(!a.overlaps_lent(&vec![300; n]));
+        for r in a.stream_mut(s0).unwrap().comp.iter_mut() {
+            r.n_comp = 750.min(r.cap - 10);
+            r.n_index_comp = r.n_comp;
+        }
+        // live rows end at base + n_comp: 750 (ratio 1 store) / 400 (ratio 2) vs lent from row 1000 - 300 = 700
+        assert!(a.overlaps_lent(&vec![300; n]), "the ratio-1 store's live rows reach row 750 > 700");
+        assert!(!a.overlaps_lent(&vec![200; n]), "lent from row 800: nothing live there");
+        // while lent (bookkeeping only: set the flag directly, no device buffers here)
+        a.lent = Some(Lent { rows: vec![200; n], swapped: Vec::new() });
+        assert!(a.is_lent());
+        let rows = StepRows::chains(&[(s0, 0)]).unwrap();
+        assert!(a.tables(&rows).is_err(), "a decode step's tables are refused while lent");
+        let s1 = a.reserve(10).unwrap(); // bookkeeping is allowed
+        a.release(s1).unwrap();
+        assert_eq!(a.end_lend().unwrap(), 0, "nothing swapped -> nothing restored");
+        assert!(!a.is_lent());
+        assert!(a.tables(&rows).is_ok());
     }
 
     /// The per-row dependency check (`check_row_dependencies`) passes the

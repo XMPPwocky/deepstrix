@@ -14,6 +14,7 @@
 
 pub mod sys;
 
+pub mod alloc_scope;
 mod buffer;
 mod device;
 mod error;

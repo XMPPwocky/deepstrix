@@ -1304,6 +1304,32 @@ impl HeterogeneousEngine {
                 job.lm_idx = None;
                 self.set_current_cached(self.dgpu.device)?;
                 let id = self.dgpu.device.id;
+                // Prefill VRAM loan: the window store lives in the loan pool's reserved region (placed views, sized
+                // for `V41_LM_ROWS`); a window that does not fit it takes the SAME halve-on-OOM path as a failed hipMalloc.
+                let _lm_place = match super::prefill_loan::lm_pool() {
+                    Some((base, bytes, dev)) if dev == id => {
+                        let al = |x: usize| x.div_ceil(256) * 256;
+                        let top_k = crate::indexer::INDEXER_TOP_K as usize;
+                        let mut sizes = vec![rows * HC_DIM as usize * 4, rows * HC_MIX_DIM as usize * 4];
+                        if want_idx {
+                            sizes.push(rows * top_k * 4);
+                            sizes.push(rows * 4);
+                        }
+                        let need: usize = sizes.iter().map(|&b| al(b)).sum();
+                        if need > bytes {
+                            None // -> the plain hipMalloc below; on a 97%-full dGPU that fails and halves the window
+                        } else {
+                            let mut off = 0usize;
+                            let ptrs = sizes.iter().map(|&b| {
+                                let p = (base as usize + off) as v4flash_hip::sys::hipDeviceptr_t;
+                                off += al(b);
+                                (p, b)
+                            }).collect();
+                            Some(v4flash_hip::alloc_scope::place(id, ptrs)?)
+                        }
+                    }
+                    _ => None,
+                };
                 let got = DeviceBuffer::<f32>::new(id, rows * HC_DIM as usize)
                     .and_then(|r| DeviceBuffer::<f32>::new(id, rows * HC_MIX_DIM as usize).map(|c| (r, c)));
                 // Layer-outer also needs the per-window-row saved indexer selection (2 KB/row): the SAME OOM policy as the
@@ -1317,6 +1343,7 @@ impl HeterogeneousEngine {
                     }
                     Ok((r, c))
                 });
+                drop(_lm_place);
                 match got {
                     Ok((r, c)) => job.lm_store = Some((r, c, rows)),
                     Err(e) if cap / 2 >= min_cap => {
@@ -8193,6 +8220,9 @@ impl HeterogeneousEngine {
             // A/B taken with it is void).
             if verify_decode_attn() && arena.is_some() {
                 return Err(eyre!("L{layer}: V41_VERIFY_DECODE_ATTN replays one sequence at raw_off 0; not for arena rows"));
+            }
+            if verify_decode_attn() && (b as usize) <= 16 && sd.verify_scores.len() == 1 {
+                return Err(eyre!("L{layer}: V41_VERIFY_DECODE_ATTN needs the full verify_scores; the loaned prefill set allocates it at 1 element"));
             }
             if verify_decode_attn() && (b as usize) <= 16 {
                 const K_SPLIT: u32 = 16;

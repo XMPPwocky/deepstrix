@@ -1585,6 +1585,18 @@ impl BatchDgpuShared {
         rows: usize,
         n_kv_max: u32,
     ) -> eyre::Result<Self> {
+        Self::alloc_rows_ctx_opts(dgpu_device, rows, n_kv_max, true)
+    }
+
+    /// [`Self::alloc_rows_ctx`] with `with_verify = false` allocating the diagnostic-only `verify_scores`
+    /// (`V41_VERIFY_DECODE_ATTN`, ~94 MB) at ONE element: the prefill VRAM loan's set (the diagnostic refuses to run on
+    /// it rather than overrun).
+    pub fn alloc_rows_ctx_opts(
+        dgpu_device: Device,
+        rows: usize,
+        n_kv_max: u32,
+        with_verify: bool,
+    ) -> eyre::Result<Self> {
         check_rows("BatchDgpuShared", rows)?;
         dgpu_device.set_current()?;
         let id = dgpu_device.id;
@@ -1717,7 +1729,7 @@ impl BatchDgpuShared {
             // kernel pair has the headroom it needs.
             verify_scores: DeviceBuffer::new(
                 id,
-                N_HEAD as usize * crate::attention::ATTN_MIXED_MAX_KEYS as usize,
+                if with_verify { N_HEAD as usize * crate::attention::ATTN_MIXED_MAX_KEYS as usize } else { 1 },
             )?,
             verify_inv: DeviceBuffer::new(id, N_HEAD as usize)?,
             verify_partials: DeviceBuffer::new(
