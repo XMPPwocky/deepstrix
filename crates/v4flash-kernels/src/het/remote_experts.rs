@@ -5469,6 +5469,9 @@ impl ExpertShard {
             // The READAHEAD sets (the last `pf_ra_sets`) and their readers are
             // outside the general reader arithmetic (design 2.3).
             let n_ra = self.pf_ra_sets.min(self.pf_stages_spare.len().saturating_sub(1));
+            if n_ra < self.pf_ra_sets {
+                eprintln!("expertd: readahead_sets={} covers every staging set: {n_ra} readahead + 1 general", self.pf_ra_sets);
+            }
             let n_par_q = b2_prefetch_par().min(self.pf_stages_spare.len().saturating_sub(n_ra).max(1));
             let queue = std::sync::Arc::new(PfQueue::with_readers(n_par_q.saturating_sub(b2_prefetch_reserve()), n_par_q));
             let _ = PF_QUEUE.set(std::sync::Arc::clone(&queue));
@@ -5597,6 +5600,7 @@ impl ExpertShard {
                     // Before the send: the receiver decrements after its receive.
                     done_ready_r.fetch_add(1, std::sync::atomic::Ordering::Release);
                     if tx_done.send(msg).is_err() {
+                        done_ready_r.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         break;
                     }
                 }
@@ -8717,7 +8721,11 @@ pub fn serve_connection(
                         (Some(p), true) => p.min(Duration::from_millis(1)),
                         (Some(p), false) => p,
                         (None, true) => Duration::from_millis(1),
-                        (None, false) => Duration::from_secs(3600),
+                        // Nothing to land and no keep-warm: the plain blocking receive.
+                        (None, false) => {
+                            got = rx_in.recv().ok();
+                            break;
+                        }
                     };
                     match rx_in.recv_timeout(slice) {
                         Ok(m) => {
