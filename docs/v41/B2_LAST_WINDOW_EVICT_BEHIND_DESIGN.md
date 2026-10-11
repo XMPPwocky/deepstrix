@@ -1,4 +1,7 @@
-# Box 2: evict behind the pass in a job's LAST prefill unit (design, rev 1, 2026-10-11)
+# Box 2: evict behind the pass in a job's LAST prefill unit (design, rev 2, 2026-10-11)
+
+rev 2 = review r1 (REVISE): "last unit" decided inside the engine (2.1), the replay gain scoped to single-unit jobs
+(3), phase splits (2.4), flags2 OR + daemon gate (2.1/2.2), Q1 answered by measurement (4).
 
 Owner 10-11: "design this and loop". Not a partition (owner: "no partitioned pool"): no slot is reserved for
 anyone; this only changes WHICH eligible page a prefill claim evicts, and only for requests of a job's last unit.
@@ -34,14 +37,26 @@ Set on every PREFILL request (never with `REQ_FLAG_DECODE`) of a job's LAST unit
   tokens.len()`), all its passes incl. the KV-only pass;
 * chunked-only / chunked tail: the chunk whose end is the job's end;
 * the replay (`prefill_job_finish`).
-Plumbing mirrors `REQ_FLAG_LONG_JOB`: `RemoteClient::last_unit` + `set_last_unit`, `HetEngine::remote_set_last_unit`,
-set by the scheduler before each unit from the job's state (`prefill_job_tick`: `pf.job.chunks_done()` -> replay =
-last; else the predicted next range end == total), cleared for decode. `patch_request_flags2` already exists (SOFT).
+Plumbing mirrors `REQ_FLAG_LONG_JOB` (`RemoteClient::last_unit` + `set_last_unit`, `HetEngine::remote_set_last_unit`,
+carried across a redial like `decode_phase` / `long_job`), but the decision is made INSIDE THE ENGINE where the unit's
+extent is exact -- NOT by the scheduler's prediction (review r1 #1: with a layer-outer window open and `lo_layer > 0`,
+`next_chunk_range` returns an EMPTY range, so passes 2..k of the last window would be unflagged; and the prediction can
+exceed a window `lm_open_window` halved on OOM, flagging a non-last window):
+* layer-major: in `prefill_job_chunk` right after `lm_open_window`, `last = job.lm.as_ref().is_some_and(|w| w.end ==
+  job.tokens.len())` -- evaluated for EVERY pass (incl. the KV-only pass) of the open window;
+* chunked: the chunk whose `chunk_end == tokens.len()` (`is_last_chunk`);
+* `prefill_job_finish` (the replay): unconditionally last.
+Set before the unit's first request, cleared when the unit returns (every path) AND by
+`remote_set_phase_busy_poll(true)` (the decode drivers' phase switch), so a decode request can never carry it.
+On the wire: `flags2 |= REQ2_FLAG_LAST` (OR: `patch_request_flags2` writes the whole word; SOFT is decode-only and LAST
+prefill-only, so they never coincide today, but the OR keeps it correct by construction).
 
 ### 2.2 Box 2: per-request "last" mode in the tiered search
 
-`note_request_phase` also records `req_last = flags2 & REQ2_FLAG_LAST != 0` (per request, like `req_prefill`;
-restored for a frame served inside a park). In a prefill-mode search (`me_tiered`) of a LAST request:
+`note_request_phase` also records `req_last = flags & REQ_FLAG_DECODE == 0 && flags2 & REQ2_FLAG_LAST != 0` (gated on
+not-decode, as the SOFT reads gate on decode). Per request, like `req_prefill`: saved/restored around a frame served
+inside a park (re:8790-8792) and fed to the parked pass's mode (`park_prefill`, re:7613); landings carried by a LAST
+request rank with it (the landing's carrier is known where `prefill_landing` is computed). In a prefill-mode search (`me_tiered`) of a LAST request:
 1. **Decode tiers.** A separate per-phase counter `last_budget_left` (reset at each phase start to
    `V41_B2_PREFILL_BUDGET_LAST`, live, file key `prefill_budget_last`; default `MAX` = OFF at ship): a decode-class
    candidate is tier 2 only while BOTH `budget_left > 0` and `last_budget_left > 0`, else tier 4. Taking a tier-2
@@ -61,6 +76,15 @@ restored for a frame served inside a park). In a prefill-mode search (`me_tiered
 
 Decode-mode searches (decode requests, incl. those interleaved during the phase) are unchanged.
 
+### 2.4 Phase splits (review r1 #3)
+
+Any interleaved decode STEP ends box 2's prefill phase (>= 16 decode-flagged requests = `ME_DECODE_STREAK`); the next
+prefill request starts a fresh phase (fresh budgets, `long` re-raised by the next long request). So: (a)
+`last_budget_left` is per phase: a last window may take up to B decode victims per pass that follows a decode step;
+(b) in the new phase every page the window loaded earlier is tier 1 (stale) and goes FIRST -- for a last window those
+are passed layers (wanted) plus any rolling-prefetched L+1/L+2 pages (re-read, small); for non-last windows this is
+today's behaviour. Do not assume one phase per window.
+
 ### 2.3 Why not just lower `prefill_budget(_long)`
 
 A multi-window job's NON-last windows revisit all 20 encoder layers every window: keeping its ~2.5-4.5K encoder
@@ -71,8 +95,16 @@ first = last: it takes free + stale + B decode victims, then recycles its own pa
 
 ## 3. Expected effect
 
-* Replay: decoder layers stay resident -> ~760 misses -> few; 3.2 s -> ~0.8-1.2 s (compute-bound) per job.
-* First decode steps after admission start warm; interleaved decode during prefill phases stops re-reading.
+* SCOPE (review r1 #2): the warm replay is for SINGLE-UNIT jobs only -- a chunked-only job (<= 2048 tokens) or a
+  one-window layer-major job, where first unit = last unit. In a multi-window job the non-last windows keep today's
+  rule by design (2.3) and the FIRST window already evicts decode's decoder-layer pages while loading its encoder set;
+  the last window's restraint cannot bring them back, so that replay still pages (~760). Fixing that needs a
+  decode-class floor = a partition, ruled out by the owner: out of scope. Multi-window jobs get only the in-phase
+  decode relief of their last window and a cheaper last window. Today's mix (hub logs 10-11 03:45-10:20 UTC): 512
+  prefill jobs, 383 chunked-only + 93 of 129 layer-major jobs single-window = **93% single-unit**.
+* Single-unit jobs: decoder layers stay resident -> the replay's ~760 misses -> few; 3.2 s -> ~0.8-1.2 s
+  (compute-bound); the first decode steps after admission start warm; interleaved decode during the phase stops
+  re-reading.
 * Last/single windows: fewer own-page re-reads (903 self-evictions in the traced phase came from the plain
   oldest-first order taking pages the window still needed); maybe slightly faster.
 * Cost: the NEXT job's first window when it is back-to-back in the same phase and shares experts with this job's
@@ -84,7 +116,10 @@ Live knob on box 2: `prefill_budget_last` alternating `MAX` (off) / `B` (e.g. 25
 (`ab_mirror.sh`-style, box-2 knob file). Score per arm: replay `elapsed_s` (hub log), replay misses (hub_req layers
 >= 20 in replay spans), decode `step_ms` in the 10 s after each admission and overall, first-window and steady
 window times (`ab_mirror_eval.py`), box-2 per-phase eviction counters (`took_decode`, `took_own`, new
-`took_last_own`). B sweep 0 / 256 / 1024 after the first verdict.
+`took_last_own`), split by single-unit vs multi-window jobs. B: review r1 #5 -- after a decode burst the pool holds the
+previous prefill phase's pages as tier 1 (thousands of slots: the previous job's encoder set + replay pages), so a cold
+single window usually needs no decode victim at all; start the A/B at B = 0 vs MAX, read `took_stale` / `took_own` /
+`took_decode` per arm, then try 256 if B = 0 shows own-page re-reads inside the window.
 
 ## 5. Tests and gates
 
@@ -99,9 +134,8 @@ window times (`ab_mirror_eval.py`), box-2 per-phase eviction counters (`took_dec
 
 ## 6. Open questions for review
 
-1. Is "last unit" right for group-major windows (not in production) and for a job whose last window is ALSO its
-   first (cold): it takes B decode victims then recycles its own -- is B = 0 too tight for a cold single window
-   (free + stale may be small right after decode)?
+1. (r1: answered by measurement, sec 4.) Group-major windows: `w.end == tokens.len()` holds for every group unit of the
+   last window, same rule.
 2. Back-to-back jobs in one phase: job A's last unit recycles its encoder pages; job B (same phase) is not last
    for its non-last windows -> normal budget again, but `budget_left` was not consumed by A's own-page recycling.
    Fine?
