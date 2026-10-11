@@ -486,6 +486,11 @@ pub mod proto {
     /// evictable any time). Bit 12 of `flags` is never a request flag, so an
     /// older daemon's echo leaves it clear and an older hub sees no block.
     pub const REQ2_FLAG_SOFT: u32 = 1;
+    /// Second-word request flag: this PREFILL request belongs to its job's LAST unit -- a layer-major window after which
+    /// no further window opens, the chunk that ends the prompt, or the replay (docs/v41/B2_LAST_WINDOW_EVICT_BEHIND_DESIGN.md).
+    /// Box 2 then caps the phase's decode victims at `prefill_budget_last` and evicts the job's own pages behind the pass
+    /// first (`last_sweep_rank`). Never set with `REQ_FLAG_DECODE`; an older daemon never reads it.
+    pub const REQ2_FLAG_LAST: u32 = 2;
     pub const REQ_FLAGS2_OFF: usize = HDR_LEN + 20;
     pub const RESP_FLAG_SOFT: u32 = 1 << 12;
     /// Request flags in the FIRST flags word stop at this bit (`REQ_FLAG_LIKELY`):
@@ -2278,6 +2283,9 @@ pub mod knobs {
         /// `V41_B2_PREFILL_BUDGET_LONG` (default unlimited; 0 = off), key
         /// `prefill_budget_long`: the budget of a phase serving a long job.
         pub static PREFILL_BUDGET_LONG = Knob::int("V41_B2_PREFILL_BUDGET_LONG", MAX, 0, MAX).alias("prefill_budget_long");
+        /// `V41_B2_PREFILL_BUDGET_LAST` (default unlimited = off), key `prefill_budget_last`: the decode victims a
+        /// prefill phase's LAST-unit requests (`REQ2_FLAG_LAST`) may take, per phase.
+        pub static PREFILL_BUDGET_LAST = Knob::int("V41_B2_PREFILL_BUDGET_LAST", MAX, 0, MAX).alias("prefill_budget_last");
         /// `V41_B2_ENCODER_VICTIMS_FIRST` (default on), key `encoder_victims_first`.
         pub static ENCODER_VICTIMS_FIRST = Knob::flag("V41_B2_ENCODER_VICTIMS_FIRST", true).alias("encoder_victims_first");
         /// `V41_EXPERT_MIRROR_FRAC` (default 0.6), key `mirror_frac`: pushed into
@@ -2423,6 +2431,12 @@ pub mod knobs {
     /// for the 58K job). Default: no limit -- the job may take every decode
     /// page it does not itself use; decode pages back after the job.
     pub fn prefill_budget_long() -> u64 { PREFILL_BUDGET_LONG.get() }
+    /// The decode-victim budget of a prefill phase's LAST-unit requests (`REQ2_FLAG_LAST`, design
+    /// docs/v41/B2_LAST_WINDOW_EVICT_BEHIND_DESIGN.md): in a job's last window / chunk / replay, an encoder layer the pass
+    /// has left is dead for the job, so past this many decode victims the request recycles the job's own pages
+    /// behind the pass instead of wiping decode's set (which the replay and the first decode steps need next).
+    /// Default unlimited = off (today's behaviour). Env `V41_B2_PREFILL_BUDGET_LAST`, file key `prefill_budget_last`.
+    pub fn prefill_budget_last() -> u64 { PREFILL_BUDGET_LAST.get() }
     /// When a prefill phase takes DECODE-class victims (mode-aware tiers 2 and
     /// 4), rank them by the prefill's layer SWEEP (`sweep_rank`): pages of
     /// layers this pass has gone past first, then the other region's, last the
@@ -2631,6 +2645,9 @@ pub struct ExpertShard {
     /// decode request never ranks in tiers or stamps prefill-class (e.g. the
     /// first requests after a burst, before the hysteresis ends the phase).
     pub req_prefill: bool,
+    /// The request being served is a LAST-unit prefill request (`REQ2_FLAG_LAST`, gated on no `REQ_FLAG_DECODE`);
+    /// mirrored into the pool's mode-evict state (`ModeEvict::req_last`) by `set_req_last`.
+    pub req_last: bool,
     /// Pin mode: each queued request's picks NOT landed when its frame
     /// ARRIVED (see [`EarlyPaged`]). Empty unless pins are on.
     pub early_paged: EarlyPaged,
@@ -2899,6 +2916,25 @@ fn own_sweep_rank(owner: Option<(u32, u32)>, for_layer: u32) -> (u8, u64) {
     }
 }
 
+/// Within a prefill phase's own pages (tier 3), for a LAST-unit request (`REQ2_FLAG_LAST`) at `rank_layer` -- the job's
+/// last window / chunk / replay, after which no encoder layer is read again by this job. Smaller evicts first:
+///   (0, l)        a layer of this region the pass has PASSED (`l < rank_layer`): dead for the job; farthest-passed first;
+///   (1, 0)        the other region (encoder pages during the replay; decoder pages -- a previous job's replay -- during
+///                 the encoder sweep);
+///   (2, MAX - l)  a layer still ahead (`l >= rank_layer`): the highest first, the next one last.
+/// Design docs/v41/B2_LAST_WINDOW_EVICT_BEHIND_DESIGN.md 2.2.
+fn last_sweep_rank(owner: Option<(u32, u32)>, rank_layer: u32) -> (u8, u64) {
+    let Some((l, _)) = owner else { return (0, 0) };
+    let split = crate::config::CED_DECODER_START as u32;
+    if (l < split) != (rank_layer < split) {
+        (1, 0)
+    } else if l < rank_layer {
+        (0, u64::from(l))
+    } else {
+        (2, u64::from(u32::MAX - l))
+    }
+}
+
 /// Per-phase counters of mode-aware eviction (logged at each phase switch).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ModeEvictCounters {
@@ -2908,6 +2944,9 @@ pub struct ModeEvictCounters {
     pub took_own: u64,
     pub took_decode_over: u64,
     pub took_decode_touched: u64,
+    /// Of `took_decode` / `took_own`: taken by LAST-unit requests (`REQ2_FLAG_LAST`).
+    pub took_last_decode: u64,
+    pub took_last_own: u64,
 }
 
 /// Consecutive decode-flagged requests that end a prefill phase.
@@ -2931,6 +2970,14 @@ struct ModeEvict {
     /// This prefill phase serves a long job: its budget has risen and its own
     /// pages rank by `own_sweep_rank`.
     long: bool,
+    /// LAST-unit budget (`REQ2_FLAG_LAST`): decode victims the phase's last-unit requests may take
+    /// (`knobs::prefill_budget_last` when `budget_live`, else this pinned value; `u64::MAX` = off), and what is left of it
+    /// in the current phase. A decode candidate is tier 2 for a last request only while BOTH budgets last.
+    last_budget: u64,
+    last_budget_left: u64,
+    /// The request being served is a LAST-unit prefill request (set per request by the shard, saved/restored around
+    /// frames served inside a park). Its own-page victims rank by `last_sweep_rank`.
+    req_last: bool,
     /// The current phase is prefill (else decode).
     prefill_phase: bool,
     /// Prefill phases begun (1-based once the first begins).
@@ -2997,7 +3044,7 @@ pub fn b2_prefill_budget() -> u64 {
 
 impl ModeEvict {
     fn enabled(n_slots: usize, budget: u64) -> Self {
-        Self { on: true, budget, phase_touch: vec![0; n_slots], ..Default::default() }
+        Self { on: true, budget, last_budget: u64::MAX, phase_touch: vec![0; n_slots], ..Default::default() }
     }
 
     /// Tier of an eligible candidate for a PREFILL-mode search (block above).
@@ -3008,7 +3055,7 @@ impl ModeEvict {
             if last_use < self.phase_start { 1 } else { 3 }
         } else if self.phase_touch[slot as usize] == self.phase {
             5
-        } else if self.budget_left > 0 {
+        } else if self.budget_left > 0 && (!self.req_last || self.last_budget_left > 0) {
             2
         } else {
             4
@@ -3882,9 +3929,10 @@ impl ShardPool {
         let c = self.me.c;
         if self.me.prefill_phase {
             eprintln!(
-                "expertd: mode-evict prefill phase {} ended: victims free {} stale-prefill {} decode {} (of which in use {}; budget {}, {} left) own-prefill {} decode-over-budget {}; decode delta {}; long {}",
+                "expertd: mode-evict prefill phase {} ended: victims free {} stale-prefill {} decode {} (of which in use {}; budget {}, {} left) own-prefill {} decode-over-budget {}; decode delta {}; long {}; last-unit: decode {} own {} (last budget {} left)",
                 self.me.phase, c.took_free, c.took_stale, c.took_decode, c.took_decode_touched, self.me.budget,
-                self.me.budget_left, c.took_own, c.took_decode_over, self.me.decode_delta.len(), u8::from(self.me.long)
+                self.me.budget_left, c.took_own, c.took_decode_over, self.me.decode_delta.len(), u8::from(self.me.long),
+                c.took_last_decode, c.took_last_own, self.me.last_budget_left
             );
         }
         if self.me.restore_on && !self.me.prefill_phase && self.me.phase > 0 {
@@ -3906,6 +3954,10 @@ impl ShardPool {
             }
             self.me.budget_left = self.me.budget;
             self.me.long = false;
+            if self.me.budget_live {
+                self.me.last_budget = knobs::prefill_budget_last();
+            }
+            self.me.last_budget_left = self.me.last_budget;
         } else if self.me.restore_on {
             self.me_build_restore();
         }
@@ -3982,9 +4034,14 @@ impl ShardPool {
             if self.me.phase_touch[slot as usize] == self.me.phase {
                 self.me.c.took_decode_touched += 1;
             }
-            if self.me.budget_left > 0 {
+            // Mirrors `ModeEvict::tier`: a tier-2 victim spends the phase budget, and a LAST request's also its own.
+            if self.me.budget_left > 0 && (!self.me.req_last || self.me.last_budget_left > 0) {
                 self.me.budget_left -= 1;
                 self.me.c.took_decode += 1;
+                if self.me.req_last {
+                    self.me.last_budget_left -= 1;
+                    self.me.c.took_last_decode += 1;
+                }
             } else {
                 self.me.c.took_decode_over += 1;
             }
@@ -3996,6 +4053,9 @@ impl ShardPool {
             self.me.c.took_stale += 1;
         } else {
             self.me.c.took_own += 1;
+            if self.me.req_last {
+                self.me.c.took_last_own += 1;
+            }
         }
     }
 
@@ -4099,7 +4159,10 @@ impl ShardPool {
             let t = self.last_use[sl as usize];
             let key = if tiered {
                 let tier = self.me.tier(sl, t, self.owner_of[sl as usize].is_none());
-                if tier == 3 && self.me.long {
+                if tier == 3 && self.me.req_last {
+                    let (rank, dist) = last_sweep_rank(self.owner_of[sl as usize], rank_layer);
+                    (tier, rank, dist)
+                } else if tier == 3 && self.me.long {
                     let (rank, dist) = own_sweep_rank(self.owner_of[sl as usize], rank_layer);
                     (tier, rank, dist)
                 } else {
@@ -5142,6 +5205,7 @@ impl ExpertShard {
             park_words: Vec::new(),
             park_prefill: false,
             req_prefill: false,
+            req_last: false,
             early_paged: EarlyPaged::default(),
             likely_seen: SeqRing::new(EarlyPaged::MAX),
             down_overlap: [0; 2],
@@ -5174,8 +5238,8 @@ impl ExpertShard {
 
     /// Mode-aware eviction: note the hub's phase of a request (`flags`) before
     /// serving it.
-    pub fn note_request_phase(&mut self, flags: u32) {
-        self.set_request_mode(flags);
+    pub fn note_request_phase(&mut self, flags: u32, flags2: u32) {
+        self.set_request_mode(flags, flags2);
         if let Some(pool) = self.pool.as_mut() {
             pool.me_note_request(flags & proto::REQ_FLAG_DECODE == 0);
             if flags & proto::REQ_FLAG_DECODE == 0 && flags & proto::REQ_FLAG_LONG_JOB != 0 {
@@ -5186,8 +5250,17 @@ impl ExpertShard {
 
     /// The request mode only, not the phase state: a frame served INSIDE a
     /// parked request's pass (its caller restores the parked one's mode).
-    pub fn set_request_mode(&mut self, flags: u32) {
+    pub fn set_request_mode(&mut self, flags: u32, flags2: u32) {
         self.req_prefill = flags & proto::REQ_FLAG_DECODE == 0;
+        self.set_req_last(self.req_prefill && flags2 & proto::REQ2_FLAG_LAST != 0);
+    }
+
+    /// The LAST-unit mode of the request being served (also restored after a frame served inside a park).
+    pub fn set_req_last(&mut self, last: bool) {
+        self.req_last = last;
+        if let Some(pool) = self.pool.as_mut() {
+            pool.me.req_last = last;
+        }
     }
 
     /// Mode-aware eviction is on for this shard's pool.
@@ -8581,9 +8654,9 @@ pub fn serve_connection(
                 }
                 // Mode-aware eviction: the hub's phase, before this pass (and
                 // its partner's) claims or lands anything.
-                shard.note_request_phase(req.flags);
+                shard.note_request_phase(req.flags, req.flags2);
                 if let Some(rb) = reqb.as_ref() {
-                    shard.note_request_phase(rb.flags);
+                    shard.note_request_phase(rb.flags, rb.flags2);
                 }
                 shard.pump_restore();
                 let ev_pin0 = shard.pin_counters();
@@ -8787,9 +8860,10 @@ pub fn serve_connection(
                             }
                             // The served-inside frame sets its own request mode;
                             // the parked request's is restored for its pass.
-                            let parked_mode = shard.req_prefill;
+                            let (parked_mode, parked_last) = (shard.req_prefill, shard.req_last);
                             let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
                             shard.req_prefill = parked_mode;
+                            shard.set_req_last(parked_last);
                             let _ = tx_req_recycle_ref.send(buf);
                             *serve_acc += t_serve.elapsed().as_nanos() as u64;
                             match out {
@@ -9330,7 +9404,7 @@ fn serve_interleaved(
     // A frame served inside a parked pass: its own claim mode, but it does not
     // move the phase (a burst of decode frames inside one park must not end a
     // prefill phase under the parked chunk).
-    shard.set_request_mode(req.flags);
+    shard.set_request_mode(req.flags, req.flags2);
     let ev_pin0 = shard.pin_counters();
     let ev_sc0 = shard.stage_counters();
     let (likely, plain) = proto::split_prefetch_words(req.flags, req.prefetch);
@@ -9704,6 +9778,9 @@ pub struct RemoteExpertClient {
     /// The prefill job now running is long (`HetEngine::remote_set_long_job`):
     /// its (non-decode) requests carry `REQ_FLAG_LONG_JOB`.
     long_job: bool,
+    /// The prefill unit now running is its job's LAST (`HetEngine::remote_set_last_unit`): its (non-decode) requests
+    /// carry `REQ2_FLAG_LAST`. Cleared by the unit's guard and by every switch to the decode phase.
+    last_unit: bool,
     /// Set when the link is known broken. The request that discovers it still
     /// fails -- its in-flight tickets can never be answered -- but the NEXT
     /// request redials instead of inheriting the corpse.
@@ -9747,11 +9824,12 @@ impl RemoteExpertClient {
         // The hub's phase survives the redial: a fresh client starts "not
         // decoding", which would flag decode requests as prefill until the next
         // decode driver sets it (box 2's mode-aware eviction reads the flag).
-        let (decode_phase, long_job) = (self.decode_phase, self.long_job);
+        let (decode_phase, long_job, last_unit) = (self.decode_phase, self.long_job, self.last_unit);
         // Dropping the old value closes its channel and joins its threads.
         *self = fresh;
         self.decode_phase = decode_phase;
         self.long_job = long_job;
+        self.last_unit = last_unit;
         eprintln!("remote_experts: reconnected to {}", self.addr);
         Ok(())
     }
@@ -9770,6 +9848,12 @@ impl RemoteExpertClient {
     /// `REQ_FLAG_LONG_JOB` while true (decode requests never do).
     pub fn set_long_job(&mut self, long: bool) {
         self.long_job = long;
+    }
+
+    /// Record whether the prefill unit now running is its job's LAST; its non-decode requests carry `REQ2_FLAG_LAST`
+    /// while true.
+    pub fn set_last_unit(&mut self, last: bool) {
+        self.last_unit = last;
     }
 
     /// The flag `set_long_job` last recorded (the scheduler sets it before every prefill unit).
@@ -9885,6 +9969,7 @@ impl RemoteExpertClient {
             busy_poll_now: opts.busy_poll_us,
             decode_phase: false,
             long_job: false,
+            last_unit: false,
             sel_scratch: vec![NO_PICK; info.max_batch as usize * nu],
             ew_scratch: vec![0.0; info.max_batch as usize * nu],
             hint_scratch: Vec::with_capacity(128),
@@ -10172,8 +10257,12 @@ impl RemoteExpertClient {
         );
         // The SOFT-HELD map (`REQ2_FLAG_SOFT`, `V41_B2_SOFT_MAP`): asked on
         // every decode request; an older daemon never reads the word.
-        if self.decode_phase && super::b2_mirror::soft_map() {
-            proto::patch_request_flags2(&mut buf, proto::REQ2_FLAG_SOFT);
+        // `REQ2_FLAG_LAST` (design docs/v41/B2_LAST_WINDOW_EVICT_BEHIND_DESIGN.md 2.1): a prefill request of its job's
+        // last unit. OR'd: `patch_request_flags2` writes the whole word.
+        let flags2 = if self.decode_phase && super::b2_mirror::soft_map() { proto::REQ2_FLAG_SOFT } else { 0 }
+            | if !self.decode_phase && self.last_unit { proto::REQ2_FLAG_LAST } else { 0 };
+        if flags2 != 0 {
+            proto::patch_request_flags2(&mut buf, flags2);
         }
         let ticket = Ticket {
             seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now(),
@@ -11487,6 +11576,108 @@ mod tests {
         assert_eq!(owner(&pool, demand), Some(3));
         let same = pool.pick_victim_any_ranked((0, 6), true, Band::Main, cur, &[], &[], cur, cur, false, true).unwrap();
         assert_eq!(same, demand);
+    }
+
+    /// LAST unit (`REQ2_FLAG_LAST`, docs/v41/B2_LAST_WINDOW_EVICT_BEHIND_DESIGN.md): with the last budget spent, a
+    /// last-unit request at encoder layer 4 recycles the phase's own pages behind the pass (layer 1 before 3), then
+    /// the layer still ahead (5), and only then decode's pages (tier 4) -- where a normal request of the same phase
+    /// takes decode's page at once (tier 2, phase budget left). With a last budget B it takes B decode pages first.
+    /// The last budget is per phase.
+    #[test]
+    fn pool_mode_evict_last_unit_recycles_behind_the_pass() {
+        let dec: Vec<u32> = (0..6).collect();
+        // Slots 0-5: decoder layer 30, decode-class; slots 6-11 free. The phase's own pages: layers 1, 3, 5.
+        let setup = |last_budget: u64| {
+            let mut pool = ShardPool::seeded(12, &[(30, 0, &dec)], 0.0);
+            pool.enable_mode_evict(100);
+            pool.me.last_budget = last_budget;
+            for e in 0..6 {
+                assert!(pool.touch_hit(30, e, false));
+            }
+            pool.me_note_request(true);
+            assert_eq!((pool.me.budget_left, pool.me.last_budget_left), (100, last_budget));
+            for (l, e) in [(1u32, 10u32), (1, 11), (3, 10), (3, 11), (5, 10), (5, 11)] {
+                let (slot, ev) = pool.claim_miss(l, e, &[e], &[], (0, 12), true, true, true).unwrap();
+                assert_eq!(ev, None, "own pages take the free slots");
+                pool.commit(l, e, slot);
+            }
+            pool
+        };
+        // A normal (non-last) request: decode's page while the phase budget lasts.
+        let mut plain = setup(0);
+        let (_, ev) = plain.claim_miss(4, 20, &[20], &[], (0, 12), true, true, true).unwrap();
+        assert_eq!(ev.map(|x| x.0), Some(30), "a non-last request takes decode (tier 2)");
+        // A LAST request, last budget 0: own passed layers first (farthest first), then ahead, then decode.
+        let mut last = setup(0);
+        last.me.req_last = true;
+        let mut order = Vec::new();
+        // One pass at layer 4 wanting 20..27 (its own layer-4 pages are wanted, so never victims).
+        let want4: Vec<u32> = (20..27).collect();
+        for e in 20..27u32 {
+            let (slot, ev) = last.claim_miss(4, e, &want4, &[], (0, 12), true, true, true).unwrap();
+            order.push(ev.unwrap().0);
+            last.commit(4, e, slot);
+        }
+        assert_eq!(order, vec![1, 1, 3, 3, 5, 5, 30], "behind the pass, then ahead, then decode (over budget)");
+        let c = last.me.c;
+        assert_eq!((c.took_last_own, c.took_last_decode, c.took_decode, c.took_decode_over), (6, 0, 0, 1));
+        // Last budget 2: two decode victims first (spending both budgets), then the own pages.
+        let mut two = setup(2);
+        two.me.req_last = true;
+        let mut order = Vec::new();
+        for e in 20..23u32 {
+            let (slot, ev) = two.claim_miss(4, e, &[e], &[], (0, 12), true, true, true).unwrap();
+            order.push(ev.unwrap().0);
+            two.commit(4, e, slot);
+        }
+        assert_eq!(order, vec![30, 30, 1]);
+        assert_eq!((two.me.budget_left, two.me.last_budget_left, two.me.c.took_last_decode), (98, 0, 2));
+        // Per phase: the next prefill phase resets the last budget.
+        two.me.req_last = false;
+        for _ in 0..ME_DECODE_STREAK {
+            two.me_note_request(false);
+        }
+        two.me_note_request(true);
+        assert_eq!(two.me.last_budget_left, 2);
+        // Off (u64::MAX, the shipped default): a last request ranks its own pages behind the pass but takes decode
+        // pages exactly as a normal request does while the phase budget lasts.
+        let mut off = setup(u64::MAX);
+        off.me.req_last = true;
+        let (_, ev) = off.claim_miss(4, 20, &[20], &[], (0, 12), true, true, true).unwrap();
+        assert_eq!(ev.map(|x| x.0), Some(30));
+    }
+
+    /// Evict-behind order of a LAST request's own pages (`last_sweep_rank`).
+    #[test]
+    fn last_sweep_rank_orders_behind_the_pass_first() {
+        let split = crate::config::CED_DECODER_START as u32;
+        let r = |l: u32, f: u32| last_sweep_rank(Some((l, 0)), f);
+        // Encoder window at layer 4: passed layers (farthest first), then the decoder region, then the layers ahead
+        // (highest first, layer 4 itself last).
+        let mut ls: Vec<u32> = vec![0, 3, 4, 5, split - 1, split, split + 3];
+        ls.sort_by_key(|&l| r(l, 4));
+        assert_eq!(ls, vec![0, 3, split, split + 3, split - 1, 5, 4]);
+        // The replay at decoder layer split+2: passed decoder layers, then the (dead) encoder pages, then those ahead.
+        let mut ls: Vec<u32> = vec![0, split, split + 1, split + 2, split + 5];
+        ls.sort_by_key(|&l| r(l, split + 2));
+        assert_eq!(ls, vec![split, split + 1, 0, split + 5, split + 2]);
+        assert_eq!(last_sweep_rank(None, 4), (0, 0));
+    }
+
+    /// `REQ2_FLAG_LAST` rides the second flags word beside SOFT (OR'd), the first word untouched.
+    #[test]
+    fn req2_flag_last_round_trips() {
+        let nu = 6usize;
+        let xq = vec![7u8; XQ_BYTES_PER_TOKEN];
+        let sel: Vec<i32> = (0..nu as i32).collect();
+        let ew = vec![0.25f32; nu];
+        let mut buf = AlignedBuf::with_capacity(1 << 16);
+        let f = proto::REQ_FLAG_OOO;
+        proto::encode_request(&mut buf, 1, 3, 1, f, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &[], &[]);
+        proto::patch_request_flags2(&mut buf, proto::REQ2_FLAG_LAST | proto::REQ2_FLAG_SOFT);
+        let r = proto::decode_request(&buf).unwrap();
+        assert_eq!((r.flags2, r.flags), (proto::REQ2_FLAG_LAST | proto::REQ2_FLAG_SOFT, f));
+        assert_eq!(proto::REQ2_FLAG_LAST & proto::REQ2_FLAG_SOFT, 0);
     }
 
     /// Farthest next use first within a long phase's own pages.

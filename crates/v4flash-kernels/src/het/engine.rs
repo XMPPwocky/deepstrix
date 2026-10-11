@@ -579,6 +579,10 @@ impl HeterogeneousEngine {
         // The daemon adapts its own reader window to this (REQ_FLAG_DECODE),
         // whether or not the hub's switch is enabled.
         c.set_decode_phase(decode);
+        if decode {
+            // A decode request never carries the last-unit flag (design 2.1).
+            c.set_last_unit(false);
+        }
         if *DECODE_US == 0 {
             return;
         }
@@ -592,6 +596,16 @@ impl HeterogeneousEngine {
         let Some(m) = self.remote.as_ref() else { return };
         let Ok(mut c) = m.lock() else { return };
         c.set_long_job(long);
+    }
+
+    /// The prefill unit about to run is its job's LAST (a window after which no further window opens, the chunk that
+    /// ends the prompt, or the replay): its box-2 requests carry `REQ2_FLAG_LAST` (docs/v41/B2_LAST_WINDOW_EVICT_BEHIND_DESIGN.md).
+    /// Set by the prefill driver itself, where the unit's extent is exact; cleared by `LastUnitGuard` and by
+    /// `remote_set_phase_busy_poll(true)`.
+    pub fn remote_set_last_unit(&self, last: bool) {
+        let Some(m) = self.remote.as_ref() else { return };
+        let Ok(mut c) = m.lock() else { return };
+        c.set_last_unit(last);
     }
 
     /// Whether the scheduler flagged the prefill unit now running as part of a LONG job (`remote_set_long_job`): the one

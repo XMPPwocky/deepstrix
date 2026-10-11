@@ -940,6 +940,17 @@ struct LmWindow {
     lo: bool,
     lo_layer: usize,
     saved: Vec<i32>,
+    /// No further window will open for this job after this one (`lm_plan_window` from its end is `None`): every unit /
+    /// pass of it is a LAST unit (`REQ2_FLAG_LAST`; design docs/v41/B2_LAST_WINDOW_EVICT_BEHIND_DESIGN.md 2.1).
+    last: bool,
+}
+
+/// Clears the remote client's last-unit flag when a prefill unit returns, on every path (`remote_set_last_unit`).
+struct LastUnitGuard<'a>(&'a HeterogeneousEngine);
+impl Drop for LastUnitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.remote_set_last_unit(false);
+    }
 }
 
 /// Plan a layer-major window from `start`: the chunks `plan_chunk` would cut
@@ -1371,9 +1382,12 @@ impl HeterogeneousEngine {
             }
             tracing::info!(pos0 = job.pos0 + start as u32, rows, sub_chunks = subs.len(), cap, layer_outer = lo,
                 tokens_done = start, tokens_total = t, "prefill_lm_window open");
+            // LAST: no further window will open after this one -- the same planning `lm_open_window` will do from `end`,
+            // at this (possibly halved) cap (design 2.1, review r2).
+            let last = lm_plan_window(job.pos0, end, t, chunk_size, lane_caps, &job.image_spans, cap)?.is_none();
             job.lm = Some(LmWindow {
                 start, end, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(),
-                lo, lo_layer: 0, saved: Vec::new(),
+                lo, lo_layer: 0, saved: Vec::new(), last,
             });
             return Ok(true);
         }
@@ -1984,6 +1998,8 @@ impl HeterogeneousEngine {
         }
         let _split_guard = super::prefill_split::install(job.split.clone());
         if job.ced && job.lm_rows > 0 && self.lm_open_window(job, lane_caps, chunk_size)? {
+            self.remote_set_last_unit(job.lm.as_ref().is_some_and(|w| w.last));
+            let _last_guard = LastUnitGuard(self);
             if job.lm.as_ref().is_some_and(|w| w.lo) {
                 return self.prefill_job_lm_pass(job, bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, pager);
             }
@@ -1993,6 +2009,9 @@ impl HeterogeneousEngine {
         let (chunk_end, b_a) = image_spans::plan_chunk(job.pos0, job.chunk_start, t, chunk_size, Some(lane_caps), &job.image_spans)?;
         let chunk_b = chunk_end - job.chunk_start;
         let is_last_chunk = chunk_end == t;
+        // LAST unit: the chunk that ends the prompt (review r3: right on the no-window fallback paths too).
+        self.remote_set_last_unit(is_last_chunk);
+        let _last_guard = LastUnitGuard(self);
         let (lazy_hcs, lazy_engram) = match job.chunk_inputs.take() {
             Some((mut h, mut e)) => {
                 // A SURPLUS is a prefix to keep: `next_chunk_range` predicted a layer-outer window and `lm_open_window` fell back
@@ -2138,6 +2157,9 @@ impl HeterogeneousEngine {
         self.dgpu.events.reset();
         self.igpu.events.reset();
         let _unit = super::trace::ctx_unit(super::trace::next_unit());
+        // The replay is always its job's LAST unit (design 2.1).
+        self.remote_set_last_unit(true);
+        let _last_guard = LastUnitGuard(self);
         let b_a = self.forward_prompt_batch_v2_pipelined_range(
             bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, &seg_hcs, &seg_tokens, seg_pos0,
             None, None, pager.as_deref_mut(), None, split..N_LAYER as usize, CedMode::Replay, Some(&seg_carry),
@@ -13299,7 +13321,7 @@ mod lm_tests {
         // An OPEN layer-outer window: the first pass (layer 0) takes the whole window, later passes none.
         job.lm_rows = 4096;
         let subs = lm_plan_window(0, 0, 10_000, 1024, caps, &[], 4096).unwrap().unwrap();
-        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(), lo: true, lo_layer: 0, saved: Vec::new() });
+        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(), lo: true, lo_layer: 0, saved: Vec::new(), last: false });
         assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (0, 4096));
         job.lm.as_mut().unwrap().lo_layer = 4;
         assert_eq!(job.next_chunk_range_impl(caps, true).unwrap(), (job.chunk_start, job.chunk_start));
@@ -13310,7 +13332,7 @@ mod lm_tests {
         let mut job = PrefillJob::new(vec![1; 5000], Vec::new(), None, None, 0, 1024).unwrap();
         assert!(!job.lm_mid_group(), "no window");
         let subs = lm_plan_window(0, 0, 5000, 1024, (512, 512), &[], 4096).unwrap().unwrap();
-        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(), lo: false, lo_layer: 0, saved: Vec::new() });
+        job.lm = Some(LmWindow { start: 0, end: 4096, subs, group: 0, sub: 0, engram: None, pf_sent: Default::default(), lo: false, lo_layer: 0, saved: Vec::new(), last: false });
         assert!(!job.lm_mid_group(), "window open, group not begun");
         for sub in 1..4 {
             job.lm.as_mut().unwrap().sub = sub;
