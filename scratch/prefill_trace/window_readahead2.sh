@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# TWO-BOX DEPLOY of the read-ahead QUEUE-WORDS fix (owner 10-11 "ok"): worktree-igpu-wmma-moe 37b01c00 =
+# TWO-BOX DEPLOY of the read-ahead QUEUE-WORDS fix (owner 10-11 "ok"): worktree-igpu-wmma-moe 8ef4ab6a =
 #   box 2: readahead jobs queue without a set and take one at pop (the shipped lane dropped ~94% of the words at
 #          arrival); readahead_queue 192 (live), 8 sets (~256 MB pinned), 4 reader threads / readahead_par active 2
 #          (live), readahead_pause (live). Knob file unchanged in content.
-#   hub  : 260530ce (same hub-side behaviour as e610996c; relinked). Hub knob file: V41_LM_PREFETCH_AHEAD=0.
-#   box 2: target-b2rq1011 expertd 91f06086 <- target-b2ra1011 08cf447e; hub 260530ce (target-gate) <- e610996c.
+#   hub  : e80554ae = reasoning effort "minimal" -> V4.1 budget 25 (owner 10-11) + relink. Hub knob file: V41_LM_PREFETCH_AHEAD=0.
+#   box 2: target-b2rq1011 expertd 91f06086 <- target-b2ra1011 08cf447e; hub e80554ae (target-gate) <- e610996c.
 #   gates (hub down, box 2 OLD): remote_experts_pin_loopback (3rd run = read-ahead) + nursery_loopback (~20 s).
 # ORDER: box 1 down, gates, box 2 down, box 2 up, box 1 up. Any failure -> both back on 08cf447e + e610996c.
 #   window_readahead2.sh [deploy|rollback] > ~/window_readahead2_deploy.log 2>&1   (never a pipe)
@@ -14,7 +14,7 @@ WT=/home/claude-code/deepstrix/.claude/worktrees/igpu-wmma-moe
 W=/home/claude-code/scratch-ms
 PROD=/home/claude-code/deepstrix/target-v41/release/deepstrix-server
 HUB_NEW=$WT/target-gate/release/deepstrix-server
-HUB_NEW_MD5=260530ce
+HUB_NEW_MD5=e80554ae
 HUB_OLD_MD5=e610996c
 HUB_BAK=$W/deepstrix-server.$HUB_OLD_MD5.bak
 MARK=/home/claude-code/logs/evtrace/deploy_markers.log
@@ -149,8 +149,8 @@ if install_hub "$HUB_NEW" "$HUB_NEW_MD5" && hub_up; then
   sed 's/\x1b\[[0-9;]*m//g' ~/logs/v41-server.log | tail -800 | grep -aE 'remote experts:|prefill VRAM loan: prefill lane set built|UNTESTED|ERROR|panicked' | tail -5 | cut -c1-240
   $SSH $B2 "N=\$(grep -a -n '^=== ' $B2LOG | tail -1 | cut -d: -f1); tail -n +\${N:-1} $B2LOG | grep -a -E 'connection from|expert shard|nursery ON|ERROR|panicked' | tail -5 | cut -c1-240"
   $SSH $B2 "N=\$(grep -a -n '^=== ' $B2LOG | tail -1 | cut -d: -f1); tail -n +\${N:-1} $B2LOG | grep -a -E 'look-ahead prefetch ON|readahead' | tail -3 | cut -c1-240"
-  say "OK: hub $HUB_NEW_MD5 + box 2 $B2_NEW_MD5 (read-ahead queue-words fix, 37b01c00)"
-  mark "done: hub $HUB_NEW_MD5 + box 2 $B2_NEW_MD5 (readahead2 37b01c00)"
+  say "OK: hub $HUB_NEW_MD5 + box 2 $B2_NEW_MD5 (read-ahead queue-words fix, 8ef4ab6a)"
+  mark "done: hub $HUB_NEW_MD5 + box 2 $B2_NEW_MD5 (readahead2 8ef4ab6a)"
   exit 0
 fi
 say "new hub unhealthy"
