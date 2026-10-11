@@ -263,7 +263,11 @@ pub async fn chat_completions(
         let budget = numeric_budget
             .filter(|&n| n >= 1)
             .map(crate::prompt_v41::V41Effort)
-            .or_else(|| req.reasoning_effort.as_deref().and_then(crate::prompt_v41::V41Effort::from_name))
+            // A named level ("minimal" = 25, ...): `reasoning_effort` wins, else letta's `reasoning`.
+            .or_else(|| match req.reasoning_effort.as_deref() {
+                Some(s) => crate::prompt_v41::V41Effort::from_name(s),
+                None => req.reasoning.as_deref().and_then(crate::prompt_v41::V41Effort::from_name),
+            })
             .unwrap_or(match effort {
                 ReasoningEffort::Off | ReasoningEffort::Low => {
                     crate::prompt_v41::V41Effort(50)

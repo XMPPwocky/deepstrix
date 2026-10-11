@@ -47,15 +47,17 @@ pub const SYSTEM_TEXT: &str = "<\u{ff5c}System\u{ff5c}>";
 const DSML: &str = "\u{ff5c}DSML\u{ff5c}";
 
 /// V4.1 reasoning effort: an integer budget in 1..=100. Named levels map to
-/// 50 / 75 / 100; the reference default is "high".
+/// 25 (minimal) / 50 / 75 / 100; the reference default is "high".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V41Effort(pub u8);
 
 impl V41Effort {
     pub const DEFAULT: V41Effort = V41Effort(75);
 
+    /// Case-insensitive. "minimal" (OpenAI / Hermes ladders) is 25 (owner 10-11): below "low", thinking still on.
     pub fn from_name(s: &str) -> Option<Self> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
+            "minimal" => Some(V41Effort(25)),
             "low" => Some(V41Effort(50)),
             "high" => Some(V41Effort(75)),
             "max" => Some(V41Effort(100)),
@@ -625,6 +627,16 @@ mod tests {
 
     fn msgs(v: serde_json::Value) -> Vec<ChatMessage> {
         v.as_array().unwrap().iter().map(|m| serde_json::from_value(m.clone()).unwrap()).collect()
+    }
+
+    /// Named effort levels -> V4.1 budgets ("minimal" = 25, owner 10-11).
+    #[test]
+    fn effort_names_map_to_budgets() {
+        for (s, n) in [("minimal", 25), ("Minimal", 25), ("low", 50), ("LOW", 50), ("high", 75), ("max", 100)] {
+            assert_eq!(V41Effort::from_name(s), Some(V41Effort(n)), "{s}");
+        }
+        assert_eq!(V41Effort::from_name("medium"), None, "medium falls back to the 4-state effort (High -> 75)");
+        assert_eq!(V41Effort::from_json(&serde_json::json!("minimal")).unwrap(), V41Effort(25));
     }
 
     /// The `encoding/README.md` "OpenAI-style messages" example, byte for byte:
