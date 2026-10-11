@@ -1258,8 +1258,11 @@ impl BatchDgpuScratch {
         };
         Ok(Self {
             rows,
-            indexer_sel_saved: mk_i32(crate::indexer::INDEXER_TOP_K as usize)?,
-            indexer_nsparse_saved: mk_i32(1)?,
+            // Zeroed at alloc: a selection carried across the sub-chunk UNITS of a group-major group (the prefill VRAM
+            // loan can end between units), so the loan's record pass sees it WRITTEN and pins it to the pool (review r3
+            // finding 3); harmless otherwise (`indexer_saved_store` says whether it holds anything).
+            indexer_sel_saved: { let mut z = mk_i32(crate::indexer::INDEXER_TOP_K as usize)?; z.fill_zero()?; z },
+            indexer_nsparse_saved: { let mut z = mk_i32(1)?; z.fill_zero()?; z },
             dump_layer_pos: u64::MAX,
             indexer_saved_store: -1,
             candidate_block_score: if crate::het::forward_layer::candidate_pool_enabled() {

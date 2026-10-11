@@ -17,14 +17,16 @@ use color_eyre::eyre::{self, eyre};
 
 use crate::sys;
 
-/// Phantom addresses live in `[FAKE_BASE, FAKE_BASE + FAKE_SPAN)`: never mapped, never dereferenced.
-const FAKE_BASE: usize = 0x7e00_0000_0000;
+/// Phantom addresses live in `[FAKE_BASE, FAKE_BASE + FAKE_SPAN)`: NON-CANONICAL on x86-64 (bits 47..63 not a sign
+/// extension), so no real host or device pointer can ever be in the range (review r3 finding 4: HIP device VAs sit in
+/// 0x7exx-0x7fxx, where the first choice of range was). Never dereferenced.
+const FAKE_BASE: usize = 0x4000_0000_0000_0000;
 const FAKE_SPAN: usize = 1 << 44;
 /// Phantom allocations are spaced at this alignment (matches what kernels assume of `hipMalloc`).
 const FAKE_ALIGN: usize = 256;
 
 /// One recorded allocation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Recorded {
     pub bytes: usize,
     /// `copy_from_host` / `fill_zero` ran on it during the recorded routine.
@@ -126,6 +128,11 @@ pub(crate) fn take(device_id: i32, bytes: usize) -> Option<eyre::Result<sys::hip
             },
         })
     })
+}
+
+/// Is `raw` a phantom address (any record scope, any thread)? Debug guard for the device-side paths.
+pub fn is_phantom(raw: sys::hipDeviceptr_t) -> bool {
+    (FAKE_BASE..FAKE_BASE + FAKE_SPAN).contains(&(raw as usize))
 }
 
 /// Write hook: `true` if `raw` is a PHANTOM of the open record scope (the caller skips the device write; the allocation

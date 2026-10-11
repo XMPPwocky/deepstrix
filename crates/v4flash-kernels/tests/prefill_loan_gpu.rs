@@ -83,7 +83,8 @@ fn loan_round_trip_keeps_live_decode_kv_bit_identical() -> eyre::Result<()> {
         kb.slice_view((cap - n) * E2M1_KEY_ROW_BYTES, n * E2M1_KEY_ROW_BYTES).fill_zero()?;
     }
     let restored = loan.end(&mut arena)?.expect("ended");
-    assert_eq!(restored, st.swapped_bytes, "every swapped byte restored (both streams still live)");
+    assert_eq!(restored.bytes, st.swapped_bytes, "every swapped byte restored (both streams still live)");
+    assert_eq!(restored.skipped, 0);
     assert!(!arena.is_lent());
     // live rows read back bit-identical (bases may have moved: compaction at lend)
     for (slot, si, comp, keys) in &expect {

@@ -1396,8 +1396,9 @@ impl Sched {
     fn end_loan(&mut self) -> eyre::Result<()> {
         let Some(l) = self.loan.as_mut() else { return Ok(()) };
         let t = Instant::now();
-        if let Some(restored) = l.end(&mut self.arena)? {
-            tracing::info!(restored_mib = restored >> 20, ms = t.elapsed().as_millis() as u64, "prefill VRAM loan: returned");
+        if let Some(st) = l.end(&mut self.arena)? {
+            tracing::info!(restored = st.restored, skipped = st.skipped, restored_mib = st.bytes >> 20, ms = t.elapsed().as_millis() as u64,
+                "prefill VRAM loan: returned");
         }
         Ok(())
     }
@@ -2730,8 +2731,20 @@ mod prefill_plan_tests {
 /// Cancelled prefills with at least this many rows done are checkpointed
 /// (`V41_MS_CHECKPOINT_MIN_ROWS`, default 4096).
 fn checkpoint_min_rows() -> usize { knobs::MS_CHECKPOINT_MIN_ROWS.usize() }
-fn chunk_rows_idle() -> usize { knobs::MS_CHUNK_ROWS_IDLE.usize() }
-fn chunk_rows_busy() -> usize { knobs::MS_CHUNK_ROWS.usize() }
+fn chunk_rows_idle() -> usize { loan_chunk_floor(knobs::MS_CHUNK_ROWS_IDLE.usize()) }
+fn chunk_rows_busy() -> usize { loan_chunk_floor(knobs::MS_CHUNK_ROWS.usize()) }
+
+/// With the prefill VRAM loan the chunk FOLLOWS the lanes (review r3 finding 2): a 1024-row chunk would still be cut
+/// 512 + 512 across the two 1024-row lanes and every MoE call would stay at 512 rows. At least two full lanes, at most
+/// `chunk_rows_cap()`.
+fn loan_chunk_floor(knob: usize) -> usize {
+    if v4flash_kernels::het::prefill_loan::enabled() {
+        let b = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
+        knob.max(2 * b).min(v4flash_kernels::het::batch_scratch::chunk_rows_cap())
+    } else {
+        knob
+    }
+}
 
 /// Same rule as `HeterogeneousEngine::sample_next` / the DSpark host twin.
 ///

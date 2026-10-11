@@ -494,6 +494,15 @@ struct Lent {
     swapped: Vec<SwapRec>,
 }
 
+/// What an `end_lend` did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EndStats {
+    pub restored: u32,
+    /// Records dropped: their slot was released (or re-reserved at another base) while lent.
+    pub skipped: u32,
+    pub bytes: u64,
+}
+
 /// What a `lend` did (logged by the scheduler).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LendStats {
@@ -1199,38 +1208,67 @@ impl KvArena {
                 swapped.push(SwapRec { slot, si, base, lo: a, comp, n_comp_rows: n_c, keys, n_key_rows: n_k });
             }
         }
-        let _ = stream;
+        // (`stream` only carries the compaction above; the saves are synchronous copies)
         self.lent = Some(Lent { rows: rows.to_vec(), swapped });
         Ok(stats)
     }
 
-    /// END the loan: write the saved rows back (H2D, synchronous) for every region still live at the SAME base (a slot
-    /// released while lent may have been re-reserved: its saved rows are dropped). The caller synchronized the device
-    /// (the prefill pass's writes into the lent rows are done). Returns the bytes restored. No-op if not lent.
-    pub fn end_lend(&mut self) -> eyre::Result<u64> {
-        let Some(l) = self.lent.take() else { return Ok(0) };
-        let _cur = self.dgpu.scoped_current()?;
-        let mut restored = 0u64;
-        for rec in l.swapped {
-            let live = self.streams.get(rec.slot).and_then(|s| s.as_ref()).is_some_and(|s| s.comp[rec.si].base == rec.base);
-            if !live {
+    /// Is `rec` still the same region's data? Its slot is live at the base it had when the loan began AND that region's
+    /// live rows still cover the saved rows. A slot released while lent may have been re-reserved -- even at the same
+    /// base (first fit): a fresh reservation has no live rows, so its saved predecessor is dropped, not written over it.
+    fn restorable(&self, rec: &SwapRec) -> bool {
+        self.streams.get(rec.slot).and_then(|s| s.as_ref()).is_some_and(|s| {
+            let r = s.comp[rec.si];
+            r.base == rec.base
+                && r.base + r.n_comp >= rec.lo + rec.n_comp_rows
+                && r.base + r.n_index_comp >= rec.lo + rec.n_key_rows
+        })
+    }
+
+    /// END the loan: write the saved rows back (H2D, synchronous) for every region still live at the SAME base. The
+    /// caller synchronized the device (the prefill pass's writes into the lent rows are done). Review r3 finding 1: the
+    /// arena stays LENT until every record is restored -- a failed copy leaves the unrestored records in place and every
+    /// data path refused (`ensure_not_lent`), so no stream decodes on prefill bytes; the next `end_lend` retries, and a
+    /// failing decode step aborts. No-op if not lent.
+    pub fn end_lend(&mut self) -> eyre::Result<EndStats> {
+        let Some(l) = self.lent.as_mut() else { return Ok(EndStats::default()) };
+        let mut recs = std::mem::take(&mut l.swapped);
+        let mut stats = EndStats::default();
+        while let Some(rec) = recs.pop() {
+            if !self.restorable(&rec) {
+                stats.skipped += 1;
                 continue;
             }
-            let width = self.stores[rec.si].width as usize;
-            let l_ = self.stores[rec.si].layer;
-            let cs = self.state.layers[l_].compressor.as_mut().expect("arena store");
-            if rec.n_comp_rows > 0 {
-                let buf = cs.comp_kv.f16_mut().expect("f16 store");
-                buf.slice_view_mut(rec.lo as usize * width, rec.n_comp_rows as usize * width).copy_from_host(&rec.comp)?;
+            if let Err(e) = self.restore_rec(&rec) {
+                recs.push(rec);
+                self.lent.as_mut().expect("still lent").swapped = recs;
+                return Err(e);
             }
-            if rec.n_key_rows > 0 {
-                let kb = cs.index_k.as_mut().expect("keys");
-                kb.slice_view_mut(rec.lo as usize * E2M1_KEY_ROW_BYTES, rec.n_key_rows as usize * E2M1_KEY_ROW_BYTES)
-                    .copy_from_host(&rec.keys)?;
-            }
-            restored += (rec.comp.len() * 2 + rec.keys.len()) as u64;
+            stats.restored += 1;
+            stats.bytes += (rec.comp.len() * 2 + rec.keys.len()) as u64;
         }
-        Ok(restored)
+        self.lent = None;
+        Ok(stats)
+    }
+
+    fn restore_rec(&mut self, rec: &SwapRec) -> eyre::Result<()> {
+        if rec.n_comp_rows == 0 && rec.n_key_rows == 0 {
+            return Ok(());
+        }
+        let _cur = self.dgpu.scoped_current()?;
+        let width = self.stores[rec.si].width as usize;
+        let l_ = self.stores[rec.si].layer;
+        let cs = self.state.layers[l_].compressor.as_mut().ok_or_else(|| eyre!("kv arena: store {} has no compressor", rec.si))?;
+        if rec.n_comp_rows > 0 {
+            let buf = cs.comp_kv.f16_mut().ok_or_else(|| eyre!("kv arena: store {} is not f16", rec.si))?;
+            buf.slice_view_mut(rec.lo as usize * width, rec.n_comp_rows as usize * width).copy_from_host(&rec.comp)?;
+        }
+        if rec.n_key_rows > 0 {
+            let kb = cs.index_k.as_mut().ok_or_else(|| eyre!("kv arena: store {} has no keys", rec.si))?;
+            kb.slice_view_mut(rec.lo as usize * E2M1_KEY_ROW_BYTES, rec.n_key_rows as usize * E2M1_KEY_ROW_BYTES)
+                .copy_from_host(&rec.keys)?;
+        }
+        Ok(())
     }
 
     pub fn release(&mut self, slot: u32) -> eyre::Result<()> {
@@ -1709,9 +1747,47 @@ mod tests {
         assert!(a.tables(&rows).is_err(), "a decode step's tables are refused while lent");
         let s1 = a.reserve(10).unwrap(); // bookkeeping is allowed
         a.release(s1).unwrap();
-        assert_eq!(a.end_lend().unwrap(), 0, "nothing swapped -> nothing restored");
+        assert_eq!(a.end_lend().unwrap(), EndStats::default(), "nothing swapped -> nothing restored");
         assert!(!a.is_lent());
         assert!(a.tables(&rows).is_ok());
+    }
+
+    /// Review r3 finding 6: the restore filter. A record is restored only if its slot is still live at the SAME base with
+    /// its live rows intact -- not a slot released and re-reserved meanwhile (even at the same base).
+    #[cfg(feature = "v41")]
+    #[test]
+    fn end_lend_restores_only_regions_live_at_the_same_base() {
+        let mut a = host_arena(4, 1000);
+        let n = a.stores.len();
+        let keep = a.reserve(100).unwrap();
+        let gone = a.reserve(100).unwrap();
+        let moved = a.reserve(100).unwrap();
+        for slot in [keep, gone, moved] {
+            for r in a.stream_mut(slot).unwrap().comp.iter_mut() {
+                r.n_comp = 20.min(r.cap);
+                r.n_index_comp = r.n_comp;
+            }
+        }
+        let rec = |a: &KvArena, slot: u32| {
+            let base = a.stream(slot).unwrap().comp[0].base;
+            SwapRec { slot: slot as usize, si: 0, base, lo: base, comp: Vec::new(), n_comp_rows: 10, keys: Vec::new(), n_key_rows: 10 }
+        };
+        let (rk, rg, rm) = (rec(&a, keep), rec(&a, gone), rec(&a, moved));
+        assert!(a.restorable(&rk) && a.restorable(&rg) && a.restorable(&rm));
+        // while lent: `gone` and `moved` released, a new reservation takes `gone`'s slot (first fit: maybe its base too)
+        a.release(gone).unwrap();
+        a.release(moved).unwrap();
+        let fresh = a.reserve(300).unwrap();
+        assert_eq!(fresh, gone, "the freed slot index is reused");
+        assert!(a.restorable(&rk), "unchanged stream");
+        assert!(!a.restorable(&rg), "re-reserved slot: a fresh region has no live rows, the old data is dropped");
+        assert!(!a.restorable(&rm), "released slot");
+        // end_lend over zero-row records exercises the bookkeeping without device copies
+        let z = |r: &SwapRec| SwapRec { n_comp_rows: 0, n_key_rows: 0, ..SwapRec { comp: Vec::new(), keys: Vec::new(), ..*r } };
+        a.lent = Some(Lent { rows: vec![0; n], swapped: vec![z(&rk), z(&rm)] });
+        let st = a.end_lend().unwrap();
+        assert_eq!((st.restored, st.skipped), (1, 1));
+        assert!(!a.is_lent());
     }
 
     /// The per-row dependency check (`check_row_dependencies`) passes the

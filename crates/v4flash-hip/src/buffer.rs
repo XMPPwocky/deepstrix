@@ -220,6 +220,7 @@ impl<T> DeviceBuffer<T> {
     }
 
     pub fn copy_to_host(&self, dst: &mut [T]) -> eyre::Result<()> {
+        debug_assert!(!crate::alloc_scope::is_phantom(self.raw), "copy_to_host from a phantom (alloc_scope record pass)");
         if dst.len() != self.len {
             return Err(eyre!(
                 "copy_to_host length mismatch: src={} dst={}",
@@ -307,6 +308,10 @@ impl<T> DeviceBuffer<T> {
         src: &DeviceBuffer<T>,
         stream: &Stream,
     ) -> eyre::Result<()> {
+        debug_assert!(
+            !crate::alloc_scope::is_phantom(self.raw) && !crate::alloc_scope::is_phantom(src.raw),
+            "device copy on a phantom (alloc_scope record pass)"
+        );
         if src.len != self.len {
             return Err(eyre!(
                 "copy_from_buffer_async length mismatch: src={} dst={}",
@@ -340,6 +345,10 @@ impl<T> DeviceBuffer<T> {
     /// decode snapshot/restore path where we want a strict happens-
     /// before relationship without managing stream events.
     pub fn copy_from_buffer(&mut self, src: &DeviceBuffer<T>) -> eyre::Result<()> {
+        debug_assert!(
+            !crate::alloc_scope::is_phantom(self.raw) && !crate::alloc_scope::is_phantom(src.raw),
+            "device copy on a phantom (alloc_scope record pass)"
+        );
         if src.len != self.len {
             return Err(eyre!(
                 "copy_from_buffer length mismatch: src={} dst={}",

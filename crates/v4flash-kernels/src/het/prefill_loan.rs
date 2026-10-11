@@ -16,7 +16,7 @@ use v4flash_hip::alloc_scope::{self, Recorded};
 use v4flash_hip::{sys, Device, DeviceBuffer, Stream};
 
 use super::batch_scratch::{BatchDgpuScratch, BatchDgpuShared};
-use super::kv_arena::{KvArena, LendStats};
+use super::kv_arena::{EndStats, KvArena, LendStats};
 use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 
 /// `V41_PREFILL_VRAM_LOAN=1` (default off; STATIC: changes allocation at startup).
@@ -68,6 +68,10 @@ pub struct Plan {
 /// First-fit-decreasing. `pool_cap` bytes; per store `(comp_bytes, comp_row_bytes, key_bytes, key_row_bytes)`. Written
 /// allocations only go to the pool. Errors if anything does not fit.
 pub fn plan(items: &[Recorded], pool_cap: usize, stores: &[(usize, usize, usize, usize)]) -> eyre::Result<Plan> {
+    // Bin ENDS aligned down to 256 B (review r3 finding 5: `index_k` is `rows_cap x 80` B, not a multiple of 256), so every
+    // buffer carved downward from an end starts 256-aligned.
+    let stores: Vec<(usize, usize, usize, usize)> = stores.iter().map(|&(c, cr, k, kr)| (c / ALIGN * ALIGN, cr, k / ALIGN * ALIGN, kr)).collect();
+    let stores = &stores[..];
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&i| (std::cmp::Reverse(items[i].bytes), i));
     // store bins, largest comp first, then keys largest first
@@ -136,7 +140,8 @@ pub struct PrefillLoan {
 /// buffers here when set (`lm_pool`).
 static LM_POOL: std::sync::Mutex<Option<(usize, usize, i32)>> = std::sync::Mutex::new(None);
 
-/// `(address, bytes, device)` of the layer-major store region, if the loan reserved one.
+/// `(address, bytes, device)` of the layer-major store region, if the loan reserved one. ONE region shared by every
+/// prefill job: reuse across jobs is fine -- the store holds nothing live between windows (review r3 nit 7).
 pub fn lm_pool() -> Option<(sys::hipDeviceptr_t, usize, i32)> {
     LM_POOL.lock().unwrap_or_else(|p| p.into_inner()).map(|(a, b, d)| (a as sys::hipDeviceptr_t, b, d))
 }
@@ -222,7 +227,7 @@ impl PrefillLoan {
 
     /// End the loan (idempotent): synchronize the whole dGPU (the prefill pass's writes into the lent rows are done),
     /// then restore the swapped rows.
-    pub fn end(&mut self, arena: &mut KvArena) -> eyre::Result<Option<u64>> {
+    pub fn end(&mut self, arena: &mut KvArena) -> eyre::Result<Option<EndStats>> {
         if !arena.is_lent() {
             return Ok(None);
         }
@@ -275,6 +280,18 @@ mod tests {
         // a full pool refuses a written allocation instead of lending it
         let e = plan(&[r(1024, false), r(100, true)], 1024, &st).unwrap_err().to_string();
         assert!(e.contains("must persist"), "{e}");
+    }
+
+    #[test]
+    fn bin_ends_are_aligned_down_so_every_buffer_starts_256_aligned() {
+        // keys bin of 1000 B (e.g. rows_cap x 80): usable end 768 -> three 256 B slots
+        let p = plan(&[r(100, false); 3], 0, &[(0, 128, 1000, 80)]).unwrap();
+        for &(bin, off) in &p.at {
+            assert_eq!(bin, Bin::Keys(0));
+            assert_eq!(off % 256, 0, "offset {off}");
+            assert!(off + 256 <= 768, "offset {off} past the aligned end");
+        }
+        assert!(plan(&[r(100, false); 4], 0, &[(0, 128, 1000, 80)]).is_err(), "a 4th slot would cross the aligned end");
     }
 
     #[test]
