@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Hub-only deploy of the Engram RAW row cache + FADV_RANDOM (owner 10-11 "yes"; acd2ba58): hub 2a5e1494 <- e8669c98;
-# env + knob files unchanged (ENGRAM_CACHE_MB default 1536 per table). Box 2 untouched. Unhealthy -> back on the
+# Hub-only deploy of the Engram RAW row cache + FADV_RANDOM (owner 10-11 "yes"; f6724e41, review r6 fixes): hub 0c957d7a <- e8669c98;
+# env + knob files unchanged (ENGRAM_CACHE_MB default 1024 per table). Box 2 untouched. Unhealthy -> back on the
 # backup binary. SKIP_IDLE=1 skips the idle wait. Redirect stdout to a FILE.
 set -u
 WT=/home/claude-code/deepstrix/.claude/worktrees/igpu-wmma-moe
@@ -8,7 +8,7 @@ W=/home/claude-code/scratch-ms
 PROD=/home/claude-code/deepstrix/target-v41/release/deepstrix-server
 NEW=$WT/target-gate/release/deepstrix-server
 OLD_MD5=e8669c98
-NEW_MD5=2a5e1494
+NEW_MD5=0c957d7a
 BAK=$W/deepstrix-server.$OLD_MD5.bak
 MARK=/home/claude-code/logs/evtrace/deploy_markers.log
 HUBPAT='^/home/claude-code/deepstrix[^ ]*/release/deepstrix-server '
