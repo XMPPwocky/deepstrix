@@ -15,8 +15,9 @@ pub const ENGRAM_ROW_BYTES: u64 = ENGRAM_ROW_DIM as u64; // 1 B per fp8 element
 pub const ENGRAM_SCALE_BYTES: u64 = (ENGRAM_ROW_DIM / 32) as u64; // 8 e8m0 per row
 /// One RAW cached row: the 256 fp8 weights then the 8 e8m0 scales.
 const RAW_ROW: usize = ENGRAM_ROW_DIM + ENGRAM_SCALE_BYTES as usize;
-/// Approximate cache bytes per row (payload + index entry), for sizing by MB.
-const RAW_ROW_COST: usize = RAW_ROW + 32;
+/// Cache bytes per row: the payload + its hashbrown `(i64, u32)` entry (16 B + a
+/// control byte at <= 7/8 load, rounded up), with both generations pre-sized.
+const RAW_ROW_COST: usize = RAW_ROW + 24;
 
 /// Dequantise one RAW row (`RAW_ROW` bytes) into 256 f32 -- the exact formula the
 /// disk path always used, so cached and uncached rows are bit-identical.
@@ -29,6 +30,9 @@ fn dequant_raw(raw: &[u8], out: &mut [f32]) {
 }
 
 /// One generation of the raw-row cache: id -> slot, rows packed in `data`.
+/// PRE-SIZED (`with_capacity`): a growing Vec doubles past its need (a 718 MB
+/// generation would sit in a 1 GiB allocation) and every doubling / rehash runs
+/// inside `insert` under the cache mutex (review r6 MAJOR-1).
 #[derive(Default)]
 struct RowGen {
     idx: std::collections::HashMap<i64, u32>,
@@ -36,6 +40,9 @@ struct RowGen {
 }
 
 impl RowGen {
+    fn with_capacity(rows: usize) -> Self {
+        Self { idx: std::collections::HashMap::with_capacity(rows), data: Vec::with_capacity(rows * RAW_ROW) }
+    }
     fn get(&self, id: i64) -> Option<&[u8]> {
         self.idx.get(&id).map(|&i| &self.data[i as usize * RAW_ROW..(i as usize + 1) * RAW_ROW])
     }
@@ -69,7 +76,8 @@ struct RawRowCache {
 
 impl RawRowCache {
     fn new(cap_rows: usize) -> Self {
-        Self { young: RowGen::default(), old: RowGen::default(), gen_cap: (cap_rows / 2).max(1) }
+        let gen_cap = (cap_rows / 2).max(1);
+        Self { young: RowGen::with_capacity(gen_cap), old: RowGen::default(), gen_cap }
     }
     /// Copy the row into `dst` if cached (promoting an `old` hit).
     fn lookup(&mut self, id: i64, dst: &mut [u8]) -> bool {
@@ -87,7 +95,7 @@ impl RawRowCache {
             return;
         }
         if self.young.len() >= self.gen_cap {
-            self.old = std::mem::take(&mut self.young);
+            self.old = std::mem::replace(&mut self.young, RowGen::with_capacity(self.gen_cap));
         }
         self.young.push(id, raw);
     }
@@ -124,8 +132,9 @@ pub struct EngramTable {
     /// 14.4 -> 11.9 tok/s) but cannot fix the granularity.
     ///
     /// n-gram hashes repeat heavily within a conversation. RAW rows (`RawRowCache`),
-    /// sized by `ENGRAM_CACHE_MB` (default 1536 per table, ~5.2M rows) or
-    /// `ENGRAM_CACHE_ROWS` (rows; wins if set); `0` disables it.
+    /// sized by `ENGRAM_CACHE_MB` (default 1024 per table, ~3.7M rows, both
+    /// generations full ~1 GB; box 1 has ~7 GB available beside 112 GB of GTT) or
+    /// `ENGRAM_CACHE_ROWS` (RAW rows -- was decoded rows; wins if set); `0` disables it.
     cache: std::sync::Mutex<RawRowCache>,
     cache_cap: usize,
     pub cache_hits: std::sync::atomic::AtomicU64,
@@ -147,7 +156,7 @@ impl EngramTable {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| {
-                let mb = std::env::var("ENGRAM_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1536);
+                let mb = std::env::var("ENGRAM_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024);
                 mb * (1 << 20) / RAW_ROW_COST
             });
         // No readahead on the tables (`ENGRAM_FADV_RANDOM`, default on): a row miss
@@ -160,7 +169,10 @@ impl EngramTable {
                 }
             }
         }
-        eprintln!("engram L{layer}: raw row cache {} rows (~{} MB)", cache_cap, cache_cap * RAW_ROW_COST >> 20);
+        eprintln!(
+            "engram L{layer}: raw row cache {} rows (~{} MB at full); FADV_RANDOM on shards {} / {}",
+            cache_cap, cache_cap * RAW_ROW_COST >> 20, st.shard_name(weight.shard), st.shard_name(scale.shard)
+        );
         Ok(Self {
             layer,
             rows: weight.shape[0],
