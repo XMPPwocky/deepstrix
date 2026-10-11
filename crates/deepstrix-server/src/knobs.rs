@@ -42,15 +42,27 @@ v4flash_kernels::knobs! {
     /// = `V41_MS_KV_GROW`.
     pub static MS_KV_SPARE = Knob::int("V41_MS_KV_SPARE", 0, 0, MAX);
     /// `V41_MS_PREFILL_BURST_MS` (default 120000): `Sched::burst_budget`.
-    pub static MS_PREFILL_BURST_MS = Knob::int("V41_MS_PREFILL_BURST_MS", 120_000, 0, MAX);
+    pub static MS_PREFILL_BURST_MS = Knob::int("V41_MS_PREFILL_BURST_MS", 120_000, 0, MAX).live();
     /// `V41_MS_PREFILL_BURST_MIN_MS` (default 10000).
-    pub static MS_PREFILL_BURST_MIN_MS = Knob::int("V41_MS_PREFILL_BURST_MIN_MS", 10_000, 0, MAX);
+    pub static MS_PREFILL_BURST_MIN_MS = Knob::int("V41_MS_PREFILL_BURST_MIN_MS", 10_000, 0, MAX).live();
     /// `V41_MS_DECODE_BURST_MS` (default 30000).
-    pub static MS_DECODE_BURST_MS = Knob::int("V41_MS_DECODE_BURST_MS", 30_000, 0, MAX);
+    pub static MS_DECODE_BURST_MS = Knob::int("V41_MS_DECODE_BURST_MS", 30_000, 0, MAX).live();
     /// `V41_MS_DECODE_BURST_MIN_MS` (default 3000).
-    pub static MS_DECODE_BURST_MIN_MS = Knob::int("V41_MS_DECODE_BURST_MIN_MS", 3_000, 0, MAX);
+    pub static MS_DECODE_BURST_MIN_MS = Knob::int("V41_MS_DECODE_BURST_MIN_MS", 3_000, 0, MAX).live();
     /// `V41_MS_BURST_SCALE` (`1`): scale the bursts by load.
-    pub static MS_BURST_SCALE = Knob::flag("V41_MS_BURST_SCALE", false);
+    pub static MS_BURST_SCALE = Knob::flag("V41_MS_BURST_SCALE", false).live();
+    /// `V41_MS_PREEMPT` (default off; LIVE): preempt the decode phase for FRESH prefill work -- a capped INTERRUPT
+    /// charged to neither burst (docs/v41/MS_PREFILL_PREEMPT_DESIGN.md), plus fresh-first job selection.
+    pub static MS_PREEMPT = Knob::flag("V41_MS_PREEMPT", false).live();
+    /// `V41_MS_PREEMPT_FRESH_MS` (default 20000; LIVE): a prefill job is FRESH until it has had this much prefill
+    /// service (wall time of its own units, finish/replay included).
+    pub static MS_PREEMPT_FRESH_MS = Knob::int("V41_MS_PREEMPT_FRESH_MS", 20_000, 0, MAX).live();
+    /// `V41_MS_PREEMPT_GAP_MS` (default 2000; LIVE): decode time between the end of one interrupt and the next
+    /// preemption (the anti-starvation floor for live streams).
+    pub static MS_PREEMPT_GAP_MS = Knob::int("V41_MS_PREEMPT_GAP_MS", 2_000, 0, MAX).live();
+    /// `V41_MS_PREEMPT_MAX_MS` (default 10000; LIVE): an interrupt ends after this long (at the next point where no
+    /// window / group holds the prefill); remaining fresh work preempts again after the gap.
+    pub static MS_PREEMPT_MAX_MS = Knob::int("V41_MS_PREEMPT_MAX_MS", 10_000, 0, MAX).live();
     /// `V41_MS_AGING_S` (default 60): queue aging.
     pub static MS_AGING_S = Knob::int("V41_MS_AGING_S", 60, 0, MAX);
     /// `V41_MS_STARVE_S` (default 600): queue starvation bound.
@@ -243,8 +255,8 @@ mod tests {
             "V41_B2_MISS_PREFETCH_MAX_WORDS_STEP", "V41_B2_MISS_PREFETCH_RANK", "V41_B2_NURSERY_PRIOR", "V41_B2_PIN_PREFILL_BAND",
             "V41_B2_SOFT_HINT", "V41_B2_SOFT_MAP", "V41_B2_SOFT_PRIOR", "V41_B2_SPEC_BUDGET", "V41_DGPU_COMBINE3", "V41_DGPU_ENGRAM_ASYNC", "V41_DGPU_ROUTER_X2", "V41_DGPU_ZC_MULTI_SPEC", "V41_DGPU_ZC_PUSH",
             "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_ENGRAM_ASYNC", "V41_LM_LAYER_OUTER", "V41_LM_PREFETCH", "V41_LM_PREFETCH_AHEAD", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL", "V41_LM_QUANTUM_LAYERS", "V41_LM_SEED_ASYNC",
-            "V41_MOE_WMMA_F16", "V41_MS_CTX_CHECK", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPHS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
-            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_PROFILE", "V41_MS_PROFILE_SAMPLE", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS", "V41_PREFILL_B1_FILLER", "V41_PREFILL_SPLIT", "V41_PREFILL_SPLIT_PRIOR",
+            "V41_MOE_WMMA_F16", "V41_MS_BURST_SCALE", "V41_MS_CTX_CHECK", "V41_MS_DECODE_BURST_MIN_MS", "V41_MS_DECODE_BURST_MS", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPHS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
+            "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_PREEMPT", "V41_MS_PREEMPT_FRESH_MS", "V41_MS_PREEMPT_GAP_MS", "V41_MS_PREEMPT_MAX_MS", "V41_MS_PREFILL_BURST_MIN_MS", "V41_MS_PREFILL_BURST_MS", "V41_MS_PROFILE", "V41_MS_PROFILE_SAMPLE", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS", "V41_PREFILL_B1_FILLER", "V41_PREFILL_SPLIT", "V41_PREFILL_SPLIT_PRIOR",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA", "V41_SUB_PROTECT",
         ]);
         // The parses these knobs had before.

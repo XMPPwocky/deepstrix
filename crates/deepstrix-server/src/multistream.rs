@@ -156,6 +156,10 @@ struct Prefill {
     /// Engram rows gathered AHEAD of the chunks that need them
     /// (`engram_lookahead`), contiguous blocks in token order.
     engram_ahead: EngramAhead,
+    /// Prefill SERVICE so far: wall time of this job's own units (`prefill_job_tick`, chunks and finish/replay), not
+    /// time since it started -- a job waiting through a decode phase does not age (docs/v41/MS_PREFILL_PREEMPT_DESIGN.md
+    /// 3.2). FRESH while below `V41_MS_PREEMPT_FRESH_MS`.
+    service: std::time::Duration,
 }
 
 /// A prefill job's Engram rows gathered ahead (2026-10-01): a long prefill
@@ -379,7 +383,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         None
     };
     let plain_lanes = PlainLanes::from_env(n_slots as usize, pipeline_min_rows());
-    let mut sched = Sched { loan, dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { loan, dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, interrupt_since: None, int_saved_since: Instant::now(), last_interrupt_end: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -441,15 +445,18 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         // middle of a layer-major group (the group's box-2 pages, as for
         // decode), and at most V41_EMBED_MAX_SHARE % of wall time while the
         // LLM has work.
-        let mid_group = finish_group() && sched.prefills.iter().any(|p| p.job.lm_mid_group());
+        let mid_group = sched.hold();
         if let Some(e) = state.embed.as_mut() {
             if !mid_group && e.due(llm) {
                 state.progress.begin();
                 worked = true;
                 let t = Instant::now();
                 e.run_phase(&state.engine, &state.progress, sched.streams.len(), sched.prefills.len());
-                // The interrupted burst is not charged for the phase.
+                // The interrupted burst (and a running preemption interrupt) is not charged for the phase.
                 sched.phase_since += t.elapsed();
+                if let Some(it) = sched.interrupt_since.as_mut() {
+                    *it += t.elapsed();
+                }
                 state.progress.pet();
                 continue;
             }
@@ -477,6 +484,98 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
 /// alternating chunk/step made every step pay the misses back.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase { Decode, Prefill }
+
+/// Why `next_phase` chose what it chose (`ms.phase` `reason`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reason {
+    /// Stay: budget not spent / interrupt still running.
+    Keep,
+    /// Stay in prefill past the budget or the interrupt's end: a window / group holds it (design 3.1).
+    Hold,
+    /// Nothing to do on either side.
+    Idle,
+    /// The other side has no work.
+    NoWork,
+    /// The phase's burst budget is spent.
+    Budget,
+    /// Decode preempted by FRESH prefill work (an interrupt begins).
+    Preempt,
+    /// The interrupt ran out of fresh work: resume the interrupted decode phase.
+    InterruptEnd,
+    /// The interrupt hit `V41_MS_PREEMPT_MAX_MS`: resume the interrupted decode phase.
+    InterruptCap,
+    /// A request starved past `V41_MS_STARVE_S`: a NORMAL prefill phase.
+    Starved,
+    /// Every live stream is stalled behind an in-flight prefill's reservation: a NORMAL prefill phase.
+    Stalled,
+}
+
+/// Everything `next_phase` decides from, read once per tick (live knobs included).
+#[derive(Clone, Copy, Debug)]
+struct PhaseSnap {
+    phase: Phase,
+    /// `phase_since.elapsed()` (for an interrupt: since the interrupt began).
+    in_phase: std::time::Duration,
+    /// The running interrupt's age, if one runs.
+    interrupt: Option<std::time::Duration>,
+    /// Since the last interrupt ended (None = never).
+    since_interrupt_end: Option<std::time::Duration>,
+    have_pf: bool,
+    have_dec: bool,
+    /// A FRESH prefill job is in flight (design 3.2).
+    fresh: bool,
+    starved: bool,
+    /// A window / group holds the prefill phase (design 3.1).
+    hold: bool,
+    budget_prefill: std::time::Duration,
+    budget_decode: std::time::Duration,
+    preempt: bool,
+    gap: std::time::Duration,
+    cap: std::time::Duration,
+}
+
+/// The phase decision (docs/v41/MS_PREFILL_PREEMPT_DESIGN.md 3.1-3.4): `(next phase, reason, an interrupt runs after)`.
+/// Pure, so the policy is unit-tested without a scheduler.
+fn next_phase(s: &PhaseSnap) -> (Phase, Reason, bool) {
+    match (s.have_pf, s.have_dec) {
+        (false, false) => (s.phase, Reason::Idle, s.interrupt.is_some()),
+        // No live stream: a NORMAL prefill phase (an interrupt has nothing to resume: cleared, review r2 MINOR-B ii).
+        (true, false) => (Phase::Prefill, if s.phase == Phase::Prefill && s.interrupt.is_none() { Reason::Keep } else { Reason::NoWork }, false),
+        (false, true) => (
+            Phase::Decode,
+            if s.interrupt.is_some() { Reason::InterruptEnd } else if s.phase == Phase::Decode { Reason::Keep } else { Reason::NoWork },
+            false,
+        ),
+        (true, true) => {
+            // Starvation first: a NORMAL prefill phase (an interrupt is cleared, not resumed: MINOR-B i).
+            if s.starved {
+                return (Phase::Prefill, Reason::Starved, false);
+            }
+            if let Some(age) = s.interrupt {
+                let over = !s.fresh || age >= s.cap;
+                if over && !s.hold {
+                    return (Phase::Decode, if s.fresh { Reason::InterruptCap } else { Reason::InterruptEnd }, false);
+                }
+                return (Phase::Prefill, if over { Reason::Hold } else { Reason::Keep }, true);
+            }
+            if s.phase == Phase::Decode && s.preempt && s.fresh && s.since_interrupt_end.is_none_or(|d| d >= s.gap) {
+                return (Phase::Prefill, Reason::Preempt, true);
+            }
+            let budget = match s.phase {
+                Phase::Prefill => s.budget_prefill,
+                Phase::Decode => s.budget_decode,
+            };
+            if s.in_phase < budget {
+                return (s.phase, Reason::Keep, false);
+            }
+            match s.phase {
+                Phase::Prefill if s.hold => (Phase::Prefill, Reason::Hold, false),
+                Phase::Prefill => (Phase::Decode, Reason::Budget, false),
+                Phase::Decode => (Phase::Prefill, Reason::Budget, false),
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct ProfileAcc {
@@ -752,6 +851,11 @@ struct Sched {
     /// (`finish_group`): since when, and units held. Logged (`hold_ms`,
     /// `hold_units`) on the `ms.phase` line that ends the burst.
     group_hold: Option<(Instant, u32)>,
+    /// A preemption INTERRUPT runs since (docs/v41/MS_PREFILL_PREEMPT_DESIGN.md 3.3); `int_saved_since` = the interrupted
+    /// decode phase's `phase_since` (resumed, shifted by the interrupt); `last_interrupt_end` gates the next preemption.
+    interrupt_since: Option<Instant>,
+    int_saved_since: Instant,
+    last_interrupt_end: Option<Instant>,
     arena: KvArena,
     dev: RowTablesDev,
     streams: Vec<Stream>,
@@ -1083,61 +1187,73 @@ impl Sched {
             if !started { break; }
         }
         for d in deferred.drain(..).rev() { self.queue.push_front(d); }
-        // Chunk or step? Bursts with hysteresis: stay in a phase until its
-        // budget elapses (V41_MS_PREFILL_BURST_MS / V41_MS_DECODE_BURST_MS,
-        // default 4000 each) or it runs out of work.
-        let have_pf = !self.prefills.is_empty();
-        let have_dec = !self.streams.is_empty();
-        // STARVATION RULE (2026-09-21): a request that has not started its
-        // prefill within `V41_MS_STARVE_S` (default 600) is prefilled before
-        // anything else -- the scheduler stays in the prefill phase, budget or
-        // not, until it is admitted; among starved requests the OLDEST goes
-        // first (admission order above). Everything else keeps the plain
-        // alternating bursts. `V41_MS_BURST_SCALE=1` additionally scales the
-        // bursts with the other side's backlog (decode / (1 + waiting
-        // prefills), prefill / (1 + live streams), floored).
-        // A request waiting for KV ROOM is not helped by prefilling (only
-        // decoding frees rows): it holds new admissions in the queue loop
-        // instead of forcing the prefill phase.
+        // Chunk or step? (docs/v41/MS_PREFILL_PREEMPT_DESIGN.md) Bursts with hysteresis (V41_MS_PREFILL_BURST_MS /
+        // V41_MS_DECODE_BURST_MS, live), the STARVATION RULE (V41_MS_STARVE_S: a request that has not started its prefill
+        // is prefilled before anything else; a request waiting for KV ROOM is not helped by prefilling), PREEMPTION of
+        // decode by FRESH prefill work (V41_MS_PREEMPT: a capped interrupt charged to neither burst), and one HOLD: no
+        // prefill phase ends inside an open window or a group-major group (3.1).
+        let snap = self.phase_snapshot();
+        let (next, reason, interrupt) = next_phase(&snap);
+        if reason == Reason::Idle {
+            return Ok(());
+        }
+        if reason == Reason::Hold {
+            let h = self.group_hold.get_or_insert((Instant::now(), 0));
+            h.1 += 1;
+        }
+        if next != self.phase || interrupt != self.interrupt_since.is_some() {
+            self.switch_phase(next, reason, interrupt, snap.starved);
+        }
+        match self.phase {
+            Phase::Prefill => {
+                // Keep the box-2 prefill band open (`b2_mirror::pin_prefill_tick`).
+                v4flash_kernels::het::b2_mirror::pin_prefill_tick();
+                self.prefill_tick(state)?
+            }
+            Phase::Decode => self.decode_step(state)?,
+        }
+        Ok(())
+    }
+
+    /// No prefill phase may end here (design 3.1): an open window (layer-outer or group-major: `checkpoint_ok` is false)
+    /// always holds; a mid-group group-major unit holds under `V41_MS_FINISH_GROUP` (review r2 MINOR-A).
+    fn hold(&self) -> bool {
+        self.prefills.iter().any(|p| !p.job.checkpoint_ok()) || (finish_group() && self.prefills.iter().any(|p| p.job.lm_mid_group()))
+    }
+
+    /// The per-tick decision snapshot (live knobs read once).
+    fn phase_snapshot(&self) -> PhaseSnap {
+        let starve = std::time::Duration::from_secs(knobs::MS_STARVE_S.get());
         let starved = self.queue.iter().any(|p| p.room_wait.is_none() && p.queued.elapsed() >= starve)
             || self.prefills.iter().any(|pf| !pf.job.chunks_done() && pf.p.queued.elapsed() >= starve);
         let scale = knobs::MS_BURST_SCALE.on();
         let waiting_pf = if scale { self.prefills.len() + self.queue.len() } else { 0 };
         let live = if scale { self.streams.len() } else { 0 };
-        let budget = |ph: Phase| std::time::Duration::from_millis(match ph {
-            Phase::Prefill => (knobs::MS_PREFILL_BURST_MS.usize() / (1 + live))
-                .max(knobs::MS_PREFILL_BURST_MIN_MS.usize()) as u64,
-            Phase::Decode => (knobs::MS_DECODE_BURST_MS.usize() / (1 + waiting_pf))
-                .max(knobs::MS_DECODE_BURST_MIN_MS.usize()) as u64,
-        });
-        let next = match (have_pf, have_dec) {
-            (true, false) => Phase::Prefill,
-            (false, true) => Phase::Decode,
-            (false, false) => return Ok(()),
-            (true, true) => {
-                if starved {
-                    Phase::Prefill
-                } else if self.phase_since.elapsed() >= budget(self.phase) {
-                    match self.phase {
-                        // Not in the middle of a layer-major group: its next
-                        // unit needs the box-2 experts the group's earlier units
-                        // just paged (`PrefillJob::lm_mid_group`). At most the
-                        // rest of one group's sub-chunks (under one window's
-                        // rows through <= 6 layers; the sticky job selection in
-                        // `prefill_tick` runs exactly that job's next unit).
-                        Phase::Prefill if finish_group() && self.prefills.iter().any(|p| p.job.lm_mid_group()) => {
-                            let h = self.group_hold.get_or_insert((Instant::now(), 0));
-                            h.1 += 1;
-                            Phase::Prefill
-                        }
-                        Phase::Prefill => Phase::Decode,
-                        Phase::Decode => Phase::Prefill,
-                    }
-                } else {
-                    self.phase
-                }
-            }
-        };
+        let ms = std::time::Duration::from_millis;
+        let fresh_ms = ms(knobs::MS_PREEMPT_FRESH_MS.get());
+        PhaseSnap {
+            phase: self.phase,
+            in_phase: self.phase_since.elapsed(),
+            interrupt: self.interrupt_since.map(|t| t.elapsed()),
+            since_interrupt_end: self.last_interrupt_end.map(|t| t.elapsed()),
+            have_pf: !self.prefills.is_empty(),
+            have_dec: !self.streams.is_empty(),
+            fresh: self.prefills.iter().any(|p| p.service < fresh_ms),
+            starved,
+            hold: self.hold(),
+            budget_prefill: ms((knobs::MS_PREFILL_BURST_MS.usize() / (1 + live)).max(knobs::MS_PREFILL_BURST_MIN_MS.usize()) as u64),
+            budget_decode: ms((knobs::MS_DECODE_BURST_MS.usize() / (1 + waiting_pf)).max(knobs::MS_DECODE_BURST_MIN_MS.usize()) as u64),
+            preempt: knobs::MS_PREEMPT.on(),
+            gap: ms(knobs::MS_PREEMPT_GAP_MS.get()),
+            cap: ms(knobs::MS_PREEMPT_MAX_MS.get()),
+        }
+    }
+
+    /// Every phase change goes through here: box-2 pin band / hint / soft-map bookkeeping, the `ms.phase` line and
+    /// `hub_phase` record, and the interrupt state (design 3.3: entering saves the decode phase's start; ending by
+    /// `InterruptEnd` / `InterruptCap` resumes it shifted by the interrupt; any other end clears it unshifted).
+    fn switch_phase(&mut self, next: Phase, reason: Reason, interrupt: bool, starved: bool) {
+        let now = Instant::now();
         if next != self.phase {
             // Box-2 pinning (`V41_B2_PIN`): a prefill phase gets a band of
             // unpinned slots, and the next decode phase restores what it released.
@@ -1158,29 +1274,44 @@ impl Sched {
                     v4flash_kernels::het::b2_mirror::pin_enter_decode(),
                 ),
             };
-            tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(),
-                burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, starved,
+            tracing::info!(from = ?self.phase, to = ?next, reason = ?reason, interrupt, live = self.streams.len(), prefills = self.prefills.len(),
+                queued = self.queue.len(), burst_ms = self.phase_since.elapsed().as_millis() as u64, starved,
                 pin_released, pin_restore, hold_units = self.group_hold.map_or(0, |h| h.1),
                 hold_ms = self.group_hold.map_or(0, |h| h.0.elapsed().as_millis() as u64), "ms.phase");
             let code = |p: &Phase| match p { Phase::Decode => 0.0, Phase::Prefill => 1.0 };
             v4flash_kernels::het::evtrace::emit(&v4flash_kernels::het::evtrace_kinds::HUB_PHASE, &[
                 v4flash_kernels::het::evtrace::now(), code(&self.phase), code(&next), self.streams.len() as f64,
                 self.prefills.len() as f64, self.queue.len() as f64, self.phase_since.elapsed().as_secs_f64() * 1e3,
-                budget(next).as_secs_f64() * 1e3, f64::from(u8::from(starved)), pin_released as f64, pin_restore as f64,
+                0.0, f64::from(u8::from(starved)), pin_released as f64, pin_restore as f64,
             ]);
-            self.phase = next;
-            self.phase_since = Instant::now();
             self.group_hold = None;
+        } else {
+            tracing::info!(phase = ?next, reason = ?reason, interrupt, "ms.phase interrupt state");
         }
-        match self.phase {
-            Phase::Prefill => {
-                // Keep the box-2 prefill band open (`b2_mirror::pin_prefill_tick`).
-                v4flash_kernels::het::b2_mirror::pin_prefill_tick();
-                self.prefill_tick(state)?
+        match (self.interrupt_since, interrupt) {
+            (None, true) => {
+                self.int_saved_since = self.phase_since;
+                self.interrupt_since = Some(now);
+                self.phase_since = now;
             }
-            Phase::Decode => self.decode_step(state)?,
+            (Some(t), false) => {
+                self.interrupt_since = None;
+                self.last_interrupt_end = Some(now);
+                self.phase_since = if next == Phase::Decode && matches!(reason, Reason::InterruptEnd | Reason::InterruptCap) {
+                    // Resume the interrupted decode phase: its budget is not charged for the interrupt.
+                    self.int_saved_since + t.elapsed()
+                } else {
+                    now
+                };
+            }
+            (Some(_), true) => {}
+            (None, false) => {
+                if next != self.phase {
+                    self.phase_since = now;
+                }
+            }
         }
-        Ok(())
+        self.phase = next;
     }
 
     /// Probe the snapshot index, restore the longest prefix into the scratch
@@ -1293,7 +1424,7 @@ impl Sched {
             Ok(v) => v,
             Err(e) => return Err((p, kv, e)),
         };
-        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, prefilled_marker, engram_ahead: EngramAhead::default() };
+        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, prefilled_marker, engram_ahead: EngramAhead::default(), service: std::time::Duration::ZERO };
         if prefilled_marker.is_some() {
             pf.p.trailing_marker = None; // consumed (`admit_stream` reads `prefilled_marker`)
         }
@@ -1312,12 +1443,29 @@ impl Sched {
         // window closes: alternating units between two jobs would make box 2's
         // pool hold both jobs' group unions at once, which is the paging the
         // window exists to avoid. Otherwise round-robin as before.
+        let fresh_ms = std::time::Duration::from_millis(knobs::MS_PREEMPT_FRESH_MS.get());
+        let aging = std::time::Duration::from_secs(knobs::MS_AGING_S.get());
+        let fresh_first = knobs::MS_PREEMPT.on();
         let i = match self.prefills.iter().position(|p| !p.job.checkpoint_ok()) {
             Some(j) => j,
             None => {
-                let i = self.rr % self.prefills.len();
-                self.rr = self.rr.wrapping_add(1);
-                i
+                // Preemption (design 3.4): an AGED fresh job, then fresh jobs by fewest remaining rows; then round-robin.
+                let fresh = || self.prefills.iter().enumerate().filter(|(_, p)| p.service < fresh_ms);
+                let pick = if !fresh_first {
+                    None
+                } else if let Some((j, _)) = fresh().filter(|(_, p)| p.p.queued.elapsed() >= aging).max_by_key(|(_, p)| p.p.queued.elapsed()) {
+                    Some(j)
+                } else {
+                    fresh().min_by_key(|(_, p)| p.job.total().saturating_sub(p.job.done_rows())).map(|(j, _)| j)
+                };
+                match pick {
+                    Some(j) => j,
+                    None => {
+                        let i = self.rr % self.prefills.len();
+                        self.rr = self.rr.wrapping_add(1);
+                        i
+                    }
+                }
             }
         };
         let mut pf = self.prefills.remove(i);
@@ -1364,7 +1512,17 @@ impl Sched {
         // only; the live streams keep going. The engine-level drain/redial is
         // still done, since a box-2 fault leaves tickets in flight.
         let (tx, slot) = (pf.p.tx.clone(), pf.slot);
-        match self.prefill_job_tick(state, pf, i) {
+        if pf.service.is_zero() {
+            tracing::info!(slot, prompt = pf.job.total(), start_wait_ms = pf.p.queued.elapsed().as_millis() as u64,
+                interrupt = self.interrupt_since.is_some(), "multistream: prefill start");
+        }
+        let t_unit = Instant::now();
+        let r = self.prefill_job_tick(state, pf, i);
+        // SERVICE (design 3.2): the unit's wall time, finish/replay included; a finished job has already left `prefills`.
+        if let Some(q) = self.prefills.iter_mut().find(|q| q.slot == slot) {
+            q.service += t_unit.elapsed();
+        }
+        match r {
             Ok(()) => Ok(()),
             Err((kv, e)) => {
                 tracing::error!(error = %e, "multistream: prefill failed; failing that request only");
@@ -1571,7 +1729,7 @@ impl Sched {
         }
         if let Err(e) = self.arena.fill_reserved(slot, &pf.kv, pos, &state.engine.dgpu.compute) { return Err((Some(pf.kv), e)); }
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
-        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, prefilled_marker, engram_ahead: _ } = pf;
+        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, prefilled_marker, engram_ahead: _, service: _ } = pf;
         self.spare_states.push(kv_done);
         let pf = PrefillDone { p: pp, job, prefix, compressed, started, prefilled_marker };
         self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
@@ -1629,10 +1787,9 @@ impl Sched {
             // reservation: run the prefill (it becomes a runnable stream)
             // instead of spinning here until the decode burst ends.
             if !self.prefills.is_empty() && self.phase == Phase::Decode {
-                let pin_released = v4flash_kernels::het::b2_mirror::pin_enter_prefill();
-                tracing::info!(stalled = stalled.len(), prefills = self.prefills.len(), pin_released, "multistream: every stream stalled; prefill phase");
-                self.phase = Phase::Prefill;
-                self.phase_since = Instant::now();
+                tracing::info!(stalled = stalled.len(), prefills = self.prefills.len(), "multistream: every stream stalled; prefill phase");
+                // A NORMAL prefill phase through the one switch (design 3.6): pins, hints, log, interrupt state cleared.
+                self.switch_phase(Phase::Prefill, Reason::Stalled, false, false);
             }
             Ok(())
         } else {
@@ -3028,5 +3185,68 @@ mod engram_ahead_tests {
         check(&rows, 2500, 3300);
         // The partly consumed block counts only its unconsumed rest.
         assert_eq!(ahead.cached_rows(), 700);
+    }
+}
+
+/// The phase decision (`next_phase`, docs/v41/MS_PREFILL_PREEMPT_DESIGN.md sec 6).
+#[cfg(test)]
+mod next_phase_tests {
+    use super::*;
+    use std::time::Duration as D;
+
+    fn snap() -> PhaseSnap {
+        PhaseSnap {
+            phase: Phase::Decode, in_phase: D::from_millis(500), interrupt: None, since_interrupt_end: None,
+            have_pf: true, have_dec: true, fresh: true, starved: false, hold: false,
+            budget_prefill: D::from_secs(120), budget_decode: D::from_secs(30),
+            preempt: true, gap: D::from_secs(2), cap: D::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn preempts_decode_for_fresh_work_only_after_the_gap() {
+        assert_eq!(next_phase(&snap()), (Phase::Prefill, Reason::Preempt, true), "fresh work, no previous interrupt");
+        let s = PhaseSnap { since_interrupt_end: Some(D::from_millis(500)), ..snap() };
+        assert_eq!(next_phase(&s), (Phase::Decode, Reason::Keep, false), "inside the gap");
+        let s = PhaseSnap { since_interrupt_end: Some(D::from_secs(3)), ..snap() };
+        assert_eq!(next_phase(&s).1, Reason::Preempt);
+        let s = PhaseSnap { fresh: false, ..snap() };
+        assert_eq!(next_phase(&s), (Phase::Decode, Reason::Keep, false), "continuing work waits for the budget");
+        let s = PhaseSnap { preempt: false, ..snap() };
+        assert_eq!(next_phase(&s), (Phase::Decode, Reason::Keep, false), "off: today's bursts");
+    }
+
+    #[test]
+    fn interrupt_ends_on_no_fresh_work_or_the_cap_never_under_a_hold() {
+        let s = PhaseSnap { phase: Phase::Prefill, interrupt: Some(D::from_secs(3)), in_phase: D::from_secs(3), ..snap() };
+        assert_eq!(next_phase(&s), (Phase::Prefill, Reason::Keep, true));
+        let s2 = PhaseSnap { fresh: false, ..s };
+        assert_eq!(next_phase(&s2), (Phase::Decode, Reason::InterruptEnd, false));
+        let s3 = PhaseSnap { interrupt: Some(D::from_secs(11)), ..s };
+        assert_eq!(next_phase(&s3), (Phase::Decode, Reason::InterruptCap, false));
+        // An open (layer-outer) window holds the interrupt past both.
+        assert_eq!(next_phase(&PhaseSnap { hold: true, ..s2 }), (Phase::Prefill, Reason::Hold, true));
+        assert_eq!(next_phase(&PhaseSnap { hold: true, ..s3 }), (Phase::Prefill, Reason::Hold, true));
+        // No prefill work left at all: back to decode, an interrupt end.
+        assert_eq!(next_phase(&PhaseSnap { have_pf: false, ..s }), (Phase::Decode, Reason::InterruptEnd, false));
+    }
+
+    #[test]
+    fn other_exits_clear_the_interrupt() {
+        let s = PhaseSnap { phase: Phase::Prefill, interrupt: Some(D::from_secs(1)), ..snap() };
+        assert_eq!(next_phase(&PhaseSnap { starved: true, ..s }), (Phase::Prefill, Reason::Starved, false), "starvation: a normal phase");
+        assert_eq!(next_phase(&PhaseSnap { have_dec: false, ..s }), (Phase::Prefill, Reason::NoWork, false), "no stream to resume");
+    }
+
+    #[test]
+    fn budgets_and_the_hold_as_today() {
+        let s = PhaseSnap { fresh: false, in_phase: D::from_secs(31), ..snap() };
+        assert_eq!(next_phase(&s), (Phase::Prefill, Reason::Budget, false));
+        let p = PhaseSnap { phase: Phase::Prefill, in_phase: D::from_secs(121), ..snap() };
+        assert_eq!(next_phase(&p), (Phase::Decode, Reason::Budget, false));
+        assert_eq!(next_phase(&PhaseSnap { hold: true, ..p }), (Phase::Prefill, Reason::Hold, false), "an open window is never cut");
+        assert_eq!(next_phase(&PhaseSnap { starved: true, ..s }), (Phase::Prefill, Reason::Starved, false));
+        assert_eq!(next_phase(&PhaseSnap { have_pf: false, have_dec: false, ..s }).1, Reason::Idle);
+        assert_eq!(next_phase(&PhaseSnap { have_dec: false, ..s }), (Phase::Prefill, Reason::NoWork, false));
     }
 }
