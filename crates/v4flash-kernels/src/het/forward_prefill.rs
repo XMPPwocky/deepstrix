@@ -1001,6 +1001,10 @@ fn chunk_visibility(pos0: u32, b: usize, spans: &[ImageSpan]) -> eyre::Result<Op
 /// logits are taken. `engram_rows`: one flattened `[T * ENGRAM_IN]` buffer per
 /// Engram layer for the whole prompt.
 pub struct PrefillJob {
+    /// Pinned staging of a layer-outer window's Engram rows, one buffer per `ENGRAM_LAYERS` entry, `window rows x
+    /// ENGRAM_IN` f32 each (`V41_LM_ENGRAM_ASYNC`). A unit's slot is copied to the device asynchronously on the dGPU
+    /// compute stream; slots are rewritten only by the NEXT window, after the pass's closing synchronize.
+    engram_pin: Vec<v4flash_hip::PinnedBuffer<f32>>,
     tokens: Vec<i32>,
     input_hcs: Vec<Vec<f32>>,
     engram_rows: Option<Vec<Vec<f32>>>,
@@ -1088,6 +1092,7 @@ impl PrefillJob {
             split: None,
             split_tried: false,
             lo_latch: std::sync::atomic::AtomicU8::new(0),
+            engram_pin: Vec::new(),
             chunk_inputs: None,
         })
     }
@@ -1668,6 +1673,39 @@ impl HeterogeneousEngine {
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.dgpu.device)?;
 
+        // Engram rows of this pass's Engram layers -> the job's pinned staging, one slot per unit (V41_LM_ENGRAM_ASYNC).
+        let engram_here: Vec<usize> = crate::config::ENGRAM_LAYERS
+            .iter()
+            .enumerate()
+            .filter(|(_, &el)| (el as usize) >= a && (el as usize) < b_end && (el as usize) < split)
+            .map(|(li, _)| li)
+            .collect();
+        let engram_async = crate::knobs::LM_ENGRAM_ASYNC.on() && !engram_here.is_empty();
+        if engram_async {
+            let need = win_rows * ein;
+            while job.engram_pin.len() < crate::config::ENGRAM_LAYERS.len() {
+                job.engram_pin.push(v4flash_hip::PinnedBuffer::<f32>::new(need)?);
+            }
+            for &li in &engram_here {
+                if job.engram_pin[li].len() < need {
+                    job.engram_pin[li] = v4flash_hip::PinnedBuffer::<f32>::new(need)?;
+                }
+                let src: &[f32] = match (lazy, engram_win.as_deref(), job.engram_rows.as_deref()) {
+                    (true, Some(w), _) => &w[li],
+                    (false, _, Some(rs)) => &rs[li],
+                    _ => return Err(eyre!("layer-outer: Engram layer in pass [{a}, {b_end}) but no Engram rows")),
+                };
+                let dst = job.engram_pin[li].as_mut_slice();
+                for un in &units {
+                    let s0 = if lazy { un.row0 } else { un.tok0 } * ein;
+                    let n = un.rows * ein;
+                    if src.len() < s0 + n {
+                        return Err(eyre!("layer-outer: Engram rows hold {} floats, unit needs [{s0}..{})", src.len(), s0 + n));
+                    }
+                    dst[un.row0 * ein..un.row0 * ein + n].copy_from_slice(&src[s0..s0 + n]);
+                }
+            }
+        }
         let n_tasks = (b_end - a) * u_count;
         let ops = sch::ops(n_tasks, |t| sch::task(t, a, u_count).0 != split);
         let pos0_job = job.pos0;
@@ -1675,6 +1713,7 @@ impl HeterogeneousEngine {
         let spans: &[ImageSpan] = &job.image_spans;
         let input_hcs: &[Vec<f32>] = &job.input_hcs;
         let engram_job: Option<&[Vec<f32>]> = job.engram_rows.as_deref();
+        let engram_pin: &[v4flash_hip::PinnedBuffer<f32>] = &job.engram_pin;
         let (res, carry, _) = job.lm_store.as_mut().expect("checked above");
         let (sel_store, nsp_store, _) = job.lm_idx.as_mut().expect("allocated above");
         let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch); 2] = [(bd_a, bi_a), (bd_b, bi_b)];
@@ -1731,9 +1770,22 @@ impl HeterogeneousEngine {
                         bd.indexer_nsparse_saved.slice_view_mut(0, un.rows).copy_from_buffer_async(&nsp_store.slice_view(un.row0, un.rows), &de.compute)?;
                     }
                     // -- Engram rows (layers 1 and 14) --
-                    match (lazy, engram_win.as_deref()) {
-                        (true, w) => self.stage_engram_lane(bd, l, w, un.row0, un.rows)?,
-                        (false, _) => self.stage_engram_lane(bd, l, engram_job, un.tok0, un.rows)?,
+                    let li_async = crate::config::ENGRAM_LAYERS.iter().position(|&el| el as usize == l).filter(|li| engram_async && engram_here.contains(li));
+                    if let Some(li) = li_async {
+                        // async: the pinned slot -> the lane's Engram rows, ordered before this unit's Engram kernels on
+                        // de.compute (no host-side drain of the device)
+                        let n = un.rows * ein;
+                        if n > bd.engram_rows.len() {
+                            return Err(eyre!("layer-outer: {} Engram rows exceed the lane's {}", un.rows, bd.engram_rows.len() / ein));
+                        }
+                        bd.engram_rows.slice_view_mut(0, n)
+                            .copy_from_host_async(&engram_pin[li].as_slice()[un.row0 * ein..un.row0 * ein + n], &de.compute)?;
+                        bd.engram_rows_ready = true;
+                    } else {
+                        match (lazy, engram_win.as_deref()) {
+                            (true, w) => self.stage_engram_lane(bd, l, w, un.row0, un.rows)?,
+                            (false, _) => self.stage_engram_lane(bd, l, engram_job, un.tok0, un.rows)?,
+                        }
                     }
                     let tokens_u = &job_tokens[un.tok0..un.tok0 + un.rows];
                     self.forward_layer_pre_moe_v2(

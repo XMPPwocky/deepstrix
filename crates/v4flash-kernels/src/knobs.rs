@@ -701,6 +701,12 @@ crate::knobs! {
     /// `V41_LM_QUANTUM_LAYERS` (default 4, 1..=20; live): layers per scheduler-visible pass of a layer-outer window. Read per
     /// pass from the window's layer cursor, so a change is safe mid-window.
     pub static LM_QUANTUM_LAYERS = Knob::int("V41_LM_QUANTUM_LAYERS", 4, 1, 20).live();
+    /// `V41_LM_ENGRAM_ASYNC` (default ON; LIVE): a layer-outer pass stages each unit's Engram rows (layers 1 and 14)
+    /// through the job's PINNED staging with an async copy on the dGPU compute stream, instead of the blocking
+    /// `copy_from_host` that drained the whole device (and the two-lane pipeline with it) at every Engram unit: measured
+    /// 10-11 at 1024-row lanes, 39% of each window had no box-2 request outstanding, in two gaps at the Engram layers.
+    /// Same bytes, same stream order -> bit-identical. `0` = the blocking path.
+    pub static LM_ENGRAM_ASYNC = Knob::flag("V41_LM_ENGRAM_ASYNC", true).live();
     /// `V41_PREFILL_SPLIT` (default off; LIVE): the frozen encoder-layer expert split of a LONG job
     /// (`prefill_split`, design sec 4). Read once per job at its first unit; a flip affects the next long job only.
     pub static PREFILL_SPLIT = Knob::flag("V41_PREFILL_SPLIT", false).live();
