@@ -1,4 +1,4 @@
-# Multistream scheduler: preempt decode for FRESH prefills (design, rev 2, 2026-10-11)
+# Multistream scheduler: preempt decode for FRESH prefills (design, rev 2 APPROVED (Fable r2), 2026-10-11)
 
 Owner 10-11: "preempt definitely, interleaving sounds bad bc eviction". Interleaving decode steps INSIDE a prefill
 window is out of scope -- and rev 2 closes the places where today's code already does it (3.1).
@@ -37,7 +37,10 @@ step ever runs inside an open prefill window.
 phase BETWEEN passes of one window: decode steps inside a window, box 2 evicts the window's set, the next pass re-pages
 it. One predicate, used by EVERY path that ends a prefill phase (budget end, interrupt end/cap, embed gate):
 
-    hold = finish_group() && prefills.iter().any(|p| !p.job.checkpoint_ok() || p.job.lm_mid_group())
+    hold = prefills.iter().any(|p| !p.job.checkpoint_ok()) || (finish_group() && prefills.iter().any(|p| p.job.lm_mid_group()))
+
+(review r2 MINOR-A: the OPEN-WINDOW half is unconditional; `V41_MS_FINISH_GROUP` keeps gating only the group-major
+hold it documents.)
 
 (`checkpoint_ok` = no window open.) Bound: one window (3.6-4 s steady at 1024-row lanes, ~9 s cold) or the rest of
 one group-major group. The starvation rule still wins (it only ever forces PREFILL).
@@ -66,6 +69,10 @@ fresh work: GAP / (GAP + MAX + hold) ~ 2 / (2 + 10 + 4) = ~12%; with FRESH_MS = 
 interrupts before it becomes continuing.
 
 A NORMAL (budgeted) prefill phase is unchanged except job selection (3.4); fresh jobs simply run first in it.
+
+Every OTHER exit from an interrupt clears it WITHOUT shifting `phase_since` (review r2 MINOR-B): (i) starvation while an
+interrupt runs -> reason `starved`, a NORMAL prefill phase from now (`phase_since = now`); (ii) all live streams
+finish during an interrupt (`have_dec` false) -> a NORMAL prefill phase, nothing to resume; (iii) `stalled` (3.6).
 
 ### 3.4 Job selection inside a prefill phase (review r1 MINOR-7)
 
