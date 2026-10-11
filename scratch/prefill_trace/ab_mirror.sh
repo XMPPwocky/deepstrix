@@ -4,8 +4,8 @@
 #   ab_mirror.sh [SLOT_S=900] [N_SLOTS=8] > ~/ab_mirror.log 2>&1
 set -u
 SLOT=${1:-900}; N=${2:-8}
-ARM_A=1.0; ARM_B=0.70
-OUT=/home/claude-code/logs/ab_mirror_20261011.txt
+ARM_A=${ARM_A:-1.0}; ARM_B=${ARM_B:-0.70}
+OUT=${OUT:-/home/claude-code/logs/ab_mirror_20261011.txt}
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 10.43.0.95"
 setv() {
   $SSH "K=~/expertd-knobs.txt; sed 's/^mirror_frac=.*/mirror_frac=$1/' \$K > \$K.tmp.\$\$ && mv \$K.tmp.\$\$ \$K && grep -q '^mirror_frac=$1\$' \$K" \
