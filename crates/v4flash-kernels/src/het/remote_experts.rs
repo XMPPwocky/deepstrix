@@ -1839,6 +1839,26 @@ impl PfQueue {
         self.cv.notify_all();
     }
 
+    /// A PROMOTED readahead job still queued without a set while every readahead
+    /// set is taken: give it `set` (a general one; a certain word may use any,
+    /// `pick_set`), so a general reader starts it now instead of after a
+    /// paused readahead read frees a set (review r4 MINOR-1). Returns false
+    /// (the caller keeps `set`) when the job is not queued, not set-less, not
+    /// certain, or a readahead set is free.
+    fn assign_set_if_starved(&self, layer: u32, e: u32, set: usize) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if !g.ra_free.is_empty() {
+            return false;
+        }
+        let Some(j) = g.jobs.iter_mut().find(|j| j.layer == layer && j.e == e && j.readahead && j.certain && j.set == NO_SET) else {
+            return false;
+        };
+        j.set = set;
+        drop(g);
+        self.cv.notify_all();
+        true
+    }
+
     /// A readahead set is free again (its read landed, or failed / was stale).
     fn release_ra_set(&self, set: usize) {
         debug_assert!(set != NO_SET);
@@ -2249,6 +2269,16 @@ struct B2Prefetch {
 }
 
 impl B2Prefetch {
+    /// After a successful `promote` of `(layer, e)`: a set-less readahead job
+    /// with no readahead set free gets a general set (review r4 MINOR-1).
+    fn feed_promoted(&mut self, layer: u32, e: u32) {
+        if let Some(set) = self.free.pop() {
+            if !self.queue.assign_set_if_starved(layer, e, set) {
+                self.free.push(set);
+            }
+        }
+    }
+
     /// A read is done with `set`: back to the list it came from.
     fn release_set(&mut self, set: usize) {
         if set >= self.ra_start {
@@ -5731,6 +5761,7 @@ impl ExpertShard {
                 // speculative queue.
                 if certain && pf.queue.promote(key.0, key.1) {
                     pf.promoted += 1;
+                    pf.feed_promoted(key.0, key.1);
                 }
                 continue;
             }
@@ -5760,6 +5791,9 @@ impl ExpertShard {
         if readahead {
             for key in pf.queue.trim_readahead(knobs::readahead_queue()) {
                 pf.pending.remove(&key);
+                // Dropped, not hinted (as a word refused at arrival used to be).
+                pf.hinted -= 1;
+                pf.ra_hinted -= 1;
                 pf.dropped += 1;
                 pf.ra_dropped += 1;
                 dropped_words.push((key.0 << 16) | key.1);
@@ -5954,6 +5988,7 @@ impl ExpertShard {
         for &e in want {
             if pf.pending.contains(&(cur_layer, e)) && pf.queue.promote(cur_layer, e) {
                 pf.promoted += 1;
+                pf.feed_promoted(cur_layer, e);
             }
         }
         // Under urgency routing a request never waits on a speculative read
@@ -11212,6 +11247,25 @@ mod tests {
         assert_eq!((free.len(), likely.len()), (6, 2), "general and LIKELY sets untouched");
         assert_eq!(pick_set_ra(&mut free, &mut likely, true, false, true, 1), Some(5), "certain: a general set");
         assert_eq!(pick_set_ra(&mut free, &mut likely, false, false, false, 1), Some(4), "speculative: unchanged");
+    }
+
+    /// A promoted set-less readahead job gets a general set only while no readahead set is free (review r4 MINOR-1).
+    #[test]
+    fn assign_set_if_starved_only_when_starved() {
+        let job = |e: u32| PfJob { layer: 9, e, set: NO_SET, certain: false, stage: false, own_prefill: false, prefill: true, restore: 0, likely: false, roles: ROLES_ALL, readahead: true, t_hint: Instant::now() };
+        let q = PfQueue::with_readers(3, 4);
+        q.push(job(1));
+        q.push(job(2));
+        assert!(!q.assign_set_if_starved(9, 1, 5), "not promoted");
+        assert!(q.promote(9, 1));
+        q.set_ra_free(vec![8]);
+        assert!(!q.assign_set_if_starved(9, 1, 5), "a readahead set is free");
+        q.set_ra_free(vec![]);
+        assert!(q.assign_set_if_starved(9, 1, 5));
+        assert!(!q.assign_set_if_starved(9, 1, 4), "already has a set");
+        // A general reader takes it now, with the general set.
+        let j = q.pop_role(false, None).unwrap();
+        assert_eq!((j.e, j.set, j.certain), (1, 5, true));
     }
 
     /// `trim_readahead` drops the OLDEST queued not-certain readahead jobs beyond the cap, nothing else.
