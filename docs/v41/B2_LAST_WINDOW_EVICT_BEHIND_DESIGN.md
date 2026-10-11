@@ -155,3 +155,15 @@ single window usually needs no decode victim at all; start the A/B at B = 0 vs M
    end the phase mid-window, so the last window's remaining passes start a NEW phase (fresh budgets; stale = the
    window's own earlier pages = tier 1, evicted first)? Probably desirable here.
 4. Should the replay's own claims also prefer encoder own pages over FREE slots? (No: free is free.)
+
+## 7. Result (deployed 2026-10-11 10:58 UTC, hub d7357c2b + box 2 0f2b0ac0 = 7e2e0407; code review APPROVE)
+
+A/B `prefill_budget_last` 0 vs OFF, 20-min alternation, 11:00-13:21 UTC (`scratch/prefill_trace/ab_last.sh`,
+`ab_mirror_eval.py`; bootstrap 95% CI, ON - OFF):
+* replay p50 1.30-1.40 s vs 3.30 s: **-2.00 s [-2.20, -1.80]**;
+* decode tok/s 44.3 vs 41.0: **+3.3 [+2.1, +4.6]** (+8%); accept 0.743 vs 0.703; step_ms +1.2 [-0.3, +2.9];
+* steady windows +0.10 s [-0.22, +0.41] (none); first windows +0.87 s [-0.21, +2.11] (unresolved; total box-2
+  victims per phase about equal, ~4.8K vs ~5.2K, so not extra re-reads);
+* box-2 phase counters: last-unit decode victims 0 (ON) vs 1,839 per phase (OFF); own recycled 3,840 vs 2,460.
+Net per single-unit turn: TTFT ~-1.1 s even if the first-window cost is real, decode +8%.
+**ADOPTED 13:22 UTC (owner): `prefill_budget_last=0` in box 2's `~/expertd-knobs.txt`** (live; remove the line = OFF).
