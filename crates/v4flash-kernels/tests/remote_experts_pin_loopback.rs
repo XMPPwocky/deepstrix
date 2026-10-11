@@ -23,10 +23,13 @@
 //! experts per layer and 16-row park passes. Each miss reads one 18.8 MB
 //! expert from this box's disk (O_DIRECT): a few hundred per run.
 //!
-//! READAHEAD (docs/v41/B2_READAHEAD_LANE_DESIGN.md 2.2-2.3): every prefill-shaped
-//! (20-row) request carries two read-ahead words for the next layer, so the
-//! readahead class (own sets + readers) runs during parked prefill passes and
-//! lands in the GPU-drain poll / idle wait under the same pin assertions.
+//! READAHEAD (docs/v41/B2_READAHEAD_LANE_DESIGN.md 2.2-2.3): a THIRD run, pinning off, replays the same stream
+//! with two next-layer read-ahead words on every prefill-shaped (20-row) request, so the readahead class (own sets
+//! + readers) runs during parked prefill passes and lands in the GPU-drain poll / idle wait. Asserts: partials
+//! BIT-IDENTICAL to the OFF run (a prefetch never changes what box 2 computes), readahead words queued, and
+//! (fatal, `V41_B2_ASSERT_PINNED`) no pinned eviction. Runs 1-2 keep the original stream and bars: read-ahead
+//! landings make a prefill pass's picks resident ahead of it, which lowers the staging-claim / paging counts those
+//! bars measure (10-11 window: claims 6 vs > 10 with the words in runs 1-2).
 //!
 //! Run (box 1, one GPU test process at a time):
 //!   CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release -p v4flash-kernels \
@@ -153,15 +156,7 @@ fn gen_stream(seed: u64) -> Vec<Vec<(Spec, Spec, bool)>> {
                     }
                 }
                 let xq: Vec<u8> = (0..b).flat_map(|_| q8k_row(rng)).collect();
-                let admit = if b == 20 {
-                    // Read-ahead words (prefill-shaped request): the next layer's.
-                    let next = LAYERS[(LAYERS.iter().position(|&l| l == layer).unwrap() + 1) % LAYERS.len()];
-                    vec![(next << 16) | zipf(rng, next), (next << 16) | zipf(rng, next)]
-                } else if rng.below(8) == 0 {
-                    vec![(layer << 16) | zipf(rng, layer)]
-                } else {
-                    Vec::new()
-                };
+                let admit = if rng.below(8) == 0 { vec![(layer << 16) | zipf(rng, layer)] } else { Vec::new() };
                 Spec { layer, b, xq, sel, ew, partner, admit }
             };
             let a = lane(&mut rng, true);
@@ -271,9 +266,10 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     let addr = listener.local_addr()?.to_string();
     let (tx_ready, rx_ready) = mpsc::channel::<eyre::Result<()>>();
     // Per connection: the pin counters, and the pool's staging counters + size.
-    // + the readahead counters (hinted, dropped, running, queued).
+    let (tx_pins, rx_pins) = mpsc::channel::<(Option<(PinCounters, u32, u32, u32)>, StageCounters, usize)>();
+    // After the third (readahead) run: the readahead counters (hinted, dropped, running, queued) + pin counters.
     type Ra = Option<(u64, u64, usize, usize)>;
-    let (tx_pins, rx_pins) = mpsc::channel::<(Option<(PinCounters, u32, u32, u32)>, StageCounters, usize, Ra)>();
+    let (tx_ra, rx_ra) = mpsc::channel::<(Ra, Option<(PinCounters, u32, u32, u32)>)>();
     let daemon = std::thread::spawn(move || -> eyre::Result<()> {
         let setup = (|| -> eyre::Result<(ExpertShard, MoeExecutor)> {
             let hf = V41HfWeights::open(&dir, None)?;
@@ -298,8 +294,13 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
         for _ in 0..2 {
             let (stream, _) = listener.accept()?;
             serve_connection(stream, &mut shard, &mut exec, &opts, None)?;
-            tx_pins.send((shard.pin_counters(), shard.stage_counters(), shard.stage_slots(), shard.readahead_stats())).unwrap();
+            tx_pins.send((shard.pin_counters(), shard.stage_counters(), shard.stage_slots())).unwrap();
         }
+        let ra0 = shard.readahead_stats();
+        let (stream, _) = listener.accept()?;
+        serve_connection(stream, &mut shard, &mut exec, &opts, None)?;
+        let ra1 = shard.readahead_stats();
+        tx_ra.send((ra0.zip(ra1).map(|(a, b)| (b.0 - a.0, b.1 - a.1, b.2, b.3)), shard.pin_counters())).unwrap();
         Ok(())
     });
     rx_ready.recv()??;
@@ -307,11 +308,35 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     let stream = gen_stream(0x5eed_0001_b2b2_0001);
     let n_req: usize = stream.iter().map(|s| 2 * s.len()).sum();
     let off = run(&addr, &stream, false)?;
-    let (pins_off, sc_off, stage_slots, ra_off) = rx_pins.recv()?;
+    let (pins_off, sc_off, stage_slots) = rx_pins.recv()?;
     let (s0, h0, r0) = b2_mirror::pin_totals();
     let on = run(&addr, &stream, true)?;
-    let (pins_on, sc_on, _, ra_on) = rx_pins.recv()?;
+    let (pins_on, sc_on, _) = rx_pins.recv()?;
     let (s1, h1, r1) = b2_mirror::pin_totals();
+    // Release words of run 2 still queued on the hub (taken now: run 3 is pin-off).
+    let unsent = b2_mirror_unsent();
+    // Run 3: the same stream + read-ahead words on the prefill-shaped requests (own Rng: runs 1-2 unchanged).
+    let mut rr = Rng(0x5eed_0003_b2b2_0003);
+    let mut add = |s: &Spec| -> Spec {
+        let mut s = s.clone();
+        if s.b == 20 {
+            let next = LAYERS[(LAYERS.iter().position(|&l| l == s.layer).unwrap() + 1) % LAYERS.len()];
+            for _ in 0..2 {
+                s.admit.push((next << 16) | rr.below(RANGE as u64) as u32);
+            }
+        }
+        s
+    };
+    let mut stream_ra: Vec<Vec<(Spec, Spec, bool)>> = Vec::with_capacity(stream.len());
+    for step in &stream {
+        let mut v = Vec::with_capacity(step.len());
+        for (a, b, f) in step {
+            v.push((add(a), add(b), *f));
+        }
+        stream_ra.push(v);
+    }
+    let ra_run = run(&addr, &stream_ra, false)?;
+    let (ra_stats, pins_ra) = rx_ra.recv()?;
     daemon.join().map_err(|_| eyre!("daemon panicked"))??;
     let _ = tx_done.send(());
 
@@ -324,7 +349,6 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
             spill_out: sc_on.spill_out - sc_off.spill_out, drops: sc_on.drops - sc_off.drops,
         }
     );
-    eprintln!("readahead (hinted, dropped, running, queued): after OFF {ra_off:?}, after ON {ra_on:?}");
     assert!(pins_off.is_none(), "pinning must stay off without the flag");
     assert_eq!(off.partials.len(), n_req);
     assert_eq!(on.partials.len(), n_req);
@@ -347,12 +371,17 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     assert_eq!(on.pin_replies as usize, n_req);
     assert!(on.held > 50 && on.paged > 10, "held {} paged {}", on.held, on.paged);
     assert!(c.new_pins > 10 && c.releases > 0 && r1 - r0 > 0, "{c:?} released {}", r1 - r0);
-    assert_eq!(c.releases, r1 - r0 - b2_mirror_unsent(), "box 2 applied every release word the hub sent");
-    // The readahead class ran (default 4 sets): words queued in its own sets, both runs (cumulative counter;
-    // most next-layer words in this 20-slot pool are already resident or pending and are skipped before a set:
-    // 4 + 5 on 10-11).
-    let (ra_off_n, ra_on_n) = (ra_off.map_or(0, |r| r.0), ra_on.ok_or_else(|| eyre!("readahead sets not allocated"))?.0);
-    assert!(ra_off_n > 0 && ra_on_n > ra_off_n, "readahead words never queued: OFF {ra_off:?} ON {ra_on:?}");
+    assert_eq!(c.releases, r1 - r0 - unsent, "box 2 applied every release word the hub sent");
+    // Run 3 (readahead): bit-identical to the OFF run, words queued in the readahead sets, no pinned eviction.
+    eprintln!("readahead run: (hinted, dropped, running, queued) {ra_stats:?}; box 2 pins after {pins_ra:?}");
+    assert_eq!(ra_run.partials.len(), n_req);
+    let mismatched_ra = off.partials.iter().zip(&ra_run.partials).filter(|(a, b)| a != b).count();
+    assert_eq!(mismatched_ra, 0, "read-ahead changed {mismatched_ra} of {n_req} partials");
+    let (ra_hinted, _, _, _) = ra_stats.ok_or_else(|| eyre!("readahead sets not allocated"))?;
+    assert!(ra_hinted > 0, "readahead words never queued: {ra_stats:?}");
+    if let Some((c3, ..)) = pins_ra {
+        assert_eq!((c3.pinned_evictions, c3.revokes), (0, 0), "{c3:?}");
+    }
     Ok(())
 }
 
