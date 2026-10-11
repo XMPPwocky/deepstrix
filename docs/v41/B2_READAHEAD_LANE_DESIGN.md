@@ -46,6 +46,11 @@ the cost changes (unit test vs the linear oracle; a debug_assert checks sortedne
 
 ### 2.2 Prompt landing on the compute thread (no new thread, no locks)
 
+IMPLEMENTED (with 2.3): `land_completed` (bounded `admit_prefetched_core`, leaves the `ensure` bookkeeping alone),
+gated by `prefetch_done_ready` (an atomic count readers raise before each send). The drain poll lands ONE read per
+call (the poll re-checks the GPU between calls, so a finished pass's reply waits for at most one landing); the idle
+wait lands up to `land_max_per_poll` per 1 ms slice while reads are outstanding (keep-warm keeps its own period).
+
 Call `admit_landed` (RE:5549, today only in the park loop) at two more points, bounded per call (e.g. <= 4 landings or
 <= 1 ms) so a reply is never delayed:
 * in `run_path`'s GPU-drain poll (RE:7761-7769, the serve loop's `overlap` closure with park == false), with
@@ -62,6 +67,12 @@ INSIDE a park are covered only by the park loop's existing `admit_landed` after 
 next landing point" estimate does not hold inside a park with a long nested pass.
 
 ### 2.3 A read-ahead class with reserved capacity
+
+IMPLEMENTED per review r2 MINOR-A as ONE queue with reader ROLES (not a second queue): `PfJob::readahead`, queued at
+the back; `PfQueue::pop_role` -- general readers skip not-certain readahead jobs, readahead readers take only
+readahead jobs (certain or not), ungated; `promote` / `urgent` / `pending` are shared, so a promoted readahead job is
+certain and either role runs it. Chunks pause with the LIKELY token (demand + certain reads). `pick_set_ra`: own sets
+or dropped. Push notifies all readers (two roles on one condvar).
 
 Hub prefill read-ahead words (`prefetch_words_prefill`, `prefill && !certain`) become a READAHEAD class:
 * own free list of `V41_B2_READAHEAD_SETS` staging sets (default 8; allocated at load beside the LIKELY sets,
