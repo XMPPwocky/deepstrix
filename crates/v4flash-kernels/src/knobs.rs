@@ -701,12 +701,27 @@ crate::knobs! {
     /// `V41_LM_QUANTUM_LAYERS` (default 4, 1..=20; live): layers per scheduler-visible pass of a layer-outer window. Read per
     /// pass from the window's layer cursor, so a change is safe mid-window.
     pub static LM_QUANTUM_LAYERS = Knob::int("V41_LM_QUANTUM_LAYERS", 4, 1, 20).live();
+    /// `V41_LM_ENGRAM_ASYNC` (default ON; LIVE): a layer-outer pass stages each unit's Engram rows (layers 1 and 14)
+    /// through the job's PINNED staging with an async copy on the dGPU compute stream, instead of the blocking
+    /// `copy_from_host` that drained the whole device (and the two-lane pipeline with it) at every Engram unit: measured
+    /// 10-11 at 1024-row lanes, 39% of each window had no box-2 request outstanding, in two gaps at the Engram layers.
+    /// Same bytes, same stream order -> bit-identical. `0` = the blocking path.
+    pub static LM_ENGRAM_ASYNC = Knob::flag("V41_LM_ENGRAM_ASYNC", true).live();
+    /// `V41_LM_SEED_ASYNC` (default ON; LIVE): the same for the layer-0 seed of a layer-outer window (each unit's input HC
+    /// rows into the lane residual): one pinned window staging (`win_rows x HC_DIM` f32, ~336 MB at 4096 rows) packed on
+    /// the host before the first pass, one async copy per unit on the dGPU compute stream, instead of `rows` BLOCKING
+    /// per-row copies that drained the device (review r6 #1: the layer 0-3 quantum's gap). Bit-identical. `0` = blocking.
+    pub static LM_SEED_ASYNC = Knob::flag("V41_LM_SEED_ASYNC", true).live();
     /// `V41_PREFILL_SPLIT` (default off; LIVE): the frozen encoder-layer expert split of a LONG job
     /// (`prefill_split`, design sec 4). Read once per job at its first unit; a flip affects the next long job only.
     pub static PREFILL_SPLIT = Knob::flag("V41_PREFILL_SPLIT", false).live();
     /// `V41_PREFILL_B1_FILLER` (default 64, 0..=384; live): ceiling on the per-layer hash filler box 1 adds to its decode-hot
     /// head (the effective filler is `min(this, live free LRU slots / encoder layers)`). Read at each job's split build.
     pub static PREFILL_B1_FILLER = Knob::int("V41_PREFILL_B1_FILLER", 64, 0, 384).live();
+    /// `V41_PREFILL_SPLIT_PRIOR` (default off; LIVE): rank the split's filler -- and its head while the hot set is cold --
+    /// by the server's persisted prefill pick counts (`expert_stats.json`) instead of hash order (`prefill_split::Prior`).
+    /// Read at each long job's split build.
+    pub static PREFILL_SPLIT_PRIOR = Knob::flag("V41_PREFILL_SPLIT_PRIOR", false).live();
     /// `V41_MOE_WMMA_F16` (default off; LIVE): an MXFP4 MoE pass that takes the WMMA arm (`V41_MOE_WMMA_GATEUP` /
     /// `_DOWN` row thresholds) runs the f16-WMMA kernels (kernels/mxfp4_moe_wmma_f16.hip: E8M0 scale folded into the
     /// perm LUT, f16 x f16 -> f32) instead of the int8 ones. Same entry points, args and 32-member chunk; NOT bit-exact
@@ -742,6 +757,14 @@ crate::knobs! {
     /// `V41_LM_PREFETCH_PER_REQ` (default 16, 1..=256; live): its words per
     /// request (`forward_prefill::lm_prefetch_per_req`).
     pub static LM_PREFETCH_PER_REQ = Knob::int("V41_LM_PREFETCH_PER_REQ", 16, 1, 256).live();
+    /// `V41_LM_PREFETCH_AHEAD` (default 0 = off, 0..=8; LIVE; needs `V41_LM_PREFETCH`): ROLLING prefetch of a layer-outer window
+    /// (P3): every lane unit of layer L queues box 2's owned, non-resident experts of layers L+1..=L+AHEAD (below the
+    /// split), paced by `V41_LM_PREFETCH_PER_REQ`. Without it box 2 starts reading a layer's misses only when that
+    /// layer's first request arrives (measured 10-11: ~5 ms after it), and the first request of every layer parks
+    /// ~40-140 ms on them -- ~1.2 s of a ~3.6 s window. REQUIRES box 2's landing-rank fix (f314438d, an expertd
+    /// redeploy): without it a landing for L+2 evicts layer L+1's pages (review r8 #1). With 1024-row lanes (4 requests
+    /// per layer) also raise `V41_LM_PREFETCH_PER_REQ` to ~64. `0` = off (the pre-P3 behaviour).
+    pub static LM_PREFETCH_AHEAD = Knob::int("V41_LM_PREFETCH_AHEAD", 0, 0, 8).live();
     /// `V41_SUB_DEFER_ACCEPTED` (default off; live): a speculative block's
     /// cache-prior admissions, pin want counts and hot-set picks wait for its
     /// accept and only the kept rows' are applied (`b2_mirror::defer_flush`).

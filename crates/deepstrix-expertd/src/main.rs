@@ -159,8 +159,10 @@ fn main() -> eyre::Result<()> {
     // Every knob resolved and printed once, the live ones watched: the knob
     // file (`V41_KNOBS_FILE`, else `V41_B2_KNOBS` / ~/expertd-knobs.txt) every
     // second, SIGUSR2 at once. Before anything reads a knob.
+    // Plus the kernel knobs box 2's own MoE reads, so they are LIVE here too (box 2's knob file): the f16-WMMA MXFP4 arm.
+    static KERNEL_KNOBS: [&v4flash_kernels::knobs::Knob; 1] = [&v4flash_kernels::knobs::MOE_WMMA_F16];
     v4flash_kernels::knobs::start_with(
-        &[v4flash_kernels::het::remote_experts::knobs::ALL],
+        &[v4flash_kernels::het::remote_experts::knobs::ALL, &KERNEL_KNOBS],
         Some(v4flash_kernels::het::remote_experts::knobs::path()),
         true,
     );

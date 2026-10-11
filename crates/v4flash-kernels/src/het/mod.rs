@@ -37,6 +37,7 @@ pub mod kv_arena;
 pub mod lm_schedule;
 pub mod lookahead;
 pub mod perfetto;
+pub mod prefill_loan;
 pub mod prefill_split;
 pub mod prefill_stats;
 pub mod remote_experts;

@@ -15,7 +15,8 @@ looked at in that pass.
 
 | entry | status | note |
 |---|---|---|
-| #57 | ~~FIXED~~ 2026-10-10, GPU check passed, **not deployed** | `RING=solo`: a stream leaving a stretch of 3+ live streams drafted from a ring missing its newest rows (E 2.4 vs 3.3 for 128 rows) |
+| #58 | **OPEN** (new 2026-10-11; production NOT affected) | Dense-window expert pager race: with dense prefill windows (`prefill dense = 1`, i.e. NOT `V41_PREFILL_UNIFIED_POOL=1 V41_PAGER_NO_DENSE=1`), lane A's `ensure_layer_union(L+1)` rewrites the shared rotating window while lane B's MoE for layer L may still be queued on the iGPU. Shows at 1024-row lanes: `lm_prefill_bitexact` `restored` chunked null differs ONLY in chunk 1's lane B (L1 kv_cache rows 604-1151 = pos 3000-3547), then everything downstream; the same case under production's pager config is BIT-IDENTICAL with a clean null (`scratch/prefill_trace/window_diag1024.sh`, 10-11 02:39-02:53 UTC). Fix: drain the iGPU (or wait on the other lane's MoE event) before a dense-window `ensure` overwrites a window in use; expert_pager.rs:293 vs :3366 comments disagree on whether the null-stream copy waits |
+| #57 | ~~FIXED~~ 2026-10-10, GPU check passed, **DEPLOYED 10-10 23:09 UTC** (hub aaea547a, `V41_MS_DSPARK_FILL=1` default; rollback `=0` at a restart or the f9fa7f87 backup) | `RING=solo`: a stream leaving a stretch of 3+ live streams drafted from a ring missing its newest rows (E 2.4 vs 3.3 for 128 rows) |
 | #56 | ~~FIXED~~ 2026-10-06 | `KvArena` switched the current device behind the engine's cache; one failed draft after an in-step `grow` (an instance of #10) |
 | #53 | **OPEN** | f16 box-2 prefill partials are on by default with no fidelity gate (new 2026-10-04) |
 | #54 | **OPEN** | `V41_SUB=1/2` substitution runs after the fidelity pin; production's mode 3 is unaffected (new 2026-10-04) |

@@ -1161,9 +1161,23 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // per-lane scratch at that instead of the full chunk. The shared set
     // (one instance, alternating between lanes) is sized the same.
     let lane_rows = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
-    let bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    // Prefill VRAM loan (`V41_PREFILL_VRAM_LOAN=1`, docs/v41/PREFILL_VRAM_LOAN_DESIGN.md): the RESIDENT dGPU lanes and
+    // shared set serve decode only -- the arena driver's rows (`V41_MS_SLOTS` x `ARENA_ROWS_PER_STREAM`) -- and prefill
+    // runs on the loan's own `lane_rows` set (multistream builds it). The iGPU scratch stays prefill-sized (host RAM).
+    #[cfg(feature = "v41")]
+    let dgpu_rows = if v4flash_kernels::het::prefill_loan::enabled() {
+        if !crate::multistream::enabled() {
+            return Err(eyre!("V41_PREFILL_VRAM_LOAN=1 needs the multistream scheduler (V41_MULTISTREAM=1): the serial path has no loan"));
+        }
+        (crate::knobs::MS_SLOTS.usize() * v4flash_kernels::het::kv_arena::ARENA_ROWS_PER_STREAM as usize).max(1)
+    } else {
+        lane_rows
+    };
+    #[cfg(not(feature = "v41"))]
+    let dgpu_rows = lane_rows;
+    let bd_a = BatchDgpuScratch::alloc_rows(dgpu, dgpu_rows)?;
     let bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
-    let bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let bd_b = BatchDgpuScratch::alloc_rows(dgpu, dgpu_rows)?;
     let bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let lane_c_rows = std::env::var("V41_MS_LANE_C_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize).max(1);
     let bd_c = BatchDgpuScratch::alloc_rows(dgpu, lane_c_rows)?;
@@ -1184,7 +1198,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
             "attention scores scratch sized from --ctx"
         );
     }
-    let sd = BatchDgpuShared::alloc_rows_ctx(dgpu, lane_rows, cfg.n_kv_max)?;
+    let sd = BatchDgpuShared::alloc_rows_ctx(dgpu, dgpu_rows, cfg.n_kv_max)?;
     // The process-static operands (arena) stage graphs may bake (docs/v41/GRAPH_KEYS_DESIGN.md 2.5, 2.7).
     sd.register_static();
     let si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
@@ -1291,6 +1305,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let expert_stats_path = crate::expert_stats::ExpertStatsAgg::path_for(&cfg.snapshot_root);
     let expert_stats =
         crate::expert_stats::ExpertStatsAgg::load_or_fresh(&expert_stats_path, &fingerprint);
+    expert_stats.publish_prefill_prior();
 
     // M7 expert pager. Takes ownership of the HF source: its mmap must outlive the
     // model, since every routed expert is read from it on demand for the life of

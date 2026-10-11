@@ -37,6 +37,10 @@ impl<T> DeviceBuffer<T> {
         let bytes = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
             eyre!("DeviceBuffer size overflow: {} * {}", len, std::mem::size_of::<T>())
         })?;
+        // An open `alloc_scope` for this device records a phantom or hands out a planned view (prefill VRAM loan).
+        if let Some(planned) = crate::alloc_scope::take(device_id, bytes) {
+            return Ok(DeviceBuffer { raw: planned?, len, device_id, is_view: true, _marker: PhantomData });
+        }
         // DEEPSTRIX_ALLOC_TRACE=1: print every allocation ≥ 8 MB with a
         // running per-device tally (audit tool; map sizes back to fields
         // by reading the alloc order in scratch/state/weights).
@@ -199,6 +203,9 @@ impl<T> DeviceBuffer<T> {
                 self.len
             ));
         }
+        if crate::alloc_scope::phantom_write(self.raw) {
+            return Ok(());
+        }
         check_eyre(
             unsafe {
                 sys::hipMemcpy(
@@ -213,6 +220,7 @@ impl<T> DeviceBuffer<T> {
     }
 
     pub fn copy_to_host(&self, dst: &mut [T]) -> eyre::Result<()> {
+        debug_assert!(!crate::alloc_scope::is_phantom(self.raw), "copy_to_host from a phantom (alloc_scope record pass)");
         if dst.len() != self.len {
             return Err(eyre!(
                 "copy_to_host length mismatch: src={} dst={}",
@@ -240,6 +248,9 @@ impl<T> DeviceBuffer<T> {
                 src.len(),
                 self.len
             ));
+        }
+        if crate::alloc_scope::phantom_write(self.raw) {
+            return Ok(());
         }
         check_eyre(
             unsafe {
@@ -297,6 +308,10 @@ impl<T> DeviceBuffer<T> {
         src: &DeviceBuffer<T>,
         stream: &Stream,
     ) -> eyre::Result<()> {
+        debug_assert!(
+            !crate::alloc_scope::is_phantom(self.raw) && !crate::alloc_scope::is_phantom(src.raw),
+            "device copy on a phantom (alloc_scope record pass)"
+        );
         if src.len != self.len {
             return Err(eyre!(
                 "copy_from_buffer_async length mismatch: src={} dst={}",
@@ -330,6 +345,10 @@ impl<T> DeviceBuffer<T> {
     /// decode snapshot/restore path where we want a strict happens-
     /// before relationship without managing stream events.
     pub fn copy_from_buffer(&mut self, src: &DeviceBuffer<T>) -> eyre::Result<()> {
+        debug_assert!(
+            !crate::alloc_scope::is_phantom(self.raw) && !crate::alloc_scope::is_phantom(src.raw),
+            "device copy on a phantom (alloc_scope record pass)"
+        );
         if src.len != self.len {
             return Err(eyre!(
                 "copy_from_buffer length mismatch: src={} dst={}",
@@ -389,6 +408,9 @@ impl<T> DeviceBuffer<T> {
     }
 
     pub fn fill_zero(&mut self) -> eyre::Result<()> {
+        if crate::alloc_scope::phantom_write(self.raw) {
+            return Ok(());
+        }
         check_eyre(
             unsafe { sys::hipMemset(self.raw, 0, self.byte_len()) },
             "hipMemset",
@@ -399,6 +421,9 @@ impl<T> DeviceBuffer<T> {
     /// (synchronous `hipMemset`), this queues on `stream` and returns
     /// immediately — safe to interleave with kernels on the same stream.
     pub fn fill_zero_async(&mut self, stream: &Stream) -> eyre::Result<()> {
+        if crate::alloc_scope::phantom_write(self.raw) {
+            return Ok(());
+        }
         check_eyre(
             unsafe { sys::hipMemsetAsync(self.raw, 0, self.byte_len(), stream.raw()) },
             "hipMemsetAsync",

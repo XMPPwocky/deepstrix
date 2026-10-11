@@ -1,0 +1,86 @@
+=== cmp (correctness vs kwide) B=1024 N_EXP=162: f16db nt2
+CMP gu_wmma vs kwide B=1024            n=14155776 bitexact=no bit_diff=2524738 nonfinite=0 max_abs=3.109e-04 max_rel=6.088e-01 rmse=5.195e-06 rel_rmse=3.935e-07 worst_idx=11434620
+KBJSON {"cmp":"gu_wmma vs kwide B=1024","bitexact":0,"bit_diff":2524738,"nonfinite":0,"max_abs":3.1090e-04,"rel_rmse":3.9347e-07}
+CMP down_wmma vs kwide2 B=1024         n=31457280 bitexact=no bit_diff=9858059 nonfinite=0 max_abs=5.859e-03 max_rel=3.621e-01 rmse=1.341e-04 rel_rmse=1.129e-07 worst_idx=21049079
+KBJSON {"cmp":"down_wmma vs kwide2 B=1024","bitexact":0,"bit_diff":9858059,"nonfinite":0,"max_abs":5.8594e-03,"rel_rmse":1.1291e-07}
+CMP gu_wmma(exact grid) vs kwide B=1024 n=14155776 bitexact=no bit_diff=2524738 nonfinite=0 max_abs=3.109e-04 max_rel=6.088e-01 rmse=5.195e-06 rel_rmse=3.935e-07 worst_idx=11434620
+KBJSON {"cmp":"gu_wmma(exact grid) vs kwide B=1024","bitexact":0,"bit_diff":2524738,"nonfinite":0,"max_abs":3.1090e-04,"rel_rmse":3.9347e-07}
+=== abx B=1024 N_EXP=162: A = f16 single-buffer (prod), B = f16 double-buffer, both chunk 32
+B gate+up (KB_CAND2)                       11477.74   11437.73   11599.62    0.568     180.3   10775.1
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=32 chunkB=32","variant":"kwide gate+up (prod, chunk 32)","med_us":20189.943,"p10_us":20108.797,"p90_us":20380.032,"ratio":1.0000,"gbps":102.52,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=32 chunkB=32","variant":"A gate+up (KB_CAND)","med_us":13793.860,"p10_us":13697.657,"p90_us":13851.624,"ratio":0.6832,"gbps":150.06,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=32 chunkB=32","variant":"B gate+up (KB_CAND2)","med_us":11477.736,"p10_us":11437.734,"p90_us":11599.622,"ratio":0.5685,"gbps":180.34,"graph":0,"flush":0}
+== abx down B=1024 n_exp=162 members=2621 chunkA=32 chunkB=32  (rounds=12 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod, chunk 32)               16537.95   16495.69   16577.15    1.000      65.1    3739.1
+A down (KB_CAND)                            5206.22    5190.88    5230.70    0.315     206.6   11877.6
+B down (KB_CAND2)                           5165.22    5141.38    5192.96    0.312     208.3   11971.8
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=32 chunkB=32","variant":"kwide2 down (prod, chunk 32)","med_us":16537.949,"p10_us":16495.686,"p90_us":16577.150,"ratio":1.0000,"gbps":65.05,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=32 chunkB=32","variant":"A down (KB_CAND)","med_us":5206.220,"p10_us":5190.878,"p90_us":5230.700,"ratio":0.3148,"gbps":206.64,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=32 chunkB=32","variant":"B down (KB_CAND2)","med_us":5165.217,"p10_us":5141.376,"p90_us":5192.958,"ratio":0.3123,"gbps":208.28,"graph":0,"flush":0}
+=== cmp (correctness vs kwide) B=2048 N_EXP=162: f16db nt2
+CMP gu_wmma vs kwide B=2048            n=28311552 bitexact=no bit_diff=5053240 nonfinite=0 max_abs=3.319e-04 max_rel=3.249e+00 rmse=5.186e-06 rel_rmse=3.934e-07 worst_idx=15018342
+KBJSON {"cmp":"gu_wmma vs kwide B=2048","bitexact":0,"bit_diff":5053240,"nonfinite":0,"max_abs":3.3188e-04,"rel_rmse":3.9344e-07}
+CMP down_wmma vs kwide2 B=2048         n=62914560 bitexact=no bit_diff=19733487 nonfinite=0 max_abs=5.859e-03 max_rel=3.621e-01 rmse=1.339e-04 rel_rmse=1.129e-07 worst_idx=21049079
+KBJSON {"cmp":"down_wmma vs kwide2 B=2048","bitexact":0,"bit_diff":19733487,"nonfinite":0,"max_abs":5.8594e-03,"rel_rmse":1.1291e-07}
+CMP gu_wmma(exact grid) vs kwide B=2048 n=28311552 bitexact=no bit_diff=5053240 nonfinite=0 max_abs=3.319e-04 max_rel=3.249e+00 rmse=5.186e-06 rel_rmse=3.934e-07 worst_idx=15018342
+KBJSON {"cmp":"gu_wmma(exact grid) vs kwide B=2048","bitexact":0,"bit_diff":5053240,"nonfinite":0,"max_abs":3.3188e-04,"rel_rmse":3.9344e-07}
+=== abx B=2048 N_EXP=162: A = f16 single-buffer (prod), B = f16 double-buffer, both chunk 32
+B gate+up (KB_CAND2)                       18250.40   18053.79   18314.90    0.478     115.6   13563.4
+KBJSON {"tag":"abx gate+up B=2048 n_exp=162 members=5246 chunkA=32 chunkB=32","variant":"kwide gate+up (prod, chunk 32)","med_us":38164.749,"p10_us":37806.149,"p90_us":38276.417,"ratio":1.0000,"gbps":55.27,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=2048 n_exp=162 members=5246 chunkA=32 chunkB=32","variant":"A gate+up (KB_CAND)","med_us":21524.015,"p10_us":21405.348,"p90_us":21637.381,"ratio":0.5640,"gbps":98.00,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=2048 n_exp=162 members=5246 chunkA=32 chunkB=32","variant":"B gate+up (KB_CAND2)","med_us":18250.401,"p10_us":18053.787,"p90_us":18314.901,"ratio":0.4782,"gbps":115.58,"graph":0,"flush":0}
+== abx down B=2048 n_exp=162 members=5246 chunkA=32 chunkB=32  (rounds=12 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod, chunk 32)               31154.03   30991.80   31299.32    1.000      36.5    3972.8
+A down (KB_CAND)                            8148.12    8120.64    8167.12    0.262     139.5   15189.8
+B down (KB_CAND2)                           8153.62    8097.51    8263.94    0.262     139.4   15179.6
+KBJSON {"tag":"abx down B=2048 n_exp=162 members=5246 chunkA=32 chunkB=32","variant":"kwide2 down (prod, chunk 32)","med_us":31154.032,"p10_us":30991.804,"p90_us":31299.320,"ratio":1.0000,"gbps":36.48,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=2048 n_exp=162 members=5246 chunkA=32 chunkB=32","variant":"A down (KB_CAND)","med_us":8148.119,"p10_us":8120.636,"p90_us":8167.118,"ratio":0.2615,"gbps":139.48,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=2048 n_exp=162 members=5246 chunkA=32 chunkB=32","variant":"B down (KB_CAND2)","med_us":8153.618,"p10_us":8097.514,"p90_us":8263.945,"ratio":0.2617,"gbps":139.38,"graph":0,"flush":0}
+=== cmp (correctness vs kwide) B=3072 N_EXP=48: f16db nt2
+CMP gu_wmma vs kwide B=3072            n=42467328 bitexact=no bit_diff=2215366 nonfinite=0 max_abs=3.109e-04 max_rel=6.088e-01 rmse=2.816e-06 rel_rmse=3.944e-07 worst_idx=11434620
+KBJSON {"cmp":"gu_wmma vs kwide B=3072","bitexact":0,"bit_diff":2215366,"nonfinite":0,"max_abs":3.1090e-04,"rel_rmse":3.9441e-07}
+CMP down_wmma vs kwide2 B=3072         n=94371840 bitexact=no bit_diff=8648115 nonfinite=0 max_abs=4.883e-03 max_rel=1.657e+01 rmse=7.257e-05 rel_rmse=1.129e-07 worst_idx=10726356
+KBJSON {"cmp":"down_wmma vs kwide2 B=3072","bitexact":0,"bit_diff":8648115,"nonfinite":0,"max_abs":4.8828e-03,"rel_rmse":1.1292e-07}
+CMP gu_wmma(exact grid) vs kwide B=3072 n=42467328 bitexact=no bit_diff=2215366 nonfinite=0 max_abs=3.109e-04 max_rel=6.088e-01 rmse=2.816e-06 rel_rmse=3.944e-07 worst_idx=11434620
+KBJSON {"cmp":"gu_wmma(exact grid) vs kwide B=3072","bitexact":0,"bit_diff":2215366,"nonfinite":0,"max_abs":3.1090e-04,"rel_rmse":3.9441e-07}
+=== abx B=3072 N_EXP=48: A = f16 single-buffer (prod), B = f16 double-buffer, both chunk 32
+B gate+up (KB_CAND2)                        7219.57    7126.86    7370.68    0.437      88.1   15025.9
+KBJSON {"tag":"abx gate+up B=3072 n_exp=48 members=2299 chunkA=32 chunkB=32","variant":"kwide gate+up (prod, chunk 32)","med_us":16517.906,"p10_us":16413.441,"p90_us":16624.514,"ratio":1.0000,"gbps":38.52,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=3072 n_exp=48 members=2299 chunkA=32 chunkB=32","variant":"A gate+up (KB_CAND)","med_us":8598.042,"p10_us":8562.519,"p90_us":8653.944,"ratio":0.5205,"gbps":74.00,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=3072 n_exp=48 members=2299 chunkA=32 chunkB=32","variant":"B gate+up (KB_CAND2)","med_us":7219.567,"p10_us":7126.862,"p90_us":7370.677,"ratio":0.4371,"gbps":88.13,"graph":0,"flush":0}
+== abx down B=3072 n_exp=48 members=2299 chunkA=32 chunkB=32  (rounds=12 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod, chunk 32)               14107.16   14010.85   14214.12    1.000      25.1    3844.9
+A down (KB_CAND)                            3329.28    3315.64    3379.74    0.236     106.3   16291.9
+B down (KB_CAND2)                           3385.50    3336.34    3414.18    0.240     104.5   16021.3
+KBJSON {"tag":"abx down B=3072 n_exp=48 members=2299 chunkA=32 chunkB=32","variant":"kwide2 down (prod, chunk 32)","med_us":14107.157,"p10_us":14010.852,"p90_us":14214.122,"ratio":1.0000,"gbps":25.09,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=3072 n_exp=48 members=2299 chunkA=32 chunkB=32","variant":"A down (KB_CAND)","med_us":3329.278,"p10_us":3315.638,"p90_us":3379.741,"ratio":0.2360,"gbps":106.31,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=3072 n_exp=48 members=2299 chunkA=32 chunkB=32","variant":"B down (KB_CAND2)","med_us":3385.502,"p10_us":3336.339,"p90_us":3414.183,"ratio":0.2400,"gbps":104.54,"graph":0,"flush":0}
+=== abx B=1024 N_EXP=162: A = f16db nt2 (chunk 32), B = f16db nt3 (chunk 48)
+B gate+up (KB_CAND2)                       11155.74   11127.04   11201.70    0.544     185.5   11086.2
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=32 chunkB=48","variant":"kwide gate+up (prod, chunk 32)","med_us":20505.960,"p10_us":20327.410,"p90_us":20619.986,"ratio":1.0000,"gbps":100.94,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=32 chunkB=48","variant":"A gate+up (KB_CAND)","med_us":11505.038,"p10_us":11463.957,"p90_us":11742.590,"ratio":0.5611,"gbps":179.92,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=32 chunkB=48","variant":"B gate+up (KB_CAND2)","med_us":11155.740,"p10_us":11127.038,"p90_us":11201.702,"ratio":0.5440,"gbps":185.55,"graph":0,"flush":0}
+== abx down B=1024 n_exp=162 members=2621 chunkA=32 chunkB=48  (rounds=12 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod, chunk 32)               16579.99   16286.45   16648.31    1.000      64.9    3729.6
+A down (KB_CAND)                            5156.70    5104.89    5164.84    0.311     208.6   11991.6
+B down (KB_CAND2)                           6173.61    6098.55    6260.54    0.372     174.3   10016.4
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=32 chunkB=48","variant":"kwide2 down (prod, chunk 32)","med_us":16579.988,"p10_us":16286.453,"p90_us":16648.314,"ratio":1.0000,"gbps":64.89,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=32 chunkB=48","variant":"A down (KB_CAND)","med_us":5156.696,"p10_us":5104.894,"p90_us":5164.837,"ratio":0.3110,"gbps":208.62,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=32 chunkB=48","variant":"B down (KB_CAND2)","med_us":6173.611,"p10_us":6098.547,"p90_us":6260.536,"ratio":0.3724,"gbps":174.26,"graph":0,"flush":0}
+=== abx B=1024 N_EXP=162: A = f16db nt3 (chunk 48), B = f16 single-buffer nt4 (chunk 64)
+B gate+up (KB_CAND2)                       10643.47   10600.67   10911.99    0.521     194.5   11619.7
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=48 chunkB=64","variant":"kwide gate+up (prod, chunk 32)","med_us":20421.955,"p10_us":20319.790,"p90_us":22333.673,"ratio":1.0000,"gbps":101.36,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=48 chunkB=64","variant":"A gate+up (KB_CAND)","med_us":11159.478,"p10_us":11126.457,"p90_us":11361.370,"ratio":0.5464,"gbps":185.49,"graph":0,"flush":0}
+KBJSON {"tag":"abx gate+up B=1024 n_exp=162 members=2621 chunkA=48 chunkB=64","variant":"B gate+up (KB_CAND2)","med_us":10643.472,"p10_us":10600.668,"p90_us":10911.986,"ratio":0.5212,"gbps":194.48,"graph":0,"flush":0}
+== abx down B=1024 n_exp=162 members=2621 chunkA=48 chunkB=64  (rounds=12 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod, chunk 32)               16394.02   16004.80   16514.11    1.000      65.6    3771.9
+A down (KB_CAND)                            6121.31    6081.87    6202.99    0.373     175.7   10101.9
+B down (KB_CAND2)                           5169.44    5142.08    5199.72    0.315     208.1   11962.1
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=48 chunkB=64","variant":"kwide2 down (prod, chunk 32)","med_us":16394.020,"p10_us":16004.799,"p90_us":16514.107,"ratio":1.0000,"gbps":65.62,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=48 chunkB=64","variant":"A down (KB_CAND)","med_us":6121.308,"p10_us":6081.866,"p90_us":6202.993,"ratio":0.3734,"gbps":175.75,"graph":0,"flush":0}
+KBJSON {"tag":"abx down B=1024 n_exp=162 members=2621 chunkA=48 chunkB=64","variant":"B down (KB_CAND2)","med_us":5169.437,"p10_us":5142.076,"p90_us":5199.719,"ratio":0.3153,"gbps":208.11,"graph":0,"flush":0}

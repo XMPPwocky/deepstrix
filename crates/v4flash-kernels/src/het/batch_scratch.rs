@@ -1258,8 +1258,11 @@ impl BatchDgpuScratch {
         };
         Ok(Self {
             rows,
-            indexer_sel_saved: mk_i32(crate::indexer::INDEXER_TOP_K as usize)?,
-            indexer_nsparse_saved: mk_i32(1)?,
+            // Zeroed at alloc: a selection carried across the sub-chunk UNITS of a group-major group (the prefill VRAM
+            // loan can end between units), so the loan's record pass sees it WRITTEN and pins it to the pool (review r3
+            // finding 3); harmless otherwise (`indexer_saved_store` says whether it holds anything).
+            indexer_sel_saved: { let mut z = mk_i32(crate::indexer::INDEXER_TOP_K as usize)?; z.fill_zero()?; z },
+            indexer_nsparse_saved: { let mut z = mk_i32(1)?; z.fill_zero()?; z },
             dump_layer_pos: u64::MAX,
             indexer_saved_store: -1,
             candidate_block_score: if crate::het::forward_layer::candidate_pool_enabled() {
@@ -1585,6 +1588,18 @@ impl BatchDgpuShared {
         rows: usize,
         n_kv_max: u32,
     ) -> eyre::Result<Self> {
+        Self::alloc_rows_ctx_opts(dgpu_device, rows, n_kv_max, true)
+    }
+
+    /// [`Self::alloc_rows_ctx`] with `with_verify = false` allocating the diagnostic-only `verify_scores`
+    /// (`V41_VERIFY_DECODE_ATTN`, ~94 MB) at ONE element: the prefill VRAM loan's set (the diagnostic refuses to run on
+    /// it rather than overrun).
+    pub fn alloc_rows_ctx_opts(
+        dgpu_device: Device,
+        rows: usize,
+        n_kv_max: u32,
+        with_verify: bool,
+    ) -> eyre::Result<Self> {
         check_rows("BatchDgpuShared", rows)?;
         dgpu_device.set_current()?;
         let id = dgpu_device.id;
@@ -1717,7 +1732,7 @@ impl BatchDgpuShared {
             // kernel pair has the headroom it needs.
             verify_scores: DeviceBuffer::new(
                 id,
-                N_HEAD as usize * crate::attention::ATTN_MIXED_MAX_KEYS as usize,
+                if with_verify { N_HEAD as usize * crate::attention::ATTN_MIXED_MAX_KEYS as usize } else { 1 },
             )?,
             verify_inv: DeviceBuffer::new(id, N_HEAD as usize)?,
             verify_partials: DeviceBuffer::new(

@@ -131,6 +131,20 @@ fn zero_state(st: &mut HetModelState) -> eyre::Result<()> {
 }
 
 /// Every difference between two states, as readable lines (empty = identical).
+/// `(first row, last row, rows that differ)` of two row-major buffers with `row` elements per row, if any differ.
+fn row_span<T: PartialEq>(a: &[T], b: &[T], row: usize) -> Option<(usize, usize, usize)> {
+    let mut first = None;
+    let (mut last, mut n) = (0usize, 0usize);
+    for (r, (x, y)) in a.chunks(row).zip(b.chunks(row)).enumerate() {
+        if x != y {
+            first.get_or_insert(r);
+            last = r;
+            n += 1;
+        }
+    }
+    first.map(|f| (f, last, n))
+}
+
 fn diff_states(a: &HetModelState, b: &HetModelState) -> eyre::Result<Vec<String>> {
     let mut out = Vec::new();
     for l in 0..N_LAYER as usize {
@@ -138,8 +152,9 @@ fn diff_states(a: &HetModelState, b: &HetModelState) -> eyre::Result<Vec<String>
         if (x.n_raw, x.raw_off) != (y.n_raw, y.raw_off) {
             out.push(format!("L{l}: n_raw/raw_off {}/{} vs {}/{}", x.n_raw, x.raw_off, y.n_raw, y.raw_off));
         }
-        if host(&x.kv_cache)? != host(&y.kv_cache)? {
-            out.push(format!("L{l}: kv_cache bytes differ"));
+        if let Some((f, z, n)) = row_span(&host(&x.kv_cache)?, &host(&y.kv_cache)?, v4flash_kernels::config::N_HEAD_DIM as usize) {
+            out.push(format!("L{l}: kv_cache bytes differ: rows {f}..={z} ({n} rows; raw_off {} n_raw {}; ring {} rows)",
+                x.raw_off, x.n_raw, x.kv_cache.len() / v4flash_kernels::config::N_HEAD_DIM as usize));
         }
         for (name, cx, cy) in [
             ("compressor", x.compressor.as_ref(), y.compressor.as_ref()),
@@ -163,7 +178,11 @@ fn diff_states(a: &HetModelState, b: &HetModelState) -> eyre::Result<Vec<String>
                         _ => false,
                     };
                     if !same {
-                        out.push(format!("L{l} {name}: comp_kv differs"));
+                        let span = match (&p.comp_kv, &q.comp_kv) {
+                            (CompKvStore::F16(u), CompKvStore::F16(v)) => row_span(&host(u)?, &host(v)?, p.width as usize),
+                            _ => None,
+                        };
+                        out.push(format!("L{l} {name}: comp_kv differs: rows {span:?} (first, last, count; n_comp {})", p.n_comp));
                     }
                     match (p.index_k.as_ref(), q.index_k.as_ref()) {
                         (Some(u), Some(v)) if host(u)? != host(v)? => out.push(format!("L{l} {name}: index_k differs")),
@@ -222,7 +241,7 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
     let engine = HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, ExecMode::HetParallel)?;
     let mut ds = DgpuScratch::alloc(dgpu)?;
     let n_kv_max: u32 = 8192;
-    let lane_rows = v4flash_kernels::het::batch_scratch::B_MAX.div_ceil(2);
+    let lane_rows = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
     let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
@@ -268,9 +287,9 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
         let sfx = &toks[pos0..];
         let hcs: Vec<Vec<f32>> = sfx.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
         let mut job = if lazy {
-            PrefillJob::new(sfx.to_vec(), Vec::new(), None, None, pos0 as u32, 1024)?
+            PrefillJob::new(sfx.to_vec(), Vec::new(), None, None, pos0 as u32, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?
         } else {
-            PrefillJob::new(sfx.to_vec(), hcs.clone(), Some(rows.clone()), None, pos0 as u32, 1024)?
+            PrefillJob::new(sfx.to_vec(), hcs.clone(), Some(rows.clone()), None, pos0 as u32, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?
         };
         job.set_layer_major_rows(lm)?;
         let mut units = 0usize;
@@ -288,7 +307,7 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
                 x_seq.push(t);
                 let pos = x_seq.len() - 1;
                 let xr = rows_for(pg.raw(), &x_seq, pos)?;
-                let mut xj = PrefillJob::new(vec![t], vec![embed(t)?], Some(xr), None, pos as u32, 1024)?;
+                let mut xj = PrefillJob::new(vec![t], vec![embed(t)?], Some(xr), None, pos as u32, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?;
                 xj.set_layer_major_rows(0)?;
                 while !xj.chunks_done() {
                     engine.prefill_job_chunk(&mut xj, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut x_state, &weights, Some(&mut *pg))?;

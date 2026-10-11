@@ -8,8 +8,16 @@
 //!
 //! WHAT. For a long job (and `V41_PREFILL_SPLIT=1`), box 1 takes its decode-hot encoder head UNION a hash filler
 //! sized from the hub's LIVE free LRU slots, so box 1's decode head is never displaced and box 2's share shrinks.
-//! Built once at job start and FROZEN (a mid-job `hot_set` refresh does not move ids). Deterministic: hash order
-//! only. Decoder layers (the replay) keep `partition_box2`: `home2` returns `None` for them.
+//! Built once at job start and FROZEN (a mid-job `hot_set` refresh does not move ids). Deterministic. Decoder layers
+//! (the replay) keep `partition_box2`: `home2` returns `None` for them.
+//!
+//! PRIOR (`V41_PREFILL_SPLIT_PRIOR`, 2026-10-10). The filler -- and, while the hot set is COLD (the first minutes after a
+//! hub restart), the head itself -- used to be the smallest-HASH ids: random. Measured on a 220K-token job built 2 min
+//! after a restart (`warm=false`): box-2 requests touched 139-149 distinct experts vs 124-128 with a warm split, ~+20%
+//! box-2 time (box 2 is weight-read bound, ~100 us per distinct expert). With the prior, ids are ranked by the server's
+//! persisted PREFILL pick counts (`expert_stats.json` prefill bank, EWMA over runs; [`set_prior`]), hash as the tie-break:
+//! a cold head is the historically prefill-hot ids, and the filler (bounded by free LRU slots, so it still displaces no
+//! decode-hot id) soaks up the prefill-hot ids box 2 would otherwise serve. The warm head stays the decode-hot set.
 //!
 //! HOW IT IS CONSULTED. `pre_moe_route` has no job handle, so the object lives in a process-global
 //! `RwLock<Option<Arc<..>>>` installed by a [`SplitGuard`] around each prefill unit; decode steps, DSpark verifies and
@@ -31,6 +39,41 @@ pub fn enabled() -> bool {
 /// effective filler is `min(this, free_lru_slots / encoder_layers)` from live counts (see [`SplitCfg::filler`]).
 pub fn filler_max() -> usize {
     crate::knobs::PREFILL_B1_FILLER.usize()
+}
+
+/// `V41_PREFILL_SPLIT_PRIOR` (default off; LIVE): rank the filler (and a cold head) by the persisted prefill pick counts.
+pub fn prior_enabled() -> bool {
+    crate::knobs::PREFILL_SPLIT_PRIOR.on()
+}
+
+/// A prior with fewer prefill tokens than this is ignored (hash order, as before).
+pub const PRIOR_MIN_TOKENS: u64 = 100_000;
+
+/// Per-(encoder layer, expert) prefill pick counts (the server's `expert_stats` prefill bank).
+pub struct Prior {
+    /// `[NL_ENC][NE]`.
+    counts: Vec<u64>,
+    pub tokens: u64,
+}
+
+static PRIOR: RwLock<Option<Arc<Prior>>> = RwLock::new(None);
+
+/// Publish the prefill prior: `counts` = the `[N_LAYER x N_EXPERT]` prefill bank (only the encoder layers are kept),
+/// `tokens` = the tokens it accumulated over. Called at model load and after every stats flush.
+pub fn set_prior(counts: &[u64], tokens: u64) {
+    if counts.len() < NL_ENC * NE {
+        return;
+    }
+    let p = Arc::new(Prior { counts: counts[..NL_ENC * NE].to_vec(), tokens });
+    *PRIOR.write().unwrap_or_else(|e| e.into_inner()) = Some(p);
+}
+
+/// The prior to build with: `None` unless the knob is on and it has `PRIOR_MIN_TOKENS`.
+pub fn prior() -> Option<Arc<Prior>> {
+    if !prior_enabled() {
+        return None;
+    }
+    PRIOR.read().unwrap_or_else(|e| e.into_inner()).clone().filter(|p| p.tokens >= PRIOR_MIN_TOKENS)
 }
 
 /// `V41_PREFILL_B2_USABLE` (default 4570): box 2's usable pool slots during a long prefill, used ONLY for the job-start
@@ -81,6 +124,8 @@ pub struct SplitStats {
     pub share2: usize,
     pub head_min: usize,
     pub head_max: usize,
+    /// The ranking came from the prefill prior (else hash order).
+    pub prior: bool,
 }
 
 impl SplitStats {
@@ -97,8 +142,13 @@ pub struct PrefillSplit {
 }
 
 impl PrefillSplit {
-    /// Build the frozen split. `head(layer, e)` = `hot_set::box1_owns` (`None` until warm).
+    /// Build the frozen split. `head(layer, e)` = `hot_set::box1_owns` (`None` until warm). Hash order (no prior).
     pub fn build(cfg: &SplitCfg, head: &dyn Fn(i32, u32) -> Option<bool>) -> Self {
+        Self::build_with_prior(cfg, head, None)
+    }
+
+    /// [`Self::build`] with the filler (and a cold head) ranked by `prior`'s prefill pick counts, hash as tie-break.
+    pub fn build_with_prior(cfg: &SplitCfg, head: &dyn Fn(i32, u32) -> Option<bool>, prior: Option<&Prior>) -> Self {
         let warm = (0..NL_ENC).any(|l| (0..NE).any(|e| head(l as i32, e as u32).is_some()));
         // Live count of ids box 1 owns for decode across ALL layers (they compete for the same LRU slots).
         let owned_now = if warm {
@@ -111,8 +161,12 @@ impl PrefillSplit {
         let (mut share1, mut head_min, mut head_max) = (0usize, usize::MAX, 0usize);
         for l in 0..NL_ENC {
             let mut order: Vec<usize> = (0..NE).collect();
-            order.sort_by_key(|&e| mix(l, e));
-            // The head: the hot set's ids when warm, else the `cold_head_per_layer` smallest-hash ids.
+            match prior {
+                Some(p) => order.sort_by_key(|&e| (std::cmp::Reverse(p.counts[l * NE + e]), mix(l, e))),
+                None => order.sort_by_key(|&e| mix(l, e)),
+            }
+            // The head: the hot set's ids when warm, else the first `cold_head_per_layer` ids of `order` (prefill-hot with
+            // the prior, smallest-hash without).
             let head_ids: Vec<usize> = if warm {
                 (0..NE).filter(|&e| head(l as i32, e as u32) == Some(true)).collect()
             } else {
@@ -121,7 +175,7 @@ impl PrefillSplit {
             for &e in &head_ids {
                 box2[l * NE + e] = false;
             }
-            // The filler: the smallest-hash ids that are not already box 1's.
+            // The filler: the first ids of `order` that are not already box 1's.
             let mut added = 0usize;
             for &e in &order {
                 if added == filler {
@@ -138,7 +192,7 @@ impl PrefillSplit {
             head_max = head_max.max(head_ids.len());
         }
         let share2 = NL_ENC * NE - share1;
-        PrefillSplit { box2, stats: SplitStats { warm, owned_now, filler, share1, share2, head_min, head_max } }
+        PrefillSplit { box2, stats: SplitStats { warm, owned_now, filler, share1, share2, head_min, head_max, prior: prior.is_some() } }
     }
 
     /// `Some(true)` = box 2 serves `(layer, e)`; `None` for layers outside the encoder range (use `partition_box2`).
@@ -260,6 +314,77 @@ mod tests {
         for l in 0..NL_ENC {
             assert_eq!(s.box2_count(l), NE - 103 - s.stats.filler);
         }
+    }
+
+    /// A prior where expert e's count in layer l is `(e * 7 + l) % NE` (distinct per layer): its top-k is known.
+    fn test_prior() -> Prior {
+        Prior { counts: (0..NL_ENC * NE).map(|i| ((i % NE) * 7 + i / NE) as u64 % NE as u64).collect(), tokens: PRIOR_MIN_TOKENS }
+    }
+
+    fn top_by_prior(p: &Prior, l: usize, k: usize) -> Vec<usize> {
+        let mut o: Vec<usize> = (0..NE).collect();
+        o.sort_by_key(|&e| (std::cmp::Reverse(p.counts[l * NE + e]), mix(l, e)));
+        o.truncate(k);
+        o
+    }
+
+    #[test]
+    fn cold_head_with_a_prior_is_the_prefill_hot_ids() {
+        let cfg = SplitCfg { lru_slots: 5041, filler_max: 64, cold_head_per_layer: 115 };
+        let p = test_prior();
+        let s = PrefillSplit::build_with_prior(&cfg, &|_, _| None, Some(&p));
+        assert!(!s.stats.warm && s.stats.prior);
+        let f = s.stats.filler;
+        for l in 0..NL_ENC {
+            // head + filler = the top (115 + filler) ids by prior count: all box 1, everything else box 2
+            let top = top_by_prior(&p, l, 115 + f);
+            for e in 0..NE {
+                assert_eq!(s.home2(l as i32, e as u32), Some(!top.contains(&e)), "L{l} e{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn warm_head_is_kept_and_the_filler_follows_the_prior() {
+        let cfg = SplitCfg { lru_slots: 5425, filler_max: 64, cold_head_per_layer: 103 };
+        let head = hot_head(103);
+        let p = test_prior();
+        let s = PrefillSplit::build_with_prior(&cfg, &head, Some(&p));
+        assert!(s.stats.warm && s.stats.prior);
+        for l in 0..NL_ENC {
+            let mut want_filler = Vec::new();
+            for e in top_by_prior(&p, l, NE) {
+                if want_filler.len() == s.stats.filler {
+                    break;
+                }
+                if head(l as i32, e as u32) != Some(true) {
+                    want_filler.push(e);
+                }
+            }
+            for e in 0..NE {
+                let box1 = head(l as i32, e as u32) == Some(true) || want_filler.contains(&e);
+                assert_eq!(s.home2(l as i32, e as u32), Some(!box1), "L{l} e{e}");
+            }
+        }
+        // same sizes as without the prior: only WHICH filler ids changes
+        let h = PrefillSplit::build(&cfg, &head);
+        assert_eq!((s.stats.share1, s.stats.share2, s.stats.filler), (h.stats.share1, h.stats.share2, h.stats.filler));
+        assert!(!h.stats.prior);
+    }
+
+    #[test]
+    fn prior_below_min_tokens_or_knob_off_is_ignored() {
+        set_prior(&vec![1u64; N_LAYER as usize * NE], PRIOR_MIN_TOKENS - 1);
+        crate::knobs::PREFILL_SPLIT_PRIOR.set("1");
+        assert!(prior().is_none(), "too few tokens");
+        set_prior(&vec![1u64; N_LAYER as usize * NE], PRIOR_MIN_TOKENS);
+        assert!(prior().is_some());
+        crate::knobs::PREFILL_SPLIT_PRIOR.set("0");
+        assert!(prior().is_none(), "knob off");
+        set_prior(&[1u64; 3], PRIOR_MIN_TOKENS); // short input is refused, previous prior kept
+        crate::knobs::PREFILL_SPLIT_PRIOR.set("1");
+        assert_eq!(prior().map(|p| p.counts.len()), Some(NL_ENC * NE));
+        crate::knobs::PREFILL_SPLIT_PRIOR.set("0");
     }
 
     #[test]
