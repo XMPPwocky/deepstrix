@@ -1846,9 +1846,8 @@ impl HeterogeneousEngine {
                         let hi = (l + pf_ahead + 1).min(split); // layers l+1..=l+ahead, below the split
                         if l + 1 < hi {
                             let words: Vec<u32> = lm_prefetch_words(l + 1..hi, split).into_iter().filter(|w| !pf_sent.contains(w)).collect();
-                            if super::remote_experts::push_prefetch_words(&words) {
-                                pf_queued = words;
-                            }
+                            // a refused push (queue full) queued nothing: track nothing (review r8 #3)
+                            pf_queued = if super::remote_experts::push_prefetch_words(&words) { words } else { Vec::new() };
                         }
                     }
                     let tokens_u = &job_tokens[un.tok0..un.tok0 + un.rows];
