@@ -74,6 +74,14 @@ readahead jobs (certain or not), ungated; `promote` / `urgent` / `pending` are s
 certain and either role runs it. Chunks pause with the LIKELY token (demand + certain reads). `pick_set_ra`: own sets
 or dropped. Push notifies all readers (two roles on one condvar).
 
+FIX 10-11 (after the first production A/B burst, ba74bb26): taking the set at ARRIVAL dropped ~94% of the words
+(48.5 s burst: 13,938 words carried, 803 read, 0.31 GB/s, readahead readers 26% busy; 6.7 s burst: 4,864 -> 255,
+0.72 GB/s, 59%) -- the hub sends up to 64 words per request, the sizing above assumed a steady trickle. Now readahead
+jobs queue WITHOUT a set (`NO_SET`) and take one of the queue-owned free readahead sets at POP; the queue is bounded
+(`readahead_queue`, 192, live, oldest out); a promoted readahead job runs on a general reader when a readahead set is
+free. 8 sets (~256 MB pinned), 4 reader threads with `readahead_par` = the ACTIVE count (live, default 2),
+`readahead_pause` live (off = unchunked: per-read time was ~18-20 ms for 18.8 MB with the pause on).
+
 Hub prefill read-ahead words (`prefetch_words_prefill`, `prefill && !certain`) become a READAHEAD class:
 * own free list of `V41_B2_READAHEAD_SETS` staging sets (default 8; allocated at load beside the LIKELY sets,
   RE:5171-5179; `release_set` RE:2086 and `n_general` ranges RE:5447 extended);
