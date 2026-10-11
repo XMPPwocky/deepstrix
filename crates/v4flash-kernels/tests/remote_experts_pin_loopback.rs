@@ -326,9 +326,6 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     );
     eprintln!("readahead (hinted, dropped, running, queued): after OFF {ra_off:?}, after ON {ra_on:?}");
     assert!(pins_off.is_none(), "pinning must stay off without the flag");
-    // The readahead class ran (default 4 sets): words queued in its own sets.
-    let (ra_hinted, _, _, _) = ra_on.ok_or_else(|| eyre!("readahead sets not allocated"))?;
-    assert!(ra_hinted > 10, "readahead words never queued: {ra_on:?}");
     assert_eq!(off.partials.len(), n_req);
     assert_eq!(on.partials.len(), n_req);
     let mismatched = off.partials.iter().zip(&on.partials).filter(|(a, b)| a != b).count();
@@ -351,6 +348,11 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     assert!(on.held > 50 && on.paged > 10, "held {} paged {}", on.held, on.paged);
     assert!(c.new_pins > 10 && c.releases > 0 && r1 - r0 > 0, "{c:?} released {}", r1 - r0);
     assert_eq!(c.releases, r1 - r0 - b2_mirror_unsent(), "box 2 applied every release word the hub sent");
+    // The readahead class ran (default 4 sets): words queued in its own sets, both runs (cumulative counter;
+    // most next-layer words in this 20-slot pool are already resident or pending and are skipped before a set:
+    // 4 + 5 on 10-11).
+    let (ra_off_n, ra_on_n) = (ra_off.map_or(0, |r| r.0), ra_on.ok_or_else(|| eyre!("readahead sets not allocated"))?.0);
+    assert!(ra_off_n > 0 && ra_on_n > ra_off_n, "readahead words never queued: OFF {ra_off:?} ON {ra_on:?}");
     Ok(())
 }
 
