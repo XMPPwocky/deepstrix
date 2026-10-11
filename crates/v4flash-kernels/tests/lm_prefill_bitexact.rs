@@ -222,7 +222,7 @@ fn layer_major_prefill_is_bit_identical_to_chunked() -> eyre::Result<()> {
     let engine = HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, ExecMode::HetParallel)?;
     let mut ds = DgpuScratch::alloc(dgpu)?;
     let n_kv_max: u32 = 8192;
-    let lane_rows = v4flash_kernels::het::batch_scratch::B_MAX.div_ceil(2);
+    let lane_rows = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
     let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;

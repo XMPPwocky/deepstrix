@@ -68,6 +68,15 @@ pub struct Plan {
 /// First-fit-decreasing. `pool_cap` bytes; per store `(comp_bytes, comp_row_bytes, key_bytes, key_row_bytes)`. Written
 /// allocations only go to the pool. Errors if anything does not fit.
 pub fn plan(items: &[Recorded], pool_cap: usize, stores: &[(usize, usize, usize, usize)]) -> eyre::Result<Plan> {
+    plan_limited(items, pool_cap, stores, 1.0)
+}
+
+/// [`plan`] using at most `limit` (0..=1) of every store bin, still carved down from each bin's END: live decode KV is
+/// compacted to the FRONT of a store at lend, so a uniform limit leaves the same `1 - limit` of every store for it before
+/// any swap. (The first GPU run, 2026-10-11, used whole stores: lent rows [650000, 486468, 0, 1300000] -> every live
+/// stream overlapped and was swapped at every lend.)
+pub fn plan_limited(items: &[Recorded], pool_cap: usize, stores: &[(usize, usize, usize, usize)], limit: f64) -> eyre::Result<Plan> {
+    let limit = limit.clamp(0.0, 1.0);
     // Bin ENDS aligned down to 256 B (review r3 finding 5: `index_k` is `rows_cap x 80` B, not a multiple of 256), so every
     // buffer carved downward from an end starts 256-aligned.
     // The slack between the true end and the aligned end lies INSIDE the lent range (review r4 NEW-2): `lent_rows`
@@ -84,6 +93,7 @@ pub fn plan(items: &[Recorded], pool_cap: usize, stores: &[(usize, usize, usize,
     comp_bins.sort_by_key(|&s| (std::cmp::Reverse(stores[s].0), s));
     let mut key_bins = comp_bins.clone();
     key_bins.sort_by_key(|&s| (std::cmp::Reverse(stores[s].2), s));
+    let room = |b: usize| ((b as f64 * limit) as usize) / ALIGN * ALIGN;
     let mut pool_used = 0usize;
     let mut comp_used = vec![0usize; stores.len()];
     let mut key_used = vec![0usize; stores.len()];
@@ -100,7 +110,7 @@ pub fn plan(items: &[Recorded], pool_cap: usize, stores: &[(usize, usize, usize,
         }
         let mut placed = false;
         for &s in &comp_bins {
-            if comp_used[s] + sz <= stores[s].0 {
+            if comp_used[s] + sz <= room(stores[s].0) {
                 comp_used[s] += sz;
                 at[i] = (Bin::Comp(s), stores[s].0 - comp_used[s]);
                 placed = true;
@@ -109,7 +119,7 @@ pub fn plan(items: &[Recorded], pool_cap: usize, stores: &[(usize, usize, usize,
         }
         if !placed {
             for &s in &key_bins {
-                if key_used[s] + sz <= stores[s].2 {
+                if key_used[s] + sz <= room(stores[s].2) {
                     key_used[s] += sz;
                     at[i] = (Bin::Keys(s), stores[s].2 - key_used[s]);
                     placed = true;
@@ -193,7 +203,18 @@ impl PrefillLoan {
             let (c, k) = arena.store_buffers(si)?;
             stores.push((c.byte_len(), arena.stores[si].width as usize * 2, k.byte_len(), E2M1_KEY_ROW_BYTES));
         }
-        let p = plan(&rec, pool_bytes - lm_region, &stores)?;
+        // The smallest uniform store limit (5% steps) at which everything fits: balanced across stores.
+        let mut p = None;
+        for pct in (5..=100).step_by(5) {
+            if let Ok(x) = plan_limited(&rec, pool_bytes - lm_region, &stores, pct as f64 / 100.0) {
+                p = Some((x, pct));
+                break;
+            }
+        }
+        let (p, limit_pct) = match p {
+            Some(x) => x,
+            None => return Err(plan(&rec, pool_bytes - lm_region, &stores).err().unwrap_or_else(|| eyre!("prefill loan: no plan"))),
+        };
         let mut ptrs = Vec::with_capacity(rec.len());
         for (i, &(bin, off)) in p.at.iter().enumerate() {
             let base = match bin {
@@ -217,7 +238,7 @@ impl PrefillLoan {
         let arena_lent: u64 = p.lent_rows.iter().zip(&stores).map(|(&r, s)| r as u64 * (s.1 + s.3) as u64).sum();
         tracing::info!(
             rows, set_mib = set_bytes >> 20, pool_mib = pool_bytes >> 20, pool_used_mib = (lm_region + p.pool_used) >> 20,
-            lm_mib = lm_region >> 20, arena_lent_mib = arena_lent >> 20, lent_rows = ?p.lent_rows, allocations = rec.len(),
+            lm_mib = lm_region >> 20, arena_lent_mib = arena_lent >> 20, store_limit_pct = limit_pct, lent_rows = ?p.lent_rows, allocations = rec.len(),
             persistent = rec.iter().filter(|r| r.written).count(), headroom_mib = headroom_bytes() >> 20,
             "prefill VRAM loan: prefill lane set built over the pool + the arena's store end ranges"
         );
@@ -320,6 +341,25 @@ mod tests {
         assert_eq!(p.at[0], (Bin::Keys(0), 512));
         let lent_from_byte = 1000 - p.lent_rows[0] as usize * 80;
         assert!(lent_from_byte <= 512, "lent range starts at byte {lent_from_byte}, the buffer at 512");
+    }
+
+    /// A uniform limit spreads the lent rows across stores instead of filling the largest whole.
+    #[test]
+    fn a_store_limit_balances_the_lent_ranges() {
+        let st = [(4096, 128, 0, 16), (2048, 128, 0, 16)];
+        let items = vec![r(1000, false), r(1000, false), r(500, false)]; // 1024 + 1024 + 512 = 2560 of 6144
+        let full = plan(&items, 0, &st).unwrap();
+        assert_eq!(full.lent_rows, vec![(1024 + 1024 + 512) / 128, 0], "whole-store FFD: everything in the big store");
+        // 50%: the big store takes 2048 (two 1024s), the small one 1024 (holds the 512)
+        let half = plan_limited(&items, 0, &st, 0.5).unwrap();
+        assert!(half.lent_rows[0] as usize * 128 <= 2048 && half.lent_rows[1] as usize * 128 <= 1024, "{:?}", half.lent_rows);
+        assert!(plan_limited(&items, 0, &st, 0.3).is_err(), "30% of 6144 cannot hold 2560 in these pieces");
+        // offsets are still measured from the TRUE end of each store
+        for &(bin, off) in &half.at {
+            if let Bin::Comp(s) = bin {
+                assert!(off >= st[s].0 / 2, "limited to the last half of store {s}: offset {off}");
+            }
+        }
     }
 
     #[test]
