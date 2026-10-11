@@ -1610,6 +1610,12 @@ struct PfDone {
     ev: [f64; 18],
 }
 
+/// `PfJob::set` of a READAHEAD job still queued: it takes one of the readahead
+/// sets only when a reader starts it (`PfQueue::pop_role`; 10-11 fix: taking the
+/// set at ARRIVAL dropped ~94% of the hub's words, which come 64 per request
+/// against 4 sets, and starved the readers between bursts).
+const NO_SET: usize = usize::MAX;
+
 /// One background read for the prefetch readers.
 struct PfJob {
     layer: u32,
@@ -1690,6 +1696,10 @@ struct PfQueueInner {
     /// Readahead readers holding a NOT-certain readahead job (they have their
     /// own threads: no reader cap shared with speculative / LIKELY jobs).
     running_readahead: usize,
+    /// Free READAHEAD staging sets: a readahead job takes one at POP (`NO_SET`
+    /// while queued); the compute thread returns it after the landing
+    /// (`release_ra_set`).
+    ra_free: Vec<usize>,
     /// At most this many speculative jobs run at once: the rest of the readers
     /// (`V41_B2_PREFETCH_RESERVE`) are kept for certain ones.
     max_spec: usize,
@@ -1717,6 +1727,7 @@ impl PfQueue {
                 running_certain: 0,
                 running_likely: 0,
                 running_readahead: 0,
+                ra_free: Vec::new(),
                 max_spec: max_spec.max(1),
                 n_readers: n_readers.max(1),
                 closed: false,
@@ -1822,6 +1833,39 @@ impl PfQueue {
         [g.running_certain as f64, g.running_spec as f64, qc as f64, (g.jobs.len() - qc - ql) as f64]
     }
 
+    /// The readahead sets free at start (`prefetch_words_core`).
+    fn set_ra_free(&self, sets: Vec<usize>) {
+        self.inner.lock().unwrap().ra_free = sets;
+        self.cv.notify_all();
+    }
+
+    /// A readahead set is free again (its read landed, or failed / was stale).
+    fn release_ra_set(&self, set: usize) {
+        debug_assert!(set != NO_SET);
+        self.inner.lock().unwrap().ra_free.push(set);
+        self.cv.notify_all();
+    }
+
+    /// Bound the QUEUED not-certain readahead jobs at `cap`: the OLDEST beyond
+    /// it are removed (their layers are the ones a pass reaches first, or has
+    /// already passed); returns their keys (the caller clears `pending`).
+    fn trim_readahead(&self, cap: usize) -> Vec<(u32, u32)> {
+        let mut g = self.inner.lock().unwrap();
+        let n = g.jobs.iter().filter(|j| j.readahead && !j.certain).count();
+        let mut excess = n.saturating_sub(cap);
+        let mut out = Vec::with_capacity(excess);
+        g.jobs.retain(|j| {
+            if excess > 0 && j.readahead && !j.certain {
+                excess -= 1;
+                out.push((j.layer, j.e));
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+
     /// Running not-certain readahead reads, queued readahead jobs (tests, stats).
     fn counts_readahead(&self) -> [usize; 2] {
         let g = self.inner.lock().unwrap();
@@ -1854,20 +1898,31 @@ impl PfQueue {
     /// running certain ones (still at most `max_spec`), and a speculative job
     /// handed out is recorded in `spec_keys` until `finish_spec_key`.
     fn pop_mode(&self, urgency: bool) -> Option<PfJob> {
-        self.pop_role(urgency, false)
+        self.pop_role(urgency, None)
     }
 
     /// `pop_mode` for a reader of a ROLE (design 2.3): a general reader
-    /// (`readahead` false) never takes a not-certain readahead job -- it
-    /// considers the first job that is not one; a readahead reader takes the
-    /// first readahead job, certain or not, ungated (its own threads, so no
-    /// cap is shared and it never holds a reader a certain read needs).
-    fn pop_role(&self, urgency: bool, readahead: bool) -> Option<PfJob> {
+    /// (`ra_reader` None) never takes a not-certain readahead job, and a
+    /// certain (promoted) one only while a readahead set is free -- it
+    /// considers the first job it may take; readahead reader `Some(i)` takes
+    /// a readahead job -- certain first, then the oldest -- ungated (its own
+    /// threads: no cap is shared and it never holds a reader a certain read
+    /// needs), while a readahead set is free and `i < knobs::readahead_par()`
+    /// (the live active count; it re-checks every 100 ms). A set-less job gets
+    /// its set HERE.
+    fn pop_role(&self, urgency: bool, ra_reader: Option<usize>) -> Option<PfJob> {
         let mut g = self.inner.lock().unwrap();
         loop {
             if g.closed {
-                // Shutdown drains everything, ungated.
-                let j = g.jobs.pop_front()?;
+                // Shutdown drains everything, ungated; a set-less readahead job
+                // with no set left is discarded (nothing waits on it any more).
+                let mut j = g.jobs.pop_front()?;
+                if j.set == NO_SET {
+                    match g.ra_free.pop() {
+                        Some(set) => j.set = set,
+                        None => continue,
+                    }
+                }
                 if j.certain {
                     g.running_certain += 1
                 } else if j.readahead {
@@ -1879,9 +1934,18 @@ impl PfQueue {
                 }
                 return Some(j);
             }
-            if readahead {
-                if let Some(i) = g.jobs.iter().position(|j| j.readahead) {
-                    let j = g.jobs.remove(i).expect("index from position");
+            if let Some(idx) = ra_reader {
+                let active = idx < knobs::readahead_par();
+                let found = if active && !g.ra_free.is_empty() {
+                    g.jobs.iter().position(|j| j.readahead && j.certain).or_else(|| g.jobs.iter().position(|j| j.readahead))
+                } else {
+                    None
+                };
+                if let Some(i) = found {
+                    let mut j = g.jobs.remove(i).expect("index from position");
+                    if j.set == NO_SET {
+                        j.set = g.ra_free.pop().expect("checked non-empty");
+                    }
                     if j.certain {
                         g.running_certain += 1;
                     } else {
@@ -1892,17 +1956,23 @@ impl PfQueue {
                     }
                     return Some(j);
                 }
-                g = self.cv.wait(g).unwrap();
+                // Timed: the active count is a live knob.
+                g = self.cv.wait_timeout(g, std::time::Duration::from_millis(100)).unwrap().0;
                 continue;
             }
             // LIKELY and speculative jobs share the speculative reader cap
             // (round 3, finding 2: LIKELY must never occupy the certain reserve).
             let below_cap = g.running_spec + g.running_likely < Self::spec_cap(&g, urgency);
-            let at = g.jobs.iter().position(|j| !j.readahead || j.certain);
+            let ra_set = !g.ra_free.is_empty();
+            let at = g.jobs.iter().position(|j| !j.readahead || (j.certain && (j.set != NO_SET || ra_set)));
             match at.map(|i| &g.jobs[i]) {
                 Some(j) if j.certain => {
                     g.running_certain += 1;
-                    return g.jobs.remove(at.expect("matched"));
+                    let mut j = g.jobs.remove(at.expect("matched"))?;
+                    if j.set == NO_SET {
+                        j.set = g.ra_free.pop().expect("checked non-empty");
+                    }
+                    return Some(j);
                 }
                 // A LIKELY job pops whether or not a certain one runs (it does
                 // not yield; its chunks may pause instead).
@@ -2119,15 +2189,16 @@ impl Drop for PfFinish<'_> {
 /// `2 * reserve` general sets (kept for certain words); a certain word takes
 /// any general set. `None` = dropped.
 fn pick_set(free: &mut Vec<usize>, free_likely: &mut Vec<usize>, certain: bool, likely: bool, reserve: usize) -> Option<usize> {
-    pick_set_ra(free, free_likely, &mut Vec::new(), certain, likely, false, reserve)
+    pick_set_ra(free, free_likely, certain, likely, false, reserve)
 }
 
-/// `pick_set` with the READAHEAD class (design 2.3): a readahead word takes
-/// one of its own sets (`free_readahead`) or is dropped -- never a general
-/// set, so park / certain reads never lose one to it.
-fn pick_set_ra(free: &mut Vec<usize>, free_likely: &mut Vec<usize>, free_readahead: &mut Vec<usize>, certain: bool, likely: bool, readahead: bool, reserve: usize) -> Option<usize> {
+/// `pick_set` with the READAHEAD class (design 2.3): a readahead word is
+/// queued WITHOUT a set (`NO_SET`: it takes one of its own sets when a reader
+/// starts it, `PfQueue::pop_role`) -- never a general set, so park / certain
+/// reads never lose one to it; the queue is bounded by `trim_readahead`.
+fn pick_set_ra(free: &mut Vec<usize>, free_likely: &mut Vec<usize>, certain: bool, likely: bool, readahead: bool, reserve: usize) -> Option<usize> {
     if readahead && !certain {
-        return free_readahead.pop();
+        return Some(NO_SET);
     }
     if likely && !certain {
         if let Some(s) = free_likely.pop() {
@@ -2152,8 +2223,8 @@ struct B2Prefetch {
     /// Free sets of the RESERVED pair for LIKELY words (indices in `n_general..ra_start`).
     free_likely: Vec<usize>,
     n_general: usize,
-    /// Free READAHEAD sets (indices `>= ra_start`; design 2.3).
-    free_readahead: Vec<usize>,
+    /// READAHEAD sets are indices `>= ra_start` (design 2.3); their free list
+    /// is the queue's (`PfQueueInner::ra_free`: taken at pop).
     ra_start: usize,
     /// Reads sent on `rx_done` and not yet received (a reader increments it
     /// BEFORE its send, the compute thread decrements after each receive): the
@@ -2181,7 +2252,7 @@ impl B2Prefetch {
     /// A read is done with `set`: back to the list it came from.
     fn release_set(&mut self, set: usize) {
         if set >= self.ra_start {
-            self.free_readahead.push(set);
+            self.queue.release_ra_set(set);
         } else if set >= self.n_general {
             self.free_likely.push(set);
         } else {
@@ -2434,14 +2505,23 @@ pub mod knobs {
         /// three). 1 = the plain per-role read. Live. Whole-expert reads keep
         /// their three role threads x two drives.
         pub static ROLE_STRIPES = Knob::int("V41_B2_ROLE_STRIPES", 3, 1, 8).alias("role_stripes");
-        /// `V41_B2_READAHEAD_SETS` (default 4, 0..=32; 0 = off: readahead words take
+        /// `V41_B2_READAHEAD_SETS` (default 8, 0..=32; 0 = off: readahead words take
         /// the general path as before), key `readahead_sets`: staging sets reserved
         /// for the hub's prefill read-ahead words (docs/v41/B2_READAHEAD_LANE_DESIGN.md
         /// 2.3; ~32 MB pinned each). STARTUP ONLY (allocated at load).
-        pub static READAHEAD_SETS = Knob::int("V41_B2_READAHEAD_SETS", 4, 0, 32).alias("readahead_sets");
-        /// `V41_B2_READAHEAD_PAR` (default 2, 1..=8), key `readahead_par`: the
-        /// dedicated readahead reader threads (design 2.3). STARTUP ONLY.
-        pub static READAHEAD_PAR = Knob::int("V41_B2_READAHEAD_PAR", 2, 1, 8).alias("readahead_par");
+        pub static READAHEAD_SETS = Knob::int("V41_B2_READAHEAD_SETS", 8, 0, 32).alias("readahead_sets");
+        /// `V41_B2_READAHEAD_PAR` (default 2, 1..=4), key `readahead_par`: ACTIVE
+        /// readahead readers (design 2.3; `B2_READAHEAD_THREADS` are spawned, the
+        /// rest sit out). Live.
+        pub static READAHEAD_PAR = Knob::int("V41_B2_READAHEAD_PAR", 2, 1, 4).alias("readahead_par");
+        /// `V41_B2_READAHEAD_PAUSE` (default on), key `readahead_pause`: a readahead
+        /// read's 1 MB chunks pause while a demand or certain read runs (design 2.3);
+        /// off = unchunked, competing with them on the drives. Live.
+        pub static READAHEAD_PAUSE = Knob::flag("V41_B2_READAHEAD_PAUSE", true).alias("readahead_pause");
+        /// `V41_B2_READAHEAD_QUEUE` (default 192, 1..=4096), key `readahead_queue`:
+        /// queued (not started) readahead words at most; the oldest beyond it are
+        /// dropped (`PfQueue::trim_readahead`). Live.
+        pub static READAHEAD_QUEUE = Knob::int("V41_B2_READAHEAD_QUEUE", 192, 1, 4096).alias("readahead_queue");
         /// `V41_B2_LAND_POLL` (default on), key `land_poll`: land completed
         /// background reads in `run_path`'s GPU-drain poll and while idle (design
         /// 2.2), not only at the next `ensure` / in the park loop. Live.
@@ -2453,8 +2533,12 @@ pub mod knobs {
     }
     /// Readahead staging sets to allocate at load (design 2.3; 0 = off).
     pub fn readahead_sets() -> usize { READAHEAD_SETS.usize() }
-    /// Readahead reader threads (design 2.3).
+    /// Active readahead readers (design 2.3).
     pub fn readahead_par() -> usize { READAHEAD_PAR.usize() }
+    /// Readahead chunks pause for demand / certain reads.
+    pub fn readahead_pause() -> bool { READAHEAD_PAUSE.on() }
+    /// Queued readahead words at most.
+    pub fn readahead_queue() -> usize { READAHEAD_QUEUE.usize() }
     /// The prompt landing points are on (design 2.2).
     pub fn land_poll() -> bool { LAND_POLL.on() }
     /// Landings per landing point (design 2.2).
@@ -2594,7 +2678,8 @@ pub mod knobs {
             if prefill_route_split() { "split" } else { "mirror" }, u8::from(fast_chain()), prefill_budget(), u8::from(encoder_victims_first()),
             nursery(), nursery_lanes(), u8::from(likely_pause_for_certain()))
             + &format!(" land_two_phase={} likely_gateup_only={} role_stripes={}", u8::from(land_two_phase()), u8::from(likely_gateup_only()), role_stripes())
-            + &format!(" readahead_sets={} readahead_par={} (startup) land_poll={} land_max_per_poll={}", readahead_sets(), readahead_par(), u8::from(land_poll()), land_max_per_poll())
+            + &format!(" readahead_sets={} (startup) readahead_par={} readahead_pause={} readahead_queue={} land_poll={} land_max_per_poll={}",
+                readahead_sets(), readahead_par(), u8::from(readahead_pause()), readahead_queue(), u8::from(land_poll()), land_max_per_poll())
     }
 }
 
@@ -2645,6 +2730,9 @@ fn b2_prefetch_reserve() -> usize {
     });
     *R
 }
+
+/// Readahead reader threads spawned (the active count is `knobs::readahead_par`, live).
+const B2_READAHEAD_THREADS: usize = 4;
 
 /// Staging sets reserved for LIKELY (hint) reads when the nursery is on
 /// (design 3.2: a reserved pair, so hints never contend with restores and
@@ -5488,18 +5576,23 @@ impl ExpertShard {
             let gpu_repack = self.repack.is_some();
             let bpe = [self.routed.gate_bytes_per_expert, self.routed.up_bytes_per_expert, self.routed.down_bytes_per_expert];
             let n_par = b2_prefetch_par().min(stages.len().saturating_sub(n_ra).max(1));
-            let n_ra_par = if n_ra > 0 { knobs::readahead_par() } else { 0 };
+            let n_ra_par = if n_ra > 0 { B2_READAHEAD_THREADS } else { 0 };
+            let n = stages.len();
+            // The reserved LIKELY pair (if any) comes before the READAHEAD sets,
+            // which are the LAST `n_ra` (`load`); their free list is the queue's.
+            let ra_start = n - n_ra;
+            queue.set_ra_free((ra_start..n).collect());
             let done_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut readers = Vec::with_capacity(n_par + n_ra_par);
             for i in 0..n_par + n_ra_par {
             // Readers `n_par..` are READAHEAD readers (design 2.3, `pop_role`).
-            let ra_reader = i >= n_par;
+            let ra_reader = (i >= n_par).then(|| i - n_par);
             let queue_r = std::sync::Arc::clone(&queue);
             let tx_done = tx_done.clone();
             let ptrs = ptrs.clone();
             let owner = std::sync::Arc::clone(&owner);
             let done_ready_r = std::sync::Arc::clone(&done_ready);
-            readers.push(std::thread::Builder::new().name(if ra_reader { "b2-readahead" } else { "b2-prefetch" }.into()).spawn(move || {
+            readers.push(std::thread::Builder::new().name(if ra_reader.is_some() { "b2-readahead" } else { "b2-prefetch" }.into()).spawn(move || {
                 let ptrs = ptrs;
                 loop {
                     let urgency = knobs::route_urgency();
@@ -5570,10 +5663,12 @@ impl ExpertShard {
                         (true, true, false) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
                         (true, false, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
                     };
-                    // A READAHEAD read always pauses for demand / certain reads
-                    // (design 2.3, review r1 MAJOR-1a), with the LIKELY rule.
+                    // A READAHEAD read pauses for demand / certain reads (design
+                    // 2.3, review r1 MAJOR-1a), with the LIKELY rule, under
+                    // `knobs::readahead_pause` (live; off = unchunked).
                     let tok = pause_token(layer, e, done.likely || done.readahead);
-                    let chunked = !done.certain && !urgency && (!done.likely || done.readahead || knobs::likely_pause_for_certain());
+                    let chunked = !done.certain && !urgency
+                        && if done.readahead { knobs::readahead_pause() } else { !done.likely || knobs::likely_pause_for_certain() };
                     v4flash_core::io_throttle::set_background(chunked.then_some(tok));
                     let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route, roles);
                     v4flash_core::io_throttle::set_background(None);
@@ -5606,18 +5701,14 @@ impl ExpertShard {
                 }
             }).expect("spawn b2-prefetch"));
             }
-            let n = stages.len();
-            // The reserved LIKELY pair (if any) comes before the READAHEAD sets,
-            // which are the LAST `n_ra` (`load`).
-            let ra_start = n - n_ra;
             let n_general = if self.pool.as_ref().is_some_and(|p| p.nursery_target > 0) { ra_start.saturating_sub(B2_LIKELY_SETS).max(1) } else { ra_start };
             self.prefetch = Some(B2Prefetch {
                 queue, rx_done, readers, stages, free: (0..n_general).collect(), free_likely: (n_general..ra_start).collect(), n_general,
-                free_readahead: (ra_start..n).collect(), ra_start, done_ready,
+                ra_start, done_ready,
                 pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, promoted: 0, queue_ns: 0, read_ns: 0, n_read: 0,
                 ra_hinted: 0, ra_dropped: 0,
             });
-            eprintln!("expertd: look-ahead prefetch ON ({n_general} staging sets + {} reserved for LIKELY reads, {n_par} readers; {n_ra} readahead sets, {n_ra_par} readahead readers)", ra_start - n_general);
+            eprintln!("expertd: look-ahead prefetch ON ({n_general} staging sets + {} reserved for LIKELY reads, {n_par} readers; {n_ra} readahead sets, {n_ra_par} readahead readers, {} active (live))", ra_start - n_general, knobs::readahead_par());
         }
         let pool = self.pool.as_mut().unwrap();
         let pf = self.prefetch.as_mut().unwrap();
@@ -5647,7 +5738,7 @@ impl ExpertShard {
             // take one of the last reserved sets is dropped (it is retried by
             // whoever wants it next); a certain word may use any set; a LIKELY
             // word takes its reserved pair first (`pick_set`).
-            let Some(set) = pick_set_ra(&mut pf.free, &mut pf.free_likely, &mut pf.free_readahead, certain, likely, readahead, reserve) else {
+            let Some(set) = pick_set_ra(&mut pf.free, &mut pf.free_likely, certain, likely, readahead, reserve) else {
                 pf.dropped += 1;
                 pf.ra_dropped += u64::from(readahead);
                 if likely {
@@ -5664,6 +5755,15 @@ impl ExpertShard {
             // down-only read completes a partial entry.
             let roles = if down_only { ROLE_DOWN } else if likely && knobs::likely_gateup_only() { ROLES_GATEUP } else { ROLES_ALL };
             pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, own_prefill, prefill, restore, likely, roles, readahead, t_hint: std::time::Instant::now() });
+        }
+        // Readahead words wait for a reader, not a set: bound the queue (oldest out).
+        if readahead {
+            for key in pf.queue.trim_readahead(knobs::readahead_queue()) {
+                pf.pending.remove(&key);
+                pf.dropped += 1;
+                pf.ra_dropped += 1;
+                dropped_words.push((key.0 << 16) | key.1);
+            }
         }
         dropped_words
     }
@@ -11101,42 +11201,60 @@ mod tests {
         assert_eq!(pick_set(&mut g, &mut none, false, true, 0), Some(2));
     }
 
-    /// READAHEAD words take only their own sets (design 2.3): never a general
-    /// or LIKELY one, dropped when theirs are busy; a certain readahead word is
-    /// a certain word.
+    /// READAHEAD words queue WITHOUT a set (design 2.3, 10-11 fix): never a
+    /// general or LIKELY one; a certain readahead word is a certain word.
     #[test]
-    fn pick_set_readahead_own_sets_only() {
-        let (mut free, mut likely, mut ra) = (vec![0usize, 1, 2, 3, 4, 5], vec![6usize, 7], vec![8usize, 9]);
-        assert_eq!(pick_set_ra(&mut free, &mut likely, &mut ra, false, false, true, 1), Some(9));
-        assert_eq!(pick_set_ra(&mut free, &mut likely, &mut ra, false, false, true, 1), Some(8));
-        assert_eq!(pick_set_ra(&mut free, &mut likely, &mut ra, false, false, true, 1), None, "own sets busy: dropped");
+    fn pick_set_readahead_no_set_at_enqueue() {
+        let (mut free, mut likely) = (vec![0usize, 1, 2, 3, 4, 5], vec![6usize, 7]);
+        for _ in 0..100 {
+            assert_eq!(pick_set_ra(&mut free, &mut likely, false, false, true, 1), Some(NO_SET), "never dropped at enqueue");
+        }
         assert_eq!((free.len(), likely.len()), (6, 2), "general and LIKELY sets untouched");
-        assert_eq!(pick_set_ra(&mut free, &mut likely, &mut ra, true, false, true, 1), Some(5), "certain: a general set");
-        assert_eq!(pick_set_ra(&mut free, &mut likely, &mut ra, false, false, false, 1), Some(4), "speculative: unchanged");
+        assert_eq!(pick_set_ra(&mut free, &mut likely, true, false, true, 1), Some(5), "certain: a general set");
+        assert_eq!(pick_set_ra(&mut free, &mut likely, false, false, false, 1), Some(4), "speculative: unchanged");
+    }
+
+    /// `trim_readahead` drops the OLDEST queued not-certain readahead jobs beyond the cap, nothing else.
+    #[test]
+    fn trim_readahead_drops_oldest() {
+        let job = |e: u32, certain: bool, readahead: bool| PfJob { layer: 9, e, set: if readahead { NO_SET } else { e as usize }, certain, stage: false, own_prefill: false, prefill: readahead, restore: 0, likely: false, roles: ROLES_ALL, readahead, t_hint: Instant::now() };
+        let q = PfQueue::with_readers(3, 4);
+        for e in 0..5 {
+            q.push(job(e, false, true));
+        }
+        q.push(job(10, false, false));
+        q.push(job(11, true, false));
+        assert!(q.promote(9, 4), "readahead 4 promoted: certain, never trimmed");
+        assert_eq!(q.trim_readahead(2), vec![(9, 0), (9, 1)]);
+        assert_eq!(q.counts_readahead(), [0, 2]);
+        assert_eq!(q.trim_readahead(2), Vec::<(u32, u32)>::new());
+        assert_eq!(q.inner.lock().unwrap().jobs.len(), 5);
     }
 
     /// Reader ROLES (design 2.3, review r2 MINOR-A): one queue; a general
     /// reader never takes a not-certain readahead job, a readahead reader takes
     /// one ungated (a certain read running) and never takes another class; a
-    /// promoted readahead job is certain and either role may take it.
+    /// promoted readahead job is certain and either role may take it. Sets are
+    /// taken at POP from the queue's free list.
     #[test]
     fn pop_role_readahead_class() {
-        let job = |e: u32, certain: bool, readahead: bool| PfJob { layer: 7, e, set: e as usize, certain, stage: false, own_prefill: false, prefill: readahead, restore: 0, likely: false, roles: ROLES_ALL, readahead, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool, readahead: bool| PfJob { layer: 7, e, set: if readahead { NO_SET } else { e as usize }, certain, stage: false, own_prefill: false, prefill: readahead, restore: 0, likely: false, roles: ROLES_ALL, readahead, t_hint: Instant::now() };
         let q = std::sync::Arc::new(PfQueue::with_readers(3, 4));
+        q.set_ra_free(vec![8, 9]);
         q.push(job(1, false, true));
         q.push(job(2, false, true));
         q.push(job(3, true, false));
         q.push(job(4, false, false));
         // General: certain 3 first, then speculative 4 (not the readahead jobs ahead of it).
-        let a = q.pop_role(false, false).unwrap();
+        let a = q.pop_role(false, None).unwrap();
         assert_eq!((a.e, a.certain), (3, true));
-        // Readahead: ungated while certain 3 runs; FIFO among readahead jobs.
-        let b = q.pop_role(false, true).unwrap();
-        assert_eq!((b.e, b.readahead), (1, true));
+        // Readahead: ungated while certain 3 runs; FIFO among readahead jobs; takes a set at pop.
+        let b = q.pop_role(false, Some(0)).unwrap();
+        assert_eq!((b.e, b.readahead, b.set), (1, true, 9));
         assert_eq!(q.counts_readahead(), [1, 1]);
         // Under route=split speculative 4 waits for certain 3; readahead 2 is never handed to a general reader.
         let q2 = std::sync::Arc::clone(&q);
-        let h = std::thread::spawn(move || q2.pop_role(false, false).map(|j| j.e));
+        let h = std::thread::spawn(move || q2.pop_role(false, None).map(|j| j.e));
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(!h.is_finished(), "general reader must not take readahead job 2");
         q.finished_class(true, false, false);
@@ -11144,8 +11262,8 @@ mod tests {
         q.finished_class(false, false, false);
         // Promotion: readahead 2 becomes certain (shared `promote`, MINOR-A) and a general reader takes it.
         assert!(q.promote(7, 2));
-        let c = q.pop_role(false, false).unwrap();
-        assert_eq!((c.e, c.certain, c.readahead), (2, true, true));
+        let c = q.pop_role(false, None).unwrap();
+        assert_eq!((c.e, c.certain, c.readahead, c.set), (2, true, true, 8));
         q.finished_class(true, false, true);
         // The readahead reader finishing its not-certain job.
         drop(PfFinish { q: &q, certain: false, likely: false, readahead: true, spec_key: None });
@@ -11153,15 +11271,29 @@ mod tests {
         // A readahead reader never takes another class: blocks until a readahead job arrives.
         q.push(job(5, false, false));
         let q3 = std::sync::Arc::clone(&q);
-        let h = std::thread::spawn(move || q3.pop_role(false, true).map(|j| j.e));
+        let h = std::thread::spawn(move || q3.pop_role(false, Some(0)).map(|j| (j.e, j.set)));
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(!h.is_finished(), "readahead reader must not take speculative job 5");
         q.push(job(6, false, true));
-        assert_eq!(h.join().unwrap(), Some(6));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!h.is_finished(), "no readahead set free: readahead job 6 waits");
+        q.release_ra_set(9);
+        assert_eq!(h.join().unwrap(), Some((6, 9)));
+        // A reader beyond the live active count (default 2) sits out.
+        q.release_ra_set(8);
+        q.push(job(12, false, true));
+        let q4 = std::sync::Arc::clone(&q);
+        let h = std::thread::spawn(move || q4.pop_role(false, Some(3)).map(|j| j.e));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(!h.is_finished(), "reader 3 is not active at readahead_par=2");
+        assert_eq!(q.pop_role(false, Some(1)).map(|j| j.e), Some(12));
+        q.close();
+        assert_eq!(h.join().unwrap(), Some(5), "closed: the reader drains the rest");
         // Promoted while a readahead reader runs it: reclassified from the readahead count.
+        // (Readahead 6 and 12 are still "running": 2 -> 1.)
         q.reclassify_certain_cls(false, true);
         let g = q.inner.lock().unwrap();
-        assert_eq!((g.running_readahead, g.running_certain), (0, 1));
+        assert_eq!((g.running_readahead, g.running_certain), (1, 1));
     }
 
     /// The wait decisions under urgency routing, as pure functions.
