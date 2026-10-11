@@ -3556,7 +3556,19 @@ impl EarlyPaged {
 /// `(layer, e)` pairs a victim search must not take besides the hub's pins
 /// and the pass's own wanted ids: a parked request's picks (`parked_pins`)
 /// and the early-page `pinned` set.
+///
+/// SORTED and DEDUPLICATED (the victim scan tests membership by binary search: design
+/// docs/v41/B2_READAHEAD_LANE_DESIGN.md 2.1 -- a background landing's linear test against an undeduplicated parked list
+/// of up to ~6K picks cost ~5.7 ms per landing, measured 10-11). Build with `extra_pins`.
 type ExtraPins<'a> = &'a [(u32, u32)];
+
+/// `pinned` + `parked_pins` as an `ExtraPins` set: sorted, deduplicated.
+fn extra_pins(pinned: &[(u32, u32)], parked: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut v: Vec<(u32, u32)> = pinned.iter().chain(parked.iter()).copied().collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
 
 /// A bounded ring of request seqs seen once (`likely_words_in`: a frame's
 /// LIKELY words are applied at its first sight -- arrival or dequeue -- and
@@ -3797,7 +3809,7 @@ impl ShardPool {
             let key = match self.owner_of[sl] {
                 None => (0u8, 0u64),
                 Some((ol, oe)) => {
-                    if (ol == want_layer && want.contains(&oe)) || extra.contains(&(ol, oe)) || self.nursery_protected((ol, oe)) {
+                    if (ol == want_layer && want.contains(&oe)) || extra.binary_search(&(ol, oe)).is_ok() || self.nursery_protected((ol, oe)) {
                         continue;
                     }
                     let (at, tick) = self.nursery_land[sl];
@@ -4126,6 +4138,7 @@ impl ShardPool {
         ignore_hub_pins: bool,
         prefill_mode: bool,
     ) -> Option<u32> {
+        debug_assert!(extra.windows(2).all(|w| w[0] < w[1]), "ExtraPins must be sorted and deduplicated (extra_pins)");
         let n = self.owner_of.len() as u32;
         let range = range.start.min(n)..range.end.min(n);
         // Mode-aware eviction: a prefill-mode search in a prefill phase ranks by
@@ -4142,7 +4155,7 @@ impl ShardPool {
             let ok = match self.owner_of[sl as usize] {
                 Some((ol, oe)) => {
                     if (ol == want_layer && want.contains(&oe))
-                        || extra.contains(&(ol, oe))
+                        || extra.binary_search(&(ol, oe)).is_ok()
                         || (!ignore_hub_pins && self.pins.is_pinned(ol, oe))
                     {
                         false
@@ -5579,7 +5592,7 @@ impl ExpertShard {
     /// any layer. Called at the top of `ensure_layer_inner`, where nothing
     /// reads the pool. `want` protects the current layer's picks from eviction.
     fn admit_prefetched(&mut self, cur_layer: u32, want: &[u32]) -> eyre::Result<()> {
-        let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
+        let pinned = extra_pins(&self.pinned, &self.parked_pins);
         let Some(pf) = self.prefetch.as_mut() else { return Ok(()) };
         let Some(pool) = self.pool.as_mut() else { return Ok(()) };
         let global = b2_global_pool();
@@ -6430,7 +6443,7 @@ impl ExpertShard {
         if down_phase && !self.pool.as_ref().is_some_and(|p| ids.iter().any(|&e| (0..N_EXPERT as i32).contains(&e) && p.is_partial(layer, e as u32))) {
             return Ok(());
         }
-        let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
+        let pinned = extra_pins(&self.pinned, &self.parked_pins);
         // `evtrace` (`b2_ensure` + one `b2_read` per demand miss): NaN when off.
         let ev_on = super::evtrace::enabled();
         let nan = f64::NAN;
@@ -11647,6 +11660,23 @@ mod tests {
         assert_eq!(ev.map(|x| x.0), Some(30));
     }
 
+    /// `extra_pins` + binary search == the old linear `contains` on an undeduplicated, unsorted list.
+    #[test]
+    fn extra_pins_membership_matches_linear() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for _ in 0..50 {
+            let raw: Vec<(u32, u32)> = (0..(next() % 3000)).map(|_| ((next() % 40) as u32, (next() % 384) as u32)).collect();
+            let (a, b) = raw.split_at(raw.len() / 3);
+            let set = extra_pins(a, b);
+            assert!(set.windows(2).all(|w| w[0] < w[1]));
+            for _ in 0..500 {
+                let k = ((next() % 40) as u32, (next() % 384) as u32);
+                assert_eq!(set.binary_search(&k).is_ok(), raw.contains(&k));
+            }
+        }
+    }
+
     /// Evict-behind order of a LAST request's own pages (`last_sweep_rank`).
     #[test]
     fn last_sweep_rank_orders_behind_the_pass_first() {
@@ -12570,7 +12600,7 @@ mod tests {
             let paged = self.paged_bits(a.layer, &sel);
             if !self.scripted && partner.is_none() && paged.iter().any(|&w| w != 0) && rng.below(3) == 0 {
                 self.st.parked += 1;
-                let parked: Vec<(u32, u32)> = Self::distinct(&sel).into_iter().map(|e| (a.layer, e)).collect();
+                let parked: Vec<(u32, u32)> = extra_pins(&[], &Self::distinct(&sel).into_iter().map(|e| (a.layer, e)).collect::<Vec<_>>());
                 let w: Vec<u32> = parked.iter().filter(|k| !self.pool.slot_of.contains_key(k)).map(|k| (k.0 << 16) | k.1).collect();
                 // The park hook: a parked prefill chunk's reads are staged.
                 self.queue_bg(&w, a.b > 16, false);
