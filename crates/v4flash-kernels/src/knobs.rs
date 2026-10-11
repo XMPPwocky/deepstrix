@@ -707,6 +707,11 @@ crate::knobs! {
     /// 10-11 at 1024-row lanes, 39% of each window had no box-2 request outstanding, in two gaps at the Engram layers.
     /// Same bytes, same stream order -> bit-identical. `0` = the blocking path.
     pub static LM_ENGRAM_ASYNC = Knob::flag("V41_LM_ENGRAM_ASYNC", true).live();
+    /// `V41_LM_SEED_ASYNC` (default ON; LIVE): the same for the layer-0 seed of a layer-outer window (each unit's input HC
+    /// rows into the lane residual): one pinned window staging (`win_rows x HC_DIM` f32, ~336 MB at 4096 rows) packed on
+    /// the host before the first pass, one async copy per unit on the dGPU compute stream, instead of `rows` BLOCKING
+    /// per-row copies that drained the device (review r6 #1: the layer 0-3 quantum's gap). Bit-identical. `0` = blocking.
+    pub static LM_SEED_ASYNC = Knob::flag("V41_LM_SEED_ASYNC", true).live();
     /// `V41_PREFILL_SPLIT` (default off; LIVE): the frozen encoder-layer expert split of a LONG job
     /// (`prefill_split`, design sec 4). Read once per job at its first unit; a flip affects the next long job only.
     pub static PREFILL_SPLIT = Knob::flag("V41_PREFILL_SPLIT", false).live();

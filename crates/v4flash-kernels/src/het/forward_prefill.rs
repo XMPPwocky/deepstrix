@@ -1001,10 +1001,14 @@ fn chunk_visibility(pos0: u32, b: usize, spans: &[ImageSpan]) -> eyre::Result<Op
 /// logits are taken. `engram_rows`: one flattened `[T * ENGRAM_IN]` buffer per
 /// Engram layer for the whole prompt.
 pub struct PrefillJob {
-    /// Pinned staging of a layer-outer window's Engram rows, one buffer per `ENGRAM_LAYERS` entry, `window rows x
-    /// ENGRAM_IN` f32 each (`V41_LM_ENGRAM_ASYNC`). A unit's slot is copied to the device asynchronously on the dGPU
-    /// compute stream; slots are rewritten only by the NEXT window, after the pass's closing synchronize.
-    engram_pin: Vec<v4flash_hip::PinnedBuffer<f32>>,
+    /// Pinned staging of a layer-outer window's Engram rows, per `ENGRAM_LAYERS` entry (allocated only for the entries a
+    /// pass actually stages: one with the default 4-layer quanta), `window rows x ENGRAM_IN` f32 each
+    /// (`V41_LM_ENGRAM_ASYNC`). A unit's slot is copied to the device asynchronously on the dGPU compute stream; slots
+    /// are rewritten only by the NEXT window, after the pass's closing synchronize.
+    engram_pin: Vec<Option<v4flash_hip::PinnedBuffer<f32>>>,
+    /// Pinned staging of a layer-outer window's layer-0 seed (input HC rows), `window rows x HC_DIM` f32
+    /// (`V41_LM_SEED_ASYNC`); same lifetime rule as `engram_pin`.
+    seed_pin: Option<v4flash_hip::PinnedBuffer<f32>>,
     tokens: Vec<i32>,
     input_hcs: Vec<Vec<f32>>,
     engram_rows: Option<Vec<Vec<f32>>>,
@@ -1093,6 +1097,7 @@ impl PrefillJob {
             split_tried: false,
             lo_latch: std::sync::atomic::AtomicU8::new(0),
             engram_pin: Vec::new(),
+            seed_pin: None,
             chunk_inputs: None,
         })
     }
@@ -1683,19 +1688,18 @@ impl HeterogeneousEngine {
         let engram_async = crate::knobs::LM_ENGRAM_ASYNC.on() && !engram_here.is_empty();
         if engram_async {
             let need = win_rows * ein;
-            while job.engram_pin.len() < crate::config::ENGRAM_LAYERS.len() {
-                job.engram_pin.push(v4flash_hip::PinnedBuffer::<f32>::new(need)?);
-            }
+            job.engram_pin.resize_with(crate::config::ENGRAM_LAYERS.len(), || None);
             for &li in &engram_here {
-                if job.engram_pin[li].len() < need {
-                    job.engram_pin[li] = v4flash_hip::PinnedBuffer::<f32>::new(need)?;
+                if job.engram_pin[li].as_ref().is_none_or(|p| p.len() < need) {
+                    job.engram_pin[li] = None; // free before allocating the larger one
+                    job.engram_pin[li] = Some(v4flash_hip::PinnedBuffer::<f32>::new(need)?);
                 }
                 let src: &[f32] = match (lazy, engram_win.as_deref(), job.engram_rows.as_deref()) {
                     (true, Some(w), _) => &w[li],
                     (false, _, Some(rs)) => &rs[li],
                     _ => return Err(eyre!("layer-outer: Engram layer in pass [{a}, {b_end}) but no Engram rows")),
                 };
-                let dst = job.engram_pin[li].as_mut_slice();
+                let dst = job.engram_pin[li].as_mut().expect("allocated above").as_mut_slice();
                 for un in &units {
                     let s0 = if lazy { un.row0 } else { un.tok0 } * ein;
                     let n = un.rows * ein;
@@ -1706,6 +1710,29 @@ impl HeterogeneousEngine {
                 }
             }
         }
+        // Layer-0 seed (input HC rows) -> the job's pinned window staging, one slot per unit (V41_LM_SEED_ASYNC).
+        let seed_async = a == 0 && crate::knobs::LM_SEED_ASYNC.on();
+        if seed_async {
+            let need = win_rows * h;
+            if job.seed_pin.as_ref().is_none_or(|p| p.len() < need) {
+                job.seed_pin = None; // free before allocating the larger one
+                job.seed_pin = Some(v4flash_hip::PinnedBuffer::<f32>::new(need)?);
+            }
+            let dst = job.seed_pin.as_mut().expect("allocated above").as_mut_slice();
+            for un in &units {
+                for i in 0..un.rows {
+                    let src: &[f32] = match hcs_lazy.as_ref() {
+                        Some(x) => x.get(un.row0 + i).map(|v| v.as_slice()).unwrap_or(&[]),
+                        None => job.input_hcs.get(un.tok0 + i).map(|v| v.as_slice()).unwrap_or(&[]),
+                    };
+                    if src.len() != h {
+                        return Err(eyre!("layer-outer: seed row {} holds {} floats, expected {h}", un.row0 + i, src.len()));
+                    }
+                    let d0 = (un.row0 + i) * h;
+                    dst[d0..d0 + h].copy_from_slice(src);
+                }
+            }
+        }
         let n_tasks = (b_end - a) * u_count;
         let ops = sch::ops(n_tasks, |t| sch::task(t, a, u_count).0 != split);
         let pos0_job = job.pos0;
@@ -1713,7 +1740,8 @@ impl HeterogeneousEngine {
         let spans: &[ImageSpan] = &job.image_spans;
         let input_hcs: &[Vec<f32>] = &job.input_hcs;
         let engram_job: Option<&[Vec<f32>]> = job.engram_rows.as_deref();
-        let engram_pin: &[v4flash_hip::PinnedBuffer<f32>] = &job.engram_pin;
+        let engram_pin: &[Option<v4flash_hip::PinnedBuffer<f32>>] = &job.engram_pin;
+        let seed_pin: Option<&v4flash_hip::PinnedBuffer<f32>> = job.seed_pin.as_ref();
         let (res, carry, _) = job.lm_store.as_mut().expect("checked above");
         let (sel_store, nsp_store, _) = job.lm_idx.as_mut().expect("allocated above");
         let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch); 2] = [(bd_a, bi_a), (bd_b, bi_b)];
@@ -1739,13 +1767,21 @@ impl HeterogeneousEngine {
                     let pos0_u = pos0_job + un.tok0 as u32;
                     let vis = chunk_visibility(pos0_u, un.rows, spans)?;
                     // -- residual / carry in --
-                    // HAZARD (review r5 #2): the layer-0 seed below is a BLOCKING `copy_from_host`. It is ordered after
-                    // Post(t-2)'s async store_out (which READS this lane's `bd.residual`/`hc_pre_carry`) ONLY because
-                    // `de.compute` is a BLOCKING stream (`Stream::new`, engine.rs:217): the null-stream memcpy waits for
-                    // everything queued on it. Make `de.compute` non-blocking and unit u's seed silently corrupts unit u-2's
-                    // store rows. The same holds for `stage_engram_lane` (layers 1 and 14). P2b-2 replaces both with a
-                    // pinned async path.
-                    if l == 0 {
+                    // The layer-0 seed and the Engram rows are async copies from pinned staging on `de.compute`
+                    // (V41_LM_SEED_ASYNC / V41_LM_ENGRAM_ASYNC), ordered after Post(t-2)'s async store_out (which READS
+                    // this lane's `bd.residual`) by the stream itself.
+                    // HAZARD (review r5 #2), the knob-off paths only: the blocking seed `copy_from_host` and
+                    // `stage_engram_lane` are ordered after that store_out ONLY because `de.compute` is a BLOCKING stream
+                    // (`Stream::new`, engine.rs:217): the null-stream memcpy waits for everything queued on it. Make
+                    // `de.compute` non-blocking and unit u's seed silently corrupts unit u-2's store rows.
+                    if l == 0 && seed_async {
+                        let n = un.rows * h;
+                        let pin = seed_pin.ok_or_else(|| eyre!("layer-outer: seed staging missing"))?;
+                        if n > bd.residual.len() {
+                            return Err(eyre!("layer-outer: {} seed rows exceed the lane's residual", un.rows));
+                        }
+                        bd.residual.slice_view_mut(0, n).copy_from_host_async(&pin.as_slice()[un.row0 * h..un.row0 * h + n], &de.compute)?;
+                    } else if l == 0 {
                         for i in 0..un.rows {
                             let src: &Vec<f32> = match hcs_lazy.as_ref() {
                                 Some(x) => &x[un.row0 + i],
@@ -1779,7 +1815,7 @@ impl HeterogeneousEngine {
                             return Err(eyre!("layer-outer: {} Engram rows exceed the lane's {}", un.rows, bd.engram_rows.len() / ein));
                         }
                         bd.engram_rows.slice_view_mut(0, n)
-                            .copy_from_host_async(&engram_pin[li].as_slice()[un.row0 * ein..un.row0 * ein + n], &de.compute)?;
+                            .copy_from_host_async(&engram_pin[li].as_ref().expect("staged above").as_slice()[un.row0 * ein..un.row0 * ein + n], &de.compute)?;
                         bd.engram_rows_ready = true;
                     } else {
                         match (lazy, engram_win.as_deref()) {
