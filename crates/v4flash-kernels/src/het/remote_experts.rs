@@ -1610,10 +1610,13 @@ struct PfDone {
     ev: [f64; 18],
 }
 
-/// `PfJob::set` of a READAHEAD job still queued: it takes one of the readahead
-/// sets only when a reader starts it (`PfQueue::pop_role`; 10-11 fix: taking the
-/// set at ARRIVAL dropped ~94% of the hub's words, which come 64 per request
-/// against 4 sets, and starved the readers between bursts).
+/// `PfJob::set` of a job queued WITHOUT a staging set. A READAHEAD job takes one
+/// of the readahead sets when a reader starts it (`PfQueue::pop_role`); a
+/// CERTAIN job that found no general set free is handed the next general set
+/// the compute thread frees (`B2Prefetch::release_set` -> `assign_waiting`).
+/// 10-11: taking a set at ARRIVAL or dropping the word dropped ~200 of a
+/// 1024-row frame's early-page picks per request (16 general sets), which then
+/// came back as serial demand misses (~100 x 2.6 ms per request).
 const NO_SET: usize = usize::MAX;
 
 /// One background read for the prefetch readers.
@@ -1859,6 +1862,27 @@ impl PfQueue {
         true
     }
 
+    /// The compute thread freed GENERAL set `set`: hand it to the OLDEST queued
+    /// certain job without a set (an early-page / park word that found none
+    /// free; or a promoted readahead job while no readahead set is free).
+    /// Returns false (the caller keeps `set`) when none waits.
+    fn assign_waiting(&self, set: usize) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let ra_empty = g.ra_free.is_empty();
+        let Some(j) = g.jobs.iter_mut().find(|j| j.certain && j.set == NO_SET && (!j.readahead || ra_empty)) else {
+            return false;
+        };
+        j.set = set;
+        drop(g);
+        self.cv.notify_all();
+        true
+    }
+
+    /// Queued certain jobs still waiting for a general set (stats, tests).
+    fn setless_certain(&self) -> usize {
+        self.inner.lock().unwrap().jobs.iter().filter(|j| j.certain && !j.readahead && j.set == NO_SET).count()
+    }
+
     /// A readahead set is free again (its read landed, or failed / was stale).
     fn release_ra_set(&self, set: usize) {
         debug_assert!(set != NO_SET);
@@ -1938,7 +1962,7 @@ impl PfQueue {
                 // with no set left is discarded (nothing waits on it any more).
                 let mut j = g.jobs.pop_front()?;
                 if j.set == NO_SET {
-                    match g.ra_free.pop() {
+                    match g.ra_free.pop().filter(|_| j.readahead) {
                         Some(set) => j.set = set,
                         None => continue,
                     }
@@ -1984,7 +2008,8 @@ impl PfQueue {
             // (round 3, finding 2: LIKELY must never occupy the certain reserve).
             let below_cap = g.running_spec + g.running_likely < Self::spec_cap(&g, urgency);
             let ra_set = !g.ra_free.is_empty();
-            let at = g.jobs.iter().position(|j| !j.readahead || (j.certain && (j.set != NO_SET || ra_set)));
+            // A set-less certain (non-readahead) job waits for `assign_waiting`.
+            let at = g.jobs.iter().position(|j| if j.readahead { j.certain && (j.set != NO_SET || ra_set) } else { j.set != NO_SET });
             match at.map(|i| &g.jobs[i]) {
                 Some(j) if j.certain => {
                     g.running_certain += 1;
@@ -2207,7 +2232,9 @@ impl Drop for PfFinish<'_> {
 /// admissions for the general sets), then a general set under the
 /// speculative rule; a speculative word never takes one of the last
 /// `2 * reserve` general sets (kept for certain words); a certain word takes
-/// any general set. `None` = dropped.
+/// any general set, or with none free is queued WITHOUT one (`NO_SET`: it gets
+/// the next general set freed, `assign_waiting`) -- never dropped. `None` =
+/// dropped.
 fn pick_set(free: &mut Vec<usize>, free_likely: &mut Vec<usize>, certain: bool, likely: bool, reserve: usize) -> Option<usize> {
     pick_set_ra(free, free_likely, certain, likely, false, reserve)
 }
@@ -2227,6 +2254,9 @@ fn pick_set_ra(free: &mut Vec<usize>, free_likely: &mut Vec<usize>, certain: boo
     }
     if !certain && free.len() <= 2 * reserve {
         return None;
+    }
+    if certain {
+        return Some(free.pop().unwrap_or(NO_SET));
     }
     free.pop()
 }
@@ -2285,7 +2315,7 @@ impl B2Prefetch {
             self.queue.release_ra_set(set);
         } else if set >= self.n_general {
             self.free_likely.push(set);
-        } else {
+        } else if !self.queue.assign_waiting(set) {
             self.free.push(set);
         }
     }
@@ -11247,6 +11277,39 @@ mod tests {
         assert_eq!((free.len(), likely.len()), (6, 2), "general and LIKELY sets untouched");
         assert_eq!(pick_set_ra(&mut free, &mut likely, true, false, true, 1), Some(5), "certain: a general set");
         assert_eq!(pick_set_ra(&mut free, &mut likely, false, false, false, 1), Some(4), "speculative: unchanged");
+    }
+
+    /// CERTAIN words are never dropped: with no general set free they queue
+    /// set-less, general readers skip them, and the next freed general set goes
+    /// to the OLDEST of them.
+    #[test]
+    fn certain_words_queue_setless_and_get_freed_sets() {
+        let (mut free, mut likely) = (vec![0usize], Vec::<usize>::new());
+        assert_eq!(pick_set(&mut free, &mut likely, true, false, 1), Some(0));
+        assert_eq!(pick_set(&mut free, &mut likely, true, false, 1), Some(NO_SET), "certain: queued without a set");
+        assert_eq!(pick_set(&mut free, &mut likely, false, false, 1), None, "speculative: still dropped");
+        let job = |e: u32, set: usize| PfJob { layer: 2, e, set, certain: true, stage: false, own_prefill: true, prefill: false, restore: 0, likely: false, roles: ROLES_ALL, readahead: false, t_hint: Instant::now() };
+        let q = std::sync::Arc::new(PfQueue::with_readers(3, 4));
+        q.push(job(1, NO_SET));
+        q.push(job(2, NO_SET));
+        q.push(job(3, 7));
+        assert_eq!(q.setless_certain(), 2);
+        // A general reader skips the set-less ones.
+        let a = q.pop_role(false, None).unwrap();
+        assert_eq!((a.e, a.set), (3, 7));
+        let q2 = std::sync::Arc::clone(&q);
+        let h = std::thread::spawn(move || q2.pop_role(false, None).map(|j| (j.e, j.set)));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!h.is_finished(), "set-less certain jobs are not handed out");
+        assert!(q.assign_waiting(5));
+        assert_eq!(h.join().unwrap(), Some((1, 5)), "the oldest gets the freed set");
+        assert!(q.assign_waiting(6));
+        assert!(!q.assign_waiting(4), "none waits");
+        assert_eq!(q.pop_role(false, None).map(|j| (j.e, j.set)), Some((2, 6)));
+        // Closed: a set-less certain job is discarded, not handed out.
+        q.push(job(9, NO_SET));
+        q.close();
+        assert!(q.pop_role(false, None).is_none());
     }
 
     /// A promoted set-less readahead job gets a general set only while no readahead set is free (review r4 MINOR-1).
