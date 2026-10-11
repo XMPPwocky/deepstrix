@@ -7,7 +7,7 @@
 set -u
 SLOT=${1:-900}; N=${2:-24}
 K=/dev/shm/deepstrix-knobs.txt
-OUT=/home/claude-code/logs/ab_ra_20261011.txt
+OUT=${OUT:-/home/claude-code/logs/ab_ra_20261011.txt}
 setv() {
   grep -v -E '^V41_LM_PREFETCH_AHEAD=' "$K" > "$K.tmp.$$" && echo "V41_LM_PREFETCH_AHEAD=$1" >> "$K.tmp.$$" && cat "$K.tmp.$$" > "$K" && rm -f "$K.tmp.$$" \
     && echo "$(date -u +%FT%T) V41_LM_PREFETCH_AHEAD=$1" | tee -a "$OUT"
