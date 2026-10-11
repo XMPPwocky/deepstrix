@@ -131,6 +131,20 @@ fn zero_state(st: &mut HetModelState) -> eyre::Result<()> {
 }
 
 /// Every difference between two states, as readable lines (empty = identical).
+/// `(first row, last row, rows that differ)` of two row-major buffers with `row` elements per row, if any differ.
+fn row_span<T: PartialEq>(a: &[T], b: &[T], row: usize) -> Option<(usize, usize, usize)> {
+    let mut first = None;
+    let (mut last, mut n) = (0usize, 0usize);
+    for (r, (x, y)) in a.chunks(row).zip(b.chunks(row)).enumerate() {
+        if x != y {
+            first.get_or_insert(r);
+            last = r;
+            n += 1;
+        }
+    }
+    first.map(|f| (f, last, n))
+}
+
 fn diff_states(a: &HetModelState, b: &HetModelState) -> eyre::Result<Vec<String>> {
     let mut out = Vec::new();
     for l in 0..N_LAYER as usize {
@@ -138,8 +152,9 @@ fn diff_states(a: &HetModelState, b: &HetModelState) -> eyre::Result<Vec<String>
         if (x.n_raw, x.raw_off) != (y.n_raw, y.raw_off) {
             out.push(format!("L{l}: n_raw/raw_off {}/{} vs {}/{}", x.n_raw, x.raw_off, y.n_raw, y.raw_off));
         }
-        if host(&x.kv_cache)? != host(&y.kv_cache)? {
-            out.push(format!("L{l}: kv_cache bytes differ"));
+        if let Some((f, z, n)) = row_span(&host(&x.kv_cache)?, &host(&y.kv_cache)?, v4flash_kernels::config::N_HEAD_DIM as usize) {
+            out.push(format!("L{l}: kv_cache bytes differ: rows {f}..={z} ({n} rows; raw_off {} n_raw {}; ring {} rows)",
+                x.raw_off, x.n_raw, x.kv_cache.len() / v4flash_kernels::config::N_HEAD_DIM as usize));
         }
         for (name, cx, cy) in [
             ("compressor", x.compressor.as_ref(), y.compressor.as_ref()),
@@ -163,7 +178,11 @@ fn diff_states(a: &HetModelState, b: &HetModelState) -> eyre::Result<Vec<String>
                         _ => false,
                     };
                     if !same {
-                        out.push(format!("L{l} {name}: comp_kv differs"));
+                        let span = match (&p.comp_kv, &q.comp_kv) {
+                            (CompKvStore::F16(u), CompKvStore::F16(v)) => row_span(&host(u)?, &host(v)?, p.width as usize),
+                            _ => None,
+                        };
+                        out.push(format!("L{l} {name}: comp_kv differs: rows {span:?} (first, last, count; n_comp {})", p.n_comp));
                     }
                     match (p.index_k.as_ref(), q.index_k.as_ref()) {
                         (Some(u), Some(v)) if host(u)? != host(v)? => out.push(format!("L{l} {name}: index_k differs")),
