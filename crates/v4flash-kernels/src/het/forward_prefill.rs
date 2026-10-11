@@ -1747,7 +1747,9 @@ impl HeterogeneousEngine {
         // non-resident experts of layers `l+1..=l+ahead` below the split, paced per request; what went out on a request is
         // remembered for the window (`pf_sent`), and the pass drops its unsent words before returning (decode runs between
         // passes and must not carry them).
-        let pf_ahead = if lm_prefetch_enabled() && self.remote.is_some() { crate::knobs::LM_PREFETCH_AHEAD.usize() } else { 0 };
+        // Last-unit only (`V41_LM_PREFETCH_LAST_ONLY`, default on): see the knob.
+        let pf_window_ok = !crate::knobs::LM_PREFETCH_LAST_ONLY.on() || job.lm.as_ref().is_some_and(|w| w.last);
+        let pf_ahead = if lm_prefetch_enabled() && self.remote.is_some() && pf_window_ok { crate::knobs::LM_PREFETCH_AHEAD.usize() } else { 0 };
         let mut pf_sent: std::collections::HashSet<u32> = std::mem::take(&mut job.lm.as_mut().expect("open window").pf_sent);
         let mut pf_queued: Vec<u32> = Vec::new();
         let pf_prev_cap = (pf_ahead > 0).then(|| super::remote_experts::set_prefetch_take_cap(lm_prefetch_per_req()));

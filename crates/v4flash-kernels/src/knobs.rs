@@ -765,6 +765,11 @@ crate::knobs! {
     /// redeploy): without it a landing for L+2 evicts layer L+1's pages (review r8 #1). With 1024-row lanes (4 requests
     /// per layer) also raise `V41_LM_PREFETCH_PER_REQ` to ~64. `0` = off (the pre-P3 behaviour).
     pub static LM_PREFETCH_AHEAD = Knob::int("V41_LM_PREFETCH_AHEAD", 0, 0, 8).live();
+    /// `V41_LM_PREFETCH_LAST_ONLY` (default ON; LIVE): the rolling prefetch runs only in a job's LAST window (no further
+    /// window opens: `LmWindow::last`). There the layers a pass has left are dead for the job, so a landing's
+    /// evict-behind victim is free; in an earlier window of a multi-window job they are the NEXT window's pages
+    /// (10-11 A/B: steady windows went from 0 to 1.8 box-2 misses/request with streaming on). `0` = every window.
+    pub static LM_PREFETCH_LAST_ONLY = Knob::flag("V41_LM_PREFETCH_LAST_ONLY", true).live();
     /// `V41_SUB_DEFER_ACCEPTED` (default off; live): a speculative block's
     /// cache-prior admissions, pin want counts and hot-set picks wait for its
     /// accept and only the kept rows' are applied (`b2_mirror::defer_flush`).
