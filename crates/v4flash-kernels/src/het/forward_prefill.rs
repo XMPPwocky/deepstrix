@@ -5521,6 +5521,22 @@ impl HeterogeneousEngine {
         r?;
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
+        // GATE DIAGNOSTIC (`V41_PREFILL_COLD_LATE_DEBUG=1`, first 40 joins): the late output's and the main output's
+        // L2 norms before the add, and how many of the unit's picks are late.
+        static LATE_DBG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_PREFILL_COLD_LATE_DEBUG").as_deref() == Ok("1"));
+        static LATE_DBG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if *LATE_DBG && LATE_DBG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+            ie.compute.synchronize()?;
+            let mut lv = vec![0f32; n];
+            let mut mv = vec![0f32; n];
+            bi.late_moe.as_ref().expect("allocated").slice_view(0, n).copy_to_host(&mut lv)?;
+            bi.ffn_moe.slice_view(0, n).copy_to_host(&mut mv)?;
+            let l2 = |v: &[f32]| v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+            let nz_rows = lv.chunks(cs_n_embd).filter(|r| r.iter().any(|&x| x != 0.0)).count();
+            let late_picks = c.sel_host_audit.iter().filter(|&&e| e >= 0 && late.contains(&(e as u32))).count();
+            eprintln!("[late-dbg] L{layer} b={b} late_ids={} late_picks={late_picks} |late|={:.4e} |main|={:.4e} late_nonzero_rows={nz_rows} nan={}",
+                late.len(), l2(&lv), l2(&mv), lv.iter().any(|x| !x.is_finite()));
+        }
         ie.vec_add.launch(&ie.compute, &mut bi.ffn_moe, bi.late_moe.as_ref().expect("allocated"), n as u32)?;
         self.moe_push_tail(bd, bi, sev, b, cs_n_embd)
     }
