@@ -341,10 +341,10 @@ fn late_pass_matches_main_pass() -> eyre::Result<()> {
     let mut arm = |name: &str, force: &str, skip: &str, pg: &mut ExpertPager| -> eyre::Result<(Vec<f32>, Vec<Vec<f32>>, usize, u64)> {
         v4flash_kernels::knobs::PREFILL_COLD_FORCE_LATE.set(force);
         v4flash_kernels::knobs::PREFILL_COLD_LATE_SKIP.set(skip);
-        let (s0, n0, _) = v4flash_kernels::het::prefill_split::late_totals();
+        let landed0 = pg.late_stats().map_or(0, |x| x.2 + x.3);
         let mut st = fresh_state()?;
         let (l, windows) = run(&prompt, 0, rows_all.clone(), &mut st, lm_rows, false, false, pg)?;
-        let (s1, n1, _) = v4flash_kernels::het::prefill_split::late_totals();
+        let landed1 = pg.late_stats().map_or(0, |x| x.2 + x.3);
         // Greedy decode steps, chunked (no late pass), off this arm's KV.
         let mut steps = Vec::new();
         let mut seq = prompt.clone();
@@ -357,7 +357,8 @@ fn late_pass_matches_main_pass() -> eyre::Result<()> {
             tok = argmax(&d) as i32;
             steps.push(d);
         }
-        let late = (s1 - s0) + (n1 - n0);
+        // Late picks joined in this arm (landed by a read + already resident at the join), from the pager.
+        let late = landed1 - landed0;
         eprintln!("  arm {name}: force {force} skip {skip}: {windows} layer-outer windows, late picks {late}, argmax {}", argmax(&l));
         Ok((l, steps, windows, late))
     };

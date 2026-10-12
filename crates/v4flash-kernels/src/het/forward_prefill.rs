@@ -1788,7 +1788,11 @@ impl HeterogeneousEngine {
             self.igpu.compute.synchronize()?;
         }
         let _pin_pass = PinPass::enter(pin);
-        let late_on = pin && crate::knobs::PREFILL_COLD_ASYNC.on() && !hot_prefill_enabled() && pager.as_deref().is_some_and(|p| p.late_on());
+        // Not with the dGPU hot het-split active on any layer of the pass (its own remap; the late pass dispatches through
+        // the pager pool only). `prefill_hot_active`, not `hot_prefill_enabled()`: the latter defaults ON even with no hot
+        // experts loaded (paged experts), which kept the late path off (gate run 1, 10-12).
+        let hot_any = (a..b_end.min(split)).any(|l| prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], &*lanes[0].0, sd));
+        let late_on = pin && crate::knobs::PREFILL_COLD_ASYNC.on() && !hot_any && pager.as_deref().is_some_and(|p| p.late_on());
         LATE_PASS.store(late_on, std::sync::atomic::Ordering::Relaxed);
         for a in LATE_SPENT.iter() {
             a.store(0, std::sync::atomic::Ordering::Relaxed);
