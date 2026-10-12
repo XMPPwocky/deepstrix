@@ -1967,6 +1967,9 @@ pub struct MtpExit {
     /// The multi-WG argmax's partials (`[ARGMAX_WG]`).
     am_v: DeviceBuffer<f32>,
     am_i: DeviceBuffer<i32>,
+    /// The threshold top-M select (`launch_batched` with no bitmap): `[1]` n = N_VOCAB, `[1]` done.
+    sel_n: DeviceBuffer<u32>,
+    sel_done: DeviceBuffer<u32>,
 }
 
 /// Device-markov drafts whose host re-draw (`draft_dist` on the same top-M) picked another token:
@@ -2009,6 +2012,12 @@ impl MtpExit {
             markov_dev: None,
             am_v: DeviceBuffer::new(device_id, crate::mtp_markov::ARGMAX_WG as usize)?,
             am_i: DeviceBuffer::new(device_id, crate::mtp_markov::ARGMAX_WG as usize)?,
+            sel_n: {
+                let mut d = DeviceBuffer::new(device_id, 1)?;
+                d.copy_from_host(&[N_VOCAB])?;
+                d
+            },
+            sel_done: DeviceBuffer::new(device_id, 1)?,
         })
     }
 
@@ -2077,9 +2086,14 @@ impl MtpExit {
                     let m = ds.m as u32;
                     let lv = self.logits.slice_view(i * nv, nv);
                     {
+                        // The top-M by the threshold select (`launch_batched`, no bitmap, `done`): the
+                        // same selection and order as the bitonic chain (`better` = score desc, ties to
+                        // the lower id), one O(n) select instead of 32 chunk sorts + a merge; a row it
+                        // cannot bracket (done = 0) falls through to the chain in the same call.
                         let mut sel = self.topk_sel_all.slice_view_mut(i * mm, mm);
-                        e.indexer_topk_bitonic.launch(
-                            s, &mut sel, &mut self.topk_bits, &mut self.topk_scratch, &lv, N_VOCAB, m,
+                        e.indexer_topk_bitonic.launch_batched(
+                            s, &mut sel, None, &mut self.topk_scratch, &lv, &self.sel_n, N_VOCAB, N_VOCAB, 0, m, 1,
+                            Some(&mut self.sel_done),
                         )?;
                     }
                     let sel = self.topk_sel_all.slice_view(i * mm, mm);
@@ -2425,6 +2439,11 @@ impl MtpExit {
         time("vec_add (V)", &mut || { let mut lj = self.logits.slice_view_mut(0, nv); e.vec_add.launch(s, &mut lj, &self.bias, N_VOCAB) })?;
         time("argmax_one (V, 1 WG)", &mut || { let lj = self.logits.slice_view(0, nv); let mut t = self.toks.slice_view_mut(1, 1); e.sampler.launch_argmax(s, &mut t, &lj, N_VOCAB) })?;
         time("argmax multi-WG (V, 64 WG)", &mut || { let lj = self.logits.slice_view(0, nv); e.mtp_markov.launch_argmax(s, &mut self.toks, 1, &lj, N_VOCAB, &mut self.am_v, &mut self.am_i) })?;
+        time("top-M threshold select (V, 64)", &mut || {
+            let lv = self.logits.slice_view(0, nv);
+            let mut sel = self.topk_sel_all.slice_view_mut(0, mm);
+            e.indexer_topk_bitonic.launch_batched(s, &mut sel, None, &mut self.topk_scratch, &lv, &self.sel_n, N_VOCAB, N_VOCAB, 0, mm as u32, 1, Some(&mut self.sel_done))
+        })?;
         time("top-M bitonic (V, M=64)", &mut || {
             let lv = self.logits.slice_view(0, nv);
             let mut sel = self.topk_sel_all.slice_view_mut(0, mm);
