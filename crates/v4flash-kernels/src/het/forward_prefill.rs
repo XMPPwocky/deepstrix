@@ -1781,6 +1781,13 @@ impl HeterogeneousEngine {
         let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch); 2] = [(bd_a, bi_a), (bd_b, bi_b)];
         let mode_of = |l: usize| if l == split { CedMode::KvSourceOnly } else { CedMode::Exact };
         let de = &self.dgpu;
+        // `V41_PREFILL_PIN_INFLIGHT`: this pass pins its lanes' in-flight box-1 slots and skips the cross-lane drain.
+        // iGPU work queued before the pass (a decode step) was never pinned: wait for it once.
+        let pin = crate::knobs::PREFILL_PIN_INFLIGHT.on() && pager.is_some();
+        if pin {
+            self.igpu.compute.synchronize()?;
+        }
+        let _pin_pass = PinPass::enter(pin);
 
         let mut exec = |op: sch::Op| -> eyre::Result<()> {
             match op {
@@ -1912,6 +1919,16 @@ impl HeterogeneousEngine {
             }
         }
         drop(exec);
+        if pin_pass() {
+            // Every pinned dispatch done before the pins go away (a decode step's ensure must not see stale pins).
+            if let Some(pg) = pager.as_deref_mut() {
+                let r = pg.unpin_all_wait();
+                if result.is_ok() {
+                    result = r;
+                }
+            }
+        }
+        drop(_pin_pass);
         if let Some(prev) = pf_prev_cap {
             pf_settle(&mut pf_queued, &mut pf_sent);
             super::remote_experts::set_prefetch_take_cap(prev);
@@ -10903,7 +10920,9 @@ impl HeterogeneousEngine {
                 // come back for these picks with the wait already over.
                 let ensure_may_evict = !replay_offload
                     && (!sparse_resid || ids.iter().any(|&e| !pg.is_resident(layer as i32, e)));
-                if drain_before_ensure && ensure_may_evict && !*lane_env::PAGER_SYNC_IGPU_OFF {
+                // `pin_pass()` (`V41_PREFILL_PIN_INFLIGHT`): every in-flight dispatch of this layer-outer pass pinned its
+                // slots, so the victim search cannot touch the other lane's live slots: no drain.
+                if drain_before_ensure && ensure_may_evict && !*lane_env::PAGER_SYNC_IGPU_OFF && !pin_pass() {
                     let _t_isync = LayerHostTimer::start(&LH_PAGER_SYNC_IGPU);
                     self.igpu.compute.synchronize()?;
                 }
@@ -12267,6 +12286,12 @@ impl HeterogeneousEngine {
         // Record MoE-done so the iGPU xfer can wait without a host sync.
         sev.moe_done.record(&ie.compute)?;
         ie.xfer.wait_event(&sev.moe_done)?;
+        // `pin_pass()`: the slots this dispatch reads stay pinned until it completes (`ExpertPager::pin_inflight`).
+        if pin_pass() {
+            if let Some(pg) = pager {
+                pg.pin_inflight(layer as i32, &c.ids, &ie.compute)?;
+            }
+        }
 
         // Single batched peer-push back of bi.ffn_moe[B*N_EMBD].
         let bi_ffn_view = bi.ffn_moe.slice_view(0, (b as usize) * cs_n_embd);
@@ -13007,6 +13032,29 @@ static SPECULATIVE_APPEND: std::sync::atomic::AtomicBool =
 
 pub fn speculative_append() -> bool {
     SPECULATIVE_APPEND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `V41_PREFILL_PIN_INFLIGHT`: set for the duration of a layer-outer prefill pass whose lanes pin their in-flight
+/// box-1 MoE slots (`ExpertPager::pin_inflight`). Both lanes of that pass are prefill units, so with every dispatch
+/// pinned a lane's `ensure` cannot evict the other lane's live slots and the cross-lane drain is skipped.
+static PIN_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn pin_pass() -> bool {
+    PIN_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Scope guard for [`pin_pass`]: cleared on drop however the pass ends.
+struct PinPass;
+impl PinPass {
+    fn enter(on: bool) -> Self {
+        PIN_PASS.store(on, std::sync::atomic::Ordering::Relaxed);
+        PinPass
+    }
+}
+impl Drop for PinPass {
+    fn drop(&mut self) {
+        PIN_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Scope guard: sets the speculative-append flag, clears it on drop.

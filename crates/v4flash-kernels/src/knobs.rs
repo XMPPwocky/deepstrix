@@ -973,6 +973,11 @@ crate::knobs! {
     /// does not protect decode's owned set; ~20 spare slots per layer beyond it (10-12), and a layer gets 2-4 requests per
     /// window, so 8 keeps a window's extra box-1 reads inside the spare slots.
     pub static PREFILL_COLD_B1_MAX = Knob::int("V41_PREFILL_COLD_B1_MAX", 8, 0, 384).live();
+    /// `V41_PREFILL_PIN_INFLIGHT` (default off; live, read at each layer-outer prefill pass): both lanes PIN the box-1
+    /// slots their in-flight MoE reads (`ExpertPager::pin_inflight`; the victim search skips them), so a prefill
+    /// `ensure` that pages no longer drains the other lane's iGPU MoE first (the drain stalled the whole two-lane
+    /// pipeline on every box-1 miss). One iGPU sync at the pass start; all pins waited out at its end.
+    pub static PREFILL_PIN_INFLIGHT = Knob::flag("V41_PREFILL_PIN_INFLIGHT", false).live();
 }
 
 #[cfg(test)]

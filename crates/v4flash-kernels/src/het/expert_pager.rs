@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::{gguf::GgufType, V41HfWeights, WeightSrc};
-use v4flash_hip::{Device, DeviceBuffer, PinnedBuffer, Stream};
+use v4flash_hip::{Device, DeviceBuffer, Event, PinnedBuffer, Stream};
 
 use crate::config::{N_EMBD, N_EXPERT, N_FF_EXP};
 use crate::model_weights::RoutedExpertWeights;
@@ -120,11 +120,15 @@ struct Residency {
     /// way (`ShardPool::last_use` + `tick`).
     last_use: Vec<u64>,
     tick: u64,
+    /// Per slot: how many IN-FLIGHT MoE dispatches still read it (`ExpertPager::pin_inflight`, prefill
+    /// layer-outer pass with `V41_PREFILL_PIN_INFLIGHT`). The victim search skips a pinned slot, which is what lets a
+    /// prefill `ensure` page without first draining the other lane's MoE.
+    pinned: Vec<u16>,
 }
 
 impl Residency {
     fn new(n_slots: usize) -> Self {
-        Residency { slot_of: SlotOf::new(), slot_key: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0 }
+        Residency { slot_of: SlotOf::new(), slot_key: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, pinned: vec![0; n_slots] }
     }
 
     #[inline]
@@ -144,6 +148,9 @@ impl Residency {
         for sl in range {
             if sl >= self.last_use.len() {
                 break;
+            }
+            if self.pinned.get(sl).is_some_and(|&p| p > 0) {
+                continue;
             }
             let t = self.last_use[sl];
             if best.is_none_or(|(bt, _)| t < bt) {
@@ -470,6 +477,10 @@ pub struct ExpertPager {
     prefetch: Option<Prefetcher>,
     readahead: Option<Readahead>,
     repack_stream: Option<Stream>,
+    /// In-flight MoE slot pins (`pin_inflight`): a ring of iGPU events, each with the slots its dispatch reads.
+    inflight_ring: Vec<Event>,
+    inflight_next: usize,
+    inflight_sets: std::collections::VecDeque<(usize, Vec<u32>)>,
     pub decode_repack_gpu_ns: u64,
 }
 
@@ -2311,6 +2322,9 @@ impl ExpertPager {
             decode_repack_gpu_ns: 0,
             prefetch: None,
             readahead: None,
+            inflight_ring: Vec::new(),
+            inflight_next: 0,
+            inflight_sets: std::collections::VecDeque::new(),
         })
     }
 
@@ -3579,14 +3593,96 @@ impl ExpertPager {
         // only the affected request and keeps this pager, and an unreleased claim
         // is a permanent, most-recently-used "hit" on the evicted expert's weights
         // (or uninitialised memory) for every later request.
+        self.prune_inflight()?;
         let mut c = Claims::default();
         match self.ensure_inner(layer, ids, &mut c) {
             Ok(()) => Ok(&self.remap),
             Err(e) => {
                 self.res.release_unlanded(layer, &c);
-                Err(e)
+                if self.inflight_sets.is_empty() {
+                    return Err(e);
+                }
+                // Every candidate slot was pinned by an in-flight dispatch: wait for them all and retry once
+                // (the pinning only ever narrows the victim search).
+                self.unpin_all_wait()?;
+                let mut c = Claims::default();
+                match self.ensure_inner(layer, ids, &mut c) {
+                    Ok(()) => Ok(&self.remap),
+                    Err(e) => {
+                        self.res.release_unlanded(layer, &c);
+                        Err(e)
+                    }
+                }
             }
         }
+    }
+
+    /// The slots of `ids` (this layer's box-1 experts, resident after `ensure`) are read by a MoE dispatch just
+    /// enqueued on `stream`: pin them against eviction until an event recorded now completes. Prefill layer-outer
+    /// pass only (`forward_prefill::pin_pass`): both lanes pin, so neither lane's `ensure` needs the drain.
+    pub fn pin_inflight(&mut self, layer: i32, ids: &[u32], stream: &Stream) -> eyre::Result<()> {
+        const RING: usize = 16;
+        self.prune_inflight()?;
+        if self.inflight_ring.len() >= RING {
+            self.inflight_next = (self.inflight_next + 1) % RING;
+            // Reusing an event a live set still waits on: finish that set first (oldest first, in order).
+            while self.inflight_sets.iter().any(|&(i, _)| i == self.inflight_next) {
+                let (i, slots) = self.inflight_sets.pop_front().expect("non-empty");
+                self.inflight_ring[i].synchronize()?;
+                self.unpin(&slots);
+            }
+        }
+        {
+            // Events bind to the device current at creation and are recorded on the iGPU stream.
+            let _dev = self.device.scoped_current()?;
+            if self.inflight_ring.len() < RING {
+                self.inflight_ring.push(Event::new_no_timing()?);
+                self.inflight_next = self.inflight_ring.len() - 1;
+            }
+            self.inflight_ring[self.inflight_next].record(stream)?;
+        }
+        let slots: Vec<u32> = ids.iter().filter_map(|&e| self.res.slot_of.get(&(layer, e)).copied()).collect();
+        for &sl in &slots {
+            if let Some(p) = self.res.pinned.get_mut(sl as usize) {
+                *p = p.saturating_add(1);
+            }
+        }
+        self.inflight_sets.push_back((self.inflight_next, slots));
+        Ok(())
+    }
+
+    fn unpin(&mut self, slots: &[u32]) {
+        for &sl in slots {
+            if let Some(p) = self.res.pinned.get_mut(sl as usize) {
+                *p = p.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Drop the pins of dispatches that have finished (non-blocking; in order).
+    pub fn prune_inflight(&mut self) -> eyre::Result<()> {
+        while let Some(&(i, _)) = self.inflight_sets.front() {
+            if !self.inflight_ring[i].query()? {
+                break;
+            }
+            let (_, slots) = self.inflight_sets.pop_front().expect("non-empty");
+            self.unpin(&slots);
+        }
+        Ok(())
+    }
+
+    /// Wait for every pinned dispatch and drop all pins (end of a pass, or the no-victim fallback).
+    pub fn unpin_all_wait(&mut self) -> eyre::Result<()> {
+        while let Some((i, slots)) = self.inflight_sets.pop_front() {
+            self.inflight_ring[i].synchronize()?;
+            self.unpin(&slots);
+        }
+        Ok(())
+    }
+
+    /// Pinned slots now (tests, logs).
+    pub fn pinned_slots(&self) -> usize {
+        self.res.pinned.iter().filter(|&&p| p > 0).count()
     }
 
     fn ensure_inner(&mut self, layer: i32, ids: &[u32], c: &mut Claims) -> eyre::Result<()> {
@@ -4107,6 +4203,22 @@ mod residency_tests {
         assert!(r.claim((1, 6), 0, 2, t0).is_err(), "both slots belong to this call");
         assert_eq!(r.slot_of.get(&(0, 0)), Some(&0), "the hit survives");
         assert_eq!(r.slot_of.get(&(1, 5)), Some(&1), "the earlier claim survives");
+        consistent(&r);
+    }
+
+    /// `V41_PREFILL_PIN_INFLIGHT`: a slot an in-flight dispatch reads is never
+    /// the victim, even when it is the least recently used; with every slot
+    /// pinned the claim fails (the caller waits the pins out and retries).
+    #[test]
+    fn claim_skips_pinned_slots() {
+        let mut r = full(3);
+        let t0 = r.tick;
+        r.pinned[0] = 1; // slot 0 is the LRU but a live dispatch reads it
+        assert_eq!(r.claim((2, 9), 0, 3, t0).unwrap(), 1, "the oldest UNPINNED slot");
+        assert_eq!(r.slot_of.get(&(0, 0)), Some(&0), "the pinned expert survives");
+        r.pinned[2] = 1;
+        assert!(r.claim((2, 10), 0, 3, t0).is_err(), "slot 1 is this call's, 0 and 2 are pinned");
+        r.pinned = vec![0; 3];
         consistent(&r);
     }
 
