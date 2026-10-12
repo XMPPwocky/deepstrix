@@ -851,6 +851,12 @@ crate::knobs! {
     /// to that chain (tests/mtp_mhc_fast_bitexact.rs). Live trace 10-12: the drafter's mixing was
     /// 0.78 ms/draft of latency-bound iGPU time (15 GB/s on 12 MB).
     pub static MTP_MHC_FAST = Knob::flag("V41_MTP_MHC_FAST", true).live();
+    /// `V41_MTP_ROUTER_BATCHED` (default on; live, read per drafter layer): the drafter's router as
+    /// ONE `f16.matvec_batched` (128 x 5120, the wide kernel's per-row reduction, bit-identical to the
+    /// per-row `matvec` loop) and ONE `router_topk.launch_batched` (each block identical to a single
+    /// `launch`) instead of 5 + 5 launches (tests/mtp_mhc_fast_bitexact.rs, router case). Live trace
+    /// 10-12: router 0.44 + top-k 0.09 ms/draft of latency-bound iGPU time.
+    pub static MTP_ROUTER_BATCHED = Knob::flag("V41_MTP_ROUTER_BATCHED", true).live();
     /// `V41_MS_GRAPHS` (default on; live since 2026-10-10, read at each arena stage's start):
     /// `forward_prefill::ms_graphs` -- the arena stage graphs; off = direct launches. Step 0c
     /// (tests/bench_graph_replay.rs) measured ~6.5 us of device time per graph replay vs < 1 us of

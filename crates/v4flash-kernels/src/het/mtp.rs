@@ -1607,26 +1607,43 @@ impl MtpState {
         // Per-row, for the same reason as `hc_mixes`: at B=5 the batched WMMA
         // GEMM returned a constant, so every token routed to experts [0, 1, 2]
         // with weight 0.5 — a uniform softmax wearing a router's clothes.
+        // `V41_MTP_ROUTER_BATCHED`: the same two steps as one launch each. NOT the batched WMMA GEMM
+        // the comment above warns about: `matvec_batched` is the wide matvec with the batch on
+        // grid.z, each row's reduction identical to `matvec`'s (128 rows >= the narrow threshold, so
+        // the per-row loop ran that same wide kernel); `launch_batched` runs `router_topk_par` once
+        // per token block, each block identical to a single `launch`.
+        let batched = crate::knobs::MTP_ROUTER_BATCHED.on();
         {
         let _t = HostUs::start_dev(&MTP_H_MROUT, s);
-        for j in 0..MTP_BLOCK {
-            let xj = self.normed.slice_view(j * N_EMBD as usize, N_EMBD as usize);
-            let mut lj = self
-                .router_logits
-                .slice_view_mut(j * MTP_N_EXPERT, MTP_N_EXPERT);
-            e.f16.matvec(s, &mut lj, &w.ffn_gate_inp.buffer, &xj, MTP_N_EXPERT as u32, N_EMBD)?;
+        if batched {
+            e.f16.matvec_batched(s, &mut self.router_logits, &w.ffn_gate_inp.buffer, &self.normed, MTP_N_EXPERT as u32, N_EMBD, B)?;
+        } else {
+            for j in 0..MTP_BLOCK {
+                let xj = self.normed.slice_view(j * N_EMBD as usize, N_EMBD as usize);
+                let mut lj = self
+                    .router_logits
+                    .slice_view_mut(j * MTP_N_EXPERT, MTP_N_EXPERT);
+                e.f16.matvec(s, &mut lj, &w.ffn_gate_inp.buffer, &xj, MTP_N_EXPERT as u32, N_EMBD)?;
+            }
         }
         }
         {
         let _t = HostUs::start_dev(&MTP_H_MTOPK, s);
-        for j in 0..MTP_BLOCK {
-            let lg = self.router_logits.slice_view(j * MTP_N_EXPERT, MTP_N_EXPERT);
-            let mut sel = self.d_selected.slice_view_mut(j * MTP_TOPK as usize, MTP_TOPK as usize);
-            let mut ew = self.d_ew.slice_view_mut(j * MTP_TOPK as usize, MTP_TOPK as usize);
-            e.router_topk.launch(
-                s, &mut sel, &mut ew, &lg, Some(&w.exp_probs_b), MTP_N_EXPERT as u32, MTP_TOPK,
-                EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS,
+        if batched {
+            e.router_topk.launch_batched(
+                s, &mut self.d_selected, &mut self.d_ew, &self.router_logits, Some(&w.exp_probs_b),
+                MTP_N_EXPERT as u32, MTP_TOPK, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, B,
             )?;
+        } else {
+            for j in 0..MTP_BLOCK {
+                let lg = self.router_logits.slice_view(j * MTP_N_EXPERT, MTP_N_EXPERT);
+                let mut sel = self.d_selected.slice_view_mut(j * MTP_TOPK as usize, MTP_TOPK as usize);
+                let mut ew = self.d_ew.slice_view_mut(j * MTP_TOPK as usize, MTP_TOPK as usize);
+                e.router_topk.launch(
+                    s, &mut sel, &mut ew, &lg, Some(&w.exp_probs_b), MTP_N_EXPERT as u32, MTP_TOPK,
+                    EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS,
+                )?;
+            }
         }
         }
         {
