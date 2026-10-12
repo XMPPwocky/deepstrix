@@ -121,6 +121,7 @@ pub mod dgpu_loan;
 pub mod mhc_pre_fused;
 pub mod mhc_arena;
 pub mod mtp_markov;
+pub mod topk_radix;
 pub mod readback_pack;
 pub mod rms_norm;
 pub mod rope;

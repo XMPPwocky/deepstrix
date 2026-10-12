@@ -152,6 +152,8 @@ pub struct DeviceEngine {
     pub mhc_arena: crate::MhcArena,
     /// The DSpark exit's device-side markov loop (`V41_MTP_DEVICE_MARKOV`).
     pub mtp_markov: crate::mtp_markov::MtpMarkov,
+    /// Batched radix top-K (`V41_IDX_TOPK_RADIX`: the decode indexer's top-512).
+    pub topk_radix: crate::topk_radix::TopkRadix,
     /// Router readback pack: host-bound router outputs into pinned memory (`V41_RB_PACK`).
     pub rb_pack: crate::ReadbackPack,
     /// Attention per-row metadata as one kernel-argument launch (`V41_ATTN_META_FILL`).
@@ -266,6 +268,7 @@ impl DeviceEngine {
             mhc_pre_fused: crate::MhcPreFused::for_arch(arch)?,
             mhc_arena: crate::MhcArena::for_arch(arch)?,
             mtp_markov: crate::mtp_markov::MtpMarkov::for_arch(arch)?,
+            topk_radix: crate::topk_radix::TopkRadix::for_arch(arch)?,
             rb_pack: crate::ReadbackPack::for_arch(arch)?,
             attn_meta: crate::attn_meta::AttnMetaFill::for_arch(arch)?,
             attn_dec: crate::attention_dec::AttentionDec::for_arch(arch)?,
