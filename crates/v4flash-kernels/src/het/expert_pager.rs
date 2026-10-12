@@ -204,6 +204,49 @@ impl Residency {
         Ok(slot)
     }
 
+    /// As `claim`, but the victim search also skips slots `skip` names (pinned slots are always skipped); with no
+    /// eligible victim it falls back to the plain claim (design rev 3, 2.4: a LATE prefill read must not evict decode's
+    /// hot-set-owned slots unless nothing else is left). Returns (slot, evicted key).
+    fn claim_skipping(&mut self, key: (i32, u32), lo: usize, hi: usize, call_tick: u64, skip: &dyn Fn((i32, u32)) -> bool) -> eyre::Result<(u32, Option<(i32, u32)>)> {
+        let hi = hi.min(self.slot_key.len());
+        if let Some(sl) = (lo..hi).find(|&sl| self.slot_key[sl].is_none()) {
+            self.slot_of.insert(key, sl as u32);
+            self.slot_key[sl] = Some(key);
+            self.touch(sl as u32);
+            return Ok((sl as u32, None));
+        }
+        let mut best: Option<(u64, usize)> = None;
+        for sl in lo..hi {
+            if self.pinned.get(sl).is_some_and(|&p| p > 0) || self.last_use[sl] > call_tick {
+                continue;
+            }
+            if self.slot_key[sl].is_some_and(|k| skip(k)) {
+                continue;
+            }
+            let t = self.last_use[sl];
+            if best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, sl));
+            }
+        }
+        match best {
+            Some((_, sl)) => {
+                let old = self.slot_key[sl].take();
+                if let Some(o) = old {
+                    self.slot_of.remove(&o);
+                }
+                self.slot_of.insert(key, sl as u32);
+                self.slot_key[sl] = Some(key);
+                self.touch(sl as u32);
+                Ok((sl as u32, old))
+            }
+            None => {
+                let old_keys: Vec<Option<(i32, u32)>> = self.slot_key.clone();
+                let slot = self.claim(key, lo, hi, call_tick)?;
+                Ok((slot, old_keys[slot as usize].filter(|&k| k != key)))
+            }
+        }
+    }
+
     /// Undo a `claim` whose bytes never landed: the key stops resolving and the
     /// slot is free again (stamp 0, so it is reused first; its contents are
     /// undefined, possibly half-written).
@@ -243,6 +286,52 @@ impl Residency {
 struct Claims {
     pending: Vec<(u32, u32)>,
     landed: usize,
+}
+
+/// A pinned stage set (gate / up / down in HF layout, per-role sizes ~19 MB) moved between the pager and a LATE reader
+/// thread. Exactly one side owns it at a time (it travels inside a job and comes back inside the result), so moving the
+/// host pointers across threads is sound.
+struct LateStage([PinnedBuffer<u8>; 3]);
+unsafe impl Send for LateStage {}
+
+struct LateJob {
+    layer: i32,
+    id: u32,
+    stage: LateStage,
+}
+
+struct LateDone {
+    layer: i32,
+    id: u32,
+    stage: LateStage,
+    ok: Result<(), String>,
+}
+
+type LateQueue = std::sync::Arc<(std::sync::Mutex<(std::collections::VecDeque<LateJob>, usize)>, std::sync::Condvar)>;
+
+/// Box-1 LATE reads (docs/v41/PREFILL_COLD_ASYNC_DESIGN.md rev 3, 2.3): a prefill cold pick given to box 1 is read by
+/// these threads while the hub keeps going; `ExpertPager::late_join` lands it before the unit's late MoE pass.
+struct LateReader {
+    /// Queued jobs + the number popped and still reading; the condvar wakes readers (and `late_cancel_all`).
+    queue: LateQueue,
+    rx: std::sync::mpsc::Receiver<LateDone>,
+    free: Vec<LateStage>,
+    /// The in-flight registry: (layer, id) queued or reading or read-but-not-joined.
+    inflight: std::collections::HashSet<(i32, u32)>,
+    done: HashMap<(i32, u32), LateDone>,
+    /// Stages whose repack is queued on the repack stream, with the event that frees them.
+    busy: std::collections::VecDeque<(Event, Vec<LateStage>)>,
+    spare_events: Vec<Event>,
+    sizes: [usize; 3],
+    /// Totals since start: reads queued / refused for want of a stage / joined (landed) / already resident at the join /
+    /// synchronous fallbacks / late claims that evicted a hot-set-OWNED slot / join wait (ns).
+    queued: u64,
+    refused: u64,
+    landed: u64,
+    resident: u64,
+    fallback: u64,
+    owned_evict: u64,
+    join_wait_ns: u64,
 }
 
 pub struct ExpertPager {
@@ -481,6 +570,7 @@ pub struct ExpertPager {
     inflight_ring: Vec<Event>,
     inflight_next: usize,
     inflight_sets: std::collections::VecDeque<(usize, Vec<u32>)>,
+    late: Option<LateReader>,
     pub decode_repack_gpu_ns: u64,
 }
 
@@ -2325,6 +2415,7 @@ impl ExpertPager {
             inflight_ring: Vec::new(),
             inflight_next: 0,
             inflight_sets: std::collections::VecDeque::new(),
+            late: None,
         })
     }
 
@@ -3685,6 +3776,320 @@ impl ExpertPager {
         self.res.pinned.iter().filter(|&&p| p > 0).count()
     }
 
+    /// Start the LATE readers (`readers` threads, each with its own handle on the HF dir, like the prefetcher) and
+    /// `stages` pinned per-role stage sets. Needs the GPU repack (late landings repack from HF layout).
+    pub fn start_late_reader(&mut self, dir: &std::path::Path, readers: usize, stages: usize) -> eyre::Result<()> {
+        if self.repack.is_none() || readers == 0 || stages == 0 {
+            return Ok(());
+        }
+        let sizes = [self.routed.gate_bytes_per_expert, self.routed.up_bytes_per_expert, self.routed.down_bytes_per_expert];
+        let mut free = Vec::with_capacity(stages);
+        for _ in 0..stages {
+            free.push(LateStage([
+                PinnedBuffer::new_with_flags(sizes[0], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::new_with_flags(sizes[1], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::new_with_flags(sizes[2], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+            ]));
+        }
+        let queue: LateQueue = std::sync::Arc::new((std::sync::Mutex::new((std::collections::VecDeque::new(), 0)), std::sync::Condvar::new()));
+        let (tx, rx) = std::sync::mpsc::channel::<LateDone>();
+        for i in 0..readers {
+            let (q, tx, dir) = (queue.clone(), tx.clone(), dir.to_path_buf());
+            std::thread::Builder::new().name(format!("b1-late-{i}")).spawn(move || {
+                let owner = match V41HfWeights::open(&dir, None) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("b1-late: cannot open {}: {e:#}; this reader exits", dir.display());
+                        return;
+                    }
+                };
+                loop {
+                    let mut job = {
+                        let (m, cv) = &*q;
+                        let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+                        loop {
+                            if let Some(j) = g.0.pop_front() {
+                                g.1 += 1;
+                                break j;
+                            }
+                            g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                        }
+                    };
+                    let ok = Self::late_read_one(&owner, job.layer, job.id, &mut job.stage);
+                    let sent = tx.send(LateDone { layer: job.layer, id: job.id, stage: job.stage, ok });
+                    {
+                        let (m, cv) = &*q;
+                        m.lock().unwrap_or_else(|p| p.into_inner()).1 -= 1;
+                        cv.notify_all();
+                    }
+                    if sent.is_err() {
+                        return;
+                    }
+                }
+            })?;
+        }
+        eprintln!("expert pager: box-1 LATE reads ON ({readers} readers, {stages} stages of {:.1} MB pinned)", sizes.iter().sum::<usize>() as f64 / 1e6);
+        self.late = Some(LateReader {
+            queue, rx, free, inflight: Default::default(), done: HashMap::new(), busy: Default::default(), spare_events: Vec::new(), sizes,
+            queued: 0, refused: 0, landed: 0, resident: 0, fallback: 0, owned_evict: 0, join_wait_ns: 0,
+        });
+        Ok(())
+    }
+
+    /// One expert's three roles, HF layout, per-role reads (the layout `repack_in_place` takes without offsets).
+    fn late_read_one(owner: &V41HfWeights, layer: i32, id: u32, st: &mut LateStage) -> Result<(), String> {
+        let src = WeightSrc::from(owner);
+        let names = [
+            format!("blk.{layer}.ffn_gate_exps.weight"),
+            format!("blk.{layer}.ffn_up_exps.weight"),
+            format!("blk.{layer}.ffn_down_exps.weight"),
+        ];
+        for (name, buf) in names.iter().zip(st.0.iter_mut()) {
+            let t = src.tensor(name).ok_or_else(|| format!("missing {name}"))?;
+            src.read_expert_hf_layout(t, id as usize, buf.as_mut_slice()).map_err(|e| format!("{e:#}"))?;
+        }
+        Ok(())
+    }
+
+    /// Late reads are available.
+    pub fn late_on(&self) -> bool {
+        self.late.is_some()
+    }
+
+    /// The in-flight registry: `(layer, id)` is being read late (queued, reading, or read and not yet joined).
+    pub fn late_inflight(&self, layer: i32, id: u32) -> bool {
+        self.late.as_ref().is_some_and(|l| l.inflight.contains(&(layer, id)))
+    }
+
+    /// Return stages whose repack has finished to the free list (non-blocking).
+    fn late_reclaim(&mut self) -> eyre::Result<()> {
+        let Some(l) = self.late.as_mut() else { return Ok(()) };
+        while let Some((ev, _)) = l.busy.front() {
+            if !ev.query()? {
+                break;
+            }
+            let (ev, stages) = l.busy.pop_front().expect("non-empty");
+            l.free.extend(stages);
+            l.spare_events.push(ev);
+        }
+        Ok(())
+    }
+
+    /// Queue LATE reads for `ids` of `layer` (not resident, not already in flight), one free stage each; returns the
+    /// ids queued (the caller treats only those as late; a refused id stays box 2's).
+    pub fn late_read(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<Vec<u32>> {
+        self.late_reclaim()?;
+        let resident: Vec<bool> = ids.iter().map(|&e| self.is_resident(layer, e)).collect();
+        let Some(l) = self.late.as_mut() else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        let mut jobs = Vec::new();
+        for (&e, &res) in ids.iter().zip(&resident) {
+            if res || l.inflight.contains(&(layer, e)) {
+                continue;
+            }
+            let Some(stage) = l.free.pop() else {
+                l.refused += 1;
+                continue;
+            };
+            l.inflight.insert((layer, e));
+            jobs.push(LateJob { layer, id: e, stage });
+            out.push(e);
+        }
+        if !jobs.is_empty() {
+            l.queued += jobs.len() as u64;
+            let (m, cv) = &*l.queue;
+            m.lock().unwrap_or_else(|p| p.into_inner()).0.extend(jobs);
+            cv.notify_all();
+        }
+        Ok(out)
+    }
+
+    /// Land the late experts `ids` of `layer` before the unit's late MoE pass: an id already resident keeps its slot; one
+    /// in flight is waited for and landed; any other (its read failed, or it was evicted after landing) is read now,
+    /// synchronously, and landed. Claims skip pinned slots, slots newer than `call_tick` (refuse what this unit or the
+    /// next one just touched) and hot-set-OWNED slots (fallback: plain LRU). Repacks are queued on the repack stream
+    /// without a per-expert sync; ONE event is recorded after them and made the dependency of `wait_stream`. Returns
+    /// (id, slot) in `ids` order.
+    pub fn late_join(&mut self, layer: i32, ids: &[u32], call_tick: u64, wait_stream: &Stream) -> eyre::Result<Vec<(u32, u32)>> {
+        if self.late.is_none() || ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.late_reclaim()?;
+        let t0 = std::time::Instant::now();
+        let lru_lo = {
+            let lo = self.dense_slots();
+            if lo >= self.n_slots as usize { 0 } else { lo }
+        };
+        let n_slots = self.n_slots as usize;
+        let mut out = Vec::with_capacity(ids.len());
+        let mut used: Vec<LateStage> = Vec::new();
+        let mut waited_ns = 0u64;
+        for &e in ids {
+            let key = (layer, e);
+            if let Some(&slot) = self.res.slot_of.get(&key) {
+                self.res.touch(slot);
+                if let Some(l) = self.late.as_mut() {
+                    l.resident += 1;
+                    l.inflight.remove(&key);
+                }
+                out.push((e, slot));
+                continue;
+            }
+            // Wait for its read if it is in flight; else (failed / evicted / never queued) read it here.
+            let mut done: Option<LateDone> = None;
+            {
+                let l = self.late.as_mut().expect("checked");
+                if l.inflight.contains(&key) {
+                    let tw = std::time::Instant::now();
+                    while !l.done.contains_key(&key) {
+                        let d = l.rx.recv().map_err(|_| eyre!("late readers gone"))?;
+                        l.done.insert((d.layer, d.id), d);
+                    }
+                    waited_ns += tw.elapsed().as_nanos() as u64;
+                    done = l.done.remove(&key);
+                    l.inflight.remove(&key);
+                }
+            }
+            let stage = match done {
+                Some(d) if d.ok.is_ok() => d.stage,
+                other => {
+                    // Synchronous fallback on this thread (never `ensure`: it would rebuild the shared remap).
+                    let mut st = match other {
+                        Some(d) => d.stage,
+                        None => self.late_take_stage()?,
+                    };
+                    Self::late_read_one(&self.owner, layer, e, &mut st).map_err(|m| eyre!("late read L{layer} e{e}: {m}"))?;
+                    if let Some(l) = self.late.as_mut() {
+                        l.fallback += 1;
+                    }
+                    st
+                }
+            };
+            let (slot, evicted) = self.res.claim_skipping(key, lru_lo, n_slots, call_tick, &|k| hot_set::box1_owns(k.0, k.1) == Some(true))?;
+            if let Some(old) = evicted {
+                if hot_set::box1_owns(old.0, old.1) == Some(true) {
+                    if let Some(l) = self.late.as_mut() {
+                        l.owned_evict += 1;
+                    }
+                }
+                push_hint(false, old.0, old.1);
+            }
+            {
+                let (rp, st) = (self.repack.as_ref().expect("late needs the GPU repack"), self.repack_stream.as_ref().expect("repack stream"));
+                Self::repack_queue(rp, st, &mut self.routed, slot, &stage.0)?;
+            }
+            used.push(stage);
+            if let Some(l) = self.late.as_mut() {
+                l.landed += 1;
+            }
+            out.push((e, slot));
+        }
+        if !used.is_empty() {
+            let _dev = self.device.scoped_current()?;
+            let l = self.late.as_mut().expect("checked");
+            let ev = match l.spare_events.pop() {
+                Some(ev) => ev,
+                None => Event::new_no_timing()?,
+            };
+            ev.record(self.repack_stream.as_ref().expect("repack stream"))?;
+            wait_stream.wait_event(&ev)?;
+            l.busy.push_back((ev, used));
+        }
+        if let Some(l) = self.late.as_mut() {
+            l.join_wait_ns += waited_ns;
+        }
+        let _ = t0;
+        Ok(out)
+    }
+
+    /// A free stage for a synchronous fallback read: reclaim, else wait for the oldest busy repack.
+    fn late_take_stage(&mut self) -> eyre::Result<LateStage> {
+        self.late_reclaim()?;
+        let l = self.late.as_mut().expect("late on");
+        if let Some(st) = l.free.pop() {
+            return Ok(st);
+        }
+        if let Some((ev, stages)) = l.busy.pop_front() {
+            ev.synchronize()?;
+            l.free.extend(stages);
+            l.spare_events.push(ev);
+            return Ok(l.free.pop().expect("a busy entry holds >= 1 stage"));
+        }
+        // Every stage is in a queued/running read or an unjoined result: take one from the results.
+        if let Some(k) = l.done.keys().next().copied() {
+            let d = l.done.remove(&k).expect("present");
+            l.inflight.remove(&k);
+            return Ok(d.stage);
+        }
+        let d = l.rx.recv().map_err(|_| eyre!("late readers gone"))?;
+        l.inflight.remove(&(d.layer, d.id));
+        Ok(d.stage)
+    }
+
+    /// End of a pass / error (rev 3, 2.3): drop QUEUED reads, WAIT for running ones (a pread cannot be aborted), drop
+    /// unjoined results, wait for queued repacks; every stage back on the free list, registry empty.
+    pub fn late_cancel_all(&mut self) -> eyre::Result<()> {
+        let Some(l) = self.late.as_mut() else { return Ok(()) };
+        {
+            let (m, cv) = &*l.queue;
+            let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+            for j in g.0.drain(..) {
+                l.free.push(j.stage);
+            }
+            while g.1 > 0 {
+                g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+        while let Ok(d) = l.rx.try_recv() {
+            l.free.push(d.stage);
+        }
+        for (_, d) in l.done.drain() {
+            l.free.push(d.stage);
+        }
+        while let Some((ev, stages)) = l.busy.pop_front() {
+            ev.synchronize()?;
+            l.free.extend(stages);
+            l.spare_events.push(ev);
+        }
+        l.inflight.clear();
+        Ok(())
+    }
+
+    /// (queued, refused, landed, resident at join, fallback, owned evictions, join wait ms) since start.
+    pub fn late_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
+        self.late.as_ref().map(|l| (l.queued, l.refused, l.landed, l.resident, l.fallback, l.owned_evict, l.join_wait_ns / 1_000_000))
+    }
+
+    /// Free stages now (tests, logs).
+    pub fn late_free_stages(&self) -> usize {
+        self.late.as_ref().map_or(0, |l| l.free.len())
+    }
+
+    /// `repack_in_place` WITHOUT the trailing stream sync (late landings: one event after all of them).
+    fn repack_queue(rp: &Mxfp4Repack, st: &Stream, routed: &mut RoutedExpertWeights, slot: u32, stage: &[PinnedBuffer<u8>; 3]) -> eyre::Result<()> {
+        let geom = [
+            (N_FF_EXP as u32, (N_EMBD / 32) as u32),
+            (N_FF_EXP as u32, (N_EMBD / 32) as u32),
+            (N_EMBD as u32, (N_FF_EXP / 32) as u32),
+        ];
+        let bpe = [routed.gate_bytes_per_expert, routed.up_bytes_per_expert, routed.down_bytes_per_expert];
+        for i in 0..3 {
+            let (rows, nb) = geom[i];
+            let dst = match i {
+                0 => &mut routed.gate.buffer,
+                1 => &mut routed.up.buffer,
+                _ => &mut routed.down.buffer,
+            };
+            rp.launch_from_ptr(st, dst, slot as usize * bpe[i], stage[i].device_ptr(), stage[i].len(), rows, nb)?;
+        }
+        Ok(())
+    }
+
+    /// The pager's LRU tick now (the join's `call_tick`: capture it BEFORE the next unit's `ensure`).
+    pub fn tick(&self) -> u64 {
+        self.res.tick
+    }
+
     fn ensure_inner(&mut self, layer: i32, ids: &[u32], c: &mut Claims) -> eyre::Result<()> {
         self.cur_layer = layer;
         if ids.len() > self.n_slots as usize {
@@ -4219,6 +4624,24 @@ mod residency_tests {
         r.pinned[2] = 1;
         assert!(r.claim((2, 10), 0, 3, t0).is_err(), "slot 1 is this call's, 0 and 2 are pinned");
         r.pinned = vec![0; 3];
+        consistent(&r);
+    }
+
+    /// LATE claims (design rev 3, 2.4): skip the slots `skip` names (decode's
+    /// owned set) while anything else is eligible, report the evicted key, and
+    /// fall back to the plain LRU claim when nothing is; pinned slots and slots
+    /// newer than `call_tick` are never victims either way.
+    #[test]
+    fn claim_skipping_avoids_owned_then_falls_back() {
+        let mut r = full(4); // keys (0, 0..4), LRU order 0,1,2,3
+        let t0 = r.tick;
+        let owned = |k: (i32, u32)| k.1 == 0 || k.1 == 1;
+        let (s, old) = r.claim_skipping((5, 50), 0, 4, t0, &owned).unwrap();
+        assert_eq!((s, old), (2, Some((0, 2))), "oldest NON-owned slot");
+        r.pinned[3] = 1;
+        let (s, old) = r.claim_skipping((5, 51), 0, 4, t0, &owned).unwrap();
+        assert_eq!((s, old), (0, Some((0, 0))), "nothing else eligible: plain LRU (slot 3 pinned, 2 is this call's)");
+        r.pinned = vec![0; 4];
         consistent(&r);
     }
 
