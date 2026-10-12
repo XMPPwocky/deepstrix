@@ -1,6 +1,7 @@
 # Prefill cold reads on box 1, off the hub thread (design, stage 2, 2026-10-12)
 
-Status: DRAFT rev 1. Owner 10-12: "ttft fix" -> "let's write up stage 2". Hub only; box 2 untouched.
+Status: rev 2 (review round 1: REVISE -> all 12 findings folded in, section 9). Owner 10-12: "ttft fix" -> "let's write up
+stage 2" -> "reviewer". Hub only; box 2 untouched.
 
 ## 0. Why (measured 10-12, timing metadata only)
 
@@ -8,105 +9,116 @@ Status: DRAFT rev 1. Owner 10-12: "ttft fix" -> "let's write up stage 2". Hub on
   (10:12-20:57 UTC) was in each job's first window; short turns (<= 1,024 rows) spend 3.9 of 4.6 s there blocked on box 2
   reading cold experts (decode evicts ~87% of the next turn's prefill set between turns; owner: no partitioned pool).
 - Box 1 can read as fast as box 2: the E100 (box 1's model drive since 20:52 UTC, no dm-crypt) does 4.42 GB/s with 8 x
-  6 MiB O_DIRECT readers; box 2's measured prefill read rate is ~4.4 GB/s over two drives. Box 1's drive sits idle
-  during first windows.
-- Stage 0 (`V41_PREFILL_COLD_B1`, hub 8f75266a) and stage 1 (`V41_PREFILL_PIN_INFLIGHT`, hub 17e2de01) moved part of the
-  cold reads to box 1 INSIDE `ensure`: the hub's box-2 wait fell from 82% to 6-13%, but first windows got SLOWER
-  (4-unit p50 6.82 -> 9.87 s with pins, 13.78 s through dm-crypt). `ensure` reads synchronously on the hub thread
-  (~70 ms for 16 experts); while it reads, the hub issues nothing (the other lane's attention, its next route, box 2's
-  next request), so both the dGPU and box 2 starve. Box 2's reads overlap the hub's work; box 1's never do.
-- Today: free-only (`FRAC 0`: cold picks box 1 already holds are computed there, ~19% of cold picks) + pins on.
+  6 MiB O_DIRECT readers; box 2's measured prefill read rate is ~4.4 GB/s over two drives. Box 1's drive idles in first
+  windows.
+- Stages 0/1 (`V41_PREFILL_COLD_B1`, `V41_PREFILL_PIN_INFLIGHT`) read box 1's share INSIDE `ensure`: the hub's box-2 wait
+  fell 82% -> 6-13% but first windows got SLOWER (4-unit p50 6.82 -> 9.87 s with pins). `ensure` reads synchronously on the
+  hub thread; meanwhile the hub issues nothing and the dGPU and box 2 starve. Production since ~21:45 UTC: free-only
+  (`FRAC 0`) + pins on.
 
-## 1. Idea: issue early, join late
+## 1. Idea: issue early at route, join at the NEXT unit's launch (review r1 simplification)
 
-A cold pick given to box 1 is NOT part of the unit's immediate iGPU MoE. At route time (`pre_moe_route`) its read is
-queued to background readers; the unit proceeds exactly as if box 2 had it (a third "leg"). In the unit's `Post`, after
-`moe_arrived` and before the remote combine, the hub joins the reads, lands them, runs a SMALL iGPU MoE pass over just
-those experts' picks, and adds the result onto `ffn_moe_recv` -- the same place and the same kind of f32 add as box 2's
-partial. The reads have one lane-layer period (Pre(t) .. Post(t), the other lane's Pre in between) to complete.
+Op order (lm_schedule.rs:54-71): Pre(t) = chain, route, prep, launch; then Post(t-1); then Pre(t+1); then Post(t).
+A cold pick given to box 1 becomes LATE: excluded from MoE(t), its read queued to background readers at route(t). The
+join happens at the START of `pre_moe_launch(t+1)` -- before MoE(t+1) is queued -- so the late pass runs on `ie.compute`
+right behind MoE(t) with nothing queued in between; `si.d_xq_q8k` / `d_x16` still hold unit t's activations (no copy).
+MoE(t)'s `moe_done` record + peer push move to the join: the late result is `vec_add`ed into `bi.ffn_moe(t)` on the
+iGPU, then ONE push, `moe_arrived` as today. Post is unchanged. The reads get route(t) .. launch(t+1): prep(t), launch(t),
+Post(t-1) (incl. its box-2 wait), chain + route + prep of t+1. A join that still waits only delays MoE(t+1), whose box-2
+leg is already submitted (route precedes launch). The last task of a pass joins in its own Post (no t+1).
 
 ## 2. Pieces
 
 ### 2.1 Route (`pre_moe_route`, `cold_route` block)
-- Today's set-aside `cold_pend` keeps its rule; of it, `cold_b1_take(n, FRAC, MAX)` picks become LATE instead of
-  `ids.push`. Late ids go into a per-lane `late: Vec<u32>` on the carry; they are in neither `ids` nor `extra_remote`.
-- Exclusion: the main box-1 pass must skip them (they are not resident). The exclusion remap is built from
-  `owns_eff = extra_remote` today; it becomes `owns_eff | late` for the remap and `verify_routing_exactly_once`, while the
-  box-2 request mask stays `extra_remote` only (box 2 must not compute them).
-- Reads: `pg.read_async(layer, &late) -> ticket` (2.3). Queued before the box-2 submit, so both disks start together.
+- In-flight registry (r1 #4): `(layer, e) -> ticket` for late reads not yet landed. A cold pick already in flight is
+  taken LATE by this unit too, with no new read (counted `cold_late_shared`); `cold_b1_take` takes those first, then new
+  ones up to FRAC/MAX and the per-layer budget (2.4).
+- Late ids go into the carry's `late: Vec<u32>`: in neither `ids` nor `extra_remote`. Box-2 request mask and
+  `remote_sel_override` stay `extra_remote` only (r1 #5).
+- Three-way exactly-once (r1 #5): every distinct pick is in exactly one of {main remap < 0, `extra_remote`, `late`}; at the
+  join, every late id's private-remap entry is negative and resolves to its landed slot. Fails closed (step error).
+- Reads: `pg.read_async(layer, &new_late) -> ticket` before the box-2 submit (both disks start together).
 
-### 2.2 Late pass (`forward_layer_post_moe_v2`, after `de.compute.wait_event(moe_arrived)`, before the remote add)
-1. `pg.join(ticket)`: wait for the reads (normally done), claim slots (2.4), repack from the staging buffers on the
-   repack stream (`repack_in_place`, as `ensure`), write the late ids' remap entries.
-2. Remap upload: `sync_remap_async(layer, ie.compute)` (stream-ordered, staging ring; same mechanism `ensure` uses).
-3. Late MoE on `ie.compute`: the batched gate/up + q8k + down kernels over the lane's rows with a MASKED selection
-   (`late_sel`: the unit's picks with every non-late id set to -1, its weights kept) and the lane's OWN xq copy (2.5),
-   writing a per-lane `bi.late_ffn` [rows x N_EMBD] f32 (zeroed rows without late picks).
-4. Peer-push `bi.late_ffn` -> `bd.late_ffn_recv` on `ie.xfer` after a `late_done` event; `de.compute` waits
-   `late_arrived` and `vec_add`s it onto `ffn_moe_recv` BEFORE the remote add (fixed order: local, late, remote).
-5. `pg.pin_inflight(layer, late, ie.compute)` (stage 1) so the other lane cannot evict them under the late kernel.
-No late picks -> nothing of this runs (no launch, no event).
+### 2.2 Late pass (at the join)
+1. `pg.join(ticket)`: wait for the reads (normally done); claim slots with a fresh `call_tick` (2.4); queue all repacks
+   on the repack stream with NO per-expert `st.synchronize()` (r1 #6); record one `late_landed` event; `ie.compute`
+   waits on it. Staging reuse is gated by that event (query).
+2. PRIVATE late remap (r1 #1, #2): a per-lane device table: late id -> `-(slot+1)`, every other id -> 0 (not mine), cap
+   `N_EXPERT_USED` (as `split_cap`, forward_prefill.rs:9501), uploaded through its own pinned stage on `ie.compute`.
+   The pager's shared `remap` / `remap_dev` / `cur_layer` / `remap_dirty` are never touched.
+3. Late MoE on `ie.compute`: the same group builder / gate-up / q8k / down / reduce as MoE(t), over the lane's REAL
+   `bi.d_selected` / `bi.d_ew` with the private remap (the builder AND the reduce both skip non-late picks: no -1 masking,
+   which the reduce would still sum, r1 #1), into a per-lane `bi.late_moe` [rows x N_EMBD].
+4. `vec_add(bi.ffn_moe, bi.late_moe)` on `ie.compute`; then MoE(t)'s deferred `moe_done` record, the push, `moe_arrived`.
+   Add order: (main + late) + shared + remote.
+5. `pg.pin_inflight(layer, late_slots, ie.compute)` right after the late launch, in the same host step as the claims.
+No late picks for unit t -> today's path exactly (moe_done + push stay in launch(t)).
 
 ### 2.3 Background reads (`ExpertPager::read_async`)
-- A reader pool (threads = `V41_PREFILL_COLD_READERS`, default 8 = the E100's measured optimum) reading each expert's
-  three tensors O_DIRECT into a PINNED staging slot (the same layout `ensure`'s miss path repacks from). Ticket = the
-  list of (id, staging slot); `join` blocks on the ticket's completion.
-- Staging pool: `V41_PREFILL_COLD_STAGES` experts (default 32 x ~18.8 MB = ~600 MB pinned host; two lanes x MAX 16).
-  No free stage -> the pick is not taken late (stays box 2's): reads never wait for staging.
-- Errors: a failed read -> the join recomputes that id via a synchronous `ensure` on the spot (correct, slow, counted).
+- Reader pool `V41_PREFILL_COLD_READERS` (static, default 8: the E100 optimum, 16 is slower), O_DIRECT into TIGHT pinned
+  stages (nibbles + scales of the coalesced layout, ~19 MB/expert; an expert stored in the per-role layout is simply not
+  taken late, r1 #7). `V41_PREFILL_COLD_STAGES` (static, default 16 = ~300 MB pinned; 0 disables); no free stage -> the
+  pick stays box 2's (never waits). Peak `MemAvailable` logged once per pass beside the Engram cache (2 GB).
+- Read failure (r1 #8): a synchronous read into the same stage at the join, then the normal landing (never `ensure()`).
+- Pass end / error (r1 #9): join or cancel every ticket, then `unpin_all_wait`; no reader writes a stage and no claim lands
+  after the pass.
 
-### 2.4 Where late experts land (box 1's pool is one LRU with no owned-set protection)
-- Victim filter for late claims: skip slots holding a hot-set OWNED id (`hot_set::box1_owns == Some(true)`) and pinned
-  slots; prefer the LRU among the rest. Decode's owned set (115/layer) is never evicted by a prefill late read; the spare
-  slots (~825 = 5,425 - 4,600) take them, oldest first (the previous turn's cold reads).
-- Budget per layer per window: `V41_PREFILL_COLD_LATE_MAX_LAYER` (default 20 ~ the spare per layer); the route stops
-  taking late ids for a layer once the window has spent it.
+### 2.4 Landing and budget
+- Late claims skip pinned slots and hot-set-OWNED slots (`hot_set::box1_owns == Some(true)`); nothing eligible -> plain
+  LRU (r1 #10). Decode misses after prefill are attributed: late claims that evicted an owned slot are counted
+  (`cold_late_owned_evict`), separate from the main `ensure`'s.
+- Budget `V41_PREFILL_COLD_LATE_MAX_LAYER` (default 20 ~ spare slots per layer) per layer per window.
 
-### 2.5 The lane's xq copy
-`si.d_xq_q8k` is SHARED scratch the other lane's launch overwrites before this lane's Post. When a unit has late picks,
-`pre_moe_launch` copies its xq rows (D2D on `ie.compute`, rows x 5,840 B = ~3 MB at 512 rows) into a per-lane
-`bi.late_xq` right after the quantize. Unit without late picks: no copy.
+## 3. Gates (r1 Q7)
+- EXACTNESS (debug knob `V41_PREFILL_COLD_FORCE_LATE`): a fixed late set made of BOX-1-RESIDENT picks (no reads), late pass
+  vs the same picks in the main pass, per-layer `ffn_moe_recv` compared on the dev path: per-pick partials identical
+  (same kernels, same row count -> same `_rows` arm), only f32 reassociation in the sum -> tight relative bound; plus the
+  three-way exactly-once check and a group-audit count on the late builder.
+- End gate: golden KLD on fixed prompts (late on vs off), within the split null.
+- Live: `pin_smoke.py` (synthetic, arithmetic answers) off vs on before any A/B.
 
-## 3. Fidelity
-The late experts' contributions are the same f32 products added in a different order (a separate pass + one more
-`vec_add`), the class of change every split already makes (live null ~0.3 nats from partition movement). Gate:
-`lm_prefill_bitexact`-style equality is NOT expected; KLD vs the off arm on fixed prompts (golden recipe) within the split
-null, plus `verify_routing_exactly_once` (fails closed) with the late class.
-
-## 4. Knobs (all live unless noted)
+## 4. Knobs (live unless noted)
 | knob | default | meaning |
 |---|---|---|
-| `V41_PREFILL_COLD_ASYNC` | off | late pass instead of `ensure` for the FRAC/MAX share (needs `V41_PREFILL_COLD_B1` and `V41_PREFILL_PIN_INFLIGHT`) |
-| `V41_PREFILL_COLD_B1_FRAC` / `_MAX` | 0.5 / 16 when async | share / cap per request |
+| `V41_PREFILL_COLD_ASYNC` | off | late reads instead of `ensure` for the FRAC/MAX share (needs `V41_PREFILL_COLD_B1`, `V41_PREFILL_PIN_INFLIGHT`) |
+| `V41_PREFILL_COLD_B1_FRAC` / `_MAX` | 0.5 / 16 when async | share / cap of NEW late reads per request |
 | `V41_PREFILL_COLD_LATE_MAX_LAYER` | 20 | late reads per layer per window |
+| `V41_PREFILL_COLD_FORCE_LATE` | off | gate only: resident picks through the late pass |
 | `V41_PREFILL_COLD_READERS` (static) | 8 | reader threads |
-| `V41_PREFILL_COLD_STAGES` (static) | 32 | pinned staging experts |
+| `V41_PREFILL_COLD_STAGES` (static) | 16 | tight pinned stages (~19 MB each) |
 
 ## 5. Expected effect (inferred)
-Per first-window request ~50 cold experts: box 2 reads them today at ~4.4 GB/s (~210 ms of disk per layer's requests,
-mostly exposed). Late reads of half on box 1 in parallel cut box 2's reads ~2x and add ~0 hub-thread time (a join that
-normally finds the reads done, a ~1-2 ms late pass on few experts, one push). Estimate: first-window blocked time
-3.6 -> ~1.8-2.2 s; short turns 4.3 -> ~2.7-3.2 s TTFT. Bounded by: box 1's iGPU doing more MoE (late experts carry few
-picks: cheap), the extra `vec_add` + push (~0.3 ms per lane-layer with late picks).
+First-window request ~50 cold experts: box 2 reads them at ~4.4 GB/s, mostly exposed. Half read late on box 1 in parallel
+cuts box 2's reads ~2x; the hub thread adds a join that normally finds the reads done and a late pass whose cost does NOT
+scale with late picks alone (post-quantize over all rows x slots, reduce over all rows, devcount grid; r1 #11): measured
+per late lane-layer before trusting the estimate. First-window blocked 3.6 -> ~1.8-2.2 s; short turns 4.3 -> ~2.7-3.2 s.
 
 ## 6. Measurement
-`first_windows.py` (job tmp; per job first-window wall + hub box-2 wait by units) against the 10-12 baseline (2-unit
-4.27 s, 4-unit 6.82 s) in alternating on/off blocks of real traffic; counters `cold_late` / `cold_late_join_wait_ms` /
-`cold_late_fallback` on the "stream admitted" line; decode box-1 misses after a prefill (must not rise: owned set is
-protected by 2.4).
+`first_windows.py` (per job first-window wall + hub box-2 wait by units) vs the 10-12 baseline (2-unit 4.27 s, 4-unit
+6.82 s), alternating on/off blocks of real traffic; counters `cold_late`, `cold_late_shared`, `cold_late_join_wait_ms`,
+`cold_late_fallback`, `cold_late_owned_evict`, late-pass ms (evtrace) on the "stream admitted" line.
 
 ## 7. Risks
 | risk | mitigation |
 |---|---|
-| a late expert evicted under its late kernel | pinned (stage 1) right after its launch; claims skip pinned and owned |
-| xq overwritten before the late pass | per-lane copy (2.5) |
-| reads not done at join (hub waits) | counted (`join_wait_ms`); FRAC/MAX live; worst case = today's synchronous read |
-| exactly-once violated | late mask in the exclusion and the verify; fails closed |
-| pinned host RAM (~600 MB) | box 1 RAM is shared with the iGPU: static knob, sized once; 0 disables |
+| late output wrong (stale partials, wrong remap) | private remap + real selection (2.2), exactness gate (3) |
+| a late expert evicted under its kernel | pinned in the same host step as its claims |
+| both lanes read the same expert | in-flight registry (2.1) |
+| join waits | counted; FRAC/MAX/budget live; a wait delays only MoE(t+1) |
+| pinned host RAM | tight stages, 16 by default, static, MemAvailable logged |
+| `V41_LM_PREFETCH` words for an expert box 1 reads late (r1 #12) | knob off in prod; route skips late ids when building words |
 
 ## 8. Slices
-1. `read_async` / `join` + staging pool + host test (tickets, failure fallback, no-stage refusal).
-2. Route late class + exclusion/verify mask + carry plumbing (late empty -> today's path exactly).
-3. xq copy + late pass + combine; host test of the masked-selection builder.
-4. GPU check on the dev path (server down or a scratch hub): one prompt, late on vs off, KLD within the split null.
-5. Deploy default off; flip live; on/off blocks.
+1. `read_async` / `join` / cancel + tight stages + in-flight registry; host tests (tickets, failure path, no-stage refusal,
+   pass-end cancel).
+2. Route late class + three-way exactly-once + carry plumbing (late empty -> today's path exactly; host test).
+3. Private late remap + late pass + deferred push at the next launch; last-task Post join.
+4. Exactness gate (FORCE_LATE, dev path / scratch hub) + golden KLD.
+5. Deploy default off; `pin_smoke`; flip live; on/off blocks.
+
+## 9. Review round 1 (2026-10-12, REVISE): where each finding went
+1 masked -1 summed by the reduce -> 2.2 step 3 (real selection + private remap). 2 shared remap corrupted -> 2.2 step 2.
+3 late pass behind MoE(t+1) -> 1 (join at launch(t+1)). 4 duplicate reads across lanes -> 2.1 registry. 5 vacuous verify
+-> 2.1 three-way check. 6 per-expert repack sync -> 2.2 step 1. 7 staging size / RAM -> 2.3 tight stages, 16. 8 fallback
+must not call `ensure` -> 2.3. 9 tickets at pass end -> 2.3. 10 owned-filter fallback + attribution -> 2.4. 11 late-pass
+cost unmeasured -> 5. 12 join placement / LM_PREFETCH words -> 1, 7. Q7 exactness gate -> 3.
