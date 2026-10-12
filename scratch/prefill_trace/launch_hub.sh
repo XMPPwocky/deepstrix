@@ -10,7 +10,12 @@ URL=http://127.0.0.1:18080
 say() { echo "$(date -u +%T) $*"; }
 if pgrep -f "$HUBPAT" >/dev/null || pgrep -f "$SUPPAT" >/dev/null; then echo "hub/supervisor already running"; exit 1; fi
 mapfile -t ENVV < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENVF" | grep -v -E '^(V41_LOG_ATTACHED|V41_PICK_TRACE|V41_PREFILL_LOGITS_DUMP)=')
-ENVV+=("V41_PICK_TRACE=/home/claude-code/logs/picks-sub-$(date -u +%Y%m%d-%H%M).trace" "$@")
+# The pick trace is OPT-IN (owner 10-12: it forces router alternatives in prefill and writes a text line per row per
+# layer on the engine thread, ~6.5 MB/min): PICK_TRACE=1 launch_hub.sh ... to record one for the cache simulator.
+if [ "${PICK_TRACE:-0}" = 1 ]; then
+  ENVV+=("V41_PICK_TRACE=/home/claude-code/logs/picks-sub-$(date -u +%Y%m%d-%H%M).trace")
+fi
+ENVV+=("$@")
 for a in "${ENVV[@]}"; do case "$a" in *=*) ;; *) echo "non-assignment env arg: $a"; exit 1;; esac; done
 echo "$(date -u +%FT%T) DEPLOY src=target-v41 md5=$(md5sum < /home/claude-code/deepstrix/target-v41/release/deepstrix-server | cut -c1-8) launch_hub.sh $*" >> /home/claude-code/logs/evtrace/deploy_markers.log
 (cd ~ && env -i "${ENVV[@]}" setsid nohup ~/run_v41_server.sh >/dev/null 2>&1 </dev/null &)
