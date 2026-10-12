@@ -241,9 +241,51 @@ impl Drop for SplitGuard {
     }
 }
 
+/// COLD READS (`V41_PREFILL_COLD_B1`, knobs.rs): is the rule on for a prefill request with this split?
+pub fn cold_b1_on(split: Option<&Arc<PrefillSplit>>) -> bool {
+    match crate::knobs::PREFILL_COLD_B1.pick() {
+        1 => split.is_none(),
+        2 => true,
+        _ => false,
+    }
+}
+
+/// How many of a request's `n_cold` cold picks box 1 reads: `frac` of them, at most `max` (the rest stay box 2's).
+pub fn cold_b1_take(n_cold: usize, frac: f64, max: usize) -> usize {
+    ((n_cold as f64 * frac.clamp(0.0, 1.0)).floor() as usize).min(max).min(n_cold)
+}
+
+/// Cold picks since the start: computed on box 1 because it already held them / read on box 1 / left to box 2.
+static COLD_B1_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COLD_B1_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COLD_B2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_cold(b1_free: u64, b1_read: u64, b2: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    COLD_B1_FREE.fetch_add(b1_free, Relaxed);
+    COLD_B1_READ.fetch_add(b1_read, Relaxed);
+    COLD_B2.fetch_add(b2, Relaxed);
+}
+
+/// (box 1 already held, box-1 reads, box-2 reads) of the cold picks, cumulative.
+pub fn cold_totals() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (COLD_B1_FREE.load(Relaxed), COLD_B1_READ.load(Relaxed), COLD_B2.load(Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_take_is_bounded() {
+        assert_eq!(cold_b1_take(0, 0.5, 8), 0);
+        assert_eq!(cold_b1_take(5, 0.5, 8), 2);
+        assert_eq!(cold_b1_take(40, 0.5, 8), 8);
+        assert_eq!(cold_b1_take(40, 0.0, 8), 0);
+        assert_eq!(cold_b1_take(3, 1.0, 8), 3);
+        assert_eq!(cold_b1_take(3, 7.0, 8), 3, "frac is clamped");
+    }
 
     fn hot_head(per_layer: usize) -> impl Fn(i32, u32) -> Option<bool> {
         // A warm hot set: the `per_layer` smallest-hash ids of every layer.

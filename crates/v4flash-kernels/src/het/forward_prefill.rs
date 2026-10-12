@@ -10192,6 +10192,16 @@ impl HeterogeneousEngine {
                     && super::expert_pager::b1_page_misses()
                     && super::expert_pager::hot_set::rep_any();
                 let mut rep_pend: Vec<u32> = Vec::new();
+                // COLD READS (`V41_PREFILL_COLD_B1`): prefill requests only (b >= 64; decode rows are Arena, DSpark
+                // verify blocks are smaller). A box-2-home pick the mirror says box 2 would read is set aside.
+                let cold_route = !holder_rows
+                    && (b as usize) >= 64
+                    && remote_split_on
+                    && super::expert_pager::t2_partition()
+                    && super::expert_pager::b1_page_misses()
+                    && super::prefill_split::cold_b1_on(psplit.as_ref());
+                let mut cold_pend: Vec<u32> = Vec::new();
+                let mut cold_free = 0u64;
                 // Under a live cache-prior, rank the hot set by the ROUTER's picks,
                 // not the prior's (held experts would inflate their own rank and
                 // lock box 1's set in).
@@ -10260,6 +10270,16 @@ impl HeterogeneousEngine {
                             } else {
                                 home2
                             };
+                            if on2 && cold_route && super::b2_mirror::lookup(layer as i32, sv as u32).is_some_and(|r| super::b2_mirror::nonres_for_miss(&r)) {
+                                if pg.is_resident(layer as i32, sv as u32) {
+                                    // Box 1 holds it: computed here, no read anywhere.
+                                    cold_free += 1;
+                                    ids.push(sv as u32);
+                                } else {
+                                    cold_pend.push(sv as u32);
+                                }
+                                continue;
+                            }
                             if on2 {
                                 extra_remote[sv as usize] = true;
                                 continue;
@@ -10305,6 +10325,23 @@ impl HeterogeneousEngine {
                         }
                         ids.push(sv as u32);
                     }
+                }
+                if cold_route {
+                    // The first `cold_b1_take` cold picks (pick order) are read and computed on box 1 (`b1_page_misses`:
+                    // `ensure` reads them with its concurrent readers), the rest stay box 2's, so both drives read.
+                    let k = super::prefill_split::cold_b1_take(
+                        cold_pend.len(),
+                        crate::knobs::PREFILL_COLD_B1_FRAC.f64(),
+                        crate::knobs::PREFILL_COLD_B1_MAX.usize(),
+                    );
+                    for (i, &e) in cold_pend.iter().enumerate() {
+                        if i < k {
+                            ids.push(e);
+                        } else {
+                            extra_remote[e as usize] = true;
+                        }
+                    }
+                    super::prefill_split::note_cold(cold_free, k as u64, (cold_pend.len() - k) as u64);
                 }
                 if !rep_pend.is_empty() {
                     // The leg of each replicated id (`hot_split::rep_legs`, `V41_B1_HOT_REP_LEG`):

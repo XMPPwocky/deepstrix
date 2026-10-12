@@ -959,6 +959,20 @@ crate::knobs! {
     pub static B1_HOT_LEG_SB_US = Knob::real("V41_B1_HOT_LEG_SB_US", 15.6, 0.0, 100000.0).live();
     pub static B1_HOT_LEG_LINK_ADD_US = Knob::real("V41_B1_HOT_LEG_LINK_ADD_US", 0.0, 0.0, 100000.0).live();
     pub static B1_HOT_LEG_OPEN_MS = Knob::real("V41_B1_HOT_LEG_OPEN_MS", 0.2, 0.0, 100.0).live();
+    /// `V41_PREFILL_COLD_B1` (`off` default | `short` | `all`; live, read per prefill lane-layer): a prefill pick whose
+    /// home is box 2 but which box 2 does not hold (the mirror: not held / soft / pending / incoming) is COLD -- box 2
+    /// would read it from disk while the hub waits (82% of the hub's box-2 wait is a job's first window, 10-12). A cold
+    /// pick box 1 already holds is computed on box 1 (no read anywhere); of the rest, `V41_PREFILL_COLD_B1_FRAC` (at most
+    /// `V41_PREFILL_COLD_B1_MAX` per request) are read and computed on box 1, in parallel with box 2's reads of the rest.
+    /// `short` = jobs without a frozen prefill split; `all` = every prefill request (changes a long job's split per
+    /// window: no bit-identity across windows).
+    pub static PREFILL_COLD_B1 = Knob::choice("V41_PREFILL_COLD_B1", 0, &[&["off"], &["short"], &["all"]]).live();
+    /// `V41_PREFILL_COLD_B1_FRAC` (default 0.5; live): share of a request's cold picks read on box 1.
+    pub static PREFILL_COLD_B1_FRAC = Knob::real("V41_PREFILL_COLD_B1_FRAC", 0.5, 0.0, 1.0).live();
+    /// `V41_PREFILL_COLD_B1_MAX` (default 8; live): box-1 cold reads per request at most. Box 1's pool is one LRU that
+    /// does not protect decode's owned set; ~20 spare slots per layer beyond it (10-12), and a layer gets 2-4 requests per
+    /// window, so 8 keeps a window's extra box-1 reads inside the spare slots.
+    pub static PREFILL_COLD_B1_MAX = Knob::int("V41_PREFILL_COLD_B1_MAX", 8, 0, 384).live();
 }
 
 #[cfg(test)]
