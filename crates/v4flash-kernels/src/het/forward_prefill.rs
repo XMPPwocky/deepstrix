@@ -5501,6 +5501,11 @@ impl HeterogeneousEngine {
             // Normally allocated at the pass start (review r3 #9); grown here only if the lane grew.
             bi.late_moe = Some(v4flash_hip::DeviceBuffer::new(self.igpu.device.id, bi.ffn_moe.len())?);
         }
+        if crate::knobs::PREFILL_COLD_LATE_SKIP.on() {
+            // GATE ONLY negative control: the late contribution is dropped.
+            pg.pin_inflight(layer, &late, &ie.compute)?;
+            return self.moe_push_tail(bd, bi, sev, b, cs_n_embd);
+        }
         // The late pass: the unit's launch body again, its output swapped into `ffn_moe`'s place.
         std::mem::swap(&mut bi.ffn_moe, bi.late_moe.as_mut().expect("allocated"));
         c.phase = PreMoePhase::Prepped;
@@ -10329,6 +10334,9 @@ impl HeterogeneousEngine {
                     && super::prefill_split::cold_b1_on(psplit.as_ref());
                 let mut cold_pend: Vec<u32> = Vec::new();
                 let mut cold_free = 0u64;
+                // GATE ONLY (`V41_PREFILL_COLD_FORCE_LATE`): box-1-home picks with id % N == 0 take the late path.
+                let force_n = if late_pass() && sparse_resid_layer && !holder_rows { crate::knobs::PREFILL_COLD_FORCE_LATE.usize() as u32 } else { 0 };
+                let mut force_pend: Vec<u32> = Vec::new();
                 // Under a live cache-prior, rank the hot set by the ROUTER's picks,
                 // not the prior's (held experts would inflate their own rank and
                 // lock box 1's set in).
@@ -10420,6 +10428,10 @@ impl HeterogeneousEngine {
                             // sensible with the two-lane step, which hides the read
                             // under box 2's leg.
                             if super::expert_pager::b1_page_misses() {
+                                if force_n > 0 && (sv as u32) % force_n == 0 {
+                                    force_pend.push(sv as u32);
+                                    continue;
+                                }
                                 ids.push(sv as u32);
                                 continue;
                             }
@@ -10503,6 +10515,19 @@ impl HeterogeneousEngine {
                         }
                     }
                     super::prefill_split::note_cold(cold_free, k as u64, (cold_pend.len() - k) as u64);
+                }
+                if !force_pend.is_empty() {
+                    // GATE ONLY: resident forced picks join the late set with no read; the rest are read late if a stage
+                    // is free, else they stay in the main pass.
+                    let (res, cold): (Vec<u32>, Vec<u32>) = force_pend.iter().partition(|&&e| pg.is_resident(layer as i32, e));
+                    let took = pg.late_read(layer as i32, &cold)?;
+                    for &e in &cold {
+                        if !took.contains(&e) {
+                            ids.push(e);
+                        }
+                    }
+                    c.late.extend_from_slice(&res);
+                    c.late.extend_from_slice(&took);
                 }
                 if !rep_pend.is_empty() {
                     // The leg of each replicated id (`hot_split::rep_legs`, `V41_B1_HOT_REP_LEG`):

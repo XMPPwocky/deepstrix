@@ -987,6 +987,13 @@ crate::knobs! {
     /// `V41_PREFILL_COLD_LATE_MAX_LAYER` (default 20; live): NEW late reads per layer per window (~ box 1's spare pool
     /// slots per layer beyond decode's owned set).
     pub static PREFILL_COLD_LATE_MAX_LAYER = Knob::int("V41_PREFILL_COLD_LATE_MAX_LAYER", 20, 0, 384).live();
+    /// `V41_PREFILL_COLD_FORCE_LATE` (GATE ONLY, default 0 = off; live): during a late pass, box-1-HOME picks with
+    /// `id % N == 0` go through the late pass instead of the main one (resident: no read). The box-1 / box-2 assignment
+    /// is unchanged, so the output may differ only by f32 reassociation (tests/late_exactness.rs).
+    pub static PREFILL_COLD_FORCE_LATE = Knob::int("V41_PREFILL_COLD_FORCE_LATE", 0, 0, 384).live();
+    /// `V41_PREFILL_COLD_LATE_SKIP` (GATE ONLY, default off; live): the late join lands its reads and pushes but SKIPS
+    /// the late MoE pass and its add -- the negative control: a missing contribution the gate must catch.
+    pub static PREFILL_COLD_LATE_SKIP = Knob::flag("V41_PREFILL_COLD_LATE_SKIP", false).live();
 }
 
 #[cfg(test)]
