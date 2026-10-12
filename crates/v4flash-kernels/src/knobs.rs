@@ -981,7 +981,8 @@ crate::knobs! {
     /// `V41_PREFILL_COLD_ASYNC` (default off; live, read at each layer-outer pass): the `V41_PREFILL_COLD_B1` share of a
     /// request's cold picks is read LATE on box 1 (background readers, docs/v41/PREFILL_COLD_ASYNC_DESIGN.md) and
     /// computed by a late iGPU MoE pass joined at the start of the next unit, instead of a synchronous read in
-    /// `ensure`. Needs `V41_PREFILL_PIN_INFLIGHT` and the late readers (`V41_PREFILL_COLD_STAGES` > 0 at startup).
+    /// `ensure`. Needs `V41_PREFILL_PIN_INFLIGHT` and the late readers, which start only with `V41_PREFILL_COLD_STAGES`
+    /// > 0 in the hub's environment (static, default 0): a live flip without them does nothing.
     pub static PREFILL_COLD_ASYNC = Knob::flag("V41_PREFILL_COLD_ASYNC", false).live();
     /// `V41_PREFILL_COLD_LATE_MAX_LAYER` (default 20; live): NEW late reads per layer per window (~ box 1's spare pool
     /// slots per layer beyond decode's owned set).

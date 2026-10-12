@@ -862,16 +862,16 @@ impl V41HfWeights {
         if !(expert_odirect() && self.st.read_range_into_direct(wt, 0, dp)?) {
             self.st.read_range_into_cached_par(wt, 0, dp, expert_pread_threads())?;
         }
-        EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.weight_bytes.fetch_add(wt.len, Relaxed);
+        read_prof().weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().weight_bytes.fetch_add(wt.len, Relaxed);
         let t_s = std::time::Instant::now();
         self.st.read_range_into_cached(sc, 0, ds)?;
-        EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
-        EXPERT_READ_PROF.n_layout.fetch_add(1, Relaxed);
-        EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
-        EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
+        read_prof().scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().scale_bytes.fetch_add(sc.len, Relaxed);
+        read_prof().n_layout.fetch_add(1, Relaxed);
+        read_prof().pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
+        read_prof().calls.fetch_add(1, Relaxed);
         Ok(())
     }
 
@@ -1026,19 +1026,19 @@ impl V41HfWeights {
         else {
             return Ok(None);
         };
-        EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.weight_bytes.fetch_add(run_w as u64, Relaxed);
+        read_prof().weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().weight_bytes.fetch_add(run_w as u64, Relaxed);
         let t_s = std::time::Instant::now();
         let Some(pad_s) = self.st.read_span_into_direct_padded(scs[0].shard, s0, run_s, dst_s)?
         else {
             return Ok(None);
         };
-        EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.scale_bytes.fetch_add(run_s as u64, Relaxed);
-        EXPERT_READ_PROF.n_runs.fetch_add(1, Relaxed);
-        EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.pread_bytes.fetch_add((run_w + run_s) as u64, Relaxed);
-        EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
+        read_prof().scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().scale_bytes.fetch_add(run_s as u64, Relaxed);
+        read_prof().n_runs.fetch_add(1, Relaxed);
+        read_prof().pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().pread_bytes.fetch_add((run_w + run_s) as u64, Relaxed);
+        read_prof().calls.fetch_add(1, Relaxed);
         let mut offs = [(0usize, 0usize, 0u32, 0u32); 3];
         for (r, o) in offs.iter_mut().enumerate() {
             *o = (
@@ -1131,18 +1131,18 @@ impl V41HfWeights {
         let Some(pad_w) = self.st.read_range_into_direct_striped(wt, 0, packed_len, region_w, route.weight_mirror_frac, stripes)? else {
             return Ok(None);
         };
-        EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.weight_bytes.fetch_add(wt.len, Relaxed);
+        read_prof().weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().weight_bytes.fetch_add(wt.len, Relaxed);
         let t_s = std::time::Instant::now();
         let Some(pad_s) = self.st.read_range_into_direct_padded_on(sc, 0, scale_len, region_s, route.scale_from_mirror)? else {
             return Ok(None);
         };
-        EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
-        EXPERT_READ_PROF.n_direct.fetch_add(1, Relaxed);
-        EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
-        EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
+        read_prof().scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().scale_bytes.fetch_add(sc.len, Relaxed);
+        read_prof().n_direct.fetch_add(1, Relaxed);
+        read_prof().pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
+        read_prof().calls.fetch_add(1, Relaxed);
         Ok(Some((pad_w, cap_w + pad_s, out as u32, nb as u32)))
     }
 
@@ -1186,23 +1186,23 @@ impl V41HfWeights {
         let mut packed = vec![0u8; wt.len as usize];
         let mut scale = vec![0u8; sc.len as usize];
         let t_pread = std::time::Instant::now();
-        EXPERT_READ_PROF.alloc_ns.fetch_add(
+        read_prof().alloc_ns.fetch_add(
             t_pread.duration_since(t_alloc).as_nanos() as u64, Relaxed);
         let t_w = std::time::Instant::now();
         if !(expert_odirect() && self.st.read_range_into_direct(wt, 0, &mut packed)?) {
             self.st.read_range_into_cached_par(wt, 0, &mut packed, expert_pread_threads())?;
         }
-        EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.weight_bytes.fetch_add(wt.len, Relaxed);
+        read_prof().weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().weight_bytes.fetch_add(wt.len, Relaxed);
         let t_s = std::time::Instant::now();
         self.st.read_range_into_cached(sc, 0, &mut scale)?;
-        EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
+        read_prof().scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().scale_bytes.fetch_add(sc.len, Relaxed);
         let t_repack = std::time::Instant::now();
-        EXPERT_READ_PROF.n_raw.fetch_add(1, Relaxed);
-        EXPERT_READ_PROF.pread_ns.fetch_add(
+        read_prof().n_raw.fetch_add(1, Relaxed);
+        read_prof().pread_ns.fetch_add(
             t_repack.duration_since(t_pread).as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
+        read_prof().pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
         assert_eq!(nb % 8, 0, "MXFP4 super-block layout needs nb % 8 == 0, got {nb}");
         for r in 0..out {
             let prow = &packed[r * half..(r + 1) * half];
@@ -1227,8 +1227,8 @@ impl V41HfWeights {
                 }
             }
         }
-        EXPERT_READ_PROF.repack_ns.fetch_add(t_repack.elapsed().as_nanos() as u64, Relaxed);
-        EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
+        read_prof().repack_ns.fetch_add(t_repack.elapsed().as_nanos() as u64, Relaxed);
+        read_prof().calls.fetch_add(1, Relaxed);
         Ok(())
     }
 }
@@ -1262,6 +1262,38 @@ pub struct ExpertReadProfile {
     pub n_runs: AtomicU64,
     pub n_direct: AtomicU64,
     pub n_raw: AtomicU64,
+}
+
+/// Where a thread that opted out (`set_thread_read_prof(false)`: box 1's LATE prefill readers, which run concurrently
+/// with `ensure` and would inflate its per-chunk deltas) books its reads instead.
+static EXPERT_READ_PROF_SINK: ExpertReadProfile = ExpertReadProfile {
+    calls: AtomicU64::new(0),
+    alloc_ns: AtomicU64::new(0),
+    pread_ns: AtomicU64::new(0),
+    repack_ns: AtomicU64::new(0),
+    pread_bytes: AtomicU64::new(0),
+    weight_ns: AtomicU64::new(0),
+    weight_bytes: AtomicU64::new(0),
+    scale_ns: AtomicU64::new(0),
+    scale_bytes: AtomicU64::new(0),
+    n_layout: AtomicU64::new(0),
+    n_runs: AtomicU64::new(0),
+    n_direct: AtomicU64::new(0),
+    n_raw: AtomicU64::new(0),
+};
+
+thread_local! {
+    static NO_READ_PROF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread's expert reads count in `EXPERT_READ_PROF` (default) or not.
+pub fn set_thread_read_prof(on: bool) {
+    NO_READ_PROF.with(|c| c.set(!on));
+}
+
+#[inline]
+fn read_prof() -> &'static ExpertReadProfile {
+    if NO_READ_PROF.with(|c| c.get()) { &EXPERT_READ_PROF_SINK } else { &EXPERT_READ_PROF }
 }
 
 pub static EXPERT_READ_PROF: ExpertReadProfile = ExpertReadProfile {

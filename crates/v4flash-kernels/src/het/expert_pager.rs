@@ -314,6 +314,8 @@ type LateQueue = std::sync::Arc<(std::sync::Mutex<(std::collections::VecDeque<La
 struct LateReader {
     /// Queued jobs + the number popped and still reading; the condvar wakes readers (and `late_cancel_all`).
     queue: LateQueue,
+    /// Reader threads alive (a reader whose HF handle failed to open exits): 0 -> `late_on()` is false.
+    live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     rx: std::sync::mpsc::Receiver<LateDone>,
     free: Vec<LateStage>,
     /// The in-flight registry: (layer, id) queued or reading or read-but-not-joined.
@@ -3799,13 +3801,17 @@ impl ExpertPager {
         }
         let queue: LateQueue = std::sync::Arc::new((std::sync::Mutex::new((std::collections::VecDeque::new(), 0)), std::sync::Condvar::new()));
         let (tx, rx) = std::sync::mpsc::channel::<LateDone>();
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(readers));
         for i in 0..readers {
-            let (q, tx, dir) = (queue.clone(), tx.clone(), dir.to_path_buf());
+            let (q, tx, dir, live) = (queue.clone(), tx.clone(), dir.to_path_buf(), live.clone());
             std::thread::Builder::new().name(format!("b1-late-{i}")).spawn(move || {
+                // Late reads run beside `ensure`: keep them out of its read profile (review r3 #6).
+                v4flash_core::hf_v41::set_thread_read_prof(false);
                 let owner = match V41HfWeights::open(&dir, None) {
                     Ok(o) => o,
                     Err(e) => {
                         eprintln!("b1-late: cannot open {}: {e:#}; this reader exits", dir.display());
+                        live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
                 };
@@ -3821,7 +3827,10 @@ impl ExpertPager {
                             g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
                         }
                     };
-                    let ok = Self::late_read_one(&owner, job.layer, job.id, &mut job.stage);
+                    // A panicking read must still report (and decrement `running`), or the join and the pass-end
+                    // cancel would wait forever (review r3 #3).
+                    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::late_read_one(&owner, job.layer, job.id, &mut job.stage)))
+                        .unwrap_or_else(|_| Err("late reader panicked".into()));
                     let sent = tx.send(LateDone { layer: job.layer, id: job.id, stage: job.stage, ok });
                     {
                         let (m, cv) = &*q;
@@ -3841,7 +3850,7 @@ impl ExpertPager {
         };
         let remap_stage = [PinnedBuffer::<i32>::new(N_EXPERT as usize)?, PinnedBuffer::<i32>::new(N_EXPERT as usize)?];
         self.late = Some(LateReader {
-            queue, rx, free, inflight: Default::default(), done: HashMap::new(), busy: Default::default(), spare_events: Vec::new(), sizes,
+            queue, live, rx, free, inflight: Default::default(), done: HashMap::new(), busy: Default::default(), spare_events: Vec::new(), sizes,
             queued: 0, refused: 0, landed: 0, resident: 0, fallback: 0, owned_evict: 0, join_wait_ns: 0,
             remap_dev, remap_stage, remap_ev: [None, None],
         });
@@ -3865,7 +3874,7 @@ impl ExpertPager {
 
     /// Late reads are available.
     pub fn late_on(&self) -> bool {
-        self.late.is_some()
+        self.late.as_ref().is_some_and(|l| l.live.load(std::sync::atomic::Ordering::Relaxed) > 0)
     }
 
     /// The in-flight registry: `(layer, id)` is being read late (queued, reading, or read and not yet joined).
@@ -3942,7 +3951,20 @@ impl ExpertPager {
                 self.res.touch(slot);
                 if let Some(l) = self.late.as_mut() {
                     l.resident += 1;
-                    l.inflight.remove(&key);
+                    if l.inflight.remove(&key) {
+                        // Its read is still running: take the result back so the stage returns (review r3 #5).
+                        while !l.done.contains_key(&key) {
+                            match l.rx.recv() {
+                                Ok(d) => {
+                                    l.done.insert((d.layer, d.id), d);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if let Some(d) = l.done.remove(&key) {
+                            l.free.push(d.stage);
+                        }
+                    }
                 }
                 out.push((e, slot));
                 continue;
@@ -3954,8 +3976,13 @@ impl ExpertPager {
                 if l.inflight.contains(&key) {
                     let tw = std::time::Instant::now();
                     while !l.done.contains_key(&key) {
-                        let d = l.rx.recv().map_err(|_| eyre!("late readers gone"))?;
-                        l.done.insert((d.layer, d.id), d);
+                        match l.rx.recv() {
+                            Ok(d) => {
+                                l.done.insert((d.layer, d.id), d);
+                            }
+                            // Every reader gone: the synchronous fallback below reads it (review r3 #4).
+                            Err(_) => break,
+                        }
                     }
                     waited_ns += tw.elapsed().as_nanos() as u64;
                     done = l.done.remove(&key);
@@ -3984,7 +4011,6 @@ impl ExpertPager {
                         l.owned_evict += 1;
                     }
                 }
-                push_hint(false, old.0, old.1);
             }
             {
                 let (rp, st) = (self.repack.as_ref().expect("late needs the GPU repack"), self.repack_stream.as_ref().expect("repack stream"));
@@ -4033,7 +4059,7 @@ impl ExpertPager {
             l.inflight.remove(&k);
             return Ok(d.stage);
         }
-        let d = l.rx.recv().map_err(|_| eyre!("late readers gone"))?;
+        let d = l.rx.recv().map_err(|_| eyre!("late readers gone and every stage held"))?;
         l.inflight.remove(&(d.layer, d.id));
         Ok(d.stage)
     }

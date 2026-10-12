@@ -1794,6 +1794,16 @@ impl HeterogeneousEngine {
             a.store(0, std::sync::atomic::Ordering::Relaxed);
         }
         let mut late_pend: [Option<(usize, PreMoeCarry)>; 2] = [None, None];
+        if late_on {
+            // The late pass's output buffers, before any unit runs (a mid-pass hipMalloc can synchronize; review r3 #9).
+            self.set_current_cached(self.igpu.device)?;
+            for (_, bi) in lanes.iter_mut() {
+                if bi.late_moe.as_ref().is_none_or(|x| x.len() < bi.ffn_moe.len()) {
+                    bi.late_moe = Some(v4flash_hip::DeviceBuffer::new(self.igpu.device.id, bi.ffn_moe.len())?);
+                }
+            }
+            self.set_current_cached(self.dgpu.device)?;
+        }
 
         let mut exec = |op: sch::Op| -> eyre::Result<()> {
             match op {
@@ -1801,16 +1811,9 @@ impl HeterogeneousEngine {
                     let (l, u) = sch::task(t, a, u_count);
                     let un = units[u];
                     let lane = t % 2;
-                    // LATE join of unit t-1 (the other lane) before anything of unit t is issued (design rev 3, 1).
                     let other = 1 - lane;
-                    if late_pend[other].as_ref().is_some_and(|(tp, _)| tp + 1 == t) {
-                        let (tp, cp) = late_pend[other].take().expect("checked");
-                        let (lp, _) = sch::task(tp, a, u_count);
-                        let pg = pager.as_deref_mut().ok_or_else(|| eyre!("late join without a pager"))?;
-                        let (bdo, bio) = &mut lanes[other];
-                        self.late_join_unit(cp, bdo, bio, sd, si, &weights.dgpu_layers[lp], &weights.igpu_layers[lp], &self.sync_events_lane(other).layers[lp], pg)?;
-                    }
-                    let (bd, bi) = &mut lanes[lane];
+                    let [lane0, lane1] = &mut lanes;
+                    let ((bd, bi), (bdo, bio)) = if lane == 0 { (lane0, lane1) } else { (lane1, lane0) };
                     check_scratch_rows("layer-outer lane unit", un.rows, bd, bi, sd, si)?;
                     // Compressor lending (reuse layers borrow their KV source's store): once per layer, around its pres.
                     let lend_src = crate::config::kv_source_of(l);
@@ -1898,7 +1901,19 @@ impl HeterogeneousEngine {
                             pos0_u, tokens_u, vis.as_deref(), None, sev, pager.as_deref_mut(), mode_of(l), &rows)?;
                         c.lane = lane;
                         self.pre_moe_route(&mut c, bd, sd, sev, pager.as_deref_mut(), &rows)?;
+                        // The join's claim cutoff, BEFORE ensure(t): it must not evict a slot this unit's ensure touches
+                        // (review r3 #1 / rev 3 2.2 step 0).
+                        let tk = pager.as_deref().map_or(0, |p| p.tick());
                         self.pre_moe_prep(&mut c, bd, bi, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev, pager.as_deref_mut())?;
+                        // LATE join of unit t-1 (the other lane) AFTER this unit's chain + route + prep were issued and
+                        // BEFORE its MoE: the late pass runs on `ie.compute` right behind MoE(t-1), its reads had route(t-1)
+                        // .. here, and the dGPU / box 2 already hold unit t's work (review r3 #1).
+                        if late_pend[other].as_ref().is_some_and(|(tp, _)| tp + 1 == t) {
+                            let (tp, cp) = late_pend[other].take().expect("checked");
+                            let (lp, _) = sch::task(tp, a, u_count);
+                            let pg = pager.as_deref_mut().ok_or_else(|| eyre!("late join without a pager"))?;
+                            self.late_join_unit(cp, bdo, bio, sd, si, &weights.dgpu_layers[lp], &weights.igpu_layers[lp], &self.sync_events_lane(other).layers[lp], pg, tk)?;
+                        }
                         self.pre_moe_launch(&mut c, bd, bi, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev, pager.as_deref_mut())?;
                         if !c.late.is_empty() {
                             late_pend[lane] = Some((t, c));
@@ -1927,8 +1942,9 @@ impl HeterogeneousEngine {
                     if late_pend[lane].as_ref().is_some_and(|(tp, _)| *tp == t) {
                         let (_, cp) = late_pend[lane].take().expect("checked");
                         let pg = pager.as_deref_mut().ok_or_else(|| eyre!("late join without a pager"))?;
+                        let tk = pg.tick();
                         let (bdo, bio) = &mut lanes[lane];
-                        self.late_join_unit(cp, bdo, bio, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], &self.sync_events_lane(lane).layers[l], pg)?;
+                        self.late_join_unit(cp, bdo, bio, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], &self.sync_events_lane(lane).layers[l], pg, tk)?;
                     }
                     let hot = prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], &*lanes[0].0, sd);
                     let (bd, _bi) = &mut lanes[lane];
@@ -5469,18 +5485,20 @@ impl HeterogeneousEngine {
         ilw: &IgpuLayerWeights,
         sev: &super::engine::LayerSyncEvents,
         pg: &mut super::expert_pager::ExpertPager,
+        call_tick: u64,
     ) -> eyre::Result<()> {
         let (layer, b, cs_n_embd, cs_n_used) = (c.layer, c.b, c.cs_n_embd, c.cs_n_used);
         let late = std::mem::take(&mut c.late);
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
-        let landed = pg.late_join(layer, &late, pg.tick(), &ie.compute)?;
+        let landed = pg.late_join(layer, &late, call_tick, &ie.compute)?;
         if landed.len() != late.len() || landed.iter().zip(&late).any(|(a, &e)| a.0 != e || pg.resident_slot(layer, e) != Some(a.1)) {
             return Err(eyre!("L{layer}: late join landed {landed:?} for {late:?} (three-way exactly-once)"));
         }
         pg.late_remap_upload(c.lane, &landed, &ie.compute)?;
         let n = (b as usize) * cs_n_embd;
         if bi.late_moe.as_ref().is_none_or(|x| x.len() < bi.ffn_moe.len()) {
+            // Normally allocated at the pass start (review r3 #9); grown here only if the lane grew.
             bi.late_moe = Some(v4flash_hip::DeviceBuffer::new(self.igpu.device.id, bi.ffn_moe.len())?);
         }
         // The late pass: the unit's launch body again, its output swapped into `ffn_moe`'s place.
@@ -5498,6 +5516,7 @@ impl HeterogeneousEngine {
         self.moe_push_tail(bd, bi, sev, b, cs_n_embd)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_layer_pre_moe_v2(
         &self,
         bd: &mut BatchDgpuScratch,
@@ -11216,6 +11235,11 @@ impl HeterogeneousEngine {
                             pg.remap(),
                             Some(excl),
                         )?;
+                }
+                // LATE ids need the exclusion above; without it they keep the self-map entry and would be computed
+                // from whatever expert that slot holds (review r3 #10).
+                if !late.is_empty() && !(remote_split_on && !owns_eff.is_empty()) {
+                    return Err(eyre!("L{layer}: {} late ids but no exclusion pass (remote split off?)", late.len()));
                 }
                 // ONE stream-ordered remap upload for the whole ensure+exclusion
                 // block -- AFTER the exclusion, which is the last mutator here --
