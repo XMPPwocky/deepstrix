@@ -244,13 +244,15 @@ mod tests {
         // read once per decode step into `het::lookahead::Cfg`), the cache
         // prior's protect count (an uncaptured kernel scalar), and the hot
         // split's placement knobs (read at each hot-set refresh; the holder
-        // switch per route).
+        // switch, the replicated leg and its cost model per route).
         let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
         live.sort();
         assert_eq!(live, [
             "V41_B1_HOT_B2HEAD", "V41_B1_HOT_HOLDER", "V41_B1_HOT_IL_HYST", "V41_B1_HOT_IL_PER_LAYER", "V41_B1_HOT_KEEP_PREFILL",
+            "V41_B1_HOT_LEG_IG0", "V41_B1_HOT_LEG_IG_B", "V41_B1_HOT_LEG_IG_D", "V41_B1_HOT_LEG_IG_N", "V41_B1_HOT_LEG_LINK_ADD_US",
+            "V41_B1_HOT_LEG_OPEN_MS", "V41_B1_HOT_LEG_S0_US", "V41_B1_HOT_LEG_SB_US", "V41_B1_HOT_LEG_SD_US",
             "V41_B1_HOT_MAX_CHANGE", "V41_B1_HOT_MOVES", "V41_B1_HOT_POLICY", "V41_B1_HOT_PREWARM_STEP", "V41_B1_HOT_REP",
-            "V41_B1_HOT_REP_HYST", "V41_B1_HOT_TARGET", "V41_B1_HOT_TOL",
+            "V41_B1_HOT_REP_HYST", "V41_B1_HOT_REP_LEG", "V41_B1_HOT_TARGET", "V41_B1_HOT_TOL",
             "V41_B2_MISS_PREFETCH", "V41_B2_MISS_PREFETCH_CAP", "V41_B2_MISS_PREFETCH_MARGIN", "V41_B2_MISS_PREFETCH_MAX_PER_LL_X10",
             "V41_B2_MISS_PREFETCH_MAX_WORDS_STEP", "V41_B2_MISS_PREFETCH_RANK", "V41_B2_NURSERY_PRIOR", "V41_B2_PIN_PREFILL_BAND",
             "V41_B2_SOFT_HINT", "V41_B2_SOFT_MAP", "V41_B2_SOFT_PRIOR", "V41_B2_SPEC_BUDGET", "V41_DGPU_COMBINE3", "V41_DGPU_ENGRAM_ASYNC", "V41_DGPU_ROUTER_X2", "V41_DGPU_ZC_MULTI_SPEC", "V41_DGPU_ZC_PUSH",

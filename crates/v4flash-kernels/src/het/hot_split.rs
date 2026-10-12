@@ -341,6 +341,63 @@ pub fn choose_legs(c: &LegCosts, b: usize, rep: &[(u32, u32)], mut n1: usize, mu
     out
 }
 
+/// The leg of a replicated pick (`V41_B1_HOT_REP_LEG`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepLeg {
+    /// The faster leg (`choose_legs`) among the boxes that hold it.
+    Cost,
+    Box1,
+    Box2,
+}
+
+/// One replicated distinct id of a lane-layer: expert, picks in the lane-layer,
+/// box 1 holds it resident, box 2 holds it pinned.
+#[derive(Clone, Copy, Debug)]
+pub struct RepPick {
+    pub e: u32,
+    pub picks: u32,
+    pub b1_has: bool,
+    pub b2_held: bool,
+}
+
+/// D3.1 for one decode lane-layer: per entry of `rep` (in its order), true =
+/// box 2. `Box1` / `Box2` pin the leg (a function of STATE only: the gate
+/// arms). `Cost`: an id only one box holds goes to that box (no read on either
+/// side); one neither holds goes to box 1, its home (`partition_box2` is false
+/// for `Rep`: the route reads it as today); the ids both hold go by
+/// `choose_legs` on top of the box-1 / box-2 picks already assigned (`n1/d1`,
+/// `n2/d2`) and the single-holder ones.
+pub fn rep_legs(c: &LegCosts, leg: RepLeg, b: usize, rep: &[RepPick], mut n1: usize, mut d1: usize, mut n2: usize, mut d2: usize) -> Vec<bool> {
+    match leg {
+        RepLeg::Box1 => return vec![false; rep.len()],
+        RepLeg::Box2 => return vec![true; rep.len()],
+        RepLeg::Cost => {}
+    }
+    let mut out = vec![false; rep.len()];
+    let mut both: Vec<usize> = Vec::new();
+    for (i, r) in rep.iter().enumerate() {
+        match (r.b1_has, r.b2_held) {
+            (true, true) => both.push(i),
+            (false, true) => {
+                out[i] = true;
+                n2 += r.picks as usize;
+                d2 += 1;
+            }
+            _ => {
+                n1 += r.picks as usize;
+                d1 += 1;
+            }
+        }
+    }
+    if !both.is_empty() {
+        let pairs: Vec<(u32, u32)> = both.iter().map(|&i| (rep[i].e, rep[i].picks)).collect();
+        for (k, on2) in choose_legs(c, b, &pairs, n1, d1, n2, d2).into_iter().enumerate() {
+            out[both[k]] = on2;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +558,32 @@ mod tests {
         let w = choose_legs(&c, 4, &[(2, 2), (1, 3)], 20, 14, 4, 2);
         assert_eq!(v[0], w[1]);
         assert_eq!(v[1], w[0]);
+    }
+
+    /// `rep_legs`: pinned legs ignore residency; under `cost` a single holder
+    /// serves, an id nobody holds goes home (box 1), and the ids both hold go
+    /// by the cost model with the single-holder ones already counted.
+    #[test]
+    fn rep_leg_rules() {
+        let c = LegCosts::default();
+        let rp = |e, picks, b1_has, b2_held| RepPick { e, picks, b1_has, b2_held };
+        let mixed = [rp(1, 3, true, false), rp(2, 1, false, true), rp(3, 2, false, false)];
+        assert_eq!(rep_legs(&c, RepLeg::Box1, 4, &mixed, 20, 14, 4, 2), vec![false; 3]);
+        assert_eq!(rep_legs(&c, RepLeg::Box2, 4, &mixed, 20, 14, 4, 2), vec![true; 3]);
+        assert_eq!(rep_legs(&c, RepLeg::Cost, 4, &mixed, 20, 14, 4, 2), vec![false, true, false]);
+        // Both hold: the same answer as `choose_legs` on the same totals.
+        let both = [rp(1, 3, true, true), rp(2, 2, true, true)];
+        let want = choose_legs(&c, 4, &[(1, 3), (2, 2)], 20, 14, 4, 2);
+        assert_eq!(rep_legs(&c, RepLeg::Cost, 4, &both, 20, 14, 4, 2), want);
+        // A single-holder id on box 2 opens the leg, so the both-held ids no
+        // longer pay OPEN: at one row with an idle box 2 the both-held id stays
+        // local alone, but may go once box 2 is open anyway.
+        let alone = [rp(5, 1, true, true)];
+        assert_eq!(rep_legs(&c, RepLeg::Cost, 1, &alone, 1, 1, 0, 0), vec![false]);
+        let opened = [rp(5, 1, true, true), rp(6, 1, false, true)];
+        let v = rep_legs(&c, RepLeg::Cost, 1, &opened, 1, 1, 0, 0);
+        assert!(v[1], "box 2 is the only holder of 6");
+        assert_eq!(v[0], choose_legs(&c, 1, &[(5, 1)], 1, 1, 1, 1)[0]);
     }
 
     #[test]
