@@ -1970,6 +1970,10 @@ pub struct MtpExit {
     /// The threshold top-M select (`launch_batched` with no bitmap): `[1]` n = N_VOCAB, `[1]` done.
     sel_n: DeviceBuffer<u32>,
     sel_done: DeviceBuffer<u32>,
+    /// The radix top-M (`MtpMarkov::launch_topm_radix`): histogram, state (both zeroed once), candidates.
+    rx_hist: DeviceBuffer<u32>,
+    rx_state: DeviceBuffer<u32>,
+    rx_cand: DeviceBuffer<u64>,
 }
 
 /// Device-markov drafts whose host re-draw (`draft_dist` on the same top-M) picked another token:
@@ -2018,6 +2022,17 @@ impl MtpExit {
                 d
             },
             sel_done: DeviceBuffer::new(device_id, 1)?,
+            rx_hist: {
+                let mut d = DeviceBuffer::new(device_id, crate::mtp_markov::RX_HIST_LEN)?;
+                d.copy_from_host(&vec![0u32; crate::mtp_markov::RX_HIST_LEN])?;
+                d
+            },
+            rx_state: {
+                let mut d = DeviceBuffer::new(device_id, crate::mtp_markov::RX_STATE)?;
+                d.copy_from_host(&vec![0u32; crate::mtp_markov::RX_STATE])?;
+                d
+            },
+            rx_cand: DeviceBuffer::new(device_id, 64)?,
         })
     }
 
@@ -2086,14 +2101,14 @@ impl MtpExit {
                     let m = ds.m as u32;
                     let lv = self.logits.slice_view(i * nv, nv);
                     {
-                        // The top-M by the threshold select (`launch_batched`, no bitmap, `done`): the
-                        // same selection and order as the bitonic chain (`better` = score desc, ties to
-                        // the lower id), one O(n) select instead of 32 chunk sorts + a merge; a row it
-                        // cannot bracket (done = 0) falls through to the chain in the same call.
+                        // The top-M by radix select (`launch_topm_radix`): the bitonic chain's selection
+                        // and order (score desc, ties to the lower id) with FIXED work -- 3 histogram passes +
+                        // a compaction. The threshold select it replaces (same result) re-scanned the row
+                        // a data-dependent number of times and its tail blew up under dGPU contention
+                        // (tests/topk_select_vocab.rs: p90 0.5-3.8 ms vs the radix 0.13-0.78).
                         let mut sel = self.topk_sel_all.slice_view_mut(i * mm, mm);
-                        e.indexer_topk_bitonic.launch_batched(
-                            s, &mut sel, None, &mut self.topk_scratch, &lv, &self.sel_n, N_VOCAB, N_VOCAB, 0, m, 1,
-                            Some(&mut self.sel_done),
+                        e.mtp_markov.launch_topm_radix(
+                            s, &mut sel, &mut self.rx_hist, &mut self.rx_state, &mut self.rx_cand, &lv, N_VOCAB, m,
                         )?;
                     }
                     let sel = self.topk_sel_all.slice_view(i * mm, mm);
@@ -2443,6 +2458,11 @@ impl MtpExit {
             let lv = self.logits.slice_view(0, nv);
             let mut sel = self.topk_sel_all.slice_view_mut(0, mm);
             e.indexer_topk_bitonic.launch_batched(s, &mut sel, None, &mut self.topk_scratch, &lv, &self.sel_n, N_VOCAB, N_VOCAB, 0, mm as u32, 1, Some(&mut self.sel_done))
+        })?;
+        time("top-M radix (V, 64)", &mut || {
+            let lv = self.logits.slice_view(0, nv);
+            let mut sel = self.topk_sel_all.slice_view_mut(0, mm);
+            e.mtp_markov.launch_topm_radix(s, &mut sel, &mut self.rx_hist, &mut self.rx_state, &mut self.rx_cand, &lv, N_VOCAB, mm as u32)
         })?;
         time("top-M bitonic (V, M=64)", &mut || {
             let lv = self.logits.slice_view(0, nv);
