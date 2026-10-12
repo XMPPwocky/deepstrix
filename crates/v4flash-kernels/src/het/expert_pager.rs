@@ -332,6 +332,12 @@ struct LateReader {
     fallback: u64,
     owned_evict: u64,
     join_wait_ns: u64,
+    /// Per LANE: the late pass's PRIVATE remap (late id -> -(slot+1), every other id 0), its pinned upload stage and
+    /// the event of its last upload (the stage is rewritten only after it). Never the shared `remap` / `remap_dev`,
+    /// which every `ensure` rebuilds (design rev 3, 2.2 step 2).
+    remap_dev: [DeviceBuffer<i32>; 2],
+    remap_stage: [PinnedBuffer<i32>; 2],
+    remap_ev: [Option<Event>; 2],
 }
 
 pub struct ExpertPager {
@@ -3829,9 +3835,15 @@ impl ExpertPager {
             })?;
         }
         eprintln!("expert pager: box-1 LATE reads ON ({readers} readers, {stages} stages of {:.1} MB pinned)", sizes.iter().sum::<usize>() as f64 / 1e6);
+        let remap_dev = {
+            let _dev = self.device.scoped_current()?;
+            [DeviceBuffer::<i32>::new(self.device.id, N_EXPERT as usize)?, DeviceBuffer::<i32>::new(self.device.id, N_EXPERT as usize)?]
+        };
+        let remap_stage = [PinnedBuffer::<i32>::new(N_EXPERT as usize)?, PinnedBuffer::<i32>::new(N_EXPERT as usize)?];
         self.late = Some(LateReader {
             queue, rx, free, inflight: Default::default(), done: HashMap::new(), busy: Default::default(), spare_events: Vec::new(), sizes,
             queued: 0, refused: 0, landed: 0, resident: 0, fallback: 0, owned_evict: 0, join_wait_ns: 0,
+            remap_dev, remap_stage, remap_ev: [None, None],
         });
         Ok(())
     }
@@ -4058,6 +4070,35 @@ impl ExpertPager {
     /// (queued, refused, landed, resident at join, fallback, owned evictions, join wait ms) since start.
     pub fn late_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
         self.late.as_ref().map(|l| (l.queued, l.refused, l.landed, l.resident, l.fallback, l.owned_evict, l.join_wait_ns / 1_000_000))
+    }
+
+    /// Upload lane `lane`'s PRIVATE late remap for `landed` (id, slot) on `stream`: every id 0 (not this pass's), each
+    /// landed id `-(slot+1)` (the het-split builder's "ours at slot"). Stream-ordered; the pinned stage is reused only
+    /// after its previous upload's event.
+    pub fn late_remap_upload(&mut self, lane: usize, landed: &[(u32, u32)], stream: &Stream) -> eyre::Result<()> {
+        let dev = self.device.scoped_current()?;
+        let l = self.late.as_mut().ok_or_else(|| eyre!("late reads off"))?;
+        let lane = lane & 1;
+        if let Some(ev) = l.remap_ev[lane].as_ref() {
+            ev.synchronize()?;
+        }
+        let st = l.remap_stage[lane].as_mut_slice();
+        st.fill(0);
+        for &(e, slot) in landed {
+            st[e as usize] = -(slot as i32) - 1;
+        }
+        l.remap_dev[lane].copy_from_host_async(l.remap_stage[lane].as_slice(), stream)?;
+        if l.remap_ev[lane].is_none() {
+            l.remap_ev[lane] = Some(Event::new_no_timing()?);
+        }
+        l.remap_ev[lane].as_ref().expect("set").record(stream)?;
+        drop(dev);
+        Ok(())
+    }
+
+    /// Lane `lane`'s private late remap (the late pass hands it to the dispatch instead of `remap_dev(layer)`).
+    pub fn late_remap_dev(&self, lane: usize) -> Option<&DeviceBuffer<i32>> {
+        self.late.as_ref().map(|l| &l.remap_dev[lane & 1])
     }
 
     /// Free stages now (tests, logs).

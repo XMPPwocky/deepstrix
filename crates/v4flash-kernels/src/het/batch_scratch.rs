@@ -952,6 +952,9 @@ pub struct BatchIgpuScratch {
     /// (`V41_REMOTE_ADDR`), like the `remote_xq_lane` it receives.
     pub xq_recv: Option<DeviceBuffer<u8>>,
     pub ffn_moe: DeviceBuffer<f32>,
+    /// Box-1 LATE prefill reads (docs/v41/PREFILL_COLD_ASYNC_DESIGN.md): the late MoE pass's output, swapped in for
+    /// `ffn_moe` while it runs, then added onto it. Allocated on first use, like `ffn_moe`.
+    pub late_moe: Option<DeviceBuffer<f32>>,
     pub d_selected: DeviceBuffer<i32>,
     pub d_ew: DeviceBuffer<f32>,
     /// By-expert MoE: per-expert pick count built by the group_builder
@@ -1040,6 +1043,7 @@ impl BatchIgpuScratch {
                 None
             },
             ffn_moe: DeviceBuffer::new(id, b * N_EMBD as usize)?,
+            late_moe: None,
             d_selected: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,
             d_ew: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,
             group_count: DeviceBuffer::new(id, N_EXPERT as usize)?,

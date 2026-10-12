@@ -1788,6 +1788,12 @@ impl HeterogeneousEngine {
             self.igpu.compute.synchronize()?;
         }
         let _pin_pass = PinPass::enter(pin);
+        let late_on = pin && crate::knobs::PREFILL_COLD_ASYNC.on() && !hot_prefill_enabled() && pager.as_deref().is_some_and(|p| p.late_on());
+        LATE_PASS.store(late_on, std::sync::atomic::Ordering::Relaxed);
+        for a in LATE_SPENT.iter() {
+            a.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut late_pend: [Option<(usize, PreMoeCarry)>; 2] = [None, None];
 
         let mut exec = |op: sch::Op| -> eyre::Result<()> {
             match op {
@@ -1795,6 +1801,15 @@ impl HeterogeneousEngine {
                     let (l, u) = sch::task(t, a, u_count);
                     let un = units[u];
                     let lane = t % 2;
+                    // LATE join of unit t-1 (the other lane) before anything of unit t is issued (design rev 3, 1).
+                    let other = 1 - lane;
+                    if late_pend[other].as_ref().is_some_and(|(tp, _)| tp + 1 == t) {
+                        let (tp, cp) = late_pend[other].take().expect("checked");
+                        let (lp, _) = sch::task(tp, a, u_count);
+                        let pg = pager.as_deref_mut().ok_or_else(|| eyre!("late join without a pager"))?;
+                        let (bdo, bio) = &mut lanes[other];
+                        self.late_join_unit(cp, bdo, bio, sd, si, &weights.dgpu_layers[lp], &weights.igpu_layers[lp], &self.sync_events_lane(other).layers[lp], pg)?;
+                    }
                     let (bd, bi) = &mut lanes[lane];
                     check_scratch_rows("layer-outer lane unit", un.rows, bd, bi, sd, si)?;
                     // Compressor lending (reuse layers borrow their KV source's store): once per layer, around its pres.
@@ -1874,13 +1889,21 @@ impl HeterogeneousEngine {
                         }
                     }
                     let tokens_u = &job_tokens[un.tok0..un.tok0 + un.rows];
-                    self.forward_layer_pre_moe_v2(
-                        bd, bi, sd, si,
-                        &mut state.layers[l], &weights.dgpu_layers[l], &weights.igpu_layers[l],
-                        pos0_u, tokens_u, vis.as_deref(), None,
-                        &self.sync_events_lane(lane).layers[l],
-                        pager.as_deref_mut(), mode_of(l), RowLayout::Contiguous,
-                    )?;
+                    {
+                        // The four phases of `forward_layer_pre_moe_v2`, keeping the carry: a unit with LATE ids parks it
+                        // for its join at the start of the next unit (design rev 3, 1).
+                        let sev = &self.sync_events_lane(lane).layers[l];
+                        let rows = RowLayout::Contiguous;
+                        let mut c = self.pre_moe_chain(bd, bi, sd, si, &mut state.layers[l], &weights.dgpu_layers[l], &weights.igpu_layers[l],
+                            pos0_u, tokens_u, vis.as_deref(), None, sev, pager.as_deref_mut(), mode_of(l), &rows)?;
+                        c.lane = lane;
+                        self.pre_moe_route(&mut c, bd, sd, sev, pager.as_deref_mut(), &rows)?;
+                        self.pre_moe_prep(&mut c, bd, bi, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev, pager.as_deref_mut())?;
+                        self.pre_moe_launch(&mut c, bd, bi, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev, pager.as_deref_mut())?;
+                        if !c.late.is_empty() {
+                            late_pend[lane] = Some((t, c));
+                        }
+                    }
                     // -- an index source publishes its selection: remember the flag and the selection for the reuse layers --
                     if is_src && l < split {
                         saved[u] = bd.indexer_saved_store;
@@ -1900,6 +1923,13 @@ impl HeterogeneousEngine {
                     let (l, u) = sch::task(t, a, u_count);
                     let un = units[u];
                     let lane = t % 2;
+                    // A unit whose next unit never came (the pass's last task): its LATE join runs here.
+                    if late_pend[lane].as_ref().is_some_and(|(tp, _)| *tp == t) {
+                        let (_, cp) = late_pend[lane].take().expect("checked");
+                        let pg = pager.as_deref_mut().ok_or_else(|| eyre!("late join without a pager"))?;
+                        let (bdo, bio) = &mut lanes[lane];
+                        self.late_join_unit(cp, bdo, bio, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], &self.sync_events_lane(lane).layers[l], pg)?;
+                    }
                     let hot = prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], &*lanes[0].0, sd);
                     let (bd, _bi) = &mut lanes[lane];
                     self.forward_layer_post_moe_v2(bd, un.rows as u32, &self.sync_events_lane(lane).layers[l], hot)?;
@@ -1919,6 +1949,15 @@ impl HeterogeneousEngine {
             }
         }
         drop(exec);
+        if late_pass() {
+            LATE_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(pg) = pager.as_deref_mut() {
+                let r = pg.late_cancel_all();
+                if result.is_ok() {
+                    result = r;
+                }
+            }
+        }
         if pin_pass() {
             // Every pinned dispatch done before the pins go away (a decode step's ensure must not see stale pins).
             if let Some(pg) = pager.as_deref_mut() {
@@ -4429,7 +4468,7 @@ impl RbLayout {
 /// (`pre_moe_chain` -> `pre_moe_route` -> `pre_moe_prep` -> `pre_moe_launch`).
 /// Owned values only: no phase borrows the pager or the weights across a phase
 /// boundary, so the driver can interleave the other lane's phases in between.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PreMoeCarry {
     phase: PreMoePhase,
     pub layer: i32,
@@ -4499,6 +4538,13 @@ pub struct PreMoeCarry {
     hot_active: bool,
     max_per_expert: u32,
     chunk_size: u32,
+    /// Box-1 LATE cold picks of this unit (`late_pass()`): read in the background, excluded from this unit's MoE and
+    /// from box 2's request, computed by the late pass joined at the start of the next unit (design rev 3).
+    late: Vec<u32>,
+    /// This launch IS the late pass (private remap of `lane`, no push, pins `ids` = the late ids).
+    late_mode: bool,
+    /// The lane this unit runs on (selects the private late remap).
+    lane: usize,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -5407,6 +5453,51 @@ impl HeterogeneousEngine {
     /// `sd` / `si` buffer is dead (last read on de.compute / ie.compute
     /// in program order) by the time this returns.
     #[allow(clippy::too_many_arguments)]
+    /// The LATE join of a unit (design rev 3, 2.2), at the start of the next unit (or in its own Post for the last task):
+    /// land its late reads, upload the lane's private remap, run the late MoE pass (the unit's own launch body over the
+    /// real selection, `split_cap = N_EXPERT_USED`, into `bi.late_moe`), add it into `bi.ffn_moe`, then the deferred
+    /// push. `c` is the unit's carry after its launch.
+    #[allow(clippy::too_many_arguments)]
+    fn late_join_unit(
+        &self,
+        mut c: PreMoeCarry,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        sev: &super::engine::LayerSyncEvents,
+        pg: &mut super::expert_pager::ExpertPager,
+    ) -> eyre::Result<()> {
+        let (layer, b, cs_n_embd, cs_n_used) = (c.layer, c.b, c.cs_n_embd, c.cs_n_used);
+        let late = std::mem::take(&mut c.late);
+        self.set_current_cached(self.igpu.device)?;
+        let ie = &self.igpu;
+        let landed = pg.late_join(layer, &late, pg.tick(), &ie.compute)?;
+        if landed.len() != late.len() || landed.iter().zip(&late).any(|(a, &e)| a.0 != e || pg.resident_slot(layer, e) != Some(a.1)) {
+            return Err(eyre!("L{layer}: late join landed {landed:?} for {late:?} (three-way exactly-once)"));
+        }
+        pg.late_remap_upload(c.lane, &landed, &ie.compute)?;
+        let n = (b as usize) * cs_n_embd;
+        if bi.late_moe.as_ref().is_none_or(|x| x.len() < bi.ffn_moe.len()) {
+            bi.late_moe = Some(v4flash_hip::DeviceBuffer::new(self.igpu.device.id, bi.ffn_moe.len())?);
+        }
+        // The late pass: the unit's launch body again, its output swapped into `ffn_moe`'s place.
+        std::mem::swap(&mut bi.ffn_moe, bi.late_moe.as_mut().expect("allocated"));
+        c.phase = PreMoePhase::Prepped;
+        c.late_mode = true;
+        c.split_cap = cs_n_used as u32;
+        c.ids = late.clone();
+        let r = self.pre_moe_launch(&mut c, bd, bi, sd, si, dlw, ilw, sev, Some(pg));
+        std::mem::swap(&mut bi.ffn_moe, bi.late_moe.as_mut().expect("allocated"));
+        r?;
+        self.set_current_cached(self.igpu.device)?;
+        let ie = &self.igpu;
+        ie.vec_add.launch(&ie.compute, &mut bi.ffn_moe, bi.late_moe.as_ref().expect("allocated"), n as u32)?;
+        self.moe_push_tail(bd, bi, sev, b, cs_n_embd)
+    }
+
     pub fn forward_layer_pre_moe_v2(
         &self,
         bd: &mut BatchDgpuScratch,
@@ -10343,7 +10434,41 @@ impl HeterogeneousEngine {
                         ids.push(sv as u32);
                     }
                 }
-                if cold_route {
+                if cold_route && late_pass() && sparse_resid_layer {
+                    // LATE (`V41_PREFILL_COLD_ASYNC`, design rev 3, 2.1): a cold pick already being read late (the
+                    // registry) joins this unit's late set with no new read; of the rest, `cold_b1_take` (within the
+                    // layer's budget) are queued to box 1's background readers -- a refused one (no free stage) stays
+                    // box 2's. Late ids are in neither `ids` nor `extra_remote`: the late pass computes them.
+                    let mut late: Vec<u32> = Vec::new();
+                    let mut rest: Vec<u32> = Vec::new();
+                    for &e in &cold_pend {
+                        if pg.late_inflight(layer as i32, e) {
+                            late.push(e);
+                        } else {
+                            rest.push(e);
+                        }
+                    }
+                    let shared = late.len();
+                    let k = super::prefill_split::cold_b1_take(
+                        rest.len(),
+                        crate::knobs::PREFILL_COLD_B1_FRAC.f64(),
+                        crate::knobs::PREFILL_COLD_B1_MAX.usize(),
+                    )
+                    .min(late_budget_left(layer as usize));
+                    let took = pg.late_read(layer as i32, &rest[..k])?;
+                    if let Some(a) = LATE_SPENT.get(layer as usize) {
+                        a.fetch_add(took.len() as u32, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    for &e in &rest {
+                        if !took.contains(&e) {
+                            extra_remote[e as usize] = true;
+                        }
+                    }
+                    super::prefill_split::note_cold(cold_free, 0, (rest.len() - took.len()) as u64);
+                    super::prefill_split::note_late(shared as u64, took.len() as u64, (k - took.len()) as u64);
+                    late.extend_from_slice(&took);
+                    c.late = late;
+                } else if cold_route {
                     // The first `cold_b1_take` cold picks (pick order) are read and computed on box 1 (`b1_page_misses`:
                     // `ensure` reads them with its concurrent readers), the rest stay box 2's, so both drives read.
                     let k = super::prefill_split::cold_b1_take(
@@ -10873,7 +10998,7 @@ impl HeterogeneousEngine {
         let PreMoeCarry {
             layer, b, cs_n_used, cs_n_embd, dump_pos, cap_ok, defer_shared, remote_split_on, split_cap,
             sparse_resid_layer, moe_group_bound, replay_offload, sparse_resid, mc0, drain_before_ensure, owns_remote_some,
-            ref mut ids, ref owns_eff, ref sel_host_remote, ref sel_host_audit, ..
+            ref mut ids, ref owns_eff, ref sel_host_remote, ref sel_host_audit, ref late, ..
         } = *c;
         let de = &self.dgpu;
         self.set_current_cached(self.dgpu.device)?;
@@ -11057,10 +11182,24 @@ impl HeterogeneousEngine {
                         // only TOUCHES the remote entries and leaves the LRU slots
                         // that `ensure` just assigned intact.
                         let _t_excl = LayerHostTimer::start(&LH_EXCL);
+                        // LATE ids (design rev 3, 2.1 / r2 #1): `ensure` reset the remap to the self-map, so the main
+                        // pass must exclude them like box 2's -- the late pass computes them. Three-way exactly-once:
+                        // a late id is neither box 2's nor in this pass's `ids`.
+                        let mut excl_v: Vec<bool> = Vec::new();
+                        if !late.is_empty() {
+                            excl_v = owns_eff.clone();
+                            for &e in late.iter() {
+                                if owns_eff[e as usize] || ids.contains(&e) {
+                                    return Err(eyre!("L{layer}: late expert {e} is also box 2's or in the main pass (three-way exactly-once)"));
+                                }
+                                excl_v[e as usize] = true;
+                            }
+                        }
+                        let excl: &[bool] = if late.is_empty() { &owns_eff[..] } else { &excl_v[..] };
                         if sparse_resid {
-                            pg.mark_remote_after_ensure(|e| owns_eff[e as usize])?;
+                            pg.mark_remote_after_ensure(|e| excl[e as usize])?;
                         } else {
-                            pg.set_remote_exclusion(layer as i32, |e| owns_eff[e as usize])?;
+                            pg.set_remote_exclusion(layer as i32, |e| excl[e as usize])?;
                         }
                         drop(_t_excl);
                         let _t_audit = LayerHostTimer::start(&LH_AUDIT);
@@ -11075,7 +11214,7 @@ impl HeterogeneousEngine {
                             layer as i32,
                             &sel_host_remote,
                             pg.remap(),
-                            Some(&owns_eff[..]),
+                            Some(excl),
                         )?;
                 }
                 // ONE stream-ordered remap upload for the whole ensure+exclusion
@@ -11468,7 +11607,14 @@ impl HeterogeneousEngine {
                 // error and plausible-looking output. Passing it unconditionally is
                 // a no-op today (mode 0 with an all-local remap is arithmetically
                 // identical to the plain builder) and the precondition for packing.
-                (routed_view, Some(pg.remap_dev(layer as i32)), false)
+                // The LATE pass dispatches through its lane's PRIVATE remap (late id -> slot, all else 0), never the
+                // shared per-layer one (design rev 3, 2.2 step 2).
+                let rm = if c.late_mode {
+                    pg.late_remap_dev(c.lane).ok_or_else(|| eyre!("L{layer}: late pass without the late readers"))?
+                } else {
+                    pg.remap_dev(layer as i32)
+                };
+                (routed_view, Some(rm), false)
             }
             None => (&ilw.routed, ilw.hot_remap.as_ref(), ilw.igpu_packed),
         };
@@ -12283,15 +12429,37 @@ impl HeterogeneousEngine {
                 }
             }
         }
-        // Record MoE-done so the iGPU xfer can wait without a host sync.
-        sev.moe_done.record(&ie.compute)?;
-        ie.xfer.wait_event(&sev.moe_done)?;
         // `pin_pass()`: the slots this dispatch reads stay pinned until it completes (`ExpertPager::pin_inflight`).
+        // The late pass pins its late ids (`c.ids` is set to them).
         if pin_pass() {
             if let Some(pg) = pager {
                 pg.pin_inflight(layer as i32, &c.ids, &ie.compute)?;
             }
         }
+        // A unit with LATE ids defers moe_done + the push to its join (the late result is added into `ffn_moe` first);
+        // the late pass itself never pushes (its join does).
+        if c.late_mode || !c.late.is_empty() {
+            self.set_current_cached(self.dgpu.device)?;
+            return Ok(());
+        }
+        self.moe_push_tail(bd, bi, sev, b, cs_n_embd)
+    }
+
+    /// The end of a lane-layer's iGPU MoE: `moe_done`, the peer push of `bi.ffn_moe` into `bd.ffn_moe_recv`,
+    /// `moe_arrived` (what `forward_layer_post_moe_v2` waits on). Run by `pre_moe_launch`, or by the late join.
+    fn moe_push_tail(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        sev: &super::engine::LayerSyncEvents,
+        b: u32,
+        cs_n_embd: usize,
+    ) -> eyre::Result<()> {
+        self.set_current_cached(self.igpu.device)?;
+        let ie = &self.igpu;
+        // Record MoE-done so the iGPU xfer can wait without a host sync.
+        sev.moe_done.record(&ie.compute)?;
+        ie.xfer.wait_event(&sev.moe_done)?;
 
         // Single batched peer-push back of bi.ffn_moe[B*N_EMBD].
         let bi_ffn_view = bi.ffn_moe.slice_view(0, (b as usize) * cs_n_embd);
@@ -13041,6 +13209,21 @@ static PIN_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 pub fn pin_pass() -> bool {
     PIN_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `V41_PREFILL_COLD_ASYNC` for the running layer-outer pass (latched at its start; needs the pin pass, the late
+/// readers, and hot prefill off: the late pass dispatches through the pager's pool only).
+static LATE_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// NEW late reads spent per layer in the current pass (`V41_PREFILL_COLD_LATE_MAX_LAYER`).
+static LATE_SPENT: [std::sync::atomic::AtomicU32; N_LAYER as usize] = [const { std::sync::atomic::AtomicU32::new(0) }; N_LAYER as usize];
+
+pub fn late_pass() -> bool {
+    LATE_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn late_budget_left(layer: usize) -> usize {
+    let spent = LATE_SPENT.get(layer).map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed)) as usize;
+    crate::knobs::PREFILL_COLD_LATE_MAX_LAYER.usize().saturating_sub(spent)
 }
 
 /// Scope guard for [`pin_pass`]: cleared on drop however the pass ends.

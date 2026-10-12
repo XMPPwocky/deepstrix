@@ -267,6 +267,25 @@ pub fn note_cold(b1_free: u64, b1_read: u64, b2: u64) {
     COLD_B2.fetch_add(b2, Relaxed);
 }
 
+/// LATE cold picks (`V41_PREFILL_COLD_ASYNC`), cumulative: joined an in-flight read (no new read) / new late reads /
+/// refused for want of a free stage (left to box 2).
+static COLD_LATE_SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COLD_LATE_NEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COLD_LATE_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_late(shared: u64, new: u64, refused: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    COLD_LATE_SHARED.fetch_add(shared, Relaxed);
+    COLD_LATE_NEW.fetch_add(new, Relaxed);
+    COLD_LATE_REFUSED.fetch_add(refused, Relaxed);
+}
+
+/// (shared, new, refused) late cold picks, cumulative.
+pub fn late_totals() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (COLD_LATE_SHARED.load(Relaxed), COLD_LATE_NEW.load(Relaxed), COLD_LATE_REFUSED.load(Relaxed))
+}
+
 /// (box 1 already held, box-1 reads, box-2 reads) of the cold picks, cumulative.
 pub fn cold_totals() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;

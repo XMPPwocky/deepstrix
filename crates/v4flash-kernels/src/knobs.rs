@@ -978,6 +978,14 @@ crate::knobs! {
     /// `ensure` that pages no longer drains the other lane's iGPU MoE first (the drain stalled the whole two-lane
     /// pipeline on every box-1 miss). One iGPU sync at the pass start; all pins waited out at its end.
     pub static PREFILL_PIN_INFLIGHT = Knob::flag("V41_PREFILL_PIN_INFLIGHT", false).live();
+    /// `V41_PREFILL_COLD_ASYNC` (default off; live, read at each layer-outer pass): the `V41_PREFILL_COLD_B1` share of a
+    /// request's cold picks is read LATE on box 1 (background readers, docs/v41/PREFILL_COLD_ASYNC_DESIGN.md) and
+    /// computed by a late iGPU MoE pass joined at the start of the next unit, instead of a synchronous read in
+    /// `ensure`. Needs `V41_PREFILL_PIN_INFLIGHT` and the late readers (`V41_PREFILL_COLD_STAGES` > 0 at startup).
+    pub static PREFILL_COLD_ASYNC = Knob::flag("V41_PREFILL_COLD_ASYNC", false).live();
+    /// `V41_PREFILL_COLD_LATE_MAX_LAYER` (default 20; live): NEW late reads per layer per window (~ box 1's spare pool
+    /// slots per layer beyond decode's owned set).
+    pub static PREFILL_COLD_LATE_MAX_LAYER = Knob::int("V41_PREFILL_COLD_LATE_MAX_LAYER", 20, 0, 384).live();
 }
 
 #[cfg(test)]

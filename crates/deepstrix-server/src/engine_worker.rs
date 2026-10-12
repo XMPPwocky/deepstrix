@@ -1321,6 +1321,13 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         if v4flash_kernels::het::expert_pager::prefill_readahead() {
             pg.start_readahead(std::path::Path::new(&cfg.gguf_path))?;
         }
+        // Box-1 LATE prefill reads (`V41_PREFILL_COLD_ASYNC`, docs/v41/PREFILL_COLD_ASYNC_DESIGN.md): readers and pinned
+        // stages are static (`V41_PREFILL_COLD_READERS`, default 8; `V41_PREFILL_COLD_STAGES`, default 16 = ~300 MB
+        // pinned; 0 = none, the knob then has no effect).
+        {
+            let env_n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+            pg.start_late_reader(std::path::Path::new(&cfg.gguf_path), env_n("V41_PREFILL_COLD_READERS", 8), env_n("V41_PREFILL_COLD_STAGES", 16))?;
+        }
         tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "expert pager ready");
         Some(pg)
     } else {

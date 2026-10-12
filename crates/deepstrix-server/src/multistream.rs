@@ -1791,9 +1791,10 @@ impl Sched {
         }
         // `V41_PREFILL_COLD_B1` totals (cumulative): cold box-2 picks box 1 already held / read on box 1 / left to box 2.
         let (cold_b1_free, cold_b1_read, cold_b2) = v4flash_kernels::het::prefill_split::cold_totals();
+        let (cold_late_shared, cold_late_new, cold_late_refused) = v4flash_kernels::het::prefill_split::late_totals();
         tracing::info!(slot, prompt = pf.prefix.len(), restored = pf.prefix.len() - pf.job.total(), prefill_ms = pf.started.elapsed().as_millis() as u64,
             lm_windows = pf.job.lm_windows_run(), reserved = self.arena.reserved_positions(slot), live = self.streams.len() + 1,
-            cold_b1_free, cold_b1_read, cold_b2, "multistream: stream admitted");
+            cold_b1_free, cold_b1_read, cold_b2, cold_late_shared, cold_late_new, cold_late_refused, "multistream: stream admitted");
         self.streams.push(s);
         Ok(())
     }
