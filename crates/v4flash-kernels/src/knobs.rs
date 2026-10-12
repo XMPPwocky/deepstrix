@@ -862,6 +862,14 @@ crate::knobs! {
     /// `launch`) instead of 5 + 5 launches (tests/mtp_mhc_fast_bitexact.rs, router case). Live trace
     /// 10-12: router 0.44 + top-k 0.09 ms/draft of latency-bound iGPU time.
     pub static MTP_ROUTER_BATCHED = Knob::flag("V41_MTP_ROUTER_BATCHED", true).live();
+    /// `V41_MTP_DEVICE_MARKOV` (default on; live, read per draft): the DSpark exit's markov loop on the
+    /// dGPU with no host round trip per position -- each position gathers its markov row by the previous
+    /// draft's token from DEVICE memory (`mtp_markov_gather_f16`), and a sampled draft is drawn on the
+    /// device (`mtp_draft_draw` = `draft_dist`'s draw in f64); one sync and readback for all 5 positions.
+    /// The verifier's q is still `draft_dist` on the host from the same top-M, and the host re-draws
+    /// to check the device (`MARKOV_DRAW_MISMATCH`). Live trace 10-12: the loop was ~2 of the exit's
+    /// 3.2 ms/draft, mostly 5 sync + readback round trips. Needs the markov table on the dGPU (66 MB).
+    pub static MTP_DEVICE_MARKOV = Knob::flag("V41_MTP_DEVICE_MARKOV", true).live();
     /// `V41_MS_GRAPHS` (default on; live since 2026-10-10, read at each arena stage's start):
     /// `forward_prefill::ms_graphs` -- the arena stage graphs; off = direct launches. Step 0c
     /// (tests/bench_graph_replay.rs) measured ~6.5 us of device time per graph replay vs < 1 us of

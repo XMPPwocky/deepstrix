@@ -150,6 +150,8 @@ pub struct DeviceEngine {
     pub mhc_pre_fused: crate::MhcPreFused,
     /// Arena mHC mixes in 1 bit-identical launch per sub-block (`V41_MHC_ARENA_FUSED`).
     pub mhc_arena: crate::MhcArena,
+    /// The DSpark exit's device-side markov loop (`V41_MTP_DEVICE_MARKOV`).
+    pub mtp_markov: crate::mtp_markov::MtpMarkov,
     /// Router readback pack: host-bound router outputs into pinned memory (`V41_RB_PACK`).
     pub rb_pack: crate::ReadbackPack,
     /// Attention per-row metadata as one kernel-argument launch (`V41_ATTN_META_FILL`).
@@ -263,6 +265,7 @@ impl DeviceEngine {
             hc_sinkhorn: HcSinkhorn::for_arch(arch)?,
             mhc_pre_fused: crate::MhcPreFused::for_arch(arch)?,
             mhc_arena: crate::MhcArena::for_arch(arch)?,
+            mtp_markov: crate::mtp_markov::MtpMarkov::for_arch(arch)?,
             rb_pack: crate::ReadbackPack::for_arch(arch)?,
             attn_meta: crate::attn_meta::AttnMetaFill::for_arch(arch)?,
             attn_dec: crate::attention_dec::AttentionDec::for_arch(arch)?,

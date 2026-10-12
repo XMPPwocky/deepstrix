@@ -1955,7 +1955,23 @@ pub struct MtpExit {
     topk_bits: DeviceBuffer<u32>,
     topk_scratch: DeviceBuffer<u32>,
     cand: DeviceBuffer<f32>,
+    /// `V41_MTP_DEVICE_MARKOV`: `[B + 1]` tokens on the device -- `[0]` the token drafted from, `[i + 1]`
+    /// position i's draft (the next position's markov gather reads it); the per-position top-M ids and
+    /// logits (`[B, MTP_DRAFT_TOP_M]`), read back once after the loop; the markov table (f16 bits,
+    /// `[N_VOCAB, MTP_MARKOV_RANK]`), uploaded on first use.
+    device_id: i32,
+    toks: DeviceBuffer<i32>,
+    topk_sel_all: DeviceBuffer<i32>,
+    cand_all: DeviceBuffer<f32>,
+    markov_dev: Option<DeviceBuffer<u16>>,
+    /// The multi-WG argmax's partials (`[ARGMAX_WG]`).
+    am_v: DeviceBuffer<f32>,
+    am_i: DeviceBuffer<i32>,
 }
+
+/// Device-markov drafts whose host re-draw (`draft_dist` on the same top-M) picked another token:
+/// only possible when `u` lands within an ulp of a cumulative boundary (device vs host `exp`).
+pub static MARKOV_DRAW_MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl MtpExit {
     pub fn alloc(device_id: i32) -> eyre::Result<Self> {
@@ -1986,7 +2002,148 @@ impl MtpExit {
                 crate::indexer::topk_merge_levels(N_VOCAB, MTP_DRAFT_TOP_M as u32).iter().map(|&n| n as usize).sum::<usize>().max(1),
             )?,
             cand: DeviceBuffer::new(device_id, MTP_DRAFT_TOP_M)?,
+            device_id,
+            toks: DeviceBuffer::new(device_id, b + 1)?,
+            topk_sel_all: DeviceBuffer::new(device_id, b * MTP_DRAFT_TOP_M)?,
+            cand_all: DeviceBuffer::new(device_id, b * MTP_DRAFT_TOP_M)?,
+            markov_dev: None,
+            am_v: DeviceBuffer::new(device_id, crate::mtp_markov::ARGMAX_WG as usize)?,
+            am_i: DeviceBuffer::new(device_id, crate::mtp_markov::ARGMAX_WG as usize)?,
         })
+    }
+
+    /// The markov table on this device (first use uploads it: 66 MB, once per process).
+    fn markov_table(&mut self, bytes: &[u8]) -> eyre::Result<()> {
+        if self.markov_dev.is_some() {
+            return Ok(());
+        }
+        let n = N_VOCAB as usize * MTP_MARKOV_RANK;
+        if bytes.len() < n * 2 {
+            return Err(eyre!("markov table: {} bytes, want {}", bytes.len(), n * 2));
+        }
+        let host: Vec<u16> = bytes[..n * 2].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let mut d = DeviceBuffer::<u16>::new(self.device_id, n)?;
+        d.copy_from_host(&host)?;
+        self.markov_dev = Some(d);
+        Ok(())
+    }
+
+    /// `V41_MTP_DEVICE_MARKOV`: the markov loop of `forward_ex` with every position's token kept on the
+    /// device. Per position: gather the markov row by the previous token (`toks[i]`), quantise, the
+    /// markov-head matvec and bias add exactly as the host loop does, then the pick -- `launch_argmax`
+    /// into `toks[i + 1]`, or the top-M (`indexer_topk_bitonic` + gather, as the host loop) and
+    /// `mtp_draft_draw` into `toks[i + 1]`. One sync at the end; the host then computes each position's
+    /// q with `draft_dist` from the read-back top-M (the verifier's q is unchanged), re-draws to check
+    /// the device's pick, and fills the confidence head from the same rows the host loop used.
+    #[allow(clippy::too_many_arguments)]
+    fn markov_loop_device(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        w: &MtpExitWeights,
+        markov_embd: &[u8],
+        markov_dtype: v4flash_core::gguf::GgufType,
+        first_token: i32,
+        sampling: Option<&DraftSampling>,
+        plain: [i32; MTP_BLOCK],
+    ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
+        let ne = N_EMBD as usize;
+        let nv = N_VOCAB as usize;
+        let mm = MTP_DRAFT_TOP_M;
+        self.markov_table(markov_embd)?;
+        self.toks.slice_view_mut(0, 1).copy_from_host(&[first_token])?;
+        for i in 0..MTP_BLOCK {
+            {
+                let table = self.markov_dev.as_ref().expect("uploaded above");
+                e.mtp_markov.launch_gather(s, &mut self.memb, table, &self.toks, i as u32, N_VOCAB, MTP_MARKOV_RANK as u32)?;
+            }
+            e.q8.quantize_input(
+                s, &mut self.memb_xq, &mut self.memb_xscale, &self.memb,
+                MTP_MARKOV_RANK as u32,
+            )?;
+            crate::het::dispatch::dense_matvec(
+                e, s, &mut self.bias, &w.markov_head, &self.memb, &self.memb_xq,
+                &self.memb_xscale, N_VOCAB, MTP_MARKOV_RANK as u32,
+            )?;
+            let mut lj = self.logits.slice_view_mut(i * nv, nv);
+            e.vec_add.launch(s, &mut lj, &self.bias, N_VOCAB)?;
+            match sampling {
+                None => {
+                    // `argmax_one`'s result over 64 WGs (same index; one WG took ~135 us on 129280).
+                    let lv = self.logits.slice_view(i * nv, nv);
+                    e.mtp_markov.launch_argmax(s, &mut self.toks, (i + 1) as u32, &lv, N_VOCAB, &mut self.am_v, &mut self.am_i)?;
+                }
+                Some(ds) => {
+                    let m = ds.m as u32;
+                    let lv = self.logits.slice_view(i * nv, nv);
+                    {
+                        let mut sel = self.topk_sel_all.slice_view_mut(i * mm, mm);
+                        e.indexer_topk_bitonic.launch(
+                            s, &mut sel, &mut self.topk_bits, &mut self.topk_scratch, &lv, N_VOCAB, m,
+                        )?;
+                    }
+                    let sel = self.topk_sel_all.slice_view(i * mm, mm);
+                    {
+                        let mut cand = self.cand_all.slice_view_mut(i * mm, mm);
+                        e.vec_add.launch_gather(s, &mut cand, &lv, &sel, m)?;
+                    }
+                    let cand = self.cand_all.slice_view(i * mm, mm);
+                    e.mtp_markov.launch_draw(
+                        s, &mut self.toks, &sel, &cand, m, ds.temperature, ds.top_p, ds.min_p_rel, ds.u[i], (i + 1) as u32,
+                    )?;
+                }
+            }
+        }
+        s.synchronize()?;
+        let mut toks_h = [0i32; MTP_BLOCK + 1];
+        self.toks.copy_to_host(&mut toks_h)?;
+        let mut ids = [0i32; MTP_BLOCK];
+        ids.copy_from_slice(&toks_h[1..]);
+        if let Some(ds) = sampling {
+            let mut cid = vec![0i32; MTP_BLOCK * mm];
+            let mut clg = vec![0f32; MTP_BLOCK * mm];
+            self.topk_sel_all.copy_to_host(&mut cid)?;
+            self.cand_all.copy_to_host(&mut clg)?;
+            for i in 0..MTP_BLOCK {
+                let (q, d) = draft_dist(&cid[i * mm..i * mm + ds.m], &clg[i * mm..i * mm + ds.m], ds.temperature, ds.top_p, ds.min_p_rel, ds.u[i])?;
+                if d != ids[i] {
+                    let n = MARKOV_DRAW_MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 8 {
+                        tracing::warn!(pos = i, device = ids[i], host = d, "mtp device markov: host re-draw differs (u at a cumulative boundary)");
+                    }
+                }
+                self.q.push(q);
+            }
+        }
+        // The confidence head, from the same rows the host loop used: x_i and the markov row of the
+        // token position i was drafted from.
+        if self.conf_w.is_none() {
+            let n = ne + MTP_MARKOV_RANK;
+            let mut hw = vec![0.0f32; n];
+            w.confidence.slice_view(0, n).copy_to_host(&mut hw)?;
+            self.conf_w = Some(hw);
+        }
+        let mut x_host = vec![0.0f32; MTP_BLOCK * ne];
+        self.x.slice_view(0, MTP_BLOCK * ne).copy_to_host(&mut x_host)?;
+        self.conf = [0.0; MTP_BLOCK];
+        let mut row = vec![0.0f32; MTP_MARKOV_RANK];
+        let mut prev = first_token;
+        for i in 0..MTP_BLOCK {
+            Self::markov_row(markov_embd, markov_dtype, prev, &mut row)?;
+            if let Some(cw) = self.conf_w.as_ref() {
+                let xi = &x_host[i * ne..(i + 1) * ne];
+                let mut acc = 0.0f64;
+                for (a, b) in cw[..ne].iter().zip(xi) {
+                    acc += (*a as f64) * (*b as f64);
+                }
+                for (a, b) in cw[ne..ne + MTP_MARKOV_RANK].iter().zip(row.iter()) {
+                    acc += (*a as f64) * (*b as f64);
+                }
+                self.conf[i] = acc as f32;
+            }
+            prev = ids[i];
+        }
+        Ok((ids, plain))
     }
 
     /// One markov-embedding row, host-side. Kept off-device for the same reason
@@ -2137,6 +2294,30 @@ impl MtpExit {
             plain[j] = got[0];
         }
 
+        if crate::knobs::MTP_DEVICE_MARKOV.on() && !want_plain && markov_dtype == v4flash_core::gguf::GgufType::F16 {
+            return self.markov_loop_device(e, s, w, markov_embd, markov_dtype, first_token, sampling, plain);
+        }
+
+        self.markov_loop_host(e, s, w, markov_embd, markov_dtype, first_token, sampling, plain)
+    }
+
+    /// The exit's markov loop on the host (the path before `V41_MTP_DEVICE_MARKOV`, and its fallback):
+    /// one sync and readback per position. Runs on the logits `forward_ex` left in `self.logits`.
+    #[allow(clippy::too_many_arguments)]
+    fn markov_loop_host(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        w: &MtpExitWeights,
+        markov_embd: &[u8],
+        markov_dtype: v4flash_core::gguf::GgufType,
+        first_token: i32,
+        sampling: Option<&DraftSampling>,
+        plain: [i32; MTP_BLOCK],
+    ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
+        let ne = N_EMBD as usize;
+        let nv = N_VOCAB as usize;
+        let mut got = [0i32; 1];
         // Confidence head. `x` is the PRE-norm `hc_pre` output the head reads,
         // and the markov row computed at iteration `i` below is exactly the
         // reference's `markov_embed[i]` (`markov_head(output_ids[i])`), so the
@@ -2215,6 +2396,83 @@ impl MtpExit {
             prev = ids[i];
         }
         Ok((ids, plain))
+    }
+
+    /// Test helper (tests/mtp_device_markov.rs): device time of each kernel of ONE device-markov
+    /// position, `reps` back-to-back launches each between two events, printed per kernel in us.
+    /// Needs `markov_loop_for_test(.., device = true)` first (the table and the top-M buffers).
+    pub fn time_markov_kernels(&mut self, e: &DeviceEngine, s: &Stream, w: &MtpExitWeights, reps: u32) -> eyre::Result<()> {
+        let nv = N_VOCAB as usize;
+        let mm = MTP_DRAFT_TOP_M;
+        let (ea, eb) = (v4flash_hip::Event::new()?, v4flash_hip::Event::new()?);
+        let mut time = |name: &str, f: &mut dyn FnMut() -> eyre::Result<()>| -> eyre::Result<()> {
+            f()?;
+            ea.record(s)?;
+            for _ in 0..reps {
+                f()?;
+            }
+            eb.record(s)?;
+            s.synchronize()?;
+            let us = v4flash_hip::Event::elapsed_ms(&ea, &eb)? as f64 * 1e3 / reps as f64;
+            eprintln!("  {name:28} {us:8.1} us");
+            Ok(())
+        };
+        let table = self.markov_dev.take().ok_or_else(|| eyre!("time_markov_kernels: run the device loop first"))?;
+        eprintln!("device-markov, one position, device time per kernel:");
+        time("gather (markov row)", &mut || e.mtp_markov.launch_gather(s, &mut self.memb, &table, &self.toks, 0, N_VOCAB, MTP_MARKOV_RANK as u32))?;
+        time("quantize_input (256)", &mut || e.q8.quantize_input(s, &mut self.memb_xq, &mut self.memb_xscale, &self.memb, MTP_MARKOV_RANK as u32))?;
+        time("markov head matvec (V x 256)", &mut || crate::het::dispatch::dense_matvec(e, s, &mut self.bias, &w.markov_head, &self.memb, &self.memb_xq, &self.memb_xscale, N_VOCAB, MTP_MARKOV_RANK as u32))?;
+        time("vec_add (V)", &mut || { let mut lj = self.logits.slice_view_mut(0, nv); e.vec_add.launch(s, &mut lj, &self.bias, N_VOCAB) })?;
+        time("argmax_one (V, 1 WG)", &mut || { let lj = self.logits.slice_view(0, nv); let mut t = self.toks.slice_view_mut(1, 1); e.sampler.launch_argmax(s, &mut t, &lj, N_VOCAB) })?;
+        time("argmax multi-WG (V, 64 WG)", &mut || { let lj = self.logits.slice_view(0, nv); e.mtp_markov.launch_argmax(s, &mut self.toks, 1, &lj, N_VOCAB, &mut self.am_v, &mut self.am_i) })?;
+        time("top-M bitonic (V, M=64)", &mut || {
+            let lv = self.logits.slice_view(0, nv);
+            let mut sel = self.topk_sel_all.slice_view_mut(0, mm);
+            e.indexer_topk_bitonic.launch(s, &mut sel, &mut self.topk_bits, &mut self.topk_scratch, &lv, N_VOCAB, mm as u32)
+        })?;
+        time("gather candidates (64)", &mut || {
+            let lv = self.logits.slice_view(0, nv);
+            let sel = self.topk_sel_all.slice_view(0, mm);
+            let mut cand = self.cand_all.slice_view_mut(0, mm);
+            e.vec_add.launch_gather(s, &mut cand, &lv, &sel, mm as u32)
+        })?;
+        time("draft draw (64)", &mut || {
+            let sel = self.topk_sel_all.slice_view(0, mm);
+            let cand = self.cand_all.slice_view(0, mm);
+            e.mtp_markov.launch_draw(s, &mut self.toks, &sel, &cand, mm as u32, 1.0, 1.0, 0.0, 0.5, 1)
+        })?;
+        self.markov_dev = Some(table);
+        Ok(())
+    }
+
+    /// Test entry (tests/mtp_device_markov.rs): run ONLY the markov loop, host or device, on the given
+    /// pre-markov logits (`[B, N_VOCAB]`) and pre-norm `x` (`[B, N_EMBD]`), as `forward_ex` would
+    /// after its head matvec. Returns the drafts; `q`, `conf` and `logits` are left as the loop left them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn markov_loop_for_test(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        w: &MtpExitWeights,
+        markov_embd: &[u8],
+        markov_dtype: v4flash_core::gguf::GgufType,
+        first_token: i32,
+        sampling: Option<&DraftSampling>,
+        logits: &[f32],
+        x: &[f32],
+        device: bool,
+    ) -> eyre::Result<[i32; MTP_BLOCK]> {
+        self.q.clear();
+        self.logits.slice_view_mut(0, logits.len()).copy_from_host(logits)?;
+        self.x.slice_view_mut(0, x.len()).copy_from_host(x)?;
+        let plain = [-1i32; MTP_BLOCK];
+        let (ids, _) = if device {
+            self.markov_loop_device(e, s, w, markov_embd, markov_dtype, first_token, sampling, plain)?
+        } else {
+            self.markov_loop_host(e, s, w, markov_embd, markov_dtype, first_token, sampling, plain)?
+        };
+        s.synchronize()?;
+        Ok(ids)
     }
 }
 
