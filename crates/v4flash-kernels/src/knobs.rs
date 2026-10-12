@@ -850,6 +850,12 @@ crate::knobs! {
     /// (stage_b's R1 at decode rows), so a captured / replayed router never disagrees with the look-ahead
     /// site about who computed layer l+1's logits.
     pub static DGPU_ROUTER_X2 = Knob::flag("V41_DGPU_ROUTER_X2", true).live();
+    /// `V41_MTP_MHC_FAST` (default on; live, read per drafter sub-block): each DSpark drafter mHC
+    /// sub-block (RMS + the 24-row mix matvec per draft row + Sinkhorn split + carry copy + collapse
+    /// + attn/ffn norm, ~10 launches) as ONE `MhcArena::launch_fast` (mode `MIX_NORMED`), bit-identical
+    /// to that chain (tests/mtp_mhc_fast_bitexact.rs). Live trace 10-12: the drafter's mixing was
+    /// 0.78 ms/draft of latency-bound iGPU time (15 GB/s on 12 MB).
+    pub static MTP_MHC_FAST = Knob::flag("V41_MTP_MHC_FAST", true).live();
     /// `V41_MS_GRAPHS` (default on; live since 2026-10-10, read at each arena stage's start):
     /// `forward_prefill::ms_graphs` -- the arena stage graphs; off = direct launches. Step 0c
     /// (tests/bench_graph_replay.rs) measured ~6.5 us of device time per graph replay vs < 1 us of
