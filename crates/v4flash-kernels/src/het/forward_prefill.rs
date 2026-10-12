@@ -9079,7 +9079,11 @@ impl HeterogeneousEngine {
                                 } else {
                                     home2
                                 };
-                                let held = if on2 {
+                                // A replicated id is held if either box holds it (design 3.1:
+                                // the leg choice serves it from a holder).
+                                let held = if super::expert_pager::hot_set::rep(layer, e as u32) {
+                                    pg.is_resident(layer, e as u32) || super::b2_mirror::resident(layer, e as u32) == Some(true)
+                                } else if on2 {
                                     super::b2_mirror::resident(layer, e as u32) == Some(true)
                                 } else {
                                     pg.is_resident(layer, e as u32)
@@ -10177,6 +10181,15 @@ impl HeterogeneousEngine {
                 // HOT SPLIT 3.2: the holder fallback serves decode rows only
                 // (prefill and verify chunks keep the home rule).
                 let holder_rows = matches!(rows, RowLayout::Arena { .. });
+                // HOT SPLIT 3.1: a replicated id of a decode row waits for the leg
+                // choice below, which needs the lane-layer's other picks. Prefill and
+                // verify chunks keep box 1 (its home), as without REP.
+                let rep_route = holder_rows
+                    && remote_split_on
+                    && super::expert_pager::t2_partition()
+                    && super::expert_pager::b1_page_misses()
+                    && super::expert_pager::hot_set::rep_any();
+                let mut rep_pend: Vec<u32> = Vec::new();
                 // Under a live cache-prior, rank the hot set by the ROUTER's picks,
                 // not the prior's (held experts would inflate their own rank and
                 // lock box 1's set in).
@@ -10221,6 +10234,10 @@ impl HeterogeneousEngine {
                         // can take the whole batch; the 170-slot objection that
                         // keeps `V41_REPLAY_OFFLOAD` off is a property of the CED
                         // replay's 162-wide union at B=128, not of a verify.
+                        if rep_route && super::expert_pager::hot_set::rep(layer as i32, sv as u32) {
+                            rep_pend.push(sv as u32);
+                            continue;
+                        }
                         if remote_split_on && super::expert_pager::t2_partition() {
                             // Box 2's share: always hers -- except a MOVING id of a
                             // decode row, served by whichever box holds it until its
@@ -10285,6 +10302,58 @@ impl HeterogeneousEngine {
                             continue;
                         }
                         ids.push(sv as u32);
+                    }
+                }
+                if !rep_pend.is_empty() {
+                    // The leg of each replicated id (`hot_split::rep_legs`, `V41_B1_HOT_REP_LEG`):
+                    // on top of the picks already split, by the box that holds it, else by the
+                    // cost model. Box 1 is the home (`partition_box2` is false for Rep): a
+                    // box-1 leg is computed here like any owned id (`b1_page_misses` above),
+                    // a box-2 leg keeps box 1's copy fresh (`touch_resident`).
+                    let mut cnt = vec![0u32; N_EXPERT as usize];
+                    for &sv in &sel_host {
+                        if (0..N_EXPERT as i32).contains(&sv) {
+                            cnt[sv as usize] += 1;
+                        }
+                    }
+                    let n1: usize = ids.iter().map(|&e| cnt[e as usize] as usize).sum();
+                    let (mut n2, mut d2) = (0usize, 0usize);
+                    for (e, &on) in extra_remote.iter().enumerate() {
+                        if on {
+                            n2 += cnt[e] as usize;
+                            d2 += 1;
+                        }
+                    }
+                    let reps: Vec<super::hot_split::RepPick> = rep_pend
+                        .iter()
+                        .map(|&e| super::hot_split::RepPick {
+                            e,
+                            picks: cnt[e as usize],
+                            b1_has: pg.is_resident(layer as i32, e),
+                            b2_held: super::b2_mirror::lookup(layer as i32, e).is_some_and(|r| r.held),
+                        })
+                        .collect();
+                    let legs = super::hot_split::rep_legs(
+                        &super::expert_pager::hot_set::leg_costs(),
+                        super::expert_pager::hot_set::rep_leg(),
+                        b as usize,
+                        &reps,
+                        n1,
+                        ids.len(),
+                        n2,
+                        d2,
+                    );
+                    for (r, &on2) in reps.iter().zip(&legs) {
+                        if r.b1_has {
+                            super::expert_pager::hot_set::clear_moving(layer as i32, r.e);
+                        }
+                        super::expert_pager::hot_set::note_rep(on2);
+                        if on2 {
+                            extra_remote[r.e as usize] = true;
+                            pg.touch_resident(layer as i32, r.e);
+                        } else {
+                            ids.push(r.e);
+                        }
                     }
                 }
                 // PREDICTED-MISS LOOK-AHEAD PREFETCH (`V41_B2_MISS_PREFETCH`,

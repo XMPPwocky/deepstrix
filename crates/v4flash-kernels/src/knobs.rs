@@ -938,6 +938,22 @@ crate::knobs! {
     pub static B1_HOT_REP = Knob::int("V41_B1_HOT_REP", 0, 0, 64).live();
     /// `V41_B1_HOT_REP_HYST` (default 5; live): the replicated set's rank hysteresis.
     pub static B1_HOT_REP_HYST = Knob::int("V41_B1_HOT_REP_HYST", 5, 0, 384).live();
+    /// `V41_B1_HOT_REP_LEG` (`cost` default | `box1` | `box2`; live, read per decode lane-layer): the leg of a
+    /// replicated pick (design 3.1, `hot_split::rep_legs`). `cost` = the faster leg among the boxes that hold it;
+    /// `box1` / `box2` pin the leg (a function of STATE only).
+    pub static B1_HOT_REP_LEG = Knob::choice("V41_B1_HOT_REP_LEG", 0, &[&["cost"], &["box1"], &["box2"]]).live();
+    /// `V41_B1_HOT_LEG_*` (live, read per decode lane-layer with a replicated pick): the leg choice's cost model
+    /// (`hot_split::LegCosts`): iGPU ms = IG0 + IG_D d + IG_N n + IG_B b; box 2 us = link(b) + LINK_ADD_US + S0 +
+    /// SD d + SB b, plus OPEN_MS for a leg the replicated picks would open.
+    pub static B1_HOT_LEG_IG0 = Knob::real("V41_B1_HOT_LEG_IG0", 0.100, 0.0, 100.0).live();
+    pub static B1_HOT_LEG_IG_D = Knob::real("V41_B1_HOT_LEG_IG_D", 0.0774, 0.0, 100.0).live();
+    pub static B1_HOT_LEG_IG_N = Knob::real("V41_B1_HOT_LEG_IG_N", 0.0046, 0.0, 100.0).live();
+    pub static B1_HOT_LEG_IG_B = Knob::real("V41_B1_HOT_LEG_IG_B", 0.0397, 0.0, 100.0).live();
+    pub static B1_HOT_LEG_S0_US = Knob::real("V41_B1_HOT_LEG_S0_US", 116.0, 0.0, 100000.0).live();
+    pub static B1_HOT_LEG_SD_US = Knob::real("V41_B1_HOT_LEG_SD_US", 99.9, 0.0, 100000.0).live();
+    pub static B1_HOT_LEG_SB_US = Knob::real("V41_B1_HOT_LEG_SB_US", 15.6, 0.0, 100000.0).live();
+    pub static B1_HOT_LEG_LINK_ADD_US = Knob::real("V41_B1_HOT_LEG_LINK_ADD_US", 0.0, 0.0, 100000.0).live();
+    pub static B1_HOT_LEG_OPEN_MS = Knob::real("V41_B1_HOT_LEG_OPEN_MS", 0.2, 0.0, 100.0).live();
 }
 
 #[cfg(test)]

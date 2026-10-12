@@ -607,6 +607,8 @@ pub mod hot_set {
     static STATE: [std::sync::atomic::AtomicU8; NL * NE] = [const { std::sync::atomic::AtomicU8::new(0) }; NL * NE];
     /// Any STATE entry is B2Head or Rep (cheap gate for the KEEP predicate).
     static KEEP_ANY: AtomicBool = AtomicBool::new(false);
+    /// Any STATE entry is Rep (the route's gate for the leg choice, design 3.1).
+    static REP_ANY: AtomicBool = AtomicBool::new(false);
     /// The last refresh ran `interleave`.
     static IL_ACTIVE: AtomicBool = AtomicBool::new(false);
     /// Design 2.4: back on `top` after an interleave. Per layer: a returning
@@ -650,6 +652,54 @@ pub mod hot_set {
     #[inline]
     pub fn keep(layer: i32, e: u32) -> bool {
         KEEP_ANY.load(Relaxed) && state(layer, e).keep()
+    }
+    /// Is any id replicated (the route's cheap gate)?
+    #[inline]
+    pub fn rep_any() -> bool {
+        REP_ANY.load(Relaxed)
+    }
+    /// Is `(layer, e)` replicated (resident on both boxes; the route picks the leg)?
+    #[inline]
+    pub fn rep(layer: i32, e: u32) -> bool {
+        REP_ANY.load(Relaxed) && state(layer, e) == Side::Rep
+    }
+    /// Replicated decode picks (distinct per lane-layer) routed to box 1 / box 2, since the start.
+    static REP_B1: AtomicU64 = AtomicU64::new(0);
+    static REP_B2: AtomicU64 = AtomicU64::new(0);
+    #[inline]
+    pub fn note_rep(on_box2: bool) {
+        if on_box2 { &REP_B2 } else { &REP_B1 }.fetch_add(1, Relaxed);
+    }
+    /// (replicated picks served by box 1, by box 2).
+    pub fn rep_totals() -> (u64, u64) {
+        (REP_B1.load(Relaxed), REP_B2.load(Relaxed))
+    }
+    /// The leg choice's cost model from the live `V41_B1_HOT_LEG_*` knobs.
+    pub fn leg_costs() -> super::super::hot_split::LegCosts {
+        use crate::knobs as k;
+        let mut c = super::super::hot_split::LegCosts::default();
+        c.ig0 = k::B1_HOT_LEG_IG0.f64();
+        c.ig_d = k::B1_HOT_LEG_IG_D.f64();
+        c.ig_n = k::B1_HOT_LEG_IG_N.f64();
+        c.ig_b = k::B1_HOT_LEG_IG_B.f64();
+        c.s0_us = k::B1_HOT_LEG_S0_US.f64();
+        c.s_d_us = k::B1_HOT_LEG_SD_US.f64();
+        c.s_b_us = k::B1_HOT_LEG_SB_US.f64();
+        let add = k::B1_HOT_LEG_LINK_ADD_US.f64();
+        for l in c.link_us.iter_mut() {
+            *l += add;
+        }
+        c.open_ms = k::B1_HOT_LEG_OPEN_MS.f64();
+        c
+    }
+    /// `V41_B1_HOT_REP_LEG`.
+    pub fn rep_leg() -> super::super::hot_split::RepLeg {
+        use super::super::hot_split::RepLeg;
+        match crate::knobs::B1_HOT_REP_LEG.pick() {
+            1 => RepLeg::Box1,
+            2 => RepLeg::Box2,
+            _ => RepLeg::Cost,
+        }
     }
     /// Holder-fallback picks (design 3.2): served by box 1 / by box 2 instead
     /// of their home, since the start.
@@ -966,6 +1016,7 @@ pub mod hot_set {
             push_prewarm(prewarm);
         }
         KEEP_ANY.store(false, Relaxed);
+        REP_ANY.store(false, Relaxed);
         TOTAL.store(TOTAL.load(Relaxed) / 2, Relaxed);
         WARM.store(true, Relaxed);
         (owned, mass_sum / NL as f32, changed)
@@ -1001,7 +1052,7 @@ pub mod hot_set {
         };
         let warm = WARM.load(Relaxed);
         let (mut owned, mut changed, mut mass_sum) = (0usize, 0usize, 0f32);
-        let (mut share_sum, mut swaps, mut b1n, mut b2n, mut keep_n) = (0f64, 0u64, 0u64, 0u64, 0u64);
+        let (mut share_sum, mut swaps, mut b1n, mut b2n, mut keep_n, mut rep_n) = (0f64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut prewarm: Vec<(i32, u32)> = Vec::new();
         let mut counts = vec![0u32; NE];
         let mut prev = vec![Side::B2; NE];
@@ -1033,6 +1084,9 @@ pub mod hot_set {
                 if s.keep() {
                     keep_n += 1;
                 }
+                if s == Side::Rep {
+                    rep_n += 1;
+                }
                 if warm && s.box2_home() != prev[e].box2_home() {
                     MOVED_AT[l * NE + e].store(epoch, Relaxed);
                 }
@@ -1055,6 +1109,7 @@ pub mod hot_set {
         IL_STATS[3].store(b2n, Relaxed);
         IL_STATS[4].store(keep_n, Relaxed);
         KEEP_ANY.store(keep_n > 0, Relaxed);
+        REP_ANY.store(rep_n > 0, Relaxed);
         // Every interleave refresh: `keep_fill` dedups against held ids and the
         // queue, so this also re-queues grants that expired unpinned.
         KEEP_DIRTY.store(true, Relaxed);
@@ -1084,7 +1139,7 @@ pub mod hot_set {
         for r in RET_LAYER.iter() {
             r.store(false, Relaxed);
         }
-        for f in [&WARM, &KEEP_ANY, &IL_ACTIVE, &RETURNING, &KEEP_DIRTY] {
+        for f in [&WARM, &KEEP_ANY, &REP_ANY, &IL_ACTIVE, &RETURNING, &KEEP_DIRTY] {
             f.store(false, Relaxed);
         }
         TOTAL.store(0, Relaxed);
@@ -1219,6 +1274,42 @@ pub mod hot_set {
             refresh().unwrap();
             assert!(interleave_active());
             assert_eq!(keep_list().len(), NL * 20);
+            reset_for_test();
+        }
+
+        /// Design 3.1's gate: with `V41_B1_HOT_REP` > 0 an interleave refresh
+        /// makes ids replicated (box-1 resident, not box-2 home, KEEP) and
+        /// raises `rep_any`; back at 0 the next refresh clears it (the route's
+        /// leg choice is then never reached).
+        #[test]
+        fn rep_gate_follows_the_knob() {
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_for_test();
+            std::env::set_var("V41_B1_HOT_MIN_PICKS", "0");
+            std::env::set_var("V41_B1_HOT_PER_LAYER", "40");
+            crate::knobs::B1_HOT_B2HEAD.set("20");
+            crate::knobs::B1_HOT_POLICY.set("interleave");
+            crate::knobs::B1_HOT_MOVES.set("64");
+            let mut seed = 11u64;
+            feed(&mut seed, 0.0);
+            refresh().unwrap();
+            feed(&mut seed, 0.0);
+            refresh().unwrap();
+            assert!(interleave_active() && !rep_any());
+            crate::knobs::B1_HOT_REP.set("4");
+            feed(&mut seed, 0.0);
+            refresh().unwrap();
+            assert!(rep_any());
+            let reps: Vec<(i32, u32)> = (0..NL as i32).flat_map(|l| (0..NE as u32).map(move |e| (l, e))).filter(|&(l, e)| rep(l, e)).collect();
+            assert_eq!(reps.len(), NL * 4);
+            for &(l, e) in &reps {
+                assert_eq!(box1_owns(l, e), Some(true));
+                assert!(!super::super::partition_box2(l, e) && keep(l, e));
+            }
+            crate::knobs::B1_HOT_REP.set("0");
+            feed(&mut seed, 0.0);
+            refresh().unwrap();
+            assert!(!rep_any() && !rep(reps[0].0, reps[0].1));
             reset_for_test();
         }
 

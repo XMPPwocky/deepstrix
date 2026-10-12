@@ -1718,9 +1718,10 @@ impl Sched {
                     // own numbers, and the holder / pre-warm / KEEP totals.
                     let (share1, swaps, b1_new, b2_new, keep) = hot_set::il_stats();
                     let (holder_b1, holder_b2) = hot_set::holder_totals();
+                    let (rep_b1, rep_b2) = hot_set::rep_totals();
                     tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
                         picks = hot_set::picks_seen(), interleave = hot_set::interleave_active(), returning = hot_set::returning(),
-                        share1 = format!("{share1:.3}"), swaps, b1_new, b2_new, keep, holder_b1, holder_b2,
+                        share1 = format!("{share1:.3}"), swaps, b1_new, b2_new, keep, holder_b1, holder_b2, rep_b1, rep_b2,
                         prewarm_queued = hot_set::prewarm_queued(), keep_queued = v4flash_kernels::het::b2_mirror::keep_queued_total(),
                         "multistream: box-1 hot set refreshed");
                 } else {

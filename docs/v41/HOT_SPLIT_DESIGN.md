@@ -404,3 +404,37 @@ hub env file carries the same lines). Open: the return mode needs its own pace k
 (e.g. per-layer coverage with a tolerance, or exit after N refreshes with the cap lifted) before any
 future top-vs-interleave A/B; the A/B itself must discard by refresh count, not minutes.
 
+
+## 16. Slice 2: the replicated route (2026-10-12)
+
+The placement already produced `Rep` (`interleave_layer`, step 1) but nothing routed it: a `Rep` id
+was box-1 home (`partition_box2` false), so every pick went to box 1 while box 2 kept a pinned copy it
+never served. Slice 2 wires the leg choice into `pre_moe_route`'s pick loop:
+
+- **Decode rows only** (`RowLayout::Arena`, the holder's rows), under the partition with
+  `b1_page_misses`, gated by `hot_set::rep_any()` (one relaxed load; false whenever
+  `V41_B1_HOT_REP` = 0 since the last refresh). A `Rep` pick is set aside and decided after the
+  lane-layer's other picks are classified, so `n1/d1` (`ids`) and `n2/d2` (`extra_remote`) are final.
+  Prefill and verify chunks keep box 1, as before.
+- **`hot_split::rep_legs`** (pure, host-tested): `V41_B1_HOT_REP_LEG` = `box1` / `box2` pins the leg;
+  `cost` sends an id only one box holds to that box (box 1 `is_resident`, box 2 mirror `held`), one
+  neither holds to box 1 (its home: `b1_page_misses` reads it, today's rule), and the ids both hold by
+  `choose_legs` on top of the single-holder ones (so OPEN is paid only by a leg the replicated picks
+  open). A box-2 leg `touch_resident`s box 1's copy; a box-1 holder clears MOVING.
+- **The prior's held mask** counts a `Rep` id held when either box holds it (the leg choice serves it
+  from a holder), so mask and route agree.
+- **Cost model live**: `V41_B1_HOT_LEG_{IG0,IG_D,IG_N,IG_B,S0_US,SD_US,SB_US,LINK_ADD_US,OPEN_MS}`
+  (defaults: the 10-03 fit, until the 10-12 refit), `hot_set::leg_costs()`.
+- **Counters**: `rep_b1` / `rep_b2` (distinct replicated picks per lane-layer by leg, cumulative) in
+  the refresh log line.
+- Exactly-once routing holds by construction (each set-aside id lands in `ids` or `extra_remote`) and
+  is still checked per step by `verify_routing_exactly_once` (fails closed).
+
+**No gate window (owner 10-12: "does it really need a gpu window").** At `V41_B1_HOT_REP=0` (production)
+`rep_any()` is false and the new branch is unreachable: the route is today's. With REP on, a replicated
+pick served by either box is the same event the interleave already performs at every refresh (an id's
+serving box changes; only the f32 summation order differs), and a box serving an id it does not hold
+still computes it correctly (box 2 is paged, box 1 reads), only slower. G-rep (section 7) would add only
+the determinism of the plumbing, which the host tests cover (`rep_leg_rules`, `rep_gate_follows_the_knob`).
+Rollout: one hub-only restart with REP 0, then `V41_B1_HOT_REP` live (kill switch: 0), watched on
+`rep_b1/rep_b2`, step errors and the step cells; then the A/B (REP 10 vs 0, discard by refresh count).
