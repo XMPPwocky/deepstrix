@@ -13,6 +13,18 @@ const MTP_MARKOV_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MTP_MARKOV_GFX1151
 pub const DRAW_MAX_M: usize = 64;
 /// Work-groups of the multi-WG argmax (`launch_argmax`); its partial scratch is `[ARGMAX_WG]`.
 pub const ARGMAX_WG: u32 = 64;
+/// `launch_topm` geometry (kernels `TM_WG` / `TM_CHUNK` / `TM_KEEP`): work-groups, max chunk, kept per WG.
+pub const TOPM_WG: u32 = 64;
+pub const TOPM_CHUNK: u32 = 2048;
+pub const TOPM_KEEP: u32 = 64;
+/// `launch_topm_radix` geometry (kernels `RX_WG` / `RX_BINS` / `RX_ST_EQOFF`): work-groups, histogram bins,
+/// and the state layout (`[RX_ST_EQOFF + RX_WG]` u32, zero-initialised once; the kernels leave it reusable).
+pub const RX_WG: u32 = 64;
+pub const RX_BINS: u32 = 2048;
+pub const RX_STATE: usize = 8 + RX_WG as usize;
+/// `launch_topm_radix`'s `hist`: the global histogram (`RX_BINS`) + pass 2's per-WG rows (`RX_WG * 1024`); zero-initialise
+/// once (the kernels leave the global part zero).
+pub const RX_HIST_LEN: usize = RX_BINS as usize + RX_WG as usize * 1024;
 
 pub struct MtpMarkov {
     module: Module,
@@ -72,6 +84,61 @@ impl MtpMarkov {
         let f = self.module.get_function("mtp_argmax_final")?;
         let cfg = LaunchConfig { grid: (1, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(f, cfg, stream, [toks.raw(), part_v.raw(), part_i.raw(), ARGMAX_WG, n, out_idx])
+    }
+
+    /// The top `m` (<= 64) ids of `logits[..n]` in the bitonic chain's order (score desc, ties to the lower id),
+    /// spread over `TOPM_WG` work-groups with fixed work: `mtp_topm_chunk` (each WG its chunk's best 64) +
+    /// `mtp_topm_final` (one WG over the `TOPM_WG * 64` survivors). `part` is `[TOPM_WG * 64]` u64 scratch.
+    pub fn launch_topm(
+        &self,
+        stream: &Stream,
+        selected: &mut DeviceBuffer<i32>,
+        part: &mut DeviceBuffer<u64>,
+        logits: &DeviceBuffer<f32>,
+        n: u32,
+        m: u32,
+    ) -> eyre::Result<()> {
+        if m == 0 || m > TOPM_KEEP || n == 0 || n.div_ceil(TOPM_WG) > TOPM_CHUNK || logits.len() < n as usize
+            || selected.len() < m as usize || part.len() < (TOPM_WG * TOPM_KEEP) as usize {
+            return Err(eyre!("mtp_markov topm: n {n} m {m} logits {} selected {} part {}", logits.len(), selected.len(), part.len()));
+        }
+        let f = self.module.get_function("mtp_topm_chunk")?;
+        let cfg = LaunchConfig { grid: (TOPM_WG, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [part.raw(), logits.raw(), n])?;
+        let f = self.module.get_function("mtp_topm_final")?;
+        let cfg = LaunchConfig { grid: (1, 1, 1), block: (1024, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [selected.raw(), part.raw(), m])
+    }
+
+    /// The top `m` (<= 64) ids of `logits[..n]` in the bitonic chain's order (score desc, ties to the lower id) by
+    /// radix select: three histogram passes (`mtp_rx_pass`, 11 + 11 + 10 key bits; the last WG of each fixes the
+    /// threshold's next bits) and `mtp_rx_compact` (key > threshold + the lowest-idx ties, then the last WG sorts the
+    /// m winners). Fixed work, 4 launches. `hist` = `[RX_HIST_LEN]` u32 and `state` = `[RX_STATE]` u32, both zeroed
+    /// once (left reusable), `cand` = `[64]` u64.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_topm_radix(
+        &self,
+        stream: &Stream,
+        selected: &mut DeviceBuffer<i32>,
+        hist: &mut DeviceBuffer<u32>,
+        state: &mut DeviceBuffer<u32>,
+        cand: &mut DeviceBuffer<u64>,
+        logits: &DeviceBuffer<f32>,
+        n: u32,
+        m: u32,
+    ) -> eyre::Result<()> {
+        if m == 0 || m > 64 || n < m || logits.len() < n as usize || selected.len() < m as usize
+            || hist.len() < RX_HIST_LEN || state.len() < RX_STATE || cand.len() < 64 {
+            return Err(eyre!("mtp_markov radix topm: n {n} m {m} logits {} selected {} hist {} state {} cand {}",
+                logits.len(), selected.len(), hist.len(), state.len(), cand.len()));
+        }
+        let f = self.module.get_function("mtp_rx_pass")?;
+        let cfg = LaunchConfig { grid: (RX_WG, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        for pass in 0u32..3 {
+            launch_kernel!(f, cfg, stream, [hist.raw(), state.raw(), logits.raw(), n, pass, m])?;
+        }
+        let f = self.module.get_function("mtp_rx_compact")?;
+        launch_kernel!(f, cfg, stream, [selected.raw(), cand.raw(), state.raw(), logits.raw(), n, m])
     }
 
     /// The sampled draft of one position: `draft_dist(ids[..m], logits[..m], ...)`'s draw, into `toks[out_idx]`.
