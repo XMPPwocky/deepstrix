@@ -572,6 +572,10 @@ pub struct MtpState {
     cur: DeviceBuffer<f32>,
     /// `attn_norm`/`ffn_norm` of `cur`, `[B, N_EMBD]`.
     normed: DeviceBuffer<f32>,
+    /// `V41_MTP_MHC_FAST` scratch: the fused kernel's last-WG counters (`[B]`, zero; the kernel
+    /// leaves them zero) and its per-row RMS scalars (`[B]`, written and read inside the launch).
+    mhc_counters: DeviceBuffer<u32>,
+    mhc_inv: DeviceBuffer<f32>,
 
     // ---- per-layer attention state ----
     /// KV ring per drafter layer: `[RING_SLOTS] x N_HEAD_DIM` f16.
@@ -706,6 +710,12 @@ impl MtpState {
             mix: DeviceBuffer::new(device_id, b * HC_MIX_DIM as usize)?,
             cur: DeviceBuffer::new(device_id, b * ne)?,
             normed: DeviceBuffer::new(device_id, b * ne)?,
+            mhc_counters: {
+                let mut c = DeviceBuffer::new(device_id, b)?;
+                c.copy_from_host(&vec![0u32; b])?;
+                c
+            },
+            mhc_inv: DeviceBuffer::new(device_id, b)?,
 
             rings,
             xq: DeviceBuffer::new(device_id, b * ne)?,
@@ -1016,6 +1026,44 @@ impl MtpState {
         Ok(())
     }
 
+    /// `V41_MTP_MHC_FAST`: one whole mHC sub-block -- `hc_mixes` + `hc_pre_and_carry` + its
+    /// `rms_w` norm -- as ONE `MhcArena::launch_fast` (mode `MIX_NORMED` = `rms_nw.launch_batched`
+    /// + narrow f16 matvec, which is `hc_mixes`' per-row `f16.matvec` at 24 rows; then the Sinkhorn
+    /// split, the collapse with the OLD carry into `cur`, its norm into `normed`, and `carry :=
+    /// split`). Bit-identical to the chain (tests/mtp_mhc_fast_bitexact.rs). `flat` is not written.
+    fn hc_sub_fast(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        fnw: &crate::weights::DeviceWeight,
+        scale: &DeviceBuffer<f32>,
+        base: &DeviceBuffer<f32>,
+        norm_w: &DeviceBuffer<f32>,
+    ) -> eyre::Result<()> {
+        e.mhc_arena.launch_fast(
+            s,
+            Some(crate::mhc_arena::FastMix {
+                weight: &fnw.buffer,
+                x: &self.h,
+                scale,
+                base,
+                mode: crate::mhc_arena::MIX_NORMED,
+                split_out: &mut self.split,
+                mix_out: &mut self.mix,
+                counters: &mut self.mhc_counters,
+                inv_rows: &mut self.mhc_inv,
+            }),
+            Some(crate::mhc_arena::FastCollapse { x: &self.h, cur_out: &mut self.cur, norm_out: &mut self.normed, norm_w }),
+            &mut self.pre_carry,
+            true,
+            HC_DIM,
+            RMS_EPS,
+            SINKHORN_ITERS,
+            SINKHORN_EPS,
+            B,
+        )
+    }
+
     /// Expand a sub-block output back to `N_HC` copies and mix the residual in.
     /// Writes `h_next` and swaps, because `hc_post` cannot alias its residual.
     fn hc_post(&mut self, e: &DeviceEngine, s: &Stream, out: bool) -> eyre::Result<()> {
@@ -1049,12 +1097,16 @@ impl MtpState {
         // to issue them -- ~200 us per launch across only ~21 launches, 20-40x a
         // normal HIP launch. Nothing in the source explains that yet, so measure
         // where inside the layer it accrues before theorising.
-        {
+        let mhc_fast = crate::knobs::MTP_MHC_FAST.on();
+        if mhc_fast {
             let _h = HostUs::start_dev(&MTP_H_HCMIX, s);
-            self.hc_mixes(e, s, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base)?;
-            self.hc_pre_and_carry(e, s)?;
-        }
-        {
+            self.hc_sub_fast(e, s, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base, &w.attn_norm)?;
+        } else {
+            {
+                let _h = HostUs::start_dev(&MTP_H_HCMIX, s);
+                self.hc_mixes(e, s, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base)?;
+                self.hc_pre_and_carry(e, s)?;
+            }
             let _h = HostUs::start_dev(&MTP_H_RMS, s);
             e.rms_w.launch_weighted_batched(
                 s, &mut self.normed, &self.cur, &w.attn_norm, N_EMBD, RMS_EPS, B,
@@ -1072,12 +1124,15 @@ impl MtpState {
             self.hc_post(e, s, true)?;
         }
 
-        {
+        if mhc_fast {
             let _h = HostUs::start_dev(&MTP_H_HCMIX, s);
-            self.hc_mixes(e, s, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base)?;
-            self.hc_pre_and_carry(e, s)?;
-        }
-        {
+            self.hc_sub_fast(e, s, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base, &w.ffn_norm)?;
+        } else {
+            {
+                let _h = HostUs::start_dev(&MTP_H_HCMIX, s);
+                self.hc_mixes(e, s, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base)?;
+                self.hc_pre_and_carry(e, s)?;
+            }
             let _h = HostUs::start_dev(&MTP_H_RMS, s);
             e.rms_w.launch_weighted_batched(
                 s, &mut self.normed, &self.cur, &w.ffn_norm, N_EMBD, RMS_EPS, B,
