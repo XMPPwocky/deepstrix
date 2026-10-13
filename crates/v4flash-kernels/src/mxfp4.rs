@@ -18,6 +18,96 @@ pub const SUPER_MXFP4_BYTES: usize = 136;
 /// `n_blocks_in` the small-b down twin is compiled for (`DN2_NB` = N_FF_EXP / 256).
 pub const SMALLB_DOWN_N_BLOCKS_IN: u32 = 9;
 
+/// A dn3 decode-down geometry: kernel symbol, rows per wave (compiled into the
+/// symbol), waves per work-group (launch-time) and the grid shape:
+///  * `dn3_*`: (row tiles, work items) -- dn2's grid;
+///  * `dn3p_*` (`persist_wgs` > 0): a 1-D grid of `persist_wgs` work-groups that walk
+///    the flattened (work item, row tile) list up to the device count;
+///  * `dn3c_*` (`col_y` > 0): (row tiles, min(work items, `col_y`)), each work-group
+///    loops over work items y, y + col_y, ... (the next expert's stripe prefetched).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dn3Geom {
+    pub sym: &'static str,
+    pub rows_per_wave: u32,
+    pub waves: u32,
+    pub persist_wgs: u32,
+    pub col_y: u32,
+}
+
+const fn dn3(sym: &'static str, rows_per_wave: u32, waves: u32) -> Dn3Geom {
+    Dn3Geom { sym, rows_per_wave, waves, persist_wgs: 0, col_y: 0 }
+}
+const fn dn3p(sym: &'static str, rows_per_wave: u32, waves: u32, persist_wgs: u32) -> Dn3Geom {
+    Dn3Geom { sym, rows_per_wave, waves, persist_wgs, col_y: 0 }
+}
+const fn dn3c(sym: &'static str, rows_per_wave: u32, waves: u32, col_y: u32) -> Dn3Geom {
+    Dn3Geom { sym, rows_per_wave, waves, persist_wgs: 0, col_y }
+}
+
+impl Dn3Geom {
+    /// Short label (benches / test messages).
+    pub fn label(&self) -> String {
+        let k = self.sym.trim_start_matches("mxfp4_matvec_par_by_expert_");
+        if self.persist_wgs > 0 {
+            format!("{k} w{} G{}", self.waves, self.persist_wgs)
+        } else if self.col_y > 0 {
+            format!("{k} w{} Y{}", self.waves, self.col_y)
+        } else {
+            format!("{k} w{}", self.waves)
+        }
+    }
+}
+
+/// Every compiled dn3 geometry (all bit-identical to dn2; tests/mxfp4_down_dn3.rs).
+pub const DN3_GEOMS: &[Dn3Geom] = &[
+    dn3("mxfp4_matvec_par_by_expert_dn3_r2", 2, 8),
+    dn3("mxfp4_matvec_par_by_expert_dn3_r2", 2, 4),
+    dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 8),
+    dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 4),
+    dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 2),
+    dn3("mxfp4_matvec_par_by_expert_dn3_r4l", 4, 4),
+    dn3("mxfp4_matvec_par_by_expert_dn3_r8", 8, 4),
+    dn3("mxfp4_matvec_par_by_expert_dn3_r8", 8, 2),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2", 2, 8, 80),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 8, 40),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 8, 80),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 4, 160),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4", 4, 4, 120),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 80),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 120),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 160),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 240),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 360),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 480),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 4, 320),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 4, 480),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pfa", 4, 4, 80),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pfa", 4, 4, 120),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epf", 2, 4, 128),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epf", 2, 2, 256),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epfa", 2, 4, 80),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epfa", 2, 4, 120),
+    dn3p("mxfp4_matvec_par_by_expert_dn3q_r2epfa", 2, 4, 120),
+    dn3p("mxfp4_matvec_par_by_expert_dn3q_r4pfa", 4, 4, 80),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4a", 2, 4, 128),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4a", 2, 4, 140),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4", 2, 4, 160),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r4w4a", 4, 4, 120),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w2a", 2, 2, 256),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w8a", 2, 8, 64),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w8a", 2, 8, 70),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r4w8a", 4, 8, 40),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r4w8a", 4, 8, 60),
+    dn3c("mxfp4_matvec_par_by_expert_dn3c_r4", 4, 4, 4),
+    dn3c("mxfp4_matvec_par_by_expert_dn3c_r4pf", 4, 4, 2),
+    dn3c("mxfp4_matvec_par_by_expert_dn3c_r4pf", 4, 4, 4),
+    dn3c("mxfp4_matvec_par_by_expert_dn3c_r4pf", 4, 4, 8),
+    dn3c("mxfp4_matvec_par_by_expert_dn3c_r2pf", 2, 8, 4),
+];
+
+/// The geometry `launch_by_expert_dn3_ex` (production arm) uses.
+pub const DN3_DEFAULT: Dn3Geom = dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 4);
+
 pub struct Mxfp4Matvec {
     module: Module,
     /// The int8-WMMA module (gfx1151 only), see [`Self::launch_by_expert_wmma_ex`].
@@ -91,6 +181,109 @@ impl Mxfp4Matvec {
             expert_members, work_items, n_work_items, dbpe, xq_slot_stride, n_used, max_per_expert,
             chunk_size, n_rows, n_blocks_in, n_work_items_dev,
         )
+    }
+
+    /// Decode twin of [`Self::launch_by_expert_smallb_ex`] (`mxfp4_matvec_par_by_expert_dn3_*`,
+    /// `V41_MOE_DOWN_DN3`): the SAME arguments and work-item / device-count contract and
+    /// BIT-IDENTICAL partials, in the production geometry [`DN3_DEFAULT`]. Compiled for
+    /// `n_blocks_in` = 9 only; `n_rows` must be a multiple of the rows per work-group.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_by_expert_dn3_ex(
+        &self,
+        stream: &Stream,
+        partials: &mut DeviceBuffer<f32>,
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+        n_work_items_dev: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        self.launch_by_expert_dn3_geom(
+            DN3_DEFAULT, stream, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
+            dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size, n_rows, n_blocks_in, n_work_items_dev,
+        )
+    }
+
+    /// [`Self::launch_by_expert_dn3_ex`] in an explicit geometry (tests / benches: every
+    /// entry of [`DN3_GEOMS`] is bit-identical to dn2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_by_expert_dn3_geom(
+        &self,
+        geom: Dn3Geom,
+        stream: &Stream,
+        partials: &mut DeviceBuffer<f32>,
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+        n_work_items_dev: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        if n_blocks_in != SMALLB_DOWN_N_BLOCKS_IN {
+            return Err(eyre!("mxfp4 dn3 down: n_blocks_in={n_blocks_in} but the kernel is compiled for {SMALLB_DOWN_N_BLOCKS_IN}"));
+        }
+        let rows_per_wg = geom.rows_per_wave * geom.waves;
+        if geom.waves == 0 || geom.waves > 8 || n_rows % rows_per_wg != 0 {
+            return Err(eyre!("mxfp4 dn3 down: n_rows={n_rows} not a multiple of {rows_per_wg} rows per WG ({geom:?})"));
+        }
+        if n_work_items_dev.is_some() && n_work_items as usize > work_items.len() {
+            return Err(eyre!("mxfp4 dn3 down: grid bound {n_work_items} > work_items {}", work_items.len()));
+        }
+        if chunk_size == 0 || chunk_size > 32 {
+            return Err(eyre!("mxfp4 dn3 down: chunk_size={chunk_size} not in 1..=32"));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let n_wi_dev = n_work_items_dev.map_or(std::ptr::null_mut(), |c| c.raw());
+        let function = self.module.get_function(geom.sym)?;
+        if geom.persist_wgs > 0 || geom.col_y > 0 {
+            let tiles = (n_rows / rows_per_wg) as u64 * n_work_items as u64;
+            let grid = if geom.col_y > 0 {
+                (n_rows / rows_per_wg, n_work_items.min(geom.col_y), 1)
+            } else {
+                ((geom.persist_wgs as u64).min(tiles) as u32, 1, 1)
+            };
+            let cfg = LaunchConfig {
+                grid,
+                block: (32 * geom.waves, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return launch_kernel!(function, cfg, stream, [
+                partials.raw(), w_base.raw(), xq_base.raw(),
+                group_count.raw(), expert_members.raw(), work_items.raw(),
+                dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size,
+                n_rows, n_blocks_in, n_wi_dev, n_work_items
+            ]);
+        }
+        let cfg = LaunchConfig {
+            grid: (n_rows / rows_per_wg, n_work_items, 1),
+            block: (32 * geom.waves, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            partials.raw(), w_base.raw(), xq_base.raw(),
+            group_count.raw(), expert_members.raw(), work_items.raw(),
+            dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size,
+            n_rows, n_blocks_in, n_wi_dev
+        ])
     }
 
     /// int8-WMMA twin of [`Self::launch_by_expert_kwide2_ex`]

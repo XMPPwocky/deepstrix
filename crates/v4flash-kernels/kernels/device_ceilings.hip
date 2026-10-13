@@ -147,3 +147,79 @@ extern "C" __global__ void dp4a_probe(int* __restrict__ out,
     }
     out[gtid] = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7;
 }
+
+// Expert-slot streaming read: EXACTLY the weight bytes one decode MoE call
+// must move (n_used experts of `slot_bytes` each, at arbitrary pool slots),
+// with nothing else -- the achievable ceiling for that call shape, launch,
+// ramp and tail included. Grid (ceil(slot_bytes / chunk_bytes), n_used) x 256:
+// WG (x, y) streams bytes [x * chunk_bytes, (x + 1) * chunk_bytes) of slot
+// slots[y], 16 B per lane, CEIL_SLOT_UNROLL loads in flight per lane before
+// any is consumed (block-stride inside the chunk). chunk_bytes % 16 == 0 and
+// slot_bytes % 16 == 0 (the MXFP4 down expert: 6,266,880 B).
+#define CEIL_SLOT_UNROLL 8
+extern "C" __global__ void ceil_read_slots(const unsigned char* __restrict__ base,
+                                           const int* __restrict__ slots,
+                                           u64 slot_bytes,
+                                           u32 chunk_bytes,
+                                           u32* __restrict__ sink) {
+    const uint4* p = (const uint4*)(base + (u64)slots[blockIdx.y] * slot_bytes);
+    const u64 v_lo = (u64)blockIdx.x * (chunk_bytes / 16u);
+    u64 v_hi = v_lo + chunk_bytes / 16u;
+    if (v_hi > slot_bytes / 16u) v_hi = slot_bytes / 16u;
+    u32 acc = 0;
+    u64 i = v_lo + threadIdx.x;
+    const u32 st = blockDim.x;
+    for (; i + (CEIL_SLOT_UNROLL - 1) * st < v_hi; i += CEIL_SLOT_UNROLL * st) {
+        uint4 a[CEIL_SLOT_UNROLL];
+#pragma unroll
+        for (int k = 0; k < CEIL_SLOT_UNROLL; k++) a[k] = p[i + (u64)k * st];
+#pragma unroll
+        for (int k = 0; k < CEIL_SLOT_UNROLL; k++) acc ^= a[k].x ^ a[k].y ^ a[k].z ^ a[k].w;
+    }
+    for (; i < v_hi; i += st) {
+        const uint4 a = p[i];
+        acc ^= a.x ^ a.y ^ a.z ^ a.w;
+    }
+    if (acc == 0x9e3779b9u) sink[0] = acc;
+}
+
+// ceil_read_slots in the MXFP4 down kernels' LANE pattern: the chunk is walked in
+// 1088 B groups of 8 super-blocks (136 B); lane (bl = lane >> 2, sub = lane & 3) of a
+// wave reads its 2 x 16 B nibble blocks at bl * 136 + 32 * sub (+16) and the dword
+// holding its 2 scale bytes at bl * 136 + 128 + 4 * (sub >> 1) -- 3 loads per lane
+// per 1088 B instead of a coalesced 512 B per instruction. Same bytes as
+// ceil_read_slots; chunk_bytes % 1088 == 0, slot_bytes % chunk_bytes == 0.
+#define CEIL_MX_UNROLL 4
+extern "C" __global__ void ceil_read_slots_mx(const unsigned char* __restrict__ base,
+                                              const int* __restrict__ slots,
+                                              u64 slot_bytes,
+                                              u32 chunk_bytes,
+                                              u32* __restrict__ sink) {
+    const unsigned char* p = base + (u64)slots[blockIdx.y] * slot_bytes + (u64)blockIdx.x * chunk_bytes;
+    const u32 lane = threadIdx.x & 31u, wave = threadIdx.x >> 5, n_waves = blockDim.x >> 5;
+    const u32 bl = lane >> 2, sub = lane & 3u;
+    const u32 groups = chunk_bytes / 1088u;
+    u32 acc = 0;
+    u32 g = wave;
+    for (; g + (CEIL_MX_UNROLL - 1) * n_waves < groups; g += CEIL_MX_UNROLL * n_waves) {
+        uint4 a[CEIL_MX_UNROLL], b[CEIL_MX_UNROLL];
+        u32 s[CEIL_MX_UNROLL];
+#pragma unroll
+        for (int k = 0; k < CEIL_MX_UNROLL; k++) {
+            const unsigned char* sb = p + (u64)(g + k * n_waves) * 1088u + bl * 136u;
+            __builtin_memcpy(&a[k], __builtin_assume_aligned(sb + 32u * sub, 8), 16);
+            __builtin_memcpy(&b[k], __builtin_assume_aligned(sb + 32u * sub + 16u, 8), 16);
+            s[k] = *(const u32*)__builtin_assume_aligned(sb + 128u + 4u * (sub >> 1), 4);
+        }
+#pragma unroll
+        for (int k = 0; k < CEIL_MX_UNROLL; k++) acc ^= a[k].x ^ a[k].y ^ a[k].z ^ a[k].w ^ b[k].x ^ b[k].y ^ b[k].z ^ b[k].w ^ s[k];
+    }
+    for (; g < groups; g += n_waves) {
+        const unsigned char* sb = p + (u64)g * 1088u + bl * 136u;
+        uint4 a, b;
+        __builtin_memcpy(&a, __builtin_assume_aligned(sb + 32u * sub, 8), 16);
+        __builtin_memcpy(&b, __builtin_assume_aligned(sb + 32u * sub + 16u, 8), 16);
+        acc ^= a.x ^ a.y ^ a.z ^ a.w ^ b.x ^ b.y ^ b.z ^ b.w ^ *(const u32*)__builtin_assume_aligned(sb + 128u + 4u * (sub >> 1), 4);
+    }
+    if (acc == 0x9e3779b9u) sink[0] = acc;
+}

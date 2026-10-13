@@ -475,6 +475,16 @@ pub fn moe_down_dn2_for(rows: u32) -> bool {
     *D && (1..=MOE_DOWN_DN2_MAX_ROWS).contains(&rows)
 }
 
+/// `V41_MOE_DOWN_DN3` (default OFF; `1` = on): a batched MXFP4 down pass of
+/// `rows <= 8` runs the decode kernel `mxfp4_matvec_par_by_expert_dn3_*`
+/// ([`crate::mxfp4::DN3_DEFAULT`]) instead of dn2: same contract, BIT-IDENTICAL
+/// partials (tests/mxfp4_down_dn3.rs). Read once.
+pub fn moe_down_dn3_for(rows: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MOE_DOWN_DN3").as_deref() == Ok("1"));
+    *D && (1..=MOE_DOWN_DN2_MAX_ROWS).contains(&rows)
+}
+
 /// `V41_MOE_WMMA_GATEUP` (default ON; `0` = the kwide gate+up at every size):
 /// an MXFP4 gate+up pass (kwide selected) of `rows >= 256` runs the int8-WMMA
 /// arm `mxfp4_pair_matvec_fused_swiglu_wmma` (gfx1151 only). The rule is the
@@ -601,6 +611,15 @@ pub fn moe_down_mxfp4(
         let f16 = moe_wmma_f16_on() && e.mxfp4.has_wmma_f16();
         return e.mxfp4.launch_by_expert_wmma_arm(
             f16, s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
+            dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
+        );
+    }
+    if moe_down_dn3_for(rows)
+        && n_blocks_in == crate::mxfp4::SMALLB_DOWN_N_BLOCKS_IN
+        && n_rows % (crate::mxfp4::DN3_DEFAULT.rows_per_wave * crate::mxfp4::DN3_DEFAULT.waves) == 0
+    {
+        return e.mxfp4.launch_by_expert_dn3_ex(
+            s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
             dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
         );
     }
