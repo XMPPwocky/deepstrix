@@ -226,7 +226,9 @@ fn cur_group(e: &DeviceEngine, s: &Stream, bf: &mut Bufs, b: u32, ev: bool, tail
 /// would leave them in DRAM: a pessimistic collapse.)
 fn touch_x(e: &DeviceEngine, s: &Stream, bf: &mut Bufs, b: u32) -> eyre::Result<()> {
     let _ = &bf.x_src;
-    e.vec_scale.launch(s, &mut bf.x, 1.0, b * 4 * NE as u32)
+    e.vec_scale.launch(s, &mut bf.x, 1.0, b * 4 * NE as u32)?;
+    // and the carry (production: written by the previous sub-block's mix-late launch)
+    e.vec_scale.launch(s, &mut bf.carry, 1.0, b * 24)
 }
 
 fn offsets(b: usize) -> G1PackOffsets {
@@ -420,7 +422,7 @@ fn bench_g1_router_block() -> eyre::Result<()> {
         for &b in &bs {
             let mut vs = vec![v4flash_kernels::g1_router_block::g1_variant_for(b)];
             for v in &vlist {
-                if !vs.contains(v) && v.0 >= b {
+                if !vs.contains(v) && (v.0 >= b || (v.0 == 8 && v.2 > 0 && v.1 < 160)) {
                     vs.push(*v);
                 }
             }
@@ -489,7 +491,7 @@ fn bench_g1_router_block() -> eyre::Result<()> {
         let dv = v4flash_kernels::g1_router_block::g1_variant_for(b);
         let mut variants = vec![dv];
         for v in &vlist {
-            if !variants.contains(v) && v.0 >= b {
+            if !variants.contains(v) && (v.0 >= b || (v.0 == 8 && v.2 > 0 && v.1 < 160)) {
                 variants.push(*v);
             }
         }

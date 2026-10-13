@@ -276,11 +276,14 @@ fn weights(id: i32, rng: &mut Lcg) -> eyre::Result<Weights> {
         up(id, &bytes)
     };
     // Duplicated rows -> exactly equal logits (with equal bias) -> the index tie-break decides.
-    let dups = [(7, 100), (200, 201), (3, 383), (50, 51), (51, 52)];
+    // (5, 37, 69) and (6, 38) share a lane (e % 32): ties inside one lane's sorted list.
+    let dups = [(7, 100), (200, 201), (3, 383), (50, 51), (51, 52), (5, 37), (37, 69), (6, 38)];
     let w0 = mk(&dups)?;
     let w1 = mk(&dups)?;
     let mut bias = |rng: &mut Lcg| -> Vec<f32> {
         let mut v: Vec<f32> = (0..NX).map(|_| rng.sym(0.05)).collect();
+        // the in-lane tie group (5, 37, 69) always in the top 6: its order IS the tie-break
+        v[5] = 3.0;
         for &(a, b) in &dups {
             v[b] = v[a];
         }
@@ -515,7 +518,7 @@ fn g1_router_block_is_bit_identical() -> eyre::Result<()> {
             for r in &refs {
                 for z in 0..bu {
                     let row = &r.sel[z * NU..(z + 1) * NU];
-                    if [(7, 100), (200, 201), (50, 51), (51, 52), (3, 383)].iter().any(|&(a, bb)| row.contains(&a) && row.contains(&bb)) {
+                    if [(7, 100), (200, 201), (50, 51), (51, 52), (3, 383), (5, 37), (37, 69), (6, 38)].iter().any(|&(a, bb)| row.contains(&a) && row.contains(&bb)) {
                         ties_sel += 1;
                     }
                 }
@@ -524,7 +527,7 @@ fn g1_router_block_is_bit_identical() -> eyre::Result<()> {
                     q8_ties_seen = true;
                 }
             }
-            for &v in VARIANTS.iter().filter(|v| v.0 >= b) {
+            for &v in VARIANTS.iter().filter(|v| v.0 >= b || (v.0 == 8 && v.2 > 0 && v.1 < 160)) {
                 for l in lanes.iter_mut() {
                     l.poison()?;
                 }
