@@ -850,6 +850,13 @@ crate::knobs! {
     /// (stage_b's R1 at decode rows), so a captured / replayed router never disagrees with the look-ahead
     /// site about who computed layer l+1's logits.
     pub static DGPU_ROUTER_X2 = Knob::flag("V41_DGPU_ROUTER_X2", true).live();
+    /// `V41_DGPU_QKV_FRONT` (default OFF; live, read per lane-layer): fusion group G2 -- the decode
+    /// attention front (input quantize, q_a + kv GEMVs, q_a rms + quantize, q_b GEMV, q rope, kv
+    /// rms / rope / fp8, window append: 8 launches) as TWO (`QkvFront::launch_a` / `launch_b`),
+    /// bit-identical (tests/qkv_front_bitexact.rs). Only at rows 1..=8 on the dp4a arms with
+    /// `V41_DEC_FUSE`, on the DIRECT path (no graph capture / replay); everything else keeps the
+    /// chain. tests/bench_qkv_front_chain.rs: -17..-18 us per lane-layer (cold, b = 1..8).
+    pub static DGPU_QKV_FRONT = Knob::flag("V41_DGPU_QKV_FRONT", false).live();
     /// `V41_MTP_MHC_FAST` (default on; live, read per drafter sub-block): each DSpark drafter mHC
     /// sub-block (RMS + the 24-row mix matvec per draft row + Sinkhorn split + carry copy + collapse
     /// + attn/ffn norm, ~10 launches) as ONE `MhcArena::launch_fast` (mode `MIX_NORMED`), bit-identical

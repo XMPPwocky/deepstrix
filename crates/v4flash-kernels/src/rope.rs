@@ -266,7 +266,7 @@ impl RopeTail {
     /// The device-side rope arguments `launch_batched` derives from `params`
     /// (theta_scale, mscale_eff, corr_low, corr_high), by the same expressions,
     /// for the fused round-2 kernels below.
-    fn device_args(params: &RopeParams, n_rot: u32) -> (f32, f32, f32, f32) {
+    pub(crate) fn device_args(params: &RopeParams, n_rot: u32) -> (f32, f32, f32, f32) {
         let theta_scale = params.freq_base.powf(-2.0 / n_rot as f32);
         let mscale_eff = if params.ext_factor != 0.0 && params.freq_scale > 0.0 {
             params.attn_factor * (1.0 + 0.1 * (1.0 / params.freq_scale).ln())
