@@ -5508,7 +5508,7 @@ impl HeterogeneousEngine {
         if crate::knobs::PREFILL_COLD_LATE_SKIP.on() {
             // GATE ONLY negative control: the late contribution is dropped.
             pg.pin_inflight(layer, &late, &ie.compute)?;
-            return self.moe_push_tail(bd, bi, sev, b, cs_n_embd);
+            return self.moe_push_tail(bd, bi, sev, b, cs_n_embd, layer);
         }
         // The late pass: the unit's launch body again, its output swapped into `ffn_moe`'s place.
         std::mem::swap(&mut bi.ffn_moe, bi.late_moe.as_mut().expect("allocated"));
@@ -5538,7 +5538,7 @@ impl HeterogeneousEngine {
                 late.len(), l2(&lv), l2(&mv), lv.iter().any(|x| !x.is_finite()));
         }
         ie.vec_add.launch(&ie.compute, &mut bi.ffn_moe, bi.late_moe.as_ref().expect("allocated"), n as u32)?;
-        self.moe_push_tail(bd, bi, sev, b, cs_n_embd)
+        self.moe_push_tail(bd, bi, sev, b, cs_n_embd, layer)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12511,7 +12511,7 @@ impl HeterogeneousEngine {
             self.set_current_cached(self.dgpu.device)?;
             return Ok(());
         }
-        self.moe_push_tail(bd, bi, sev, b, cs_n_embd)
+        self.moe_push_tail(bd, bi, sev, b, cs_n_embd, layer)
     }
 
     /// The end of a lane-layer's iGPU MoE: `moe_done`, the peer push of `bi.ffn_moe` into `bd.ffn_moe_recv`,
@@ -12523,9 +12523,17 @@ impl HeterogeneousEngine {
         sev: &super::engine::LayerSyncEvents,
         b: u32,
         cs_n_embd: usize,
+        layer: i32,
     ) -> eyre::Result<()> {
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
+        if pin_pass() && *CAPTURE_LAYER == Some(layer) {
+            ie.compute.synchronize()?;
+            let n = (b as usize) * cs_n_embd;
+            let mut v = vec![0f32; n];
+            bi.ffn_moe.slice_view(0, n).copy_to_host(&mut v)?;
+            MOE_CAPTURES.lock().unwrap_or_else(|p| p.into_inner()).push((layer, b, v));
+        }
         // Record MoE-done so the iGPU xfer can wait without a host sync.
         sev.moe_done.record(&ie.compute)?;
         ie.xfer.wait_event(&sev.moe_done)?;
@@ -13288,6 +13296,17 @@ static LATE_SPENT: [std::sync::atomic::AtomicU32; N_LAYER as usize] = [const { s
 
 pub fn late_pass() -> bool {
     LATE_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// GATE ONLY (`V41_PREFILL_CAPTURE_MOE=<layer>`, tests/late_exactness.rs): during a layer-outer pass, each unit's final
+/// iGPU MoE output of that layer (`bi.ffn_moe` right before its push; after the late add for a late unit), in issue order.
+static CAPTURE_LAYER: std::sync::LazyLock<Option<i32>> =
+    std::sync::LazyLock::new(|| std::env::var("V41_PREFILL_CAPTURE_MOE").ok().and_then(|v| v.parse().ok()));
+static MOE_CAPTURES: std::sync::Mutex<Vec<(i32, u32, Vec<f32>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Take (and clear) the captured (layer, rows, values) MoE outputs.
+pub fn take_moe_captures() -> Vec<(i32, u32, Vec<f32>)> {
+    std::mem::take(&mut *MOE_CAPTURES.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
 fn late_budget_left(layer: usize) -> usize {

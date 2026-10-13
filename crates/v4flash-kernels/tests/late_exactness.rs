@@ -193,6 +193,9 @@ fn late_pass_matches_main_pass() -> eyre::Result<()> {
     if std::env::var("V41_REMOTE_ADDR").is_err() {
         return Err(eyre!("the late pass exists only under the box-2 partition: set V41_REMOTE_ADDR (box 2 up)"));
     }
+    // The verdict compares layer-0 MoE outputs (identical inputs in every arm): end-to-end logits compound f32
+    // reassociation through discrete router / indexer near-ties and saturate (gate runs 2-3, 10-12).
+    std::env::set_var("V41_PREFILL_CAPTURE_MOE", std::env::var("GATE_LAYER").unwrap_or_else(|_| "0".into()));
     for (k, v) in [("V41_LM_LAYER_OUTER", "1"), ("V41_PREFILL_PIN_INFLIGHT", "1"), ("V41_PREFILL_COLD_ASYNC", "1"), ("V41_PREFILL_COLD_B1", "off")] {
         std::env::set_var(k, v);
     }
@@ -338,12 +341,14 @@ fn late_pass_matches_main_pass() -> eyre::Result<()> {
     let prompt = synth_prompt(21, env_usize("GATE_TOKENS", 5000));
     let rows_all = rows_for(pg.raw(), &prompt, 0)?;
     // One arm: (prefill logits, decode-step logits, windows, late picks counted in the arm).
-    let mut arm = |name: &str, force: &str, skip: &str, pg: &mut ExpertPager| -> eyre::Result<(Vec<f32>, Vec<Vec<f32>>, usize, u64)> {
+    let mut arm = |name: &str, force: &str, skip: &str, pg: &mut ExpertPager| -> eyre::Result<(Vec<f32>, Vec<Vec<f32>>, usize, u64, Vec<Vec<f32>>)> {
         v4flash_kernels::knobs::PREFILL_COLD_FORCE_LATE.set(force);
         v4flash_kernels::knobs::PREFILL_COLD_LATE_SKIP.set(skip);
         let landed0 = pg.late_stats().map_or(0, |x| x.2 + x.3);
         let mut st = fresh_state()?;
+        let _ = v4flash_kernels::het::forward_prefill::take_moe_captures();
         let (l, windows) = run(&prompt, 0, rows_all.clone(), &mut st, lm_rows, false, false, pg)?;
+        let caps: Vec<Vec<f32>> = v4flash_kernels::het::forward_prefill::take_moe_captures().into_iter().map(|c| c.2).collect();
         let landed1 = pg.late_stats().map_or(0, |x| x.2 + x.3);
         // Greedy decode steps, chunked (no late pass), off this arm's KV.
         let mut steps = Vec::new();
@@ -359,13 +364,19 @@ fn late_pass_matches_main_pass() -> eyre::Result<()> {
         }
         // Late picks joined in this arm (landed by a read + already resident at the join), from the pager.
         let late = landed1 - landed0;
-        eprintln!("  arm {name}: force {force} skip {skip}: {windows} layer-outer windows, late picks {late}, argmax {}", argmax(&l));
-        Ok((l, steps, windows, late))
+        eprintln!("  arm {name}: force {force} skip {skip}: {windows} layer-outer windows, late picks {late}, argmax {}, {} captured units", argmax(&l), caps.len());
+        Ok((l, steps, windows, late, caps))
     };
-    let (la, sa, wa, _) = arm("A", "0", "0", &mut pg)?;
-    let (la2, sa2, _, _) = arm("A2 (null)", "0", "0", &mut pg)?;
-    let (lb, sb, _, late_b) = arm("B (late)", &force_n, "0", &mut pg)?;
-    let (lx, sx, _, _) = arm("X (late dropped)", &force_n, "1", &mut pg)?;
+    let (la, sa, wa, _, ca) = arm("A", "0", "0", &mut pg)?;
+    let (la2, sa2, _, _, ca2) = arm("A2 (null)", "0", "0", &mut pg)?;
+    let (lb, sb, _, late_b, cb) = arm("B (late)", &force_n, "0", &mut pg)?;
+    let (lx, sx, _, _, cx) = arm("X (late dropped)", &force_n, "1", &mut pg)?;
+    // THE VERDICT: per-unit layer-0 MoE outputs (identical inputs in every arm).
+    let caprel = |x: &[Vec<f32>], y: &[Vec<f32>]| -> f64 { x.iter().zip(y).map(|(a, b)| rel(a, b)).fold(0.0, f64::max) };
+    let units_ok = !ca.is_empty() && ca.len() == cb.len() && ca.len() == cx.len() && ca.len() == ca2.len();
+    let (m_null, m_late, m_neg) = (caprel(&ca, &ca2), caprel(&ca, &cb), caprel(&ca, &cx));
+    let layer_tol = std::env::var("GATE_LAYER_TOL").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1e-4);
+    eprintln!("LAYER gate ({} units): max rel-L2 null {m_null:.3e}, late {m_late:.3e}, dropped {m_neg:.3e} (tol {layer_tol:.0e})", ca.len());
     v4flash_kernels::knobs::PREFILL_COLD_FORCE_LATE.set("0");
     v4flash_kernels::knobs::PREFILL_COLD_LATE_SKIP.set("0");
     let worst = |l: &[f32], s: &[Vec<f32>], l2: &[f32], s2: &[Vec<f32>]| -> f64 {
@@ -386,14 +397,18 @@ fn late_pass_matches_main_pass() -> eyre::Result<()> {
     if late_b == 0 {
         fail.push("arm B counted no late picks: the late path never ran".to_string());
     }
-    if !argmax_ok {
-        fail.push("argmax differs between A and B".to_string());
+    let _ = (argmax_ok, gate_k, gate_eps, d_null, d_late, d_neg); // end-to-end: information only (compounds, see above)
+    if !units_ok {
+        fail.push(format!("layer captures missing or unequal: A {} A2 {} B {} X {}", ca.len(), ca2.len(), cb.len(), cx.len()));
     }
-    if d_late > (gate_k * d_null).max(gate_eps) {
-        fail.push(format!("rel-L2(A, B) {d_late:.3e} > max({gate_k} x null {d_null:.3e}, {gate_eps:.0e})"));
+    if m_null != 0.0 {
+        fail.push(format!("layer null not bit-identical ({m_null:.3e}): no verdict"));
     }
-    if d_neg < gate_neg * d_late.max(gate_eps) {
-        fail.push(format!("negative control too close: rel-L2(A, X) {d_neg:.3e} < {gate_neg} x max(late, eps) -- the gate cannot see a missing late term"));
+    if m_late > layer_tol {
+        fail.push(format!("layer-0 MoE late vs main {m_late:.3e} > {layer_tol:.0e}"));
+    }
+    if m_neg < gate_neg * m_late.max(gate_eps * 1e-2) {
+        fail.push(format!("negative control too close at layer 0: dropped {m_neg:.3e} vs late {m_late:.3e}"));
     }
     if fail.is_empty() {
         eprintln!("LATE GATE PASS");
