@@ -299,6 +299,35 @@ fn weights(id: i32, rng: &mut Lcg) -> eyre::Result<Weights> {
     Ok(Weights { w0, w1, bias0: up(id, &b0)?, bias1: up(id, &b1)?, norm_w: up(id, &nw)? })
 }
 
+/// Weights whose top is one big exact tie: rows `t0 .. t0 + n` of both gates are copies of row t0 and
+/// share the highest bias, so every batch row's top-n_used is decided among n tied experts by the
+/// index rule. n > 32 exercises family "r"'s fallback (more than 32 candidates at the threshold);
+/// n = 384 makes every logit of a row equal.
+fn weights_tied(id: i32, rng: &mut Lcg, t0: usize, n: usize) -> eyre::Result<Weights> {
+    let mut mk = || -> eyre::Result<DeviceBuffer<u8>> {
+        let mut w: Vec<u16> = (0..NX * NE).map(|_| f16_bits(rng.sym(0.03))).collect();
+        let row: Vec<u16> = w[t0 * NE..(t0 + 1) * NE].to_vec();
+        for r in t0..(t0 + n).min(NX) {
+            w[r * NE..(r + 1) * NE].copy_from_slice(&row);
+        }
+        let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        up(id, &bytes)
+    };
+    let w0 = mk()?;
+    let w1 = mk()?;
+    let mut bias = |rng: &mut Lcg| -> Vec<f32> {
+        let mut v: Vec<f32> = (0..NX).map(|_| rng.sym(0.05)).collect();
+        for r in t0..(t0 + n).min(NX) {
+            v[r] = 3.0;
+        }
+        v
+    };
+    let b0 = bias(rng);
+    let b1 = bias(rng);
+    let nw: Vec<f32> = (0..NE).map(|_| 0.5 + rng.sym(0.4).abs()).collect();
+    Ok(Weights { w0, w1, bias0: up(id, &b0)?, bias1: up(id, &b1)?, norm_w: up(id, &nw)? })
+}
+
 /// The production pack plan (forward_prefill.rs order): sel, look, look_ew, orig, range, ew, xq.
 fn plan_offsets(c: &Cfg, b: usize, l: &Lane) -> eyre::Result<(G1PackOffsets, usize)> {
     let mut plan = PackPlan::default();
@@ -527,7 +556,12 @@ fn g1_router_block_is_bit_identical() -> eyre::Result<()> {
                     q8_ties_seen = true;
                 }
             }
-            for &v in VARIANTS.iter().filter(|v| v.0 >= b || (v.0 == 8 && v.2 > 0 && v.1 < 160)) {
+            let vf = std::env::var("G1_VFILTER").unwrap_or_default();
+            for &v in VARIANTS
+                .iter()
+                .filter(|v| v4flash_kernels::g1_router_block::g1_variant_ok(**v, b) && v.0 < 1000)
+                .filter(|v| vf.is_empty() || vf.split(',').any(|f| v4flash_kernels::g1_router_block::g1_symbol(**v).contains(f)))
+            {
                 for l in lanes.iter_mut() {
                     l.poison()?;
                 }
@@ -554,8 +588,77 @@ fn g1_router_block_is_bit_identical() -> eyre::Result<()> {
     }
     eprintln!("checks {checks}, failures {fails}; rows with a tied duplicate pair both picked: {ties_sel}; xq checked: {q8_ties_seen}");
     let _ = HC_MIX_DIM;
+    let err = e.g1.error_word()?;
+    if err != 0 {
+        return Err(eyre!("G1 sticky error word {err:#x}: a bounded poll expired"));
+    }
     if fails > 0 {
         return Err(eyre!("{fails} of {checks} (b, cfg, variant, lane) runs differ from the production chain"));
+    }
+    Ok(())
+}
+
+/// Large exact ties at the top of the router (family "r"'s threshold-and-rank selection falls back to
+/// the serial passes above 32 candidates): 40 tied experts, and every expert tied. All variants, both
+/// lanes, b in {1, 3, 4, 8, 16}, against the production chain.
+#[test]
+#[ignore]
+fn g1_router_block_big_ties_bit_identical() -> eyre::Result<()> {
+    install_panic_handler();
+    let (dev, arch) = dgpu()?;
+    dev.set_current()?;
+    let id = dev.id;
+    let e = DeviceEngine::for_arch(dev, &arch)?;
+    let s = Stream::new(id)?;
+    let mut rng = Lcg(0x71e5_0bad);
+    let mut lanes = [Lane::new(id, &mut rng)?, Lane::new(id, &mut rng)?];
+    let mut checks = 0usize;
+    let mut fails = 0usize;
+    for &(t0, n) in &[(10usize, 40usize), (0, 384), (100, 6), (300, 33)] {
+        let w = weights_tied(id, &mut rng, t0, n)?;
+        for &b in &[1u32, 3, 4, 8, 16] {
+            let bu = b as usize;
+            for c in &CFGS {
+                let mut refs = Vec::new();
+                for (li, l) in lanes.iter_mut().enumerate() {
+                    l.poison()?;
+                    run_reference(&e, &s, &w, l, c, b, 3 + li)?;
+                    s.synchronize()?;
+                    refs.push(l.snap(bu)?);
+                }
+                for &v in VARIANTS.iter().filter(|v| v4flash_kernels::g1_router_block::g1_variant_ok(**v, b) && v.0 < 1000) {
+                    for l in lanes.iter_mut() {
+                        l.poison()?;
+                    }
+                    s.synchronize()?;
+                    for (li, l) in lanes.iter_mut().enumerate() {
+                        run_fused(&e, &s, &w, l, c, b, 3 + li, v)?;
+                    }
+                    s.synchronize()?;
+                    for (li, l) in lanes.iter().enumerate() {
+                        let f = l.snap(bu)?;
+                        let (_, words) = plan_offsets(c, bu, l)?;
+                        let d = diff(&refs[li], &f, c, words);
+                        checks += 1;
+                        if !d.is_empty() {
+                            fails += 1;
+                            if fails <= 10 {
+                                eprintln!("FAIL tie ({t0}, {n}) b={b} cfg={} {v:?} lane {li}:\n  {}", c.name, d.join("\n  "));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("tie block ({t0}, {n}): done ({fails} failures so far)");
+    }
+    eprintln!("big ties: checks {checks}, failures {fails}");
+    let err = e.g1.error_word()?;
+    if err != 0 {
+        return Err(eyre!("G1 sticky error word {err:#x}: a bounded poll expired"));
+    }
+    if fails > 0 {
+        return Err(eyre!("{fails} of {checks} runs differ from the production chain"));
     }
     Ok(())
 }

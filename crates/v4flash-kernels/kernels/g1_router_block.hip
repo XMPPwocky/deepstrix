@@ -19,6 +19,10 @@
 // expert index) with the weights summed in pick order, and each Q8_K block keeps q8_k_quantize's
 // expressions and its tree's tie rule (below).
 //
+// Two kernel families share the roles and the arithmetic below: the round-1 forms (g1_body: symbols
+// _z / _p) and FAMILY "r" (g1r_body, the default since round 2: see its header further down for the
+// measured hardware behaviour it is scheduled around).
+//
 // DEPENDENCY GRAPH -> ROLES. Every workgroup draws a TICKET (atomic) on entry and takes its role from
 // it, so a workgroup that waits only ever waits on LOWER tickets, which were drawn by workgroups that
 // are already resident: forward progress needs no assumption about the hardware's dispatch order
@@ -694,7 +698,7 @@ __device__ __forceinline__ void g1_prefetch(const G1Args& a, unsigned idx, unsig
 // The cache prior's WG (ticket b, when there is a prior): pinned host -> d_prior, RELEASE prior_ready.
 // Its own WG: a PCIe read is slow, and the in-order load counter would make a WG wait for it before
 // any later load of its own.
-__device__ void g1_prior(const G1Args& a, unsigned tid) {
+__device__ __forceinline__ void g1_prior(const G1Args& a, unsigned tid) {
     const float p0 = a.prior_host[tid];
     const float p1 = (tid + G1_BLOCK < G1_NEXP) ? a.prior_host[tid + G1_BLOCK] : 0.0f;
     a.prior_dev[tid] = p0;
@@ -706,7 +710,7 @@ __device__ void g1_prior(const G1Args& a, unsigned tid) {
     }
 }
 
-__device__ void g1_collapse(const G1Args& a, unsigned z, unsigned tid, float* sq, unsigned long long* ts) {
+__device__ __forceinline__ void g1_collapse(const G1Args& a, unsigned z, unsigned tid, float* sq, unsigned long long* ts) {
     if (a.dbg & 256u) __builtin_amdgcn_s_setprio(3);
     const float* cxb = a.cx + (size_t)z * (size_t)(G1_HC * G1_NE);
     const float* cwb = a.carry + (size_t)z * (size_t)G1_MIX;
@@ -844,6 +848,686 @@ __device__ void g1_body(const G1Args& a) {
         }
     }
 }
+
+// ============================================================================================
+// FAMILY "r" (G1-optimal, symbols g1_router_block_r{ZB}_{CPP}_{P0}_{KW}_{RX}_p{KP}_w{NW}): the same
+// roles, outputs and per-output arithmetic as the families above (BIT-IDENTICAL to the production
+// chain: tests/g1_router_block_bitexact.rs), with the schedule rebuilt from what the hardware does.
+// Measured on gfx1201 beside the hub (tests/g1o_probe.rs + the in-kernel trace of
+// tests/bench_g1_router_block.rs, 10-13):
+//   (1) A CU's vector memory path is a FIFO: an L2-hot load issued behind a WG's 80 outstanding
+//       gate loads per lane waits ~10 us. Scalar loads do not queue there (0.35 us vs 0.09 idle).
+//   (2) The gate stream reaches the byte roof with only 8 u32 words per lane in flight (603 GB/s,
+//       the same as a whole-row prefetch); u16 lane-strided loads (h20's) peak at 533 GB/s.
+//   (3) Outstanding bytes slow every other access: store + fence 0.16 us at 10 words per lane in
+//       flight, 2.4 us at 40, 3.2 us at 80; scalar loads 0.23 -> 1.17 us. The collapse runs under
+//       the stream, so a deep prefetch delays its flag one-for-one.
+//   (4) `__syncthreads` drains every outstanding load in WGP mode (s_wait_loadcnt 0), so phase
+//       barriers here are LDS-only; and a scoped s_load can hit a stale scalar-cache line, so every
+//       poll invalidates the scalar cache first.
+// Hence:
+//   * ROUTER WG = NW waves, one gate row each, all b batch rows (each weight byte read once). Gate
+//     words are loaded as u32 (lane 2k+s loads word 32c + 16s + k = elements 64c + 32s + 2k, +1) and
+//     re-dealt to h20's lanes by ONE DPP quad swap + ONE v_perm per word: every lane still
+//     accumulates i = lane + 32 j, j ascending, with h20's FMA and shfl_down tree.
+//   * P0 words per lane are prefetched at entry, PACED (word c is issued once word c - KP landed):
+//     the stream runs at the roof under the collapse without queueing in front of it.
+//   * One wave per WG polls the collapse flags (scalar loads, not behind the stream); then each wave
+//     stages ITS share of x (ffn_input_norm) for RX phases ahead, issued in consumption order with
+//     its gate words (the FIFO returns x when the phase needs it). Per phase (CPP words = 64 CPP
+//     elements per row): write the phase's x share into an LDS slab, one LDS-only barrier, issue x
+//     for phase + RX and the gate words up to the ring front, then the phase's FMAs (LDS reads in
+//     batches, no branch on b in the loop: rows past b compute clamped copies that are discarded --
+//     a guarded row puts each LDS read in its own block and the waitcnt pass then drains the ring).
+//   * COLLAPSE WG: mhc_fast's collapse, its tree with LDS-only barriers and wave shuffles (the same
+//     adds in the same order); PRIOR WG: pulls the norm weight into L2 first, then copies the prior.
+//   * TAIL WGs (highest tickets): one selection task per wave, all in parallel. The selection is
+//     THRESHOLD + RANK: T = the n_used-th largest of the 32 lane maxima (every top-n_used element is
+//     >= T), the candidates >= T rank themselves under wfred's key; the serial passes remain as the
+//     fallback (> 32 candidates, or T <= ord(-INF)). The emit's prior compose is lane-parallel.
+// Every poll is bounded (G1R_SPIN_CAP ticks of the 100 MHz counter, 2 s): on expiry it sets the
+// sticky S_ERR word (G1RouterBlock::error_word) and proceeds, so a broken flag protocol fails the
+// tests instead of hanging the GPU. Forward progress as before: every wait is on lower tickets.
+// --------------------------------------------------------------------------------------------
+#define G1R_NWC (G1_NE / 64u)              // 80 u32 words per lane per gate row
+
+// A barrier that waits for this wave's LDS operations only (no global-load drain).
+__device__ __forceinline__ void g1r_lds_barrier() {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+#else
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#endif
+}
+
+#define G1R_SPIN_CAP 200000000ull          // 2 s at 100 MHz
+
+// (s_dcache_inv first: a scoped s_load alone was measured to return a stale flag from the scalar
+// cache -- polls timed out at the cap in tests/g1_router_block_bitexact.rs.)
+__device__ __forceinline__ unsigned g1_sload_dev(const unsigned* pv) {
+    // the address is uniform; make that explicit (an LDS-derived index looks divergent)
+    const unsigned long long pa = (unsigned long long)pv;
+    const unsigned lo = (unsigned)__builtin_amdgcn_readfirstlane((int)(unsigned)pa);
+    const unsigned hi = (unsigned)__builtin_amdgcn_readfirstlane((int)(unsigned)(pa >> 32));
+    const unsigned* p = (const unsigned*)(((unsigned long long)hi << 32) | lo);
+    unsigned r;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    asm volatile("s_dcache_inv\n\ts_wait_kmcnt 0x0\n\ts_load_b32 %0, %1, 0x0 scope:SCOPE_DEV\n\ts_wait_kmcnt 0x0" : "=s"(r) : "s"(p) : "memory");
+#else
+    asm volatile("s_dcache_inv\n\ts_load_dword %0, %1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)" : "=s"(r) : "s"(p) : "memory");
+#endif
+    return r;
+}
+
+// Invalidate this CU's vector caches (L0 / GL1) WITHOUT waiting on outstanding loads (a C++ acquire
+// fence waits for every outstanding load: the whole prefetched ring).
+__device__ __forceinline__ void g1_vinv() {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    asm volatile("global_inv scope:SCOPE_DEV" ::: "memory");
+#else
+    asm volatile("buffer_gl0_inv\n\tbuffer_gl1_inv" ::: "memory");
+#endif
+}
+
+// Wave-uniform bounded scalar poll until *p >= v (SLEEP: s_sleep units between polls).
+template <unsigned SLEEP = 2>
+__device__ __forceinline__ void g1_spoll_ge(const unsigned* p, unsigned v, unsigned* err) {
+    const unsigned long long t0 = g1_now();
+    while (g1_sload_dev(p) < v) {
+        if (g1_now() - t0 > G1R_SPIN_CAP) {
+            if ((threadIdx.x & 31u) == 0u) atomicOr(err, 1u);
+            break;
+        }
+        if constexpr (SLEEP > 0) __builtin_amdgcn_s_sleep(SLEEP);
+    }
+}
+
+#define S_ERR (S_WORDS)                    // sticky error word (its own line, after the flags)
+
+__device__ __forceinline__ void g1r_pin() { asm volatile("" ::: "memory"); }
+
+// Compile-time loop: f(g1_uc<I>{}) for I in [I0, N) (each body sees a constant index).
+template <unsigned V> struct g1_uc { static constexpr unsigned value = V; };
+template <unsigned I, unsigned N, class F>
+__device__ __forceinline__ void g1_static_for(F&& f) {
+    if constexpr (I < N) {
+        f(g1_uc<I>{});
+        g1_static_for<I + 1u, N>(f);
+    }
+}
+
+template <unsigned P0, unsigned CPP, unsigned KW>
+__host__ __device__ constexpr unsigned g1r_front(int ph) {
+    // gate words issued once phase ph's issue point has run (ph = -1: the entry prefetch).
+    // KW > 0: a ring KW words ahead of consumption (never below P0); KW = 0: CONTINUOUS -- P0 ahead and
+    // CPP more at every phase, so the stream does not pause while the phases catch up after the flag.
+    return ph < 0 ? (P0 < G1R_NWC ? P0 : G1R_NWC)
+         : KW == 0u ? (P0 + ((unsigned)ph + 1u) * CPP < G1R_NWC ? P0 + ((unsigned)ph + 1u) * CPP : G1R_NWC)
+                    : ((((unsigned)ph + 1u) * CPP + KW > P0 ? ((unsigned)ph + 1u) * CPP + KW : P0) < G1R_NWC
+                           ? (((unsigned)ph + 1u) * CPP + KW > P0 ? ((unsigned)ph + 1u) * CPP + KW : P0)
+                           : G1R_NWC);
+}
+
+template <unsigned ZB, unsigned CPP, unsigned P0, unsigned KW, unsigned RX, unsigned KP, unsigned NW, class BAR>
+__device__ __forceinline__ void g1r_router(const G1Args& a, unsigned mat, unsigned row, unsigned lane, unsigned warp,
+                                           float* sx, unsigned long long* ts, BAR&& bar) {
+    constexpr unsigned NPH = G1R_NWC / CPP;
+    constexpr unsigned PHE = 64u * CPP;
+    constexpr unsigned SLAB = ZB * PHE;
+    constexpr unsigned PRS = ZB * CPP;                 // (row, 64-element chunk) pairs per phase
+    constexpr unsigned NI = (PRS + NW - 1u) / NW;      // pairs staged per wave (the last ones clamped)
+    static_assert(G1R_NWC % CPP == 0 && RX >= 1 && RX <= NPH, "g1r shape");
+    const unsigned b = a.b;
+    const unsigned* __restrict__ wr = reinterpret_cast<const unsigned*>((mat == 0 ? a.w0 : a.w1) + (size_t)row * G1_NE);
+    const unsigned kk = lane >> 1, ss = lane & 1u;
+    const unsigned psel = ss ? 0x03020706u : 0x05040100u;
+    const float* __restrict__ xg = a.norm_out;
+    unsigned wv[G1R_NWC];
+    float xr[RX][NI][2];
+    // this wave's x share: pairs warp + NW i (clamped to the last pair: a duplicate load + the same
+    // LDS write, no branch); rows past b load row b - 1 (results discarded)
+    auto load_x = [&](unsigned q, float (&r)[NI][2]) {
+        #pragma unroll
+        for (unsigned i = 0; i < NI; ++i) {
+            const unsigned pr = min(warp + NW * i, PRS - 1u);
+            const unsigned z = min(pr / CPP, b - 1u), cs = pr % CPP;
+            const float* p = xg + (size_t)z * G1_NE + q * PHE + 64u * cs + lane;
+            r[i][0] = p[0];
+            r[i][1] = p[32];
+        }
+    };
+    auto write_x = [&](unsigned q, const float (&r)[NI][2]) {
+        float2* d = reinterpret_cast<float2*>(sx + (q & 1u) * SLAB);
+        #pragma unroll
+        for (unsigned i = 0; i < NI; ++i) {
+            const unsigned pr = min(warp + NW * i, PRS - 1u);
+            d[pr * 32u + lane] = make_float2(r[i][0], r[i][1]);   // pair (z, cs) at z * CPP + cs
+        }
+    };
+    // ---- entry prefetch: the first P0 words, PACED (word c issued once word c - KP has landed: the
+    // stream keeps ~KP words per lane in flight -- enough for the byte roof -- instead of queueing P0
+    // words at once, which delays the collapse's loads and stores by the queue's drain time)
+    g1_static_for<0u, g1r_front<P0, CPP, KW>(-1)>([&](auto cc_) {
+        constexpr unsigned c = decltype(cc_)::value;
+        if constexpr (KP > 0 && c >= KP) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+            asm volatile("s_wait_loadcnt %0" :: "n"(KP - 1) : "memory");
+#else
+            asm volatile("s_waitcnt vmcnt(%0)" :: "n"(KP - 1) : "memory");
+#endif
+        }
+        wv[c] = wr[32u * c + 16u * ss + kk];
+    });
+    g1r_pin();
+    G1_TS(2);
+    // ---- the rows' flags: ONE wave per WG polls (scalar loads are not behind the ring; a scalar-cache
+    // invalidate per poll -- every wave polling thrashed the WGP's scalar cache); the rest wait at an
+    // LDS-only barrier with their rings in flight
+    if (warp == 0 && !(a.dbg & 8u)) {
+        for (unsigned z = 0; z < b; ++z) g1_spoll_ge(a.sync + S_READY(z), 1u, a.sync + S_ERR);
+    }
+    bar();
+    g1_vinv();
+    G1_TS(3);
+    g1_static_for<0u, RX>([&](auto qc) { load_x(decltype(qc)::value, xr[decltype(qc)::value]); });
+    g1r_pin();
+    float acc[ZB];
+    #pragma unroll
+    for (unsigned z = 0; z < ZB; ++z) acc[z] = 0.0f;
+    unsigned long long* tph = (ts != nullptr) ? ts + 1024u * 16u : nullptr;   // bench: per-phase completion times
+    g1_static_for<0u, NPH>([&](auto phc) {
+        constexpr unsigned ph = decltype(phc)::value;
+        if (tph != nullptr && ph > 0) tph[ph - 1] = g1_now();
+        write_x(ph, xr[ph % RX]);
+        bar();
+        if constexpr (ph + RX < NPH) load_x(ph + RX, xr[ph % RX]);
+        constexpr unsigned c0 = g1r_front<P0, CPP, KW>((int)ph - 1), c1 = g1r_front<P0, CPP, KW>((int)ph);
+        g1_static_for<c0, c1>([&](auto cc_) {
+            constexpr unsigned c = decltype(cc_)::value;
+            wv[c] = wr[32u * c + 16u * ss + kk];
+        });
+        g1r_pin();
+        const float2* xs = reinterpret_cast<const float2*>(sx + (ph & 1u) * SLAB);
+        // Half-phases: all LDS reads of HC chunks x ZB rows first (one batch in flight), then their
+        // FMAs. Every row 0..ZB-1 is computed (rows past b: clamped copies, discarded): no branch in
+        // the loop -- a guarded row puts each LDS read in its own block, waited one at a time.
+        constexpr unsigned HC0 = CPP >= 4u ? CPP / 2u : CPP;
+        constexpr unsigned HC = (ZB >= 16u && HC0 > 1u) ? 1u : ((ZB >= 8u && HC0 > 2u) ? 2u : HC0);   // bound the LDS batch registers
+        g1_static_for<0u, CPP / HC>([&](auto hcc) {
+            constexpr unsigned h0 = decltype(hcc)::value * HC;
+            float2 xv[HC][ZB];
+            g1_static_for<0u, HC>([&](auto i_) {
+                constexpr unsigned i = decltype(i_)::value;
+                #pragma unroll
+                for (unsigned z = 0; z < ZB; ++z) xv[i][z] = xs[(z * CPP + h0 + i) * 32u + lane];
+            });
+            g1_static_for<0u, HC>([&](auto i_) {
+                constexpr unsigned i = decltype(i_)::value;
+                const unsigned u = wv[ph * CPP + h0 + i];
+                const unsigned o = (unsigned)__builtin_amdgcn_mov_dpp((int)u, 0xB1, 0xf, 0xf, false);   // quad_perm [1,0,3,2]
+                const unsigned e = __builtin_amdgcn_perm(o, u, psel);
+                const float w0 = __half2float(__ushort_as_half((unsigned short)(e & 0xffffu)));
+                const float w1 = __half2float(__ushort_as_half((unsigned short)(e >> 16)));
+                #pragma unroll
+                for (unsigned z = 0; z < ZB; ++z) {
+                    acc[z] += w0 * xv[i][z].x;
+                    acc[z] += w1 * xv[i][z].y;
+                }
+            });
+            // pin the FMA chain here (pure ALU is not ordered by the memory clobbers: the scheduler
+            // otherwise runs every chunk's DPP/perm first and the serial FMA chain last -> spills)
+            #pragma unroll
+            for (unsigned z = 0; z < ZB; ++z) asm volatile("" : "+v"(acc[z]));
+            __builtin_amdgcn_sched_barrier(0);
+        });
+    });
+    if (tph != nullptr) tph[NPH - 1] = g1_now();
+    float mine = 0.0f;
+    #pragma unroll
+    for (unsigned z = 0; z < ZB; ++z) {
+        if (z < b) {
+            const float s = g1_warp_sum(acc[z]);
+            const float s0 = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(s), 0));
+            if (lane == z) mine = s0;
+        }
+    }
+    if (lane < b) {
+        float* lg = mat == 0 ? a.logits0 : a.logits1;
+        const float* bias = mat == 0 ? a.bias0 : a.bias1;
+        lg[(size_t)lane * G1_NEXP + row] = mine;
+        const float p = sqrtf(g1_softplus_stable(mine));
+        a.scr[G1_SCR_PROB(mat, lane) + row] = p;
+        a.scr[G1_SCR_SCORE(mat, lane) + row] = (bias != nullptr) ? (p + bias[row]) : p;
+    }
+    G1_TS(4);
+}
+
+// Collapse WG of family "r" (32 NW threads): mhc_fast's collapse arithmetic verbatim on threads
+// 0..255; with NW > 8 the extra waves bring the (cold) norm weight into LDS meanwhile (no x load
+// queues behind a DRAM read in its wave's in-order counter); NW = 8 reads it last, from L2 (the
+// prior WG pulled it there first).
+template <unsigned NW>
+__device__ __forceinline__ void g1r_collapse(const G1Args& a, unsigned z, unsigned tid, float* sq, float* snw, unsigned long long* ts) {
+    float cv[G1_PE];
+    float nw[G1_PE];
+    if (tid >= G1_BLOCK) {
+        if constexpr (NW > 8u) {
+            const float4* nw4 = reinterpret_cast<const float4*>(a.norm_w);
+            float4* s4 = reinterpret_cast<float4*>(snw);
+            for (unsigned i = tid - G1_BLOCK; i < G1_NE / 4u; i += 32u * NW - G1_BLOCK) s4[i] = nw4[i];
+        }
+    } else {
+        const float* cxb = a.cx + (size_t)z * (size_t)(G1_HC * G1_NE);
+        const float* cwb = a.carry + (size_t)z * (size_t)G1_MIX;
+        float cw[G1_HC];
+        #pragma unroll
+        for (uint32_t h = 0; h < G1_HC; h++) cw[h] = cwb[h];
+        float xs[G1_HC][G1_PE];
+        #pragma unroll
+        for (uint32_t h = 0; h < G1_HC; h++) {
+            #pragma unroll
+            for (uint32_t j = 0; j < G1_PE; j++) xs[h][j] = cxb[(size_t)h * G1_NE + tid + G1_BLOCK * j];
+        }
+        if constexpr (NW == 8u) {
+            #pragma unroll
+            for (uint32_t j = 0; j < G1_PE; j++) nw[j] = a.norm_w[tid + G1_BLOCK * j];
+        }
+        __builtin_amdgcn_sched_barrier(0);   // keep this issue order
+        #pragma unroll
+        for (uint32_t j = 0; j < G1_PE; j++) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (uint32_t h = 0; h < G1_HC; h++) acc += xs[h][j] * cw[h];
+            cv[j] = acc;
+            a.cur_out[(size_t)z * G1_NE + tid + G1_BLOCK * j] = acc;
+        }
+        G1_TS(8);
+        double partial = 0.0;
+        #pragma unroll
+        for (uint32_t j = 0; j < G1_PE; j++) {
+            const float v = cv[j];
+            partial += (double)v * (double)v;
+        }
+        sq[tid] = (float)partial;
+    }
+    // mhc_fast's tree (sq[tid] += sq[tid + s], s = 128 .. 1) with LDS-only barriers (no wait on the cur
+    // stores) for the cross-wave levels and wave 0's shuffles for s <= 16: the same adds, same order.
+    if (NW > 8u) __syncthreads();   // the norm weight's LDS copy (extra waves) is complete too
+    g1r_lds_barrier();
+    if (tid < 128u) sq[tid] += sq[tid + 128u];
+    g1r_lds_barrier();
+    if (tid < 64u) sq[tid] += sq[tid + 64u];
+    g1r_lds_barrier();
+    if (tid < 32u) {
+        float v = sq[tid] + sq[tid + 32u];
+        #pragma unroll
+        for (unsigned s = 16u; s > 0u; s >>= 1) {
+            const float o = __shfl_down(v, s, 32);
+            if (tid < s) v = v + o;
+        }
+        if (tid == 0) sq[0] = v;
+    }
+    g1r_lds_barrier();
+    G1_TS(9);
+    if (tid < G1_BLOCK) {
+        const float mean_sq = sq[0] / (float)G1_NE;
+        const float nscale = rsqrtf(mean_sq + a.rms_eps);
+        #pragma unroll
+        for (uint32_t j = 0; j < G1_PE; j++) {
+            const float w = (NW > 8u) ? snw[tid + G1_BLOCK * j] : nw[j];
+            a.norm_out[(size_t)z * G1_NE + tid + G1_BLOCK * j] = cv[j] * nscale * w;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        __hip_atomic_store(a.sync + S_READY(z), 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    G1_TS(2);
+    const bool want_xq = (a.xq != nullptr) || (a.pack != nullptr && a.pk_xq != G1_NONE);
+    if (want_xq && !(a.dbg & 2u)) {
+        const unsigned lane = tid & (G1_WARP - 1u), warp = tid >> 5u;
+        #pragma nounroll
+        for (unsigned j = warp; j < G1_PE; j += NW) g1_q8k_block(a, z, j, lane);
+    }
+    G1_TS(3);
+}
+
+// ---- family "r" selection: the same winners as g1_pass (wfred's key: score order, then the lower
+// expert index), with a shorter dependent chain per pass: the lane's max by a max tree, its first
+// index by a bit-mask + find-first, the wave max by DPP, and the lower-index tie resolution only when
+// two lanes hold the max (ballot fast path). Winners stay in registers (lane k = pass k).
+__device__ __forceinline__ void g1r_sel_task(const G1Args& a, unsigned mat, unsigned z, unsigned kind, unsigned lane, G1Sel& sl,
+                                             float* sprob, unsigned long long* ts) {
+    const float* pr = a.scr + G1_SCR_PROB(mat, z);
+    const float* scv = a.scr + G1_SCR_SCORE(mat, z);
+    float sc[G1_EPL], pv[G1_EPL], pp[G1_EPL];
+    #pragma unroll
+    for (unsigned i = 0; i < G1_EPL; ++i) sc[i] = scv[lane + G1_WARP * i];
+    #pragma unroll
+    for (unsigned i = 0; i < G1_EPL; ++i) pp[i] = pr[lane + G1_WARP * i];
+    if (kind == 1u) {
+        #pragma unroll
+        for (unsigned i = 0; i < G1_EPL; ++i) pv[i] = a.prior_dev[lane + G1_WARP * i];
+    }
+    unsigned h[G1_EPL];
+    #pragma unroll
+    for (unsigned i = 0; i < G1_EPL; ++i) h[i] = g1_ord(kind == 1u ? (sc[i] + pv[i]) : sc[i]);
+    #pragma unroll
+    for (unsigned i = 0; i < G1_EPL; ++i) sprob[lane + G1_WARP * i] = pp[i];   // this task's probs (own wave only)
+    if (ts != nullptr) {   // bench trace: the scores are in (the loads' latency is behind us)
+        unsigned x = 0u;
+        #pragma unroll
+        for (unsigned i = 0; i < G1_EPL; ++i) x ^= h[i] ^ __float_as_uint(pp[i]);
+        asm volatile("" :: "v"(x));
+        ts[13] = g1_now();
+    }
+    int my_e = -1;
+    float my_p = 0.0f;
+    const unsigned kn = a.n_used;
+    // ---- THRESHOLD + RANK (exact, the same winners in the same order as the serial passes):
+    //   T = the kn-th largest of the 32 lane maxima: at least kn elements are >= T, so every one of the
+    //   top kn is >= T. The candidates (>= T; typically kn..12 of them) rank themselves against each
+    //   other under wfred's key (higher score, then the lower expert index); rank r -> pick r.
+    // Falls back to the serial passes when T <= ord(-INF) (the masked-to--INF re-pick semantics of the
+    // passes) or more than 32 candidates tie at or above T.
+    unsigned m01 = max(h[0], h[1]), m23 = max(h[2], h[3]), m45 = max(h[4], h[5]);
+    unsigned m67 = max(h[6], h[7]), m89 = max(h[8], h[9]), mab = max(h[10], h[11]);
+    unsigned mv = max(max(max(m01, m23), max(m45, m67)), max(m89, mab));
+    unsigned T = 0u;
+    #pragma nounroll
+    for (unsigned p = 0; p < kn; ++p) {
+        T = g1_wmax_u32(mv);
+        const unsigned bl = (unsigned)__builtin_amdgcn_ballot_w32(mv == T);
+        if (lane == (unsigned)__builtin_ctz(bl)) mv = 0u;
+    }
+    unsigned cm = 0u;
+    #pragma unroll
+    for (unsigned i = 0; i < G1_EPL; ++i) cm |= (h[i] >= T ? 1u : 0u) << i;
+    const unsigned cnt = (unsigned)__builtin_popcount(cm);
+    // exclusive prefix of cnt over the lanes (cnt <= 12: 4 bit planes x mbcnt) and the total
+    unsigned off = 0u, C = 0u;
+    #pragma unroll
+    for (unsigned bit = 0; bit < 4u; ++bit) {
+        const unsigned bb = (unsigned)__builtin_amdgcn_ballot_w32((cnt >> bit) & 1u);
+        off += __builtin_amdgcn_mbcnt_lo(bb, 0u) << bit;
+        C += (unsigned)__builtin_popcount(bb) << bit;
+    }
+    unsigned* ck = reinterpret_cast<unsigned*>(sprob + G1_NEXP);   // [32] keys, [32] indices, [8] picks
+    unsigned* ci = ck + 32;
+    unsigned* cw = ck + 64;
+    if (C <= 32u && T > 0x007fffffu) {
+        #pragma unroll
+        for (unsigned i = 0; i < G1_EPL; ++i) {
+            if ((cm >> i) & 1u) {
+                ck[off] = h[i];
+                ci[off] = lane + G1_WARP * i;
+                ++off;
+            }
+        }
+        const unsigned kl = lane < C ? ck[lane] : 0u;
+        const unsigned il = lane < C ? ci[lane] : 0xffffffffu;
+        unsigned rank = 0u;
+        #pragma nounroll
+        for (unsigned q = 0; q < C; ++q) {
+            const unsigned kq = (unsigned)__builtin_amdgcn_readlane((int)kl, (int)q);
+            const unsigned iq = (unsigned)__builtin_amdgcn_readlane((int)il, (int)q);
+            rank += (kq > kl || (kq == kl && iq < il)) ? 1u : 0u;
+        }
+        if (lane < C && rank < kn) cw[rank] = il;
+        if (lane < kn) my_e = (int)cw[lane];
+    } else {
+        #pragma nounroll
+        for (unsigned k = 0; k < kn; ++k) {
+            unsigned n01 = max(h[0], h[1]), n23 = max(h[2], h[3]), n45 = max(h[4], h[5]);
+            unsigned n67 = max(h[6], h[7]), n89 = max(h[8], h[9]), nab = max(h[10], h[11]);
+            const unsigned m = max(max(max(n01, n23), max(n45, n67)), max(n89, nab));
+            unsigned bits = 0u;
+            #pragma unroll
+            for (unsigned i = 0; i < G1_EPL; ++i) bits |= (h[i] == m ? 1u : 0u) << i;
+            const unsigned ib = (unsigned)__builtin_ctz(bits | (1u << 31));   // the lane's first maximum
+            const unsigned mh = g1_wmax_u32(m);
+            const unsigned bal = (unsigned)__builtin_amdgcn_ballot_w32(m == mh);
+            unsigned wl, wi;
+            if (__builtin_popcount(bal) == 1) {
+                wl = (unsigned)__builtin_ctz(bal);
+                wi = (unsigned)__builtin_amdgcn_readlane((int)ib, (int)wl);
+            } else {
+                const unsigned win = g1_wmin_u32(m == mh ? lane + G1_WARP * ib : 0xffffffffu);
+                wl = win & 31u;
+                wi = win >> 5;
+            }
+            if (lane == k) my_e = (int)(wl + G1_WARP * wi);
+            if (lane == wl) {
+                #pragma unroll
+                for (unsigned i = 0; i < G1_EPL; ++i)
+                    if (i == wi) h[i] = 0x007fffffu;   // ord(-INF): still a candidate, as wfred's masked score
+            }
+        }
+    }
+    if (lane < a.n_used) {
+        my_p = sprob[my_e];   // the winner's prob (written by this wave above: in-order LDS)
+        sl.e[z][kind][lane] = my_e;
+        sl.p[z][kind][lane] = my_p;
+    }
+    if (kind == 0u && mat == 0 && a.range_out != nullptr) {
+        float mx = -INFINITY, mn = INFINITY;
+        #pragma unroll
+        for (unsigned i = 0; i < G1_EPL; ++i) { mx = fmaxf(mx, sc[i]); mn = fminf(mn, sc[i]); }
+        const float range = g1_wmax_f32(mx) - g1_wmin_f32(mn);
+        if (lane == 0) {
+            a.range_out[z] = range;
+            if (a.pack != nullptr && a.pk_range != G1_NONE) a.pack[a.pk_range + z] = __float_as_uint(range);
+        }
+    }
+}
+
+// ---- family "r" emit: g1_emit_row's outputs; the prior compose is lane-parallel (each lane holds
+// one pick of each list; the protect test is a ballot) instead of LDS reads in a nested loop.
+__device__ __forceinline__ void g1r_emit_row(const G1Args& a, unsigned mat, unsigned z, unsigned lane, const G1Sel& sl) {
+    const bool prior = (mat == 0) && (a.prior_host != nullptr);
+    const unsigned n_used = a.n_used;
+    const unsigned n_protect = a.n_protect < n_used ? a.n_protect : n_used;
+    int e0 = -1, e1 = -1;
+    float p0 = 0.0f, p1 = 0.0f;
+    if (lane < n_used) {
+        e0 = sl.e[z][0][lane];
+        p0 = sl.p[z][0][lane];
+        if (prior) { e1 = sl.e[z][1][lane]; p1 = sl.p[z][1][lane]; }
+    }
+    int my_orig = e0, my_sel = e0;
+    float p_orig = p0, p_sel = p0;
+    if (prior) {
+        if (lane >= n_protect) { my_sel = -1; p_sel = 0.0f; }
+        unsigned cnt = n_protect;
+        #pragma nounroll
+        for (unsigned t = 0; t < n_used; ++t) {
+            const int e = __builtin_amdgcn_readlane(e1, (int)t);
+            const bool prot = __builtin_amdgcn_ballot_w32(lane < n_protect && e0 == e) != 0u;
+            if (!prot && cnt < n_used) {
+                const float pt = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(p1), (int)t));
+                if (lane == cnt) { my_sel = e; p_sel = pt; }
+                ++cnt;
+            }
+        }
+    }
+    const int plain = my_orig;   // the router's own top-n_used (what M62 counts)
+    if (prior && a.prior_dry != 0u) {
+        const int t = my_sel; my_sel = my_orig; my_orig = t;
+        const float tp = p_sel; p_sel = p_orig; p_orig = tp;
+    }
+    const float pj = (lane < n_used && my_sel >= 0) ? p_sel : 0.0f;
+    float sum = 0.0f;
+    #pragma nounroll
+    for (unsigned j = 0; j < n_used; ++j) sum += __int_as_float(__builtin_amdgcn_readlane(__float_as_int(pj), j));
+    if (sum < a.weight_eps) sum = a.weight_eps;
+    if (lane < n_used) {
+        const unsigned o = z * n_used + lane;
+        const float wj = pj / sum * a.scale;
+        if (mat == 0) {
+            a.sel[o] = my_sel;
+            a.ew[o] = wj;
+            if (a.orig_sel != nullptr) a.orig_sel[o] = my_orig;
+            if (a.pack != nullptr) {
+                if (a.pk_sel != G1_NONE) a.pack[a.pk_sel + o] = (unsigned)my_sel;
+                if (a.pk_ew != G1_NONE) a.pack[a.pk_ew + o] = __float_as_uint(wj);
+                if (a.pk_orig != G1_NONE) a.pack[a.pk_orig + o] = (unsigned)my_orig;
+            }
+            if (a.sel_bank != nullptr && plain >= 0 && (unsigned)plain < G1_NEXP)
+                atomicAdd(&a.sel_bank[a.bank_off + (unsigned)plain], 1u);
+        } else {
+            a.look_sel[o] = my_sel;
+            a.look_ew[o] = wj;
+            if (a.pack != nullptr) {
+                if (a.pk_look != G1_NONE) a.pack[a.pk_look + o] = (unsigned)my_sel;
+                if (a.pk_look_ew != G1_NONE) a.pack[a.pk_look_ew + o] = __float_as_uint(wj);
+            }
+        }
+    }
+}
+
+// Tail WG `ti` (NWV waves): (mat, rows z0..) selection tasks, one wave each, then the emits.
+template <unsigned NWV, unsigned NRW>
+__device__ __forceinline__ void g1r_tail(const G1Args& a, unsigned ti, unsigned tid, G1Sel& sl, unsigned long long* ts) {
+    const unsigned b = a.b;
+    const bool prior = a.prior_host != nullptr;
+    const unsigned k0 = prior ? 2u : 1u;
+    const unsigned rpw0 = NWV / k0;
+    const unsigned nt0 = (b + rpw0 - 1u) / rpw0;
+    unsigned mat, z0, kinds, rpw;
+    if (ti < nt0) { mat = 0; z0 = ti * rpw0; kinds = k0; rpw = rpw0; }
+    else { mat = 1; z0 = (ti - nt0) * NWV; kinds = 1; rpw = NWV; }
+    const unsigned nz = min(rpw, b - z0);
+    const unsigned lane = tid & (G1_WARP - 1u), warp = tid >> 5u;
+    if (warp == 0) {
+        g1_spoll_ge<0>(a.sync + S_RDONE(mat), NRW, a.sync + S_ERR);
+        if (mat == 0 && prior) g1_spoll_ge(a.sync + S_PRIOR, 1u, a.sync + S_ERR);
+    }
+    __syncthreads();
+    g1_vinv();
+    G1_TS(5);
+    if (!(a.dbg & 4u)) {
+        if (warp < nz * kinds)
+            g1r_sel_task(a, mat, z0 + warp / kinds, warp % kinds, lane, sl, reinterpret_cast<float*>(&sl + 1) + warp * (G1_NEXP + 80u), ts);
+        __syncthreads();
+        G1_TS(10);
+        if (warp < nz) g1r_emit_row(a, mat, z0 + warp, lane, sl);
+        G1_TS(11);
+    }
+    G1_TS(6);
+}
+
+template <unsigned NW>
+__device__ __forceinline__ unsigned g1r_number_of_tails(unsigned b, unsigned n_mat, bool prior) {
+    const unsigned rpw0 = prior ? NW / 2u : NW;
+    return (b + rpw0 - 1u) / rpw0 + (n_mat == 2u ? (b + NW - 1u) / NW : 0u);
+}
+
+template <unsigned ZB, unsigned CPP, unsigned P0, unsigned KW, unsigned RX, unsigned KP, unsigned NW>
+__device__ __forceinline__ void g1r_body(const G1Args& a) {
+    static_assert(NW >= 8u && G1_NEXP % NW == 0u, "g1r: NW waves per WG, a divisor of 384");
+    constexpr unsigned NRW = G1_NEXP / NW;                         // router WGs per matrix
+    __shared__ unsigned s_ticket;
+    constexpr unsigned SXF = 2u * ZB * 64u * CPP;                  // router x slabs
+    constexpr unsigned CLF = G1_BLOCK + (NW > 8u ? G1_NE : 0u);    // collapse: sq (+ norm weight)
+    constexpr unsigned SB0 = SXF > CLF ? SXF : CLF;
+    constexpr unsigned TLF = sizeof(G1Sel) / 4u + NW * (G1_NEXP + 80u);   // tail: G1Sel + per wave: probs + candidates
+    constexpr unsigned SBUF = SB0 > TLF ? SB0 : TLF;
+    __shared__ __attribute__((aligned(16))) float s_buf[SBUF];
+    static_assert(sizeof(G1Sel) % 16u == 0u, "g1r tail LDS");
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & (G1_WARP - 1u), warp = tid >> 5u;
+    const unsigned long long t_start = g1_now();
+    if (tid == 0) s_ticket = atomicAdd(a.sync + S_TICKET, 1u);
+    __syncthreads();
+    const unsigned t = s_ticket;
+    unsigned long long* ts = (a.ts != nullptr && tid == 0) ? a.ts + (size_t)t * 16u : nullptr;
+    G1_TS(1);
+    if (ts != nullptr) {
+        ts[0] = t_start;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        unsigned hw;
+        asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID1)" : "=s"(hw));
+        ts[14] = hw;   // bench trace: where this WG runs (WGP / SA / SE)
+#endif
+    }
+    const unsigned b = a.b;
+    const bool prior = a.prior_host != nullptr;
+    const unsigned np = 1u;                                         // the prior / L2-warm WG (always)
+    const unsigned nr = a.n_mat * NRW;
+    const unsigned total = b + np + nr + g1r_number_of_tails<NW>(b, a.n_mat, prior);
+
+    if (t < b) {
+        g1r_collapse<NW>(a, t, tid, s_buf, s_buf + G1_BLOCK, ts);
+    } else if (t < b + np) {
+        // the norm weight into L2 first (the collapse reads it last when NW = 8), then the prior
+        if (tid < G1_BLOCK) {
+            float s = 0.0f;
+            #pragma unroll
+            for (unsigned j = 0; j < G1_PE; ++j) s += a.norm_w[tid + G1_BLOCK * j];
+            if (s == 1234.5f && a.dbg == 0xfffffffeu) a.sync[S_TICKET + 1u] = 1u;   // never: keeps the loads
+        }
+        if (prior) {
+            for (unsigned i = tid; i < G1_NEXP; i += 32u * NW) a.prior_dev[i] = a.prior_host[i];
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence();
+                __hip_atomic_store(a.sync + S_PRIOR, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            }
+        }
+        G1_TS(3);
+    } else if (t < b + np + nr) {
+        const unsigned r = t - b - np;
+        const unsigned mat = r / NRW;
+        g1r_router<ZB, CPP, P0, KW, RX, KP, NW>(a, mat, (r - mat * NRW) * NW + warp, lane, warp, s_buf, ts, []() { g1r_lds_barrier(); });
+        __syncthreads();
+        if (tid == 0) {
+            __threadfence();
+            atomicAdd(a.sync + S_RDONE(mat), 1u);
+        }
+    } else {
+        g1r_tail<NW, NRW>(a, t - b - np - nr, tid, *reinterpret_cast<G1Sel*>(s_buf), ts);
+    }
+
+    // ---- finish: the last WG resets the scratch (not S_ERR) and posts the completion word.
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        const unsigned prev = atomicAdd(a.sync + S_FINISH, 1u);
+        G1_TS(7);
+        if (prev == total - 1u) {
+            __threadfence();
+            a.sync[S_TICKET] = 0u;
+            a.sync[S_RDONE(0)] = 0u;
+            a.sync[S_RDONE(1)] = 0u;
+            a.sync[S_PRIOR] = 0u;
+            for (unsigned z = 0; z < G1_MAXB; ++z) a.sync[S_READY(z)] = 0u;
+            a.sync[S_FINISH] = 0u;
+            if (a.done_word != nullptr) {
+                __threadfence_system();
+                __hip_atomic_store(a.done_word, a.done_value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+        }
+    }
+}
+
+// g1_router_block_r{ZB}_{CPP}_{P0}_{KW}_{RX}_p{KP}_w{NW}: ZB batch rows (b <= ZB), CPP u32 words per
+// phase, P0 words prefetched (paced, KP in flight), a ring KW words ahead (0: continuous issue), x
+// staged RX phases ahead, NW router waves (rows) per WG. The set G1_VARIANTS lists; chosen per b by
+// g1_variant_for (cold group wall, tests/bench_g1_router_block.rs, 10-13).
+#define G1R_KERNEL(ZB, CPP, P0, KW, RX, KP, NW)                                                                    \
+extern "C" __global__ __launch_bounds__(32 * NW) void                                                              \
+g1_router_block_r##ZB##_##CPP##_##P0##_##KW##_##RX##_p##KP##_w##NW(G1Args a) {                                    \
+    g1r_body<ZB, CPP, P0, KW, RX, KP, NW>(a);                                                                      \
+}
+G1R_KERNEL(1, 8, 24, 16, 2, 8, 8)
+G1R_KERNEL(2, 8, 24, 16, 2, 8, 8)
+G1R_KERNEL(3, 8, 24, 16, 2, 8, 8)
+G1R_KERNEL(4, 8, 24, 16, 2, 8, 8)
+G1R_KERNEL(4, 8, 32, 16, 2, 8, 8)
+G1R_KERNEL(4, 8, 40, 0, 3, 8, 8)
+G1R_KERNEL(8, 4, 24, 16, 4, 8, 8)
+G1R_KERNEL(16, 2, 24, 16, 8, 8, 8)
 
 // Symbols g1_router_block_z{ZB}_c{CH}: ZB = batch rows per router wave (>= b), CH = weight
 // elements per lane per chunk (bounds the x double-buffer: ZB * CH * 2 registers).

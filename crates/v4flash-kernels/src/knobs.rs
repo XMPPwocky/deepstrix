@@ -919,6 +919,10 @@ crate::knobs! {
     /// Bench 10-13 (tests/bench_g1_router_block.rs, cold weights, beside the hub): queued group wall
     /// b=1 66.1 -> 34.4 us, b=4 72.0 -> 39.6, b=8 88.7 -> 51.6, b=16 122.8 -> 73.1; lane-layer chain
     /// (bench_dgpu_chain_map reuse vs reuse_g1, warm) b=4 307.3 -> 283.1 us, host enqueue -12 us.
+    /// Round 2 (G1-optimal, same knob): the default kernels are family "r" (paced u32 gate ring, x
+    /// staged in consumption order, scalar flag polls, threshold + rank selection); cold group wall
+    /// vs round 1: b=1 33.6 -> 31.9 us, b=2 36.9 -> 34.3, b=4 41.5 -> 38.0, b=8 52.9 -> 50.2,
+    /// b=16 74.4 -> 72.2. `V41_DGPU_G1_VARIANT` (startup, bench / A/B) selects a round-1 kernel.
     pub static DGPU_G1_FUSED = Knob::flag("V41_DGPU_G1_FUSED", false).live();
     /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
     /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top

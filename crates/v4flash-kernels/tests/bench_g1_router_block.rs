@@ -422,16 +422,22 @@ fn bench_g1_router_block() -> eyre::Result<()> {
         for &b in &bs {
             let mut vs = vec![v4flash_kernels::g1_router_block::g1_variant_for(b)];
             for v in &vlist {
-                if !vs.contains(v) && (v.0 >= b || (v.0 == 8 && v.2 > 0 && v.1 < 160)) {
+                if !vs.contains(v) && v4flash_kernels::g1_router_block::g1_variant_ok(*v, b) {
                     vs.push(*v);
                 }
             }
             for &v in &vs {
                 let (zb, pf) = (v.0, v.1);
-                let total = v4flash_kernels::g1_router_block::G1RouterBlock::grid(b, true, true) as usize;
-                let nq = 1usize; // the prior's WG
-                let n_rwg = (total - b as usize - nq) / 2;
-                let mut acc: Vec<Vec<f64>> = vec![Vec::new(); 22];
+                let total = v4flash_kernels::g1_router_block::G1RouterBlock::grid_for(b, true, true, v) as usize;
+                let nq = 1usize; // the prior's WG (family r: always present)
+                let n_rwg = if v4flash_kernels::g1_router_block::g1_is_r(v) { 384 / v4flash_kernels::g1_router_block::g1r_nw(v) as usize } else { 48usize };
+                let mut acc: Vec<Vec<f64>> = vec![Vec::new(); 24];
+                // family r: router logits time by how many WGs share the router WG's WGP (HW_ID1 in slot 14)
+                let mut by_occ: std::collections::BTreeMap<usize, Vec<f64>> = Default::default();
+                // family r (CPP 8): per-phase completion time across router WGs (p50 / max per launch)
+                let mut ph_p50: Vec<Vec<f64>> = vec![Vec::new(); 10];
+                let mut ph_max: Vec<Vec<f64>> = vec![Vec::new(); 10];
+                let mut slow_roles: std::collections::BTreeMap<String, usize> = Default::default();
                 for _ in 0..rounds.min(60) {
                     rig.ramp(ramp_us)?;
                     rig.time_q(!warm, &mut |st, m| if m { g1_group(&e, st, &mut bf, b, v, false, None) } else { touch_x(&e, st, &mut bf, b) })?;
@@ -441,6 +447,7 @@ fn bench_g1_router_block() -> eyre::Result<()> {
                     let us = |v: u64| (v.saturating_sub(t0)) as f64 / 100.0; // 100 MHz
                     let coll: Vec<usize> = (0..b as usize).collect();
                     let rout: Vec<usize> = (b as usize + nq..total).collect();
+                    let fslot = 2;
                     let q8w: Vec<usize> = (b as usize..b as usize + nq).collect();
                     let mx = |ks: &[usize], s: usize| ks.iter().map(|&k| us(t(k, s))).fold(0f64, f64::max);
                     let md = |ks: &[usize], s: usize| pct(&ks.iter().map(|&k| us(t(k, s))).collect::<Vec<_>>(), 0.5);
@@ -448,7 +455,7 @@ fn bench_g1_router_block() -> eyre::Result<()> {
                     let vals = [
                         mx(&(0..total).collect::<Vec<_>>(), 0), // last WG start
                         md(&rout, 1),                            // router ticket p50
-                        mx(&coll, 2),                            // collapse flag (last row)
+                        mx(&coll, fslot),                        // collapse flag (last row)
                         mx(&q8w, 2).max(mx(&coll, 3)),           // q8k / prior end
                         md(&rout, 2),                            // router prefetch issued p50
                         md(&rout, 3),                            // router flag seen p50
@@ -468,18 +475,70 @@ fn bench_g1_router_block() -> eyre::Result<()> {
                         us(t(0, 8)),  // collapse 0: cur computed (loads consumed)
                         us(t(0, 9)),  // collapse 0: rms reduced
                         us(t(0, 2)),  // collapse 0: flag
+                        mx(&coll, 3),                // collapse: q8k done (max)
+                        pct(&tails.iter().map(|&k| us(t(k, 13)) - us(t(k, 5))).collect::<Vec<_>>(), 0.5), // family r: tail loads
                     ];
                     for (i, v) in vals.iter().enumerate() {
                         acc[i].push(*v);
+                    }
+                    if v4flash_kernels::g1_router_block::g1_is_r(v) && v.2 / 1_000_000 % 100 == 8 {
+                        for ph in 0..10 {
+                            let vals: Vec<f64> = rout.iter().take(2 * n_rwg).map(|&k| us(ts[(1024 + k) * 16 + ph])).collect();
+                            ph_p50[ph].push(pct(&vals, 0.5));
+                            ph_max[ph].push(pct(&vals, 1.0));
+                        }
+                        // the 4 slowest router WGs at phase 2: which roles share their WGP?
+                        let wgp = |k: usize| (t(k, 14) >> 10) & 0x7ff;
+                        let mut rs: Vec<usize> = rout.iter().take(2 * n_rwg).copied().collect();
+                        rs.sort_by(|&x, &y| ts[(1024 + y) * 16 + 2].cmp(&ts[(1024 + x) * 16 + 2]));
+                        for &k in rs.iter().take(4) {
+                            let mut co: Vec<String> = Vec::new();
+                            for j in 0..total {
+                                if j != k && wgp(j) == wgp(k) {
+                                    let role = if j < b as usize { "collapse" } else if j < b as usize + nq { "prior" } else if j < b as usize + nq + 2 * n_rwg { "router" } else { "tail" };
+                                    co.push(role.to_string());
+                                }
+                            }
+                            co.sort();
+                            *slow_roles.entry(co.join("+")).or_default() += 1;
+                        }
+                    }
+                    if v4flash_kernels::g1_router_block::g1_is_r(v) {
+                        let wgp = |k: usize| (t(k, 14) >> 10) & 0x7ff;
+                        let mut occ: std::collections::HashMap<u64, usize> = Default::default();
+                        let mut occr: std::collections::HashMap<u64, usize> = Default::default();
+                        for k in 0..total {
+                            *occ.entry(wgp(k)).or_default() += 1;
+                        }
+                        for &k in rout.iter().take(2 * n_rwg) {
+                            *occr.entry(wgp(k)).or_default() += 1;
+                        }
+                        for &k in rout.iter().take(2 * n_rwg) {
+                            by_occ.entry(10 * occ[&wgp(k)] + occr[&wgp(k)]).or_default().push(us(t(k, 4)));
+                        }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(gap_ms));
                 }
                 let names = ["last WG start", "router ticket p50", "collapse flag (max)", "q8k/prior end (max)", "router prefetch issued p50",
                     "router flag seen p50", "router flag seen max", "router logits p50", "router logits max", "tail start (first)", "tail end (last)",
-                    "last finish", "tails", "router WGs/mat", "tail row0: probs", "tail row0: passes", "tail row0: emit", "tail again (dbg 32)", "collapse0 ticket", "collapse0 cur done", "collapse0 rms done", "collapse0 flag"];
+                    "last finish", "tails", "router WGs/mat", "tail row0: probs", "tail row0: passes", "tail row0: emit", "tail again (dbg 32)", "collapse0 ticket", "collapse0 cur done", "collapse0 rms done", "collapse0 flag",
+                    "collapse q8k done max", "r: tail scores loaded"];
                 eprintln!("\n== TRACE b = {b} {v:?} ({}; us from the first WG's start, p50 over launches)", if warm { "WARM" } else { "COLD" });
                 for (i, n) in names.iter().enumerate() {
                     eprintln!("  {:<28} {:>8.2}   (p10 {:>7.2}, p90 {:>7.2})", n, pct(&acc[i], 0.5), pct(&acc[i], 0.1), pct(&acc[i], 0.9));
+                }
+                for (k, n) in &slow_roles {
+                    eprintln!("  slowest-4 router WGs share their WGP with [{k}]: {n}");
+                }
+                if !ph_p50[0].is_empty() {
+                    let mut line = String::from("  phase done (p50 WG / last WG):");
+                    for ph in 0..10 {
+                        line += &format!(" {:.1}/{:.1}", pct(&ph_p50[ph], 0.5), pct(&ph_max[ph], 0.5));
+                    }
+                    eprintln!("{line}");
+                }
+                for (o, v) in &by_occ {
+                    eprintln!("  router WGs on a WGP holding {} WGs ({} routers): {:>5} samples, logits p50 {:>6.2} p90 {:>6.2} max {:>6.2}", o / 10, o % 10, v.len(), pct(v, 0.5), pct(v, 0.9), pct(v, 1.0));
                 }
             }
         }
@@ -491,7 +550,7 @@ fn bench_g1_router_block() -> eyre::Result<()> {
         let dv = v4flash_kernels::g1_router_block::g1_variant_for(b);
         let mut variants = vec![dv];
         for v in &vlist {
-            if !variants.contains(v) && (v.0 >= b || (v.0 == 8 && v.2 > 0 && v.1 < 160)) {
+            if !variants.contains(v) && v4flash_kernels::g1_router_block::g1_variant_ok(*v, b) {
                 variants.push(*v);
             }
         }

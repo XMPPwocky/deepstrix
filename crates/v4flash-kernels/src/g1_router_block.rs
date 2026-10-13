@@ -5,6 +5,12 @@
 //! (tests/g1_router_block_bitexact.rs). See the kernel's header for the roles and the proof of
 //! forward progress (ticketed workgroups).
 //!
+//! Default kernels (`g1_variant_for`): family "r" (the kernel's FAMILY "r" header): u32 gate words in
+//! a paced ring at the byte roof, x staged in consumption order, scalar flag polls, LDS-only phase
+//! barriers, and threshold + rank selection tails. The round-1 families stay selectable through
+//! `V41_DGPU_G1_VARIANT` for A/B. Family "r"'s polls are bounded (2 s): an expired poll sets the
+//! sticky [`G1RouterBlock::error_word`] instead of hanging the GPU.
+//!
 //! The kernel keeps a small self-resetting scratch (`sync`, zero between launches): launches that
 //! share one [`G1RouterBlock`] must be STREAM-ORDERED (production: `de.compute` only).
 
@@ -21,7 +27,8 @@ pub const G1_N_EXPERT: u32 = 384;
 /// Picks per row the kernel supports.
 pub const G1_MAX_USED: u32 = 8;
 const G1_RWG: u32 = 48; // router WGs per matrix and batch slice (384 rows / 8 waves)
-const S_WORDS: usize = 32 * (5 + G1_MAX_B as usize); // one 128-byte line per word (the kernel's S_*)
+const S_WORDS: usize = 32 * (5 + G1_MAX_B as usize + 1); // one 128-byte line per word (the kernel's S_*, + S_ERR)
+const S_ERR: usize = 32 * (5 + G1_MAX_B as usize);
 const XQ_ROW_BYTES: usize = 20 * 292;
 /// A pack segment the launch does not write.
 pub const PK_NONE: u32 = u32::MAX;
@@ -163,14 +170,15 @@ pub struct G1RouterBlock {
     ts: Option<DeviceBuffer<u64>>,
 }
 
-/// The kernel variants (zb, ch, phe): ZB = batch rows per router wave. phe = 0: the REGISTER form
-/// `g1_router_block_z{zb}_c{ch}` (zb >= b; x read from L2 by every wave, ch weight elements per lane
-/// per chunk, h20's double-buffered loop); phe > 0: the PHASED-LDS form `g1_router_block_p{zb}_{phe}_{ch}`
-/// (x staged in LDS per K-slab of 32 * phe elements, a ring of ch weight elements per lane prefetched
-/// before the row wait; the zb = 8 forms loop over row slices of 8, so they cover b = 1..16). One
-/// wave per weight row: each weight byte is read once per slice and the launch is <= 114 WGs, all
-/// resident. Chosen per b from tests/bench_g1_router_block.rs (cold, beside the hub, 10-13).
-pub const G1_VARIANTS: [(u32, u32, u32); 10] = [
+/// The kernel variants, as tuples. Round-1 families (zb, ch, phe): ZB = batch rows per router wave;
+/// phe = 0: the REGISTER form `g1_router_block_z{zb}_c{ch}` (zb >= b; x read from L2 by every wave, ch
+/// weight elements per lane per chunk, h20's double-buffered loop); phe > 0: the PHASED-LDS form
+/// `g1_router_block_p{zb}_{phe}_{ch}` (the zb = 8 forms loop over row slices of 8, so they cover
+/// b = 1..16). Family "r" (ch = 108, see the kernel's FAMILY "r" header):
+/// (zb, 108, kp * 100_000_000 + cpp * 1_000_000 + p0 * 10_000 + kw * 100 + rx) ->
+/// `g1_router_block_r{zb}_{cpp}_{p0}_{kw}_{rx}_p{kp}_w8`: u32 gate words in a paced ring, x staged in
+/// consumption order, scalar flag polls, parallel threshold + rank selection tails.
+pub const G1_VARIANTS: [(u32, u32, u32); 18] = [
     (1, 20, 0),
     (2, 10, 0),
     (4, 8, 0),
@@ -181,18 +189,63 @@ pub const G1_VARIANTS: [(u32, u32, u32); 10] = [
     (8, 80, 20),
     (8, 40, 20),
     (16, 40, 10),
+    (1, 108, 808_241_602),
+    (2, 108, 808_241_602),
+    (3, 108, 808_241_602),
+    (4, 108, 808_241_602),
+    (4, 108, 808_321_602),
+    (4, 108, 808_400_003),
+    (8, 108, 804_241_604),
+    (16, 108, 802_241_608),
 ];
+
+/// Is `v` a family-"r" variant?
+pub fn g1_is_r(v: (u32, u32, u32)) -> bool {
+    v.1 == 108
+}
+
+/// Router waves (gate rows) per WG of a family-"r" variant (the symbol's `_w`).
+pub fn g1r_nw(v: (u32, u32, u32)) -> u32 {
+    v.1 - 100
+}
+
+/// Tail WGs of a family-"r" launch (the kernel's `g1r_number_of_tails`).
+fn g1r_tails(b: u32, look: bool, prior: bool, nw: u32) -> u32 {
+    let rpw0 = if prior { nw / 2 } else { nw };
+    b.div_ceil(rpw0) + if look { b.div_ceil(nw) } else { 0 }
+}
+
+/// Can variant `v` run `b` rows? (zb >= b, except the round-1 phased zb = 8 forms, which loop over
+/// row slices.)
+pub fn g1_variant_ok(v: (u32, u32, u32), b: u32) -> bool {
+    v.0 >= b || (!g1_is_r(v) && v.0 == 8 && v.2 > 0 && v.1 < 160)
+}
 
 /// The symbol of a variant.
 pub fn g1_symbol(v: (u32, u32, u32)) -> String {
-    if v.2 == 0 {
+    if g1_is_r(v) {
+        let p = v.2;
+        format!(
+            "g1_router_block_r{}_{}_{}_{}_{}_p{}_w{}",
+            v.0,
+            p / 1_000_000 % 100,
+            p / 10_000 % 100,
+            p / 100 % 100,
+            p % 100,
+            p / 100_000_000,
+            g1r_nw(v)
+        )
+    } else if v.2 == 0 {
         format!("g1_router_block_z{}_c{}", v.0, v.1)
     } else {
         format!("g1_router_block_p{}_{}_{}", v.0, v.2, v.1)
     }
 }
 
-/// The variant for `b` rows. `V41_DGPU_G1_VARIANT=zb,ch,phe` overrides (bench / tuning).
+/// The variant for `b` rows: family "r", one row count per launch shape (cold group wall, beside the
+/// hub, 10-13: b=1 33.6 -> 31.9 us, b=2 36.9 -> 34.3, b=3 40.0 -> 36.5, b=4 41.5 -> 38.0, b=8 52.9
+/// -> 50.2, b=16 74.4 -> 72.2 vs the round-1 table). `V41_DGPU_G1_VARIANT=zb,ch,phe` overrides
+/// (bench / A/B, startup), e.g. `4,8,0` for the round-1 b=4 kernel.
 pub fn g1_variant_for(b: u32) -> (u32, u32, u32) {
     static OVR: std::sync::LazyLock<Option<(u32, u32, u32)>> = std::sync::LazyLock::new(|| {
         let v = std::env::var("V41_DGPU_G1_VARIANT").ok()?;
@@ -200,15 +253,16 @@ pub fn g1_variant_for(b: u32) -> (u32, u32, u32) {
         Some((it.next()??, it.next()??, it.next().flatten().unwrap_or(0)))
     });
     if let Some(v) = *OVR {
-        if v.0 >= b || (v.0 == 8 && v.2 > 0 && v.1 < 160) {
+        if sym_ok(v) && g1_variant_ok(v, b) {
             return v;
         }
     }
     match b {
-        0..=2 => (2, 64, 32),
-        3..=4 => (4, 8, 0),
-        5..=8 => (8, 40, 20),
-        _ => (8, 40, 20),
+        0..=1 => (1, 108, 808_241_602),
+        2 => (2, 108, 808_241_602),
+        3..=4 => (4, 108, 808_321_602),
+        5..=8 => (8, 108, 804_241_604),
+        _ => (16, 108, 802_241_608),
     }
 }
 
@@ -259,6 +313,13 @@ impl G1RouterBlock {
         Ok(Self { module, sync, scr, ts })
     }
 
+    /// The sticky error word (family "r": a bounded poll expired; 0 = never). Synchronizes.
+    pub fn error_word(&self) -> eyre::Result<u32> {
+        let mut v = vec![0u32; S_WORDS];
+        self.sync.copy_to_host(&mut v)?;
+        Ok(v[S_ERR])
+    }
+
     /// Debug phase timestamps of the last launch (`V41_DGPU_G1_TS`, 100 MHz steady counter):
     /// `[ticket][8]`, see the kernel's `TS_*` slots. None when the knob is off.
     pub fn ts_dump(&self) -> eyre::Result<Option<Vec<u64>>> {
@@ -274,7 +335,27 @@ impl G1RouterBlock {
 
     /// Workgroups of one launch: `b` collapse WGs, the prior's WG, and 48 router WGs per matrix.
     pub fn grid(b: u32, look: bool, prior: bool) -> u32 {
-        b + prior as u32 + g1_n_pf() + (1 + look as u32) * G1_RWG
+        Self::grid_for(b, look, prior, g1_variant_for(b))
+    }
+
+    /// Workgroups of one launch of variant `v` (family "r": collapse WGs, the prior / L2-warm WG, the
+    /// router WGs and the selection tail WGs; no prefetch WGs).
+    pub fn grid_for(b: u32, look: bool, prior: bool, v: (u32, u32, u32)) -> u32 {
+        if g1_is_r(v) {
+            let nw = g1r_nw(v);
+            b + 1 + (1 + look as u32) * (G1_N_EXPERT / nw) + g1r_tails(b, look, prior, nw)
+        } else {
+            b + prior as u32 + g1_n_pf() + (1 + look as u32) * G1_RWG
+        }
+    }
+
+    /// Threads per workgroup of variant `v`.
+    pub fn block_for(v: (u32, u32, u32)) -> u32 {
+        if g1_is_r(v) {
+            32 * g1r_nw(v)
+        } else {
+            256
+        }
     }
 
     /// Launch the whole router block on `stream` (see the module docs: stream-ordered launches only).
@@ -293,7 +374,7 @@ impl G1RouterBlock {
             return Err(eyre!("g1_router_block: n_used {} must be in [1, {G1_MAX_USED}]", io.n_used));
         }
         // the phased zb = 8 forms (phe > 0, ch < 160) loop over row slices of 8; the others need zb >= b
-        if !sym_ok(v) || (zb < b && !(zb == 8 && v.2 > 0 && v.1 < 160)) {
+        if !sym_ok(v) || !g1_variant_ok(v, b) {
             return Err(eyre!("g1_router_block: no variant {v:?} for b {b}"));
         }
         let ne = crate::config::N_EMBD as usize;
@@ -361,7 +442,7 @@ impl G1RouterBlock {
             rms_eps: c.rms_eps,
             scale: io.scale,
             weight_eps: io.weight_eps,
-            n_pf: g1_n_pf(),
+            n_pf: if g1_is_r(v) { 0 } else { g1_n_pf() },
             dbg: g1_dbg(),
         };
         if let Some(l) = io.look.as_ref() {
@@ -416,7 +497,11 @@ impl G1RouterBlock {
         }
         let name = g1_symbol(v);
         let function = self.module.get_function(&name)?;
-        let cfg = LaunchConfig { grid: (Self::grid(b, io.look.is_some(), io.prior.is_some()), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid: (Self::grid_for(b, io.look.is_some(), io.prior.is_some(), v), 1, 1),
+            block: (Self::block_for(v), 1, 1),
+            shared_mem_bytes: 0,
+        };
         launch_kernel!(function, cfg, stream, [a])
     }
 }
