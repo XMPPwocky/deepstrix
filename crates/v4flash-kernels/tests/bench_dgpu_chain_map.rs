@@ -333,6 +333,12 @@ enum Op {
     EgQuantZc,     // Engram quantize reading the gathered rows straight from pinned host memory
     // --- dGPU fusion group G1 (V41_DGPU_G1_FUSED): MhcPreFfn .. RbPack + SelCount as ONE launch
     G1Fused,
+    // --- G2 (V41_DGPU_QKV_FRONT): QQuant + QA + KvMv + QRmsQuant as launch A; QB + QRope + KvRrf +
+    //     KvAppend as launch B
+    G2A,
+    G2B,
+    // --- G3 (V41_ATTN_G3): AttnMeta + Gather + Attn + ORopeQ as ONE launch
+    G3Attn,
 }
 
 use Op::*;
@@ -359,6 +365,9 @@ impl Op {
             EgH2d => b * ENGRAM_IN as usize * f,
             EgQuant | EgQuantZc => b * ENGRAM_IN as usize * (f + 1),
             G1Fused => 2 * f16_bytes(N_EXPERT, N_EMBD) + b * (hcd + 2 * ne) * f,
+            G2A => q8_bytes(N_LORA_Q, N_EMBD) + q8_bytes(N_HEAD_DIM, N_EMBD) + b * ne * f,
+            G2B => q8_bytes(Q_FLAT, N_LORA_Q) + b * Q_FLAT as usize * f,
+            G3Attn => b * (640 * 512 * 2 + Q_FLAT as usize * (f + 1)),
             EgMvQ => q8_bytes(ENGRAM_OUT_Q, ENGRAM_IN),
             EgGate => b * (2 * hcd + 5 * ne) * f,
             MhcPreAttn => f16_bytes(HC_MIX_DIM, HC_DIM) + b * (hcd + 2 * ne) * f,
@@ -428,6 +437,8 @@ impl Op {
             RouterMv | PriorH2d | RouterTopk | RouterTopkZc | LookTopk | XqQ8k => "router",
             RbPack | SelRecord | SelCount => "rb_pack",
             G1Fused => "g1_router_block",
+            G2A | G2B => "g2_qkv_front",
+            G3Attn => "g3_attn_block",
             ShQuant | ShFused | ShGate | ShUp | ShSwiglu | ShQuantMid | ShDown => "shared_expert",
             MixLate => "mix_ffn_late",
         }
@@ -468,6 +479,25 @@ fn chain(class: &str, b: u32) -> Vec<Op> {
                 match o {
                     MhcPreFfn => v.push(G1Fused),
                     RouterMv | PriorH2d | RouterTopk | LookTopk | XqQ8k | RbPack | SelCount => {}
+                    o => v.push(o),
+                }
+            }
+            return v;
+        }
+        // G2 alone / G3 alone / G1 + G2 + G3 together (the decode-opt branch with all three knobs on),
+        // each in production order.
+        "reuse_g2" | "reuse_g3" | "reuse_g123" => {
+            let (g1, g2, g3) = (class == "reuse_g123", class != "reuse_g3", class != "reuse_g2");
+            let mut v = Vec::new();
+            for o in chain("reuse", b) {
+                match o {
+                    QQuant if g2 => v.push(G2A),
+                    QB if g2 => v.push(G2B),
+                    QA | QRmsQuant | QRope | KvMv | KvRrf | KvAppend if g2 => {}
+                    Attn if g3 => v.push(G3Attn),
+                    AttnMeta | Gather | ORopeQ if g3 => {}
+                    MhcPreFfn if g1 => v.push(G1Fused),
+                    RouterMv | PriorH2d | RouterTopk | LookTopk | XqQ8k | RbPack | SelCount if g1 => {}
                     o => v.push(o),
                 }
             }
@@ -648,22 +678,36 @@ struct Bufs {
     gate_sh: DeviceBuffer<f32>,
     up_sh: DeviceBuffer<f32>,
     mid_sh: DeviceBuffer<f32>,
+    // G2 launch A's work-group ticket (0 between launches) / G3's zero key row
+    ticket: DeviceBuffer<u32>,
+    zero_row: DeviceBuffer<u16>,
+}
+
+/// The synthetic weight bytes: valid as Q8_0 blocks AND as f16 (see `Bufs::new_in`).
+fn weight_region(id: i32, bytes: usize) -> eyre::Result<DeviceBuffer<u8>> {
+    let mut h = vec![0u8; bytes];
+    for (i, x) in h.iter_mut().enumerate() {
+        *x = ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 37) as u8 & 0xBB;
+    }
+    let mut d = DeviceBuffer::<u8>::new(id, bytes)?;
+    d.copy_from_host(&h)?;
+    Ok(d)
 }
 
 impl Bufs {
     fn new(id: i32, rng: &mut Lcg, n_idx: u32) -> eyre::Result<Self> {
+        Self::new_in(id, rng, n_idx, None)
+    }
+    /// `shared`: alias another set's weight region (a view, no allocation) -- the combined bit-exact
+    /// check runs four buffer sets beside the hub and needs only the weights, not the flush range.
+    fn new_in(id: i32, rng: &mut Lcg, n_idx: u32, shared: Option<&DeviceBuffer<u8>>) -> eyre::Result<Self> {
         let b = BMAX;
         let (ne, hcd, m) = (N_EMBD as usize, HC_DIM as usize, HC_MIX_DIM as usize);
         // Weight bytes valid as Q8_0 blocks AND as f16: `& 0xBB` keeps every f16 high byte's exponent
         // field <= 14 (finite, |x| < 1); as int8 they are in [-128, 59]; Q8_0 scales are finite.
-        let region = {
-            let mut h = vec![0u8; REGION];
-            for (i, x) in h.iter_mut().enumerate() {
-                *x = ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 37) as u8 & 0xBB;
-            }
-            let mut d = DeviceBuffer::<u8>::new(id, REGION)?;
-            d.copy_from_host(&h)?;
-            d
+        let region = match shared {
+            Some(r) => r.slice_view(0, r.len()),
+            None => weight_region(id, REGION)?,
         };
         let carry0: Vec<f32> = (0..b * m).map(|i| if i % m < 4 { 0.25 } else { 0.1 }).collect();
         // One stream's rows at consecutive positions (a DSpark verify lane) deep in a long context.
@@ -840,6 +884,8 @@ impl Bufs {
             gate_sh: zeros(id, b * N_FF_SHARED as usize)?,
             up_sh: zeros(id, b * N_FF_SHARED as usize)?,
             mid_sh: dev_rand(id, b * N_FF_SHARED as usize, rng, 1.0)?,
+            ticket: zeros(id, 1)?,
+            zero_row: zeros(id, N_HEAD_DIM as usize)?,
         })
     }
     /// A weight view at the head of the region (every weight aliases [0, W_SPAN)). `slot` staggers
@@ -1109,7 +1155,9 @@ fn run(e: &DeviceEngine, s: &Stream, bf: &mut Bufs, op: Op, b: u32) -> eyre::Res
             e.rb_pack.launch(s, &mut bf.rb, plan.segs())
         }
         SelRecord => bf.sel_ev.record(s),
-        SelCount => e.expert_sel_count.launch(s, &mut bf.sel_bank, &bf.sel, 7, N_EXPERT, b * N_EXPERT_USED as u32),
+        // M62 counts the router's PLAIN picks: under the live cache prior (V41_SUB=3, not dry) that is
+        // `d_orig_sel` (forward_prefill `plain_sel`), not the prior-adjusted `d_selected`.
+        SelCount => e.expert_sel_count.launch(s, &mut bf.sel_bank, &bf.orig_sel, 7, N_EXPERT, b * N_EXPERT_USED as u32),
         G1Fused => {
             use v4flash_kernels::g1_router_block::{G1Collapse, G1Io, G1Look, G1PackOffsets, G1Prior};
             let (w0, w1) = (bf.w(f16_bytes(N_EXPERT, N_EMBD), 0), bf.w(f16_bytes(N_EXPERT, N_EMBD), 1));
@@ -1136,6 +1184,44 @@ fn run(e: &DeviceEngine, s: &Stream, bf: &mut Bufs, op: Op, b: u32) -> eyre::Res
                 b,
             };
             e.g1.launch(s, io)
+        }
+        G2A => {
+            let (wa, wkv) = (bf.w(q8_bytes(N_LORA_Q, N_EMBD), 0), bf.w(q8_bytes(N_HEAD_DIM, N_EMBD), 0));
+            e.qkv_front.launch_a(
+                s, &mut bf.qr, &mut bf.kv_raw, &wa, &wkv, &bf.attn_in, &mut bf.qr_normed, &mut bf.qr_xq, &mut bf.qr_xs, &bf.q_a_norm_w, RMS_EPS,
+                &mut bf.ticket, b, v4flash_kernels::qkv_front::grid_a(b),
+            )
+        }
+        G2B => {
+            let w = bf.w(q8_bytes(Q_FLAT, N_LORA_Q), 0);
+            let pos = bf.pos.slice_view(0, bu);
+            e.qkv_front.launch_b(
+                s, &mut bf.q_normed, &w, &bf.qr_xq, &bf.qr_xs, &pos, &bf.rope, &mut bf.kv_cache, &bf.kv_raw, &bf.kv_norm_w, RMS_EPS,
+                Some(&bf.slot_per), 0, b,
+            )
+        }
+        G3Attn => {
+            use v4flash_kernels::attn_dec_g3::{G3Comp, G3Rows};
+            let pos = bf.pos.slice_view(0, bu);
+            // Production writes the R1 `g3_heads_*` views; here the bench's own heads_xq / heads_xs
+            // (no aliasing in the bench) so OA reads it unchanged.
+            e.attn_g3.launch(
+                s,
+                None,
+                &mut bf.heads_xq,
+                &mut bf.heads_xs,
+                &bf.zero_row,
+                &bf.sinks,
+                &bf.q_normed,
+                &bf.kv_cache,
+                G3Comp::Selected { store: &bf.comp_store, sel: &bf.sel_saved, sel_stride: INDEXER_TOP_K, base: Some(&bf.comp_base) },
+                G3Rows { n_raw: &bf.n_raw_host[..bu], raw_off: &bf.n_off_host[..bu], n_comp: &bf.n_comp_host[..bu] },
+                &pos,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                &bf.rope,
+            )
         }
         ShQuant => e.q8.quantize_input_batched(s, &mut bf.xq, &mut bf.xs, &bf.ffn_in, N_EMBD, b),
         ShFused => {
@@ -1401,7 +1487,7 @@ type Stats = std::collections::HashMap<(u32, Op), (f64, f64, f64, f64, f64)>; //
 
 fn all_ops(b: u32) -> Vec<Op> {
     let mut v: Vec<Op> = vec![Empty];
-    for c in ["engram", "kvsrc", "index", "reuse", "reuse_zc", "reuse_min"] {
+    for c in ["engram", "kvsrc", "index", "reuse", "reuse_zc", "reuse_min", "reuse_g123"] {
         for op in chain(c, b) {
             if !v.contains(&op) {
                 v.push(op);
@@ -1470,7 +1556,7 @@ fn bw_gbs() -> f64 {
 // ---------------------------------------------------------------------------------------------
 fn section_chain(e: &DeviceEngine, rig: &mut Rig, bf: &mut Bufs, bs: &[u32], rounds: usize, rng: &mut Lcg, stats: &Stats) -> eyre::Result<()> {
     let classes_all = ["reuse", "reuse#AA", "index", "kvsrc", "route:reuse", "reuse_zc", "reuse_noev", "reuse_min", "route:reuse_zc",
-        "reuse_g1", "route:reuse_g1",
+        "reuse_g1", "route:reuse_g1", "reuse_g2", "reuse_g3", "reuse_g123", "route:reuse_g123",
         "probe_empty1", "probe_empty17", "probe_vadd17", "probe_pinned8", "probe_pageable8", "probe_event8", "probe_remote8"];
     let only = std::env::var("BENCH_CLASSES").ok();
     let classes: Vec<&str> = classes_all.iter().copied().filter(|c| *c == "reuse" || only.as_deref().map_or(true, |o| o.split(',').any(|x| x == *c))).collect();
@@ -1609,6 +1695,191 @@ fn bench_dgpu_chain_map() -> eyre::Result<()> {
     if let Ok(p) = std::env::var("BENCH_LABELS") {
         std::fs::write(&p, LABELS.lock().unwrap().join("\n"))?;
         eprintln!("labels -> {p}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// COMBINED bit-exactness: G1 + G2 + G3 (V41_DGPU_G1_FUSED + V41_DGPU_QKV_FRONT + V41_ATTN_G3) on
+// one lane-layer, in production order, vs the all-off production chain.
+// ---------------------------------------------------------------------------------------------
+fn bytes_of<T: Copy + Default>(d: &DeviceBuffer<T>) -> eyre::Result<Vec<u8>> {
+    let mut h = vec![T::default(); d.len()];
+    d.copy_to_host(&mut h)?;
+    // SAFETY: plain-old-data element types (f32 / i32 / u32 / u16 / i8 / u8), read as bytes.
+    Ok(unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u8, h.len() * std::mem::size_of::<T>()) }.to_vec())
+}
+
+/// Every buffer a lane-layer leaves for its readers, WHOLE (rows past b included, so the written set
+/// must match too). Left out on purpose -- dead hand-offs the fused paths no longer write and nothing
+/// downstream reads: `q` (q_b -> rope), `kv_normed` (kv tail -> append), the device metadata
+/// `n_raw_per` / `n_raw_off` / `n_comp_per` (G3 takes them in its arguments), `active` (the gather
+/// destination; G3 reads the selection in place), `heads` f32 (dead under V41_DEC_SKIP_DEAD; G3 is
+/// taken only then). The quantized heads (wo_a's input) ARE compared.
+fn lane_snapshot(bf: &Bufs) -> eyre::Result<Vec<(&'static str, Vec<u8>)>> {
+    Ok(vec![
+        ("residual_next", bytes_of(&bf.residual_next)?),
+        ("split", bytes_of(&bf.split)?),
+        ("mix", bytes_of(&bf.mix)?),
+        ("carry", bytes_of(&bf.carry)?),
+        ("mhc_counters", bytes_of(&bf.counters)?),
+        ("inv_rows", bytes_of(&bf.inv_rows)?),
+        ("attn_cur", bytes_of(&bf.attn_cur)?),
+        ("attn_in", bytes_of(&bf.attn_in)?),
+        ("xq", bytes_of(&bf.xq)?),
+        ("xs", bytes_of(&bf.xs)?),
+        ("qr", bytes_of(&bf.qr)?),
+        ("qr_normed", bytes_of(&bf.qr_normed)?),
+        ("qr_xq", bytes_of(&bf.qr_xq)?),
+        ("qr_xs", bytes_of(&bf.qr_xs)?),
+        ("q_normed", bytes_of(&bf.q_normed)?),
+        ("kv_raw", bytes_of(&bf.kv_raw)?),
+        ("kv_cache", bytes_of(&bf.kv_cache)?),
+        ("comp_store", bytes_of(&bf.comp_store)?),
+        ("heads_xq", bytes_of(&bf.heads_xq)?),
+        ("heads_xs", bytes_of(&bf.heads_xs)?),
+        ("low", bytes_of(&bf.low)?),
+        ("low_xq", bytes_of(&bf.low_xq)?),
+        ("low_xs", bytes_of(&bf.low_xs)?),
+        ("attn_out", bytes_of(&bf.attn_out)?),
+        ("after_attn_hc", bytes_of(&bf.after_attn_hc)?),
+        ("ffn_cur", bytes_of(&bf.ffn_cur)?),
+        ("ffn_in", bytes_of(&bf.ffn_in)?),
+        ("logits", bytes_of(&bf.logits)?),
+        ("logits2", bytes_of(&bf.logits2)?),
+        ("prior", bytes_of(&bf.prior)?),
+        ("sel", bytes_of(&bf.sel)?),
+        ("ew", bytes_of(&bf.ew)?),
+        ("orig_sel", bytes_of(&bf.orig_sel)?),
+        ("range", bytes_of(&bf.range)?),
+        ("look_sel", bytes_of(&bf.look_sel)?),
+        ("look_ew", bytes_of(&bf.look_ew)?),
+        ("rxq", bytes_of(&bf.rxq)?),
+        ("rb_pack", {
+            let w = bf.rb.as_slice();
+            // SAFETY: u32 words read as bytes.
+            unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) }.to_vec()
+        }),
+        ("sel_bank", bytes_of(&bf.sel_bank)?),
+        ("mid_xq", bytes_of(&bf.mid_xq)?),
+        ("mid_xs", bytes_of(&bf.mid_xs)?),
+        ("gate_sh", bytes_of(&bf.gate_sh)?),
+        ("up_sh", bytes_of(&bf.up_sh)?),
+        ("mid_sh", bytes_of(&bf.mid_sh)?),
+        ("ffn_shared", bytes_of(&bf.ffn_shared)?),
+        ("ticket", bytes_of(&bf.ticket)?),
+    ])
+}
+
+/// The names of the buffers that differ (with the differing byte count and the first one).
+fn snapshot_diff(a: &[(&'static str, Vec<u8>)], b: &[(&'static str, Vec<u8>)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for ((na, va), (_, vb)) in a.iter().zip(b) {
+        if va != vb {
+            let first = va.iter().zip(vb).position(|(x, y)| x != y).unwrap_or(0);
+            let n = va.iter().zip(vb).filter(|(x, y)| x != y).count();
+            out.push(format!("{na} ({n} bytes differ, first at byte {first})"));
+        }
+    }
+    out
+}
+
+fn finite_frac(d: &DeviceBuffer<f32>, n: usize) -> eyre::Result<f64> {
+    let mut h = vec![0f32; d.len()];
+    d.copy_to_host(&mut h)?;
+    let n = n.min(h.len());
+    Ok(h[..n].iter().filter(|x| x.is_finite()).count() as f64 / n.max(1) as f64)
+}
+
+/// G1 + G2 + G3 together (and each alone) on one lane-layer, production order, both lanes on one
+/// stream, rows 1..=8 (G2's range; G1 / G3 alone cover 9..16 in their own tests): every buffer the
+/// lane-layer leaves for its readers is BIT-IDENTICAL to the all-off chain's. Two consecutive passes
+/// per row count (the second reads the first's carry / kv / bank state), lane B at 9 - b rows. A
+/// negative control (one residual value x 1.001 in the fused arm) must be detected.
+///
+///   HIP_VISIBLE_DEVICES=0 HIP_FORCE_DEV_KERNARG=1 DEBUG_CLR_KERNARG_HDP_FLUSH_WA=1 \
+///   DEBUG_CLR_KERNARG_DEV_ARCHS=gfx1201 nix develop -c cargo test --release --features v41 \
+///     -p v4flash-kernels --test bench_dgpu_chain_map combined_g123 -- --ignored --nocapture
+///
+/// VRAM: one 46 MB weight region + 4 buffer sets (~16 MB each at n_idx 4096), ~115 MB.
+#[test]
+#[ignore]
+fn combined_g123_bit_identical_to_chain() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let (dev, arch) = dgpu()?;
+    dev.set_current()?;
+    let e = DeviceEngine::for_arch(dev, &arch)?;
+    let id = e.device.id;
+    let s = Stream::new(id)?;
+    let n_idx = 4096;
+    let region = weight_region(id, W_SPAN)?;
+    let (seed_a, seed_b) = (0x5eed_c4a1u64, 0x0b5e_55edu64);
+    let mut total = 0usize;
+    let mut fails = 0usize;
+    for class in ["reuse_g123", "reuse_g1", "reuse_g2", "reuse_g3"] {
+        let mk = |seed: u64| -> eyre::Result<Bufs> {
+            let mut rng = Lcg(seed);
+            let mut bf = Bufs::new_in(id, &mut rng, n_idx, Some(&region))?;
+            bf.rb.as_mut_slice().fill(0);
+            bf.moe_ev.record(&s)?;
+            Ok(bf)
+        };
+        // [chain lane A, chain lane B, fused lane A, fused lane B]; equal seeds = equal contents.
+        let mut lanes = [mk(seed_a)?, mk(seed_b)?, mk(seed_a)?, mk(seed_b)?];
+        s.synchronize()?;
+        for b in 1..=BMAX as u32 {
+            let b2 = BMAX as u32 + 1 - b;
+            for pass in 0..2 {
+                for (k, bf) in lanes.iter_mut().enumerate() {
+                    let rows = if k % 2 == 0 { b } else { b2 };
+                    for op in chain(if k < 2 { "reuse" } else { class }, rows) {
+                        run(&e, &s, bf, op, rows)?;
+                    }
+                }
+                s.synchronize()?;
+                for lane in 0..2 {
+                    let d = snapshot_diff(&lane_snapshot(&lanes[lane])?, &lane_snapshot(&lanes[lane + 2])?);
+                    total += 1;
+                    if !d.is_empty() {
+                        fails += 1;
+                        eprintln!(
+                            "FAIL {class} b={b} lane {} rows {} pass {pass}: {}",
+                            ["A", "B"][lane],
+                            if lane == 0 { b } else { b2 },
+                            d.join("; ")
+                        );
+                    }
+                }
+            }
+            let ff = finite_frac(&lanes[2].attn_out, b as usize * N_EMBD as usize)?;
+            let fq = finite_frac(&lanes[2].q_normed, b as usize * Q_FLAT as usize)?;
+            let fs = finite_frac(&lanes[2].ffn_shared, b as usize * N_EMBD as usize)?;
+            eprintln!("{class} b={b} (lane B {b2}): compared x2 passes; finite attn_out {ff:.3} q_normed {fq:.3} ffn_shared {fs:.3}");
+        }
+        // Negative control: the comparison must see a 1e-3 relative change of one residual input (a
+            // 1-ulp nudge rounds away in the collapse sum and changes nothing downstream).
+        if class == "reuse_g123" {
+            let b = 4u32;
+            let mut h = vec![0f32; lanes[2].residual.len()];
+            lanes[2].residual.copy_to_host(&mut h)?;
+            h[17] *= 1.001;
+            lanes[2].residual.copy_from_host(&h)?;
+            for k in [0usize, 2] {
+                for op in chain(if k < 2 { "reuse" } else { class }, b) {
+                    run(&e, &s, &mut lanes[k], op, b)?;
+                }
+            }
+            s.synchronize()?;
+            let d = snapshot_diff(&lane_snapshot(&lanes[0])?, &lane_snapshot(&lanes[2])?);
+            eprintln!("negative control (residual[17] x 1.001, b=4): {} buffers differ: {}", d.len(), d.join("; "));
+            if d.is_empty() {
+                return Err(eyre!("negative control NOT detected: the comparison is blind"));
+            }
+        }
+    }
+    eprintln!("COMBINED: {total} lane-layer comparisons, {fails} failures");
+    if fails > 0 {
+        return Err(eyre!("{fails} of {total} combined comparisons differ"));
     }
     Ok(())
 }

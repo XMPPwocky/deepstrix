@@ -7889,10 +7889,15 @@ impl HeterogeneousEngine {
         // inverse rope / heads quantize) as ONE launch, only where the chain would run exactly the
         // kernels it replaces (see `attn_g3`). `g3_n_comp` is the chain's final n_comp_per.
         let g3_sparse = ratio > 0 && (need_mask || s2_reuse);
-        let g3_n_comp: Vec<i32> = n_comp_after
-            .iter()
-            .map(|&v| (if ratio == 0 { 0 } else if g3_sparse { v.min(INDEXER_TOP_K) } else { v }) as i32)
-            .collect();
+        // (Built only with the knob on: `g3` below short-circuits on `attn_g3()` before reading it.)
+        let g3_n_comp: Vec<i32> = if attn_g3() {
+            n_comp_after
+                .iter()
+                .map(|&v| (if ratio == 0 { 0 } else if g3_sparse { v.min(INDEXER_TOP_K) } else { v }) as i32)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let g3 = cfg!(feature = "v41")
             && attn_g3()
             && !ms_graphs()
@@ -9515,7 +9520,9 @@ impl HeterogeneousEngine {
         // from the same copy (a live knob flipping between them would leave
         // the pack and its reader disagreeing).
         // (`mp`, `look_next`, `look_next2`: decided above stage 8.)
-        let _t_router = de.events.stage("dgpu.router", &de.compute)?;
+        // Under G1 the router block's work is the one fused launch below, timed there as
+        // `dgpu.router` (so `ms.stage` / dgpu_busy keep it); no empty `dgpu.router` span here.
+        let _t_router = if g1_on { None } else { Some(de.events.stage("dgpu.router", &de.compute)?) };
         // dGPU bundle slice 3 (`V41_DGPU_ROUTER_X2`): the look-ahead's matvec rode this layer's router
         // launch (into `sd.router_logits2`); the look-ahead site below then only runs its top-k.
         let mut look_fused = false;
@@ -9888,7 +9895,7 @@ impl HeterogeneousEngine {
         let rb = if rb_pack_on() && b <= rb_pack_max_rows() && pager.is_some() && super::expert_pager::pager_union_prefill() {
             use crate::readback_pack::{PackPlan, PackSeg};
             self.set_current_cached(self.dgpu.device)?;
-            let _t = de.events.stage("dgpu.rb_pack", &de.compute)?;
+            let _t = if g1_on { None } else { Some(de.events.stage("dgpu.rb_pack", &de.compute)?) };
             let (nb, n_sel, na) = (b as usize, (b as usize) * cs_n_used, n_alt_layer as usize);
             let mut plan = PackPlan::default();
             let mut l = RbLayout { packed: true, ..Default::default() };
@@ -9931,6 +9938,9 @@ impl HeterogeneousEngine {
         };
         if g1_on {
             self.set_current_cached(self.dgpu.device)?;
+            // The fused block (collapse + router + top-ks + Q8_K + pack + M62) is attributed to
+            // `dgpu.router`, the parent stage the profile and dgpu_busy count (G1 verdict finding).
+            let _t_g1 = de.events.stage("dgpu.router", &de.compute)?;
             let _t = de.events.stage("k.router.g1", &de.compute)?;
             self.launch_g1(de, bd, sd, dlw, look_next, &rb, prior_on, sub3, remote_split_on, layer as u32, b, cs_n_used as u32)?;
         }
