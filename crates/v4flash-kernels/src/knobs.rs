@@ -855,7 +855,8 @@ crate::knobs! {
     /// rms / rope / fp8, window append: 8 launches) as TWO (`QkvFront::launch_a` / `launch_b`),
     /// bit-identical (tests/qkv_front_bitexact.rs). Only at rows 1..=8 on the dp4a arms with
     /// `V41_DEC_FUSE`, on the DIRECT path (no graph capture / replay); everything else keeps the
-    /// chain. tests/bench_qkv_front_chain.rs: -17..-18 us per lane-layer (cold, b = 1..8).
+    /// chain. tests/bench_qkv_front_chain.rs: -18.1..-19.5 us per lane-layer (cold, b = 1..8; warm
+    /// -16.8..-19.2), 8 -> 2 launches; at 2 lanes x 40 layers ~1.5 ms of dGPU time per step.
     pub static DGPU_QKV_FRONT = Knob::flag("V41_DGPU_QKV_FRONT", false).live();
     /// `V41_MTP_MHC_FAST` (default on; live, read per drafter sub-block): each DSpark drafter mHC
     /// sub-block (RMS + the 24-row mix matvec per draft row + Sinkhorn split + carry copy + collapse

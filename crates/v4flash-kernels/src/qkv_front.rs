@@ -15,6 +15,22 @@
 //!
 //! Not written any more: `q` (the un-roped q_b output) and `kv_normed` (the f32 row the append
 //! read) -- hand-offs that only existed because the chain ran as separate launches.
+//!
+//! Measured 2026-10-13 beside the live hub (tests/bench_qkv_front_chain.rs, cold = MALL flushed,
+//! 100 interleaved rounds; rocprofv3 kernel trace on the dGPU only):
+//! - chain wall new - cur: -19.5 / -19.2 / -19.0 / -18.1 / -18.9 us per lane-layer at b = 1/2/3/4/8
+//!   (warm -16.8..-19.2; A/A |d| p50 0.2-0.6 cold), 8 -> 2 launches.
+//! - kernel time, cold: launch A 18.6 / 21.8 / 27.1 us at b = 1/4/8 (the chain's 7 non-q_b kernels:
+//!   31.2 / 32.3 / 36.9 us + 6 gaps); launch B 72.3 / 76.0 / 80.5 = the q_b GEMV alone + 0..0.4.
+//! - floors: 9.75 MB at the measured cold streaming rate (~575-600 GB/s: read_v4 p10, q_b at 590)
+//!   = 16.3-17 us; a dependent launch 2.2 us (1.6 of pure gap). Launch A's remaining gap to its
+//!   floor is the per-work-group input quantize (~1 us at b = 4, ~3 at b = 8: it disappears if the
+//!   producer of attn_input_norm also emits its Q8_0) and the exposed q_a tail (~1-1.5 us at b = 4,
+//!   ~3.5 at b = 8: one ticket round trip, one L2 round trip, a 256-wide tree per row).
+//! - ONE launch (q_b streamed by launch A's work-groups after an in-kernel publish of the q_a tail;
+//!   commit 271f512e, reverted): bit-identical but +15 / +70 / +196 us at b = 1/4/8 -- the
+//!   kernel-uniform dynamic LDS caps residency, and 256 warps cannot hide the q_b warp-sum
+//!   latencies the 4096-work-group launch hides. Two launches is the floor here.
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};

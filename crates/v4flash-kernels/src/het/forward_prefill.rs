@@ -6256,7 +6256,8 @@ impl HeterogeneousEngine {
                 cfg!(feature = "v41"),
                 b,
                 dlw.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0
-                    && dlw.attn_kv.dtype == v4flash_core::gguf::GgufType::Q8_0,
+                    && dlw.attn_kv.dtype == v4flash_core::gguf::GgufType::Q8_0
+                    && dlw.attn_q_b.dtype == v4flash_core::gguf::GgufType::Q8_0,
                 super::dispatch::small_b_dense_dp4a(b),
                 prefill_f32_matvec(b),
                 prefill_f32_matvec_qb_wo(b) && std::env::var("QB_WMMA").is_err(),

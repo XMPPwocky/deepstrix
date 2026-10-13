@@ -13,12 +13,14 @@
 // (8 launches) as TWO launches, every output BIT-IDENTICAL (tests/qkv_front_bitexact.rs):
 //
 //   qkv_front_a_tB<b>  grid G x 256: each work-group quantizes the [b, 5120] input into LDS (the
-//       wave kernel's expressions; a 32-block's amax is a max, so the lane split does not matter),
-//       then streams q_a and kv rows (one warp per row, two rows per warp pass, the tB GEMV's
-//       per-(row, b) lane striding, expression and warp-sum tree). The LAST work-group to finish
-//       (one device-scope ticket; no work-group ever waits for another, so dispatch order cannot
-//       deadlock it) runs rms_quant_q8_1280's body over all b rows at once (same double partials,
-//       same 256-wide LDS tree per row, same quantize) and resets the ticket.
+//       wave kernel's expressions, one lane per 32-block; a 32-block's amax is a max, so the lane
+//       split does not matter), then streams its q_a rows, takes a ticket, and streams its kv rows
+//       (one warp per row, two rows in flight per warp, the tB GEMV's per-(row, b) lane striding,
+//       expression and warp-sum tree). The work-group with the LAST ticket (no work-group ever
+//       waits for another, so dispatch order cannot deadlock it) then runs rms_quant_q8_1280's
+//       body over all b rows (same double partials, same 256-wide tree per row -- its last 5
+//       strides in one wave's registers, same adds -- same output expression and quantize) and
+//       resets the ticket.
 //   qkv_front_b_tB<b>  grid 1 + 4096 x 256: work-group 0 runs kv_rms_rope_fp8's body per row and
 //       stores the f16 cache row itself (kv_cache_append's `(_Float16)` cast of the same f32);
 //       work-groups 1.. are the q_b tB GEMV, and the 8 work-groups of each head's rope tail
@@ -27,6 +29,14 @@
 //       the chain was sequential) are never written.
 //
 // Bytes: 9.75 MB (q_a + kv) + 44.56 MB (q_b) of Q8_0 weights; everything else is L2-resident.
+//
+// Code size matters here: every instruction of a kernel that runs once per lane-layer comes from a
+// cold instruction cache, so the per-row loops stay rolled (a fully unrolled b = 8 prologue + tail
+// was ~10k instructions and cost ~40 us). Measurement-only builds: -DQF_DBG_NO_PRO / _NO_GEMV /
+// _NO_TAIL drop one part of launch A (tests/bench_qkv_front_chain.rs BENCH_SECTION=variant).
+// A ONE-launch variant (q_b streamed by launch A's work-groups after an in-kernel publish) was
+// built, bit-identical, and measured SLOWER (+15..+196 us; commit 271f512e, reverted): see
+// src/qkv_front.rs.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
@@ -171,23 +181,15 @@ __device__ __forceinline__ void qf_front_a(
     const unsigned stride = gridDim.x * 8u;
     const unsigned p0 = blockIdx.x * 8u + warp;
 
-    // ---- 1. The first weight row goes out first (DRAM latency under the quantize).
-    QfRow wA, wB;
-#ifndef QF_DBG_NO_GEMV
-    if (p0 < R) qf_load_row(wA, qf_row_ptr(w_qa, w_kv, p0), lane);
-#endif
-
-    // ---- 2. Q8_0 of x into LDS as [b][half][block][16 B] (+ xscale [b][block]): ONE lane per
+    // ---- 1 + 2. Q8_0 of x into LDS as [b][half][block][16 B] (+ xscale [b][block]): ONE lane per
     // 32-block (8 float4 loads, amax by v_max over its 32 values: a max, so the order does not
     // change it), then q8_0_quantize_f32_wave's d = amax / 127, id, lrintf + clamp. No cross-lane
-    // traffic: a butterfly per block (5 dependent shuffles) serialized ~6 us into the b = 8 prologue.
-#ifndef QF_DBG_NO_PRO
-#pragma unroll 1
-    for (unsigned gb = tid; gb < (unsigned)B * QF_BLOCKS; gb += 256u) {
-        const float4* src = reinterpret_cast<const float4*>(x + (size_t)gb * 32u);
-        float4 v[8];
-#pragma unroll
-        for (int k = 0; k < 8; ++k) v[k] = src[k];
+    // traffic: a butterfly per block (5 dependent shuffles) serialized ~6 us into the b = 8
+    // prologue. The first pass's x loads go out, THEN the first weight row (DRAM latency under the
+    // quantize), then the passes: loads retire in order, so x loads issued behind the weights
+    // would wait for DRAM.
+    QfRow wA, wB;
+    auto quant_block = [&](unsigned gb, const float4 (&v)[8]) {
         float amax = 0.0f;
 #pragma unroll
         for (int k = 0; k < 8; ++k)
@@ -208,33 +210,72 @@ __device__ __forceinline__ void qf_front_a(
         }
         *reinterpret_cast<uint4*>(xq_l + ((size_t)(rb * 2u + 0u) * QF_BLOCKS + bl) * 16u) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
         *reinterpret_cast<uint4*>(xq_l + ((size_t)(rb * 2u + 1u) * QF_BLOCKS + bl) * 16u) = make_uint4(pk[4], pk[5], pk[6], pk[7]);
+    };
+#ifndef QF_DBG_NO_PRO
+    float4 v0[8];
+    const bool has0 = tid < (unsigned)B * QF_BLOCKS;
+    if (has0) {
+        const float4* src = reinterpret_cast<const float4*>(x + (size_t)tid * 32u);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) v0[k] = src[k];
+    }
+#endif
+#ifndef QF_DBG_NO_GEMV
+    if (p0 < R) qf_load_row(wA, qf_row_ptr(w_qa, w_kv, p0), lane);
+#endif
+#ifndef QF_DBG_NO_PRO
+    if (has0) quant_block(tid, v0);
+#pragma unroll 1
+    for (unsigned gb = tid + 256u; gb < (unsigned)B * QF_BLOCKS; gb += 256u) {
+        const float4* src = reinterpret_cast<const float4*>(x + (size_t)gb * 32u);
+        float4 v[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) v[k] = src[k];
+        quant_block(gb, v);
     }
 #endif
     __syncthreads();
 
-    // ---- 3. GEMV over (q_a ++ kv) rows, one warp per row, rows p0, p0 + stride, ...; two weight
+    // ---- 3. GEMV, one warp per row, rows p0, p0 + stride, ...: every work-group's q_a rows first,
+    // then a q ticket, then its kv rows. The last q ticket's work-group runs the q_a tail AFTER its
+    // own kv rows (the GEMV's LDS is live until then), i.e. while the other work-groups still
+    // stream kv (~29% of the bytes): the tail is off the launch's critical path. Two weight
     // buffers so the next row's loads are in flight while this one is reduced.
 #ifndef QF_DBG_NO_GEMV
 #pragma unroll 1
-    for (unsigned p = p0; p < R; p += 2u * stride) {
+    for (unsigned p = p0; p < QF_QA; p += 2u * stride) {
         const unsigned pB = p + stride, pA2 = p + 2u * stride;
-        if (pB < R) qf_load_row(wB, qf_row_ptr(w_qa, w_kv, pB), lane);
-        qf_row_dot<B>(wA, xq_l, xs_l, lane, p < QF_QA ? qr : kv_raw, p < QF_QA ? QF_QA : QF_KV,
-                      p < QF_QA ? p : p - QF_QA);
-        if (pA2 < R) qf_load_row(wA, qf_row_ptr(w_qa, w_kv, pA2), lane);
-        if (pB < R)
-            qf_row_dot<B>(wB, xq_l, xs_l, lane, pB < QF_QA ? qr : kv_raw, pB < QF_QA ? QF_QA : QF_KV,
-                          pB < QF_QA ? pB : pB - QF_QA);
+        if (pB < QF_QA) qf_load_row(wB, qf_row_ptr(w_qa, w_kv, pB), lane);
+        qf_row_dot<B>(wA, xq_l, xs_l, lane, qr, QF_QA, p);
+        if (pA2 < QF_QA) qf_load_row(wA, qf_row_ptr(w_qa, w_kv, pA2), lane);
+        if (pB < QF_QA) qf_row_dot<B>(wB, xq_l, xs_l, lane, qr, QF_QA, pB);
     }
+    // this warp's first kv row (p0 + k stride >= 1280): its loads go out before the ticket
+    const unsigned kq = p0 >= QF_QA ? 0u : (QF_QA - p0 + stride - 1u) / stride;
+    const unsigned pk = p0 + kq * stride;
+    if (pk < R) qf_load_row(wA, qf_row_ptr(w_qa, w_kv, pk), lane);
 #endif
 
-    // ---- 4. Ticket: the last work-group runs the q_a norm + quantize over every row.
+    // ---- 4. q ticket: the last work-group to finish its q_a rows owns the q_a tail.
     __shared__ unsigned qf_last;
     __threadfence();
     __syncthreads();
     if (tid == 0) qf_last = (atomicAdd(ticket, 1u) == gridDim.x - 1u) ? 1u : 0u;
     __syncthreads();
-    if (qf_last == 0u) return;
+    const bool last = qf_last != 0u;
+
+#ifndef QF_DBG_NO_GEMV
+#pragma unroll 1
+    for (unsigned p = pk; p < R; p += 2u * stride) {
+        const unsigned pB = p + stride, pA2 = p + 2u * stride;
+        if (pB < R) qf_load_row(wB, qf_row_ptr(w_qa, w_kv, pB), lane);
+        qf_row_dot<B>(wA, xq_l, xs_l, lane, kv_raw, QF_KV, p - QF_QA);
+        if (pA2 < R) qf_load_row(wA, qf_row_ptr(w_qa, w_kv, pA2), lane);
+        if (pB < R) qf_row_dot<B>(wB, xq_l, xs_l, lane, kv_raw, QF_KV, pB - QF_QA);
+    }
+#endif
+    if (!last) return;
+    __syncthreads();   // the GEMV's LDS is dead in this work-group
     __threadfence();
 #ifdef QF_DBG_NO_TAIL
     if (tid == 0) *ticket = 0u;
@@ -279,7 +320,7 @@ __device__ __forceinline__ void qf_front_a(
         }
     }
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0; stride >>= 1) {
+    for (unsigned int stride = 128u; stride >= 32u; stride >>= 1) {
         if (tid < stride) {
             float t[B];   // the B rows' adds are independent: issue every LDS read first
 #pragma unroll
@@ -289,6 +330,23 @@ __device__ __forceinline__ void qf_front_a(
         }
         __syncthreads();
     }
+    // strides 16 .. 1 in wave 0's registers: lane t adds lane t + stride's value -- the tree's
+    // `sdata[t] += sdata[t + stride]` for t < stride, the same adds in the same order (lanes
+    // >= stride compute values nothing reads), without 5 barriers and LDS round trips
+    if (tid < 32u) {
+        float t[B];
+#pragma unroll
+        for (unsigned b = 0; b < (unsigned)B; ++b) t[b] = sdata[b * 256u + tid];
+#pragma unroll
+        for (unsigned int stride = 16u; stride > 0; stride >>= 1)
+#pragma unroll
+            for (unsigned b = 0; b < (unsigned)B; ++b) t[b] += __shfl_down(t[b], stride);
+        if (tid == 0) {
+#pragma unroll
+            for (unsigned b = 0; b < (unsigned)B; ++b) sdata[b * 256u] = t[b];
+        }
+    }
+    __syncthreads();
 #pragma unroll 1
     for (unsigned g = tid; g < (unsigned)B * 40u; g += 256u) {
         const unsigned b = g / 40u, k = g - b * 40u;
