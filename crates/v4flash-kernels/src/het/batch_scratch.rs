@@ -756,6 +756,13 @@ pub struct BatchDgpuShared {
     pub low: DeviceBuffer<f32>,
     pub heads_xq: DeviceBuffer<i8>,
     pub heads_xscale: DeviceBuffer<f32>,
+    /// `V41_ATTN_G3`'s heads quantize destinations: R1 views at offset 0 (the `heads` region, which
+    /// G3 does not write). NOT the R2 `heads_xq` / `heads_xscale`: those live inside `q_normed`, which
+    /// the G3 attention launch is still reading in other work-groups while it writes its epilogue.
+    pub g3_heads_xq: DeviceBuffer<i8>,
+    pub g3_heads_xscale: DeviceBuffer<f32>,
+    /// 1 KB of zeros: the row G3's key table points invalid keys at.
+    pub g3_zero_row: DeviceBuffer<u16>,
     pub low_xq: DeviceBuffer<i8>,
     pub low_xscale: DeviceBuffer<f32>,
     pub attn_out: DeviceBuffer<f32>,
@@ -1647,6 +1654,19 @@ impl BatchDgpuShared {
         let q = Carver::new(&r1_arena).take::<f32>(q_len(rows));
         let indexer_scores = Carver::new(&r1_arena).take::<f32>(indexer_scores_len(rows));
         let heads = Carver::new(&r1_arena).take::<f32>(q_len(rows));
+        // `V41_ATTN_G3` outputs share `heads`' R1 lifetime (P5a -> P6) and region.
+        let (g3_heads_xq, g3_heads_xscale) = {
+            let mut c = Carver::new(&r1_arena);
+            let xq = c.take::<i8>(b * Q_FLAT as usize);
+            let xs = c.take::<f32>(b * BLOCKS_GROUPED_OUT as usize);
+            debug_assert!(c.off <= q_len(rows) * 4);
+            (xq, xs)
+        };
+        let g3_zero_row = {
+            let mut z: DeviceBuffer<u16> = DeviceBuffer::new(id, N_HEAD_DIM as usize)?;
+            z.copy_from_host(&vec![0u16; N_HEAD_DIM as usize])?;
+            z
+        };
         let hot = if hot_scratch_wanted() {
             Some(BatchDgpuHotScratch::alloc(id, rows, &r1_arena)?)
         } else {
@@ -1807,6 +1827,9 @@ impl BatchDgpuShared {
             low,
             heads_xq,
             heads_xscale,
+            g3_heads_xq,
+            g3_heads_xscale,
+            g3_zero_row,
             low_xq,
             low_xscale,
             attn_out,
