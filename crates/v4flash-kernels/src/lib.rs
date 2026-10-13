@@ -33,6 +33,7 @@ pub mod attention;
 pub mod attn_meta;
 pub mod attention_dec;
 pub mod attn_dec_g3;
+pub mod attn_dec_g3o;
 pub mod b2_fast_chain;
 pub mod broadcast;
 pub mod candidate_blocks;

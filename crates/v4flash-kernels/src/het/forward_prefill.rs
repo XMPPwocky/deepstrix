@@ -2461,15 +2461,19 @@ fn attn_dec_fused() -> bool {
 /// with `V41_DEC_SKIP_DEAD`, no sub-tensor dump, rows of <= 512 compressed + 640 total keys, an
 /// f16 main store when the selection is used, graphs off, no `V41_VERIFY_DECODE_ATTN`.
 /// Index-source layers still fill `n_index_comp_per_b` (one 1-destination `attn_meta_fill`).
+///
+/// LIVE since 2026-10-13 (`knobs::ATTN_G3`): read once per decode lane-layer (`g3` below), so a flip
+/// takes effect at the next lane-layer and never splits one.
 pub fn attn_g3() -> bool {
-    static D: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("V41_ATTN_G3").as_deref() == Ok("1"));
-    *D
+    crate::knobs::ATTN_G3.on()
 }
 
-/// The `V41_ATTN_G3` launch at an attention site (stage `k.attn.g3`): `xq` / `xscale` (the R1
-/// `g3_heads_*` views) get what `rope_inv_quant_q8` would write into `heads_xq` / `heads_xscale`;
-/// `heads` is not written (the call sites take G3 only when nothing reads it).
+/// The `V41_ATTN_G3` launch at an attention site: `xq` / `xscale` (the R1 `g3_heads_*` views) get
+/// what `rope_inv_quant_q8` would write into `heads_xq` / `heads_xscale`; `heads` is not written (the
+/// call sites take G3 only when nothing reads it). `V41_ATTN_G3_KERNEL` (live, read per launch) picks
+/// the kernel: round 1's `attn_dec_g3` (stage `k.attn.g3`, the default) or a G3-optimal "W" kernel
+/// (`attn_dec_g3o`, stage `k.attn.g3w`; `auto` = `attn_dec_g3o::auto_mode` per b / row length). Every
+/// choice writes the same bytes (tests/attn_g3o.rs, tests/attn_dec_g3_bitexact.rs).
 #[allow(clippy::too_many_arguments)]
 fn launch_attn_g3(
     de: &super::engine::DeviceEngine,
@@ -2486,6 +2490,38 @@ fn launch_attn_g3(
     pos_per_b: &DeviceBuffer<i32>,
     rope: &crate::RopeParams,
 ) -> eyre::Result<()> {
+    use crate::attn_dec_g3o::G3oMode;
+    let w = |parts| Some(G3oMode::Whole { parts, warps: 16 });
+    let mode = match crate::knobs::ATTN_G3_KERNEL.pick() {
+        1 => crate::attn_dec_g3o::auto_mode(n_raw, n_comp),
+        2 => w(1),
+        3 => w(2),
+        4 => w(4),
+        _ => None,
+    };
+    if let Some(mode) = mode {
+        let _t = de.events.stage("k.attn.g3w", &de.compute)?;
+        return de.attn_g3o.launch(
+            &de.compute,
+            mode,
+            None,
+            xq,
+            xscale,
+            zero_row,
+            sinks,
+            q,
+            raw_kv,
+            comp,
+            crate::attn_dec_g3::G3Rows { n_raw, raw_off, n_comp },
+            pos_per_b,
+            N_HEAD,
+            N_HEAD_DIM,
+            N_ROT,
+            rope,
+            None,
+            None,
+        );
+    }
     let _t = de.events.stage("k.attn.g3", &de.compute)?;
     de.attn_g3.launch(
         &de.compute,
@@ -7889,8 +7925,10 @@ impl HeterogeneousEngine {
         // inverse rope / heads quantize) as ONE launch, only where the chain would run exactly the
         // kernels it replaces (see `attn_g3`). `g3_n_comp` is the chain's final n_comp_per.
         let g3_sparse = ratio > 0 && (need_mask || s2_reuse);
-        // (Built only with the knob on: `g3` below short-circuits on `attn_g3()` before reading it.)
-        let g3_n_comp: Vec<i32> = if attn_g3() {
+        // (Built only with the knob on. The live knob is read ONCE here, so a flip cannot split the
+        // lane-layer: an empty `g3_n_comp` fails `rows_ok` below.)
+        let g3_on = attn_g3();
+        let g3_n_comp: Vec<i32> = if g3_on {
             n_comp_after
                 .iter()
                 .map(|&v| (if ratio == 0 { 0 } else if g3_sparse { v.min(INDEXER_TOP_K) } else { v }) as i32)
@@ -7899,7 +7937,7 @@ impl HeterogeneousEngine {
             Vec::new()
         };
         let g3 = cfg!(feature = "v41")
-            && attn_g3()
+            && g3_on
             && !ms_graphs()
             && !verify_decode_attn()
             && attn_dec_score_for(b)

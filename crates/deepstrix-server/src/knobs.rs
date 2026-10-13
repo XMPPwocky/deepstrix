@@ -245,10 +245,12 @@ mod tests {
         // prior's protect count (an uncaptured kernel scalar), and the hot
         // split's placement knobs (read at each hot-set refresh; the holder
         // switch, the replicated leg and its cost model per route), and the dGPU
-        // fusion switches G1 / G2 (read per decode lane-layer; default off).
+        // fusion switches G1 / G2 / G3 (read per decode lane-layer; default off) and G3's kernel
+        // choice (read per G3 launch; default the round-1 kernel).
         let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
         live.sort();
         assert_eq!(live, [
+            "V41_ATTN_G3", "V41_ATTN_G3_KERNEL",
             "V41_B1_HOT_B2HEAD", "V41_B1_HOT_HOLDER", "V41_B1_HOT_IL_HYST", "V41_B1_HOT_IL_PER_LAYER", "V41_B1_HOT_KEEP_PREFILL",
             "V41_B1_HOT_LEG_IG0", "V41_B1_HOT_LEG_IG_B", "V41_B1_HOT_LEG_IG_D", "V41_B1_HOT_LEG_IG_N", "V41_B1_HOT_LEG_LINK_ADD_US",
             "V41_B1_HOT_LEG_OPEN_MS", "V41_B1_HOT_LEG_S0_US", "V41_B1_HOT_LEG_SB_US", "V41_B1_HOT_LEG_SD_US",

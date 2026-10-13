@@ -924,6 +924,19 @@ crate::knobs! {
     /// vs round 1: b=1 33.6 -> 31.9 us, b=2 36.9 -> 34.3, b=4 41.5 -> 38.0, b=8 52.9 -> 50.2,
     /// b=16 74.4 -> 72.2. `V41_DGPU_G1_VARIANT` (startup, bench / A/B) selects a round-1 kernel.
     pub static DGPU_G1_FUSED = Knob::flag("V41_DGPU_G1_FUSED", false).live();
+    /// `V41_ATTN_G3` (default OFF; live since 2026-10-13, read once per decode lane-layer): fusion
+    /// group G3 -- attn_meta_fill + indexer_gather + the fused decode attention + rope_inv_quant_q8
+    /// as ONE launch (`forward_prefill::attn_g3`), bit-identical quantized heads.
+    pub static ATTN_G3 = Knob::flag("V41_ATTN_G3", false).live();
+    /// `V41_ATTN_G3_KERNEL` (default `g3`; live, read per G3 launch): which kernel runs a G3
+    /// lane-layer. `g3` = round 1's `attn_dec_g3` (one WG per row and head tile); `w1` / `w2` / `w4` =
+    /// the G3-optimal "W" kernels (`attn_dec_g3o`: one WG per row, head tile and 1/n of the dims, the
+    /// scores and softmax replicated per dim part, pipelined loads, faster softmax / epilogue); `auto`
+    /// = `attn_dec_g3o::auto_mode` (W4 at b = 1, W2 at b = 2..3, W1 from b = 4 on rows of >= 384 keys,
+    /// else `g3`). Every choice writes the same bytes (tests/attn_g3o.rs). Measured 10-13
+    /// (tests/attn_g3o.rs bench_g3o_chain_wall, paired vs `g3`): -3.4 us/lane-layer at b = 1, -2.3 at
+    /// b = 2, -1.0..-1.3 at b = 3, -0.4..-1.5 from b = 4 on long rows; docs/v41/DECODE_OPT_KNOBS.md.
+    pub static ATTN_G3_KERNEL = Knob::choice("V41_ATTN_G3_KERNEL", 0, &[&["g3"], &["auto"], &["w1"], &["w2"], &["w4"]]).live();
     /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
     /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top
     /// `per_layer()` (today, bit-identical); `interleave` = box 1 holds `V41_B1_HOT_TARGET` of the

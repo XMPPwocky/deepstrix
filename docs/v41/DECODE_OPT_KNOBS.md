@@ -28,7 +28,8 @@ no counter, so look for their `k.router.g1` / `k.attn.g3` stages in a sub-stage 
 | `V41_DGPU_G1_VARIANT`, `_NPF`, `_TS`, `_DBG`, `_HSACO_GFX1201` | unset | startup | G1 bench-only overrides (variant table -- `4,8,0` etc. select the round-1 kernels for A/B, `4,108,808321602` a family-"r" one; prefetch WGs (round-1 only), in-kernel phase timestamps, ablations, code-object override). Never set in production (`_HSACO_*` loads an arbitrary code object) | - | - |
 | `V41_DGPU_QKV_FRONT` | off | **live** (per lane-layer) | G2: input quantize + q_a + kv GEMVs + q_a rms/quant (launch A, last-WG ticket) and q_b + q rope + kv rms/rope/fp8 + window append (launch B): 8 launches -> 2. Only at rows 1..=8 on the dp4a arms with `V41_DEC_FUSE`, Q8_0 weights, no kv f16 round trip, DIRECT stage (no graph capture) | `qkv_front_bitexact` (112 cases: b=1..8, plain + YaRN, arena + contiguous, 2 lanes) | -18.1..-19.5 us per lane-layer cold (b=1..8); G2 part 80-96% of its ~19.6 us floor (b=4: 24.1 us = 81%) |
 | `V41_DGPU_QKV_FRONT_GRID` | 64 | startup | G2 launch A work-group count (bench override) | same test | G=64 optimal or tied at b=4/8 |
-| `V41_ATTN_G3` | off (`1` = on) | startup (LazyLock) | G3: attn_meta_fill + indexer_gather + fused decode attention + rope_inv_quant_q8 as ONE launch (`attn_dec_g3.hip`; selection read in place, V by transposed loads, inverse rope + Q8_0 heads in the epilogue, written to the R1 `g3_heads_*` views). Index-source layers keep a 1-destination meta fill. Only with graphs off, the dec_fused attention, the `V41_DEC_FUSE` dp4a wo_a arm, `V41_DEC_SKIP_DEAD`, b <= 16, n_comp <= 512 and n_raw + n_comp <= 640, an f16 main store when the selection is used | `attn_dec_g3_bitexact::attn_dec_g3_is_bit_identical_to_the_chain` (256 comparisons, b=1..16, both lanes) | chain wall cold b=1 44.6 -> 25.8 us, b=4 48.5 -> 26.1, b=8 59.9 -> 30.2, b=16 98.4 -> 51.0; 4 launches -> 1 (2 on index-source layers); ~40% of the 7.2 us byte+launch roof at b=4 (verdict: not yet optimal; bit-identical two-launch split is the next step) |
+| `V41_ATTN_G3` | off (`1` = on) | **live** since 10-13 (read once per decode lane-layer) | G3: attn_meta_fill + indexer_gather + fused decode attention + rope_inv_quant_q8 as ONE launch (`attn_dec_g3.hip`; selection read in place, V by transposed loads, inverse rope + Q8_0 heads in the epilogue, written to the R1 `g3_heads_*` views). Index-source layers keep a 1-destination meta fill. Only with graphs off, the dec_fused attention, the `V41_DEC_FUSE` dp4a wo_a arm, `V41_DEC_SKIP_DEAD`, b <= 16, n_comp <= 512 and n_raw + n_comp <= 640, an f16 main store when the selection is used | `attn_dec_g3_bitexact::attn_dec_g3_is_bit_identical_to_the_chain` (256 comparisons, b=1..16, both lanes) | chain wall cold b=1 44.6 -> 25.8 us, b=4 48.5 -> 26.1, b=8 59.9 -> 30.2, b=16 98.4 -> 51.0; 4 launches -> 1 (2 on index-source layers); ~40% of the 7.2 us byte+launch roof at b=4 (verdict: not yet optimal; bit-identical two-launch split is the next step) |
+| `V41_ATTN_G3_KERNEL` | `g3` | **live** (read per G3 launch) | which kernel a G3 lane-layer runs: `g3` = round 1's `attn_dec_g3`; `w1` / `w2` / `w4` = the G3-optimal "W" kernels (`attn_dec_g3o.hip`: one WG per row, head tile and 1/n of the dims; pipelined loads, faster phase A and epilogue; n = 2 / 4 replicate the scores + softmax per dim part); `auto` = `attn_dec_g3o::auto_mode`: W4 at b = 1, W2 at b = 2..3, W1 from b = 4 when every row holds >= 384 keys, else `g3`. Only matters with `V41_ATTN_G3=1`. Stage `k.attn.g3w` for the W kernels | `attn_g3o::g3o_bit_identical_to_the_chain` (10080 comparisons: 7 kernels x b = 1..16 x 2 lanes x 3 rope sets x 5 key layouts x steady / ragged / edge rows, subnormal + signed-zero KV, with and without heads_out; negative control) | `auto` vs `g3`, paired p50 (100 rounds, cold / warm): long rows (selected 128 + 512, index-source) b=1 -3.3 / -3.3 us, b=2 -2.3 / -2.1, b=3 -1.3 / -1.0, b=4 -0.7 / -1.2, b=8 -1.0 / -1.0, b=16 -1.4 / -1.4; ratio-0 (128 keys) b=1 -1.7, b=2 -1.2, b=3 -1.1, b>=4 0; short dense (128 + 200) b=1 -2.3, b=2 -1.5, b=3 -1.3, b>=4 0 (A/A p25..p75 within +-0.9). See "G3 round 2" |
 
 ## Combined check (G1 + G2 + G3 together)
 
@@ -72,8 +73,11 @@ must be measured live (profiled per-step dGPU wall, not tok/s: the e2e noise flo
   77.2 -> 80.0 us saved.
 - G2: G2 part floor ~19.1-19.6 us (9.75 MB at 590 GB/s + 1 gap + ~1 us tail); 81% at b=4, 67% at b=8.
   Next: Q8_0 of `attn_input_norm` emitted by its producer (drops the per-WG re-quantize), earlier q_a tail.
-- G3: byte+launch roof 7.2-7.6 us, split-limited ~10 us; G3 ~18 us at b=4. Next: bit-identical
-  two-launch split (scores over all WGPs, W.V by 128-dim quarters), V prefetch before softmax.
+- G3: byte+launch roof 7.2-7.6 us at b=4 (3.2 MB at ~600 GB/s + one dependent launch). Device time
+  (wall minus the event pair) at b=4 cold: round 1 20.0 us (38%), `auto` (W1) 19.3 us (39%); at b=1
+  round 1 18.1 us vs a 3.6 us roof (20%), `auto` (W4) 14.8 us (24%). The bit-identical split the
+  round-1 verdict proposed was built and measured: it does not beat round 1 from b = 3 (see "G3
+  round 2" for what bounds this group on gfx1201).
 - MoE: dn3q 98-99% and pair_dec 93-95% of the same-bytes streaming probe on gfx1151.
 
 ## G1 round 2 (G1-optimal): what the hardware does, what was built, what remains
@@ -113,16 +117,83 @@ Where the b=4 kernel span (21.4 us; floor 13.6-14.3) still goes, each measured:
 4. `selected_ready` (~3 us of queue time) is unchanged: the done word the kernel already writes needs
    the host protocol switched (owner approval + a gate run).
 
+## G3 round 2 (G3-optimal): what was built, what was measured, what bounds it
+
+Everything below: gfx1201 beside the live hub, dGPU only, production kernarg env, one process,
+interleaved random order, MALL flushed for "cold"; tests/attn_g3o.rs (bench_g3o_chain_wall,
+g3o_trace, bench_g3o_floors, g3o_load_probe + g3o_latency_probe with scratch/g3o/probe.hip). Device
+work = wall minus the wall of the same launch with an empty body (10.4-10.8 us, incl. the 7.5 us
+event pair).
+
+Built (all bit-identical to the chain, tests/attn_g3o.rs):
+1. The split the round-1 verdict proposed: S work-groups (row, 2 head tiles, 16 key tiles; every
+   warp one K tile, two chains) write f16 scores (+ V^T fragments made by a WMMA against the identity
+   from the K fragments they already hold) to a scratch; V work-groups (row, head tile, half the
+   dims) replicate the 16-head softmax and run the W.V chains + epilogue. As two launches
+   (`attn_g3o_s` + `attn_g3o_v`) and as ONE launch with ticketed roles (`attn_g3o_t`: V waits only on
+   lower tickets, bounded scalar polls, self-resetting counters; scores and V^T counted separately).
+   Result: -1.9..-2.5 us at b = 1, -1.0..-1.5 at b = 2, +0.4..+1.6 at b = 3..4, +8..+21 at b >= 5.
+   Kept as bench-only modes.
+2. The "W" family (production, `V41_ATTN_G3_KERNEL`): round 1's one-WG-per-(row, head tile)
+   structure with every load pipelined (the selection, then q, then K; the next K tile loaded into the
+   registers the chain just consumed; the W.V transposed-load ring started before the softmax), a
+   branch-free phase A, the Q8_0 scale once per lane, and 1, 2 or 4 WGs per (row, head tile)
+   (the scores + softmax replicated per dim part). Numbers in the knob table.
+
+Measured on the way (each with a timing build or a probe):
+- Per-tile branches around loads made the waitcnt pass put `s_wait_loadcnt 0` after every load (the
+  W.V ring and the rolling K prefetch were fully serialized): runtime loops with branch-free bodies
+  (table entries past n_tiles are the zero row, weights zero-padded to the ring) fixed it.
+- `global_load_tr_b128` moves ~2 TB/s aggregate vs ~4.8 for the K-fragment pattern (g3o_load_probe,
+  L2-resident, 32 WGs x 16 warps); one WG per WGP reaches ~150 GB/s of fragment loads.
+- Dependent-load latency unloaded: 138 ns (L2), 259 ns (DRAM-cold) (g3o_latency_probe). Under this
+  kernel's load the K / V phases are bandwidth-bound, not latency-bound: an L2 prefetch of the later
+  K tiles (vector or `s_prefetch_data`) changed nothing or slowed it (+0.5..+2 us).
+- W1 ablations at b=4 (wrong output, timing only): with no K / V traffic, no softmax and no W.V
+  chain the kernel still needs 6.0 us (the 3 x 32-deep score chains per warp, the selection / q round
+  trips, barriers, epilogue); K + V traffic adds 5.0 us (1.3 MB through one WGP), the softmax 2.6
+  us (16 heads of phase A VALU on one WGP), the W.V chains 3.9 us.
+- Split: S launch alone 8.5 us at b=4 (DRAM-bound K stream + V^T writes), the V tail after it
+  6.8 us (score + V^T loads 1.7 us of issue stall, 16-head softmax 2.2, chains 1.4, epilogue 0.6).
+- Neither 32-warp WGs (1024 threads, <= 2 score tiles per warp), a deeper W.V ring (8), a
+  row-major dispatch order, nor staging the Q8 bytes through LDS helped (+0..+2 us).
+
+What stops the 7.2-7.6 us roof at b=4, precisely:
+- Bit-identity fixes the dependency shape: each score is one 32-step WMMA chain, each output one
+  40-step chain over the key tiles in order, each head's softmax one warp in lane-strided order.
+  On one WGP that is >= 2.1 us of WMMA issue per phase (1312 WMMAs / 4 SIMDs x 6.5 ns) plus the
+  16-head phase A (2.6 us measured).
+- WMMA M = 16 heads: every K and V tile is read once per head tile, 5.2 MB per row through the CUs
+  (4x the 1.3 MB of unique bytes). Sharing a tile across head tiles needs a WG holding q of 64 heads
+  (64 KB) or the weights of 64 heads (84 KB): the 64 KB per-WG LDS limit rules both out.
+- Spreading a row over more WGPs (the split) keeps the 4x traffic and adds the score / V^T scratch
+  round trips and a replicated 16-head softmax per V work-group: measured slower than one WG from
+  b = 3. Two-launch costs a 2.3 us dependent launch on top.
+- So at b >= 4 the group is set by per-WGP throughput (1.3 MB per (row, head tile) at ~150 GB/s)
+  plus the chains and the softmax: ~15 us of work vs ~10-11 us for a perfectly overlapped W1. The
+  remaining idea not built: a dedicated softmax role spread over 4 WGs per head tile (4 heads each)
+  feeding V work-groups that hold all 64 heads' weights in two LDS halves -- it removes the 4x V
+  re-read and the replicated softmax but adds a second hand-off; estimated -2..-4 us at b=4 from the
+  measurements above, unproven.
+- Not touched (other groups): index-source layers still run the 1-destination `attn_meta_fill`
+  (~2.4 us x 16 lane-layers per step) because the indexer kernels read `n_index_comp_per_b` from
+  device memory.
+
+Per step (2 lanes x 40 layers, long context, b = 4): `auto` saves ~0.07 ms (76 compressed
+lane-layers x ~0.9 us); at b = 1 ~0.13 ms per lane. Below the e2e noise floor: confirm with the
+per-step dGPU busy / stage profile (`k.attn.g3w` vs `k.attn.g3`), not tok/s.
+
 ## Deploy notes (when the owner decides)
 
-- `V41_DGPU_G1_FUSED` and `V41_DGPU_QKV_FRONT` are live knobs: they can be A/B'd without a restart
-  once a decode-opt hub is running. `V41_ATTN_G3`, `V41_MOE_PAIR_DEC`, `V41_MOE_DOWN_DN3` are read
-  once at start.
+- `V41_DGPU_G1_FUSED`, `V41_DGPU_QKV_FRONT`, `V41_ATTN_G3` and `V41_ATTN_G3_KERNEL` are live knobs:
+  they can be A/B'd without a restart once a decode-opt hub is running (`V41_ATTN_G3_KERNEL=auto`
+  only acts where `V41_ATTN_G3=1`). `V41_MOE_PAIR_DEC`, `V41_MOE_DOWN_DN3` are read once at start.
 - The MoE knobs also act inside `deepstrix-expertd` (box 2 runs the same dispatch): a box-2 change
   means rebuilding expertd on box 2 and the two-box restart order.
 - Stage attribution with the knobs on: G1's launch is timed as `dgpu.router` (+ `k.router.g1`); the
   empty `dgpu.router` / `dgpu.rb_pack` spans are not opened under G1, `dgpu.mhc_pre_ffn` is then
   near-empty (its work moved into the G1 launch). G2's work shows under `dgpu.q_chain`
   (`k.q_chain.qkv_front_a/_b`) and `dgpu.kv_chain` disappears. G3 shows under `dgpu.attn_compute`
-  (`k.attn.g3`), and its epilogue moves the rope_inv_quant work out of `dgpu.output_proj`. Compare
+  (`k.attn.g3`, or `k.attn.g3w` for the W kernels), and its epilogue moves the rope_inv_quant work
+  out of `dgpu.output_proj`. Compare
   sums of stages (or dgpu_busy), not single stages.
