@@ -5577,6 +5577,87 @@ impl HeterogeneousEngine {
         self.pre_moe_launch(&mut c, bd, bi, sd, si, dlw, ilw, sev, pager)
     }
 
+    /// dGPU fusion group G1 (`V41_DGPU_G1_FUSED`): the router block of `pre_moe_chain` as ONE
+    /// `G1RouterBlock` launch on `de.compute` -- the same operands, outputs and pack words as the
+    /// chain it replaces there (collapse -> router + look-ahead -> prior -> top-ks -> Q8_K -> pack ->
+    /// M62). `rb` is the pack layout the chain's `PackPlan` produced (not launched under G1).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_g1(
+        &self,
+        de: &super::engine::DeviceEngine,
+        bd: &mut BatchDgpuScratch,
+        sd: &mut BatchDgpuShared,
+        dlw: &DgpuLayerWeights,
+        look_next: Option<&DgpuLayerWeights>,
+        rb: &RbLayout,
+        prior_on: bool,
+        sub3: bool,
+        remote_split_on: bool,
+        layer: u32,
+        b: u32,
+        n_used: u32,
+    ) -> eyre::Result<()> {
+        use crate::g1_router_block::{G1Collapse, G1Io, G1Look, G1PackOffsets, G1Prior, PK_NONE};
+        let off = |s: Option<(u32, u32)>| s.map_or(PK_NONE, |(o, _)| o);
+        let offsets = G1PackOffsets {
+            sel: off(rb.sel),
+            look: off(rb.look),
+            look_ew: off(rb.look_ew),
+            orig: off(rb.orig),
+            range: off(rb.range),
+            ew: off(rb.ew),
+            xq: off(rb.xq),
+        };
+        if rb.packed && (rb.look2.is_some() || rb.alts.is_some() || rb.alt_w.is_some()) {
+            return Err(eyre!("L{layer}: G1 packs no look2 / alternatives (g1_on excludes them)"));
+        }
+        let mut bank = self.sel_stats_bank(true);
+        let io = G1Io {
+            collapse: G1Collapse {
+                x: &bd.after_attn_hc,
+                carry: &bd.hc_pre_carry,
+                norm_w: &dlw.ffn_norm,
+                cur_out: &mut sd.ffn_cur,
+                norm_out: &mut bd.ffn_input_norm,
+                rms_eps: RMS_EPS,
+            },
+            w0: &dlw.ffn_gate_inp.buffer,
+            bias0: dlw.router_bias_dev.as_ref(),
+            logits0: &mut sd.router_logits,
+            look: look_next.map(|nl| G1Look {
+                w: &nl.ffn_gate_inp.buffer,
+                bias: nl.router_bias_dev.as_ref(),
+                logits: &mut sd.router_logits2,
+                sel: &mut sd.look_sel,
+                ew: &mut sd.look_ew,
+            }),
+            prior: if prior_on {
+                Some(G1Prior {
+                    host: &bd.prior_pin,
+                    host_off: layer as usize * N_EXPERT as usize,
+                    dev: &mut bd.d_prior,
+                    n_protect: super::b2_mirror::protect(),
+                    dry: super::b2_mirror::dry(),
+                })
+            } else {
+                None
+            },
+            sel: &mut bd.d_selected,
+            ew: &mut bd.d_ew,
+            orig_sel: if sub3 { Some(&mut bd.d_orig_sel) } else { None },
+            range: if sub3 { Some(&mut bd.d_range) } else { None },
+            xq: if remote_split_on { bd.remote_xq_lane.as_mut() } else { None },
+            pack: if rb.packed { Some((&mut bd.rb_pack, offsets)) } else { None },
+            sel_bank: bank.as_deref_mut().map(|g| (g, layer * N_EXPERT)),
+            done: None,
+            n_used,
+            scale: EXPERT_WEIGHT_SCALE,
+            weight_eps: ROUTER_WEIGHT_EPS,
+            b,
+        };
+        de.g1.launch(&de.compute, io)
+    }
+
     pub fn pre_moe_chain(
         &self,
         bd: &mut BatchDgpuScratch,
@@ -8873,6 +8954,57 @@ impl HeterogeneousEngine {
         // ========================================================
         // Stage 8: mhc_pre_ffn (BATCHED, same shape as Stage 1)
         // ========================================================
+        // The router's look-ahead / alternatives / image-row decisions (documented at the router
+        // below), made here so the G1 fusion decision sees them. Same values as before.
+        let mp = super::lookahead::cfg();
+        let (g_next, g_next2) = super::lookahead::look_gates(mp.mode, lookahead_prefetch(), lookahead_depth());
+        let look_next: Option<&DgpuLayerWeights> = match &rows {
+            RowLayout::Arena { next_router, .. } if g_next => next_router.filter(|nl| !nl.is_hash_router),
+            _ => None,
+        };
+        let look_next2: Option<&DgpuLayerWeights> = match &rows {
+            RowLayout::Arena { next_router2, .. } if g_next2 => next_router2.filter(|nl| !nl.is_hash_router),
+            _ => None,
+        };
+        let n_alt_layer: u32 = if !dlw.is_hash_router
+            && ((matches!(rows, RowLayout::Arena { .. }) && super::b2_mirror::mode() != 3)
+                || super::expert_pager::pick_trace_on())
+        {
+            router_alts()
+        } else {
+            0
+        };
+        let image_runs = image_spans::image_runs(tokens);
+        // dGPU fusion group G1 (`V41_DGPU_G1_FUSED`, default off): the whole router block below --
+        // the pre-ffn collapse, router + k1 look-ahead matvecs, the prior's upload, both top-ks,
+        // box 2's Q8_K rows, the readback pack and the M62 counts -- as ONE `G1RouterBlock` launch,
+        // bit-identical (tests/g1_router_block_bitexact.rs). Only for the shape it reproduces: the
+        // direct (uncaptured) mHC-fast collapse with the mixes late, the fp32 router, no hash
+        // router, no alternatives, no k2 look-ahead, no image rows, no fidelity pin / dump / stats.
+        let g1_on = crate::knobs::DGPU_G1_FUSED.on()
+            && cfg!(feature = "v41")
+            && !mhc_split
+            && matches!(rows, RowLayout::Arena { .. })
+            && mhc_arena_fused()
+            && mhc_narrow_fallback_for(b)
+            && (b as usize) <= sd.mhc_counters.len()
+            && mhc_fast()
+            && mhc_ffn_late()
+            && cap_ok
+            && ced != CedMode::KvSourceOnly
+            && (ctx.is_some() || !ms_graphs())
+            && !router_wmma_for(b)
+            && !dlw.is_hash_router
+            && b >= 1
+            && b <= crate::g1_router_block::G1_MAX_B
+            && n_alt_layer == 0
+            && look_next2.is_none()
+            && image_runs.is_empty()
+            && !super::fidelity_tap::pin_on()
+            && !super::engine::subtensor_dump_armed(layer as usize)
+            && stats.is_none()
+            && N_EXPERT == crate::g1_router_block::G1_N_EXPERT
+            && (cs_n_used as u32) <= crate::g1_router_block::G1_MAX_USED;
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
         // `mhc_ffn_late`: set when the fused pre-ffn mixes are queued after the router.
         let mut ffn_mix_late = false;
@@ -8923,7 +9055,9 @@ impl HeterogeneousEngine {
         // `V41_MHC_FAST`: collapse + rms_w as one launch (the mixes follow the
         // router under `mhc_ffn_late`), or the whole sub-block inline.
         let fast_ffn = fused_ffn && mhc_fast() && cfg!(feature = "v41");
-        if fast_ffn {
+        if fast_ffn && g1_on {
+            // G1: the collapse is the fused kernel's first role (launched at the router below).
+        } else if fast_ffn {
             let _t = de.events.stage("k.mhc_pre_ffn.fast", &de.compute)?;
             let mix = if ffn_mix_late {
                 None
@@ -9078,16 +9212,7 @@ impl HeterogeneousEngine {
         // the readback pack below and its reader decide the `look` segments
         // from the same copy (a live knob flipping between them would leave
         // the pack and its reader disagreeing).
-        let mp = super::lookahead::cfg();
-        let (g_next, g_next2) = super::lookahead::look_gates(mp.mode, lookahead_prefetch(), lookahead_depth());
-        let look_next: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router, .. } if g_next => next_router.filter(|nl| !nl.is_hash_router),
-            _ => None,
-        };
-        let look_next2: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router2, .. } if g_next2 => next_router2.filter(|nl| !nl.is_hash_router),
-            _ => None,
-        };
+        // (`mp`, `look_next`, `look_next2`: decided above stage 8.)
         let _t_router = de.events.stage("dgpu.router", &de.compute)?;
         // dGPU bundle slice 3 (`V41_DGPU_ROUTER_X2`): the look-ahead's matvec rode this layer's router
         // launch (into `sd.router_logits2`); the look-ahead site below then only runs its top-k.
@@ -9098,7 +9223,7 @@ impl HeterogeneousEngine {
         if r1_router {
             self.stage_b.count("g.router_matvec", super::arena_ctx::C_DIRECT);
         }
-        if !cap.skip {
+        if !cap.skip && !g1_on {
         {
             // Gate projection.
             //
@@ -9180,15 +9305,7 @@ impl HeterogeneousEngine {
         // Router alternatives (`V41_ROUTER_ALTS`) only where they are used: decode
         // rows (box-2 miss substitution) or when the pick trace records them.
         // Prefill chunks otherwise skip the extra argmax passes and readbacks.
-        let n_alt_layer: u32 = if !dlw.is_hash_router
-            && ((matches!(rows, RowLayout::Arena { .. }) && super::b2_mirror::mode() != 3)
-                || super::expert_pager::pick_trace_on())
-        {
-            router_alts()
-        } else {
-            0
-        };
-        let image_runs = image_spans::image_runs(tokens);
+        // (`n_alt_layer`, `image_runs`: decided above stage 8.)
         let sub3 = super::b2_mirror::mode() == 3
             && image_runs.is_empty()
             && cache_prior_active(
@@ -9245,11 +9362,14 @@ impl HeterogeneousEngine {
                                 *d = if held { boost } else { 0.0 };
                             }
                         }
-                        bd.d_prior.copy_from_host_async(&bd.prior_pin.as_slice()[slot..slot + ne], &de.compute)?;
+                        if !g1_on {
+                            bd.d_prior.copy_from_host_async(&bd.prior_pin.as_slice()[slot..slot + ne], &de.compute)?;
+                        }
                         prior_on = true;
                     }
                 }
             }
+            if !g1_on {
             de.router_topk.launch_batched_ex(
                 &de.compute,
                 &mut bd.d_selected,
@@ -9275,6 +9395,7 @@ impl HeterogeneousEngine {
                     range_out: if sub3 { Some(&mut bd.d_range) } else { None },
                 },
             )?;
+            }
             // KNOWN_BUGS #0b: layer 0's MoE half is where verify diverges from
             // decode while attention is clean. Expert SELECTION is the first
             // thing to rule in or out -- different experts fully explain the
@@ -9402,7 +9523,7 @@ impl HeterogeneousEngine {
         } else {
             None
         };
-        if let Some(nl) = look_next {
+        if let Some(nl) = look_next.filter(|_| !g1_on) {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
             if !look_fused {
                 de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
@@ -9432,7 +9553,7 @@ impl HeterogeneousEngine {
         // by the time the other lane's chain has been launched) instead of
         // draining the whole compute stream, and the peer push in
         // `pre_moe_prep` waits on the same event.
-        if remote_split_on {
+        if remote_split_on && !g1_on {
             if let Some(xq_dev) = bd.remote_xq_lane.as_mut() {
                 self.set_current_cached(self.dgpu.device)?;
                 de.q8k.launch(
@@ -9499,11 +9620,18 @@ impl HeterogeneousEngine {
                     l.xq = Some(plan.push(PackSeg::bytes(xq_dev, xq_bytes)?));
                 }
             }
-            de.rb_pack.launch(&de.compute, &mut bd.rb_pack, plan.segs())?;
+            if !g1_on {
+                de.rb_pack.launch(&de.compute, &mut bd.rb_pack, plan.segs())?;
+            }
             l
         } else {
             RbLayout::default()
         };
+        if g1_on {
+            self.set_current_cached(self.dgpu.device)?;
+            let _t = de.events.stage("k.router.g1", &de.compute)?;
+            self.launch_g1(de, bd, sd, dlw, look_next, &rb, prior_on, sub3, remote_split_on, layer as u32, b, cs_n_used as u32)?;
+        }
         sev.selected_ready.record(&de.compute)?;
 
         // M62: accumulate the chunk's picks into the prefill stats bank
@@ -9511,7 +9639,11 @@ impl HeterogeneousEngine {
         // The router's own picks: under a live cache-prior `d_selected` holds the
         // prior's choice and `d_orig_sel` the plain one.
         let plain_sel = if prior_on && !super::b2_mirror::dry() { &bd.d_orig_sel } else { &bd.d_selected };
-        self.record_sel_stats(true, plain_sel, layer as u32, b)?;
+        if g1_on {
+            self.note_sel_tokens(true, layer as u32, b);
+        } else {
+            self.record_sel_stats(true, plain_sel, layer as u32, b)?;
+        }
 
         // Stats collection (optional). Copies d_selected to host — sync,
         // fences the device. Don't enable in production prefill.

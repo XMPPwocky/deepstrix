@@ -205,6 +205,8 @@ pub struct DeviceEngine {
     /// only (router lives there) but instantiated on both arches so the
     /// engine struct stays symmetric.
     pub expert_sel_count: crate::ExpertSelCount,
+    /// dGPU fusion group G1 (`V41_DGPU_G1_FUSED`): the decode router block as one launch.
+    pub g1: crate::g1_router_block::G1RouterBlock,
 
     /// Per-device event pool for kernel-scope timing. Use
     /// `events.stage(name, &compute)` to wrap a kernel-group.
@@ -298,6 +300,7 @@ impl DeviceEngine {
             vec_scale: crate::VecScaleInplace::for_arch(arch)?,
             moe_group_builder: crate::moe_group_builder::MoeGroupBuilder::for_arch(arch)?,
             expert_sel_count: crate::ExpertSelCount::for_arch(arch)?,
+            g1: crate::g1_router_block::G1RouterBlock::for_arch(arch, device.id)?,
             events,
         })
     }
@@ -1847,6 +1850,25 @@ impl HeterogeneousEngine {
             ctr.fetch_add(tokens as u64, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// M62 under the G1 fused router block (`V41_DGPU_G1_FUSED`): the bank the kernel counts this
+    /// layer's picks into (`None` when stats are off) -- the caller launches while holding the
+    /// guard -- and [`Self::note_sel_tokens`] for the token counter `record_sel_stats` bumps.
+    pub fn sel_stats_bank(&self, is_prefill: bool) -> Option<std::sync::MutexGuard<'_, DeviceBuffer<u32>>> {
+        if !Self::sel_stats_enabled() {
+            return None;
+        }
+        let bank = if is_prefill { &self.sel_stats_prefill } else { &self.sel_stats_decode };
+        Some(bank.lock().expect("sel_stats lock"))
+    }
+
+    /// The token half of [`Self::record_sel_stats`] (the picks were counted on the device).
+    pub fn note_sel_tokens(&self, is_prefill: bool, layer: u32, tokens: u32) {
+        if Self::sel_stats_enabled() && tokens != 0 && layer == 0 {
+            let ctr = if is_prefill { &self.sel_tokens_prefill } else { &self.sel_tokens_decode };
+            ctr.fetch_add(tokens as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// M62: read back and zero both banks. Returns
