@@ -331,6 +331,8 @@ enum Op {
     PostCombineZc, // hc_post_add2 reading box 2's partial straight from the pinned host buffer (no SDMA copy)
     RouterTopkZc,  // router top-k reading the cache prior straight from pinned host memory (no blit copy)
     EgQuantZc,     // Engram quantize reading the gathered rows straight from pinned host memory
+    // --- dGPU fusion group G1 (V41_DGPU_G1_FUSED): MhcPreFfn .. RbPack + SelCount as ONE launch
+    G1Fused,
 }
 
 use Op::*;
@@ -356,6 +358,7 @@ impl Op {
             PostCombine | PostCombineZc => b * (3 * ne + 2 * hcd) * f,
             EgH2d => b * ENGRAM_IN as usize * f,
             EgQuant | EgQuantZc => b * ENGRAM_IN as usize * (f + 1),
+            G1Fused => 2 * f16_bytes(N_EXPERT, N_EMBD) + b * (hcd + 2 * ne) * f,
             EgMvQ => q8_bytes(ENGRAM_OUT_Q, ENGRAM_IN),
             EgGate => b * (2 * hcd + 5 * ne) * f,
             MhcPreAttn => f16_bytes(HC_MIX_DIM, HC_DIM) + b * (hcd + 2 * ne) * f,
@@ -424,6 +427,7 @@ impl Op {
             MhcPreFfn => "mhc_pre_ffn",
             RouterMv | PriorH2d | RouterTopk | RouterTopkZc | LookTopk | XqQ8k => "router",
             RbPack | SelRecord | SelCount => "rb_pack",
+            G1Fused => "g1_router_block",
             ShQuant | ShFused | ShGate | ShUp | ShSwiglu | ShQuantMid | ShDown => "shared_expert",
             MixLate => "mix_ffn_late",
         }
@@ -457,6 +461,18 @@ fn chain(class: &str, b: u32) -> Vec<Op> {
         "probe_event8" => return [vec![Empty], vec![SelRecord; 8]].concat(),
         "probe_remote8" => return [vec![Empty], vec![PostH2d; 8]].concat(),
         "reuse_noev" => return chain("reuse", b).into_iter().filter(|o| *o != SelRecord).collect(),
+        // dGPU fusion group G1: the router block as one launch (selected_ready still recorded after it).
+        "reuse_g1" => {
+            let mut v = Vec::new();
+            for o in chain("reuse", b) {
+                match o {
+                    MhcPreFfn => v.push(G1Fused),
+                    RouterMv | PriorH2d | RouterTopk | LookTopk | XqQ8k | RbPack | SelCount => {}
+                    o => v.push(o),
+                }
+            }
+            return v;
+        }
         // PROXY of the fused design: only the launches that survive fusion (their current kernels;
         // the absorbed epilogue work is not added back, so this is a lower bound on the fused wall).
         "reuse_min" => {
@@ -1094,6 +1110,33 @@ fn run(e: &DeviceEngine, s: &Stream, bf: &mut Bufs, op: Op, b: u32) -> eyre::Res
         }
         SelRecord => bf.sel_ev.record(s),
         SelCount => e.expert_sel_count.launch(s, &mut bf.sel_bank, &bf.sel, 7, N_EXPERT, b * N_EXPERT_USED as u32),
+        G1Fused => {
+            use v4flash_kernels::g1_router_block::{G1Collapse, G1Io, G1Look, G1PackOffsets, G1Prior};
+            let (w0, w1) = (bf.w(f16_bytes(N_EXPERT, N_EMBD), 0), bf.w(f16_bytes(N_EXPERT, N_EMBD), 1));
+            let ns = (bu * N_EXPERT_USED) as u32;
+            let offs = G1PackOffsets { sel: 0, look: ns, look_ew: 2 * ns, orig: 3 * ns, range: 4 * ns, ew: 4 * ns + bu as u32, xq: 5 * ns + bu as u32 };
+            let io = G1Io {
+                collapse: G1Collapse { x: &bf.after_attn_hc, carry: &bf.carry, norm_w: &bf.ffn_norm_w, cur_out: &mut bf.ffn_cur, norm_out: &mut bf.ffn_in, rms_eps: RMS_EPS },
+                w0: &w0,
+                bias0: Some(&bf.bias),
+                logits0: &mut bf.logits,
+                look: Some(G1Look { w: &w1, bias: Some(&bf.bias2), logits: &mut bf.logits2, sel: &mut bf.look_sel, ew: &mut bf.look_ew }),
+                prior: Some(G1Prior { host: &bf.prior_pin, host_off: 0, dev: &mut bf.prior, n_protect: 2, dry: false }),
+                sel: &mut bf.sel,
+                ew: &mut bf.ew,
+                orig_sel: Some(&mut bf.orig_sel),
+                range: Some(&mut bf.range),
+                xq: Some(&mut bf.rxq),
+                pack: Some((&mut bf.rb, offs)),
+                sel_bank: Some((&mut bf.sel_bank, 7 * N_EXPERT)),
+                done: None,
+                n_used: N_EXPERT_USED as u32,
+                scale: EXPERT_WEIGHT_SCALE,
+                weight_eps: ROUTER_WEIGHT_EPS,
+                b,
+            };
+            e.g1.launch(s, io)
+        }
         ShQuant => e.q8.quantize_input_batched(s, &mut bf.xq, &mut bf.xs, &bf.ffn_in, N_EMBD, b),
         ShFused => {
             let (w0, w1) = (bf.w(q8_bytes(N_FF_SHARED, N_EMBD), 0), bf.w(q8_bytes(N_FF_SHARED, N_EMBD), 2));
@@ -1427,6 +1470,7 @@ fn bw_gbs() -> f64 {
 // ---------------------------------------------------------------------------------------------
 fn section_chain(e: &DeviceEngine, rig: &mut Rig, bf: &mut Bufs, bs: &[u32], rounds: usize, rng: &mut Lcg, stats: &Stats) -> eyre::Result<()> {
     let classes_all = ["reuse", "reuse#AA", "index", "kvsrc", "route:reuse", "reuse_zc", "reuse_noev", "reuse_min", "route:reuse_zc",
+        "reuse_g1", "route:reuse_g1",
         "probe_empty1", "probe_empty17", "probe_vadd17", "probe_pinned8", "probe_pageable8", "probe_event8", "probe_remote8"];
     let only = std::env::var("BENCH_CLASSES").ok();
     let classes: Vec<&str> = classes_all.iter().copied().filter(|c| *c == "reuse" || only.as_deref().map_or(true, |o| o.split(',').any(|x| x == *c))).collect();

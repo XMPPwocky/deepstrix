@@ -906,8 +906,11 @@ crate::knobs! {
     /// prior's upload, both top-ks, box 2's Q8_K rows, the readback pack, the M62 counts) as ONE
     /// launch (`G1RouterBlock`, kernels/g1_router_block.hip) instead of nine queue operations; every
     /// output bit-identical (tests/g1_router_block_bitexact.rs). Only where the current chain is
-    /// the direct mHC-fast + mix-late + router-x2-eligible + packed decode shape (`g1_eligible`);
+    /// the direct mHC-fast + mix-late fp32-router decode shape (`g1_on` in pre_moe_chain);
     /// everything else keeps the current path. `selected_ready` is recorded after it as before.
+    /// Bench 10-13 (tests/bench_g1_router_block.rs, cold weights, beside the hub): queued group wall
+    /// b=1 66.1 -> 34.4 us, b=4 72.0 -> 39.6, b=8 88.7 -> 51.6, b=16 122.8 -> 73.1; lane-layer chain
+    /// (bench_dgpu_chain_map reuse vs reuse_g1, warm) b=4 307.3 -> 283.1 us, host enqueue -12 us.
     pub static DGPU_G1_FUSED = Knob::flag("V41_DGPU_G1_FUSED", false).live();
     /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
     /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top
