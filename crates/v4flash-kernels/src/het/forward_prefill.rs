@@ -2411,6 +2411,64 @@ fn attn_dec_fused() -> bool {
     *D
 }
 
+/// `V41_ATTN_G3` (default OFF; `1` = on): the decode attention BLOCK as ONE launch,
+/// `AttnDecG3::launch` (kernels/attn_dec_g3.hip), in place of `attn_meta_fill` +
+/// `indexer_gather` + `attention_dec_fused_vt_qreg_sp_d4` + `rope_inv_quant_q8`: the per-row
+/// metadata in the kernel arguments, the selected compressed rows read in place through the
+/// top-K selection, W.V from `global_load_tr_b128` (no LDS V ring), and the inverse rope + Q8_0
+/// quantize of `heads` as the epilogue. BIT-IDENTICAL quantized heads (the wo_a input) to the
+/// chain (tests/attn_dec_g3_bitexact.rs), written to the R1 `g3_heads_xq` / `g3_heads_xscale`
+/// views (the R2 `heads_xq` lives inside `q_normed`, which other work-groups of the same launch
+/// are still reading). Taken only where the chain would run exactly those kernels and nothing
+/// reads `heads` afterwards: the `dec_fused` attention, the `V41_DEC_FUSE` dp4a output projection
+/// with `V41_DEC_SKIP_DEAD`, no sub-tensor dump, rows of <= 512 compressed + 640 total keys, an
+/// f16 main store when the selection is used, graphs off, no `V41_VERIFY_DECODE_ATTN`.
+/// Index-source layers still fill `n_index_comp_per_b` (one 1-destination `attn_meta_fill`).
+pub fn attn_g3() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_ATTN_G3").as_deref() == Ok("1"));
+    *D
+}
+
+/// The `V41_ATTN_G3` launch at an attention site (stage `k.attn.g3`): `xq` / `xscale` (the R1
+/// `g3_heads_*` views) get what `rope_inv_quant_q8` would write into `heads_xq` / `heads_xscale`;
+/// `heads` is not written (the call sites take G3 only when nothing reads it).
+#[allow(clippy::too_many_arguments)]
+fn launch_attn_g3(
+    de: &super::engine::DeviceEngine,
+    xq: &mut DeviceBuffer<i8>,
+    xscale: &mut DeviceBuffer<f32>,
+    zero_row: &DeviceBuffer<u16>,
+    sinks: &DeviceBuffer<f32>,
+    q: &DeviceBuffer<f32>,
+    raw_kv: &DeviceBuffer<u16>,
+    comp: crate::attn_dec_g3::G3Comp<'_>,
+    n_raw: &[i32],
+    raw_off: &[i32],
+    n_comp: &[i32],
+    pos_per_b: &DeviceBuffer<i32>,
+    rope: &crate::RopeParams,
+) -> eyre::Result<()> {
+    let _t = de.events.stage("k.attn.g3", &de.compute)?;
+    de.attn_g3.launch(
+        &de.compute,
+        None,
+        xq,
+        xscale,
+        zero_row,
+        sinks,
+        q,
+        raw_kv,
+        comp,
+        crate::attn_dec_g3::G3Rows { n_raw, raw_off, n_comp },
+        pos_per_b,
+        N_HEAD,
+        N_HEAD_DIM,
+        N_ROT,
+        rope,
+    )
+}
+
 /// `V41_ATTN_DEC_SCORE_BLK128` (default ON; `0` = the 16-warp WG): when the
 /// `attn_dec_score_for(b)` path runs the PAIR (fused off or not applicable),
 /// score with `attention_dec_score_blk128` (kernels/attention_dec.hip): the
@@ -7618,6 +7676,35 @@ impl HeterogeneousEngine {
                 && n_comp_after.iter().any(|&v| v > INDEXER_TOP_K)
         };
         let _t_attn = de.events.stage("dgpu.attn_compute", &de.compute)?;
+        // `V41_ATTN_G3`: the attention block (meta + gather + attention + the output projection's
+        // inverse rope / heads quantize) as ONE launch, only where the chain would run exactly the
+        // kernels it replaces (see `attn_g3`). `g3_n_comp` is the chain's final n_comp_per.
+        let g3_sparse = ratio > 0 && (need_mask || s2_reuse);
+        let g3_n_comp: Vec<i32> = n_comp_after
+            .iter()
+            .map(|&v| (if ratio == 0 { 0 } else if g3_sparse { v.min(INDEXER_TOP_K) } else { v }) as i32)
+            .collect();
+        let g3 = cfg!(feature = "v41")
+            && attn_g3()
+            && !ms_graphs()
+            && !verify_decode_attn()
+            && attn_dec_score_for(b)
+            && attn_dec_fused()
+            && !*lane_env::ATTN_FUSED
+            && !super::batch_scratch::use_f32_scores()
+            && dec_fuse(b)
+            && std::env::var("Q8_GROUPED_VARIANT")
+                .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() })
+                == "dp4a"
+            && N_HEAD == 64
+            && N_HEAD_DIM == 512
+            && N_ROT == 64
+            && dec_skip_dead()
+            && !super::engine::subtensor_dump_armed(layer as usize)
+            && (ratio > 0 || (swa_via_mixed() && n_raw_after.iter().any(|&v| v > 0)))
+            && (!g3_sparse
+                || matches!(ls.compressor.as_ref().map(|c| &c.comp_kv), Some(CompKvStore::F16(_))))
+            && crate::attn_dec_g3::AttnDecG3::rows_ok(&n_raw_per_host, &g3_n_comp);
         // `V41_ATTN_META_FILL`: the per-row metadata as ONE kernel-argument
         // launch, with n_comp_per already in its FINAL form (min(n, TOP_K) when
         // the indexer fires or the S2 selection is reused -- the dense values the
@@ -7626,7 +7713,19 @@ impl HeterogeneousEngine {
         // the gather / score / smwsum) and the indexer's n_index_comp_per_b
         // included. The device bytes every kernel reads are the same.
         let meta_fill = attn_meta_fill() && (b as usize) <= crate::attn_meta::ATTN_META_MAX_ROWS;
-        if meta_fill {
+        if g3 {
+            // G3 reads n_raw / raw_off / n_comp from its arguments; only the indexer's
+            // n_index_comp_per_b is still needed on device (index-source layers). Without
+            // `meta_fill` the indexer block below copies it itself.
+            if meta_fill && need_mask {
+                use crate::attn_meta::MetaDst;
+                let n_idx: Vec<i32> = n_comp_after.iter().map(|&v| v as i32).collect();
+                de.attn_meta.launch(
+                    &de.compute,
+                    [None, None, None, Some(MetaDst::new(&mut sd.n_index_comp_per_b, &n_idx)?)],
+                )?;
+            }
+        } else if meta_fill {
             use crate::attn_meta::MetaDst;
             let sparse = need_mask || s2_reuse;
             let n_comp_final: Vec<i32> = n_comp_after
@@ -7678,7 +7777,28 @@ impl HeterogeneousEngine {
                     && attn_dec_fused()
                     && n_total_max <= crate::attention_dec::ATTN_DEC_FUSED_MAX_KEYS
                     && !verify_decode_attn();
-                if dec_fused {
+                if g3 && !dec_fused {
+                    // G3 skipped the meta fill: the chain cannot run with stale metadata
+                    return Err(eyre!("L{layer}: V41_ATTN_G3 chosen but the dec_fused attention is not applicable"));
+                }
+                if dec_fused && g3 {
+                    let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+                    launch_attn_g3(
+                        de,
+                        &mut sd.g3_heads_xq,
+                        &mut sd.g3_heads_xscale,
+                        &sd.g3_zero_row,
+                        &dlw.attn_sinks,
+                        &sd.q_normed,
+                        &ls.kv_cache,
+                        crate::attn_dec_g3::G3Comp::None,
+                        &n_raw_per_host,
+                        &n_raw_offset_per_host,
+                        &g3_n_comp,
+                        &pos_v,
+                        &dlw.rope_params,
+                    )?;
+                } else if dec_fused {
                     let _t = de.events.stage("k.attn.dec_fused", &de.compute)?;
                     de.attn_dec.launch_fused_f16s_rows(
                         &de.compute,
@@ -8191,7 +8311,7 @@ impl HeterogeneousEngine {
                 // then reads only top-K rows per token instead of doing
                 // dense reads with a -INF mask — 15× DRAM/WMMA savings on
                 // both score and smwsum at depth 32K.
-                {
+                if !g3 {
                     let _t = de.events.stage("k.indexer.gather", &de.compute)?;
                     let cs_ref = ls
                         .compressor
@@ -8229,7 +8349,7 @@ impl HeterogeneousEngine {
                 // Re-upload sparse n_comp_per (= min(actual, INDEXER_TOP_K))
                 // so score+smwsum iterate only over the gathered top-K rows.
                 // (`meta_fill` wrote these values up front.)
-                if !meta_fill {
+                if !meta_fill && !g3 {
                     let sparse_n_comp_host: Vec<i32> = n_comp_after
                         .iter()
                         .map(|&v| v.min(INDEXER_TOP_K) as i32)
@@ -8263,7 +8383,7 @@ impl HeterogeneousEngine {
                             "S2 shared selection ACTIVE (reuse layer skipped score+topk)");
                     });
                 }
-                if !meta_fill {
+                if !meta_fill && !g3 {
                     let sparse_n_comp_host: Vec<i32> = n_comp_after
                         .iter()
                         .map(|&v| v.min(INDEXER_TOP_K) as i32)
@@ -8272,7 +8392,7 @@ impl HeterogeneousEngine {
                     ncp_v.copy_from_host_async(&sparse_n_comp_host, &de.compute)?;
                 }
                 let cs_ref = ls.compressor.as_ref().expect("s2_reuse implies a compressor");
-                match &cs_ref.comp_kv {
+                if !g3 { match &cs_ref.comp_kv {
                     CompKvStore::F16(buf) => de.indexer_gather.launch_batched_rows(
                         &de.compute,
                         &mut sd.attn_active_comp_kv,
@@ -8284,7 +8404,7 @@ impl HeterogeneousEngine {
                         arena_comp_base,
                     )?,
                     _ => return Err(eyre!("L{layer}: S2 reuse needs an f16 main store")),
-                }
+                } }
                 _t_ix.end()?;
                 true
             } else {
@@ -8343,7 +8463,51 @@ impl HeterogeneousEngine {
                 && attn_dec_fused()
                 && eff_n_total_max <= crate::attention_dec::ATTN_DEC_FUSED_MAX_KEYS
                 && !verify_decode_attn();
-            if dec_fused {
+            if g3 && !dec_fused {
+                // G3 skipped the meta fill and the gather: the chain cannot run without them
+                return Err(eyre!("L{layer}: V41_ATTN_G3 chosen but the dec_fused attention is not applicable"));
+            }
+            if dec_fused && g3 {
+                // The chain's comp rows: the selection's rows of the main store (what the gather
+                // copies; the gather was skipped), or the dense store at the row's base.
+                let comp = if indexer_fired {
+                    let store = match ls.compressor.as_ref().map(|c| &c.comp_kv) {
+                        Some(CompKvStore::F16(buf)) => buf,
+                        _ => return Err(eyre!("L{layer}: V41_ATTN_G3 needs an f16 main store")),
+                    };
+                    crate::attn_dec_g3::G3Comp::Selected {
+                        store,
+                        sel: &bd.indexer_sel_saved,
+                        sel_stride: INDEXER_TOP_K,
+                        base: arena_comp_base,
+                    }
+                } else {
+                    match eff_comp_kv_buf {
+                        Some(store) => crate::attn_dec_g3::G3Comp::Dense {
+                            store,
+                            base: attn_comp_base,
+                            batch_stride: eff_comp_kv_batch_stride,
+                        },
+                        None => crate::attn_dec_g3::G3Comp::None,
+                    }
+                };
+                let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+                launch_attn_g3(
+                    de,
+                    &mut sd.g3_heads_xq,
+                    &mut sd.g3_heads_xscale,
+                    &sd.g3_zero_row,
+                    &dlw.attn_sinks,
+                    &sd.q_normed,
+                    &ls.kv_cache,
+                    comp,
+                    &n_raw_per_host,
+                    &n_raw_offset_per_host,
+                    &g3_n_comp,
+                    &pos_v,
+                    &dlw.rope_params,
+                )?;
+            } else if dec_fused {
                 let _t = de.events.stage("k.attn.dec_fused", &de.compute)?;
                 de.attn_dec.launch_fused_f16s_rows(
                     &de.compute,
@@ -8671,7 +8835,9 @@ impl HeterogeneousEngine {
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
         // ========================================================
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
-        let cap = self.stage_cap_ctx(de, "g.output_proj", layer as usize, b, lane_ptr, cap_ok, ctx)?;
+        // `V41_ATTN_G3` already wrote the quantized heads (R1 `g3_heads_*`): this stage must run
+        // direct (a replayed graph would re-run rope_inv_quant and read the R2 `heads_xq`).
+        let cap = self.stage_cap_ctx(de, "g.output_proj", layer as usize, b, lane_ptr, cap_ok && !g3, ctx)?;
         if !cap.skip {
         // SLACK PROBE site `verify_dgpu`: one stall per layer on the dGPU
         // chain. 40 layers x 2 lanes, so the injected total is 80x the tick
@@ -8686,7 +8852,9 @@ impl HeterogeneousEngine {
             .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
         let heads_rope_quant_fused = cfg!(feature = "v41") && dec_fuse(b) && grp_variant != "f16x"
             && N_HEAD == 64 && N_HEAD_DIM == 512 && N_ROT == 64;
-        if heads_rope_quant_fused {
+        if heads_rope_quant_fused && g3 {
+            // done by the attention block's epilogue (`V41_ATTN_G3`)
+        } else if heads_rope_quant_fused {
             let _t = de.events.stage("k.output_proj.rope_inv_quant", &de.compute)?;
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
             match cap.src.ind() {
@@ -8777,6 +8945,12 @@ impl HeterogeneousEngine {
                     Some(ind) => de.q8_grouped.matvec_grouped_batched_ind(
                         &de.compute, ind.with(1, slot::WO_A), &mut sd.low, &dlw.attn_output_a.buffer,
                         &sd.heads_xq, &sd.heads_xscale,
+                        GROUP_DIM, RANK, N_GROUPS, b,
+                    )?,
+                    // `V41_ATTN_G3`: the attention block quantized heads into the R1 views
+                    None if g3 => de.q8_grouped.matvec_grouped_batched(
+                        &de.compute, &mut sd.low, &dlw.attn_output_a.buffer,
+                        &sd.g3_heads_xq, &sd.g3_heads_xscale,
                         GROUP_DIM, RANK, N_GROUPS, b,
                     )?,
                     None => de.q8_grouped.matvec_grouped_batched(
