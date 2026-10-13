@@ -128,6 +128,7 @@ struct G1Args {
     float rms_eps;
     float scale;
     float weight_eps;
+    unsigned n_pf;            // PREFETCH workgroups (0 = none)
     unsigned dbg;             // bench ablations (V41_DGPU_G1_DBG): 1 no prior, 2 no q8k, 4 no top-k tail, 8 no row wait, 16 no ticket
 };
 
@@ -211,9 +212,10 @@ __device__ __forceinline__ float g1_wmin_f32(float f) {
 }
 
 // --------------------------------------------------------------------------------------------
-// One selection pass (see TOP-K above): returns the winner (uniform), masks it to ord(-INF).
+// One selection pass (see TOP-K above): the winner expert (uniform) and its prob; the winner is
+// masked to ord(-INF) in its owner lane. `p` = this lane's 12 probs.
 // --------------------------------------------------------------------------------------------
-__device__ __forceinline__ int g1_pass(unsigned (&h)[G1_EPL], unsigned lane) {
+__device__ __forceinline__ int g1_pass(unsigned (&h)[G1_EPL], const float (&p)[G1_EPL], unsigned lane, float& pw) {
     // lane-local max tree on (h, i): the right side wins only when strictly greater
     unsigned h1[6], i1[6];
     #pragma unroll
@@ -236,8 +238,12 @@ __device__ __forceinline__ int g1_pass(unsigned (&h)[G1_EPL], unsigned lane) {
     ib = g4 ? i2[2] : ib;
     const unsigned mh = g1_wmax_u32(hb);
     const unsigned win = g1_wmin_u32(hb == mh ? lane + G1_WARP * ib : 0xffffffffu);
-    if ((win & 31u) == lane) {
-        const unsigned wi = win >> 5;
+    const unsigned wi = win >> 5, wl = win & 31u;
+    float pl = 0.0f;
+    #pragma unroll
+    for (unsigned i = 0; i < G1_EPL; ++i) pl = (i == wi) ? p[i] : pl;
+    pw = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(pl), wl));
+    if (wl == lane) {
         #pragma unroll
         for (unsigned i = 0; i < G1_EPL; ++i)
             if (i == wi) h[i] = 0x007fffffu;   // ord(-INF): still a candidate, as wfred's masked score
@@ -245,70 +251,82 @@ __device__ __forceinline__ int g1_pass(unsigned (&h)[G1_EPL], unsigned lane) {
     return (int)win;
 }
 
-__device__ __forceinline__ void g1_topk_row(const G1Args& a, unsigned mat, unsigned z, unsigned lane, float* s_p, unsigned long long* ts) {
+// LDS of the selection tasks: per row and list (0 = the plain scores, 1 = scores + prior), the
+// n_used winners in pass order (expert, prob).
+struct G1Sel {
+    int e[G1_MAXB][2][8];
+    float p[G1_MAXB][2][8];
+};
+
+// TASK: one row's n_used passes over one list (kind 0: score; kind 1: score + prior, UNMASKED --
+// the emit skips the protected experts instead of masking them: the same sequence of unprotected
+// winners as wfred's masked passes, and n_used of them leave at least n_used - n_protect).
+__device__ __forceinline__ void g1_sel_task(const G1Args& a, unsigned mat, unsigned z, unsigned kind, unsigned lane, G1Sel& sl) {
     const float* pr = a.scr + G1_SCR_PROB(mat, z);
     const float* scv = a.scr + G1_SCR_SCORE(mat, z);
-    const bool prior = (mat == 0) && (a.prior_host != nullptr);
-    const unsigned n_used = a.n_used;
-    const unsigned n_protect = a.n_protect < n_used ? a.n_protect : n_used;
-
-    // All loads first (one L2 round trip).
     float sc[G1_EPL], pv[G1_EPL], pp[G1_EPL];
     #pragma unroll
     for (unsigned i = 0; i < G1_EPL; ++i) sc[i] = scv[lane + G1_WARP * i];
     #pragma unroll
     for (unsigned i = 0; i < G1_EPL; ++i) pp[i] = pr[lane + G1_WARP * i];
-    #pragma unroll
-    for (unsigned i = 0; i < G1_EPL; ++i) pv[i] = prior ? a.prior_dev[lane + G1_WARP * i] : 0.0f;
-    unsigned hs[G1_EPL], hbo[G1_EPL];
-    #pragma unroll
-    for (unsigned i = 0; i < G1_EPL; ++i) {
-        s_p[lane + G1_WARP * i] = pp[i];
-        hs[i] = g1_ord(sc[i]);
-        hbo[i] = g1_ord(prior ? (sc[i] + pv[i]) : -INFINITY);
+    if (kind == 1u) {
+        #pragma unroll
+        for (unsigned i = 0; i < G1_EPL; ++i) pv[i] = a.prior_dev[lane + G1_WARP * i];
     }
-    G1_TS(10);
-    float range = 0.0f;
-    if (mat == 0 && a.range_out != nullptr) {
+    unsigned h[G1_EPL];
+    #pragma unroll
+    for (unsigned i = 0; i < G1_EPL; ++i) h[i] = g1_ord(kind == 1u ? (sc[i] + pv[i]) : sc[i]);
+    #pragma nounroll
+    for (unsigned k = 0; k < a.n_used; ++k) {
+        float pw;
+        const int w = g1_pass(h, pp, lane, pw);
+        if (lane == 0) { sl.e[z][kind][k] = w; sl.p[z][kind][k] = pw; }
+    }
+    // the row's score range (max - min of the plain scores), from the plain task
+    if (kind == 0u && mat == 0 && a.range_out != nullptr) {
         float mx = -INFINITY, mn = INFINITY;
         #pragma unroll
         for (unsigned i = 0; i < G1_EPL; ++i) { mx = fmaxf(mx, sc[i]); mn = fminf(mn, sc[i]); }
-        range = g1_wmax_f32(mx) - g1_wmin_f32(mn);
+        const float range = g1_wmax_f32(mx) - g1_wmin_f32(mn);
+        if (lane == 0) {
+            a.range_out[z] = range;
+            if (a.pack != nullptr && a.pk_range != G1_NONE) a.pack[a.pk_range + z] = __float_as_uint(range);
+        }
     }
-    // Lane k ends with pick k (sel) / original pick k (orig).
+}
+
+// EMIT: row z's picks, weights, device outputs, pack words and M62 counts from the tasks' lists.
+__device__ __forceinline__ void g1_emit_row(const G1Args& a, unsigned mat, unsigned z, unsigned lane, const G1Sel& sl) {
+    const bool prior = (mat == 0) && (a.prior_host != nullptr);
+    const unsigned n_used = a.n_used;
+    const unsigned n_protect = a.n_protect < n_used ? a.n_protect : n_used;
     int my_orig = -1, my_sel = -1;
-    #pragma nounroll
-    for (unsigned k = 0; k < n_used; ++k) {
-        const int w = g1_pass(hs, lane);
-        if (lane == k) my_orig = w;
-    }
+    float p_orig = 0.0f, p_sel = 0.0f;
+    if (lane < n_used) { my_orig = sl.e[z][0][lane]; p_orig = sl.p[z][0][lane]; }
     my_sel = my_orig;
+    p_sel = p_orig;
     if (prior) {
-        my_sel = (lane < n_protect) ? my_orig : -1;
+        if (lane >= n_protect) { my_sel = -1; p_sel = 0.0f; }
+        unsigned cnt = n_protect;
         #pragma nounroll
-        for (unsigned k = 0; k < n_protect; ++k) {
-            const unsigned o = (unsigned)__builtin_amdgcn_readlane(my_orig, k);
-            if ((o & 31u) == lane) {
-                const unsigned oi = o >> 5;
-                #pragma unroll
-                for (unsigned i = 0; i < G1_EPL; ++i)
-                    if (i == oi) hbo[i] = 0x007fffffu;
+        for (unsigned t = 0; t < n_used; ++t) {
+            const int e = sl.e[z][1][t];
+            bool prot = false;
+            #pragma nounroll
+            for (unsigned q = 0; q < n_protect; ++q) prot = prot || (e == sl.e[z][0][q]);
+            if (!prot && cnt < n_used) {
+                if (lane == cnt) { my_sel = e; p_sel = sl.p[z][1][t]; }
+                ++cnt;
             }
         }
-        #pragma nounroll
-        for (unsigned k = n_protect; k < n_used; ++k) {
-            const int w = g1_pass(hbo, lane);
-            if (lane == k) my_sel = w;
-        }
     }
-    G1_TS(11);
     const int plain = my_orig;   // the router's own top-n_used (what M62 counts)
-    if (prior && a.prior_dry != 0u) { const int t = my_sel; my_sel = my_orig; my_orig = t; }
-    __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-    // Weights: lane j's prob, summed in pick order.
-    const float pj = (lane < n_used && my_sel >= 0) ? s_p[my_sel] : 0.0f;
+    if (prior && a.prior_dry != 0u) {
+        const int t = my_sel; my_sel = my_orig; my_orig = t;
+        const float tp = p_sel; p_sel = p_orig; p_orig = tp;
+    }
+    // Weights: lane j's prob, summed in pick order (wfred: p = s >= 0 ? prob : 0).
+    const float pj = (lane < n_used && my_sel >= 0) ? p_sel : 0.0f;
     float sum = 0.0f;
     #pragma nounroll
     for (unsigned j = 0; j < n_used; ++j) sum += __int_as_float(__builtin_amdgcn_readlane(__float_as_int(pj), j));
@@ -336,11 +354,19 @@ __device__ __forceinline__ void g1_topk_row(const G1Args& a, unsigned mat, unsig
             }
         }
     }
-    if (mat == 0 && a.range_out != nullptr && lane == 0) {
-        a.range_out[z] = range;
-        if (a.pack != nullptr && a.pk_range != G1_NONE) a.pack[a.pk_range + z] = __float_as_uint(range);
-    }
-    G1_TS(12);
+}
+
+// The tail of matrix `mat` (the WG whose router part finished last): the selection tasks spread
+// over the 8 waves (a row's plain and prior passes run in different waves), then one wave per row
+// composes and emits.
+__device__ __forceinline__ void g1_tail(const G1Args& a, unsigned mat, unsigned warp, unsigned lane, G1Sel& sl, unsigned long long* ts) {
+    const unsigned b = a.b;
+    const unsigned kinds = (mat == 0 && a.prior_host != nullptr) ? 2u : 1u;
+    for (unsigned t = warp; t < b * kinds; t += 8u) g1_sel_task(a, mat, t / kinds, t % kinds, lane, sl);
+    __syncthreads();
+    G1_TS(10);
+    for (unsigned z = warp; z < b; z += 8u) g1_emit_row(a, mat, z, lane, sl);
+    G1_TS(11);
 }
 
 // --------------------------------------------------------------------------------------------
@@ -551,48 +577,61 @@ __device__ __forceinline__ void g1_router_wave_ph(const G1Args& a, unsigned mat,
     G1_TS(3);
     const float4* xg = reinterpret_cast<const float4*>(a.norm_out);
     float4* sx4 = reinterpret_cast<float4*>(sx);
-    // staging map: thread tid's i-th float4 of the phase = row zz, float4 c of the slab
-    auto stage_load = [&](unsigned ph, float4 (&st)[ST4]) {
-        #pragma unroll
-        for (unsigned i = 0; i < ST4; ++i) {
-            const unsigned f = tid + G1_BLOCK * i;            // float4 index in [ZB][SLAB / 4]
-            const unsigned zz = f / (SLAB / 4u), c = f % (SLAB / 4u);
-            st[i] = (zz < b) ? xg[(size_t)zz * (G1_NE / 4u) + ph * (SLAB / 4u) + c] : make_float4(0.f, 0.f, 0.f, 0.f);
+    float mine = 0.0f;
+    // Batch rows in slices of ZB (b > ZB: one slice after the other; a later slice re-reads its
+    // weights, from the caches the first slice filled).
+    constexpr unsigned SL = (ZB == 8u) ? G1_MAXB / ZB : 1u;   // row slices (only the ZB = 8 forms loop)
+    #pragma unroll
+    for (unsigned si = 0; si < SL; ++si) {
+        const unsigned z0 = si * ZB;
+        if (z0 >= b) break;
+        const unsigned nz = min(ZB, b - z0);
+        if (z0 != 0u) {
+            #pragma unroll
+            for (unsigned e = 0; e < PFE; ++e) wq[e] = wr[lane + G1_WARP * e];
         }
-    };
-    float4 st[ST4];
-    stage_load(0, st);
-    float acc[ZB];
-    #pragma unroll
-    for (unsigned z = 0; z < ZB; ++z) acc[z] = 0.0f;
-    #pragma unroll
-    for (unsigned ph = 0; ph < NPH; ++ph) {
+        // staging map: thread tid's i-th float4 of the phase = row zz, float4 c of the slab
+        auto stage_load = [&](unsigned ph, float4 (&st)[ST4]) {
+            #pragma unroll
+            for (unsigned i = 0; i < ST4; ++i) {
+                const unsigned f = tid + G1_BLOCK * i;            // float4 index in [ZB][SLAB / 4]
+                const unsigned zz = f / (SLAB / 4u), c = f % (SLAB / 4u);
+                st[i] = (zz < nz) ? xg[(size_t)(z0 + zz) * (G1_NE / 4u) + ph * (SLAB / 4u) + c] : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        };
+        float4 st[ST4];
+        stage_load(0, st);
+        float acc[ZB];
         #pragma unroll
-        for (unsigned i = 0; i < ST4; ++i) sx4[tid + G1_BLOCK * i] = st[i];
-        __syncthreads();
-        if (ph + 1 < NPH) stage_load(ph + 1, st);
-        const unsigned slot = (ph % RPH) * PHE;
+        for (unsigned z = 0; z < ZB; ++z) acc[z] = 0.0f;
+        #pragma unroll
+        for (unsigned ph = 0; ph < NPH; ++ph) {
+            #pragma unroll
+            for (unsigned i = 0; i < ST4; ++i) sx4[tid + G1_BLOCK * i] = st[i];
+            __syncthreads();
+            if (ph + 1 < NPH) stage_load(ph + 1, st);
+            const unsigned slot = (ph % RPH) * PHE;
+            #pragma unroll
+            for (unsigned z = 0; z < ZB; ++z) {
+                if (z < nz) {
+                    #pragma unroll
+                    for (unsigned jj = 0; jj < PHE; ++jj) acc[z] += __half2float(wq[slot + jj]) * sx[z * SLAB + lane + G1_WARP * jj];
+                }
+            }
+            // refill this slot with the phase RPH ahead
+            if (ph + RPH < NPH) {
+                #pragma unroll
+                for (unsigned jj = 0; jj < PHE; ++jj) wq[slot + jj] = wr[lane + G1_WARP * ((ph + RPH) * PHE + jj)];
+            }
+            __syncthreads();
+        }
         #pragma unroll
         for (unsigned z = 0; z < ZB; ++z) {
-            if (z < b) {
-                #pragma unroll
-                for (unsigned jj = 0; jj < PHE; ++jj) acc[z] += __half2float(wq[slot + jj]) * sx[z * SLAB + lane + G1_WARP * jj];
+            if (z < nz) {
+                const float s = g1_warp_sum(acc[z]);
+                const float s0 = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(s), 0));
+                if (lane == z0 + z) mine = s0;
             }
-        }
-        // refill this slot with the phase RPH ahead
-        if (ph + RPH < NPH) {
-            #pragma unroll
-            for (unsigned jj = 0; jj < PHE; ++jj) wq[slot + jj] = wr[lane + G1_WARP * ((ph + RPH) * PHE + jj)];
-        }
-        __syncthreads();
-    }
-    float mine = 0.0f;
-    #pragma unroll
-    for (unsigned z = 0; z < ZB; ++z) {
-        if (z < b) {
-            const float s = g1_warp_sum(acc[z]);
-            const float s0 = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(s), 0));
-            if (lane == z) mine = s0;
         }
     }
     if (lane < b) {
@@ -705,6 +744,49 @@ __device__ __forceinline__ void g1_router_wave_full(const G1Args& a, unsigned ma
 }
 
 // --------------------------------------------------------------------------------------------
+// PREFETCH WG (`n_pf` of them, right after the collapse / prior tickets): streams both gate matrices
+// DRAM -> L2 / MALL with 16-byte loads, in the order the router waves consume them (the first 2560
+// bytes of every row, then the next 2560, ...), so the DRAM stream runs at full width from the
+// kernel's start whatever the collapse and the router waves' in-order load counters do; the router
+// waves' own loads then mostly hit the caches (or merge with these in flight). The loaded words are
+// folded into a value nothing reads (kept alive by an impossible store).
+// --------------------------------------------------------------------------------------------
+__device__ __forceinline__ void g1_prefetch(const G1Args& a, unsigned idx, unsigned tid) {
+    constexpr unsigned UNIT = 2560u;                      // bytes per (row, super-chunk): 5 wave loads
+    constexpr unsigned NSC = G1_NE * 2u / UNIT;           // 4 super-chunks per row
+    const unsigned rows = G1_NEXP * a.n_mat;
+    const unsigned units = NSC * rows;
+    const unsigned nw = a.n_pf * 8u;
+    const unsigned gw = idx * 8u + (tid >> 5u);
+    const unsigned lane = tid & 31u;
+    unsigned acc = 0u;
+    #pragma nounroll
+    for (unsigned u0 = gw; u0 < units; u0 += 4u * nw) {
+        uint4 v[4][5];
+        #pragma unroll
+        for (unsigned q = 0; q < 4; ++q) {
+            const unsigned u = u0 + q * nw;
+            if (u < units) {
+                const unsigned sc = u / rows, r = u % rows;
+                const __half* w = (r < G1_NEXP ? a.w0 + (size_t)r * G1_NE : a.w1 + (size_t)(r - G1_NEXP) * G1_NE);
+                const uint4* p = reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned char*>(w) + sc * UNIT) + lane;
+                #pragma unroll
+                for (unsigned k = 0; k < 5; ++k) v[q][k] = p[32u * k];
+            } else {
+                #pragma unroll
+                for (unsigned k = 0; k < 5; ++k) v[q][k] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        #pragma unroll
+        for (unsigned q = 0; q < 4; ++q) {
+            #pragma unroll
+            for (unsigned k = 0; k < 5; ++k) acc ^= v[q][k].x ^ v[q][k].y ^ v[q][k].z ^ v[q][k].w;
+        }
+    }
+    if (acc == 0x9e3779b9u && a.dbg == 0xfffffffeu) a.sync[S_TICKET + 1u] = acc;   // never: keeps the loads
+}
+
+// --------------------------------------------------------------------------------------------
 // Collapse WG (mhc_fast's collapse branch, verbatim arithmetic), then the prior, then Q8_K.
 // --------------------------------------------------------------------------------------------
 // The cache prior's WG (ticket b, when there is a prior): pinned host -> d_prior, RELEASE prior_ready.
@@ -726,6 +808,12 @@ __device__ void g1_collapse(const G1Args& a, unsigned z, unsigned tid, float* sq
     if (a.dbg & 256u) __builtin_amdgcn_s_setprio(3);
     const float* cxb = a.cx + (size_t)z * (size_t)(G1_HC * G1_NE);
     const float* cwb = a.carry + (size_t)z * (size_t)G1_MIX;
+    // Load order = need order (the load counter is in order): the carry and x feed cur and the
+    // RMS reduction; the (cold) norm weight is only needed after the reduction, so its DRAM
+    // latency hides under it instead of gating cur.
+    float cw[G1_HC];
+    #pragma unroll
+    for (uint32_t h = 0; h < G1_HC; h++) cw[h] = cwb[h];
     float xs[G1_HC][G1_PE];
     #pragma unroll
     for (uint32_t h = 0; h < G1_HC; h++) {
@@ -735,9 +823,7 @@ __device__ void g1_collapse(const G1Args& a, unsigned z, unsigned tid, float* sq
     float nw[G1_PE];
     #pragma unroll
     for (uint32_t j = 0; j < G1_PE; j++) nw[j] = a.norm_w[tid + G1_BLOCK * j];
-    float cw[G1_HC];
-    #pragma unroll
-    for (uint32_t h = 0; h < G1_HC; h++) cw[h] = cwb[h];
+    __builtin_amdgcn_sched_barrier(0);   // keep this issue order
     float cv[G1_PE];
     #pragma unroll
     for (uint32_t j = 0; j < G1_PE; j++) {
@@ -790,6 +876,7 @@ __device__ void g1_body(const G1Args& a) {
     // collapse: sq[256]; router (phased-LDS form): the x slab [ZB][32 * PHE]; tails: probs [8][384]
     constexpr unsigned SBUF = (PHE != 0 && ZB * G1_WARP * PHE > 8 * G1_NEXP) ? ZB * G1_WARP * PHE : 8 * G1_NEXP;
     __shared__ __attribute__((aligned(16))) float s_buf[SBUF];
+    static_assert(sizeof(G1Sel) <= sizeof(float) * SBUF, "g1 tail LDS");
     const unsigned tid = threadIdx.x;
     const unsigned lane = tid & (G1_WARP - 1u);
     const unsigned warp = tid >> 5u;
@@ -802,15 +889,18 @@ __device__ void g1_body(const G1Args& a) {
     if (ts != nullptr) ts[0] = t_start;
     const unsigned b = a.b;
     const unsigned np = (a.prior_host != nullptr) ? 1u : 0u;
-    const unsigned total = b + np + a.n_mat * G1_RWG;
+    const unsigned total = b + np + a.n_pf + a.n_mat * G1_RWG;
 
     if (t < b) {
         g1_collapse(a, t, tid, s_buf, ts);
+    } else if (t >= b + np && t < b + np + a.n_pf) {
+        g1_prefetch(a, t - b - np, tid);
+        G1_TS(3);
     } else if (t < b + np) {
         g1_prior(a, tid);
         G1_TS(3);
     } else {
-        const unsigned r = t - b - np;
+        const unsigned r = t - b - np - a.n_pf;
         const unsigned mat = r / G1_RWG;
         const unsigned row = (r - mat * G1_RWG) * 8u + warp;
         if constexpr (PHE != 0 && CH == G1_EPW) g1_router_wave_full<ZB, (PHE ? PHE : 2)>(a, mat, row, lane, tid, s_buf, ts);
@@ -826,8 +916,7 @@ __device__ void g1_body(const G1Args& a) {
         if (s_last != 0u) {
             g1_wg_wait(a.sync, 0, 0, mat == 0 && a.prior_host != nullptr);
             G1_TS(5);
-            if (!(a.dbg & 4u))
-                for (unsigned z = warp; z < b; z += 8u) g1_topk_row(a, mat, z, lane, s_buf + warp * G1_NEXP, z == 0 ? ts : nullptr);
+            if (!(a.dbg & 4u)) g1_tail(a, mat, warp, lane, *reinterpret_cast<G1Sel*>(s_buf), ts);
             __syncthreads();
             G1_TS(6);
         }

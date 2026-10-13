@@ -74,6 +74,7 @@ struct G1ArgsRaw {
     rms_eps: f32,
     scale: f32,
     weight_eps: f32,
+    n_pf: u32,
     dbg: u32,
 }
 
@@ -169,7 +170,7 @@ pub struct G1RouterBlock {
 /// `g1_router_block_p{zb}_{phe}_{ch}` (x staged in LDS per K-slab of 32 * phe elements, a ring of
 /// ch weight elements per lane prefetched before the row wait).
 /// ch = 160 (the whole weight row per lane): the full-prefetch phased form (packed d16 loads at entry).
-pub const G1_VARIANTS: [(u32, u32, u32); 20] = [
+pub const G1_VARIANTS: [(u32, u32, u32); 21] = [
     (1, 20, 0),
     (2, 20, 0),
     (2, 10, 0),
@@ -184,6 +185,7 @@ pub const G1_VARIANTS: [(u32, u32, u32); 20] = [
     (8, 80, 20),
     (8, 40, 20),
     (16, 80, 10),
+    (16, 40, 10),
     (1, 160, 32),
     (2, 160, 32),
     (4, 160, 40),
@@ -209,17 +211,23 @@ pub fn g1_variant_for(b: u32) -> (u32, u32, u32) {
         Some((it.next()??, it.next()??, it.next().flatten().unwrap_or(0)))
     });
     if let Some(v) = *OVR {
-        if v.0 >= b {
+        if v.0 >= b || (v.0 == 8 && v.2 > 0 && v.1 < 160) {
             return v;
         }
     }
     match b {
-        0..=1 => (1, 160, 32),
-        2 => (2, 160, 32),
-        3..=4 => (4, 160, 40),
-        5..=8 => (8, 160, 20),
-        _ => (16, 160, 20),
+        0..=2 => (2, 64, 32),
+        3..=4 => (4, 8, 0),
+        5..=8 => (8, 40, 20),
+        _ => (8, 40, 20),
     }
+}
+
+/// Prefetch workgroups per launch (`V41_DGPU_G1_NPF`, default 0 while it is measured).
+pub fn g1_n_pf() -> u32 {
+    static N: std::sync::LazyLock<u32> =
+        std::sync::LazyLock::new(|| std::env::var("V41_DGPU_G1_NPF").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(256));
+    *N
 }
 
 /// `V41_DGPU_G1_DBG` (bench ablations only; 0 = the real kernel): see the kernel's `G1Args::dbg`.
@@ -277,7 +285,7 @@ impl G1RouterBlock {
 
     /// Workgroups of one launch: `b` collapse WGs, the prior's WG, and 48 router WGs per matrix.
     pub fn grid(b: u32, look: bool, prior: bool) -> u32 {
-        b + prior as u32 + (1 + look as u32) * G1_RWG
+        b + prior as u32 + g1_n_pf() + (1 + look as u32) * G1_RWG
     }
 
     /// Launch the whole router block on `stream` (see the module docs: stream-ordered launches only).
@@ -295,7 +303,8 @@ impl G1RouterBlock {
         if io.n_used == 0 || io.n_used > G1_MAX_USED {
             return Err(eyre!("g1_router_block: n_used {} must be in [1, {G1_MAX_USED}]", io.n_used));
         }
-        if !sym_ok(v) || zb < b {
+        // the phased zb = 8 forms (phe > 0, ch < 160) loop over row slices of 8; the others need zb >= b
+        if !sym_ok(v) || (zb < b && !(zb == 8 && v.2 > 0 && v.1 < 160)) {
             return Err(eyre!("g1_router_block: no variant {v:?} for b {b}"));
         }
         let ne = crate::config::N_EMBD as usize;
@@ -363,6 +372,7 @@ impl G1RouterBlock {
             rms_eps: c.rms_eps,
             scale: io.scale,
             weight_eps: io.weight_eps,
+            n_pf: g1_n_pf(),
             dbg: g1_dbg(),
         };
         if let Some(l) = io.look.as_ref() {
