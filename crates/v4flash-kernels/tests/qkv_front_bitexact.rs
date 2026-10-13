@@ -22,7 +22,7 @@
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::q8_0::Q8_0Matvec;
-use v4flash_kernels::qkv_front::{QkvFront, MAX_B};
+use v4flash_kernels::qkv_front::{QkvFront, MAX_B, MAX_GRID_ONE};
 use v4flash_kernels::{KvCacheAppend, RmsNorm, RopeParams, RopeTail};
 
 fn pick_dgpu() -> eyre::Result<Device> {
@@ -128,6 +128,7 @@ struct Lane {
     pos: DeviceBuffer<i32>,
     slots: DeviceBuffer<i32>,
     ticket: DeviceBuffer<u32>,
+    epoch: u32,
 }
 
 impl Lane {
@@ -148,7 +149,8 @@ impl Lane {
             cache: upload(id, &vec![0x7c01u16; CACHE_ROWS * 512])?,
             pos: upload(id, &vec![0i32; bm])?,
             slots: upload(id, &vec![0i32; bm])?,
-            ticket: upload(id, &[0u32])?,
+            ticket: upload(id, &[0u32; 4])?,
+            epoch: 0,
         })
     }
     /// Fresh inputs for `b` rows; poisons the outputs.
@@ -220,6 +222,14 @@ fn chain(m: &Mods, s: &Stream, w: &W, l: &mut Lane, p: &RopeParams, b: u32, aren
     m.q8.matvec_batched(s, &mut l.kv_raw, &w.kv, &l.xq, &l.xs, 512, 5120, b)?;
     m.rope.launch_kv_rms_rope_fp8(s, &mut l.kv_normed, &l.kv_raw, &w.kv_norm, EPS, &l.pos, 64, b, p)?;
     m.app.launch_batched_rows(s, &mut l.cache, &l.kv_normed, base, 512, b, if arena { Some(&l.slots) } else { None })
+}
+
+/// `QkvFront::launch_one` (`V41_DGPU_QKV_FRONT_ONE`).
+fn fused_one(m: &Mods, s: &Stream, w: &W, l: &mut Lane, p: &RopeParams, b: u32, arena: bool, base: u32, grid: u32) -> eyre::Result<()> {
+    l.epoch = l.epoch.wrapping_add(1).max(1);
+    m.qf.launch_one(s, &mut l.qr, &mut l.kv_raw, &w.qa, &w.kv, &l.x, &mut l.qr_normed, &mut l.qr_xq, &mut l.qr_xs,
+        &w.qa_norm, EPS, &mut l.ticket, l.epoch, &mut l.q_normed, &w.qb, &l.pos, p, &mut l.cache, &w.kv_norm,
+        if arena { Some(&l.slots) } else { None }, base, b, grid)
 }
 
 fn fused(m: &Mods, s: &Stream, w: &W, l: &mut Lane, p: &RopeParams, b: u32, arena: bool, base: u32, grid: u32) -> eyre::Result<()> {
@@ -314,6 +324,7 @@ fn qkv_front_matches_chain() -> eyre::Result<()> {
     // reference and fused copies of two lanes
     let mut ref_l = [Lane::new(id, 8)?, Lane::new(id, 8)?];
     let mut new_l = [Lane::new(id, 8)?, Lane::new(id, 8)?];
+    let mut one_l = [Lane::new(id, 8)?, Lane::new(id, 8)?];
     let grids = [64u32, 32, 56, 96, 112, 224, 1, 7];
     let mut cases = 0;
     for b in 1..=MAX_B {
@@ -329,6 +340,11 @@ fn qkv_front_matches_chain() -> eyre::Result<()> {
                     let mut r2 = Lcg(seed);
                     ref_l[lane].fill(&mut r1, bu, case + lane as u32)?;
                     new_l[lane].fill(&mut r2, bu, case + lane as u32)?;
+                    one_l[lane].fill(&mut Lcg(seed), bu, case + lane as u32)?;
+                }
+                let g1 = (grid % MAX_GRID_ONE).max(1);
+                for lane in 0..2 {
+                    fused_one(&m, &s, &w, &mut one_l[lane], p, b, arena, base, g1)?;
                 }
                 // lanes interleaved on one stream, as the two-lane decode issues them
                 for lane in 0..2 {
@@ -349,9 +365,14 @@ fn qkv_front_matches_chain() -> eyre::Result<()> {
                 for lane in 0..2 {
                     let what = format!("b={b} {pname} arena={arena} grid={grid} lane={lane}");
                     compare(&snap(&ref_l[lane], bu)?, &snap(&new_l[lane], bu)?, &what)?;
+                    compare(&snap(&ref_l[lane], bu)?, &snap(&one_l[lane], bu)?, &format!("{what} ONE g={g1}"))?;
                     let t = download(&new_l[lane].ticket)?;
                     if t[0] != 0 {
                         return Err(eyre!("{what}: ticket left at {}", t[0]));
+                    }
+                    let t = download(&one_l[lane].ticket)?;
+                    if t[0] != 0 || t[2] != 0 || t[3] != 0 || t[1] != one_l[lane].epoch {
+                        return Err(eyre!("{what} ONE: ctl left at {t:?} (epoch {})", one_l[lane].epoch));
                     }
                     cases += 1;
                 }
@@ -362,8 +383,12 @@ fn qkv_front_matches_chain() -> eyre::Result<()> {
                 chain(&m, &s, &w, &mut ref_l[0], p, b, arena, base)?;
                 fused(&m, &s, &w, &mut new_l[0], p, b, arena, base, grid)?;
                 fused(&m, &s, &w, &mut new_l[0], p, b, arena, base, grid)?; // idempotent re-run
+                one_l[0].fill(&mut Lcg(seed), bu, case + 100)?;
+                fused_one(&m, &s, &w, &mut one_l[0], p, b, arena, base, g1)?;
+                fused_one(&m, &s, &w, &mut one_l[0], p, b, arena, base, g1)?;
                 s.synchronize()?;
                 compare(&snap(&ref_l[0], bu)?, &snap(&new_l[0], bu)?, &format!("b={b} {pname} arena={arena} rerun"))?;
+                compare(&snap(&ref_l[0], bu)?, &snap(&one_l[0], bu)?, &format!("b={b} {pname} arena={arena} ONE rerun"))?;
                 cases += 1;
             }
         }
@@ -378,8 +403,11 @@ fn qkv_front_matches_chain() -> eyre::Result<()> {
             let p = &rope_params()[1].1;
             chain(&m, &s, &w, &mut ref_l[1], p, b, true, 0)?;
             fused(&m, &s, &w, &mut new_l[1], p, b, true, 0, grid)?;
+            one_l[1].fill(&mut Lcg(seed), b as usize, 900 + grid)?;
+            fused_one(&m, &s, &w, &mut one_l[1], p, b, true, 0, grid.min(MAX_GRID_ONE))?;
             s.synchronize()?;
             compare(&snap(&ref_l[1], b as usize)?, &snap(&new_l[1], b as usize)?, &format!("b={b} grid={grid}"))?;
+            compare(&snap(&ref_l[1], b as usize)?, &snap(&one_l[1], b as usize)?, &format!("b={b} ONE grid={}", grid.min(MAX_GRID_ONE)))?;
             cases += 1;
         }
     }
@@ -390,6 +418,6 @@ fn qkv_front_matches_chain() -> eyre::Result<()> {
             &mut l.qr_xs, &w.qa_norm, EPS, &mut l.ticket, b, 64);
         assert!(ra.is_err(), "launch_a must refuse b={b}");
     }
-    eprintln!("qkv_front: {cases} cases bit-identical (b = 1..={MAX_B}, plain + YaRN, arena + contiguous, 2 lanes)");
+    eprintln!("qkv_front: {cases} cases bit-identical, two-launch AND one-launch (b = 1..={MAX_B}, plain + YaRN, arena + contiguous, 2 lanes)");
     Ok(())
 }

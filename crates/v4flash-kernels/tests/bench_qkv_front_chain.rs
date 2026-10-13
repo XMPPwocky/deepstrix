@@ -25,7 +25,7 @@ use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::device_ceilings::DeviceCeilings;
 use v4flash_kernels::wmma_probe::WmmaProbe;
 use v4flash_kernels::q8_0::Q8_0Matvec;
-use v4flash_kernels::qkv_front::{grid_a, QkvFront};
+use v4flash_kernels::qkv_front::{grid_a, grid_one, QkvFront};
 use v4flash_kernels::{KvCacheAppend, RmsNorm, RopeParams, RopeTail};
 
 const MB: usize = 1 << 20;
@@ -92,6 +92,7 @@ struct Bufs {
     pos: DeviceBuffer<i32>,
     slots: DeviceBuffer<i32>,
     ticket: DeviceBuffer<u32>,
+    epoch: u32,
     qa_norm: DeviceBuffer<f32>,
     kv_norm: DeviceBuffer<f32>,
 }
@@ -129,6 +130,7 @@ enum Arm {
     NewA,
     NewB,
     QaKv,
+    One,
 }
 impl Arm {
     fn name(self) -> &'static str {
@@ -140,13 +142,14 @@ impl Arm {
             Arm::NewA => "new_a",
             Arm::NewB => "new_b",
             Arm::QaKv => "qakv",
+            Arm::One => "one",
         }
     }
     fn launches(self) -> u32 {
         match self {
             Arm::Cur | Arm::Cur2 => 8,
             Arm::New | Arm::QaKv => 2,
-            Arm::Qb | Arm::NewA | Arm::NewB => 1,
+            Arm::Qb | Arm::NewA | Arm::NewB | Arm::One => 1,
         }
     }
 }
@@ -197,6 +200,12 @@ impl Rig {
                 self.q8.matvec_batched(s, &mut d.qr, &wqa, &d.xq, &d.xs, 1280, 5120, b)?;
                 self.q8.matvec_batched(s, &mut d.kv_raw, &wkv, &d.xq, &d.xs, 512, 5120, b)
             }
+            Arm::One => {
+                d.epoch = d.epoch.wrapping_add(1).max(1);
+                self.qf.launch_one(s, &mut d.qr, &mut d.kv_raw, &wqa, &wkv, &d.x, &mut d.qr_normed, &mut d.qr_xq,
+                    &mut d.qr_xs, &d.qa_norm, EPS, &mut d.ticket, d.epoch, &mut d.q_normed, &wqb, &d.pos, &self.p,
+                    &mut d.cache, &d.kv_norm, Some(&d.slots), 0, b, grid_one(b))
+            }
         }
     }
     /// [flush + re-touch x] [sleep kernel] evA <f> evB -> device us.
@@ -236,7 +245,8 @@ fn bufs(id: i32, rng: &mut Lcg) -> eyre::Result<Bufs> {
         cache: upload(id, &vec![0u16; 256 * 512])?,
         pos: upload(id, &(0..bm as i32).map(|i| 4000 + 17 * i).collect::<Vec<_>>())?,
         slots: upload(id, &(0..bm as i32).map(|i| 3 + 29 * i).collect::<Vec<_>>())?,
-        ticket: upload(id, &[0u32])?,
+        ticket: upload(id, &[0u32; 4])?,
+        epoch: 0,
         qa_norm: upload(id, &(0..1280).map(|_| 0.5 + rng.sym(0.3)).collect::<Vec<_>>())?,
         kv_norm: upload(id, &(0..512).map(|_| 0.5 + rng.sym(0.3)).collect::<Vec<_>>())?,
     })
@@ -406,7 +416,7 @@ fn bench_qkv_front_chain() -> eyre::Result<()> {
     }
 
     if section == "chain" || section == "all" {
-        let arms = [Arm::Cur, Arm::Cur2, Arm::New, Arm::Qb, Arm::NewA, Arm::NewB, Arm::QaKv];
+        let arms = [Arm::Cur, Arm::Cur2, Arm::New, Arm::Qb, Arm::NewA, Arm::NewB, Arm::QaKv, Arm::One];
         for &b in &bs {
             let g = grid_a(b);
             for cold in [true, false] {
@@ -431,10 +441,15 @@ fn bench_qkv_front_chain() -> eyre::Result<()> {
                 let pd = |x: usize, y: usize| -> Vec<f64> { res[x].iter().zip(&res[y]).map(|(a, b)| a - b).collect() };
                 let aa = pd(1, 0);
                 let nd = pd(2, 0);
+                let od = pd(7, 0);
+                let on = pd(7, 2);
                 let aa_abs: Vec<f64> = aa.iter().map(|v| v.abs()).collect();
                 eprintln!("PAIRED b={b} {tag}: new-cur p10 {:.1} p50 {:.1} p90 {:.1} | A/A cur2-cur p50 {:.1} |d| p50 {:.1} p90 {:.1} | G2 part: cur-qb {:.1} new-qb {:.1}",
                     pct(&nd, 0.1), pct(&nd, 0.5), pct(&nd, 0.9), pct(&aa, 0.5), pct(&aa_abs, 0.5), pct(&aa_abs, 0.9),
                     pct(&res[0], 0.5) - pct(&res[3], 0.5), pct(&res[2], 0.5) - pct(&res[3], 0.5));
+                eprintln!("PAIRED b={b} {tag}: one-cur p10 {:.1} p50 {:.1} p90 {:.1} | one-new p10 {:.1} p50 {:.1} p90 {:.1} | G2 part one-qb {:.1}",
+                    pct(&od, 0.1), pct(&od, 0.5), pct(&od, 0.9), pct(&on, 0.1), pct(&on, 0.5), pct(&on, 0.9),
+                    pct(&res[7], 0.5) - pct(&res[3], 0.5));
             }
         }
     }

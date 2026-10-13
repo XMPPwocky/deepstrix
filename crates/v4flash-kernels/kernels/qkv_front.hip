@@ -157,7 +157,7 @@ __device__ __forceinline__ void qf_row_dot(QfRow& w, const unsigned char* xq_l, 
 }
 
 template <int B>
-__device__ __forceinline__ void qf_front_a(
+__device__ __forceinline__ bool qf_front_a_core(
         float* __restrict__ qr, float* __restrict__ kv_raw,
         const unsigned char* __restrict__ w_qa, const unsigned char* __restrict__ w_kv,
         const float* __restrict__ x,
@@ -234,11 +234,10 @@ __device__ __forceinline__ void qf_front_a(
     __syncthreads();
     if (tid == 0) qf_last = (atomicAdd(ticket, 1u) == gridDim.x - 1u) ? 1u : 0u;
     __syncthreads();
-    if (qf_last == 0u) return;
+    if (qf_last == 0u) return false;
     __threadfence();
 #ifdef QF_DBG_NO_TAIL
-    if (tid == 0) *ticket = 0u;
-    return;
+    return true;
 #endif
 
     // rms_quant_q8_1280_body for all B rows: per row the same loads, double partials, 256-wide LDS
@@ -326,7 +325,7 @@ __device__ __forceinline__ void qf_front_a(
         xo[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
         xo[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
     }
-    if (tid == 0) *ticket = 0u;   // every other work-group has taken its ticket
+    return true;   // the caller resets the ticket: every other work-group has taken one
 }
 
 #define QF_FRONT_A(NAME, B)                                                                          \
@@ -336,7 +335,9 @@ __device__ __forceinline__ void qf_front_a(
             float* __restrict__ qr_normed, signed char* __restrict__ qr_xq,                          \
             float* __restrict__ qr_xscale, const float* __restrict__ q_a_norm, float eps,            \
             unsigned int* __restrict__ ticket) {                                                     \
-        qf_front_a<B>(qr, kv_raw, w_qa, w_kv, x, qr_normed, qr_xq, qr_xscale, q_a_norm, eps, ticket); \
+        if (qf_front_a_core<B>(qr, kv_raw, w_qa, w_kv, x, qr_normed, qr_xq, qr_xscale, q_a_norm, eps, ticket) \
+            && threadIdx.x == 0)                                                                 \
+            *ticket = 0u;                                                                            \
     }
 QF_FRONT_A(qkv_front_a_tB1, 1)
 QF_FRONT_A(qkv_front_a_tB2, 2)
@@ -346,6 +347,74 @@ QF_FRONT_A(qkv_front_a_tB5, 5)
 QF_FRONT_A(qkv_front_a_tB6, 6)
 QF_FRONT_A(qkv_front_a_tB7, 7)
 QF_FRONT_A(qkv_front_a_tB8, 8)
+
+// kv_rms_rope_fp8_body per row (verbatim but for the row loop and the store), then
+// kv_cache_append_batched's `cache[slot * 512 + d] = (_Float16)kv_new[d]`. One work-group of 256.
+template <int B>
+__device__ __forceinline__ void qf_kv_tail(
+        float* sdata, unsigned short* __restrict__ kv_cache, const float* __restrict__ kv_raw,
+        const float* __restrict__ kv_norm, float eps, const int* __restrict__ pos_per_b, float theta_scale,
+        float freq_scale, float ext_factor, float mscale_eff, float corr_low, float corr_high,
+        const int* __restrict__ slot_per, unsigned slot_base) {
+    const unsigned tid = threadIdx.x;
+    // kv_rms_rope_fp8_body per row (verbatim but for the row loop and the store), then
+    // kv_cache_append_batched's `cache[slot * 512 + d] = (_Float16)kv_new[d]`.
+    _Float16* cache = reinterpret_cast<_Float16*>(kv_cache);
+    for (unsigned b = 0; b < (unsigned)B; ++b) {
+        const float* xb = kv_raw + (size_t)b * 512u;
+        float xv[2], wv[2], v[2];
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) xv[j] = xb[tid + 256u * j];
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) wv[j] = kv_norm[tid + 256u * j];
+        double partial = 0.0;
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) {
+            const float xx = xv[j];
+            partial += (double)xx * (double)xx;
+        }
+        sdata[tid] = (float)partial;
+        __syncthreads();
+        for (unsigned int stride = 128u; stride > 0; stride >>= 1) {
+            if (tid < stride) sdata[tid] += sdata[tid + stride];
+            __syncthreads();
+        }
+        const float mean_sq = sdata[0] / (float)512u;
+        const float scale = rsqrtf(mean_sq + eps);
+        __syncthreads();   // sdata[0] read by all before the next row's partials land
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) v[j] = xv[j] * scale * wv[j];
+        if (tid >= 192u) {
+            const unsigned e = tid + 256u;
+            v[1] = qf_rot_pair(v[1], e, pos_per_b[b], (e - 448u) >> 1, 1.0f, theta_scale, freq_scale, ext_factor,
+                               mscale_eff, corr_low, corr_high);
+        }
+        const unsigned slot = slot_per ? (unsigned)slot_per[b] : slot_base + b;
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) {
+            float a = fabsf(v[j]);
+            a = fmaxf(a, __shfl_xor(a, 1));
+            a = fmaxf(a, __shfl_xor(a, 2));
+            a = fmaxf(a, __shfl_xor(a, 4));
+            a = fmaxf(a, __shfl_xor(a, 8));
+            a = fmaxf(a, __shfl_xor(a, 16));
+            const float amax = fmaxf(a, 1.0e-4f);
+            const float t = amax / 448.0f;
+            int ex;
+            const float m = frexpf(t, &ex);
+            const int cexp = (m == 0.5f) ? ex - 1 : ex;
+            const float sc = ldexpf(1.0f, cexp);
+            float q = v[j] / sc;
+            q = fminf(fmaxf(q, -448.0f), 448.0f);
+            float kvn = dsv4_e4m3fn_dequant(q) * sc;
+            // materialize the f32 the chain stores: left to itself the compiler folds the
+            // multiply + f16 cast into v_fma_mixlo_f16(sc, +-T, +0), and -0 + +0 = +0 drops
+            // the sign of a zero code (the chain stores -0.0f, the append casts it to 0x8000)
+            asm volatile("" : "+v"(kvn));
+            cache[(unsigned long long)slot * 512u + tid + 256u * j] = (_Float16)kvn;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Launch B
@@ -361,63 +430,8 @@ __device__ __forceinline__ void qf_front_b(
     __shared__ float sdata[256];
     const unsigned tid = threadIdx.x;
     if (blockIdx.x == 0) {
-        // kv_rms_rope_fp8_body per row (verbatim but for the row loop and the store), then
-        // kv_cache_append_batched's `cache[slot * 512 + d] = (_Float16)kv_new[d]`.
-        _Float16* cache = reinterpret_cast<_Float16*>(kv_cache);
-        for (unsigned b = 0; b < (unsigned)B; ++b) {
-            const float* xb = kv_raw + (size_t)b * 512u;
-            float xv[2], wv[2], v[2];
-#pragma unroll
-            for (unsigned j = 0; j < 2; ++j) xv[j] = xb[tid + 256u * j];
-#pragma unroll
-            for (unsigned j = 0; j < 2; ++j) wv[j] = kv_norm[tid + 256u * j];
-            double partial = 0.0;
-#pragma unroll
-            for (unsigned j = 0; j < 2; ++j) {
-                const float xx = xv[j];
-                partial += (double)xx * (double)xx;
-            }
-            sdata[tid] = (float)partial;
-            __syncthreads();
-            for (unsigned int stride = 128u; stride > 0; stride >>= 1) {
-                if (tid < stride) sdata[tid] += sdata[tid + stride];
-                __syncthreads();
-            }
-            const float mean_sq = sdata[0] / (float)512u;
-            const float scale = rsqrtf(mean_sq + eps);
-            __syncthreads();   // sdata[0] read by all before the next row's partials land
-#pragma unroll
-            for (unsigned j = 0; j < 2; ++j) v[j] = xv[j] * scale * wv[j];
-            if (tid >= 192u) {
-                const unsigned e = tid + 256u;
-                v[1] = qf_rot_pair(v[1], e, pos_per_b[b], (e - 448u) >> 1, 1.0f, theta_scale, freq_scale, ext_factor,
-                                   mscale_eff, corr_low, corr_high);
-            }
-            const unsigned slot = slot_per ? (unsigned)slot_per[b] : slot_base + b;
-#pragma unroll
-            for (unsigned j = 0; j < 2; ++j) {
-                float a = fabsf(v[j]);
-                a = fmaxf(a, __shfl_xor(a, 1));
-                a = fmaxf(a, __shfl_xor(a, 2));
-                a = fmaxf(a, __shfl_xor(a, 4));
-                a = fmaxf(a, __shfl_xor(a, 8));
-                a = fmaxf(a, __shfl_xor(a, 16));
-                const float amax = fmaxf(a, 1.0e-4f);
-                const float t = amax / 448.0f;
-                int ex;
-                const float m = frexpf(t, &ex);
-                const int cexp = (m == 0.5f) ? ex - 1 : ex;
-                const float sc = ldexpf(1.0f, cexp);
-                float q = v[j] / sc;
-                q = fminf(fmaxf(q, -448.0f), 448.0f);
-                float kvn = dsv4_e4m3fn_dequant(q) * sc;
-                // materialize the f32 the chain stores: left to itself the compiler folds the
-                // multiply + f16 cast into v_fma_mixlo_f16(sc, +-T, +0), and -0 + +0 = +0 drops
-                // the sign of a zero code (the chain stores -0.0f, the append casts it to 0x8000)
-                asm volatile("" : "+v"(kvn));
-                cache[(unsigned long long)slot * 512u + tid + 256u * j] = (_Float16)kvn;
-            }
-        }
+        qf_kv_tail<B>(sdata, kv_cache, kv_raw, kv_norm, eps, pos_per_b, theta_scale, freq_scale, ext_factor,
+                      mscale_eff, corr_low, corr_high, slot_per, slot_base);
         return;
     }
 
@@ -503,3 +517,210 @@ QF_FRONT_B(qkv_front_b_tB5, 5)
 QF_FRONT_B(qkv_front_b_tB6, 6)
 QF_FRONT_B(qkv_front_b_tB7, 7)
 QF_FRONT_B(qkv_front_b_tB8, 8)
+
+// ---------------------------------------------------------------------------------------------
+// ONE launch (`V41_DGPU_QKV_FRONT_ONE`): launch A's grid, then every work-group streams q_b.
+//
+//   grid G x 256 (G <= the device's resident capacity at this LDS size: every work-group is
+//   resident before any waits, so the one in-kernel wait cannot deadlock -- see QkvFront::launch_one)
+//   1. launch A's body (input quantize, q_a ++ kv GEMV, ticket). The last work-group runs the q_a
+//      tail, PUBLISHES ctl[1] = epoch (release), then runs the kv tail + append (overlapping q_b).
+//   2. q_b phase, all work-groups: each warp grabs chunks of 16 row pairs (ctl[2], one grab ahead)
+//      and loads its first pair's weights BEFORE waiting for ctl[1] == epoch (the q_b stream
+//      starts under the q_a tail; no launch gap, no ramp). Then qr_xq / qr_xscale go to LDS, and
+//      each pair (rows 2p, 2p + 1 -- one rope pair) runs the tB GEMV's per-row expression and warp
+//      sum; the rope pair rotates in registers (rope_tail_batched_copy's expressions).
+//   3. The last work-group out (ctl[3]) resets ctl[2] / ctl[3]; ctl[0] was reset by the A tail.
+// ctl = { A ticket, published epoch, q_b chunk counter, end ticket }.
+// ---------------------------------------------------------------------------------------------
+#define QF_QB_PAIRS 16384u
+#define QF_QB_CHUNK 16u
+#define QF_QB_NCHUNK (QF_QB_PAIRS / QF_QB_CHUNK)
+
+// One rope pair of q_b rows: [row r][block slot s] (slot 1 only for lanes < 8: 40 blocks).
+struct QfQbPair {
+    uint4 a0[2][2], a1[2][2];
+    float ws[2][2];
+};
+
+__device__ __forceinline__ void qf_qb_load(QfQbPair& w, const unsigned char* __restrict__ w_qb, unsigned pair,
+                                           unsigned lane) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const unsigned char* wr = w_qb + (size_t)(2u * pair + r) * QF_QB_BLOCKS * 34u;
+        const __half* scales = (const __half*)wr;
+        const int8_t* quants = (const int8_t*)(wr + (size_t)QF_QB_BLOCKS * 2u);
+        __builtin_memcpy(&w.a0[r][0], quants + (size_t)lane * 32u, 16);
+        __builtin_memcpy(&w.a1[r][0], quants + (size_t)lane * 32u + 16, 16);
+        w.ws[r][0] = __half2float(scales[lane]);
+        if (lane < QF_QB_BLOCKS - 32u) {
+            const unsigned bl = lane + 32u;
+            __builtin_memcpy(&w.a0[r][1], quants + (size_t)bl * 32u, 16);
+            __builtin_memcpy(&w.a1[r][1], quants + (size_t)bl * 32u + 16, 16);
+            w.ws[r][1] = __half2float(scales[bl]);
+        }
+    }
+}
+
+// q_b rows 2p, 2p + 1: q8_0_gemv_bpack_tb_body's `acc[b] += ws * xs[b] * (float)dot` over
+// bl = lane, lane + 32 (< 40), warp_sum, then the rope (rows 448..511 of a head) or a plain store.
+template <int B>
+__device__ __forceinline__ void qf_qb_pair(const QfQbPair& w, unsigned pair, const unsigned char* xq_l,
+                                           const float* xs_l, unsigned lane, float* __restrict__ q_normed,
+                                           const int* __restrict__ pos_per_b, float theta_scale, float freq_scale,
+                                           float ext_factor, float mscale_eff, float corr_low, float corr_high,
+                                           int inverse) {
+    float acc[2][B];
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+        for (int b = 0; b < B; ++b) acc[r][b] = 0.0f;
+#pragma unroll
+    for (int sl = 0; sl < 2; ++sl) {
+        const unsigned bl = lane + 32u * sl;
+        if (sl == 1 && lane >= QF_QB_BLOCKS - 32u) break;
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            const uint4 bv0 = *reinterpret_cast<const uint4*>(xq_l + ((size_t)(b * 2 + 0) * QF_QB_BLOCKS + bl) * 16u);
+            const uint4 bv1 = *reinterpret_cast<const uint4*>(xq_l + ((size_t)(b * 2 + 1) * QF_QB_BLOCKS + bl) * 16u);
+            const float xs = xs_l[b * QF_QB_BLOCKS + bl];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                int32_t dot = qf_dot8(w.a0[r][sl], w.a1[r][sl], bv0, bv1);
+                acc[r][b] += w.ws[r][sl] * xs * (float)dot;
+            }
+        }
+    }
+    const unsigned row0 = 2u * pair;
+    const unsigned hrow = row0 & 511u;
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+        const float x0 = qf_warp_sum(acc[0][b]);
+        const float x1 = qf_warp_sum(acc[1][b]);
+        if (lane == 0) {
+            float* o = q_normed + (size_t)b * QF_QB_ROWS + row0;
+            if (hrow < 448u) {
+                o[0] = x0;
+                o[1] = x1;
+            } else {
+                const unsigned l = (hrow - 448u) >> 1;
+                const float theta = qf_theta(pos_per_b[b], l, theta_scale, freq_scale, ext_factor, corr_low, corr_high);
+                const float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
+                const float c = cosf(theta) * mscale_eff;
+                const float s = sin_sign * sinf(theta) * mscale_eff;
+                o[0] = x0 * c - x1 * s;
+                o[1] = x0 * s + x1 * c;
+            }
+        }
+    }
+}
+
+template <int B>
+__device__ __forceinline__ void qf_front_one(
+        float* __restrict__ qr, float* __restrict__ kv_raw, const unsigned char* __restrict__ w_qa,
+        const unsigned char* __restrict__ w_kv, const float* __restrict__ x, float* __restrict__ qr_normed,
+        signed char* __restrict__ qr_xq, float* __restrict__ qr_xscale, const float* __restrict__ q_a_norm,
+        float eps, unsigned int* __restrict__ ctl, unsigned epoch,
+        float* __restrict__ q_normed, const unsigned char* __restrict__ w_qb, const int* __restrict__ pos_per_b,
+        float theta_scale, float freq_scale, float ext_factor, float mscale_eff, float corr_low, float corr_high,
+        int inverse, unsigned short* __restrict__ kv_cache, const float* __restrict__ kv_norm,
+        const int* __restrict__ slot_per, unsigned slot_base) {
+    extern __shared__ __attribute__((aligned(16))) unsigned char qf_lds[];
+    const unsigned tid = threadIdx.x, lane = tid & 31u;
+    if (qf_front_a_core<B>(qr, kv_raw, w_qa, w_kv, x, qr_normed, qr_xq, qr_xscale, q_a_norm, eps, ctl)) {
+        // publish the q_a tail's qr_xq / qr_xscale, then the kv tail beside the q_b stream
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+            ctl[0] = 0u;
+            __hip_atomic_store(&ctl[1], epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        qf_kv_tail<B>(reinterpret_cast<float*>(qf_lds), kv_cache, kv_raw, kv_norm, eps, pos_per_b, theta_scale,
+                      freq_scale, ext_factor, mscale_eff, corr_low, corr_high, slot_per, slot_base);
+    }
+
+    // ---- q_b phase: static pairs (a single-address chunk counter serialized ~1024 grabs at the L2)
+    const unsigned INVALID = 0xffffffffu;
+    const unsigned pstride = gridDim.x * 8u;
+    unsigned pnext = blockIdx.x * 8u + (tid >> 5);
+    auto next_pair = [&]() -> unsigned {
+        if (pnext >= QF_QB_PAIRS) return INVALID;
+        const unsigned r = pnext;
+        pnext += pstride;
+        return r;
+    };
+    QfQbPair wA, wB;
+    unsigned pa = next_pair();
+    if (pa != INVALID) qf_qb_load(wA, w_qb, pa, lane);
+
+    // wait for the q_a tail (every wave polls: the acquire must cover its own caches)
+    if (lane == 0) {
+        while (__hip_atomic_load(&ctl[1], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != epoch)
+            __builtin_amdgcn_s_sleep(2);
+    }
+    __builtin_amdgcn_wave_barrier();
+    __threadfence();
+    __syncthreads();   // the A body's / kv tail's LDS use is over
+    unsigned char* xq_l = qf_lds;                                                   // B * 1280
+    float* xs_l = reinterpret_cast<float*>(qf_lds + (size_t)B * QF_QB_K);          // B * 40
+    for (unsigned i = tid; i < (unsigned)B * QF_QB_BLOCKS * 2u; i += 256u) {
+        // 16-B half h of block bl of row b -> [b][h][bl][16 B]
+        const unsigned b = i / (QF_QB_BLOCKS * 2u), rem = i - b * QF_QB_BLOCKS * 2u;
+        const unsigned bl = rem >> 1, h = rem & 1u;
+        *reinterpret_cast<uint4*>(xq_l + ((size_t)(b * 2u + h) * QF_QB_BLOCKS + bl) * 16u) =
+            *reinterpret_cast<const uint4*>(qr_xq + (size_t)b * QF_QB_K + bl * 32u + h * 16u);
+    }
+    for (unsigned i = tid; i < (unsigned)B * QF_QB_BLOCKS; i += 256u) xs_l[i] = qr_xscale[i];
+    __syncthreads();
+
+    if (pa != INVALID) {
+#pragma unroll 1
+        for (;;) {
+            const unsigned pb = next_pair();
+            if (pb != INVALID) qf_qb_load(wB, w_qb, pb, lane);
+            qf_qb_pair<B>(wA, pa, xq_l, xs_l, lane, q_normed, pos_per_b, theta_scale, freq_scale, ext_factor,
+                          mscale_eff, corr_low, corr_high, inverse);
+            if (pb == INVALID) break;
+            pa = next_pair();
+            if (pa != INVALID) qf_qb_load(wA, w_qb, pa, lane);
+            qf_qb_pair<B>(wB, pb, xq_l, xs_l, lane, q_normed, pos_per_b, theta_scale, freq_scale, ext_factor,
+                          mscale_eff, corr_low, corr_high, inverse);
+            if (pa == INVALID) break;
+        }
+    }
+
+    // ---- the last work-group out resets the chunk counter
+    __shared__ unsigned qf_end_last;
+    __syncthreads();
+    if (tid == 0) qf_end_last = (atomicAdd(&ctl[3], 1u) == gridDim.x - 1u) ? 1u : 0u;
+    __syncthreads();
+    if (qf_end_last && tid == 0) {
+        ctl[2] = 0u;
+        ctl[3] = 0u;
+    }
+}
+
+#define QF_FRONT_ONE(NAME, B)                                                                        \
+    extern "C" __global__ __launch_bounds__(256) void NAME(                                          \
+            float* __restrict__ qr, float* __restrict__ kv_raw, const unsigned char* __restrict__ w_qa, \
+            const unsigned char* __restrict__ w_kv, const float* __restrict__ x,                     \
+            float* __restrict__ qr_normed, signed char* __restrict__ qr_xq,                          \
+            float* __restrict__ qr_xscale, const float* __restrict__ q_a_norm, float eps,            \
+            unsigned int* __restrict__ ctl, unsigned epoch, float* __restrict__ q_normed,            \
+            const unsigned char* __restrict__ w_qb, const int* __restrict__ pos_per_b,               \
+            float theta_scale, float freq_scale, float ext_factor, float mscale_eff, float corr_low, \
+            float corr_high, int inverse, unsigned short* __restrict__ kv_cache,                     \
+            const float* __restrict__ kv_norm, const int* __restrict__ slot_per, unsigned slot_base) { \
+        qf_front_one<B>(qr, kv_raw, w_qa, w_kv, x, qr_normed, qr_xq, qr_xscale, q_a_norm, eps, ctl,  \
+                        epoch, q_normed, w_qb, pos_per_b, theta_scale, freq_scale, ext_factor,       \
+                        mscale_eff, corr_low, corr_high, inverse, kv_cache, kv_norm, slot_per,       \
+                        slot_base);                                                                  \
+    }
+QF_FRONT_ONE(qkv_front_one_tB1, 1)
+QF_FRONT_ONE(qkv_front_one_tB2, 2)
+QF_FRONT_ONE(qkv_front_one_tB3, 3)
+QF_FRONT_ONE(qkv_front_one_tB4, 4)
+QF_FRONT_ONE(qkv_front_one_tB5, 5)
+QF_FRONT_ONE(qkv_front_one_tB6, 6)
+QF_FRONT_ONE(qkv_front_one_tB7, 7)
+QF_FRONT_ONE(qkv_front_one_tB8, 8)
