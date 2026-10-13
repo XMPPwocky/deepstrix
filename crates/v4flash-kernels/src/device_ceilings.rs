@@ -105,6 +105,58 @@ impl DeviceCeilings {
         launch_kernel!(f, Self::cfg(n_blocks, block_threads), stream, [src.raw(), dst.raw(), n_vec])
     }
 
+    /// Expert-slot streaming read (`ceil_read_slots`): exactly the weight bytes
+    /// of `n_slots_used` experts of `slot_bytes` each at the pool slots in
+    /// `slots` (device), WG chunks of `chunk_bytes` -- the achievable ceiling for
+    /// a MoE call that must move those bytes, launch + ramp + tail included.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_slots(
+        &self,
+        stream: &Stream,
+        base: &DeviceBuffer<u8>,
+        slots: &DeviceBuffer<i32>,
+        n_slots_used: u32,
+        slot_bytes: usize,
+        chunk_bytes: u32,
+        sink: &mut DeviceBuffer<u32>,
+    ) -> eyre::Result<()> {
+        if slot_bytes % 16 != 0 || chunk_bytes % 16 != 0 || chunk_bytes == 0 || (slots.len() as u32) < n_slots_used {
+            return Err(eyre!("read_slots: bad geometry"));
+        }
+        let f = self.module.get_function("ceil_read_slots")?;
+        let cfg = LaunchConfig {
+            grid: ((slot_bytes as u64).div_ceil(chunk_bytes as u64) as u32, n_slots_used, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(f, cfg, stream, [base.raw(), slots.raw(), slot_bytes as u64, chunk_bytes, sink.raw()])
+    }
+
+    /// [`Self::read_slots`] in the MXFP4 down kernels' per-lane access pattern
+    /// (`ceil_read_slots_mx`): `chunk_bytes` % 1088 == 0 and `slot_bytes` % `chunk_bytes` == 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_slots_mx(
+        &self,
+        stream: &Stream,
+        base: &DeviceBuffer<u8>,
+        slots: &DeviceBuffer<i32>,
+        n_slots_used: u32,
+        slot_bytes: usize,
+        chunk_bytes: u32,
+        sink: &mut DeviceBuffer<u32>,
+    ) -> eyre::Result<()> {
+        if chunk_bytes == 0 || chunk_bytes % 1088 != 0 || slot_bytes % chunk_bytes as usize != 0 || (slots.len() as u32) < n_slots_used {
+            return Err(eyre!("read_slots_mx: bad geometry"));
+        }
+        let f = self.module.get_function("ceil_read_slots_mx")?;
+        let cfg = LaunchConfig {
+            grid: ((slot_bytes / chunk_bytes as usize) as u32, n_slots_used, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(f, cfg, stream, [base.raw(), slots.raw(), slot_bytes as u64, chunk_bytes, sink.raw()])
+    }
+
     /// dp4a issue-rate probe. Ops emitted = n_blocks × block_threads × n_iters × 64.
     pub fn dp4a(
         &self,
