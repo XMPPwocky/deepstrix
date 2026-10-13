@@ -859,7 +859,7 @@ impl V41HfWeights {
         // ~3,400 MB/s on the same block size against the same device, and one
         // aggregate counter cannot say which of the three is responsible.
         let t_w = std::time::Instant::now();
-        if !(expert_odirect() && self.st.read_range_into_direct(wt, 0, dp)?) {
+        if !(expert_odirect() && self.st.read_range_into_direct_layout(wt, 0, dp)?) {
             self.st.read_range_into_cached_par(wt, 0, dp, expert_pread_threads())?;
         }
         read_prof().weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
@@ -1189,7 +1189,7 @@ impl V41HfWeights {
         read_prof().alloc_ns.fetch_add(
             t_pread.duration_since(t_alloc).as_nanos() as u64, Relaxed);
         let t_w = std::time::Instant::now();
-        if !(expert_odirect() && self.st.read_range_into_direct(wt, 0, &mut packed)?) {
+        if !(expert_odirect() && self.st.read_range_into_direct_layout(wt, 0, &mut packed)?) {
             self.st.read_range_into_cached_par(wt, 0, &mut packed, expert_pread_threads())?;
         }
         read_prof().weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);

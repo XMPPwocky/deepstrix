@@ -458,6 +458,95 @@ impl SafetensorsDir {
         Ok(true)
     }
 
+    /// The layout reads' O_DIRECT weight read (`hf_v41::read_expert_hf_layout`): striped over the mirror with
+    /// `V41_EXPERT_MIRROR_LAYOUT=1` (static, box 1; share `V41_EXPERT_MIRROR_FRAC`), else exactly `read_range_into_direct`.
+    pub fn read_range_into_direct_layout(&self, t: &StTensor, byte_off: u64, dst: &mut [u8]) -> eyre::Result<bool> {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_EXPERT_MIRROR_LAYOUT").as_deref() == Ok("1"));
+        if *ON {
+            self.read_range_into_direct_mirrored(t, byte_off, dst, crate::hf_v41::expert_mirror_frac())
+        } else {
+            self.read_range_into_direct(t, byte_off, dst)
+        }
+    }
+
+    /// `read_range_into_direct` across TWO drives (box 1, owner 10-12: "the e100 primary, what is striped stays striped"):
+    /// the outward-rounded, 4096-aligned span is cut at `1 - mirror_frac` of its length (aligned); the head is read from
+    /// the primary handle and the tail from the mirror (`V41_EXPERT_MIRROR_DIR`) CONCURRENTLY, into the same aligned
+    /// bounce buffer, then the requested subrange is copied out. No mirror for this shard, `mirror_frac <= 0`, or a span
+    /// under two blocks -> exactly `read_range_into_direct`; `mirror_frac >= 1` reads it all from the mirror.
+    pub fn read_range_into_direct_mirrored(&self, t: &StTensor, byte_off: u64, dst: &mut [u8], mirror_frac: f32) -> eyre::Result<bool> {
+        const A: u64 = 4096;
+        let mirror = self.mirror_files.get(t.shard).and_then(|m| m.as_ref());
+        let Some(Some(file)) = self.direct_files.get(t.shard) else {
+            return Ok(false);
+        };
+        let Some(mirror) = mirror else {
+            return self.read_range_into_direct(t, byte_off, dst);
+        };
+        if mirror_frac <= 0.0 || dst.is_empty() {
+            return self.read_range_into_direct(t, byte_off, dst);
+        }
+        let end = byte_off.checked_add(dst.len() as u64).ok_or_else(|| eyre!("{}: range overflow", t.name))?;
+        if end > t.len {
+            return Err(eyre!("{}: range [{byte_off},{end}) exceeds tensor length {}", t.name, t.len));
+        }
+        let abs = t.offset + byte_off;
+        let lo = abs & !(A - 1);
+        let hi = (abs + dst.len() as u64 + A - 1) & !(A - 1);
+        let span = (hi - lo) as usize;
+        if span < 2 * A as usize {
+            return self.read_range_into_direct(t, byte_off, dst);
+        }
+        let head = (abs - lo) as usize;
+        let need = head + dst.len();
+        // The primary's share, rounded to a block; the mirror reads the rest (up to `need`; a short read past EOF on the
+        // shard's last tensor is fine once the requested bytes are in, as in `read_range_into_direct`).
+        let frac = mirror_frac.min(1.0) as f64;
+        let cut = (((span as f64) * (1.0 - frac)) as u64 / A * A).min(span as u64) as usize;
+        struct Aligned(*mut u8, std::alloc::Layout);
+        impl Drop for Aligned {
+            fn drop(&mut self) {
+                // SAFETY: allocated with this exact layout below.
+                unsafe { std::alloc::dealloc(self.0, self.1) }
+            }
+        }
+        let layout = std::alloc::Layout::from_size_align(span, A as usize).map_err(|e| eyre!("{}: bad direct layout: {e}", t.name))?;
+        // SAFETY: span >= 2A > 0, valid layout.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            return Err(eyre!("{}: direct bounce alloc of {span} failed", t.name));
+        }
+        let guard = Aligned(ptr, layout);
+        // SAFETY: `ptr` owns `span` bytes for the lifetime of `guard`.
+        let buf = unsafe { std::slice::from_raw_parts_mut(guard.0, span) };
+        let (a, b) = buf.split_at_mut(cut);
+        let read_part = |f: &std::fs::File, part: &mut [u8], at: u64, want: usize, which: &str| -> eyre::Result<()> {
+            let mut got = 0usize;
+            while got < want {
+                let n = f.read_at(&mut part[got..], at + got as u64).wrap_err_with(|| {
+                    format!("O_DIRECT {which} pread at {} in {} for {}", at + got as u64, self.shard_names[t.shard], t.name)
+                })?;
+                if n == 0 {
+                    return Err(eyre!("{}: O_DIRECT {which} short read at {}: got {got} of {want}", t.name, at + got as u64));
+                }
+                got += n;
+            }
+            Ok(())
+        };
+        let want_a = need.min(cut);
+        let want_b = need.saturating_sub(cut);
+        let (ra, rb) = std::thread::scope(|sc| {
+            let hb = (want_b > 0).then(|| sc.spawn(|| read_part(mirror, b, lo + cut as u64, want_b, "mirror")));
+            let ra = if want_a > 0 { read_part(file, a, lo, want_a, "primary") } else { Ok(()) };
+            let rb = hb.map_or(Ok(()), |h| h.join().unwrap_or_else(|_| Err(eyre!("mirror reader panicked"))));
+            (ra, rb)
+        });
+        ra?;
+        rb?;
+        dst.copy_from_slice(&buf[head..head + dst.len()]);
+        Ok(true)
+    }
+
     /// Tell the kernel this tensor's byte range is read RANDOMLY, so it stops
     /// issuing readahead for it.
     ///
