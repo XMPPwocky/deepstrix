@@ -901,6 +901,14 @@ crate::knobs! {
     /// shared expert as the addend when there is none): one launch fewer per lane-layer, out_hc
     /// bit-identical. Off = the separate vec_add before box 2's wait, as before.
     pub static DGPU_COMBINE3 = Knob::flag("V41_DGPU_COMBINE3", true).live();
+    /// `V41_DGPU_G1_FUSED` (default OFF; live, read per decode lane-layer): dGPU fusion group G1 --
+    /// the decode router block (pre-ffn collapse, router of l + the k1 look-ahead's l+1, the cache
+    /// prior's upload, both top-ks, box 2's Q8_K rows, the readback pack, the M62 counts) as ONE
+    /// launch (`G1RouterBlock`, kernels/g1_router_block.hip) instead of nine queue operations; every
+    /// output bit-identical (tests/g1_router_block_bitexact.rs). Only where the current chain is
+    /// the direct mHC-fast + mix-late + router-x2-eligible + packed decode shape (`g1_eligible`);
+    /// everything else keeps the current path. `selected_ready` is recorded after it as before.
+    pub static DGPU_G1_FUSED = Knob::flag("V41_DGPU_G1_FUSED", false).live();
     /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
     /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top
     /// `per_layer()` (today, bit-identical); `interleave` = box 1 holds `V41_B1_HOT_TARGET` of the
