@@ -391,7 +391,7 @@ fn dn3_bit_identical_to_dn2() -> eyre::Result<()> {
         slot_stride as u32, nu as u32, 2, 32, nr as u32, 8, None).is_err(), "n_blocks_in != 9 must be refused");
     let rows_wg = DN3_DEFAULT.rows_per_wave * DN3_DEFAULT.waves;
     assert!(e.mxfp4.launch_by_expert_dn3_ex(&s, &mut p, &w, &midq, &gc, &em, &wi, g.wi.len() as u32, dbpe as u32,
-        slot_stride as u32, nu as u32, 2, 32, rows_wg + 8, nb as u32, None).is_err(), "n_rows % rows-per-WG != 0 must be refused");
+        slot_stride as u32, nu as u32, 2, 32, rows_wg + rows_wg / 2, nb as u32, None).is_err(), "n_rows % rows-per-WG != 0 must be refused");
     eprintln!("PASS: {n_cases} cases x (exact, bound+count): {n_launch_cmp} launches bit-identical to dn2 \
 (kwide2, {} dn3 geometries, dispatch with V41_MOE_DOWN_DN3=1); dn2 == CPU replica of its order on {replica_checked} outputs; \
 max rel err vs the plain CPU oracle (different order) {worst_rel_oracle:.3e}", DN3_GEOMS.len());

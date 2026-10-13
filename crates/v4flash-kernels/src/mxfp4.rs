@@ -18,30 +18,29 @@ pub const SUPER_MXFP4_BYTES: usize = 136;
 /// `n_blocks_in` the small-b down twin is compiled for (`DN2_NB` = N_FF_EXP / 256).
 pub const SMALLB_DOWN_N_BLOCKS_IN: u32 = 9;
 
-/// A dn3 decode-down geometry: kernel symbol, rows per wave (compiled into the
-/// symbol), waves per work-group (launch-time) and the grid shape:
-///  * `dn3_*`: (row tiles, work items) -- dn2's grid;
-///  * `dn3p_*` (`persist_wgs` > 0): a 1-D grid of `persist_wgs` work-groups that walk
-///    the flattened (work item, row tile) list up to the device count;
-///  * `dn3c_*` (`col_y` > 0): (row tiles, min(work items, `col_y`)), each work-group
-///    loops over work items y, y + col_y, ... (the next expert's stripe prefetched).
+/// A dn3 decode-down geometry (`mxfp4_matvec_par_by_expert_dn3*`,
+/// kernels/mxfp4_matvec.hip): kernel symbol, rows per wave (compiled into the
+/// symbol), waves per work-group, and the grid:
+///  * `persist_wgs == 0` (`dn3_r4`): dn2's 2-D grid (row tiles, work items);
+///  * `persist_wgs > 0` (`dn3p_*`, `dn3l_*`): a persistent 1-D grid of that many
+///    work-groups walking the flattened (work item, row tile) list up to the device
+///    count (= the resident work-group capacity on gfx1151 at the kernel's VGPRs).
+///
+/// The `dn3l_*` kernels are compiled for their wave count (the symbol's `w`) and
+/// return without writing for any other block size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dn3Geom {
     pub sym: &'static str,
     pub rows_per_wave: u32,
     pub waves: u32,
     pub persist_wgs: u32,
-    pub col_y: u32,
 }
 
 const fn dn3(sym: &'static str, rows_per_wave: u32, waves: u32) -> Dn3Geom {
-    Dn3Geom { sym, rows_per_wave, waves, persist_wgs: 0, col_y: 0 }
+    Dn3Geom { sym, rows_per_wave, waves, persist_wgs: 0 }
 }
 const fn dn3p(sym: &'static str, rows_per_wave: u32, waves: u32, persist_wgs: u32) -> Dn3Geom {
-    Dn3Geom { sym, rows_per_wave, waves, persist_wgs, col_y: 0 }
-}
-const fn dn3c(sym: &'static str, rows_per_wave: u32, waves: u32, col_y: u32) -> Dn3Geom {
-    Dn3Geom { sym, rows_per_wave, waves, persist_wgs: 0, col_y }
+    Dn3Geom { sym, rows_per_wave, waves, persist_wgs }
 }
 
 impl Dn3Geom {
@@ -50,63 +49,29 @@ impl Dn3Geom {
         let k = self.sym.trim_start_matches("mxfp4_matvec_par_by_expert_");
         if self.persist_wgs > 0 {
             format!("{k} w{} G{}", self.waves, self.persist_wgs)
-        } else if self.col_y > 0 {
-            format!("{k} w{} Y{}", self.waves, self.col_y)
         } else {
             format!("{k} w{}", self.waves)
         }
     }
 }
 
+/// The production dn3 geometry (`V41_MOE_DOWN_DN3=1`): persistent, LDS-staged
+/// coalesced stripes, R = 2 rows per wave, 4-wave work-groups, G = 140 = the
+/// resident capacity at 205 VGPRs (7 waves / SIMD x 4 SIMDs x 20 WGPs / 4 waves).
+pub const DN3_DEFAULT: Dn3Geom = dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4a", 2, 4, 140);
+/// The 2-D-grid dn3 (`V41_MOE_DOWN_DN3=grid`): no persistence (hardware work-group
+/// scheduling), dn2's empty-column tail at bound > D.
+pub const DN3_GRID: Dn3Geom = dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 4);
+
 /// Every compiled dn3 geometry (all bit-identical to dn2; tests/mxfp4_down_dn3.rs).
 pub const DN3_GEOMS: &[Dn3Geom] = &[
-    dn3("mxfp4_matvec_par_by_expert_dn3_r2", 2, 8),
-    dn3("mxfp4_matvec_par_by_expert_dn3_r2", 2, 4),
-    dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 8),
-    dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 4),
-    dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 2),
-    dn3("mxfp4_matvec_par_by_expert_dn3_r4l", 4, 4),
-    dn3("mxfp4_matvec_par_by_expert_dn3_r8", 8, 4),
-    dn3("mxfp4_matvec_par_by_expert_dn3_r8", 8, 2),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2", 2, 8, 80),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 8, 40),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 8, 80),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 4, 160),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4", 4, 4, 120),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 80),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 120),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 160),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 240),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 360),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pf", 4, 4, 480),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 4, 320),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2pf", 2, 4, 480),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pfa", 4, 4, 80),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pfa", 4, 4, 120),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epf", 2, 4, 128),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epf", 2, 2, 256),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epfa", 2, 4, 80),
-    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epfa", 2, 4, 120),
-    dn3p("mxfp4_matvec_par_by_expert_dn3q_r2epfa", 2, 4, 120),
-    dn3p("mxfp4_matvec_par_by_expert_dn3q_r4pfa", 4, 4, 80),
-    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4a", 2, 4, 128),
-    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4a", 2, 4, 140),
+    DN3_DEFAULT,
+    DN3_GRID,
     dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4", 2, 4, 160),
     dn3p("mxfp4_matvec_par_by_expert_dn3l_r4w4a", 4, 4, 120),
-    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w2a", 2, 2, 256),
-    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w8a", 2, 8, 64),
-    dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w8a", 2, 8, 70),
-    dn3p("mxfp4_matvec_par_by_expert_dn3l_r4w8a", 4, 8, 40),
-    dn3p("mxfp4_matvec_par_by_expert_dn3l_r4w8a", 4, 8, 60),
-    dn3c("mxfp4_matvec_par_by_expert_dn3c_r4", 4, 4, 4),
-    dn3c("mxfp4_matvec_par_by_expert_dn3c_r4pf", 4, 4, 2),
-    dn3c("mxfp4_matvec_par_by_expert_dn3c_r4pf", 4, 4, 4),
-    dn3c("mxfp4_matvec_par_by_expert_dn3c_r4pf", 4, 4, 8),
-    dn3c("mxfp4_matvec_par_by_expert_dn3c_r2pf", 2, 8, 4),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pfa", 4, 4, 80),
+    dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epfa", 2, 4, 120),
 ];
-
-/// The geometry `launch_by_expert_dn3_ex` (production arm) uses.
-pub const DN3_DEFAULT: Dn3Geom = dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 4);
 
 pub struct Mxfp4Matvec {
     module: Module,
@@ -254,15 +219,11 @@ impl Mxfp4Matvec {
         }
         let n_wi_dev = n_work_items_dev.map_or(std::ptr::null_mut(), |c| c.raw());
         let function = self.module.get_function(geom.sym)?;
-        if geom.persist_wgs > 0 || geom.col_y > 0 {
+        if geom.persist_wgs > 0 {
+            // Never more work-groups than (tile, work item) pairs of the bound.
             let tiles = (n_rows / rows_per_wg) as u64 * n_work_items as u64;
-            let grid = if geom.col_y > 0 {
-                (n_rows / rows_per_wg, n_work_items.min(geom.col_y), 1)
-            } else {
-                ((geom.persist_wgs as u64).min(tiles) as u32, 1, 1)
-            };
             let cfg = LaunchConfig {
-                grid,
+                grid: ((geom.persist_wgs as u64).min(tiles) as u32, 1, 1),
                 block: (32 * geom.waves, 1, 1),
                 shared_mem_bytes: 0,
             };

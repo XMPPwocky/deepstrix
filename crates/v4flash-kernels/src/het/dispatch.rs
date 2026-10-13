@@ -475,14 +475,28 @@ pub fn moe_down_dn2_for(rows: u32) -> bool {
     *D && (1..=MOE_DOWN_DN2_MAX_ROWS).contains(&rows)
 }
 
-/// `V41_MOE_DOWN_DN3` (default OFF; `1` = on): a batched MXFP4 down pass of
-/// `rows <= 8` runs the decode kernel `mxfp4_matvec_par_by_expert_dn3_*`
-/// ([`crate::mxfp4::DN3_DEFAULT`]) instead of dn2: same contract, BIT-IDENTICAL
-/// partials (tests/mxfp4_down_dn3.rs). Read once.
-pub fn moe_down_dn3_for(rows: u32) -> bool {
-    static D: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("V41_MOE_DOWN_DN3").as_deref() == Ok("1"));
-    *D && (1..=MOE_DOWN_DN2_MAX_ROWS).contains(&rows)
+/// `V41_MOE_DOWN_DN3` value -> dn3 geometry: `1` = [`crate::mxfp4::DN3_DEFAULT`]
+/// (persistent, LDS-staged), `grid` = [`crate::mxfp4::DN3_GRID`] (2-D grid);
+/// anything else (incl. unset) = off.
+pub fn moe_down_dn3_parse(v: Option<&str>) -> Option<crate::mxfp4::Dn3Geom> {
+    match v {
+        Some("1") => Some(crate::mxfp4::DN3_DEFAULT),
+        Some("grid") => Some(crate::mxfp4::DN3_GRID),
+        _ => None,
+    }
+}
+
+/// `V41_MOE_DOWN_DN3` (default OFF; `1` or `grid`, read once): a batched MXFP4 down
+/// pass of `rows <= 8` (hub decode lanes, box-2 decode requests) runs the decode
+/// kernel dn3 (`mxfp4_matvec_par_by_expert_dn3*`, kernels/mxfp4_matvec.hip) instead
+/// of dn2: same contract, BIT-IDENTICAL partials (tests/mxfp4_down_dn3.rs). 2026-10-13
+/// bench (gfx1151, cold weights, production bound grid, p50): 94-97% of the
+/// slot-streaming read ceiling vs dn2's 58-89%; b=4: D=4 173.5 -> 118.5 us, D=8
+/// 268.7 -> 228.5, D=12 363.3 -> 339.4; b=8 D=4 194.9 -> 118.8.
+pub fn moe_down_dn3_for(rows: u32) -> Option<crate::mxfp4::Dn3Geom> {
+    static D: std::sync::LazyLock<Option<crate::mxfp4::Dn3Geom>> =
+        std::sync::LazyLock::new(|| moe_down_dn3_parse(std::env::var("V41_MOE_DOWN_DN3").ok().as_deref()));
+    if (1..=MOE_DOWN_DN2_MAX_ROWS).contains(&rows) { *D } else { None }
 }
 
 /// `V41_MOE_WMMA_GATEUP` (default ON; `0` = the kwide gate+up at every size):
@@ -614,14 +628,13 @@ pub fn moe_down_mxfp4(
             dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
         );
     }
-    if moe_down_dn3_for(rows)
-        && n_blocks_in == crate::mxfp4::SMALLB_DOWN_N_BLOCKS_IN
-        && n_rows % (crate::mxfp4::DN3_DEFAULT.rows_per_wave * crate::mxfp4::DN3_DEFAULT.waves) == 0
-    {
-        return e.mxfp4.launch_by_expert_dn3_ex(
-            s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
-            dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
-        );
+    if let Some(geom) = moe_down_dn3_for(rows) {
+        if n_blocks_in == crate::mxfp4::SMALLB_DOWN_N_BLOCKS_IN && n_rows % (geom.rows_per_wave * geom.waves) == 0 {
+            return e.mxfp4.launch_by_expert_dn3_geom(
+                geom, s, partials, w_base, xq_base, group_count, expert_members, work_items, n_work_items,
+                dbpe, xq_slot_stride, n_used, max_per_expert, chunk, n_rows, n_blocks_in, n_wi_dev,
+            );
+        }
     }
     if moe_down_dn2_for(rows)
         && n_blocks_in == crate::mxfp4::SMALLB_DOWN_N_BLOCKS_IN
@@ -735,6 +748,23 @@ pub fn moe_gate_up_chunked_ex(
 
 #[cfg(test)]
 mod tests {
+    /// `V41_MOE_DOWN_DN3`: only `1` / `grid` select dn3 (default off), and every
+    /// dn3 geometry tiles the hub's N_EMBD rows (the dispatch arm's precondition).
+    #[test]
+    fn dn3_knob_and_geometries() {
+        use crate::mxfp4::{DN3_DEFAULT, DN3_GEOMS, DN3_GRID};
+        assert_eq!(super::moe_down_dn3_parse(None), None);
+        assert_eq!(super::moe_down_dn3_parse(Some("0")), None);
+        assert_eq!(super::moe_down_dn3_parse(Some("")), None);
+        assert_eq!(super::moe_down_dn3_parse(Some("1")), Some(DN3_DEFAULT));
+        assert_eq!(super::moe_down_dn3_parse(Some("grid")), Some(DN3_GRID));
+        assert!(DN3_DEFAULT.persist_wgs > 0 && DN3_GRID.persist_wgs == 0);
+        for g in DN3_GEOMS {
+            assert_eq!(crate::config::N_EMBD % (g.rows_per_wave * g.waves), 0, "{g:?}");
+            assert!(g.waves >= 1 && g.waves <= 8, "{g:?}");
+        }
+    }
+
     /// `moe_wi_upper_bound` is >= the exact count for every split of M
     /// members into groups (brute force over small cases and a few big ones).
     #[test]
