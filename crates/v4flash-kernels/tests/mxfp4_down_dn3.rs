@@ -22,7 +22,7 @@
 //!     -- --ignored --test-threads=1 --nocapture
 //! Bench env: DN3_REPS (default 60), DN3_POOL_SLOTS (default 470 = 2.95 GB).
 
-use color_eyre::eyre::{self, eyre};
+use color_eyre::eyre;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::config::{BLOCKS_Q8K_DOWN_IN, N_EMBD, N_EXPERT_USED};
 use v4flash_kernels::device_ceilings::DeviceCeilings;
@@ -398,6 +398,109 @@ max rel err vs the plain CPU oracle (different order) {worst_rel_oracle:.3e}", D
     Ok(())
 }
 
+/// Edge shapes vs the CPU replica of dn2's arithmetic, EVERY output bit for bit, for
+/// every compiled dn3 geometry that tiles n_rows (the others must refuse): n_rows 24 /
+/// 40 / N_EMBD (sampled), chunk 1 / 2 / 3 / 32, b = 1..8 (odd included), the sweep
+/// builder at n_virt = 6 (b = 8: every expert has 8 members -- past dn3q's 3 held
+/// activations and split over chunks), the decode builder with the experts at the
+/// LAST pool slots, exact and bound + device-count grids, repeated launches on one
+/// stream (the queue re-arms); unwritten partials must keep the sentinel.
+#[test]
+#[ignore]
+fn dn3_exact_edges() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let Some(dev) = pick_igpu()? else {
+        eprintln!("SKIP: no gfx1151 device");
+        return Ok(());
+    };
+    dev.set_current()?;
+    let arch = dev.properties()?.gcn_arch_name;
+    let id = dev.id;
+    let e = DeviceEngine::for_arch(dev, &arch)?;
+    let s = Stream::new(id)?;
+    let mut rng = Lcg(0x5EED_ED6E);
+    let nu = N_EXPERT_USED;
+    let nb = BLOCKS_Q8K_DOWN_IN as usize;
+    let slot_stride = nb * BLOCK_Q8_K_BYTES;
+    const N_PHYS: usize = 12;
+    let (mut launches, mut outputs, mut refused) = (0usize, 0usize, 0usize);
+    for &nr in &[24usize, 40, N_EMBD as usize] {
+        let dbpe = nr * nb * SUPER_MXFP4_BYTES;
+        let w_host = mxfp4_weights(&mut rng, N_PHYS, nr, nb, 118, 8);
+        let w = upload(id, &w_host)?;
+        let mut cases: Vec<(String, Groups, usize)> = Vec::new();
+        for b in 1..=8usize {
+            for chunk in [1usize, 2, 3, 32] {
+                cases.push((format!("sweep n_virt=6 b={b} chunk={chunk}"), build_groups(&mut rng, b, nu, 6, N_PHYS, chunk), chunk));
+                let d = (2 * b).min(N_PHYS).min(nu * b);
+                let slots: Vec<u32> = ((N_PHYS - d)..N_PHYS).map(|x| x as u32).collect();
+                cases.push((format!("decode pool-end b={b} D={d} chunk={chunk}"), decode_groups(b, &slots, N_PHYS, chunk), chunk));
+            }
+        }
+        // Rows checked against the CPU per (member): all for the small shapes, 64 for N_EMBD.
+        let rows_chk: Vec<usize> = if nr <= 64 { (0..nr).collect() } else { (0..64).map(|k| (k * 997 + 13) % nr).collect() };
+        for (label, g, chunk) in &cases {
+            let b = g.max_per_expert;
+            let midq_h = q8k_blocks(&mut rng, b * nu * nb, true);
+            let midq = upload(id, &midq_h)?;
+            let (gc, em) = (upload(id, &g.gc)?, upload(id, &g.em)?);
+            let n_real = g.wi.len();
+            let bound = (b * nu).max(n_real);
+            let mut wi_pad = g.wi.clone();
+            wi_pad.resize(bound, 0);
+            let (wi_exact, wi_bound, cnt) = (upload(id, &g.wi)?, upload(id, &wi_pad)?, upload(id, &[n_real as i32])?);
+            let n_out = b * nu * nr;
+            // The CPU replica's partials (NaN sentinel where no member writes).
+            let mut want = vec![SENTINEL.to_bits(); n_out];
+            for (ee, &n) in g.gc.iter().enumerate() {
+                for m in 0..n as usize {
+                    let packed = g.em[ee * g.max_per_expert + m];
+                    let (row_b, slot) = ((packed >> 16) as usize, (packed & 0xffff) as usize);
+                    let y = &midq_h[(row_b * nu + slot) * slot_stride..(row_b * nu + slot + 1) * slot_stride];
+                    for &r in &rows_chk {
+                        let w_row = &w_host[ee * dbpe + r * nb * SUPER_MXFP4_BYTES..ee * dbpe + (r + 1) * nb * SUPER_MXFP4_BYTES];
+                        want[(row_b * nu + slot) * nr + r] = cpu_dn2_replica(w_row, y).to_bits();
+                    }
+                }
+            }
+            for geom in DN3_GEOMS {
+                for bounded in [false, true] {
+                    let (wi_d, n_wi, c) = if bounded { (&wi_bound, bound as u32, Some(&cnt)) } else { (&wi_exact, n_real as u32, None) };
+                    // Twice on one stream: the second launch runs on the re-armed queue.
+                    for rep in 0..2 {
+                        let mut p = upload(id, &vec![SENTINEL; n_out])?;
+                        let r = e.mxfp4.launch_by_expert_dn3_geom(*geom, &s, &mut p, &w, &midq, &gc, &em, wi_d, n_wi, dbpe as u32,
+                            slot_stride as u32, nu as u32, g.max_per_expert as u32, *chunk as u32, nr as u32, nb as u32, c);
+                        if nr as u32 % (geom.rows_per_wave * geom.waves) != 0 {
+                            assert!(r.is_err(), "{label} nr={nr}: {} must refuse n_rows", geom.label());
+                            refused += 1;
+                            break;
+                        }
+                        r?;
+                        s.synchronize()?;
+                        let got = bits(&download(&p, n_out)?);
+                        let written = got.iter().filter(|&&v| v != SENTINEL.to_bits()).count();
+                        assert_eq!(written, g.members * nr, "{label} nr={nr} {} rep {rep}: wrote {written} of {} partials",
+                            geom.label(), g.members * nr);
+                        for (i, (&gv, &wv)) in got.iter().zip(&want).enumerate() {
+                            let r_i = i % nr;
+                            if wv != SENTINEL.to_bits() || nr <= 64 {
+                                assert_eq!(gv, wv, "{label} nr={nr} {} {} rep {rep}: partial {i} (row {r_i}) {:e} vs CPU {:e}",
+                                    geom.label(), if bounded { "bound+count" } else { "exact" }, f32::from_bits(gv), f32::from_bits(wv));
+                                outputs += 1;
+                            }
+                        }
+                        launches += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("PASS: {launches} launches, {outputs} partials bit-identical to the CPU replica of dn2 (n_rows 24/40/{}, chunk 1/2/3/32, \
+b 1..8, up to 8 members per expert, pool-end slots, exact + bound grids, 2 launches per stream); {refused} n_rows refusals", N_EMBD);
+    Ok(())
+}
+
 // ------------------------------------------------------------------------- 2. bench
 
 #[derive(Clone)]
@@ -492,7 +595,7 @@ fn bench_dn3_decode() -> eyre::Result<()> {
     .into_iter().filter(|&(b, d)| d <= nu * b).collect();
     let mut arms = vec![Arm::Dn2, Arm::Dn2Aa];
     let only = std::env::var("DN3_ONLY").ok();
-    for g in DN3_GEOMS {
+    for g in DN3_GEOMS.iter().chain(v4flash_kernels::mxfp4::DN3_BENCH_REFS) {
         let a = Arm::Dn3(*g);
         if only.as_deref().is_none_or(|o| o.split(',').any(|x| a.name().contains(x))) {
             arms.push(a);
@@ -565,8 +668,13 @@ fn bench_dn3_decode() -> eyre::Result<()> {
     let slot_stride = (nb * BLOCK_Q8_K_BYTES) as u32;
     for rep in 0..reps + 3 {
         for (si, x) in sb.iter_mut().enumerate() {
-            for k in 0..arms.len() {
-                let ai = (k + rep + si) % arms.len();
+            // A fresh random arm order per (rep, shape): a fixed cyclic order gives every
+            // arm the same predecessor, a 1-2% position bias (dn2 vs its A/A twin).
+            let mut order: Vec<usize> = (0..arms.len()).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, rng.below(i as u32 + 1) as usize);
+            }
+            for &ai in &order {
                 let (gc, em, wi, cnt, slots, bound, mpe) = &x.rot[rot_i % N_ROT];
                 rot_i += 1;
                 let (a, bev) = (Event::new()?, Event::new()?);

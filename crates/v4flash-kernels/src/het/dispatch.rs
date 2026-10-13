@@ -468,7 +468,9 @@ pub const MOE_WMMA_DOWN_MIN_ROWS: u32 = 128;
 /// at b = 1..8 incl. 1-member groups). 2026-09-26 sweep (A_moe_smallb/
 /// dn2_member_outer, gfx1151, cold weights): kernel 178 -> 142 us at b = 4, chain
 /// x1.085 (b=4) / x1.05 (b=2) / x1.08 (b=8). Measured only up to 8 rows, so
-/// larger passes keep kwide2 (or the WMMA arm below).
+/// larger passes keep kwide2 (or the WMMA arm below). PRECEDENCE: a set
+/// `V41_MOE_DOWN_DN3` ([`moe_down_dn3_for`]) is checked FIRST and wins at these
+/// sizes whatever this knob says -- `V41_MOE_DOWN_DN2=0` alone does not turn dn3 off.
 pub fn moe_down_dn2_for(rows: u32) -> bool {
     static D: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_MOE_DOWN_DN2").as_deref() != Ok("0"));
@@ -476,23 +478,32 @@ pub fn moe_down_dn2_for(rows: u32) -> bool {
 }
 
 /// `V41_MOE_DOWN_DN3` value -> dn3 geometry: `1` = [`crate::mxfp4::DN3_DEFAULT`]
-/// (persistent, LDS-staged), `grid` = [`crate::mxfp4::DN3_GRID`] (2-D grid);
-/// anything else (incl. unset) = off.
+/// (dn3q: persistent, dynamic wave-tile queue, LDS-staged), `static` =
+/// [`crate::mxfp4::DN3_STATIC`] (dn3l: persistent, static tile walk), `grid` =
+/// [`crate::mxfp4::DN3_GRID`] (dn3_r4: 2-D grid); anything else (incl. unset) = off.
 pub fn moe_down_dn3_parse(v: Option<&str>) -> Option<crate::mxfp4::Dn3Geom> {
     match v {
         Some("1") => Some(crate::mxfp4::DN3_DEFAULT),
+        Some("static") => Some(crate::mxfp4::DN3_STATIC),
         Some("grid") => Some(crate::mxfp4::DN3_GRID),
         _ => None,
     }
 }
 
-/// `V41_MOE_DOWN_DN3` (default OFF; `1` or `grid`, read once): a batched MXFP4 down
-/// pass of `rows <= 8` (hub decode lanes, box-2 decode requests) runs the decode
-/// kernel dn3 (`mxfp4_matvec_par_by_expert_dn3*`, kernels/mxfp4_matvec.hip) instead
-/// of dn2: same contract, BIT-IDENTICAL partials (tests/mxfp4_down_dn3.rs). 2026-10-13
-/// bench (gfx1151, cold weights, production bound grid, p50): 94-97% of the
-/// slot-streaming read ceiling vs dn2's 58-89%; b=4: D=4 173.5 -> 118.5 us, D=8
-/// 268.7 -> 228.5, D=12 363.3 -> 339.4; b=8 D=4 194.9 -> 118.8.
+/// `V41_MOE_DOWN_DN3` (default OFF; `1`, `static` or `grid`, read once at the first
+/// MoE down): a batched MXFP4 down pass of `rows <= 8` (hub decode lanes, box-2
+/// decode requests) runs the decode kernel dn3 (`mxfp4_matvec_par_by_expert_dn3*`,
+/// kernels/mxfp4_matvec.hip) instead of dn2: same contract, BIT-IDENTICAL partials
+/// (tests/mxfp4_down_dn3.rs). This arm is checked BEFORE dn2's, so a set
+/// `V41_MOE_DOWN_DN3` runs dn3 even with `V41_MOE_DOWN_DN2=0`; unset (or `0`) is the
+/// rollback to dn2 / kwide2. Needs n_blocks_in = 9 and n_rows a multiple of the
+/// geometry's rows per work-group (8; `grid` 16), else the dn2 / kwide2 arms decide.
+/// 2026-10-13 bench (gfx1151, cold weights over a 2.95 GB pool, production bound grid +
+/// device count, medians of 3 x 200 interleaved reps beside the live hub): `1` (dn3q)
+/// runs at 98-99% of the same-bytes streaming probe at b = 1..8, D = 4..16 (95-97% at
+/// D = 1-2) vs dn2's 66-96% and `static` (dn3l) 94-97%; b=4: D=4 149.7 -> 115.3 us,
+/// D=8 247.8 -> 219.0, D=16 447.7 -> 427.9; b=8: D=4 170.8 -> 115.2, D=8 289.3 ->
+/// 222.1, D=16 484.3 -> 430.6.
 pub fn moe_down_dn3_for(rows: u32) -> Option<crate::mxfp4::Dn3Geom> {
     static D: std::sync::LazyLock<Option<crate::mxfp4::Dn3Geom>> =
         std::sync::LazyLock::new(|| moe_down_dn3_parse(std::env::var("V41_MOE_DOWN_DN3").ok().as_deref()));
@@ -789,17 +800,22 @@ pub fn moe_gate_up_chunked_ex(
 
 #[cfg(test)]
 mod tests {
-    /// `V41_MOE_DOWN_DN3`: only `1` / `grid` select dn3 (default off), and every
+    /// `V41_MOE_DOWN_DN3`: only `1` / `static` / `grid` select dn3 (default off), and every
     /// dn3 geometry tiles the hub's N_EMBD rows (the dispatch arm's precondition).
     #[test]
     fn dn3_knob_and_geometries() {
-        use crate::mxfp4::{DN3_DEFAULT, DN3_GEOMS, DN3_GRID};
+        use crate::mxfp4::{DN3_DEFAULT, DN3_GEOMS, DN3_GRID, DN3_STATIC};
         assert_eq!(super::moe_down_dn3_parse(None), None);
         assert_eq!(super::moe_down_dn3_parse(Some("0")), None);
         assert_eq!(super::moe_down_dn3_parse(Some("")), None);
         assert_eq!(super::moe_down_dn3_parse(Some("1")), Some(DN3_DEFAULT));
         assert_eq!(super::moe_down_dn3_parse(Some("grid")), Some(DN3_GRID));
-        assert!(DN3_DEFAULT.persist_wgs > 0 && DN3_GRID.persist_wgs == 0);
+        assert_eq!(super::moe_down_dn3_parse(Some("static")), Some(DN3_STATIC));
+        assert_eq!(super::moe_down_dn3_parse(Some("true")), None);
+        assert!(DN3_DEFAULT.persist_wgs > 0 && DN3_DEFAULT.queue);
+        assert!(DN3_STATIC.persist_wgs > 0 && !DN3_STATIC.queue && DN3_GRID.persist_wgs == 0);
+        // The queue's fallback must tile exactly like the default (same launcher checks).
+        assert_eq!(DN3_STATIC.rows_per_wave * DN3_STATIC.waves, DN3_DEFAULT.rows_per_wave * DN3_DEFAULT.waves);
         for g in DN3_GEOMS {
             assert_eq!(crate::config::N_EMBD % (g.rows_per_wave * g.waves), 0, "{g:?}");
             assert!(g.waves >= 1 && g.waves <= 8, "{g:?}");

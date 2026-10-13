@@ -22,25 +22,32 @@ pub const SMALLB_DOWN_N_BLOCKS_IN: u32 = 9;
 /// kernels/mxfp4_matvec.hip): kernel symbol, rows per wave (compiled into the
 /// symbol), waves per work-group, and the grid:
 ///  * `persist_wgs == 0` (`dn3_r4`): dn2's 2-D grid (row tiles, work items);
-///  * `persist_wgs > 0` (`dn3p_*`, `dn3l_*`): a persistent 1-D grid of that many
-///    work-groups walking the flattened (work item, row tile) list up to the device
-///    count (= the resident work-group capacity on gfx1151 at the kernel's VGPRs).
+///  * `persist_wgs > 0`: a persistent 1-D grid of that many work-groups (never more
+///    than the (row tile, work item) pairs of the host bound), walking the flattened
+///    (work item, row tile) list up to the DEVICE count -- statically (`dn3p_*`,
+///    `dn3l_*`: tiles blockIdx.x + k G) or, with `queue`, from a device work queue
+///    (`dn3q_*`: dynamic per-wave tiles; one extra kernel argument, the launcher's
+///    counter slot, see [`Dn3Queue`]).
 ///
-/// The `dn3l_*` kernels are compiled for their wave count (the symbol's `w`) and
-/// return without writing for any other block size.
+/// The `dn3l_*` / `dn3q_*` kernels are compiled for their wave count (the symbol's
+/// `w`) and return without writing for any other block size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dn3Geom {
     pub sym: &'static str,
     pub rows_per_wave: u32,
     pub waves: u32,
     pub persist_wgs: u32,
+    pub queue: bool,
 }
 
 const fn dn3(sym: &'static str, rows_per_wave: u32, waves: u32) -> Dn3Geom {
-    Dn3Geom { sym, rows_per_wave, waves, persist_wgs: 0 }
+    Dn3Geom { sym, rows_per_wave, waves, persist_wgs: 0, queue: false }
 }
 const fn dn3p(sym: &'static str, rows_per_wave: u32, waves: u32, persist_wgs: u32) -> Dn3Geom {
-    Dn3Geom { sym, rows_per_wave, waves, persist_wgs }
+    Dn3Geom { sym, rows_per_wave, waves, persist_wgs, queue: false }
+}
+const fn dn3q(sym: &'static str, rows_per_wave: u32, waves: u32, persist_wgs: u32) -> Dn3Geom {
+    Dn3Geom { sym, rows_per_wave, waves, persist_wgs, queue: true }
 }
 
 impl Dn3Geom {
@@ -55,10 +62,15 @@ impl Dn3Geom {
     }
 }
 
-/// The production dn3 geometry (`V41_MOE_DOWN_DN3=1`): persistent, LDS-staged
-/// coalesced stripes, R = 2 rows per wave, 4-wave work-groups, G = 140 = the
-/// resident capacity at 205 VGPRs (7 waves / SIMD x 4 SIMDs x 20 WGPs / 4 waves).
-pub const DN3_DEFAULT: Dn3Geom = dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4a", 2, 4, 140);
+/// The production dn3 geometry (`V41_MOE_DOWN_DN3=1`): `dn3q_r2w4`, the dynamic
+/// wave-tile queue over LDS-staged coalesced 2-row stripes, 4-wave work-groups, G =
+/// 140 (170 VGPRs: 8 waves / SIMD = 160 resident; 100..160 measured flat, 140 leaves
+/// room for another queue's work-groups -- the queue rebalances around late ones).
+pub const DN3_DEFAULT: Dn3Geom = dn3q("mxfp4_matvec_par_by_expert_dn3q_r2w4", 2, 4, 140);
+/// The static persistent dn3 (`V41_MOE_DOWN_DN3=static`, and [`DN3_DEFAULT`]'s
+/// fallback when the queue's counter slots run out): dn3l, G = 140 = the resident
+/// capacity at 205 VGPRs (7 waves / SIMD x 4 SIMDs x 20 WGPs / 4 waves).
+pub const DN3_STATIC: Dn3Geom = dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4a", 2, 4, 140);
 /// The 2-D-grid dn3 (`V41_MOE_DOWN_DN3=grid`): no persistence (hardware work-group
 /// scheduling), dn2's empty-column tail at bound > D.
 pub const DN3_GRID: Dn3Geom = dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 4);
@@ -66,12 +78,16 @@ pub const DN3_GRID: Dn3Geom = dn3("mxfp4_matvec_par_by_expert_dn3_r4", 4, 4);
 /// Every compiled dn3 geometry (all bit-identical to dn2; tests/mxfp4_down_dn3.rs).
 pub const DN3_GEOMS: &[Dn3Geom] = &[
     DN3_DEFAULT,
+    DN3_STATIC,
     DN3_GRID,
     dn3p("mxfp4_matvec_par_by_expert_dn3l_r2w4", 2, 4, 160),
-    dn3p("mxfp4_matvec_par_by_expert_dn3l_r4w4a", 4, 4, 120),
+    dn3p("mxfp4_matvec_par_by_expert_dn3l_r4w4a", 4, 4, 100),
     dn3p("mxfp4_matvec_par_by_expert_dn3p_r4pfa", 4, 4, 80),
     dn3p("mxfp4_matvec_par_by_expert_dn3p_r2epfa", 2, 4, 120),
 ];
+/// Bench references, NOT bit-exact: `dn3q_r2w4b` = dn3q with the unpack / dot /
+/// reduce replaced by an XOR fold (same stream, queue, LDS staging, activation loads).
+pub const DN3_BENCH_REFS: &[Dn3Geom] = &[dn3q("mxfp4_matvec_par_by_expert_dn3q_r2w4b", 2, 4, 140)];
 
 pub struct Mxfp4Matvec {
     module: Module,
@@ -79,6 +95,66 @@ pub struct Mxfp4Matvec {
     wmma: Option<Module>,
     /// The f16-WMMA module (gfx1151 only), see [`Self::launch_by_expert_wmma_arm`].
     wmma_f16: Option<Module>,
+    /// The dn3q work-queue counters ([`Dn3Geom::queue`]).
+    dn3_queue: Dn3Queue,
+}
+
+/// Counter slots of the `dn3q_*` work queue: one u32 queue head per slot, zero at
+/// rest -- every launch leaves its slot zeroed (the holder of its last ticket re-arms
+/// it), so a slot is safe for any sequence of NON-OVERLAPPING launches. A direct
+/// launch takes its STREAM's slot (launches on one stream never overlap); a launch
+/// under stream capture takes a slot of its own for the life of the process (the
+/// graph bakes the pointer, and two replays of one graph exec cannot overlap either:
+/// they would already race on its baked partials buffer). A destroyed stream's handle
+/// re-used by a new stream inherits its slot: fine once the old stream's work is done.
+/// When the slots run out the launch falls back to [`DN3_STATIC`] (same partials).
+struct Dn3Queue {
+    ctr: DeviceBuffer<u32>,
+    slots: std::sync::Mutex<Dn3Slots>,
+}
+struct Dn3Slots {
+    by_stream: std::collections::HashMap<usize, u32>,
+    next: u32,
+}
+const DN3_QUEUE_SLOTS: u32 = 16384;
+
+impl Dn3Queue {
+    /// 64 KB on the CURRENT device (the one the module is loaded on), zeroed.
+    fn new() -> eyre::Result<Self> {
+        let mut dev: i32 = 0;
+        let rc = unsafe { v4flash_hip::sys::hipGetDevice(&mut dev) };
+        if rc != 0 {
+            return Err(eyre!("mxfp4 dn3 queue: hipGetDevice failed ({rc})"));
+        }
+        let mut ctr = DeviceBuffer::<u32>::new(dev, DN3_QUEUE_SLOTS as usize)?;
+        ctr.fill_zero()?;
+        Ok(Self { ctr, slots: std::sync::Mutex::new(Dn3Slots { by_stream: Default::default(), next: 0 }) })
+    }
+
+    /// The counter slot for a launch on `stream` (None: out of slots).
+    fn slot(&self, stream: &Stream) -> Option<v4flash_hip::sys::hipDeviceptr_t> {
+        let mut status: i32 = 0;
+        let rc = unsafe { v4flash_hip::sys::hipStreamIsCapturing(stream.raw(), &mut status) };
+        // An unanswerable query counts as capturing: a slot of its own is always safe.
+        let capturing = rc != 0 || status != 0;
+        let mut g = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        let known = if capturing { None } else { g.by_stream.get(&(stream.raw() as usize)).copied() };
+        let s = match known {
+            Some(s) => s,
+            None => {
+                if g.next >= DN3_QUEUE_SLOTS {
+                    return None;
+                }
+                let s = g.next;
+                g.next += 1;
+                if !capturing {
+                    g.by_stream.insert(stream.raw() as usize, s);
+                }
+                s
+            }
+        };
+        Some(unsafe { (self.ctr.raw() as *mut u32).add(s as usize) } as v4flash_hip::sys::hipDeviceptr_t)
+    }
 }
 
 impl Mxfp4Matvec {
@@ -99,7 +175,7 @@ impl Mxfp4Matvec {
         } else {
             (None, None)
         };
-        Ok(Self { module, wmma, wmma_f16 })
+        Ok(Self { module, wmma, wmma_f16, dn3_queue: Dn3Queue::new()? })
     }
 
     /// Whether the int8-WMMA down kernel exists on this device (gfx1151).
@@ -218,7 +294,30 @@ impl Mxfp4Matvec {
             return Ok(());
         }
         let n_wi_dev = n_work_items_dev.map_or(std::ptr::null_mut(), |c| c.raw());
+        let (geom, ctr) = if geom.queue {
+            match self.dn3_queue.slot(stream) {
+                Some(p) => (geom, p),
+                None => (DN3_STATIC, std::ptr::null_mut()),
+            }
+        } else {
+            (geom, std::ptr::null_mut())
+        };
+        let rows_per_wg = geom.rows_per_wave * geom.waves;
         let function = self.module.get_function(geom.sym)?;
+        if geom.queue {
+            let tiles = (n_rows / rows_per_wg) as u64 * n_work_items as u64;
+            let cfg = LaunchConfig {
+                grid: ((geom.persist_wgs as u64).min(tiles) as u32, 1, 1),
+                block: (32 * geom.waves, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return launch_kernel!(function, cfg, stream, [
+                partials.raw(), w_base.raw(), xq_base.raw(),
+                group_count.raw(), expert_members.raw(), work_items.raw(),
+                dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size,
+                n_rows, n_blocks_in, n_wi_dev, n_work_items, ctr
+            ]);
+        }
         if geom.persist_wgs > 0 {
             // Never more work-groups than (tile, work item) pairs of the bound.
             let tiles = (n_rows / rows_per_wg) as u64 * n_work_items as u64;
