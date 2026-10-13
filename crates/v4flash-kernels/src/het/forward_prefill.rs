@@ -530,6 +530,43 @@ pub static ZC_PULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Lane-layers whose router + look-ahead matvecs ran as ONE fused launch (`V41_DGPU_ROUTER_X2`), since
 /// start: the gate's proof that the path ran.
 pub static ROUTER_X2_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lane-layers whose attention front ran as the two `QkvFront` launches (`V41_DGPU_QKV_FRONT`),
+/// since start: the proof that the path ran.
+pub static QKV_FRONT_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a lane-layer's attention front takes `QkvFront` (`V41_DGPU_QKV_FRONT`). Pure, so the
+/// routing is host-tested: the fused kernels reproduce exactly the chain that runs when every one
+/// of these holds -- V4.1 shapes, Q8_0 q_a + kv, the dp4a arms of q_a (`small_b_dense_dp4a`), kv
+/// (`prefill_f32_matvec`) and q_b (`prefill_f32_matvec_qb_wo`, no `QB_WMMA` override), the
+/// `V41_DEC_FUSE` tails, no f16 round trip, and rows 1..=`qkv_front::MAX_B` (the kernels'
+/// instantiations). The caller also requires a DIRECT stage (no graph capture / replay).
+#[allow(clippy::too_many_arguments)]
+pub fn qkv_front_selected(
+    knob: bool,
+    v41: bool,
+    b: u32,
+    q8_weights: bool,
+    qa_dp4a: bool,
+    kv_dp4a: bool,
+    qb_dp4a: bool,
+    dec_fuse: bool,
+    kv_f16rt: bool,
+) -> bool {
+    knob && v41
+        && (1..=crate::qkv_front::MAX_B).contains(&b)
+        && q8_weights
+        && qa_dp4a
+        && kv_dp4a
+        && qb_dp4a
+        && dec_fuse
+        && !kv_f16rt
+        && N_EMBD == crate::qkv_front::K_IN
+        && N_LORA_Q == crate::qkv_front::N_QA
+        && N_HEAD_DIM == crate::qkv_front::HEAD_DIM
+        && N_ROT == crate::qkv_front::N_ROT
+        && N_HEAD * N_HEAD_DIM == crate::qkv_front::N_QB
+}
+
 /// This decode step has >= 2 speculating streams (set by the scheduler before the forward):
 /// zero-copy stays off then unless `V41_DGPU_ZC_MULTI_SPEC`.
 pub static STEP_MULTI_SPEC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -6126,10 +6163,95 @@ impl HeterogeneousEngine {
         // Stage 2: Q chain (BATCHED quantize + matvec + rms + ...)
         // ========================================================
         // M7 CED: a source-only call needs neither Q nor the window KV.
+        // `V41_DGPU_QKV_FRONT`: set when the two fused launches below replaced the q chain, the kv
+        // chain AND the window append (the kv stage and the append then launch nothing).
+        let mut qkv_front_used = false;
         if ced != CedMode::KvSourceOnly {
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         let cap = self.stage_cap_ctx(de, "g.q_chain", layer as usize, b, lane_ptr, cap_ok, ctx)?;
-        if !cap.skip {
+        if cap.is_direct()
+            && qkv_front_selected(
+                crate::knobs::DGPU_QKV_FRONT.on(),
+                cfg!(feature = "v41"),
+                b,
+                dlw.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0
+                    && dlw.attn_kv.dtype == v4flash_core::gguf::GgufType::Q8_0,
+                super::dispatch::small_b_dense_dp4a(b),
+                prefill_f32_matvec(b),
+                prefill_f32_matvec_qb_wo(b) && std::env::var("QB_WMMA").is_err(),
+                dec_fuse(b),
+                kv_f16_roundtrip(),
+            )
+        {
+            // The window-append destination, exactly as the append block below derives it.
+            let (slot_per, slot_base) = match arena {
+                Some((t, d)) => {
+                    let dec = (layer as usize) >= crate::config::CED_DECODER_START;
+                    let slp = if dec { &t.slot_per_dec } else { &t.slot_per };
+                    let need = slp.iter().map(|&s| s as usize + 1).max().unwrap_or(0) * N_HEAD_DIM as usize;
+                    if ls.kv_cache.len() < need {
+                        return Err(eyre!(
+                            "L{layer}: arena raw append slot past the layer buffer ({} f16 < {need})",
+                            ls.kv_cache.len()
+                        ));
+                    }
+                    (Some(if dec { &d.slot_per_dec } else { &d.slot_per }), 0u32)
+                }
+                None => {
+                    let append_at = ls.raw_off + ls.n_raw;
+                    assert!(
+                        (append_at + b) as usize <= kv_cache_rows(),
+                        "kv_append OOB: raw_off={} + n_raw_before={} + b={b} > KV_CACHE_ROWS={}",
+                        ls.raw_off,
+                        ls.n_raw,
+                        kv_cache_rows(),
+                    );
+                    (None, append_at)
+                }
+            };
+            {
+                let _t = de.events.stage("k.q_chain.qkv_front_a", &de.compute)?;
+                de.qkv_front.launch_a(
+                    &de.compute,
+                    &mut sd.qr,
+                    &mut sd.kv_raw,
+                    &dlw.attn_q_a.buffer,
+                    &dlw.attn_kv.buffer,
+                    &sd.attn_input_norm,
+                    &mut sd.qr_normed,
+                    &mut sd.qr_xq,
+                    &mut sd.qr_xscale,
+                    &dlw.q_a_norm,
+                    RMS_EPS,
+                    &mut sd.qkv_front_ticket,
+                    b,
+                    crate::qkv_front::grid_a(b),
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.q_chain.qkv_front_b", &de.compute)?;
+                let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+                de.qkv_front.launch_b(
+                    &de.compute,
+                    &mut sd.q_normed,
+                    &dlw.attn_q_b.buffer,
+                    &sd.qr_xq,
+                    &sd.qr_xscale,
+                    &pos_v,
+                    &dlw.rope_params,
+                    &mut ls.kv_cache,
+                    &sd.kv_raw,
+                    &dlw.kv_a_norm,
+                    RMS_EPS,
+                    slot_per,
+                    slot_base,
+                    b,
+                )?;
+            }
+            qkv_front_used = true;
+            QKV_FRONT_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !cap.skip && !qkv_front_used {
         // `V41_DEC_SKIP_DEAD`: x16_n_embd is read only by the q_a f16x arm (Q8_0 and not
         // small-b dp4a, dense_gemm_prefill) and the kv f16x arm (!prefill_f32_matvec).
         let q_a_is_q8 = dlw.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0;
@@ -6395,6 +6517,8 @@ impl HeterogeneousEngine {
         // ========================================================
         // Stage 3: KV chain (BATCHED matvec + rms; per-token rope/fp8/f16rt)
         // ========================================================
+        // (`V41_DGPU_QKV_FRONT`: done by the fused launches above -- no stage, no capture.)
+        if !qkv_front_used {
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
         let cap = self.stage_cap_ctx(de, "g.kv_chain", layer as usize, b, lane_ptr, cap_ok, ctx)?;
         if !cap.skip {
@@ -6536,6 +6660,7 @@ impl HeterogeneousEngine {
         }
         cap.end()?;
         drop(_t_kv);
+        } // !qkv_front_used
         } // ced != KvSourceOnly (stages 2-3)
         let _t_kv_append_comp = de.events.stage("dgpu.kv_append_compressor_serial", &de.compute)?;
         let mut n_raw_after: Vec<u32> = Vec::with_capacity(b as usize);
@@ -6655,7 +6780,9 @@ impl HeterogeneousEngine {
         // catastrophic divergences (KL up to 8.07 nats vs a 0.006 baseline) all
         // at lane B's first row, all at pos >= SWA_WINDOW, minimum pos exactly
         // 128 -- i.e. from the very first slide, and never before it.
-        if let Some((t, d)) = arena {
+        if qkv_front_used {
+            // `V41_DGPU_QKV_FRONT`: launch B stored these rows (same slots, same f16 bits).
+        } else if let Some((t, d)) = arena {
             // Per-row destination slots in the layer's arena buffer
             // (`KvArena::tables`: `region + raw_off + n_raw`, compaction before
             // the step keeps it inside the stream's region).
@@ -13798,5 +13925,29 @@ mod lm_tests {
             s = e;
         }
         assert!(subs.last().unwrap().1 <= 4096);
+    }
+}
+
+#[cfg(test)]
+mod qkv_front_routing_tests {
+    use super::qkv_front_selected;
+
+    /// Every precondition on, rows 1..=8: taken; any one of them off, or rows outside the kernels'
+    /// instantiations (0, 9..=16: the f16x q_a arm in production), keeps the chain.
+    #[test]
+    fn qkv_front_takes_only_the_chain_it_reproduces() {
+        let all = |b: u32| qkv_front_selected(true, true, b, true, true, true, true, true, false);
+        for b in 1..=8 {
+            assert!(all(b), "b={b}");
+        }
+        for b in [0u32, 9, 12, 16, 64] {
+            assert!(!all(b), "b={b}");
+        }
+        for k in 0..8 {
+            let f = |i: usize| i != k;
+            let rf16 = k == 7; // the eighth case: the kv f16 round trip ON (it must be off)
+            let got = qkv_front_selected(f(0), f(1), 4, f(2), f(3), f(4), f(5), f(6), rf16);
+            assert!(!got, "precondition {k} off must keep the chain");
+        }
     }
 }

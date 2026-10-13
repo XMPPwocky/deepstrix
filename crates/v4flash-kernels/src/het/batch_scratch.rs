@@ -628,6 +628,9 @@ pub struct BatchDgpuShared {
     // ---- KV chain (P3 → P4 kv_append) ----
     pub kv_raw: DeviceBuffer<f32>,
     pub kv_normed: DeviceBuffer<f32>,
+    /// `V41_DGPU_QKV_FRONT`: the work-group ticket of `QkvFront::launch_a` (one u32, 0 between
+    /// launches; this scratch set's launches are serial on one stream).
+    pub qkv_front_ticket: DeviceBuffer<u32>,
     /// Scratch ring (≥ `SWA_WINDOW * N_HEAD_DIM`) used by the post-chunk
     /// SWA-eviction pass (P5e). After a prefill chunk leaves the cache
     /// holding `n_raw_during_chunk > SWA_WINDOW` rows in the oversized
@@ -1710,6 +1713,11 @@ impl BatchDgpuShared {
 
             kv_raw: mk_f32(N_HEAD_DIM as usize)?,
             kv_normed: mk_f32(N_HEAD_DIM as usize)?,
+            qkv_front_ticket: {
+                let mut c = DeviceBuffer::<u32>::new(id, 1)?;
+                c.fill_zero()?;
+                c
+            },
             // rows*N_HEAD_DIM ≥ SWA_WINDOW*N_HEAD_DIM for any rows ≥ 128;
             // the eviction pass copies at most SWA_WINDOW rows through it.
             kv_ring_scratch: DeviceBuffer::new(

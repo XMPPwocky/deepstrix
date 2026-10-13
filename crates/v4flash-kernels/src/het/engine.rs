@@ -117,6 +117,8 @@ pub struct DeviceEngine {
     pub shared_fused: SharedExpertFused,
     pub f16: F16Matvec,
     pub rope: RopeTail,
+    /// Decode attention front in two launches (`V41_DGPU_QKV_FRONT`, fusion group G2).
+    pub qkv_front: crate::qkv_front::QkvFront,
     pub attn_swa: AttentionSwa,
     pub attn_mixed: AttentionMixed,
     pub swiglu: Swiglu,
@@ -239,6 +241,7 @@ impl DeviceEngine {
             shared_fused: SharedExpertFused::for_arch(arch)?,
             f16: F16Matvec::for_arch(arch)?,
             rope: RopeTail::for_arch(arch)?,
+            qkv_front: crate::qkv_front::QkvFront::for_arch(arch)?,
             attn_swa: AttentionSwa::for_arch(arch)?,
             attn_mixed: AttentionMixed::for_arch(arch)?,
             swiglu: Swiglu::for_arch(arch)?,

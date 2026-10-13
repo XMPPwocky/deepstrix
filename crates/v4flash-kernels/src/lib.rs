@@ -115,6 +115,7 @@ pub mod q5_k_dense;
 pub mod q6_k;
 pub mod q6_k_dense;
 pub mod q8_0;
+pub mod qkv_front;
 pub mod q8_k;
 pub mod qwen3_embed;
 pub mod dgpu_loan;
