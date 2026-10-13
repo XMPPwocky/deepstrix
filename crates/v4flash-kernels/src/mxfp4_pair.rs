@@ -15,6 +15,21 @@ pub(crate) const MXFP4_MOE_WMMA_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MXF
 /// `kernels/mxfp4_moe_wmma_f16.hip` (the f16-WMMA arm, 2026-10-10): same entry
 /// names / args / chunk as the int8 arm, selected per launch (`V41_MOE_WMMA_F16`).
 pub(crate) const MXFP4_MOE_WMMA_F16_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MXFP4_MOE_WMMA_F16_GFX1151"));
+/// `kernels/mxfp4_pair_decode.hip` (the decode-regime gate+up, `V41_MOE_PAIR_DEC`,
+/// 2026-10-13). Loaded on gfx1151 only (the iGPU runs the MXFP4 MoE).
+pub(crate) const MXFP4_PAIR_DECODE_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MXFP4_PAIR_DECODE_GFX1151"));
+
+/// Q8_K super-blocks per row the decode kernel is compiled for (`MXDEC_NB`:
+/// V4.1 gate/up, 5120 / 256).
+pub const MXFP4_DEC_N_BLOCKS: u32 = 20;
+/// Most token rows (`rows`) the decode kernel stages (`MXDEC_MAXTOK`).
+pub const MXFP4_DEC_MAX_TOK: u32 = 8;
+/// Default waves per work-group of the decode kernel (one work-group per CU,
+/// `__launch_bounds__(512)` caps it at 16). `V41_MOE_PAIR_DEC_WAVES` overrides it.
+pub const MXFP4_DEC_WAVES_DEFAULT: u32 = 16;
+/// Work-item buffers that can hold a dynamic-order ticket of the decode kernel
+/// at once (a launch past them runs the static unit order).
+pub const MXFP4_DEC_TICKET_SLOTS: usize = 32;
 
 /// Members per work item the WMMA kernels stage (`WM_MAX_CHUNK`; the kernel
 /// silently clamps a larger chunk, which would DROP members, so the launchers
@@ -43,6 +58,52 @@ pub struct Mxfp4PairMatvec {
     wmma: Option<Module>,
     /// The f16-WMMA module (gfx1151 only), see [`Self::launch_fused_swiglu_wmma_arm`].
     wmma_f16: Option<Module>,
+    /// The decode-regime module (gfx1151 only), see [`Self::launch_fused_swiglu_dec_ex`].
+    dec: Option<Module>,
+    /// CUs of the device the decode kernel launches on (its persistent grid).
+    dec_cus: std::sync::OnceLock<u32>,
+    /// The decode kernel's self-resetting ticket counters, 2 u32 per slot, zeroed
+    /// at load (never inside a launch path: no memset can land in a captured
+    /// graph), and the `work_items` buffer each slot belongs to. Two launches
+    /// that share a work-item buffer are never in flight together (the builder
+    /// rewrites it for every launch, so the kernels' own outputs already depend
+    /// on that), hence neither are two launches that share a ticket -- captured
+    /// graphs included, whose replays carry the captured buffer.
+    dec_tickets: Option<DeviceBuffer<u32>>,
+    dec_ticket_keys: std::sync::Mutex<Vec<usize>>,
+}
+
+/// `V41_MOE_PAIR_DEC_WAVES` (read once, 1..=16): waves per work-group of the
+/// decode kernel; default [`MXFP4_DEC_WAVES_DEFAULT`].
+pub fn dec_waves() -> u32 {
+    static W: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_MOE_PAIR_DEC_WAVES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| (1..=16).contains(n))
+            .unwrap_or(MXFP4_DEC_WAVES_DEFAULT)
+    });
+    *W
+}
+
+/// `V41_MOE_PAIR_DEC_DYN` (read once; default ON, `0` = off): the decode kernel
+/// takes its units after the first from a ticket counter (dynamic order, one
+/// ticket per `work_items` buffer, see `dec_tickets`) instead of a fixed stride.
+/// Same bits either way; measured 2% faster at D = 16 (the static stride leaves a
+/// one-unit tail and waits for the slowest CU), neutral at D <= 8.
+pub fn dec_dynamic() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MOE_PAIR_DEC_DYN").as_deref() != Ok("0"));
+    *D
+}
+
+/// `V41_MOE_PAIR_DEC_WGS` (read once): work-groups of the decode kernel's
+/// persistent grid; 0 / unset = one per CU of the launching device.
+fn dec_wgs_override() -> u32 {
+    static G: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_MOE_PAIR_DEC_WGS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0)
+    });
+    *G
 }
 
 /// Warps per workgroup (= rows per workgroup, one row each) for the decode
@@ -69,12 +130,36 @@ impl Mxfp4PairMatvec {
             return Err(eyre!("unsupported arch for mxfp4_pair_matvec: {arch}"));
         };
         let module = Module::load_data(image)?;
-        let (wmma, wmma_f16) = if arch.starts_with("gfx1151") {
-            (Some(Module::load_data(MXFP4_MOE_WMMA_GFX1151)?), Some(Module::load_data(MXFP4_MOE_WMMA_F16_GFX1151)?))
+        let (wmma, wmma_f16, dec) = if arch.starts_with("gfx1151") {
+            (
+                Some(Module::load_data(MXFP4_MOE_WMMA_GFX1151)?),
+                Some(Module::load_data(MXFP4_MOE_WMMA_F16_GFX1151)?),
+                Some(Module::load_data(MXFP4_PAIR_DECODE_GFX1151)?),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
-        Ok(Self { module, wmma, wmma_f16 })
+        // The decode kernel's per-device state, set up here (never in a launch
+        // path, which may be inside a graph capture): the CU count of its
+        // persistent grid and the zeroed tickets of the dynamic order.
+        let dec_cus = std::sync::OnceLock::new();
+        let dec_tickets = if dec.is_some() {
+            let mut dev = 0i32;
+            // SAFETY: plain query of the calling thread's current device.
+            unsafe { v4flash_hip::sys::hipGetDevice(&mut dev) };
+            // HIP reports WGPs on RDNA: CUs = 2x.
+            let wgps = v4flash_hip::Device::new(dev).properties()?.multi_processor_count.max(1) as u32;
+            let _ = dec_cus.set(2 * wgps);
+            let mut t = DeviceBuffer::<u32>::new(dev, 2 * MXFP4_DEC_TICKET_SLOTS)?;
+            t.fill_zero()?;
+            Some(t)
+        } else {
+            None
+        };
+        Ok(Self {
+            module, wmma, wmma_f16, dec, dec_cus, dec_tickets,
+            dec_ticket_keys: std::sync::Mutex::new(Vec::new()),
+        })
     }
 
     /// Whether the int8-WMMA gate+up kernel exists on this device (gfx1151).
@@ -82,8 +167,38 @@ impl Mxfp4PairMatvec {
     /// Whether the f16-WMMA gate+up kernel exists on this device (gfx1151).
     pub fn has_wmma_f16(&self) -> bool { self.wmma_f16.is_some() }
 
+    /// Whether the decode-regime gate+up kernel exists on this device (gfx1151).
+    pub fn has_dec(&self) -> bool { self.dec.is_some() }
+
     /// The loaded modules (tests: explicit-symbol launches).
     pub fn module(&self) -> &Module { &self.module }
+    pub fn dec_module(&self) -> Option<&Module> { self.dec.as_ref() }
+
+    /// The decode kernel's ticket for launches on `work_items` (a 2-u32 view),
+    /// or None when every slot belongs to another work-item buffer.
+    pub fn dec_ticket(&self, work_items: &DeviceBuffer<i32>) -> Option<DeviceBuffer<u32>> {
+        let t = self.dec_tickets.as_ref()?;
+        let key = work_items.raw() as usize;
+        let mut m = self.dec_ticket_keys.lock().ok()?;
+        let slot = match m.iter().position(|&k| k == key) {
+            Some(i) => i,
+            None if m.len() < MXFP4_DEC_TICKET_SLOTS => {
+                m.push(key);
+                m.len() - 1
+            }
+            None => return None,
+        };
+        Some(t.slice_view(2 * slot, 2))
+    }
+
+    /// The decode kernel's default persistent grid on `stream`'s device: one
+    /// work-group per CU (`V41_MOE_PAIR_DEC_WGS` overrides).
+    pub fn dec_wgs(&self, _stream: &Stream) -> eyre::Result<u32> {
+        if dec_wgs_override() > 0 {
+            return Ok(dec_wgs_override());
+        }
+        self.dec_cus.get().copied().ok_or_else(|| eyre!("mxfp4 pair dec: no decode module on this arch (gfx1151 only)"))
+    }
     pub fn wmma_module(&self) -> Option<&Module> { self.wmma.as_ref() }
     pub fn wmma_f16_module(&self) -> Option<&Module> { self.wmma_f16.as_ref() }
 
@@ -508,5 +623,143 @@ impl Mxfp4PairMatvec {
                 n_wi_dev
             ]
         )
+    }
+
+    /// Decode-regime twin of [`Self::launch_fused_swiglu_kwide_ex`]
+    /// (`mxfp4_pair_matvec_fused_swiglu_dec`, kernels/mxfp4_pair_decode.hip): the
+    /// SAME argument list, work-item / device-count contract and outputs,
+    /// BIT-IDENTICAL to kwide (tests/mxfp4_pair_decode.rs), plus `rows` = the
+    /// pass's token rows (`xq` holds `rows` Q8_K rows; 1..=8). A PERSISTENT grid:
+    /// one work-group of 16 waves per CU whatever the work-item count (no dead
+    /// work-groups for the device-count bound), its waves taking every (work item,
+    /// row) unit -- the units after the first from `work_items`' ticket
+    /// (`V41_MOE_PAIR_DEC_DYN`, default on). Needs `n_blocks == 20` and even
+    /// `n_rows`; gfx1151 only. 1 launch, like kwide.
+    /// Selected by `dispatch::moe_gate_up_chunked_rows` (`V41_MOE_PAIR_DEC`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_dec_ex(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items_dev: Option<&DeviceBuffer<i32>>,
+        rows: u32,
+    ) -> eyre::Result<()> {
+        let wgs = self.dec_wgs(stream)?;
+        let ticket = if dec_dynamic() { self.dec_ticket(work_items) } else { None };
+        self.launch_fused_swiglu_dec_raw(
+            "mxfp4_pair_matvec_fused_swiglu_dec", wgs, dec_waves(), ticket.as_ref(), None, stream, mid, gate_w_base, up_w_base, xq,
+            expert_w, group_count, expert_members, work_items, n_work_items, gate_bpe, up_bpe, n_used,
+            max_per_expert, chunk_size, clamp, n_rows, n_blocks, n_work_items_dev, rows,
+        )
+    }
+
+    /// [`Self::launch_fused_swiglu_dec_ex`] with an explicit entry point, grid,
+    /// work-group size and unit order (`ticket`: 2 zeroed u32, the dynamic order;
+    /// None = static) (tests / bench: every geometry and order must give the same
+    /// bits; `sink` is the extra argument of the bench-only load-only entries).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_dec_raw(
+        &self,
+        symbol: &str,
+        wgs: u32,
+        waves: u32,
+        ticket: Option<&DeviceBuffer<u32>>,
+        sink: Option<&mut DeviceBuffer<u32>>,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items_dev: Option<&DeviceBuffer<i32>>,
+        rows: u32,
+    ) -> eyre::Result<()> {
+        let module = self.dec.as_ref().ok_or_else(|| eyre!("mxfp4 pair dec: no decode module on this arch (gfx1151 only)"))?;
+        if n_work_items as usize > work_items.len() {
+            return Err(eyre!("mxfp4 pair dec: n_work_items {n_work_items} > work_items {}", work_items.len()));
+        }
+        if n_blocks != MXFP4_DEC_N_BLOCKS {
+            return Err(eyre!("mxfp4 pair dec: n_blocks={n_blocks}, the kernel is compiled for {MXFP4_DEC_N_BLOCKS}"));
+        }
+        if n_rows == 0 || n_rows % 2 != 0 {
+            return Err(eyre!("mxfp4 pair dec: n_rows={n_rows} must be even and > 0"));
+        }
+        if rows == 0 || rows > MXFP4_DEC_MAX_TOK {
+            return Err(eyre!("mxfp4 pair dec: rows={rows} outside 1..={MXFP4_DEC_MAX_TOK} (LDS staging)"));
+        }
+        let xq_row = n_blocks as usize * crate::q8_k::BLOCK_Q8_K_BYTES;
+        if xq.len() < rows as usize * xq_row {
+            return Err(eyre!("mxfp4 pair dec: xq {} bytes < rows x {xq_row}", xq.len()));
+        }
+        if chunk_size == 0 || wgs == 0 || waves == 0 || waves > 16 {
+            return Err(eyre!("mxfp4 pair dec: chunk_size={chunk_size} wgs={wgs} waves={waves}"));
+        }
+        // Per-lane row offsets are 32-bit and stay inside one expert.
+        let row_bytes = n_blocks as u64 * 136;
+        if n_rows as u64 * row_bytes > gate_bpe.min(up_bpe) as u64 {
+            return Err(eyre!("mxfp4 pair dec: n_rows x row bytes exceeds bytes per expert ({gate_bpe}, {up_bpe})"));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let n_wi_dev = n_work_items_dev.map_or(std::ptr::null_mut(), |c| c.raw());
+        if ticket.is_some_and(|t| t.len() < 2) {
+            return Err(eyre!("mxfp4 pair dec: the ticket needs 2 u32"));
+        }
+        let tk = ticket.map_or(std::ptr::null_mut(), |t| t.raw());
+        let function = module.get_function(symbol)?;
+        let cfg = LaunchConfig { grid: (wgs, 1, 1), block: (waves * 32, 1, 1), shared_mem_bytes: 0 };
+        match sink {
+            None => launch_kernel!(
+                function,
+                cfg,
+                stream,
+                [
+                    mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(), expert_w.raw(),
+                    group_count.raw(), expert_members.raw(), work_items.raw(), n_work_items,
+                    gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows,
+                    n_wi_dev, rows, tk
+                ]
+            ),
+            Some(k) => launch_kernel!(
+                function,
+                cfg,
+                stream,
+                [
+                    mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(), expert_w.raw(),
+                    group_count.raw(), expert_members.raw(), work_items.raw(), n_work_items,
+                    gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows,
+                    n_wi_dev, rows, tk, k.raw()
+                ]
+            ),
+        }
     }
 }

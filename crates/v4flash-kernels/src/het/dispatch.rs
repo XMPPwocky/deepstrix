@@ -522,6 +522,38 @@ pub fn moe_wmma_down_for(rows: u32) -> bool {
     *D && rows >= MOE_WMMA_DOWN_MIN_ROWS
 }
 
+/// Largest pass (rows) whose MXFP4 gate+up may run the decode-regime kernel (`V41_MOE_PAIR_DEC`).
+pub const MOE_PAIR_DEC_MAX_ROWS: u32 = 8;
+
+/// `V41_MOE_PAIR_DEC` (default OFF; `1` = on): an MXFP4 gate+up pass (kwide
+/// selected, not the WMMA arm) of `rows <= 8` runs
+/// `mxfp4_pair_matvec_fused_swiglu_dec_*` (kernels/mxfp4_pair_decode.hip, 2026-10-13)
+/// instead of `mxfp4_pair_matvec_fused_swiglu_kwide`: same arguments, device-count
+/// contract and outputs, BIT-IDENTICAL `mid` (tests/mxfp4_pair_decode.rs). Built
+/// for the decode regime (b = 1..8 rows, 4-20 distinct cold experts): a persistent
+/// grid (no dead work-groups for the device-count bound) and a barrier-free load
+/// pipeline that keeps 4 super-block pairs in flight per wave instead of one.
+/// Measured (cold experts, kernel alone): 1.09-1.13x kwide at 1-1.5 members per
+/// expert (93-95% of an ideal read of the same bytes, vs kwide's 84-86%), up to
+/// 1.32x with shared experts. Read once. Trace stage `igpu.pair_dec`.
+pub fn moe_pair_dec_for(rows: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MOE_PAIR_DEC").as_deref() == Ok("1"));
+    *D && (1..=MOE_PAIR_DEC_MAX_ROWS).contains(&rows)
+}
+
+/// Does an MXFP4 gate+up pass of `rows` (n_blocks / n_rows of the call) take the
+/// decode-regime kernel on this engine? (Also the trace label's source of truth.)
+pub fn mxfp4_gateup_dec_selected(e: &DeviceEngine, dt: GgufType, rows: u32, n_blocks: u32, n_rows: u32) -> bool {
+    dt == GgufType::MXFP4
+        && pair_kwide_selected(dt, pair_variant_rollback())
+        && e.mxfp4pair.has_dec()
+        && moe_pair_dec_for(rows)
+        && !mxfp4_gateup_wmma_selected(e, dt, rows)
+        && n_blocks == crate::mxfp4_pair::MXFP4_DEC_N_BLOCKS
+        && n_rows % 2 == 0
+}
+
 /// Does an MXFP4 gate+up pass of `rows` take the int8-WMMA arm on this engine?
 /// (Also the trace label's source of truth, see [`pair_prefill_stage_rows`].)
 pub fn mxfp4_gateup_wmma_selected(e: &DeviceEngine, dt: GgufType, rows: u32) -> bool {
@@ -541,7 +573,9 @@ pub fn moe_wmma_f16_on() -> bool {
 /// [`pair_prefill_stage`] for a pass of `rows` on `e`: `igpu.pair_wmma_i8` /
 /// `igpu.pair_wmma_f16` when the MXFP4 gate+up takes a WMMA arm.
 pub fn pair_prefill_stage_rows(e: &DeviceEngine, dt: GgufType, rows: u32) -> &'static str {
-    if mxfp4_gateup_wmma_selected(e, dt, rows) {
+    if mxfp4_gateup_dec_selected(e, dt, rows, crate::config::BLOCKS_Q8K_GATE_IN, crate::config::N_FF_EXP) {
+        "igpu.pair_dec"
+    } else if mxfp4_gateup_wmma_selected(e, dt, rows) {
         if moe_wmma_f16_on() && e.mxfp4pair.has_wmma_f16() { "igpu.pair_wmma_f16" } else { "igpu.pair_wmma_i8" }
     } else {
         pair_prefill_stage(dt)
@@ -579,6 +613,13 @@ pub fn moe_gate_up_chunked_rows(
     n_wi_dev: Option<&DeviceBuffer<i32>>,
     rows: u32,
 ) -> eyre::Result<bool> {
+    if mxfp4_gateup_dec_selected(e, dt, rows, n_blocks, n_rows) {
+        e.mxfp4pair.launch_fused_swiglu_dec_ex(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks, n_wi_dev, rows,
+        )?;
+        return Ok(true);
+    }
     if mxfp4_gateup_wmma_selected(e, dt, rows) {
         let f16 = moe_wmma_f16_on() && e.mxfp4pair.has_wmma_f16();
         e.mxfp4pair.launch_fused_swiglu_wmma_arm(
@@ -798,6 +839,17 @@ mod tests {
     }
 
     use super::*;
+
+    /// `V41_MOE_PAIR_DEC` is opt-in: unset, no pass size takes the decode kernel;
+    /// set, only decode passes (1..=8 rows) do.
+    #[test]
+    fn pair_dec_is_opt_in_and_decode_only() {
+        let on = std::env::var("V41_MOE_PAIR_DEC").as_deref() == Ok("1");
+        for rows in [0u32, 1, 2, 4, 8, 9, 16, 255, 256, 1024] {
+            let want = on && (1..=MOE_PAIR_DEC_MAX_ROWS).contains(&rows);
+            assert_eq!(moe_pair_dec_for(rows), want, "rows={rows} knob={on}");
+        }
+    }
 
     /// Regression guard for the 2026-09-04 fix: IQ2_S is gate/up on 42 of 43
     /// layers of the Vision-Exp mix, and before the fix it had no kwide arm,
