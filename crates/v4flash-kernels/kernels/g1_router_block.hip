@@ -646,104 +646,6 @@ __device__ __forceinline__ void g1_router_wave_ph(const G1Args& a, unsigned mat,
 }
 
 // --------------------------------------------------------------------------------------------
-// Router wave, FULL-PREFETCH form (ZB >= b rows, x staged per K-slab of 32 * PHE in LDS): all 160
-// weight elements of the lane are requested at entry, packed two per VGPR by global_load_d16_b16 /
-// global_load_d16_hi_b16 (inline asm: the compiler loads each half into its own VGPR, 170 VGPRs),
-// so the router's whole DRAM stream starts with the kernel and never waits on the collapse or on
-// this wave's progress. The loads are opaque to the compiler: ONE s_wait_loadcnt 0 before the first
-// FMA (after the row wait) covers them. Accumulation: h20's per-lane sequence, as the other forms.
-// --------------------------------------------------------------------------------------------
-__device__ __forceinline__ void g1_ld_lo(unsigned& r, const __half* p) {
-    asm volatile("global_load_d16_b16 %0, %1, off" : "+v"(r) : "v"(p) : "memory");
-}
-__device__ __forceinline__ void g1_ld_hi(unsigned& r, const __half* p) {
-    asm volatile("global_load_d16_hi_b16 %0, %1, off" : "+v"(r) : "v"(p) : "memory");
-}
-__device__ __forceinline__ void g1_wait_vm0() {
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    asm volatile("s_wait_loadcnt 0x0" ::: "memory");
-#else
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-#endif
-}
-__device__ __forceinline__ float g1_h_lo(unsigned r) { return __half2float(__ushort_as_half((unsigned short)(r & 0xffffu))); }
-__device__ __forceinline__ float g1_h_hi(unsigned r) { return __half2float(__ushort_as_half((unsigned short)(r >> 16))); }
-
-template <unsigned ZB, unsigned PHE>
-__device__ __forceinline__ void g1_router_wave_full(const G1Args& a, unsigned mat, unsigned row, unsigned lane,
-                                                    unsigned tid, float* sx, unsigned long long* ts) {
-    constexpr unsigned NPH = G1_EPW / PHE;
-    constexpr unsigned SLAB = G1_WARP * PHE;
-    constexpr unsigned ST4 = ZB * SLAB / 4u / G1_BLOCK;
-    static_assert(G1_EPW % PHE == 0 && PHE % 2 == 0 && (ZB * SLAB) % (4u * G1_BLOCK) == 0, "g1 phase shape");
-    const unsigned b = a.b;
-    const __half* wr = (mat == 0 ? a.w0 : a.w1) + (size_t)row * G1_NE + lane;
-    unsigned w2[G1_EPW / 2];   // w2[k] = { w[lane + 32 (2k)], w[lane + 32 (2k + 1)] }
-    #pragma unroll
-    for (unsigned k = 0; k < G1_EPW / 2; ++k) {
-        w2[k] = 0u;
-        g1_ld_lo(w2[k], wr + 64u * k);
-        g1_ld_hi(w2[k], wr + 64u * k + 32u);
-    }
-    G1_TS(2);
-    g1_wg_wait(a.sync, 0, (a.dbg & 8u) ? 0u : b, false);
-    G1_TS(3);
-    const float4* xg = reinterpret_cast<const float4*>(a.norm_out);
-    float4* sx4 = reinterpret_cast<float4*>(sx);
-    auto stage_load = [&](unsigned ph, float4 (&st)[ST4]) {
-        #pragma unroll
-        for (unsigned i = 0; i < ST4; ++i) {
-            const unsigned f = tid + G1_BLOCK * i;
-            const unsigned zz = f / (SLAB / 4u), c = f % (SLAB / 4u);
-            st[i] = (zz < b) ? xg[(size_t)zz * (G1_NE / 4u) + ph * (SLAB / 4u) + c] : make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-    };
-    float4 st[ST4];
-    stage_load(0, st);
-    g1_wait_vm0();   // the weights (and phase 0's x)
-    float acc[ZB];
-    #pragma unroll
-    for (unsigned z = 0; z < ZB; ++z) acc[z] = 0.0f;
-    #pragma unroll
-    for (unsigned ph = 0; ph < NPH; ++ph) {
-        #pragma unroll
-        for (unsigned i = 0; i < ST4; ++i) sx4[tid + G1_BLOCK * i] = st[i];
-        __syncthreads();
-        if (ph + 1 < NPH) stage_load(ph + 1, st);
-        #pragma unroll
-        for (unsigned z = 0; z < ZB; ++z) {
-            if (z < b) {
-                #pragma unroll
-                for (unsigned jj = 0; jj < PHE; ++jj) {
-                    const unsigned j = ph * PHE + jj;
-                    const float w = (j & 1u) ? g1_h_hi(w2[j >> 1]) : g1_h_lo(w2[j >> 1]);
-                    acc[z] += w * sx[z * SLAB + lane + G1_WARP * jj];
-                }
-            }
-        }
-        __syncthreads();
-    }
-    float mine = 0.0f;
-    #pragma unroll
-    for (unsigned z = 0; z < ZB; ++z) {
-        if (z < b) {
-            const float s = g1_warp_sum(acc[z]);
-            const float s0 = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(s), 0));
-            if (lane == z) mine = s0;
-        }
-    }
-    if (lane < b) {
-        float* lg = mat == 0 ? a.logits0 : a.logits1;
-        const float* bias = mat == 0 ? a.bias0 : a.bias1;
-        lg[(size_t)lane * G1_NEXP + row] = mine;
-        const float p = sqrtf(g1_softplus_stable(mine));
-        a.scr[G1_SCR_PROB(mat, lane) + row] = p;
-        a.scr[G1_SCR_SCORE(mat, lane) + row] = (bias != nullptr) ? (p + bias[row]) : p;
-    }
-    G1_TS(4);
-}
-
-// --------------------------------------------------------------------------------------------
 // PREFETCH WG (`n_pf` of them, right after the collapse / prior tickets): streams both gate matrices
 // DRAM -> L2 / MALL with 16-byte loads, in the order the router waves consume them (the first 2560
 // bytes of every row, then the next 2560, ...), so the DRAM stream runs at full width from the
@@ -903,8 +805,7 @@ __device__ void g1_body(const G1Args& a) {
         const unsigned r = t - b - np - a.n_pf;
         const unsigned mat = r / G1_RWG;
         const unsigned row = (r - mat * G1_RWG) * 8u + warp;
-        if constexpr (PHE != 0 && CH == G1_EPW) g1_router_wave_full<ZB, (PHE ? PHE : 2)>(a, mat, row, lane, tid, s_buf, ts);
-        else if constexpr (PHE != 0) g1_router_wave_ph<ZB, (PHE ? PHE : 1), CH>(a, mat, row, lane, tid, s_buf, ts);
+        if constexpr (PHE != 0) g1_router_wave_ph<ZB, (PHE ? PHE : 1), CH>(a, mat, row, lane, tid, s_buf, ts);
         else g1_router_wave<ZB, CH>(a, mat, row, lane, ts);
         __syncthreads();
         if (tid == 0) {
@@ -955,27 +856,14 @@ extern "C" __global__ __launch_bounds__(256) void g1_router_block_z##ZB##_c##CH(
 extern "C" __global__ __launch_bounds__(256) void g1_router_block_p##ZB##_##PHE##_##PFE(G1Args a) { \
     g1_body<ZB, PFE, PHE>(a);                                                                   \
 }
-G1_KERNEL_PH(1, 32, 64)
 G1_KERNEL_PH(2, 32, 64)
 G1_KERNEL_PH(4, 40, 80)
 G1_KERNEL_PH(8, 20, 80)
 G1_KERNEL_PH(8, 20, 40)
-G1_KERNEL_PH(16, 10, 80)
 G1_KERNEL_PH(16, 10, 40)
-// Full-prefetch forms (PFE = 160): g1_router_block_p{ZB}_{PHE}_160.
-G1_KERNEL_PH(1, 32, 160)
-G1_KERNEL_PH(2, 32, 160)
-G1_KERNEL_PH(4, 40, 160)
-G1_KERNEL_PH(8, 20, 160)
-G1_KERNEL_PH(8, 40, 160)
-G1_KERNEL_PH(16, 10, 160)
-G1_KERNEL_PH(16, 20, 160)
 G1_KERNEL(1, 20)
-G1_KERNEL(2, 20)
 G1_KERNEL(2, 10)
-G1_KERNEL(4, 10)
 G1_KERNEL(4, 8)
-G1_KERNEL(8, 5)
 G1_KERNEL(8, 4)
 G1_KERNEL(16, 4)
 

@@ -163,35 +163,24 @@ pub struct G1RouterBlock {
     ts: Option<DeviceBuffer<u64>>,
 }
 
-/// The kernel variants (zb, ch, phe): ZB = rows per router wave (>= b: one wave per weight row covers
-/// every batch row, so each weight byte is read once and the launch is at most 113 WGs, all
-/// resident). phe = 0: the register form `g1_router_block_z{zb}_c{ch}` (x read from L2 by every
-/// wave, CH weight elements per lane per chunk); phe > 0: the phased-LDS form
-/// `g1_router_block_p{zb}_{phe}_{ch}` (x staged in LDS per K-slab of 32 * phe elements, a ring of
-/// ch weight elements per lane prefetched before the row wait).
-/// ch = 160 (the whole weight row per lane): the full-prefetch phased form (packed d16 loads at entry).
-pub const G1_VARIANTS: [(u32, u32, u32); 21] = [
+/// The kernel variants (zb, ch, phe): ZB = batch rows per router wave. phe = 0: the REGISTER form
+/// `g1_router_block_z{zb}_c{ch}` (zb >= b; x read from L2 by every wave, ch weight elements per lane
+/// per chunk, h20's double-buffered loop); phe > 0: the PHASED-LDS form `g1_router_block_p{zb}_{phe}_{ch}`
+/// (x staged in LDS per K-slab of 32 * phe elements, a ring of ch weight elements per lane prefetched
+/// before the row wait; the zb = 8 forms loop over row slices of 8, so they cover b = 1..16). One
+/// wave per weight row: each weight byte is read once per slice and the launch is <= 114 WGs, all
+/// resident. Chosen per b from tests/bench_g1_router_block.rs (cold, beside the hub, 10-13).
+pub const G1_VARIANTS: [(u32, u32, u32); 10] = [
     (1, 20, 0),
-    (2, 20, 0),
     (2, 10, 0),
-    (4, 10, 0),
     (4, 8, 0),
-    (8, 5, 0),
     (8, 4, 0),
     (16, 4, 0),
-    (1, 64, 32),
     (2, 64, 32),
     (4, 80, 40),
     (8, 80, 20),
     (8, 40, 20),
-    (16, 80, 10),
     (16, 40, 10),
-    (1, 160, 32),
-    (2, 160, 32),
-    (4, 160, 40),
-    (8, 160, 20),
-    (8, 160, 40),
-    (16, 160, 20),
 ];
 
 /// The symbol of a variant.
