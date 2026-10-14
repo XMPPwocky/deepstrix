@@ -141,8 +141,8 @@ pub struct EngramTable {
     pub cache_misses: std::sync::atomic::AtomicU64,
     /// Stats line at most once a minute (`gather`).
     last_log: std::sync::Mutex<std::time::Instant>,
-    /// HEDGED gathers (`gather_hedged`): owned handles on both copies of the weight / scale shards, opened at the first
-    /// hedged gather (`None` inside = no usable mirror: plain reads).
+    /// HEDGED gathers (`gather_hedged`): owned handles on both copies of the weight / scale shards, opened at `open`
+    /// when `V41_EXPERT_MIRROR_DIR` is set, else at the first hedged gather (`None` inside = no usable mirror).
     hedge_files: std::sync::OnceLock<Option<std::sync::Arc<HedgeFiles>>>,
 }
 
@@ -186,7 +186,7 @@ impl EngramTable {
             "engram L{layer}: raw row cache {} rows (~{} MB at full); FADV_RANDOM on shards {} / {}",
             cache_cap, cache_cap * RAW_ROW_COST >> 20, st.shard_name(weight.shard), st.shard_name(scale.shard)
         );
-        Ok(Self {
+        let t = Self {
             layer,
             rows: weight.shape[0],
             weight,
@@ -197,7 +197,12 @@ impl EngramTable {
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             last_log: std::sync::Mutex::new(std::time::Instant::now()),
             hedge_files: std::sync::OnceLock::new(),
-        })
+        };
+        // Hedge handles (and the mirror's header + sampled-data check) at OPEN, not inside the first decode gather.
+        if std::env::var_os("V41_EXPERT_MIRROR_DIR").is_some() {
+            let _ = t.hedge_files(st);
+        }
+        Ok(t)
     }
 
     /// The table's hedge handles (first call opens them; `None` = no usable mirror copy).

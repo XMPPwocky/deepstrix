@@ -865,7 +865,8 @@ impl V41HfWeights {
         read_prof().weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
         read_prof().weight_bytes.fetch_add(wt.len, Relaxed);
         let t_s = std::time::Instant::now();
-        self.st.read_range_into_cached(sc, 0, ds)?;
+        // Hedged only on a decode-critical thread with `V41_EXPERT_HEDGE_MS` on; else exactly `read_range_into_cached`.
+        self.st.read_range_into_cached_hedged(sc, 0, ds)?;
         read_prof().scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
         read_prof().scale_bytes.fetch_add(sc.len, Relaxed);
         read_prof().n_layout.fetch_add(1, Relaxed);

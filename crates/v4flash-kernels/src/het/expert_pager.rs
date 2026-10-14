@@ -3585,6 +3585,8 @@ impl ExpertPager {
                 // nor overlapping the CPU with the device. One thread per role is the
                 // cheapest test of where the floor actually is. Default 1 = old behaviour.
                 let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+                // The per-role threads inherit the caller's decode-critical mark (hedged reads, `V41_EXPERT_HEDGE_MS`).
+                let critical = v4flash_core::hedge::is_critical();
                 std::thread::scope(|sc| {
                     for (name, dst) in [
                         (&names[0], &mut *b0),
@@ -3593,6 +3595,7 @@ impl ExpertPager {
                     ] {
                         let err = &err;
                         sc.spawn(move || {
+                            let _critical = v4flash_core::hedge::critical_scope(critical);
                             let src = WeightSrc::from(owner);
                             match src.tensor(name) {
                                 None => *err.lock().unwrap() = Some(format!("missing {name}")),
@@ -4343,6 +4346,9 @@ impl ExpertPager {
         // counts a prefix of `c.pending`.
         let k = self.stages.len().max(1);
         let pending = &c.pending;
+        // DECODE-critical reads (`count_as_prefill` is false for decode rows and verifies since 10-14): only these may
+        // hedge to the mirror (`V41_EXPERT_HEDGE_MS`, `v4flash_core::hedge::critical_scope`).
+        let critical = !self.count_as_prefill;
         for chunk in pending.chunks(k) {
             let t_read = std::time::Instant::now();
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
@@ -4360,6 +4366,7 @@ impl ExpertPager {
                         let [p0, p1, p2] = st;
                         let (b0, b1, b2) = (p0.as_mut_slice(), p1.as_mut_slice(), p2.as_mut_slice());
                         hs.push(sc.spawn(move || -> R {
+                            let _critical = v4flash_core::hedge::critical_scope(critical);
                             Self::read_miss_into(owner, gpu_repack, layer, id, names, b0, b1, b2)
                                 .map_err(|e| format!("{e:#}"))
                         }));

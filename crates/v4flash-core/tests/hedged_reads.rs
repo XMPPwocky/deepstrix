@@ -73,6 +73,8 @@ fn expert_hedge_is_bit_identical_and_wins_on_a_stalled_primary() {
     hedge::set_expert_hedge_ms(0);
     assert!(st.read_range_into_direct_mirrored(&t, 0, &mut a, frac).unwrap());
     let s0 = hedge::EXPERT.snapshot();
+    // Expert reads hedge only on a DECODE-critical thread (the pager's decode readers set this).
+    let _critical = hedge::critical_scope(true);
     hedge::set_expert_hedge_ms(5);
     hedge::set_test_primary_delay_ms(300);
     let t0 = Instant::now();
