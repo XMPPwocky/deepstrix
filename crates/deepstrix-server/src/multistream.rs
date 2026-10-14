@@ -398,7 +398,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         None
     };
     let plain_lanes = PlainLanes::from_env(n_slots as usize, pipeline_min_rows());
-    let mut sched = Sched { loan, dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, interrupt_since: None, int_saved_since: Instant::now(), last_interrupt_end: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0, saver: None };
+    let mut sched = Sched { loan, dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, interrupt_since: None, int_saved_since: Instant::now(), last_interrupt_end: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0, saver: None, rewarm_due: false };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -893,6 +893,9 @@ struct Sched {
     tick: u64,
     /// The background snapshot writer (`V41_SNAPSHOT_SAVE_ASYNC`): created at the first async save.
     saver: Option<snapshot::AsyncSaver>,
+    /// A prefill burst just ended with `V41_B1_REWARM_AFTER_PREFILL` on: the next token boundary queues box 1's owned,
+    /// non-resident experts for the background prefetcher.
+    rewarm_due: bool,
 }
 
 /// A live perfetto trace of N decode steps (`knobs::PERFETTO_STEPS`):
@@ -1311,6 +1314,9 @@ impl Sched {
                     v4flash_kernels::het::b2_mirror::pin_enter_decode(),
                 ),
             };
+            if self.phase == Phase::Prefill && next == Phase::Decode && v4flash_kernels::knobs::B1_REWARM_AFTER_PREFILL.on() {
+                self.rewarm_due = true;
+            }
             tracing::info!(from = ?self.phase, to = ?next, reason = ?reason, interrupt, live = self.streams.len(), prefills = self.prefills.len(),
                 queued = self.queue.len(), burst_ms = self.phase_since.elapsed().as_millis() as u64,
                 next_budget_ms = next_budget.as_millis() as u64, starved,
@@ -2014,6 +2020,14 @@ impl Sched {
         let ring_settle_ms = self.dsp.as_mut().map(|d| d.settle_writes()).unwrap_or(0.0);
         if let Some(pg) = state.pager.as_mut() {
             pg.drain_prefetched()?;
+            // `V41_B1_REWARM_AFTER_PREFILL`: the burst's evictions of box 1's OWNED experts go back through the pre-warm
+            // queue below (decoder layers first), paced like the hot-set newcomers.
+            if std::mem::take(&mut self.rewarm_due) {
+                let ids = pg.owned_not_resident();
+                let added = v4flash_kernels::het::expert_pager::hot_set::queue_prewarm(&ids);
+                tracing::info!(owned_not_resident = ids.len(), queued = added, per_step = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize(),
+                    protect_fallback = pg.protect_owned_fallback(), "b1 rewarm after prefill");
+            }
             // HOT SPLIT pre-warm (design 5): box-1 newcomers of the last
             // refreshes, a few per step (empty outside an interleave / return).
             let n = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize();

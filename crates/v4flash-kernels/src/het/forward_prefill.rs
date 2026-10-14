@@ -1314,8 +1314,17 @@ impl HeterogeneousEngine {
             return None;
         }
         let pg = pager?;
+        // `V41_B1_PROTECT_OWNED`: the filler also leaves room for the non-owned experts box 1 holds now and ~2 slots per
+        // layer, so a long job's share fits the genuinely spare slots (sized to the free slots exactly, it evicted owned
+        // ones: 10-14 decode-spike analysis).
+        let reserve = if crate::knobs::B1_PROTECT_OWNED.on() {
+            pg.resident_count_where(&|l, e| super::expert_pager::hot_set::box1_owns(l, e) != Some(true)) + ps::PROTECT_HEADROOM_PER_LAYER * crate::config::N_LAYER as usize
+        } else {
+            0
+        };
         let cfg = ps::SplitCfg {
             lru_slots: pg.lru_slots(),
+            reserve,
             filler_max: ps::filler_max(),
             // Cold (hot set not warm yet): size the head for the policy that will warm it. INTERLEAVE (live in production)
             // owns `B1_HOT_IL_PER_LAYER` ids/layer, more than the `top` head.
@@ -1326,7 +1335,7 @@ impl HeterogeneousEngine {
         let st = &split.stats;
         let usable2 = ps::b2_usable_estimate();
         tracing::info!(
-            tokens = job.total(), warm = st.warm, prior = st.prior, prior_tokens = prior.as_ref().map_or(0, |p| p.tokens), lru_slots = cfg.lru_slots, owned_now = st.owned_now, filler = st.filler,
+            tokens = job.total(), warm = st.warm, prior = st.prior, prior_tokens = prior.as_ref().map_or(0, |p| p.tokens), lru_slots = cfg.lru_slots, owned_now = st.owned_now, reserve = cfg.reserve, filler = st.filler,
             head_min = st.head_min, head_max = st.head_max, share1 = st.share1, share2 = st.share2,
             share2_per_layer = st.share2 / crate::config::CED_DECODER_START, usable2,
             expected_rereads_per_window = st.expected_rereads(usable2),
@@ -4980,6 +4989,8 @@ impl RbLayout {
 #[derive(Default, Clone)]
 pub struct PreMoeCarry {
     phase: PreMoePhase,
+    /// The rows are decode (`RowLayout::Arena`), set at route: what `prep` tells the pager (`set_prefill_rows`).
+    arena_rows: bool,
     pub layer: i32,
     pub b: u32,
     cs_n_used: usize,
@@ -11239,6 +11250,7 @@ impl HeterogeneousEngine {
                 // HOT SPLIT 3.2: the holder fallback serves decode rows only
                 // (prefill and verify chunks keep the home rule).
                 let holder_rows = matches!(rows, RowLayout::Arena { .. });
+                c.arena_rows = holder_rows;
                 // HOT SPLIT 3.1: a replicated id of a decode row waits for the leg
                 // choice below, which needs the lane-layer's other picks. Prefill and
                 // verify chunks keep box 1 (its home), as without REP.
@@ -12082,7 +12094,11 @@ impl HeterogeneousEngine {
                             pg.set_scan_window(Some((n - scan, n)));
                         }
                     }
+                    // PREFILL rows (not decode, not a verify): `V41_B1_PROTECT_OWNED` keeps box 1's owned set out of their
+                    // victim search (`ExpertPager::set_prefill_rows`).
+                    pg.set_prefill_rows(!c.arena_rows && !speculative_append());
                     let r = pg.ensure(layer as i32, &ids).map(|_| ());
+                    pg.set_prefill_rows(false);
                     pg.set_scan_window(None);
                     pg.set_count_as_prefill(false);
                     r?;

@@ -247,6 +247,24 @@ impl Residency {
         }
     }
 
+    /// `lru_victim` that also skips slots holding a key `skip` names; `None` when every candidate is skipped.
+    fn lru_victim_skipping(&self, range: std::ops::Range<usize>, skip: &dyn Fn((i32, u32)) -> bool) -> Option<u32> {
+        let mut best: Option<(u64, u32)> = None;
+        for sl in range {
+            if sl >= self.last_use.len() {
+                break;
+            }
+            if self.pinned.get(sl).is_some_and(|&p| p > 0) || self.slot_key[sl].is_some_and(|k| skip(k)) {
+                continue;
+            }
+            let t = self.last_use[sl];
+            if best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, sl as u32));
+            }
+        }
+        best.map(|(_, sl)| sl)
+    }
+
     /// Undo a `claim` whose bytes never landed: the key stops resolving and the
     /// slot is free again (stamp 0, so it is reused first; its contents are
     /// undefined, possibly half-written).
@@ -431,6 +449,12 @@ pub struct ExpertPager {
     /// prefill's paging hid inside `decode_misses`, making the window path and
     /// the unified path impossible to compare. Set around a prefill `ensure`.
     count_as_prefill: bool,
+    /// The rows of the running `ensure` are PREFILL rows (set by the prefill driver around its `ensure`; the row kind,
+    /// not `count_as_prefill`). With `V41_B1_PROTECT_OWNED` their misses claim slots skipping box 1's OWNED set
+    /// (`hot_set::box1_owns`), falling back to the plain LRU only when nothing else is evictable.
+    prefill_rows: bool,
+    /// Owned slots a protected claim still evicted (the fallback), since start.
+    protect_owned_fallback: u64,
     /// SCAN REGION: while set, `ensure` may only take slots from `[lo, hi)`.
     ///
     /// Prefill is a scan, not a reuse workload: one 1024-token chunk touches
@@ -855,6 +879,15 @@ pub mod hot_set {
     /// the front of the queue.
     pub fn requeue_prewarm(layer: i32, e: u32) {
         PREWARM.lock().unwrap_or_else(|p| p.into_inner()).push_front((layer, e));
+    }
+    /// `V41_B1_REWARM_AFTER_PREFILL`: append `ids` to the pre-warm queue (in order), skipping ids already queued; the
+    /// hub drains it `V41_B1_HOT_PREWARM_STEP` per decode step. Returns the ids added.
+    pub fn queue_prewarm(ids: &[(i32, u32)]) -> usize {
+        let mut g = PREWARM.lock().unwrap_or_else(|p| p.into_inner());
+        let have: std::collections::HashSet<(i32, u32)> = g.iter().copied().collect();
+        let before = g.len();
+        g.extend(ids.iter().copied().filter(|k| !have.contains(k)));
+        g.len() - before
     }
     /// The pin ledger's "box 2 no longer owns it" (stale / lost): today's
     /// `!partition_box2` (the hash split before warm-up included), less the
@@ -2067,9 +2100,14 @@ impl ExpertPager {
             let slot = match self.res.slot_key.iter().enumerate().skip(lru_lo).find(|(_, k)| k.is_none()) {
                 Some((free, _)) => free as u32,
                 None => {
-                    let victim = self
-                        .res
-                        .lru_victim(lru_lo..self.n_slots as usize)
+                    // `V41_B1_PROTECT_OWNED`: an admitted prefetch skips box 1's owned slots too (plain LRU if only
+                    // owned slots are left).
+                    let range = lru_lo..self.n_slots as usize;
+                    let protected = crate::knobs::B1_PROTECT_OWNED.on()
+                        .then(|| self.res.lru_victim_skipping(range.clone(), &|k| hot_set::box1_owns(k.0, k.1) == Some(true)))
+                        .flatten();
+                    let victim = protected
+                        .or_else(|| self.res.lru_victim(range))
                         .ok_or_else(|| eyre!("expert pager: prefetch has no slot to evict"))?;
                     if let Some(old) = self.res.slot_key[victim as usize].take() {
                         self.res.slot_of.remove(&old);
@@ -2382,6 +2420,8 @@ impl ExpertPager {
             remap_stage_next: 0,
             cur_layer: 0,
             count_as_prefill: false,
+            prefill_rows: false,
+            protect_owned_fallback: 0,
             scan_window: None,
             device: igpu,
             prefill_requests: 0,
@@ -2499,6 +2539,33 @@ impl ExpertPager {
     }
 
     /// Count the next `ensure`'s requests/misses as PREFILL, not decode.
+    /// See `prefill_rows`.
+    pub fn set_prefill_rows(&mut self, v: bool) {
+        self.prefill_rows = v;
+    }
+
+    /// Owned slots protected prefill claims evicted anyway (nothing else was evictable), since start.
+    pub fn protect_owned_fallback(&self) -> u64 {
+        self.protect_owned_fallback
+    }
+
+    /// Resident experts `(layer, id)` for which `pred` holds.
+    pub fn resident_count_where(&self, pred: &dyn Fn(i32, u32) -> bool) -> usize {
+        self.res.slot_of.into_iter().filter(|(&(l, e), _)| pred(l, e)).count()
+    }
+
+    /// `V41_B1_REWARM_AFTER_PREFILL`: box 1's OWNED experts that are not resident, decoder layers
+    /// (`CED_DECODER_START..`) first -- where a prefill burst's evictions hurt decode most -- then the encoder layers.
+    pub fn owned_not_resident(&self) -> Vec<(i32, u32)> {
+        let split = crate::config::CED_DECODER_START as i32;
+        let n_layer = crate::config::N_LAYER as i32;
+        (split..n_layer)
+            .chain(0..split)
+            .flat_map(|l| (0..N_EXPERT).map(move |e| (l, e)))
+            .filter(|&(l, e)| hot_set::box1_owns(l, e) == Some(true) && !self.res.slot_of.contains_key(&(l, e)))
+            .collect()
+    }
+
     pub fn set_count_as_prefill(&mut self, v: bool) {
         self.count_as_prefill = v;
     }
@@ -4231,7 +4298,18 @@ impl ExpertPager {
             // Slot claimed NOW (slot_of + slot_key + touch) so the next miss cannot
             // pick it again; the remap entry is written once the bytes have landed,
             // and `ensure` releases the claim if they never do.
-            let slot = self.res.claim(key, lru_lo, lru_hi, call_tick)?;
+            // `V41_B1_PROTECT_OWNED` + PREFILL rows: the victim search skips box 1's owned set (as the late join's
+            // `claim_skipping`); plain LRU only when nothing else is evictable (counted).
+            let slot = if self.prefill_rows && crate::knobs::B1_PROTECT_OWNED.on() {
+                let owned = |k: (i32, u32)| hot_set::box1_owns(k.0, k.1) == Some(true);
+                let (slot, evicted) = self.res.claim_skipping(key, lru_lo, lru_hi, call_tick, &owned)?;
+                if evicted.is_some_and(owned) {
+                    self.protect_owned_fallback += 1;
+                }
+                slot
+            } else {
+                self.res.claim(key, lru_lo, lru_hi, call_tick)?
+            };
             // Safety net for the degenerate case above: if this slot does fall inside a
             // dense window, that window is no longer a faithful copy of its layer.
             if (slot as usize) < self.dense_slots() {
@@ -4698,6 +4776,22 @@ mod residency_tests {
     /// owned set) while anything else is eligible, report the evicted key, and
     /// fall back to the plain LRU claim when nothing is; pinned slots and slots
     /// newer than `call_tick` are never victims either way.
+    #[test]
+    fn lru_victim_skipping_skips_and_returns_none_when_all_skipped() {
+        let mut r = Residency::new(4);
+        for (i, k) in [(0, 10u32), (0, 11), (0, 12), (0, 13)].into_iter().enumerate() {
+            let s = r.claim(k, 0, 4, u64::MAX).unwrap();
+            assert_eq!(s as usize, i);
+        }
+        // LRU order is claim order: slot 0 oldest. Skip expert 10 -> slot 1.
+        assert_eq!(r.lru_victim(0..4), Some(0));
+        assert_eq!(r.lru_victim_skipping(0..4, &|k| k.1 == 10), Some(1));
+        // A pinned slot is skipped too.
+        r.pinned[1] = 1;
+        assert_eq!(r.lru_victim_skipping(0..4, &|k| k.1 == 10), Some(2));
+        assert_eq!(r.lru_victim_skipping(0..4, &|_| true), None, "all skipped: the caller falls back");
+    }
+
     #[test]
     fn claim_skipping_avoids_owned_then_falls_back() {
         let mut r = full(4); // keys (0, 0..4), LRU order 0,1,2,3

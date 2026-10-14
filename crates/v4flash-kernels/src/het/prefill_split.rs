@@ -98,6 +98,9 @@ fn mix(layer: usize, e: usize) -> u64 {
 pub struct SplitCfg {
     /// Hub LRU slots (`n_slots - lru_lo`): what decode-hot ids and the prefill share compete for.
     pub lru_slots: usize,
+    /// Slots the filler must also leave alone (`V41_B1_PROTECT_OWNED`: box 1's resident NON-owned experts +
+    /// `PROTECT_HEADROOM_PER_LAYER` per layer); 0 = the original sizing.
+    pub reserve: usize,
     /// Ceiling on the per-layer filler (`filler_max()`).
     pub filler_max: usize,
     /// Per-layer head size to use when the hot set is NOT warm (`hot_set::per_layer()`).
@@ -108,10 +111,13 @@ impl SplitCfg {
     /// `min(filler_max, (lru_slots - owned_now) / encoder_layers)`: the filler never exceeds the hub's live free
     /// slots, so it displaces ~no decode-hot id by construction (review r2 finding 1).
     pub fn filler(&self, owned_now: usize) -> usize {
-        let free = self.lru_slots.saturating_sub(owned_now);
+        let free = self.lru_slots.saturating_sub(owned_now).saturating_sub(self.reserve);
         self.filler_max.min(free / NL_ENC)
     }
 }
+
+/// `V41_B1_PROTECT_OWNED`: headroom slots per layer (all layers) the filler leaves free.
+pub const PROTECT_HEADROOM_PER_LAYER: usize = 2;
 
 /// Sizes for the job-start log line and the gate (review r2).
 #[derive(Clone, Debug, Default)]
@@ -316,8 +322,20 @@ mod tests {
     }
 
     #[test]
+    fn reserve_shrinks_the_filler_and_zero_keeps_the_old_sizing() {
+        // interleave 115 x 40 = 4,600 owned of 5,425 => 825 free => 41/layer (the production 41-43, 10-14) ...
+        let base = SplitCfg { reserve: 0, lru_slots: 5425, filler_max: 64, cold_head_per_layer: 115 };
+        assert_eq!(PrefillSplit::build(&base, &hot_head(115)).stats.filler, 41);
+        // ... minus 745 resident non-owned + 2 x 40 headroom => 0 free: no filler (the share stays box 2's).
+        let prot = SplitCfg { reserve: 745 + PROTECT_HEADROOM_PER_LAYER * N_LAYER as usize, ..base };
+        assert_eq!(PrefillSplit::build(&prot, &hot_head(115)).stats.filler, 0);
+        let some = SplitCfg { reserve: 400, ..base };
+        assert_eq!(PrefillSplit::build(&some, &hot_head(115)).stats.filler, (825 - 400) / NL_ENC);
+    }
+
+    #[test]
     fn deterministic_and_frozen() {
-        let cfg = SplitCfg { lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
         let a = PrefillSplit::build(&cfg, &hot_head(103));
         let b = PrefillSplit::build(&cfg, &hot_head(103));
         assert_eq!(a.box2, b.box2);
@@ -327,26 +345,26 @@ mod tests {
     #[test]
     fn filler_is_bounded_by_live_free_slots() {
         // top: 103 x 40 = 4,120 owned, 5,041 LRU slots => free 921 => filler 46/layer (review r2: NOT 64).
-        let cfg = SplitCfg { lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
         let s = PrefillSplit::build(&cfg, &hot_head(103));
         assert_eq!(s.stats.owned_now, 103 * N_LAYER as usize);
         assert_eq!(s.stats.filler, 46);
         // reclaimed dense window (5,425 slots): free 1,305 => capped at the knob (64) ... 1305/20 = 65 => 64.
-        let cfg = SplitCfg { lru_slots: 5425, filler_max: 64, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5425, filler_max: 64, cold_head_per_layer: 103 };
         let s = PrefillSplit::build(&cfg, &hot_head(103));
         assert_eq!(s.stats.filler, 64);
         // interleave 115 x 40 = 4,600 on 5,041 => 441 free => 22/layer.
-        let cfg = SplitCfg { lru_slots: 5041, filler_max: 64, cold_head_per_layer: 115 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5041, filler_max: 64, cold_head_per_layer: 115 };
         let s = PrefillSplit::build(&cfg, &hot_head(115));
         assert_eq!(s.stats.filler, 22);
         // owned >= slots: no filler, never underflows.
-        let cfg = SplitCfg { lru_slots: 1000, filler_max: 64, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 1000, filler_max: 64, cold_head_per_layer: 103 };
         assert_eq!(PrefillSplit::build(&cfg, &hot_head(103)).stats.filler, 0);
     }
 
     #[test]
     fn box1_keeps_its_decode_head_and_box2_gets_the_rest() {
-        let cfg = SplitCfg { lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
         let head = hot_head(103);
         let s = PrefillSplit::build(&cfg, &head);
         for l in 0..NL_ENC {
@@ -366,7 +384,7 @@ mod tests {
     fn cold_hot_set_is_defined_not_n_slots_over_20() {
         // `owned_now = 0` would give n_slots/20 = 271/layer of filler (review r3 N1); the cold case must size from
         // `cold_head_per_layer`.
-        let cfg = SplitCfg { lru_slots: 5041, filler_max: 400, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5041, filler_max: 400, cold_head_per_layer: 103 };
         let s = PrefillSplit::build(&cfg, &|_, _| None);
         assert!(!s.stats.warm);
         assert_eq!(s.stats.owned_now, 103 * N_LAYER as usize);
@@ -391,7 +409,7 @@ mod tests {
 
     #[test]
     fn cold_head_with_a_prior_is_the_prefill_hot_ids() {
-        let cfg = SplitCfg { lru_slots: 5041, filler_max: 64, cold_head_per_layer: 115 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5041, filler_max: 64, cold_head_per_layer: 115 };
         let p = test_prior();
         let s = PrefillSplit::build_with_prior(&cfg, &|_, _| None, Some(&p));
         assert!(!s.stats.warm && s.stats.prior);
@@ -407,7 +425,7 @@ mod tests {
 
     #[test]
     fn warm_head_is_kept_and_the_filler_follows_the_prior() {
-        let cfg = SplitCfg { lru_slots: 5425, filler_max: 64, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5425, filler_max: 64, cold_head_per_layer: 103 };
         let head = hot_head(103);
         let p = test_prior();
         let s = PrefillSplit::build_with_prior(&cfg, &head, Some(&p));
@@ -450,7 +468,7 @@ mod tests {
 
     #[test]
     fn decoder_layers_are_not_covered() {
-        let cfg = SplitCfg { lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
         let s = PrefillSplit::build(&cfg, &hot_head(103));
         assert_eq!(s.home2(CED_DECODER_START as i32, 0), None);
         assert_eq!(s.home2(N_LAYER as i32 - 1, 7), None);
@@ -460,7 +478,7 @@ mod tests {
 
     #[test]
     fn guard_installs_and_restores() {
-        let cfg = SplitCfg { lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
+        let cfg = SplitCfg { reserve: 0, lru_slots: 5041, filler_max: 64, cold_head_per_layer: 103 };
         let s = Arc::new(PrefillSplit::build(&cfg, &hot_head(103)));
         assert!(current().is_none());
         {
