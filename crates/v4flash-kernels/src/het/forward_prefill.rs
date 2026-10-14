@@ -35,7 +35,7 @@ use crate::routing::hash_router_select;
 use super::image_spans::{self, ImageSpan};
 
 use super::batch_scratch::{
-    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, B_MAX,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, G6Pending, G6PendingRemote, B_MAX,
 };
 use super::engine::HeterogeneousEngine;
 use super::prefill_stats::PrefillStats;
@@ -3840,6 +3840,79 @@ impl HeterogeneousEngine {
     }
 
 
+    /// Fusion group G4: the decode shared expert with its input quantize and the late FFN mixes in ONE
+    /// launch (`G4Shared::launch_qmix`, ahead of the GEMVs: the mixes read only `after_attn_hc`, and
+    /// their `split` / carry are first read by the FFN combine and the next collapse), then the
+    /// shared expert's GEMVs exactly as `issue_shared_expert_prefill` issues them on the direct dp4a
+    /// arm. Bit-identical to that + the `mhc_mix_ffn_late` launch. All of it is attributed to
+    /// `dgpu.shared_expert` (k.shared_expert.g4_qmix): the late mixes' time moves there from
+    /// `dgpu.mhc_mix_ffn_late`.
+    fn issue_g4(&self, sd: &mut BatchDgpuShared, bd: &mut BatchDgpuScratch, dlw: &DgpuLayerWeights, b: u32) -> eyre::Result<()> {
+        let de = &self.dgpu;
+        let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
+        {
+            let _t = de.events.stage("k.shared_expert.g4_qmix", &de.compute)?;
+            de.g4.launch_qmix(
+                &de.compute,
+                crate::g4_shared::G4Quant { xq: &mut sd.xq_n_embd, xscale: &mut sd.xscale_n_embd, x: &bd.ffn_input_norm, n: N_EMBD },
+                crate::g4_shared::G4Mix {
+                    weight: &dlw.hc_ffn_fn.buffer,
+                    x: &bd.after_attn_hc,
+                    scale: &dlw.hc_ffn_scale,
+                    base: &dlw.hc_ffn_base,
+                    split_out: &mut bd.split,
+                    mix_out: &mut sd.mix,
+                    counters: &mut sd.mhc_counters,
+                    carry: &mut bd.hc_pre_carry,
+                    write_carry: true,
+                    rms_eps: RMS_EPS,
+                    sinkhorn_iters: SINKHORN_ITERS,
+                    sinkhorn_eps: SINKHORN_EPS,
+                },
+                b,
+            )?;
+        }
+        if shared_fused_for(b) {
+            let _t = de.events.stage("k.shared_expert.fused_gateup", &de.compute)?;
+            de.shared_fused.launch(
+                &de.compute, &mut sd.mid_sh_xq, &mut sd.mid_sh_xscale, &dlw.shared.gate.buffer, &dlw.shared.up.buffer,
+                &sd.xq_n_embd, &sd.xscale_n_embd, N_EMBD, N_FF_SHARED, b, crate::config::SWIGLU_CLAMP_EXP,
+            )?;
+        } else {
+            {
+                let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
+                super::dispatch::dense_gemm_prefill(
+                    de, &de.compute, &mut sd.gate_sh, &dlw.shared.gate, &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
+                    Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))), b, N_FF_SHARED, N_EMBD,
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
+                super::dispatch::dense_gemm_prefill(
+                    de, &de.compute, &mut sd.up_sh, &dlw.shared.up, &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
+                    Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))), b, N_FF_SHARED, N_EMBD,
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.shared_expert.swiglu", &de.compute)?;
+                de.swiglu.launch_clamped(&de.compute, &mut sd.mid_sh, &sd.gate_sh, &sd.up_sh, b * N_FF_SHARED, crate::config::SWIGLU_CLAMP_EXP)?;
+            }
+            {
+                let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
+                de.q8.quantize_input_batched(&de.compute, &mut sd.mid_sh_xq, &mut sd.mid_sh_xscale, &sd.mid_sh, N_FF_SHARED, b)?;
+            }
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.down_matvec", &de.compute)?;
+            super::dispatch::dense_gemm_prefill(
+                de, &de.compute, &mut bd.ffn_shared, &dlw.shared.down, &sd.mid_sh_xq, &sd.mid_sh_xscale, &sd.kq_mid_q8k,
+                Some((&sd.mid_sh16, super::batch_scratch::f16_pitch(N_FF_SHARED))), b, N_EMBD, N_FF_SHARED,
+            )?;
+        }
+        G4_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Stage 10, the batched shared expert, as a callable unit.
     ///
     /// Extracted so it can be issued at EITHER of two points in `pre_moe`:
@@ -5337,6 +5410,9 @@ impl HeterogeneousEngine {
             let (lo, hi) = (offs[i], offs[i + 1]);
             let t = all_tables.rows(lo, hi);
             dev.upload(&t, &self.dgpu.compute)?;
+            // G6: nothing deferred survives a step (an aborted one leaves its combine behind).
+            bd.g6_pending = None;
+            bd.g6_allow = None;
             for (k, hc) in input_hcs[lo..hi].iter().enumerate() {
                 let mut slot = bd.residual.slice_view_mut(k * HC_DIM as usize, HC_DIM as usize);
                 slot.copy_from_host(hc)?;
@@ -5407,7 +5483,11 @@ impl HeterogeneousEngine {
                 let bl = (offs[i + 1] - offs[i]) as u32;
                 let (bd, _, _) = &mut lanes[i];
                 let hot = prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], bd, sd);
+                // G6: this lane's next call is its chain of layer l + 1 (Ph::Post below), so the Post
+                // may defer the combine into that chain's pre-attn launch.
+                bd.g6_allow = (l + 1 < n_layer).then_some(l as i32);
                 self.forward_layer_post_moe_v2(bd, bl, &self.sync_events_lane(i).layers[l], hot)?;
+                bd.g6_allow = None;
                 std::mem::swap(&mut bd.residual, &mut bd.residual_next);
             }};
         }
@@ -5848,6 +5928,45 @@ impl HeterogeneousEngine {
                 return Err(eyre!("L{layer}: arena tables have no store for this layer"));
             }
         }
+        // Fusion group G6: a combine the previous layer's Post deferred into this launch. Taken
+        // before anything here reads `bd.residual` (the MTP capture, Engram, dumps); flushed as the
+        // old combine where the fused launch does not apply, dropped when stale (an aborted step:
+        // the residual was re-uploaded since).
+        let g6_fused: Option<G6Pending> = match bd.g6_pending.take() {
+            None => None,
+            Some(p) if p.layer + 1 != layer as i32 || p.b as usize != tokens.len() => {
+                G6_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(pending = ?p, layer, rows = tokens.len(), "G6: stale deferred combine dropped");
+                None
+            }
+            Some(p) => {
+                let b = p.b;
+                let mhc_split_here = cap_ok
+                    && ms_mhc_split()
+                    && cfg!(feature = "v41")
+                    && ced != CedMode::KvSourceOnly
+                    && b <= super::batch_scratch::MHC_SPLIT_MAX_ROWS;
+                let fast_here = mhc_fast()
+                    && cfg!(feature = "v41")
+                    && mhc_arena_fused()
+                    && mhc_pre_scaled_for(b)
+                    && (b as usize) <= sd.mhc_counters.len();
+                let ok = ctx.is_none()
+                    && !mhc_split_here
+                    && fast_here
+                    && layer != 0
+                    && dlw.engram.is_none()
+                    && ced == CedMode::Exact
+                    && !(bd.mtp_capture_rows > 0 && super::mtp::MtpState::src_slot(layer).is_some())
+                    && !super::engine::subtensor_dump_armed(layer as usize);
+                if ok {
+                    Some(p)
+                } else {
+                    self.g6_flush(bd, p)?;
+                    None
+                }
+            }
+        };
         // Per-row base arrays for this layer's store (None: contiguous, or a
         // dense layer). The `*_rows` launches take them; their `None` form is
         // byte-identical to the old entry points.
@@ -6063,7 +6182,8 @@ impl HeterogeneousEngine {
         //   compute: collapse with the OLD carry, rms_w; record hc_collapse_attn
         //   hc:      wait; carry := split; record hc_mixes_attn
         //   compute: waits hc_mixes_attn before `hc_post` (stage 7) reads split
-        let mhc_split = cap_ok
+        let mhc_split = g6_fused.is_none()
+            && cap_ok
             && ms_mhc_split()
             && cfg!(feature = "v41")
             && ced != CedMode::KvSourceOnly
@@ -6119,11 +6239,15 @@ impl HeterogeneousEngine {
             && mhc_arena_fused()
             && mhc_pre_scaled_for(b)
             && (b as usize) <= sd.mhc_counters.len();
-        let cap = self.stage_cap(de, "g.mhc_pre_attn", layer as usize, b, lane_ptr, cap_ok && !r1_attn)?;
+        let cap = self.stage_cap(de, "g.mhc_pre_attn", layer as usize, b, lane_ptr, cap_ok && !r1_attn && g6_fused.is_none())?;
         if r1_attn {
             self.stage_b.count("g.mhc_pre_attn", super::arena_ctx::C_DIRECT);
         }
-        if !cap.skip {
+        if let Some(p) = g6_fused {
+            // G6: the deferred combine + this sub-block (mixes, collapse, rms_w, carry) as ONE launch.
+            let _t = de.events.stage("k.mhc_pre_attn.g6", &de.compute)?;
+            self.launch_g6(bd, sd, dlw, p)?;
+        } else if !cap.skip {
         // `V41_MHC_FAST`: the whole sub-block (mixes, collapse, rms_w, carry
         // copy) as ONE bit-identical launch. The collapse reads the OLD carry;
         // the launch's last WG then writes carry := split, except on a CED
@@ -10010,7 +10134,19 @@ impl HeterogeneousEngine {
         // remote submit under `V41_PREFILL_PRESUBMIT=1` so its dGPU work lands
         // inside the box-2 RPC window. See `issue_shared_expert_prefill`.
         let defer_shared = prefill_presubmit() && remote_split_active();
-        if !defer_shared {
+        // Fusion group G4 (`V41_DGPU_G4_SHARED`, live): the shared expert's input quantize + the late
+        // FFN mixes in one launch (`G4Shared::launch_qmix`) ahead of its GEMVs, on the direct decode
+        // shape it reproduces; the late mixes then ran.
+        let g4_on = !defer_shared
+            && ffn_mix_late
+            && ctx.is_none()
+            && mhc_fast()
+            && crate::knobs::DGPU_G4_SHARED.on()
+            && g4_shape_ok(dlw, b)
+            && !super::engine::subtensor_dump_armed(layer as usize);
+        if g4_on {
+            self.issue_g4(sd, bd, dlw, b)?;
+        } else if !defer_shared {
             self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok, false)?;
         }
 
@@ -10018,7 +10154,7 @@ impl HeterogeneousEngine {
         // is first read by the FFN combine's hc_post, the carry by the next
         // layer's collapse -- both later on this stream). Then carry := split,
         // after the stage-8 collapse read the old carry.
-        if ffn_mix_late {
+        if ffn_mix_late && !g4_on {
             let _t = de.events.stage("dgpu.mhc_mix_ffn_late", &de.compute)?;
             // 2.11 R1: one launch under `V41_MHC_FAST` -> direct under `stage_b`.
             let r1_late = ctx.is_some() && mhc_fast();
@@ -13082,6 +13218,24 @@ impl HeterogeneousEngine {
         // after box 2's wait (same f32 add, same order; nothing reads `ffn_moe_recv` in between
         // but the `V41_REMOTE_DBG` dumps, which keep the old order).
         let defer_shared = crate::knobs::DGPU_COMBINE3.on() && !*lane_env::REMOTE_DBG;
+        // Fusion group G6 (`V41_DGPU_G6_BOUNDARY`, live): DEFER this combine into the next layer's
+        // pre-attn mHC launch (`g6_boundary`). Only when the ready-first driver says the lane's next
+        // call is that chain (`g6_allow`), and only for the combine shape the kernel reproduces: the
+        // shared expert deferred into the combine (COMBINE3), no resident-expert partial, the fused
+        // decode adds (`dec_fuse`), box 2's partial (if any) through its pinned staging.
+        let g6_layer = bd.g6_allow.take();
+        let g6_mode = match g6_layer {
+            Some(_) => crate::knobs::DGPU_G6_BOUNDARY.pick(),
+            None => 0,
+        };
+        let g6_try = g6_mode != 0
+            && defer_shared
+            && !hot_active
+            && dec_fuse(b)
+            && b <= crate::g6_boundary::G6_MAX_B
+            && bd.remote_ffn_moe.is_some();
+        // Where box 2's partial went (set by the upload below when `g6_try`).
+        let mut g6_remote = G6PendingRemote::Device;
         if !defer_shared {
             let _t_combine = de.events.stage("dgpu.ffn_combine.local", &de.compute)?;
             let _t = de.events.stage("k.ffn_combine.vec_add", &de.compute)?;
@@ -13254,9 +13408,22 @@ impl HeterogeneousEngine {
                             done.synchronize()?;
                         }
                         pin.as_mut_slice()[..rows].copy_from_slice(src);
-                        dst.slice_view_mut(0, rows).copy_from_host_async(&pin.as_slice()[..rows], &de.compute)?;
-                        done.record(&de.compute)?;
-                        bd.remote_upload_pending = true;
+                        if g6_try && g6_mode == 2 {
+                            // G6 `zc`: the boundary launch reads the staging zero-copy; it records
+                            // `done` after itself (`launch_g6`).
+                            g6_remote = G6PendingRemote::Pinned;
+                        } else if g6_try {
+                            // G6 `early`: the copy on the upload stream NOW (beside whatever
+                            // `de.compute` runs), `de.compute` waits for it before the boundary launch.
+                            dst.slice_view_mut(0, rows).copy_from_host_async(&pin.as_slice()[..rows], &de.up)?;
+                            done.record(&de.up)?;
+                            de.compute.wait_event(done)?;
+                            bd.remote_upload_pending = true;
+                        } else {
+                            dst.slice_view_mut(0, rows).copy_from_host_async(&pin.as_slice()[..rows], &de.compute)?;
+                            done.record(&de.compute)?;
+                            bd.remote_upload_pending = true;
+                        }
                     }
                     _ => dst.slice_view_mut(0, rows).copy_from_host(src)?,
                 }
@@ -13299,6 +13466,19 @@ impl HeterogeneousEngine {
                 bd.remote_ffn_moe_layer, bd.remote_ffn_moe_valid,
                 l2(&local), l2(&rem), l2(&rem) / l2(&local).max(1e-9),
             );
+        }
+        if g6_try {
+            // G6: the combine's inputs are final in `de.compute`'s order (moe_arrived waited above,
+            // the shared expert and the FFN mixes queued before); the launch happens in the next
+            // layer's chain, where the time shows under `dgpu.mhc_pre_attn` (k.mhc_pre_attn.g6).
+            if std::mem::take(&mut bd.mhc_ffn_split_pending) {
+                self.dgpu.compute.wait_event(&sev.hc_mixes_ffn)?;
+            }
+            let remote = if bd.remote_ffn_moe_valid { g6_remote } else { G6PendingRemote::None };
+            bd.remote_ffn_moe_valid = false;
+            bd.g6_pending = Some(G6Pending { layer: g6_layer.unwrap_or(-1), b, remote });
+            G6_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
         }
         // Second half of the combine, AFTER the blocking wait above. Separate
         // bracket from `dgpu.ffn_combine.local` on purpose -- see the note there.
@@ -13441,7 +13621,116 @@ impl HeterogeneousEngine {
         }
         Ok(())
     }
+
+    /// Fusion group G6: the FFN combine a Post deferred, issued as the Post would have (the H2D the
+    /// `zc` mode skipped, then `hc_post_from_split_batched_add2` / `_add` into `bd.residual`, which
+    /// is the swapped `residual_next`), where the next chain cannot fuse it.
+    fn g6_flush(&self, bd: &mut BatchDgpuScratch, p: G6Pending) -> eyre::Result<()> {
+        self.set_current_cached(self.dgpu.device)?;
+        let de = &self.dgpu;
+        let b = p.b;
+        let _t_combine_remote = de.events.stage("dgpu.ffn_combine.remote", &de.compute)?;
+        if p.remote == G6PendingRemote::Pinned {
+            let rows = b as usize * N_EMBD as usize;
+            let (pin, done, dst) = match (bd.remote_ffn_moe_pin.as_ref(), bd.remote_upload_done.as_ref(), bd.remote_ffn_moe.as_mut()) {
+                (Some(p), Some(d), Some(r)) => (p, d, r),
+                _ => return Err(eyre!("G6 flush: pinned partial without its staging / event / buffer")),
+            };
+            dst.slice_view_mut(0, rows).copy_from_host_async(&pin.as_slice()[..rows], &de.compute)?;
+            done.record(&de.compute)?;
+            bd.remote_upload_pending = true;
+        }
+        if p.remote == G6PendingRemote::None {
+            let _t = de.events.stage("k.ffn_combine.hc_post_add", &de.compute)?;
+            de.hc_post.launch_from_split_batched_add(
+                &de.compute, &mut bd.residual, &bd.ffn_moe_recv, &bd.ffn_shared, &bd.after_attn_hc, &bd.split,
+                N_HC, N_EMBD, N_HC, b,
+            )?;
+        } else {
+            let _t = de.events.stage("k.ffn_combine.hc_post_add2", &de.compute)?;
+            let remote = bd.remote_ffn_moe.as_ref().ok_or_else(|| eyre!("G6 flush: no remote buffer"))?;
+            de.hc_post.launch_from_split_batched_add2(
+                &de.compute, &mut bd.residual, &bd.ffn_moe_recv, &bd.ffn_shared, remote, &bd.after_attn_hc, &bd.split,
+                N_HC, N_EMBD, N_HC, b,
+            )?;
+        }
+        G6_FLUSHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Fusion group G6: the deferred combine + this layer's pre-attn mHC sub-block as ONE
+    /// `g6_boundary` launch on `de.compute` (bit-identical to `g6_flush` + `MhcArena::launch_fast`).
+    fn launch_g6(&self, bd: &mut BatchDgpuScratch, sd: &mut BatchDgpuShared, dlw: &DgpuLayerWeights, p: G6Pending) -> eyre::Result<()> {
+        use crate::g6_boundary::{G6Combine, G6Mhc, G6Remote};
+        let de = &self.dgpu;
+        let remote = match p.remote {
+            G6PendingRemote::None => None,
+            G6PendingRemote::Pinned => {
+                Some(G6Remote::Pinned(bd.remote_ffn_moe_pin.as_ref().ok_or_else(|| eyre!("G6: no pinned staging"))?, 0))
+            }
+            G6PendingRemote::Device => Some(G6Remote::Device(bd.remote_ffn_moe.as_ref().ok_or_else(|| eyre!("G6: no remote buffer"))?)),
+        };
+        de.g6.launch(
+            &de.compute,
+            G6Combine {
+                moe: &bd.ffn_moe_recv,
+                shared: &bd.ffn_shared,
+                remote,
+                after_attn: &bd.after_attn_hc,
+                resid_out: &mut bd.residual,
+            },
+            G6Mhc {
+                weight: &dlw.hc_attn_fn.buffer,
+                scale: &dlw.hc_attn_scale,
+                base: &dlw.hc_attn_base,
+                split: &mut bd.split,
+                mix_out: &mut sd.mix,
+                counters: &mut sd.mhc_counters,
+                inv_rows: &mut sd.mhc_inv_rows,
+                carry: &mut bd.hc_pre_carry,
+                write_carry: true,
+                cur_out: &mut sd.attn_cur,
+                norm_out: &mut sd.attn_input_norm,
+                norm_w: &dlw.attn_norm,
+                rms_eps: RMS_EPS,
+                sinkhorn_iters: SINKHORN_ITERS,
+                sinkhorn_eps: SINKHORN_EPS,
+            },
+            p.b,
+        )?;
+        if p.remote == G6PendingRemote::Pinned {
+            // the staging may be rewritten (next Post) only after this launch has read it
+            bd.remote_upload_done.as_ref().ok_or_else(|| eyre!("G6: no upload event"))?.record(&de.compute)?;
+            bd.remote_upload_pending = true;
+        }
+        G6_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
 }
+
+/// Fusion group G4 (`V41_DGPU_G4_SHARED`): lane-layers whose input quantize + late mixes ran as `g4_qmix`.
+pub static G4_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fusion group G4's shape: the decode shared expert on the dp4a arm with Q8_0 weights (whose input
+/// quantize `g4_qmix` absorbs; its GEMVs are issued as before). Pure (knobs read at startup).
+pub fn g4_shape_ok(dlw: &DgpuLayerWeights, b: u32) -> bool {
+    use v4flash_core::gguf::GgufType;
+    let q8 = dlw.shared.gate.dtype == GgufType::Q8_0 && dlw.shared.up.dtype == GgufType::Q8_0 && dlw.shared.down.dtype == GgufType::Q8_0;
+    g4_rows_ok(b) && q8
+}
+
+/// The row / kernel-path half of [`g4_shape_ok`]: the dp4a arm (rows 1..=8, which quantizes the input
+/// with the wave kernel `g4_qmix` reproduces).
+pub fn g4_rows_ok(b: u32) -> bool {
+    (1..=crate::g4_shared::G4_MAX_B).contains(&b) && super::dispatch::small_b_dense_dp4a(b) && crate::q8_0::q8_quant_wave()
+}
+
+/// Fusion group G6 counters (`V41_DGPU_G6_BOUNDARY`): combines a Post deferred, boundary launches,
+/// deferred combines flushed as the old combine (the next chain could not fuse), stale ones dropped.
+pub static G6_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static G6_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static G6_FLUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static G6_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Host wall inside the per-layer verify/prefill body, split by phase.
 ///

@@ -339,6 +339,12 @@ enum Op {
     G2B,
     // --- G3 (V41_ATTN_G3): AttnMeta + Gather + Attn + ORopeQ as ONE launch
     G3Attn,
+    // --- G6 (V41_DGPU_G6_BOUNDARY): PostH2d + PostCombine + MhcPreAttn as ONE launch.
+    G6Up,  // `early`: box 2's partial pinned H2D on the upload stream + de.compute's wait on it
+    G6Dev, // the boundary launch reading the uploaded partial
+    G6Zc,  // `zc`: the boundary launch reading the partial zero-copy from the pinned staging
+    // --- G4 (V41_DGPU_G4_SHARED): ShQuant + MixLate as ONE launch, ahead of the shared GEMVs
+    G4QMix,
 }
 
 use Op::*;
@@ -368,6 +374,9 @@ impl Op {
             G2A => q8_bytes(N_LORA_Q, N_EMBD) + q8_bytes(N_HEAD_DIM, N_EMBD) + b * ne * f,
             G2B => q8_bytes(Q_FLAT, N_LORA_Q) + b * Q_FLAT as usize * f,
             G3Attn => b * (640 * 512 * 2 + Q_FLAT as usize * (f + 1)),
+            G6Up => b * ne * f,
+            G4QMix => f16_bytes(HC_MIX_DIM, HC_DIM) + b * hcd * f + b * ne * (f + 1),
+            G6Dev | G6Zc => f16_bytes(HC_MIX_DIM, HC_DIM) + b * (3 * ne + hcd + hcd + 2 * ne) * f,
             EgMvQ => q8_bytes(ENGRAM_OUT_Q, ENGRAM_IN),
             EgGate => b * (2 * hcd + 5 * ne) * f,
             MhcPreAttn => f16_bytes(HC_MIX_DIM, HC_DIM) + b * (hcd + 2 * ne) * f,
@@ -439,6 +448,8 @@ impl Op {
             G1Fused => "g1_router_block",
             G2A | G2B => "g2_qkv_front",
             G3Attn => "g3_attn_block",
+            G6Up | G6Dev | G6Zc => "g6_boundary",
+            G4QMix => "g4_shared",
             ShQuant | ShFused | ShGate | ShUp | ShSwiglu | ShQuantMid | ShDown => "shared_expert",
             MixLate => "mix_ffn_late",
         }
@@ -472,6 +483,18 @@ fn chain(class: &str, b: u32) -> Vec<Op> {
         "probe_event8" => return [vec![Empty], vec![SelRecord; 8]].concat(),
         "probe_remote8" => return [vec![Empty], vec![PostH2d; 8]].concat(),
         "reuse_noev" => return chain("reuse", b).into_iter().filter(|o| *o != SelRecord).collect(),
+        // G6: the boundary as one launch. `reuse_g6` = the `early` copy on the upload stream with
+        // nothing to hide behind (the chain is alone: its worst case); `reuse_g6h` = the copy already
+        // done (hidden behind the other lane's work: its best case); `reuse_g6zc` = zero-copy.
+        "reuse_g6" => return with_g6(chain("reuse", b), Some(G6Up), G6Dev),
+        "reuse_g6h" => return with_g6(chain("reuse", b), None, G6Dev),
+        "reuse_g6zc" => return with_g6(chain("reuse", b), None, G6Zc),
+        "reuse_g1236" => return with_g6(chain("reuse_g123", b), Some(G6Up), G6Dev),
+        "reuse_g1236h" => return with_g6(chain("reuse_g123", b), None, G6Dev),
+        // G4: the shared expert + the late mixes in two launches (alone / with everything else).
+        "reuse_g4" => return with_g4(chain("reuse", b)),
+        "reuse_g12346" => return with_g4(with_g6(chain("reuse_g123", b), Some(G6Up), G6Dev)),
+        "reuse_g12346h" => return with_g4(with_g6(chain("reuse_g123", b), None, G6Dev)),
         // dGPU fusion group G1: the router block as one launch (selected_ready still recorded after it).
         "reuse_g1" => {
             let mut v = Vec::new();
@@ -539,10 +562,38 @@ fn chain(class: &str, b: u32) -> Vec<Op> {
     v
 }
 
+/// `v` with G6: the partial's H2D replaced by `up` (or nothing), the combine dropped, the pre-attn
+/// mHC replaced by the boundary launch `g6`.
+fn with_g6(v: Vec<Op>, up: Option<Op>, g6: Op) -> Vec<Op> {
+    let mut out = Vec::new();
+    for o in v {
+        match o {
+            PostH2d => out.extend(up),
+            PostCombine => {}
+            MhcPreAttn => out.push(g6),
+            o => out.push(o),
+        }
+    }
+    out
+}
+
+/// `v` with G4: ShQuant -> G4QMix (the quantize + the late mixes), MixLate dropped.
+fn with_g4(v: Vec<Op>) -> Vec<Op> {
+    let mut out = Vec::new();
+    for o in v {
+        match o {
+            ShQuant => out.push(G4QMix),
+            MixLate => {}
+            o => out.push(o),
+        }
+    }
+    out
+}
+
 /// Ops that dispatch a kernel (the rest are copies, event records, waits).
 fn is_kernel(op: Op) -> bool {
     // (the *Zc proxies are kernels)
-    !matches!(op, WaitMoe | PostH2d | PriorH2d | SelRecord | CompH2d | CompPosH2d | EgH2d)
+    !matches!(op, WaitMoe | PostH2d | PriorH2d | SelRecord | CompH2d | CompPosH2d | EgH2d | G6Up)
 }
 
 /// Ops of the router critical path: from the MoE's arrival to `selected_ready` (what the host waits
@@ -560,6 +611,9 @@ struct Bufs {
     n_idx: u32,
     moe_ev: Event,
     sel_ev: Event,
+    // G6 `early`: the upload stream + its event
+    up: Stream,
+    up_ev: Event,
     // mHC / residual
     residual: DeviceBuffer<f32>,
     residual_next: DeviceBuffer<f32>,
@@ -766,6 +820,8 @@ impl Bufs {
             n_idx,
             moe_ev: Event::new()?,
             sel_ev: Event::new()?,
+            up: Stream::new(id)?,
+            up_ev: Event::new()?,
             residual: dev_rand(id, b * hcd, rng, 1.0)?,
             residual_next: zeros(id, b * hcd)?,
             after_attn_hc: dev_rand(id, b * hcd, rng, 1.0)?,
@@ -932,7 +988,7 @@ fn run(e: &DeviceEngine, s: &Stream, bf: &mut Bufs, op: Op, b: u32) -> eyre::Res
                 s,
                 Some(FastMix {
                     weight: &w,
-                    x: &bf.residual,
+                    x: &bf.residual_next,
                     scale: &bf.hc_scale,
                     base: &bf.hc_base,
                     mode: MIX_PRE_SCALED,
@@ -941,7 +997,7 @@ fn run(e: &DeviceEngine, s: &Stream, bf: &mut Bufs, op: Op, b: u32) -> eyre::Res
                     counters: &mut bf.counters,
                     inv_rows: &mut bf.inv_rows,
                 }),
-                Some(FastCollapse { x: &bf.residual, cur_out: &mut bf.attn_cur, norm_out: &mut bf.attn_in, norm_w: &bf.attn_norm_w }),
+                Some(FastCollapse { x: &bf.residual_next, cur_out: &mut bf.attn_cur, norm_out: &mut bf.attn_in, norm_w: &bf.attn_norm_w }),
                 &mut bf.carry,
                 true,
                 HC_DIM,
@@ -1241,6 +1297,61 @@ fn run(e: &DeviceEngine, s: &Stream, bf: &mut Bufs, op: Op, b: u32) -> eyre::Res
         ShDown => {
             let w = bf.w(q8_bytes(N_EMBD, N_FF_SHARED), 0);
             e.q8.matvec_batched(s, &mut bf.ffn_shared, &w, &bf.mid_xq, &bf.mid_xs, N_EMBD, N_FF_SHARED, b)
+        }
+        G4QMix => {
+            let wm = bf.w(f16_bytes(HC_MIX_DIM, HC_DIM), 1);
+            e.g4.launch_qmix(
+                s,
+                v4flash_kernels::g4_shared::G4Quant { xq: &mut bf.xq, xscale: &mut bf.xs, x: &bf.ffn_in, n: N_EMBD },
+                v4flash_kernels::g4_shared::G4Mix {
+                    weight: &wm,
+                    x: &bf.after_attn_hc,
+                    scale: &bf.hc_scale,
+                    base: &bf.hc_base,
+                    split_out: &mut bf.split,
+                    mix_out: &mut bf.mix,
+                    counters: &mut bf.counters,
+                    carry: &mut bf.carry,
+                    write_carry: true,
+                    rms_eps: RMS_EPS,
+                    sinkhorn_iters: SINKHORN_ITERS,
+                    sinkhorn_eps: SINKHORN_EPS,
+                },
+                b,
+            )
+        }
+        G6Up => {
+            let src = &bf.remote_pin.as_slice()[..bu * ne];
+            bf.remote.slice_view_mut(0, bu * ne).copy_from_host_async(src, &bf.up)?;
+            bf.up_ev.record(&bf.up)?;
+            s.wait_event(&bf.up_ev)
+        }
+        G6Dev | G6Zc => {
+            use v4flash_kernels::g6_boundary::{G6Combine, G6Mhc, G6Remote};
+            let w = bf.w(f16_bytes(HC_MIX_DIM, HC_DIM), 0);
+            let remote = if op == G6Zc { G6Remote::Pinned(&bf.remote_pin, 0) } else { G6Remote::Device(&bf.remote) };
+            e.g6.launch(
+                s,
+                G6Combine { moe: &bf.moe_recv, shared: &bf.ffn_shared, remote: Some(remote), after_attn: &bf.after_attn_hc, resid_out: &mut bf.residual_next },
+                G6Mhc {
+                    weight: &w,
+                    scale: &bf.hc_scale,
+                    base: &bf.hc_base,
+                    split: &mut bf.split,
+                    mix_out: &mut bf.mix,
+                    counters: &mut bf.counters,
+                    inv_rows: &mut bf.inv_rows,
+                    carry: &mut bf.carry,
+                    write_carry: true,
+                    cur_out: &mut bf.attn_cur,
+                    norm_out: &mut bf.attn_in,
+                    norm_w: &bf.attn_norm_w,
+                    rms_eps: RMS_EPS,
+                    sinkhorn_iters: SINKHORN_ITERS,
+                    sinkhorn_eps: SINKHORN_EPS,
+                },
+                b,
+            )
         }
         PostCombineZc => {
             // SAFETY: the pinned buffer is hipHostMalloc'd (mapped, UVA): its pointer is valid on the device.
@@ -1557,6 +1668,7 @@ fn bw_gbs() -> f64 {
 fn section_chain(e: &DeviceEngine, rig: &mut Rig, bf: &mut Bufs, bs: &[u32], rounds: usize, rng: &mut Lcg, stats: &Stats) -> eyre::Result<()> {
     let classes_all = ["reuse", "reuse#AA", "index", "kvsrc", "route:reuse", "reuse_zc", "reuse_noev", "reuse_min", "route:reuse_zc",
         "reuse_g1", "route:reuse_g1", "reuse_g2", "reuse_g3", "reuse_g123", "route:reuse_g123",
+        "reuse_g6", "reuse_g6h", "reuse_g6zc", "reuse_g1236", "reuse_g1236h", "reuse_g4", "reuse_g12346", "reuse_g12346h",
         "probe_empty1", "probe_empty17", "probe_vadd17", "probe_pinned8", "probe_pageable8", "probe_event8", "probe_remote8"];
     let only = std::env::var("BENCH_CLASSES").ok();
     let classes: Vec<&str> = classes_all.iter().copied().filter(|c| *c == "reuse" || only.as_deref().map_or(true, |o| o.split(',').any(|x| x == *c))).collect();
@@ -1816,7 +1928,10 @@ fn combined_g123_bit_identical_to_chain() -> eyre::Result<()> {
     let (seed_a, seed_b) = (0x5eed_c4a1u64, 0x0b5e_55edu64);
     let mut total = 0usize;
     let mut fails = 0usize;
-    for class in ["reuse_g123", "reuse_g1", "reuse_g2", "reuse_g3"] {
+    let classes: Vec<String> = std::env::var("COMBINED_CLASSES")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|_| ["reuse_g123", "reuse_g1", "reuse_g2", "reuse_g3", "reuse_g6", "reuse_g6zc", "reuse_g1236", "reuse_g4", "reuse_g12346"].map(String::from).to_vec());
+    for class in classes.iter().map(String::as_str) {
         let mk = |seed: u64| -> eyre::Result<Bufs> {
             let mut rng = Lcg(seed);
             let mut bf = Bufs::new_in(id, &mut rng, n_idx, Some(&region))?;
@@ -1825,6 +1940,31 @@ fn combined_g123_bit_identical_to_chain() -> eyre::Result<()> {
             Ok(bf)
         };
         // [chain lane A, chain lane B, fused lane A, fused lane B]; equal seeds = equal contents.
+        // Negative control (every class), on FRESH lanes before the comparisons: the comparison must
+        // see a 1e-3 relative change of one input of the FFN combine (moe_recv[17]). Fresh, because
+        // the synthetic state saturates over the passes (huge mix logits -> sigmoid / exp underflow to
+        // exact 0 -> a nudged input can vanish), which blinded a control taken at the end.
+        {
+            let b = 4u32;
+            let (mut c0, mut c2) = (mk(seed_a)?, mk(seed_a)?);
+            s.synchronize()?;
+            let mut h = vec![0f32; c2.moe_recv.len()];
+            c2.moe_recv.copy_to_host(&mut h)?;
+            h[17] *= 1.001;
+            c2.moe_recv.copy_from_host(&h)?;
+            for op in chain("reuse", b) {
+                run(&e, &s, &mut c0, op, b)?;
+            }
+            for op in chain(class, b) {
+                run(&e, &s, &mut c2, op, b)?;
+            }
+            s.synchronize()?;
+            let d = snapshot_diff(&lane_snapshot(&c0)?, &lane_snapshot(&c2)?);
+            eprintln!("negative control {class} (moe_recv[17] x 1.001, b=4, fresh): {} buffers differ: {}", d.len(), d.join("; "));
+            if d.is_empty() {
+                return Err(eyre!("negative control NOT detected: the comparison is blind"));
+            }
+        }
         let mut lanes = [mk(seed_a)?, mk(seed_b)?, mk(seed_a)?, mk(seed_b)?];
         s.synchronize()?;
         for b in 1..=BMAX as u32 {
@@ -1855,26 +1995,6 @@ fn combined_g123_bit_identical_to_chain() -> eyre::Result<()> {
             let fq = finite_frac(&lanes[2].q_normed, b as usize * Q_FLAT as usize)?;
             let fs = finite_frac(&lanes[2].ffn_shared, b as usize * N_EMBD as usize)?;
             eprintln!("{class} b={b} (lane B {b2}): compared x2 passes; finite attn_out {ff:.3} q_normed {fq:.3} ffn_shared {fs:.3}");
-        }
-        // Negative control: the comparison must see a 1e-3 relative change of one residual input (a
-            // 1-ulp nudge rounds away in the collapse sum and changes nothing downstream).
-        if class == "reuse_g123" {
-            let b = 4u32;
-            let mut h = vec![0f32; lanes[2].residual.len()];
-            lanes[2].residual.copy_to_host(&mut h)?;
-            h[17] *= 1.001;
-            lanes[2].residual.copy_from_host(&h)?;
-            for k in [0usize, 2] {
-                for op in chain(if k < 2 { "reuse" } else { class }, b) {
-                    run(&e, &s, &mut lanes[k], op, b)?;
-                }
-            }
-            s.synchronize()?;
-            let d = snapshot_diff(&lane_snapshot(&lanes[0])?, &lane_snapshot(&lanes[2])?);
-            eprintln!("negative control (residual[17] x 1.001, b=4): {} buffers differ: {}", d.len(), d.join("; "));
-            if d.is_empty() {
-                return Err(eyre!("negative control NOT detected: the comparison is blind"));
-            }
         }
     }
     eprintln!("COMBINED: {total} lane-layer comparisons, {fails} failures");

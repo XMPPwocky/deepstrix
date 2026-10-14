@@ -121,7 +121,7 @@ pub fn grouped_bpack_symbol(batch: u32) -> &'static str {
 /// xscale is NaN instead of 0). 2026-09-26 sweep (C1_dense_decode/
 /// quantize_wave, warm graph node): K=5120 b=4 4.46 -> 3.56 us (x1.25), K=32768
 /// b=4 8.2 -> 4.5 us with the grid pad; ~5-7 us per lane-layer.
-fn q8_quant_wave() -> bool {
+pub fn q8_quant_wave() -> bool {
     static D: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_Q8_QUANT_WAVE").as_deref() != Ok("0"));
     *D

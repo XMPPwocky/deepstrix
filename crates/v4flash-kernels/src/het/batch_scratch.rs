@@ -239,6 +239,30 @@ fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
 /// Costs 3 slots * 128 rows * N_EMBD * 4 B ~= 11 MB.
 pub const MTP_CAP_ROWS: usize = 128;
 
+/// A combine `forward_layer_post_moe_v2` deferred into the next layer's `g6_boundary` launch
+/// (fusion group G6). Everything else it needs is in the lane's scratch: `ffn_moe_recv`,
+/// `ffn_shared`, `after_attn_hc`, `split`, and box 2's partial per `remote`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct G6Pending {
+    /// The layer whose combine it is (the launch belongs to `layer + 1`'s chain).
+    pub layer: i32,
+    pub b: u32,
+    pub remote: G6PendingRemote,
+}
+
+/// Where a deferred combine's box-2 partial is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum G6PendingRemote {
+    /// No box-2 partial this lane-layer (the `_add` combine: the shared expert alone).
+    None,
+    /// In `remote_ffn_moe_pin` (host): the launch reads it zero-copy, then records
+    /// `remote_upload_done` on `de.compute`.
+    Pinned,
+    /// Uploaded to `remote_ffn_moe` on the dGPU's upload stream (`de.up`) at the Post, which also
+    /// queued `de.compute`'s wait on `remote_upload_done`.
+    Device,
+}
+
 pub struct BatchDgpuScratch {
     /// Row capacity every B-scaled buffer was sized for. Callers must
     /// never run a batch larger than this through the scratch.
@@ -455,6 +479,13 @@ pub struct BatchDgpuScratch {
     /// this layer; the FFN combine must wait `hc_mixes_ffn` before `hc_post`
     /// reads `split`.
     pub mhc_ffn_split_pending: bool,
+    /// Fusion group G6 (`V41_DGPU_G6_BOUNDARY`): the ready-first driver's Post sets this when the
+    /// lane's next call is its `pre_moe_chain` of the next layer: `Some(layer)` (consumed by the Post).
+    pub g6_allow: Option<i32>,
+    /// Fusion group G6: the FFN combine the Post DEFERRED into the next layer's pre-attn mHC launch
+    /// (`g6_boundary`). Taken by that `pre_moe_chain` (fused, or flushed as the old combine when the
+    /// fused path does not apply there); dropped when stale (an aborted step).
+    pub g6_pending: Option<G6Pending>,
     /// Request in flight on the remote shard for this lane's layer.
     ///
     /// Submitted in pre-MoE and awaited in POST-MoE, so box 2 computes its half
@@ -1399,6 +1430,8 @@ impl BatchDgpuScratch {
             },
             remote_upload_pending: false,
             mhc_ffn_split_pending: false,
+            g6_allow: None,
+            g6_pending: None,
             remote_ticket: None,
             remote_late: false,
             ev_req: [f64::NAN; 9],

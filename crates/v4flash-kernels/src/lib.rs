@@ -126,6 +126,8 @@ pub mod mhc_arena;
 pub mod mtp_markov;
 pub mod readback_pack;
 pub mod g1_router_block;
+pub mod g4_shared;
+pub mod g6_boundary;
 pub mod rms_norm;
 pub mod rope;
 pub mod sampler;

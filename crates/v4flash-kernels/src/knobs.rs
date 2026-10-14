@@ -937,6 +937,27 @@ crate::knobs! {
     /// (tests/attn_g3o.rs bench_g3o_chain_wall, paired vs `g3`): -3.4 us/lane-layer at b = 1, -2.3 at
     /// b = 2, -1.0..-1.3 at b = 3, -0.4..-1.5 from b = 4 on long rows; docs/v41/DECODE_OPT_KNOBS.md.
     pub static ATTN_G3_KERNEL = Knob::choice("V41_ATTN_G3_KERNEL", 0, &[&["g3"], &["auto"], &["w1"], &["w2"], &["w4"]]).live();
+    /// `V41_DGPU_G6_BOUNDARY` (default `off`; live, read at each decode Post of the ready-first
+    /// driver): fusion group G6 -- the decode layer BOUNDARY (box 2's partial upload, the FFN combine
+    /// `hc_post_from_split_batched_add2` / `_add`, and the next layer's `mhc_fast_batched` pre-attn
+    /// sub-block: 3 queue ops on `de.compute`) as ONE `g6_boundary` launch, every output bit-identical
+    /// (tests/g6_boundary_bitexact.rs). The Post defers the combine; the next layer's chain launches
+    /// it in place of the mHC sub-block (or flushes it as the old combine where the fused path does
+    /// not apply: Engram / MTP-capture / dump layers, graphs, the split mixes). How box 2's partial
+    /// gets there: `early` (`1`, `on`) = its pinned H2D on the dGPU's upload stream `de.up` the moment
+    /// the reply is consumed, `de.compute` waiting on it (off the compute stream's timeline);
+    /// `zc` = read zero-copy from the pinned staging inside the launch (PCIe in the kernel:
+    /// ~3 us per row, measured). tests/bench_g6_boundary.rs: docs/v41/DECODE_OPT_KNOBS.md.
+    /// `V41_DGPU_G4_SHARED` (default OFF; live, read per decode lane-layer): fusion group G4 -- the
+    /// decode shared expert's input quantize and the late FFN mixes (`mhc_fast` mix NORMED + carry,
+    /// whose 24 workgroups per row each recomputed the row's fp64 RMS) as ONE launch (`g4_qmix`: the
+    /// RMS once per row, the mix workgroups waiting on it), issued ahead of the shared expert's
+    /// GEMVs, which keep their launches (at the byte roof); every output bit-identical
+    /// (tests/g4_shared_bitexact.rs). Only on the direct decode path with the late mixes
+    /// (`ffn_mix_late`), the dp4a arm and Q8_0 shared weights; everything else keeps the chain.
+    /// docs/v41/DECODE_OPT_KNOBS.md.
+    pub static DGPU_G4_SHARED = Knob::flag("V41_DGPU_G4_SHARED", false).live();
+    pub static DGPU_G6_BOUNDARY = Knob::choice("V41_DGPU_G6_BOUNDARY", 0, &[&["off", "0"], &["early", "1", "on"], &["zc"]]).live();
     /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
     /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top
     /// `per_layer()` (today, bit-identical); `interleave` = box 1 holds `V41_B1_HOT_TARGET` of the

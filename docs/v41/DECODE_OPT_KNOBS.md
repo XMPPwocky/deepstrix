@@ -14,7 +14,8 @@ row allocated per `BatchDgpuShared`, and engine modules loaded at start).
 NOT deployed. None of the fused paths has run inside the hub yet (no restarts were allowed): before
 flipping any of them, run the layer-0 exactness gate / golden gate with the knob on (hub down, box 2
 up) and prove each path ran: G2 has the counter `forward_prefill::QKV_FRONT_LAUNCHES`; G1 and G3 have
-no counter, so look for their `k.router.g1` / `k.attn.g3` stages in a sub-stage profile.
+no counter, so look for their `k.router.g1` / `k.attn.g3` stages in a sub-stage profile. G6 has
+`forward_prefill::G6_DEFERRED` / `G6_LAUNCHES` / `G6_FLUSHED` / `G6_DROPPED`, G4 `G4_LAUNCHES`.
 
 ## Knobs
 
@@ -30,6 +31,11 @@ no counter, so look for their `k.router.g1` / `k.attn.g3` stages in a sub-stage 
 | `V41_DGPU_QKV_FRONT_GRID` | 64 | startup | G2 launch A work-group count (bench override) | same test | G=64 optimal or tied at b=4/8 |
 | `V41_ATTN_G3` | off (`1` = on) | **live** since 10-13 (read once per decode lane-layer) | G3: attn_meta_fill + indexer_gather + fused decode attention + rope_inv_quant_q8 as ONE launch (`attn_dec_g3.hip`; selection read in place, V by transposed loads, inverse rope + Q8_0 heads in the epilogue, written to the R1 `g3_heads_*` views). Index-source layers keep a 1-destination meta fill. Only with graphs off, the dec_fused attention, the `V41_DEC_FUSE` dp4a wo_a arm, `V41_DEC_SKIP_DEAD`, b <= 16, n_comp <= 512 and n_raw + n_comp <= 640, an f16 main store when the selection is used | `attn_dec_g3_bitexact::attn_dec_g3_is_bit_identical_to_the_chain` (256 comparisons, b=1..16, both lanes) | chain wall cold b=1 44.6 -> 25.8 us, b=4 48.5 -> 26.1, b=8 59.9 -> 30.2, b=16 98.4 -> 51.0; 4 launches -> 1 (2 on index-source layers); ~40% of the 7.2 us byte+launch roof at b=4 (verdict: not yet optimal; bit-identical two-launch split is the next step) |
 | `V41_ATTN_G3_KERNEL` | `g3` | **live** (read per G3 launch) | which kernel a G3 lane-layer runs: `g3` = round 1's `attn_dec_g3`; `w1` / `w2` / `w4` = the G3-optimal "W" kernels (`attn_dec_g3o.hip`: one WG per row, head tile and 1/n of the dims; pipelined loads, faster phase A and epilogue; n = 2 / 4 replicate the scores + softmax per dim part); `auto` = `attn_dec_g3o::auto_mode`: W4 at b = 1, W2 at b = 2..3, W1 from b = 4 when every row holds >= 384 keys, else `g3`. Only matters with `V41_ATTN_G3=1`. Stage `k.attn.g3w` for the W kernels | `attn_g3o::g3o_bit_identical_to_the_chain` (10080 comparisons: 7 kernels x b = 1..16 x 2 lanes x 3 rope sets x 5 key layouts x steady / ragged / edge rows, subnormal + signed-zero KV, with and without heads_out; negative control) | `auto` vs `g3`, paired p50 (100 rounds, cold / warm): long rows (selected 128 + 512, index-source) b=1 -3.3 / -3.3 us, b=2 -2.3 / -2.1, b=3 -1.3 / -1.0, b=4 -0.7 / -1.2, b=8 -1.0 / -1.0, b=16 -1.4 / -1.4; ratio-0 (128 keys) b=1 -1.7, b=2 -1.2, b=3 -1.1, b>=4 0; short dense (128 + 200) b=1 -2.3, b=2 -1.5, b=3 -1.3, b>=4 0 (A/A p25..p75 within +-0.9). See "G3 round 2" |
+| `V41_DGPU_G4_SHARED` | off | **live** (per decode lane-layer) | G4: the shared expert's input quantize + the late FFN mixes (`mhc_fast` mix NORMED + carry := split, whose 24 WGs per row each recomputed the row's fp64 RMS) as ONE launch (`g4_shared.hip` `g4_qmix`: one RMS WG per row, the mix WGs waiting on it, ticketed), issued ahead of the shared expert's GEMVs, which keep their launches (at the byte roof). Only on the direct decode path with the late mixes, the dp4a arm (rows 1..=8), Q8_0 shared weights, the wave quantize | `g4_shared_bitexact` (64 lane comparisons: b = 1..16, 2 lanes interleaved, 2 passes, GEMVs to b = 8; negative control) | cold, paired p50 vs the chain (quant + gate/up + down + mix): b=1 -2.6 us, b=2 -6.8, b=4 -9.7, b=8 -20.5 (A/A <= 1.3); the mix part alone (QuantMix -> QMix, device) b=4 23.3 -> 11.6 us. Launches 4 -> 3 (7 -> 6 at b 6..8) |
+| `V41_DGPU_G4_TS` | unset | startup | G4 bench-only in-kernel phase timestamps | - | - |
+| `V41_DGPU_G6_BOUNDARY` | `off` (`early` / `1` / `on`, `zc`) | **live** (read at each decode Post of the ready-first driver) | G6: the layer boundary -- box 2's partial upload + the FFN combine (`hc_post_from_split_batched_add2` / `_add`) + the next layer's `mhc_fast_batched` pre-attn sub-block -- as ONE launch (`g6_boundary.hip`, ticketed lead / mix roles, the RMS slices in the mix WGs, a register Sinkhorn). The Post defers the combine (`bd.g6_pending`); the next chain launches it in place of the mHC sub-block, or flushes it as the old combine where it cannot (Engram / MTP-capture / dump layers, graphs / stage_b, the split mixes, `ced` != Exact). `early`: the partial's pinned H2D runs on the new upload stream `de.up` at the Post, `de.compute` waits on its event; `zc`: the lead WGs read it zero-copy | `g6_boundary_bitexact` (128 lane comparisons: b = 1..16, partial pinned / device / none, write_carry on/off, 2 lanes interleaved, 2 passes; 200-launch mixed sequence; negative control) | cold, paired p50 vs the chain (H2D + combine + mhc_fast): partial resident (early, copy hidden) b=2 -18.0 us, b=4 -25.5, b=8 -37.5, b=16 -61.9; `zc` -13.2 / -15.3 / -16.4 / -17.8 (A/A <= 1.1). 3 queue ops -> 1 on `de.compute` |
+| `V41_DGPU_G6_MR` | 2 | startup | G6 mix rows per mix WG (`g6_boundary_m{1,2,3}`; bench override) | same test, every MR | in-kernel finish b=4: MR 2 9.4 us, MR 3 11.4, MR 1 slower |
+| `V41_DGPU_G6_TS`, `V41_DGPU_G6_DBG` | unset | startup | G6 bench-only phase timestamps / ablation (`1` = skip the partial's read) | - | - |
 
 ## Combined check (G1 + G2 + G3 together)
 
@@ -183,9 +189,89 @@ Per step (2 lanes x 40 layers, long context, b = 4): `auto` saves ~0.07 ms (76 c
 lane-layers x ~0.9 us); at b = 1 ~0.13 ms per lane. Below the e2e noise floor: confirm with the
 per-step dGPU busy / stage profile (`k.attn.g3w` vs `k.attn.g3`), not tok/s.
 
+## G4 + G6 (the layer boundary): design, floors, what was measured
+
+Production chain at the boundary of lane-layer l -> l+1 (b <= 5): [shared: quantize -> fused gate/up
+-> down] -> mix_ffn_late -> (Post) wait moe_arrived -> pinned H2D of box 2's partial -> combine ->
+(Chain l+1) mhc_fast pre-attn. Real dependencies: the iGPU's `moe_arrived` and box 2's reply sit
+between the shared expert / late mixes (G4, off the route path, overlapping the MoE) and the combine
+(G6, on the critical path). So the fewest launches the dependencies allow is G4's GEMVs + one
+pre-MoE latency launch, and ONE launch after the MoE.
+
+**G6** (`V41_DGPU_G6_BOUNDARY`): the combine's inputs are final after `moe_arrived` (+ the partial);
+the next layer's mHC needs only the combine's output. One launch, ticketed roles: per row a LEAD WG
+(combine in hc_post's order, stores residual_next, releases a flag, then the collapse on the values
+in registers) and 12 MIX WGs (MR = 2 mix rows each; weights prefetched before the flag, the row from
+L2 after it; the 16 RMS slices of the old RMS WG folded in), the last of a row runs the RMS finalize
+and the Sinkhorn split in registers (DPP quad broadcasts for rows, v_permlane16 for columns, same
+expressions in the same order). The PCIe link reads ~6.5 GB/s (SDMA and zero-copy alike: 80 KB at
+b=4 = 12 us), so the partial's bytes cannot leave the critical path by fusion; `early` moves the
+SDMA copy off `de.compute`'s timeline (the upload stream starts it the moment the Post consumes the
+reply, beside the other lane's work and the iGPU wait), `zc` reads it inside the lead WG.
+
+- Floor at b=4: ~2.0 MB of DRAM bytes (3.2 us at 640 GB/s, not binding) vs a dependency chain of
+  ~7 us (WG entry ~1, cold lead loads ~1.5-2, store + fence + flag ~0.5, flag detection ~0.3, the
+  mix's x from L2 + 80-FMA chain ~1, reductions ~0.5, counter ~0.3, the 20-iteration Sinkhorn chain
+  ~1.5 (40 dependent IEEE divisions), finish ~0.2) + one dependent launch (~2.3).
+- Measured (in-kernel trace, cold, partial in VRAM, MR 2): lead stores 3.6-3.8 us, flag 4.1-4.5, mix
+  wait over 4.6-5.0, dots 5.6-6.3, slice trees 6.3-7.2 -> 6.8-7.8, tail 7.3-8.4 -> 9.2-10.7, finish
+  9.4-11.0 us: ~64-74% of the ~7 us chain floor. Device time (event wall minus the empty-launch
+  wall) b=4: 11.5 us vs the chain's 36.9 us; 3 queue ops -> 1 (copy off the stream in `early`).
+- What stands between it and the floor, measured: the lead's cold loads (140 KB through one WG,
+  ~2.7 us; splitting the combine over more WGs moves the collapse behind a second hand-off), the
+  slice trees in the mix WGs (~0.6-0.9 us), the Sinkhorn chain (~2 us measured vs ~1.5 of division
+  latency). Built and replaced on the way: an LDS Sinkhorn (3.9 us), a separate RMS WG (its 80 fp64
+  FMAs per thread were the critical path, 4.8 us after the flag), the slice sums read with volatile
+  loads in the tail (+3 us, serial).
+- Wiring: the ready-first Post sets `bd.g6_allow`; `forward_layer_post_moe_v2` defers only the
+  COMBINE3 + DEC_FUSE + no-hot shape, b <= 16, with the pinned staging; `pre_moe_chain` takes the
+  pending combine before anything reads `bd.residual` and fuses it, flushes it (same ops as the
+  Post), or drops it when stale (an aborted step; the step start also clears it). The partial's
+  staging is rewritten only after `remote_upload_done` (recorded after the copy on `de.up`, or after
+  the boundary launch in `zc`). The `early` copy reuses `remote_ffn_moe`: the next layer's copy is
+  enqueued only at its Post, after the host saw `selected_ready` of that layer, which de.compute
+  records after this boundary launch.
+
+**G4** (`V41_DGPU_G4_SHARED`): the gate/up (94% of the byte roof) and down (100%) GEMVs keep their
+launches; what was not at a floor is the late mixes (mode NORMED: every one of a row's 24 WGs
+recomputed the row's fp64 RMS + tree before its dot: 19.4 us device at b=4 for ~1.3 MB) and the
+quantize launch + gap. `g4_qmix` = the quantize WGs + one RMS WG per row + 24 mix WGs per row
+waiting on it (ticketed), ahead of the GEMVs (the mixes read only `after_attn_hc`).
+
+- Measured: QuantMix (2 launches) -> QMix (1) device b=1 14.6 -> 10.1 us, b=4 23.3 -> 11.6, b=8 36.8
+  -> 15.8; in-kernel b=4: RMS released 7.4-7.9 us (x row cold 80 KB + 80 fp64 FMAs per thread at
+  1/32 rate + the 256-wide tree), mix done 11.5, finish 11.8. Group (cold): b=4 90.9 -> 80.8 us vs a
+  pure-bytes floor of 60.3 us (38.6 MB at 640 GB/s; 64 us at the 600 GB/s these GEMVs reach cold) +
+  2 dependent gaps.
+- Dead ends, built and measured 10-14 (not kept): (1) the quantize folded into the gate/up WGs (each of 72
+  WGs re-quantizing 80 KB at b=4): +10 us; (2) the mixes in the down GEMV's grid: +7 us at b=4 vs the
+  two launches -- the mix WGs' latency-bound loads queue behind the down's stream in the same CU's
+  memory FIFO (G1's finding), so the "hidden" mix becomes the tail.
+- What remains: the RMS chain (~5 us of the 11.6: one fp64 chain of 80 FMAs per thread is ~0.9 us
+  per wave at 1/32 rate, the rest is the cold row load and the tree) -- it could be produced by the
+  producer of `after_attn_hc` (the post-attn hc_post, or G1's collapse which holds the row in
+  registers), and the two dependent gaps before / between the GEMVs.
+
+Combined chain wall (map harness, warm weights, 150 paired rounds beside the hub; `reuse_g6` = the
+`early` copy exposed (nothing to hide behind in a lone chain), `reuse_g6h` = the copy already done):
+
+| b | A/A \|d\| p50 | G4 | G6 early | G6 hidden | G6 zc | G1+G2+G3 | G1+G2+G3+G6h | G1+G2+G3+G4+G6 | ... +G6h |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 | 4.0 | 6.8 | 15.0 | 19.0 | 13.5 | 73.9 | 89.1 | 96.9 | **102.1** |
+| 4 | 3.1 | 9.4 | 20.4 | 25.1 | 13.8 | 68.0 | 93.8 | 98.8 | **103.7** |
+| 8 | 3.0 | 17.2 | 31.9 | 37.5 | 14.7 | 74.1 | 111.9 | 124.4 | **129.1** |
+
+(us saved per reuse lane-layer vs the production chain, paired p50; queue ops at b=4: 33 -> 14 with
+all five.) `combined_g123_bit_identical_to_chain` now also runs `reuse_g6`, `reuse_g6zc`,
+`reuse_g1236`, `reuse_g4`, `reuse_g12346`: 288 comparisons, 0 failures; its negative control moved to
+a FRESH lane pair (the synthetic state saturates over the passes: huge mix logits underflow sigmoid /
+exp to exact 0 and a nudged input can vanish) and to `moe_recv[17]` (the pre-attn mHC now reads the
+combine's output, as production does after the residual swap).
+
 ## Deploy notes (when the owner decides)
 
-- `V41_DGPU_G1_FUSED`, `V41_DGPU_QKV_FRONT`, `V41_ATTN_G3` and `V41_ATTN_G3_KERNEL` are live knobs:
+- `V41_DGPU_G1_FUSED`, `V41_DGPU_QKV_FRONT`, `V41_ATTN_G3`, `V41_ATTN_G3_KERNEL`, `V41_DGPU_G4_SHARED` and
+  `V41_DGPU_G6_BOUNDARY` are live knobs:
   they can be A/B'd without a restart once a decode-opt hub is running (`V41_ATTN_G3_KERNEL=auto`
   only acts where `V41_ATTN_G3=1`). `V41_MOE_PAIR_DEC`, `V41_MOE_DOWN_DN3` are read once at start.
 - The MoE knobs also act inside `deepstrix-expertd` (box 2 runs the same dispatch): a box-2 change
@@ -195,5 +281,12 @@ per-step dGPU busy / stage profile (`k.attn.g3w` vs `k.attn.g3`), not tok/s.
   near-empty (its work moved into the G1 launch). G2's work shows under `dgpu.q_chain`
   (`k.q_chain.qkv_front_a/_b`) and `dgpu.kv_chain` disappears. G3 shows under `dgpu.attn_compute`
   (`k.attn.g3`, or `k.attn.g3w` for the W kernels), and its epilogue moves the rope_inv_quant work
-  out of `dgpu.output_proj`. Compare
-  sums of stages (or dgpu_busy), not single stages.
+  out of `dgpu.output_proj`. G4's launch shows as `k.shared_expert.g4_qmix` under `dgpu.shared_expert`
+  (the late mixes' time moves there; `dgpu.mhc_mix_ffn_late` is not opened). G6's launch shows as
+  `k.mhc_pre_attn.g6` under `dgpu.mhc_pre_attn` (the combine's time moves there from
+  `dgpu.ffn_combine.remote`, which is not opened at a deferring Post; a flushed combine keeps it).
+  Compare sums of stages (or dgpu_busy), not single stages.
+- G6 adds a stream to every `DeviceEngine` (`de.up`, idle unless `early`) and two scratch buffers in
+  the engine module (sync words, RMS slice sums); G4 one sync buffer + 16 floats. G6's gate: with the
+  knob on, `G6_LAUNCHES` must grow and `G6_FLUSHED` stay small (Engram / MTP layers only), `G6_DROPPED`
+  0.

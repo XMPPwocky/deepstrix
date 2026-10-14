@@ -104,6 +104,11 @@ pub struct DeviceEngine {
     /// the whole point of the design; running the mixes here lets them overlap
     /// the ~413 us of q/kv/attention/output_proj that follows the collapse.
     pub hc: Stream,
+    /// Upload stream for box 2's decode partial under fusion group G6's early copy
+    /// (`V41_DGPU_G6_BOUNDARY=early`): the pinned H2D runs here the moment the reply is consumed,
+    /// beside whatever `compute` is running; `compute` waits on `remote_upload_done` before the
+    /// boundary launch reads it. Idle otherwise.
+    pub up: Stream,
 
     pub rms_w: RmsNorm,
     pub rms_nw: RmsNormNoWeight,
@@ -213,6 +218,12 @@ pub struct DeviceEngine {
     pub expert_sel_count: crate::ExpertSelCount,
     /// dGPU fusion group G1 (`V41_DGPU_G1_FUSED`): the decode router block as one launch.
     pub g1: crate::g1_router_block::G1RouterBlock,
+    /// dGPU fusion group G6 (`V41_DGPU_G6_BOUNDARY`): the layer boundary (box 2's partial zero-copy,
+    /// the FFN combine, the next layer's pre-attn mHC) as one launch.
+    pub g6: crate::g6_boundary::G6Boundary,
+    /// dGPU fusion group G4 (`V41_DGPU_G4_SHARED`): the shared expert's input quantize + the late FFN mixes
+    /// in one launch.
+    pub g4: crate::g4_shared::G4Shared,
 
     /// Per-device event pool for kernel-scope timing. Use
     /// `events.stage(name, &compute)` to wrap a kernel-group.
@@ -227,6 +238,7 @@ impl DeviceEngine {
         let compute = Stream::new(device.id)?;
         let xfer = Stream::new(device.id)?;
         let hc = Stream::new(device.id)?;
+        let up = Stream::new(device.id)?;
         super::trace::name_stream(&compute, "compute");
         super::trace::name_stream(&xfer, "xfer");
         super::trace::name_stream(&hc, "hc");
@@ -239,6 +251,7 @@ impl DeviceEngine {
             compute,
             xfer,
             hc,
+            up,
             rms_w: RmsNorm::for_arch(arch)?,
             rms_nw: RmsNormNoWeight::for_arch(arch)?,
             q8: Q8_0Matvec::for_arch(arch)?,
@@ -310,6 +323,8 @@ impl DeviceEngine {
             moe_group_builder: crate::moe_group_builder::MoeGroupBuilder::for_arch(arch)?,
             expert_sel_count: crate::ExpertSelCount::for_arch(arch)?,
             g1: crate::g1_router_block::G1RouterBlock::for_arch(arch, device.id)?,
+            g6: crate::g6_boundary::G6Boundary::for_arch(arch, device.id)?,
+            g4: crate::g4_shared::G4Shared::for_arch(arch, device.id)?,
             events,
         })
     }
