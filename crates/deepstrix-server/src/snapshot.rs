@@ -864,10 +864,20 @@ struct BlobWriter {
     bytes: u64,
 }
 
-impl BlobWriter {
-    fn new(path: PathBuf) -> Self {
-        Self { path, w: None, bytes: 0 }
+/// Where a snapshot's per-layer device reads go: a blob FILE (`BlobWriter`, `save`) or host memory (`Vec<u8>`,
+/// `capture`, written to the same files later by the async writer).
+trait BlobSink {
+    fn write(&mut self, bytes: &[u8]) -> eyre::Result<()>;
+}
+
+impl BlobSink for Vec<u8> {
+    fn write(&mut self, bytes: &[u8]) -> eyre::Result<()> {
+        self.extend_from_slice(bytes);
+        Ok(())
     }
+}
+
+impl BlobSink for BlobWriter {
     fn write(&mut self, bytes: &[u8]) -> eyre::Result<()> {
         use std::io::Write;
         if bytes.is_empty() {
@@ -879,6 +889,12 @@ impl BlobWriter {
         self.w.as_mut().unwrap().write_all(bytes)?;
         self.bytes += bytes.len() as u64;
         Ok(())
+    }
+}
+
+impl BlobWriter {
+    fn new(path: PathBuf) -> Self {
+        Self { path, w: None, bytes: 0 }
     }
     fn finish(mut self) -> eyre::Result<u64> {
         use std::io::Write;
@@ -908,7 +924,7 @@ impl SaveScratch {
         &mut self,
         buf: &v4flash_hip::DeviceBuffer<u16>,
         n: usize,
-        out: &mut BlobWriter,
+        out: &mut impl BlobSink,
     ) -> eyre::Result<()> {
         self.stream_u16_at(buf, 0, n, out)
     }
@@ -919,7 +935,7 @@ impl SaveScratch {
         buf: &v4flash_hip::DeviceBuffer<u16>,
         off: usize,
         n: usize,
-        out: &mut BlobWriter,
+        out: &mut impl BlobSink,
     ) -> eyre::Result<()> {
         if n == 0 {
             return Ok(());
@@ -940,7 +956,7 @@ impl SaveScratch {
         &mut self,
         buf: &v4flash_hip::DeviceBuffer<u8>,
         n: usize,
-        out: &mut BlobWriter,
+        out: &mut impl BlobSink,
     ) -> eyre::Result<()> {
         if n == 0 {
             return Ok(());
@@ -953,7 +969,7 @@ impl SaveScratch {
         &mut self,
         buf: &v4flash_hip::DeviceBuffer<f32>,
         n: usize,
-        out: &mut BlobWriter,
+        out: &mut impl BlobSink,
     ) -> eyre::Result<()> {
         if n == 0 {
             return Ok(());
@@ -1168,6 +1184,39 @@ fn commit_dir(tmp: &Path, dir: &Path, old: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
+/// The six blob streams of one snapshot, in the order `save` fills them per layer.
+struct Blobs<S> {
+    kv: S,
+    comp_kv: S,
+    comp_state: S,
+    index_comp_kv: S,
+    index_comp_state: S,
+    index_k: S,
+}
+
+impl Blobs<BlobWriter> {
+    /// The blob FILES of a snapshot directory (each created on its first non-empty write).
+    fn files(dir: &Path) -> Self {
+        Blobs {
+            kv: BlobWriter::new(dir.join("kv.bin")),
+            comp_kv: BlobWriter::new(dir.join("comp_kv.bin")),
+            comp_state: BlobWriter::new(dir.join("comp_state.bin")),
+            index_comp_kv: BlobWriter::new(dir.join("index_comp_kv.bin")),
+            index_comp_state: BlobWriter::new(dir.join("index_comp_state.bin")),
+            index_k: BlobWriter::new(dir.join("index_k.bin")),
+        }
+    }
+}
+
+impl Blobs<Vec<u8>> {
+    fn bytes(&self) -> u64 {
+        [&self.kv, &self.comp_kv, &self.comp_state, &self.index_comp_kv, &self.index_comp_state, &self.index_k]
+            .iter()
+            .map(|v| v.len() as u64)
+            .sum()
+    }
+}
+
 /// The files of one snapshot, written into `dir` (meta.json last). Returns
 /// (disk bytes, creation time).
 fn save_files(
@@ -1187,14 +1236,21 @@ fn save_files(
     let tokens_bytes = token_ids_as_bytes(tokens);
     fs::write(dir.join("tokens.bin"), &tokens_bytes)?;
 
-    // Pull device data per layer.
+    // Pull device data per layer, streamed straight to the blob files.
+    let mut blobs = Blobs::files(dir);
+    let layers = read_layers(state, dgpu, igpu, &mut blobs)?;
+    finish_files(blobs, layers, tokens_bytes.len() as u64, state.n_kv_max, tokens.len(), image_spans, fingerprint, dir, session_id)
+}
+
+/// The per-layer device reads of a snapshot (the live prefix of every store, see the comments inside), appended to
+/// `blobs` -- the blob files of a synchronous `save`, or host memory for `capture`. Leaves `dgpu` current.
+fn read_layers<S: BlobSink>(
+    state: &HetModelState,
+    dgpu: Device,
+    igpu: Device,
+    blobs: &mut Blobs<S>,
+) -> eyre::Result<Vec<PerLayerMeta>> {
     let mut layers = Vec::with_capacity(N_LAYER as usize);
-    let mut kv_blob = BlobWriter::new(dir.join("kv.bin"));
-    let mut comp_kv_blob = BlobWriter::new(dir.join("comp_kv.bin"));
-    let mut comp_state_blob = BlobWriter::new(dir.join("comp_state.bin"));
-    let mut index_comp_kv_blob = BlobWriter::new(dir.join("index_comp_kv.bin"));
-    let mut index_comp_state_blob = BlobWriter::new(dir.join("index_comp_state.bin"));
-    let mut index_k_blob = BlobWriter::new(dir.join("index_k.bin"));
     let mut scratch = SaveScratch::default();
     for (li, layer) in state.layers.iter().enumerate() {
         let ratio = COMPRESS_RATIOS[li];
@@ -1208,7 +1264,7 @@ fn save_files(
         dgpu.set_current()?;
         let kv_used_n = (kv_rows as usize) * (N_HEAD_DIM as usize);
         let kv_first = (layer.raw_off + layer.n_raw - kv_rows) as usize * (N_HEAD_DIM as usize);
-        scratch.stream_u16_at(&layer.kv_cache, kv_first, kv_used_n, &mut kv_blob)?;
+        scratch.stream_u16_at(&layer.kv_cache, kv_first, kv_used_n, &mut blobs.kv)?;
 
         let mut comp_kv_format = CompKvFormat::F16;
         let mut comp_kv_row_bytes = 0u32;
@@ -1227,13 +1283,13 @@ fn save_files(
             match &comp.comp_kv {
                 CompKvStore::F16(buf) => {
                     let ck_used_n = (comp.n_comp as usize) * (comp.head_dim as usize);
-                    scratch.stream_u16(buf, ck_used_n, &mut comp_kv_blob)?;
+                    scratch.stream_u16(buf, ck_used_n, &mut blobs.comp_kv)?;
                     comp_kv_format = CompKvFormat::F16;
                     comp_kv_row_bytes = comp.head_dim * 2;
                 }
                 CompKvStore::Fp8 { rows, .. } => {
                     let ck_used_b = (comp.n_comp as usize) * FP8_KV_ROW_BYTES;
-                    scratch.stream_u8(rows, ck_used_b, &mut comp_kv_blob)?;
+                    scratch.stream_u8(rows, ck_used_b, &mut blobs.comp_kv)?;
                     comp_kv_format = CompKvFormat::Fp8E4m3B64;
                     comp_kv_row_bytes = FP8_KV_ROW_BYTES as u32;
                 }
@@ -1247,7 +1303,7 @@ fn save_files(
             if let Some(ik) = comp.index_k.as_ref() {
                 let used = (comp.n_index_comp as usize) * E2M1_KEY_ROW_BYTES;
                 if used > 0 {
-                    scratch.stream_u8(ik, used, &mut index_k_blob)?;
+                    scratch.stream_u8(ik, used, &mut blobs.index_k)?;
                 }
                 has_index_k = true;
                 n_index_k = comp.n_index_comp;
@@ -1256,8 +1312,8 @@ fn save_files(
             // exactly state_rows*width so no slicing needed.
             let n_state = comp.state_kv.len();
             igpu.set_current()?;
-            scratch.stream_f32(&comp.state_kv, n_state, &mut comp_state_blob)?;
-            scratch.stream_f32(&comp.state_score, n_state, &mut comp_state_blob)?;
+            scratch.stream_f32(&comp.state_kv, n_state, &mut blobs.comp_state)?;
+            scratch.stream_f32(&comp.state_score, n_state, &mut blobs.comp_state)?;
             (
                 true,
                 comp.n_comp,
@@ -1289,19 +1345,19 @@ fn save_files(
             match &icomp.comp_kv {
                 CompKvStore::F16(ibuf) => {
                     let ck_used_n = (icomp.n_comp as usize) * (icomp.head_dim as usize);
-                    scratch.stream_u16(ibuf, ck_used_n, &mut index_comp_kv_blob)?;
+                    scratch.stream_u16(ibuf, ck_used_n, &mut blobs.index_comp_kv)?;
                 }
                 CompKvStore::E2m1(rows) => {
                     let ck_used_b = (icomp.n_comp as usize) * E2M1_KEY_ROW_BYTES;
-                    scratch.stream_u8(rows, ck_used_b, &mut index_comp_kv_blob)?;
+                    scratch.stream_u8(rows, ck_used_b, &mut blobs.index_comp_kv)?;
                 }
                 CompKvStore::Fp8 { .. } => {
                     return Err(eyre!("snapshot.save: layer {li} indexer store cannot be FP8"));
                 }
             }
             let n_state = icomp.state_kv.len();
-            scratch.stream_f32(&icomp.state_kv, n_state, &mut index_comp_state_blob)?;
-            scratch.stream_f32(&icomp.state_score, n_state, &mut index_comp_state_blob)?;
+            scratch.stream_f32(&icomp.state_kv, n_state, &mut blobs.index_comp_state)?;
+            scratch.stream_f32(&icomp.state_score, n_state, &mut blobs.index_comp_state)?;
             (
                 true,
                 icomp.n_comp,
@@ -1340,15 +1396,31 @@ fn save_files(
     }
     // Restore dgpu as current (callers expect that).
     dgpu.set_current()?;
+    Ok(layers)
+}
 
+/// Finish the blob files of a snapshot and write its meta.json (LAST: a directory without one is never loaded).
+/// Returns (disk bytes, creation time).
+#[allow(clippy::too_many_arguments)]
+fn finish_files(
+    blobs: Blobs<BlobWriter>,
+    layers: Vec<PerLayerMeta>,
+    tokens_bytes: u64,
+    n_kv_max: u32,
+    token_count: usize,
+    image_spans: &[ImageSpan],
+    fingerprint: &ModelFingerprint,
+    dir: &Path,
+    session_id: Option<&str>,
+) -> eyre::Result<(u64, u64)> {
     // Finish the streamed blobs (kv.bin always exists, even if empty —
     // restore reads it unconditionally).
-    let kv_bytes = kv_blob.finish()?;
+    let kv_bytes = blobs.kv.finish()?;
     if kv_bytes == 0 {
         fs::write(dir.join("kv.bin"), b"")?;
     }
-    let comp_kv_bytes = comp_kv_blob.finish()?;
-    let comp_state_bytes = comp_state_blob.finish()?;
+    let comp_kv_bytes = blobs.comp_kv.finish()?;
+    let comp_state_bytes = blobs.comp_state.finish()?;
     // `index_k.bin` was NEVER finish()ed and neither it nor `index_comp_kv.bin`
     // fed `total_bytes` (2026-09-22 audit A7). Consequences, measured on the live
     // cache (416 entries): the index believed it held 99.92 GiB against a 100 GiB
@@ -1358,10 +1430,9 @@ fn save_files(
     // `index_k.bin`, which `load` silently degrades to `n_index_comp = 0`, i.e.
     // the dense-attention regression the v5->v6 note at the top of this file
     // measured. Bind both, and count both.
-    let index_comp_kv_bytes = index_comp_kv_blob.finish()?;
-    let index_k_bytes = index_k_blob.finish()?;
-    let _ = index_comp_state_blob.finish()?;
-    drop(scratch);
+    let index_comp_kv_bytes = blobs.index_comp_kv.finish()?;
+    let index_k_bytes = blobs.index_k.finish()?;
+    let _ = blobs.index_comp_state.finish()?;
 
     // Total disk bytes (including meta.json's eventual size — we
     // approximate by writing meta first and summing).
@@ -1369,8 +1440,8 @@ fn save_files(
     let mut meta = SnapshotMeta {
         format_version: FORMAT_VERSION,
         fingerprint: fingerprint.clone(),
-        token_count: tokens.len() as u32,
-        n_kv_max: state.n_kv_max,
+        token_count: token_count as u32,
+        n_kv_max,
         created_at_unix: now,
         last_used_unix: now,
         layers,
@@ -1379,7 +1450,7 @@ fn save_files(
         image_spans: image_spans.to_vec(),
         kv_epoch: KV_EPOCH,
     };
-    let mut total_bytes: u64 = tokens_bytes.len() as u64 + kv_bytes;
+    let mut total_bytes: u64 = tokens_bytes + kv_bytes;
     total_bytes += comp_kv_bytes;
     total_bytes += comp_state_bytes;
     total_bytes += index_comp_kv_bytes;
@@ -1390,6 +1461,309 @@ fn save_files(
     let meta_final = serde_json::to_vec_pretty(&meta).map_err(|e| eyre!("meta encode: {e}"))?;
     fs::write(dir.join("meta.json"), &meta_final)?;
     Ok((total_bytes, now))
+}
+
+// ---- ASYNC SAVE (`V41_SNAPSHOT_SAVE_ASYNC`, 10-14): the post-replay snapshot off the TTFT path ----
+//
+// `capture` does the device reads of `save` on the engine thread, at the point `save` ran (the prefill's scratch
+// state is quiescent and still the job's: nothing reads device memory after it returns), into HOST memory. The
+// `AsyncSaver`'s writer thread then hashes the key, writes the files into a PRIVATE `.tmp-` directory (meta.json
+// last) and hands the result back; the ENGINE thread commits it (`commit_dir`: renames) and indexes it at its next
+// `poll` / `drain`. So every rename / delete of an INDEXED directory (restore, eviction, same-key replacement) stays on
+// the engine thread, and a snapshot is never indexed before its files are complete. A crash in between leaves only a
+// `.tmp-<key>.a<n>-<pid>` directory, which `SnapshotIndex::load` deletes at the next start (`save_dir_is_stale`).
+
+/// A snapshot's device state in host memory (`capture`): exactly the bytes `save` streams to its blob files.
+pub struct SnapshotImage {
+    blobs: Blobs<Vec<u8>>,
+    layers: Vec<PerLayerMeta>,
+    n_kv_max: u32,
+}
+
+impl SnapshotImage {
+    /// Host bytes held.
+    pub fn bytes(&self) -> u64 {
+        self.blobs.bytes()
+    }
+}
+
+/// Copy the live prefix of `state` to host memory: the device reads of [`save`], synchronous, on the caller's thread
+/// (the same preconditions as `save`). Nothing is written to disk.
+pub fn capture(state: &HetModelState, dgpu: Device, igpu: Device) -> eyre::Result<SnapshotImage> {
+    if state.layers.len() != N_LAYER as usize {
+        return Err(eyre!("snapshot.capture: layer count {} != N_LAYER {}", state.layers.len(), N_LAYER));
+    }
+    let mut blobs = Blobs { kv: Vec::new(), comp_kv: Vec::new(), comp_state: Vec::new(), index_comp_kv: Vec::new(), index_comp_state: Vec::new(), index_k: Vec::new() };
+    let layers = read_layers(state, dgpu, igpu, &mut blobs)?;
+    Ok(SnapshotImage { blobs, layers, n_kv_max: state.n_kv_max })
+}
+
+/// Host bytes [`capture`] would hold for `state` (its live prefixes; no device read): the async saver's memory cap.
+pub fn image_bytes(state: &HetModelState) -> u64 {
+    let mut n = 0u64;
+    for layer in &state.layers {
+        n += (layer.n_raw.min(SWA_WINDOW) as u64) * (N_HEAD_DIM as u64) * 2;
+        if let Some(c) = &layer.compressor {
+            n += match &c.comp_kv {
+                CompKvStore::F16(_) => (c.n_comp as u64) * (c.head_dim as u64) * 2,
+                CompKvStore::Fp8 { .. } => (c.n_comp as u64) * FP8_KV_ROW_BYTES as u64,
+                CompKvStore::E2m1(_) => 0,
+            };
+            if c.index_k.is_some() {
+                n += (c.n_index_comp as u64) * E2M1_KEY_ROW_BYTES as u64;
+            }
+            n += (c.state_kv.len() as u64) * 8;
+        }
+        if let Some(c) = &layer.indexer_compressor {
+            n += match &c.comp_kv {
+                CompKvStore::F16(_) => (c.n_comp as u64) * (c.head_dim as u64) * 2,
+                CompKvStore::E2m1(_) => (c.n_comp as u64) * E2M1_KEY_ROW_BYTES as u64,
+                CompKvStore::Fp8 { .. } => 0,
+            };
+            n += (c.state_kv.len() as u64) * 8;
+        }
+    }
+    n
+}
+
+/// Write `image` as the files of one snapshot into `dir` (the same files `save_files` writes for the state it was
+/// captured from; meta.json last). Returns (disk bytes, creation time).
+fn write_image(
+    image: SnapshotImage,
+    tokens: &[i32],
+    image_spans: &[ImageSpan],
+    fingerprint: &ModelFingerprint,
+    dir: &Path,
+    session_id: Option<&str>,
+) -> eyre::Result<(u64, u64)> {
+    let tokens_bytes = token_ids_as_bytes(tokens);
+    fs::write(dir.join("tokens.bin"), &tokens_bytes)?;
+    let SnapshotImage { blobs, layers, n_kv_max } = image;
+    let mut files = Blobs::files(dir);
+    // One blob at a time, each freed once written (BlobWriter skips empty writes: a file exists iff non-empty).
+    for (src, dst) in [
+        (blobs.kv, &mut files.kv),
+        (blobs.comp_kv, &mut files.comp_kv),
+        (blobs.comp_state, &mut files.comp_state),
+        (blobs.index_comp_kv, &mut files.index_comp_kv),
+        (blobs.index_comp_state, &mut files.index_comp_state),
+        (blobs.index_k, &mut files.index_k),
+    ] {
+        dst.write(&src)?;
+    }
+    finish_files(files, layers, tokens_bytes.len() as u64, n_kv_max, tokens.len(), image_spans, fingerprint, dir, session_id)
+}
+
+/// One post-replay snapshot for the background writer.
+pub struct SaveRequest {
+    pub image: SnapshotImage,
+    pub tokens: Vec<i32>,
+    pub image_spans: Vec<ImageSpan>,
+    pub session_id: Option<String>,
+}
+
+/// The snapshot key of a token sequence (`blake3_decoded`), shareable with the writer thread.
+pub type SnapshotKeyFn = std::sync::Arc<dyn Fn(&[i32], &[ImageSpan]) -> [u8; 32] + Send + Sync>;
+
+/// The production key: BLAKE3 of the decoded bytes (as `save`).
+pub fn key_fn(vocab: std::sync::Arc<BpeVocab>, byte_decoder: HashMap<char, u8>) -> SnapshotKeyFn {
+    std::sync::Arc::new(move |tokens: &[i32], spans: &[ImageSpan]| blake3_decoded(tokens, spans, &vocab, &byte_decoder))
+}
+
+struct SaveJob {
+    req: SaveRequest,
+    seq: u64,
+    queued: std::time::Instant,
+}
+
+/// A written (not yet committed) snapshot.
+struct Written {
+    tmp: PathBuf,
+    old: PathBuf,
+    entry: IndexEntry,
+}
+
+struct SaveDone {
+    seq: u64,
+    result: eyre::Result<Written>,
+    bytes: u64,
+    tokens: usize,
+    wait_ms: u64,
+    write_ms: u64,
+}
+
+/// The background snapshot writer (see the section comment). Created idle: its thread starts at the first `submit`.
+/// Single writer, FIFO.
+pub struct AsyncSaver {
+    root: PathBuf,
+    fingerprint: ModelFingerprint,
+    key: SnapshotKeyFn,
+    worker: Option<(std::sync::mpsc::Sender<SaveJob>, std::sync::mpsc::Receiver<SaveDone>)>,
+    /// Submitted, not yet committed: seq -> the save's tokens (`drain_prefix_of`).
+    pending: BTreeMap<u64, Vec<i32>>,
+    in_flight_bytes: u64,
+    seq: u64,
+}
+
+impl AsyncSaver {
+    pub fn new(root: PathBuf, fingerprint: ModelFingerprint, key: SnapshotKeyFn) -> Self {
+        Self { root, fingerprint, key, worker: None, pending: BTreeMap::new(), in_flight_bytes: 0, seq: 0 }
+    }
+
+    /// Saves submitted and not yet committed.
+    pub fn in_flight(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Host bytes held by those saves.
+    pub fn in_flight_bytes(&self) -> u64 {
+        self.in_flight_bytes
+    }
+
+    /// Queue `req` for the writer thread (started on first use). On error nothing was queued.
+    pub fn submit(&mut self, req: SaveRequest) -> eyre::Result<()> {
+        if self.worker.is_none() {
+            let (jtx, jrx) = std::sync::mpsc::channel::<SaveJob>();
+            let (dtx, drx) = std::sync::mpsc::channel::<SaveDone>();
+            let (root, fingerprint, key) = (self.root.clone(), self.fingerprint.clone(), self.key.clone());
+            std::thread::Builder::new().name("snapshot-save".into()).spawn(move || {
+                while let Ok(job) = jrx.recv() {
+                    let t = std::time::Instant::now();
+                    let wait_ms = job.queued.elapsed().as_millis() as u64;
+                    let (bytes, tokens) = (job.req.image.bytes(), job.req.tokens.len());
+                    let seq = job.seq;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_job(&root, &fingerprint, &key, seq, job.req)))
+                        .unwrap_or_else(|_| Err(eyre!("snapshot writer panicked")));
+                    let done = SaveDone { seq, result, bytes, tokens, wait_ms, write_ms: t.elapsed().as_millis() as u64 };
+                    if dtx.send(done).is_err() {
+                        return;
+                    }
+                }
+            })?;
+            self.worker = Some((jtx, drx));
+        }
+        self.seq += 1;
+        let bytes = req.image.bytes();
+        let tokens = req.tokens.clone();
+        let job = SaveJob { req, seq: self.seq, queued: std::time::Instant::now() };
+        let (jtx, _) = self.worker.as_ref().expect("started above");
+        if jtx.send(job).is_err() {
+            self.worker = None;
+            return Err(eyre!("snapshot writer thread gone"));
+        }
+        self.pending.insert(self.seq, tokens);
+        self.in_flight_bytes += bytes;
+        Ok(())
+    }
+
+    /// Commit and index every save the writer has finished (non-blocking). Engine thread only.
+    pub fn poll(&mut self, index: &mut SnapshotIndex) -> usize {
+        let mut n = 0;
+        while !self.pending.is_empty() {
+            let Some((_, drx)) = self.worker.as_ref() else { break };
+            match drx.try_recv() {
+                Ok(done) => {
+                    self.finish(done, index);
+                    n += 1;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.lost();
+                    break;
+                }
+            }
+        }
+        n
+    }
+
+    /// Wait for every submitted save, committing and indexing each (when idle, at shutdown). Engine thread only.
+    pub fn drain(&mut self, index: &mut SnapshotIndex) -> usize {
+        self.drain_while(index, |_| true)
+    }
+
+    /// Wait (committing and indexing, in FIFO order) until no pending save's tokens are a prefix of `tokens`: before a
+    /// request's snapshot probe, so a save still being written that the probe could restore is not missed. Engine
+    /// thread only.
+    pub fn drain_prefix_of(&mut self, index: &mut SnapshotIndex, tokens: &[i32]) -> usize {
+        self.drain_while(index, |p| tokens.starts_with(p))
+    }
+
+    fn drain_while(&mut self, index: &mut SnapshotIndex, wanted: impl Fn(&[i32]) -> bool) -> usize {
+        let mut n = 0;
+        while self.pending.values().any(|t| wanted(t)) {
+            let Some((_, drx)) = self.worker.as_ref() else { break };
+            match drx.recv() {
+                Ok(done) => {
+                    self.finish(done, index);
+                    n += 1;
+                }
+                Err(_) => {
+                    self.lost();
+                    break;
+                }
+            }
+        }
+        n
+    }
+
+    /// The writer thread died: its unfinished saves are lost (their `.tmp-` dirs go at the next start).
+    fn lost(&mut self) {
+        tracing::error!(in_flight = self.pending.len(), "snapshot writer thread gone; its pending saves are dropped");
+        self.worker = None;
+        self.pending.clear();
+        self.in_flight_bytes = 0;
+    }
+
+    fn finish(&mut self, done: SaveDone, index: &mut SnapshotIndex) {
+        self.pending.remove(&done.seq);
+        self.in_flight_bytes = self.in_flight_bytes.saturating_sub(done.bytes);
+        let w = match done.result {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(error = %e, tokens = done.tokens, "multistream: snapshot.save (async) failed");
+                return;
+            }
+        };
+        let t = std::time::Instant::now();
+        if let Err(e) = commit_dir(&w.tmp, &w.entry.dir, &w.old) {
+            tracing::error!(error = %e, tokens = done.tokens, "multistream: snapshot.save (async) commit failed");
+            return;
+        }
+        let (hash, sid, disk_bytes) = (w.entry.hash, w.entry.session_id.clone(), w.entry.disk_bytes);
+        index.insert(w.entry);
+        if let Some(sid) = sid {
+            index.session_to_hash.insert(sid, hash);
+        }
+        tracing::info!(tokens = done.tokens, image_mib = done.bytes >> 20, disk_mib = disk_bytes >> 20, wait_ms = done.wait_ms,
+            write_ms = done.write_ms, commit_ms = t.elapsed().as_millis() as u64, "multistream: snapshot saved (async)");
+    }
+}
+
+/// The writer thread's work for one save: key, private directory, files (meta.json last). Not committed.
+fn write_job(root: &Path, fingerprint: &ModelFingerprint, key: &SnapshotKeyFn, seq: u64, req: SaveRequest) -> eyre::Result<Written> {
+    let SaveRequest { image, tokens, image_spans, session_id } = req;
+    let hash = key(&tokens, &image_spans);
+    let dir = root.join(hex::encode(hash));
+    // Unique per save (two saves of one key may be in flight, or a synchronous checkpoint of it); the `-<pid>` tail
+    // keeps `save_dir_is_stale` working.
+    let tag = format!("{}.a{seq}-{}", hex::encode(hash), std::process::id());
+    let tmp = root.join(format!("{SAVE_TMP_PREFIX}{tag}"));
+    let old = root.join(format!("{SAVE_OLD_PREFIX}{tag}"));
+    let _ = fs::remove_dir_all(&tmp);
+    let written = fs::create_dir_all(&tmp)
+        .map_err(eyre::Report::from)
+        .and_then(|()| write_image(image, &tokens, &image_spans, fingerprint, &tmp, session_id.as_deref()));
+    match written {
+        Ok((disk_bytes, now)) => Ok(Written {
+            tmp,
+            old,
+            entry: IndexEntry { hash, token_count: tokens.len() as u32, last_used_unix: now, disk_bytes, dir, session_id },
+        }),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Restore a snapshot into `state`. The caller must have already
@@ -2243,5 +2617,190 @@ mod retention_tests {
         running.update(b"more");
         whole.extend_from_slice(b"more");
         assert_eq!(*running.finalize().as_bytes(), *blake3::hash(&whole).as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod async_save_tests {
+    //! `V41_SNAPSHOT_SAVE_ASYNC`: the background writer, the engine-side commit, and the crash contract. Host only (a
+    //! hand-made `SnapshotImage`; `capture`'s device reads are `save`'s, shared through `read_layers`).
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn unique_root() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("deepstrix-async-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+    fn fp() -> ModelFingerprint {
+        ModelFingerprint {
+            n_layer: 1,
+            n_head_dim: 1,
+            vocab_size: 1,
+            token_embd_prefix_blake3: "x".into(),
+            tensor_directory_blake3: "y".into(),
+        }
+    }
+    fn key() -> SnapshotKeyFn {
+        std::sync::Arc::new(|t: &[i32], _: &[ImageSpan]| *blake3::hash(&token_ids_as_bytes(t)).as_bytes())
+    }
+    fn image(kv: usize, comp_state: usize, index_k: usize) -> SnapshotImage {
+        SnapshotImage {
+            blobs: Blobs {
+                kv: vec![1u8; kv],
+                comp_kv: Vec::new(),
+                comp_state: vec![2u8; comp_state],
+                index_comp_kv: Vec::new(),
+                index_comp_state: Vec::new(),
+                index_k: vec![3u8; index_k],
+            },
+            layers: Vec::new(),
+            n_kv_max: 64,
+        }
+    }
+    fn req(tokens: Vec<i32>, img: SnapshotImage, sid: Option<&str>) -> SaveRequest {
+        SaveRequest { image: img, tokens, image_spans: Vec::new(), session_id: sid.map(|s| s.to_string()) }
+    }
+    fn save_dirs(root: &Path) -> Vec<String> {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(SAVE_TMP_PREFIX) || n.starts_with(SAVE_OLD_PREFIX))
+            .collect()
+    }
+
+    #[test]
+    fn indexed_only_after_commit_with_complete_files() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        let mut saver = AsyncSaver::new(root.clone(), fp(), key());
+        let tokens = vec![5, 6, 7];
+        let hash = key()(&tokens, &[]);
+        let dir = root.join(hex::encode(hash));
+        saver.submit(req(tokens.clone(), image(4, 8, 3), Some("S"))).unwrap();
+        assert_eq!(saver.in_flight(), 1);
+        assert_eq!(saver.in_flight_bytes(), 15);
+        // Whatever the writer has done, the key's directory appears only at the engine-side commit.
+        assert!(!dir.exists(), "committed before poll/drain");
+        assert_eq!(idx.len(), 0);
+        assert_eq!(saver.drain(&mut idx), 1);
+        assert_eq!((saver.in_flight(), saver.in_flight_bytes()), (0, 0));
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.session_to_hash.get("S"), Some(&hash));
+        // The file contract `restore` relies on: kv.bin always, the other blobs iff non-empty, meta.json last.
+        let size = |n: &str| fs::metadata(dir.join(n)).map(|m| m.len()).ok();
+        assert_eq!(size("tokens.bin"), Some(12));
+        assert_eq!(size("kv.bin"), Some(4));
+        assert_eq!(size("comp_state.bin"), Some(8));
+        assert_eq!(size("index_k.bin"), Some(3));
+        assert_eq!(size("comp_kv.bin"), None);
+        assert_eq!(size("index_comp_kv.bin"), None);
+        assert_eq!(size("index_comp_state.bin"), None);
+        let meta: SnapshotMeta = serde_json::from_slice(&fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta.token_count, 3);
+        assert_eq!(meta.n_kv_max, 64);
+        assert_eq!(meta.session_id.as_deref(), Some("S"));
+        assert_eq!(meta.kv_epoch, KV_EPOCH);
+        let on_disk: u64 = ["tokens.bin", "kv.bin", "comp_state.bin", "index_k.bin", "meta.json"].iter().filter_map(|n| size(n)).sum();
+        // `disk_bytes` counts meta.json at its pre-`disk_bytes` size (as the synchronous save).
+        assert!(meta.disk_bytes <= on_disk && on_disk - meta.disk_bytes < 16, "disk_bytes {} vs {on_disk}", meta.disk_bytes);
+        assert!(save_dirs(&root).is_empty(), "leftover save dirs: {:?}", save_dirs(&root));
+        // A restart sees the same entry.
+        let again = SnapshotIndex::load(root.clone(), fp(), 1 << 40).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again.total_bytes(), idx.total_bytes());
+    }
+
+    #[test]
+    fn a_crash_before_commit_is_never_loaded() {
+        let root = unique_root();
+        let mut saver = AsyncSaver::new(root.clone(), fp(), key());
+        saver.submit(req(vec![1, 2], image(4, 0, 0), None)).unwrap();
+        // The writer finishes; the engine never commits (the process dies here): only the private dir exists.
+        let (_, drx) = saver.worker.as_ref().unwrap();
+        let done = drx.recv().unwrap();
+        let w = done.result.unwrap();
+        assert!(w.tmp.join("meta.json").exists(), "the writer wrote a complete private dir");
+        assert!(!w.entry.dir.exists());
+        let name = w.tmp.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with(SAVE_TMP_PREFIX) && name.ends_with(&format!("-{}", std::process::id())), "{name}");
+        // Our own pid is stale at load (a restart); a live other process's would be left alone.
+        assert_eq!(save_dir_is_stale(&name), Some(true));
+        if cfg!(target_os = "linux") {
+            assert_eq!(save_dir_is_stale(&format!("{SAVE_TMP_PREFIX}{}.a3-1", hex::encode([0u8; 32]))), Some(false));
+        }
+        let idx = SnapshotIndex::load(root.clone(), fp(), 1 << 40).unwrap();
+        assert_eq!(idx.len(), 0, "a save that never committed was indexed");
+        assert!(!w.tmp.exists(), "load deletes the uncommitted save");
+    }
+
+    #[test]
+    fn same_key_twice_replaces_and_counts_once() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        let mut saver = AsyncSaver::new(root.clone(), fp(), key());
+        saver.submit(req(vec![9, 9], image(4, 0, 0), Some("A"))).unwrap();
+        saver.submit(req(vec![9, 9], image(6, 0, 0), Some("A"))).unwrap();
+        assert_eq!(saver.drain(&mut idx), 2);
+        assert_eq!(idx.len(), 1);
+        let e = idx.by_hash.values().next().unwrap();
+        assert_eq!(fs::metadata(e.dir.join("kv.bin")).unwrap().len(), 6, "the later save wins");
+        assert_eq!(idx.total_bytes(), e.disk_bytes);
+        assert!(save_dirs(&root).is_empty(), "leftover save dirs: {:?}", save_dirs(&root));
+    }
+
+    #[test]
+    fn a_failed_write_indexes_nothing_and_frees_its_budget() {
+        let base = unique_root();
+        // The snapshot root is a FILE: the writer cannot create its private dir.
+        let root = base.join("not-a-dir");
+        fs::write(&root, b"x").unwrap();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        let mut saver = AsyncSaver::new(root.clone(), fp(), key());
+        saver.submit(req(vec![1], image(4, 0, 0), None)).unwrap();
+        assert_eq!(saver.drain(&mut idx), 1);
+        assert_eq!(idx.len(), 0);
+        assert_eq!((saver.in_flight(), saver.in_flight_bytes()), (0, 0));
+        // The writer survives a failed save.
+        let root2 = unique_root();
+        let mut saver2 = AsyncSaver::new(root2.clone(), fp(), key());
+        let mut idx2 = SnapshotIndex::new(root2, fp(), 1 << 40);
+        saver2.submit(req(vec![1], image(4, 0, 0), None)).unwrap();
+        saver2.submit(req(vec![2], image(4, 0, 0), None)).unwrap();
+        assert_eq!(saver2.drain(&mut idx2), 2);
+        assert_eq!(idx2.len(), 2);
+    }
+
+    #[test]
+    fn a_probe_waits_only_for_saves_it_could_restore() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        let mut saver = AsyncSaver::new(root.clone(), fp(), key());
+        saver.submit(req(vec![1, 2, 3], image(4, 0, 0), None)).unwrap();
+        // Not a prefix of [7, 8]: no wait (whatever the writer has done, nothing is committed by this call).
+        assert_eq!(saver.drain_prefix_of(&mut idx, &[7, 8]), 0);
+        assert_eq!(idx.len(), 0);
+        // A prefix of [1, 2, 3, 4]: waited for, committed, indexed.
+        assert_eq!(saver.drain_prefix_of(&mut idx, &[1, 2, 3, 4]), 1);
+        assert_eq!((idx.len(), saver.in_flight()), (1, 0));
+    }
+
+    #[test]
+    fn poll_never_blocks_and_commits_what_is_done() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        let mut saver = AsyncSaver::new(root.clone(), fp(), key());
+        assert_eq!(saver.poll(&mut idx), 0, "idle saver");
+        saver.submit(req(vec![4], image(4, 0, 0), None)).unwrap();
+        let t = std::time::Instant::now();
+        while saver.in_flight() > 0 {
+            saver.poll(&mut idx);
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "the writer never finished");
+            std::thread::yield_now();
+        }
+        assert_eq!(idx.len(), 1);
     }
 }

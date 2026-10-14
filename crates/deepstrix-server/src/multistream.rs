@@ -386,7 +386,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         None
     };
     let plain_lanes = PlainLanes::from_env(n_slots as usize, pipeline_min_rows());
-    let mut sched = Sched { loan, dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, interrupt_since: None, int_saved_since: Instant::now(), last_interrupt_end: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { loan, dsp, plain_lanes, trace: LiveTrace::default(), profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, head_out, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), group_hold: None, interrupt_since: None, int_saved_since: Instant::now(), last_interrupt_end: None, arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0, saver: None };
 
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
@@ -404,6 +404,8 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             trim_heap_and_log("host heap at idle");
         }
         if idle {
+            // Async snapshot saves finish and are indexed before the engine blocks (the next request's probe sees them).
+            sched.saves_drain(&mut state);
             // Clear `inflight` BEFORE blocking: the tick that finished the last
             // stream left it set, and the hang watchdog then aborted an IDLE
             // engine 30 min later (DEEPSTRIX_HANG_DEADLINE_MS) -- twice on
@@ -430,6 +432,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             }
             Some(EngineRequest::Shutdown { ack }) => {
                 sched.abort_all("server shutting down");
+                sched.saves_drain(&mut state);
                 if let Some(e) = state.embed.as_mut() {
                     e.fail_all("server shutting down");
                 }
@@ -873,6 +876,8 @@ struct Sched {
     /// Round-robin cursor over `prefills` for chunk ticks.
     rr: usize,
     tick: u64,
+    /// The background snapshot writer (`V41_SNAPSHOT_SAVE_ASYNC`): created at the first async save.
+    saver: Option<snapshot::AsyncSaver>,
 }
 
 /// A live perfetto trace of N decode steps (`knobs::PERFETTO_STEPS`):
@@ -991,6 +996,8 @@ impl Sched {
 
     /// One scheduler tick: a prefill chunk (or its start/finish) or a decode step.
     fn tick(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
+        // Finished async snapshot saves: committed and indexed here, on the engine thread.
+        self.saves_poll(state);
         // The drafter's async ring writes (`MsDspark::settle_writes`): before any
         // prefill / admission work blocks on the iGPU, so a write's fault is
         // charged to its slot, not to an unrelated request.
@@ -1336,6 +1343,15 @@ impl Sched {
     /// this fails).
     fn start_prefill(&mut self, state: &mut WorkerState, p: Pending, mut kv: v4flash_kernels::het::HetModelState, slot: u32) -> Result<Prefill, (Pending, v4flash_kernels::het::HetModelState, eyre::Report)> {
         let t0 = Instant::now();
+        // An async snapshot save still being written that this prompt could restore (its tokens are a prefix of the
+        // prompt's): wait for it and index it before the probe. Others keep writing.
+        if let Some(s) = self.saver.as_mut().filter(|s| s.in_flight() > 0) {
+            let t = Instant::now();
+            let n = s.drain_prefix_of(&mut state.snapshot_index, &p.req.tokens);
+            if n > 0 {
+                tracing::info!(saves = n, waited_ms = t.elapsed().as_millis() as u64, "multistream: waited for an async snapshot save before the probe");
+            }
+        }
         save_live_if_dirty(state);
         state.live = None;
         if let Err(e) = kv.reset_in_place(state.dgpu, state.igpu) { return Err((p, kv, e)); }
@@ -1700,7 +1716,7 @@ impl Sched {
         kv.restore_compressor_lending();
         // Snapshot the prompt (the legacy path saves here too, before the marker).
         flush_expert_stats(state);
-        if pf.prefilled_marker.is_none() {
+        if pf.prefilled_marker.is_none() && !(knobs::SNAPSHOT_SAVE_ASYNC.on() && self.save_async(state, &pf)) {
             let tokens_saved: Vec<i32> = pf.prefix.clone();
             match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
                 state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, pf.p.session_id.as_deref())) {
@@ -1713,6 +1729,65 @@ impl Sched {
             }
         }
         self.try_admit(state, pf, logits)
+    }
+
+    /// `V41_SNAPSHOT_SAVE_ASYNC`: the post-replay snapshot of `pf`'s prompt through the background writer. The device
+    /// reads run HERE (`snapshot::capture`, into host memory), at the point the synchronous save ran: `pf.kv` is the
+    /// job's own scratch state, quiescent after the replay, and goes back to `spare_states` only after admission, so
+    /// nothing can change it under the reads; the writer never touches the device. Returns false (the caller saves
+    /// synchronously, as before) when the capture would exceed `V41_SNAPSHOT_ASYNC_MAX_MB` with the saves in flight,
+    /// or the writer cannot take it; true when the save is queued, or the capture failed (logged, as a failed save).
+    fn save_async(&mut self, state: &mut WorkerState, pf: &Prefill) -> bool {
+        let need = snapshot::image_bytes(&pf.kv);
+        let held = self.saver.as_ref().map_or(0, |s| s.in_flight_bytes());
+        let cap = knobs::SNAPSHOT_ASYNC_MAX_MB.get().saturating_mul(1 << 20);
+        if held.saturating_add(need) > cap {
+            tracing::info!(need_mib = need >> 20, held_mib = held >> 20, cap_mib = cap >> 20, "multistream: async snapshot over the memory cap; saving synchronously");
+            return false;
+        }
+        let t = Instant::now();
+        let tokens: Vec<i32> = pf.prefix.clone();
+        let req = match checkpoint_spans(&pf.p.req.image_spans, tokens.len()).and_then(|image_spans| {
+            snapshot::capture(&pf.kv, state.dgpu, state.igpu).map(|image| snapshot::SaveRequest { image, tokens, image_spans, session_id: pf.p.session_id.clone() })
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "multistream: snapshot.capture failed");
+                return true;
+            }
+        };
+        let image_mib = req.image.bytes() >> 20;
+        let saver = self.saver.get_or_insert_with(|| {
+            snapshot::AsyncSaver::new(state.snapshot_index.root().to_path_buf(), state.model_fingerprint.clone(),
+                snapshot::key_fn(state.vocab.clone(), state.byte_decoder.clone()))
+        });
+        match saver.submit(req) {
+            Ok(()) => {
+                tracing::info!(slot = pf.slot, tokens = pf.prefix.len(), image_mib, capture_ms = t.elapsed().as_millis() as u64, in_flight = saver.in_flight(),
+                    "multistream: snapshot captured (async save queued)");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "multistream: async snapshot writer unavailable; saving synchronously");
+                false
+            }
+        }
+    }
+
+    /// Commit and index the async snapshot saves the writer has finished (non-blocking).
+    fn saves_poll(&mut self, state: &mut WorkerState) {
+        if let Some(s) = self.saver.as_mut().filter(|s| s.in_flight() > 0) {
+            s.poll(&mut state.snapshot_index);
+        }
+    }
+
+    /// Wait for every async snapshot save in flight and index it.
+    fn saves_drain(&mut self, state: &mut WorkerState) {
+        if let Some(s) = self.saver.as_mut().filter(|s| s.in_flight() > 0) {
+            let t = Instant::now();
+            let n = s.drain(&mut state.snapshot_index);
+            tracing::info!(saves = n, waited_ms = t.elapsed().as_millis() as u64, "multistream: async snapshot saves drained");
+        }
     }
 
     /// Admit a prefilled request into the slot it reserved before its prefill

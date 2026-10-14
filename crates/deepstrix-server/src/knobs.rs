@@ -179,6 +179,17 @@ v4flash_kernels::knobs! {
     /// stream 1.033x, aggregate +22.6%); 1 = a lone stream only.
     pub static MS_DSPARK_STREAMS = Knob::int("V41_MS_DSPARK_STREAMS", 2, 1, 2).live();
 
+    // ---- prompt snapshots (multistream)
+    /// `V41_SNAPSHOT_SAVE_ASYNC` (default off; LIVE, read at each prefill's end): the post-replay snapshot of a prompt
+    /// leaves the TTFT path. The device reads stay where `snapshot::save` ran (`snapshot::capture`, host memory, before
+    /// the request is admitted and its scratch state reused); the key hash, the files and the meta go to a background
+    /// writer (a private `.tmp-` dir), and the engine thread commits + indexes the snapshot at its next tick (waits for
+    /// it before a snapshot lookup, when idle and at shutdown). Mid-prefill checkpoints stay synchronous.
+    pub static SNAPSHOT_SAVE_ASYNC = Knob::flag("V41_SNAPSHOT_SAVE_ASYNC", false).live();
+    /// `V41_SNAPSHOT_ASYNC_MAX_MB` (default 2048; LIVE): host memory the async saves may hold (captured, not yet
+    /// written); a save that would exceed it runs synchronously as before.
+    pub static SNAPSHOT_ASYNC_MAX_MB = Knob::int("V41_SNAPSHOT_ASYNC_MAX_MB", 2048, 0, 1 << 20).live();
+
     // ---- embed phase (docs/v41/EMBED_PHASE_DESIGN.md; static unless marked)
     /// `V41_EMBED_PHASE_TOKENS` (default 16384): max tokens in one embed
     /// phase. Sizes the dGPU loan.
@@ -262,7 +273,7 @@ mod tests {
             "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_ENGRAM_ASYNC", "V41_LM_LAYER_OUTER", "V41_LM_PREFETCH", "V41_LM_PREFETCH_AHEAD", "V41_LM_PREFETCH_LAST_ONLY", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL", "V41_LM_QUANTUM_LAYERS", "V41_LM_SEED_ASYNC",
             "V41_MOE_WMMA_F16", "V41_MS_BURST_SCALE", "V41_MS_CTX_CHECK", "V41_MS_DECODE_BURST_MIN_MS", "V41_MS_DECODE_BURST_MS", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPHS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
             "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_PREEMPT", "V41_MS_PREEMPT_FRESH_MS", "V41_MS_PREEMPT_GAP_MS", "V41_MS_PREEMPT_MAX_MS", "V41_MS_PREFILL_BURST_MIN_MS", "V41_MS_PREFILL_BURST_MS", "V41_MS_PROFILE", "V41_MS_PROFILE_SAMPLE", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_MTP_DEVICE_MARKOV", "V41_MTP_MHC_FAST", "V41_MTP_ROUTER_BATCHED", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS", "V41_PREFILL_B1_FILLER", "V41_PREFILL_COLD_ASYNC", "V41_PREFILL_COLD_ASYNC_RANGE", "V41_PREFILL_COLD_B1", "V41_PREFILL_COLD_B1_FRAC", "V41_PREFILL_COLD_B1_MAX", "V41_PREFILL_COLD_FORCE_LATE", "V41_PREFILL_COLD_LATE_MAX_LAYER", "V41_PREFILL_COLD_LATE_SKIP", "V41_PREFILL_PIN_INFLIGHT", "V41_PREFILL_SPLIT", "V41_PREFILL_SPLIT_PRIOR",
-            "V41_REMOTE_PARTIAL_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA", "V41_SUB_PROTECT",
+            "V41_REMOTE_PARTIAL_ASYNC", "V41_SNAPSHOT_ASYNC_MAX_MB", "V41_SNAPSHOT_SAVE_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA", "V41_SUB_PROTECT",
         ]);
         // The parses these knobs had before.
         let p = |k: &Knob, s: &str| k.kind.parse(s);
