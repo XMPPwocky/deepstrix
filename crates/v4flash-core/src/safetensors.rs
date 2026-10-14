@@ -123,6 +123,8 @@ pub struct SafetensorsDir {
     /// range from it concurrently with the head from `direct_files`, so ONE
     /// expert miss is served by two drives (box 2, 2026-09-22).
     mirror_files: Vec<Option<File>>,
+    /// `V41_EXPERT_MIRROR_DIR` as opened (`hedge_handles` opens its own handles there).
+    mirror_dir: Option<PathBuf>,
     shard_names: Vec<String>,
     tensors: HashMap<String, StTensor>,
 }
@@ -245,7 +247,7 @@ impl SafetensorsDir {
         if mirror_dir.is_some() {
             eprintln!("safetensors: expert mirror {} shards of {} usable from {}", mirror_files.iter().filter(|m| m.is_some()).count(), shard_names.len(), mirror_dir.as_ref().unwrap().display());
         }
-        Ok(Self { dir, files, direct_files, mirror_files, shard_names, tensors })
+        Ok(Self { dir, files, direct_files, mirror_files, mirror_dir, shard_names, tensors })
     }
 
     pub fn dir(&self) -> &Path {
@@ -535,9 +537,33 @@ impl SafetensorsDir {
         };
         let want_a = need.min(cut);
         let want_b = need.saturating_sub(cut);
+        // HEDGED head (`V41_EXPERT_HEDGE_MS`, `crate::hedge`): the primary's share on its own detached thread into an
+        // OWNED buffer; past the deadline the same range is read from the mirror too and the first answer is copied in.
+        let hedge = crate::hedge::expert_hedge().filter(|_| want_a > 0);
+        let read_head = |a: &mut [u8]| -> eyre::Result<()> {
+            let Some(d) = hedge else { return read_part(file, a, lo, want_a, "primary") };
+            let (pf, mf) = (file.try_clone()?, mirror.try_clone()?);
+            let (len, name) = (a.len(), format!("{} ({})", t.name, self.shard_names[t.shard]));
+            let n2 = name.clone();
+            let primary = move |_: usize| -> eyre::Result<crate::hedge::AlignedBuf> {
+                crate::hedge::test_primary_delay();
+                let mut b = crate::hedge::AlignedBuf::new(len)?;
+                crate::hedge::read_direct_exact(&pf, &mut b.as_mut_slice()[..len], lo, want_a).wrap_err_with(|| format!("hedged primary read of {name}"))?;
+                Ok(b)
+            };
+            let mirror_read = move |_: usize| -> eyre::Result<crate::hedge::AlignedBuf> {
+                let mut b = crate::hedge::AlignedBuf::new(len)?;
+                crate::hedge::read_direct_exact(&mf, &mut b.as_mut_slice()[..len], lo, want_a).wrap_err_with(|| format!("hedged mirror read of {n2}"))?;
+                Ok(b)
+            };
+            let (mut got, _) = crate::hedge::hedged(1, d, std::sync::Arc::new(primary), std::sync::Arc::new(mirror_read), &crate::hedge::EXPERT)?;
+            let b = got.pop().expect("one chunk");
+            a[..want_a].copy_from_slice(&b.as_slice()[..want_a]);
+            Ok(())
+        };
         let (ra, rb) = std::thread::scope(|sc| {
             let hb = (want_b > 0).then(|| sc.spawn(|| read_part(mirror, b, lo + cut as u64, want_b, "mirror")));
-            let ra = if want_a > 0 { read_part(file, a, lo, want_a, "primary") } else { Ok(()) };
+            let ra = if want_a > 0 { read_head(a) } else { Ok(()) };
             let rb = hb.map_or(Ok(()), |h| h.join().unwrap_or_else(|_| Err(eyre!("mirror reader panicked"))));
             (ra, rb)
         });
@@ -545,6 +571,42 @@ impl SafetensorsDir {
         rb?;
         dst.copy_from_slice(&buf[head..head + dst.len()]);
         Ok(true)
+    }
+
+    /// HEDGED READS (`crate::hedge`): OWNED handles for shard `shard` -- a duplicate of the primary's BUFFERED handle and
+    /// a fresh O_DIRECT handle on the mirror's same-named file -- that detached hedge threads can keep past the caller.
+    /// `None` without a mirror dir, or when the mirror file's size or safetensors HEADER bytes differ from the
+    /// primary's (then it is not a copy of this shard and must never answer for it).
+    pub fn hedge_handles(&self, shard: usize) -> eyre::Result<Option<(std::sync::Arc<File>, std::sync::Arc<File>)>> {
+        let Some(dir) = self.mirror_dir.as_ref() else { return Ok(None) };
+        let name = self.shard_names.get(shard).ok_or_else(|| eyre!("hedge: no shard {shard}"))?;
+        let (pp, mp) = (self.dir.join(name), dir.join(name));
+        let same_size = matches!((std::fs::metadata(&pp), std::fs::metadata(&mp)), (Ok(a), Ok(b)) if a.len() == b.len());
+        if !same_size {
+            return Ok(None);
+        }
+        let header = |path: &Path| -> eyre::Result<Vec<u8>> {
+            let mut f = File::open(path).wrap_err_with(|| format!("open {}", path.display()))?;
+            let mut n = [0u8; 8];
+            f.read_exact(&mut n)?;
+            let n = u64::from_le_bytes(n);
+            if n > 256 << 20 {
+                return Err(eyre!("{}: header length {n} is implausible", path.display()));
+            }
+            let mut h = vec![0u8; 8 + n as usize];
+            h[..8].copy_from_slice(&n.to_le_bytes());
+            f.read_exact(&mut h[8..])?;
+            Ok(h)
+        };
+        if header(&pp)? != header(&mp)? {
+            eprintln!("hedge: {} differs from its mirror's header; no hedged reads for it", name);
+            return Ok(None);
+        }
+        let primary = self.files[shard].try_clone().wrap_err("hedge: dup the primary handle")?;
+        let Ok(mirror) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&mp) else {
+            return Ok(None);
+        };
+        Ok(Some((std::sync::Arc::new(primary), std::sync::Arc::new(mirror))))
     }
 
     /// Tell the kernel this tensor's byte range is read RANDOMLY, so it stops

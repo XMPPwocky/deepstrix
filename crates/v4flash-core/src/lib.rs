@@ -9,6 +9,7 @@ pub mod engram_hash;
 pub mod engram_table;
 pub mod gguf;
 pub mod gguf_write;
+pub mod hedge;
 pub mod hf_v41;
 pub mod io_throttle;
 pub mod heap;

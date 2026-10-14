@@ -2885,8 +2885,30 @@ impl Sched {
             v4flash_kernels::het::evtrace::emit(k, &v);
             v4flash_kernels::het::evtrace_kinds::clear_step();
         }
+        log_hedges(step_id);
         Ok(())
     }
+}
+
+/// Every `HEDGE_LOG_STEPS` decode steps, if any hedged read fired since the last line: the hedge counters of both sites
+/// (`v4flash_core::hedge`: Engram row gathers, expert weight-plane reads), deltas since the last line.
+const HEDGE_LOG_STEPS: u64 = 1000;
+fn log_hedges(step: u64) {
+    static LAST: std::sync::Mutex<([u64; 7], [u64; 7])> = std::sync::Mutex::new(([0; 7], [0; 7]));
+    if step % HEDGE_LOG_STEPS != 0 {
+        return;
+    }
+    let (e, x) = (v4flash_core::hedge::ENGRAM.snapshot(), v4flash_core::hedge::EXPERT.snapshot());
+    let Ok(mut last) = LAST.lock() else { return };
+    let d = |a: [u64; 7], b: [u64; 7]| -> [u64; 7] { std::array::from_fn(|i| a[i].saturating_sub(b[i])) };
+    let (de, dx) = (d(e, last.0), d(x, last.1));
+    *last = (e, x);
+    if de[1] == 0 && dx[1] == 0 && de[5] == 0 && dx[5] == 0 {
+        return;
+    }
+    tracing::info!(steps = HEDGE_LOG_STEPS, engram_calls = de[0], engram_fired = de[1], engram_chunks = de[2], engram_won_primary = de[3],
+        engram_won_mirror = de[4], engram_rescued = de[5], engram_cap_skips = de[6], expert_calls = dx[0], expert_fired = dx[1],
+        expert_won_primary = dx[3], expert_won_mirror = dx[4], expert_rescued = dx[5], expert_cap_skips = dx[6], "b1 hedged reads");
 }
 
 /// The image spans of the saved prefix `[0, n)`. A cut that straddles an image
@@ -3208,7 +3230,12 @@ fn gather_engram_table(
     let mut out = vec![0f32; b * ein];
     let flat: Vec<i64> = live.iter().flat_map(|(_, h)| h[li]).collect();
     let mut tmp = vec![0f32; live.len() * ein];
-    ec.tables[li].gather(&ec.st, &flat, &mut tmp, engram_threads())?;
+    // HEDGED (`V41_ENGRAM_HEDGE_MS`, live, 0 = off): row misses the primary (E100) has not answered within the deadline
+    // are re-read from the mirror copy, first answer wins (same bytes: bit-identical rows). Off: the plain gather.
+    match knobs::ENGRAM_HEDGE_MS.get() {
+        0 => ec.tables[li].gather(&ec.st, &flat, &mut tmp, engram_threads())?,
+        ms => ec.tables[li].gather_hedged(&ec.st, &flat, &mut tmp, engram_threads(), Some(std::time::Duration::from_millis(ms)))?,
+    }
     for (k, (r, _)) in live.iter().enumerate() {
         out[r * ein..(r + 1) * ein].copy_from_slice(&tmp[k * ein..(k + 1) * ein]);
     }

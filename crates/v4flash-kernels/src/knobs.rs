@@ -1059,6 +1059,17 @@ crate::knobs! {
     /// `V41_PREFILL_COLD_LATE_SKIP` (GATE ONLY, default off; live): the late join lands its reads and pushes but SKIPS
     /// the late MoE pass and its add -- the negative control: a missing contribution the gate must catch.
     pub static PREFILL_COLD_LATE_SKIP = Knob::flag("V41_PREFILL_COLD_LATE_SKIP", false).live();
+    /// `V41_EXPERT_HEDGE_MS` (default 0 = off; live, pushed into `v4flash_core::hedge` by its hook): an expert
+    /// weight-plane read through the striped mirror path (`read_range_into_direct_mirrored`, `V41_EXPERT_MIRROR_LAYOUT`)
+    /// whose PRIMARY (E100) share is not back within this many ms is read from the mirror copy too, first answer wins
+    /// (same bytes: bit-identical). Against the E100's ~1 Hz ~100 ms read pauses (10-14 decode-spike analysis);
+    /// suggested 15 (normal reads are well under it). At most `hedge::MAX_HEDGES_IN_FLIGHT` hedges outstanding.
+    pub static EXPERT_HEDGE_MS = Knob::int("V41_EXPERT_HEDGE_MS", 0, 0, 10_000).live().hook(expert_hedge_hook);
+}
+
+/// Pushes `V41_EXPERT_HEDGE_MS` into the core read path (it cannot read this crate's knobs).
+fn expert_hedge_hook(k: &Knob) {
+    v4flash_core::hedge::set_expert_hedge_ms(k.get());
 }
 
 #[cfg(test)]

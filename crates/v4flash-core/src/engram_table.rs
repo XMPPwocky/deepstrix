@@ -141,6 +141,19 @@ pub struct EngramTable {
     pub cache_misses: std::sync::atomic::AtomicU64,
     /// Stats line at most once a minute (`gather`).
     last_log: std::sync::Mutex<std::time::Instant>,
+    /// HEDGED gathers (`gather_hedged`): owned handles on both copies of the weight / scale shards, opened at the first
+    /// hedged gather (`None` inside = no usable mirror: plain reads).
+    hedge_files: std::sync::OnceLock<Option<std::sync::Arc<HedgeFiles>>>,
+}
+
+/// Both copies of a table's two tensors (`SafetensorsDir::hedge_handles`) and their absolute offsets.
+struct HedgeFiles {
+    w_primary: std::sync::Arc<std::fs::File>,
+    w_mirror: std::sync::Arc<std::fs::File>,
+    s_primary: std::sync::Arc<std::fs::File>,
+    s_mirror: std::sync::Arc<std::fs::File>,
+    w_off: u64,
+    s_off: u64,
 }
 
 impl EngramTable {
@@ -183,12 +196,53 @@ impl EngramTable {
             cache_hits: std::sync::atomic::AtomicU64::new(0),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             last_log: std::sync::Mutex::new(std::time::Instant::now()),
+            hedge_files: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The table's hedge handles (first call opens them; `None` = no usable mirror copy).
+    fn hedge_files(&self, st: &SafetensorsDir) -> Option<std::sync::Arc<HedgeFiles>> {
+        self.hedge_files
+            .get_or_init(|| {
+                let open = || -> eyre::Result<Option<HedgeFiles>> {
+                    let (Some((w_primary, w_mirror)), Some((s_primary, s_mirror))) = (st.hedge_handles(self.weight.shard)?, st.hedge_handles(self.scale.shard)?) else {
+                        return Ok(None);
+                    };
+                    Ok(Some(HedgeFiles { w_primary, w_mirror, s_primary, s_mirror, w_off: self.weight.offset, s_off: self.scale.offset }))
+                };
+                match open() {
+                    Ok(Some(h)) => {
+                        eprintln!("engram L{}: hedged reads ready (mirror copies of {} / {})", self.layer, st.shard_name(self.weight.shard), st.shard_name(self.scale.shard));
+                        Some(std::sync::Arc::new(h))
+                    }
+                    Ok(None) => {
+                        eprintln!("engram L{}: no usable mirror copy: hedged gathers read the primary only", self.layer);
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("engram L{}: hedge handles: {e:#}; hedged gathers read the primary only", self.layer);
+                        None
+                    }
+                }
+            })
+            .clone()
+    }
+
+    /// [`Self::gather`] for a DECODE step, with HEDGED disk reads (`V41_ENGRAM_HEDGE_MS`, `crate::hedge`): row misses
+    /// not read from the primary within `hedge` are re-read from the mirror copy and the first answer is used (same
+    /// bytes either way: bit-identical rows). `None`, no row cache (`ENGRAM_CACHE_ROWS=0`) or no usable mirror ->
+    /// exactly `gather`.
+    pub fn gather_hedged(&self, st: &SafetensorsDir, ids: &[i64], out: &mut [f32], threads: usize, hedge: Option<std::time::Duration>) -> eyre::Result<()> {
+        self.gather_impl(st, ids, out, threads, hedge)
     }
 
     /// Gather + dequantise `ids.len()` rows into `out` (`ids.len() * 256` f32),
     /// `threads` concurrent preads (each row is two small reads: 256 B + 8 B).
     pub fn gather(&self, st: &SafetensorsDir, ids: &[i64], out: &mut [f32], threads: usize) -> eyre::Result<()> {
+        self.gather_impl(st, ids, out, threads, None)
+    }
+
+    fn gather_impl(&self, st: &SafetensorsDir, ids: &[i64], out: &mut [f32], threads: usize, hedge: Option<std::time::Duration>) -> eyre::Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -240,7 +294,10 @@ impl EngramTable {
                 need.dedup();
                 self.cache_misses.fetch_add(need.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 let mut fetched = vec![0u8; need.len() * RAW_ROW];
-                self.read_raw(st, &need, &mut fetched, threads)?;
+                match hedge.and_then(|d| self.hedge_files(st).map(|h| (d, h))) {
+                    Some((d, h)) => Self::read_raw_hedged(h, &need, &mut fetched, threads, d)?,
+                    None => self.read_raw(st, &need, &mut fetched, threads)?,
+                }
                 for &k in &miss_at {
                     let j = need.binary_search(&ids[k]).expect("every miss was fetched");
                     raw[k * RAW_ROW..(k + 1) * RAW_ROW].copy_from_slice(&fetched[j * RAW_ROW..(j + 1) * RAW_ROW]);
@@ -303,6 +360,46 @@ impl EngramTable {
             handles.into_iter().map(|h| h.join().expect("engram read thread panicked")).collect()
         });
         results.into_iter().collect::<eyre::Result<Vec<()>>>()?;
+        Ok(())
+    }
+
+    /// `read_raw` HEDGED: the same `threads`-way chunking, each chunk read from the primary (buffered, as `read_raw`) on
+    /// its own detached thread into an owned buffer; chunks not back within `hedge` are read again from the mirror
+    /// (O_DIRECT, 4 KiB-aligned bounce per row: the mirror's pages stay out of the page cache) and the first answer is
+    /// copied into `dst` (`crate::hedge::hedged`).
+    fn read_raw_hedged(h: std::sync::Arc<HedgeFiles>, ids: &[i64], dst: &mut [u8], threads: usize, hedge: std::time::Duration) -> eyre::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let threads = threads.clamp(1, ids.len().max(1));
+        let per = ids.len().div_ceil(threads);
+        let chunks: std::sync::Arc<Vec<Vec<i64>>> = std::sync::Arc::new(ids.chunks(per).map(|c| c.to_vec()).collect());
+        let (hp, cp) = (h.clone(), chunks.clone());
+        let primary = move |i: usize| -> eyre::Result<Vec<u8>> {
+            crate::hedge::test_primary_delay();
+            let c = &cp[i];
+            let mut v = vec![0u8; c.len() * RAW_ROW];
+            for (&id, row) in c.iter().zip(v.chunks_exact_mut(RAW_ROW)) {
+                let (w, s) = row.split_at_mut(ENGRAM_ROW_DIM);
+                hp.w_primary.read_exact_at(w, hp.w_off + id as u64 * ENGRAM_ROW_BYTES).map_err(|e| eyre!("engram primary row {id}: {e}"))?;
+                hp.s_primary.read_exact_at(s, hp.s_off + id as u64 * ENGRAM_SCALE_BYTES).map_err(|e| eyre!("engram primary scale {id}: {e}"))?;
+            }
+            Ok(v)
+        };
+        let (hm, cm) = (h, chunks.clone());
+        let mirror = move |i: usize| -> eyre::Result<Vec<u8>> {
+            let c = &cm[i];
+            let mut v = vec![0u8; c.len() * RAW_ROW];
+            let mut sc = crate::hedge::AlignedBuf::new(2 * crate::hedge::AlignedBuf::ALIGN)?;
+            for (&id, row) in c.iter().zip(v.chunks_exact_mut(RAW_ROW)) {
+                let (w, s) = row.split_at_mut(ENGRAM_ROW_DIM);
+                crate::hedge::read_direct_small(&hm.w_mirror, hm.w_off + id as u64 * ENGRAM_ROW_BYTES, w, &mut sc)?;
+                crate::hedge::read_direct_small(&hm.s_mirror, hm.s_off + id as u64 * ENGRAM_SCALE_BYTES, s, &mut sc)?;
+            }
+            Ok(v)
+        };
+        let (parts, _) = crate::hedge::hedged(chunks.len(), hedge, std::sync::Arc::new(primary), std::sync::Arc::new(mirror), &crate::hedge::ENGRAM)?;
+        for (part, d) in parts.iter().zip(dst.chunks_mut(per * RAW_ROW)) {
+            d.copy_from_slice(part);
+        }
         Ok(())
     }
 
