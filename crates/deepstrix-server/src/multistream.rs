@@ -163,6 +163,18 @@ struct Prefill {
     /// time since it started -- a job waiting through a decode phase does not age (docs/v41/MS_PREFILL_PREEMPT_DESIGN.md
     /// 3.2). FRESH while below `V41_MS_PREEMPT_FRESH_MS`.
     service: std::time::Duration,
+    /// LONG job (`long_job`): `V41_LONG_PREFILL_TOKENS` (live) read ONCE, when the job starts; every unit of the job
+    /// (chunks / windows, finish, replay) runs with this flag (`remote_set_long_job`), so a knob flip mid-job never
+    /// splits one job between the two regimes.
+    long_job: bool,
+}
+
+/// Whether a prefill job of `total` tokens is LONG under `V41_LONG_PREFILL_TOKENS = long_min`: strictly MORE tokens
+/// than the knob (a job of exactly `long_min` tokens is not long); 0 = never. A long job flags its box-2 requests
+/// `REQ_FLAG_LONG_JOB` and builds the frozen prefill split (`build_prefill_split`), which also turns the
+/// `V41_PREFILL_COLD_B1=short` cold reads off for it.
+fn long_job(total: usize, long_min: u64) -> bool {
+    long_min > 0 && total as u64 > long_min
 }
 
 /// A prefill job's Engram rows gathered ahead (2026-10-01): a long prefill
@@ -1456,7 +1468,8 @@ impl Sched {
             Ok(v) => v,
             Err(e) => return Err((p, kv, e)),
         };
-        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, prefilled_marker, engram_ahead: EngramAhead::default(), service: std::time::Duration::ZERO };
+        let long_job = long_job(job.total(), crate::knobs::LONG_PREFILL_TOKENS.get());
+        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, prefilled_marker, engram_ahead: EngramAhead::default(), service: std::time::Duration::ZERO, long_job };
         if prefilled_marker.is_some() {
             pf.p.trailing_marker = None; // consumed (`admit_stream` reads `prefilled_marker`)
         }
@@ -1607,9 +1620,8 @@ impl Sched {
         if let Err(e) = self.lend_loan(state) {
             return Err((Some(pf.kv), e));
         }
-        // Every unit of the job (chunks, finish, replay) says whether it is long.
-        let long_min = crate::knobs::LONG_PREFILL_TOKENS.get() as usize;
-        state.engine.remote_set_long_job(long_min > 0 && pf.job.total() > long_min);
+        // Every unit of the job (chunks, finish, replay) says whether it is long (latched at the job's start).
+        state.engine.remote_set_long_job(pf.long_job);
         if !pf.job.chunks_done() {
             let t = Instant::now();
             if let Some(pg) = state.pager.as_mut() {
@@ -1822,7 +1834,7 @@ impl Sched {
         }
         if let Err(e) = self.arena.fill_reserved(slot, &pf.kv, pos, &state.engine.dgpu.compute) { return Err((Some(pf.kv), e)); }
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
-        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, prefilled_marker, engram_ahead: _, service: _ } = pf;
+        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, prefilled_marker, engram_ahead: _, service: _, long_job: _ } = pf;
         self.spare_states.push(kv_done);
         let pf = PrefillDone { p: pp, job, prefix, compressed, started, prefilled_marker };
         self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
@@ -2925,6 +2937,28 @@ fn restore_candidates<H: PartialEq, D>(session: Option<(usize, H, D)>, walk: Opt
         (Some(a), Some(b)) if a.0 >= b.0 => vec![a, b],
         (Some(a), Some(b)) => vec![b, a],
         (a, b) => a.into_iter().chain(b).collect(),
+    }
+}
+
+#[cfg(test)]
+mod long_job_tests {
+    use super::long_job;
+
+    #[test]
+    fn long_is_strictly_more_tokens_and_zero_is_never() {
+        // The production value (4096) and the code default (16384): the boundary job is NOT long.
+        assert!(!long_job(4096, 4096));
+        assert!(long_job(4097, 4096));
+        assert!(!long_job(16384, 16384));
+        assert!(long_job(16385, 16384));
+        assert!(!long_job(1 << 30, 0), "0 = never");
+        assert!(!long_job(0, 1));
+    }
+
+    #[test]
+    fn the_knob_is_live() {
+        assert!(crate::knobs::LONG_PREFILL_TOKENS.live);
+        assert_eq!(crate::knobs::LONG_PREFILL_TOKENS.kind.parse("8192"), Some(8192));
     }
 }
 

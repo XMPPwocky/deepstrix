@@ -145,10 +145,12 @@ v4flash_kernels::knobs! {
     /// filled in when the stream drafts (`ms_dspark::Backlog`, KNOWN_BUGS #57);
     /// off = the seed is written at once and unwritten rows are dropped.
     pub static MS_DSPARK_FILL = Knob::flag("V41_MS_DSPARK_FILL", true);
-    /// `V41_LONG_PREFILL_TOKENS` (default 16384): a prefill job longer than this
-    /// flags its box-2 requests `REQ_FLAG_LONG_JOB` (box 2's phase keeps the
-    /// job's experts: `knobs::prefill_budget_long` there); 0 = never.
-    pub static LONG_PREFILL_TOKENS = Knob::int("V41_LONG_PREFILL_TOKENS", 16384, 0, u32::MAX as u64);
+    /// `V41_LONG_PREFILL_TOKENS` (default 16384; LIVE since 10-14, read once per prefill job when it starts,
+    /// `multistream::long_job`): a prefill job of MORE tokens than this is LONG -- it flags its box-2 requests
+    /// `REQ_FLAG_LONG_JOB` (box 2's phase keeps the job's experts: `knobs::prefill_budget_long` there) and builds the
+    /// frozen encoder expert split (`build_prefill_split`, with `V41_PREFILL_SPLIT`), which also turns
+    /// `V41_PREFILL_COLD_B1=short` off for the job; 0 = never.
+    pub static LONG_PREFILL_TOKENS = Knob::int("V41_LONG_PREFILL_TOKENS", 16384, 0, u32::MAX as u64).live();
     /// `V41_MS_DSPARK_MIN_GAIN` (default 1.0): the stage-1 back-off bar.
     pub static MS_DSPARK_MIN_GAIN = Knob::real("V41_MS_DSPARK_MIN_GAIN", 1.0, 0.0, 1e9);
     /// `V41_MS_DSPARK_EXPLORE` (default 1/32): `ms_dspark::explore_p`.
@@ -257,7 +259,9 @@ mod tests {
         // split's placement knobs (read at each hot-set refresh; the holder
         // switch, the replicated leg and its cost model per route), and the dGPU
         // fusion switches G1 / G2 / G3 / G4 / G6 (read per decode lane-layer; default off) and G3's kernel
-        // choice (read per G3 launch; default the round-1 kernel).
+        // choice (read per G3 launch; default the round-1 kernel), and (10-14) the range-pass late reads (read per
+        // prefill range pass), the async snapshot save and its memory cap (read per prefill finish), and the long-job
+        // threshold (read once per prefill job).
         let mut live: Vec<&str> = all.iter().filter(|k| k.live).map(|k| k.name).collect();
         live.sort();
         assert_eq!(live, [
@@ -270,7 +274,7 @@ mod tests {
             "V41_B2_MISS_PREFETCH", "V41_B2_MISS_PREFETCH_CAP", "V41_B2_MISS_PREFETCH_MARGIN", "V41_B2_MISS_PREFETCH_MAX_PER_LL_X10",
             "V41_B2_MISS_PREFETCH_MAX_WORDS_STEP", "V41_B2_MISS_PREFETCH_RANK", "V41_B2_NURSERY_PRIOR", "V41_B2_PIN_PREFILL_BAND",
             "V41_B2_SOFT_HINT", "V41_B2_SOFT_MAP", "V41_B2_SOFT_PRIOR", "V41_B2_SPEC_BUDGET", "V41_DGPU_COMBINE3", "V41_DGPU_ENGRAM_ASYNC", "V41_DGPU_G1_FUSED", "V41_DGPU_G4_SHARED", "V41_DGPU_G6_BOUNDARY", "V41_DGPU_QKV_FRONT", "V41_DGPU_ROUTER_X2", "V41_DGPU_ZC_MULTI_SPEC", "V41_DGPU_ZC_PUSH",
-            "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_ENGRAM_ASYNC", "V41_LM_LAYER_OUTER", "V41_LM_PREFETCH", "V41_LM_PREFETCH_AHEAD", "V41_LM_PREFETCH_LAST_ONLY", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL", "V41_LM_QUANTUM_LAYERS", "V41_LM_SEED_ASYNC",
+            "V41_EMBED_FAULT_LAYER", "V41_EMBED_MAX_SHARE", "V41_EMBED_VERIFY", "V41_EVTRACE_DEV", "V41_LM_ENGRAM_ASYNC", "V41_LM_LAYER_OUTER", "V41_LM_PREFETCH", "V41_LM_PREFETCH_AHEAD", "V41_LM_PREFETCH_LAST_ONLY", "V41_LM_PREFETCH_PER_REQ", "V41_LM_PREFILL", "V41_LM_QUANTUM_LAYERS", "V41_LM_SEED_ASYNC", "V41_LONG_PREFILL_TOKENS",
             "V41_MOE_WMMA_F16", "V41_MS_BURST_SCALE", "V41_MS_CTX_CHECK", "V41_MS_DECODE_BURST_MIN_MS", "V41_MS_DECODE_BURST_MS", "V41_MS_DSPARK_STREAMS", "V41_MS_ENGRAM_THREADS", "V41_MS_GRAPHS", "V41_MS_GRAPH_KEYS", "V41_MS_HEAD_CANDS", "V41_MS_LANES_LEARNED",
             "V41_MS_PIPELINE_MIN_ROWS", "V41_MS_PREEMPT", "V41_MS_PREEMPT_FRESH_MS", "V41_MS_PREEMPT_GAP_MS", "V41_MS_PREEMPT_MAX_MS", "V41_MS_PREFILL_BURST_MIN_MS", "V41_MS_PREFILL_BURST_MS", "V41_MS_PROFILE", "V41_MS_PROFILE_SAMPLE", "V41_MS_SPEC_LANES", "V41_MS_TAINT_PROBE", "V41_MTP_DEVICE_MARKOV", "V41_MTP_MHC_FAST", "V41_MTP_ROUTER_BATCHED", "V41_PERFETTO_KERNELS", "V41_PERFETTO_STEPS", "V41_PREFILL_B1_FILLER", "V41_PREFILL_COLD_ASYNC", "V41_PREFILL_COLD_ASYNC_RANGE", "V41_PREFILL_COLD_B1", "V41_PREFILL_COLD_B1_FRAC", "V41_PREFILL_COLD_B1_MAX", "V41_PREFILL_COLD_FORCE_LATE", "V41_PREFILL_COLD_LATE_MAX_LAYER", "V41_PREFILL_COLD_LATE_SKIP", "V41_PREFILL_PIN_INFLIGHT", "V41_PREFILL_SPLIT", "V41_PREFILL_SPLIT_PRIOR",
             "V41_REMOTE_PARTIAL_ASYNC", "V41_SNAPSHOT_ASYNC_MAX_MB", "V41_SNAPSHOT_SAVE_ASYNC", "V41_SUB_DEFER_ACCEPTED", "V41_SUB_LAMBDA", "V41_SUB_PROTECT",
