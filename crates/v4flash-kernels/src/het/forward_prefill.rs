@@ -1314,14 +1314,10 @@ impl HeterogeneousEngine {
             return None;
         }
         let pg = pager?;
-        // `V41_B1_PROTECT_OWNED`: the filler also leaves room for the non-owned experts box 1 holds now and ~2 slots per
-        // layer, so a long job's share fits the genuinely spare slots (sized to the free slots exactly, it evicted owned
-        // ones: 10-14 decode-spike analysis).
-        let reserve = if crate::knobs::B1_PROTECT_OWNED.on() {
-            pg.resident_count_where(&|l, e| super::expert_pager::hot_set::box1_owns(l, e) != Some(true)) + ps::PROTECT_HEADROOM_PER_LAYER * crate::config::N_LAYER as usize
-        } else {
-            0
-        };
+        // `V41_B1_PROTECT_OWNED`: the filler leaves ~2 slots per layer of headroom (sized to the free slots EXACTLY, its
+        // reads evicted owned experts: 10-14 decode-spike analysis). Resident NON-owned experts are not reserved: they
+        // are what the filler reuses, and protected claims never evict owned ones anyway (review r2 #6).
+        let reserve = if crate::knobs::B1_PROTECT_OWNED.on() { ps::PROTECT_HEADROOM_PER_LAYER * crate::config::N_LAYER as usize } else { 0 };
         let cfg = ps::SplitCfg {
             lru_slots: pg.lru_slots(),
             reserve,

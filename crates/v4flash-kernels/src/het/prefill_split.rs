@@ -98,8 +98,8 @@ fn mix(layer: usize, e: usize) -> u64 {
 pub struct SplitCfg {
     /// Hub LRU slots (`n_slots - lru_lo`): what decode-hot ids and the prefill share compete for.
     pub lru_slots: usize,
-    /// Slots the filler must also leave alone (`V41_B1_PROTECT_OWNED`: box 1's resident NON-owned experts +
-    /// `PROTECT_HEADROOM_PER_LAYER` per layer); 0 = the original sizing.
+    /// Slots the filler must also leave alone (`V41_B1_PROTECT_OWNED`: `PROTECT_HEADROOM_PER_LAYER` per layer); 0 = the
+    /// original sizing.
     pub reserve: usize,
     /// Ceiling on the per-layer filler (`filler_max()`).
     pub filler_max: usize,
@@ -326,11 +326,13 @@ mod tests {
         // interleave 115 x 40 = 4,600 owned of 5,425 => 825 free => 41/layer (the production 41-43, 10-14) ...
         let base = SplitCfg { reserve: 0, lru_slots: 5425, filler_max: 64, cold_head_per_layer: 115 };
         assert_eq!(PrefillSplit::build(&base, &hot_head(115)).stats.filler, 41);
-        // ... minus 745 resident non-owned + 2 x 40 headroom => 0 free: no filler (the share stays box 2's).
-        let prot = SplitCfg { reserve: 745 + PROTECT_HEADROOM_PER_LAYER * N_LAYER as usize, ..base };
-        assert_eq!(PrefillSplit::build(&prot, &hot_head(115)).stats.filler, 0);
-        let some = SplitCfg { reserve: 400, ..base };
-        assert_eq!(PrefillSplit::build(&some, &hot_head(115)).stats.filler, (825 - 400) / NL_ENC);
+        // ... minus the protect headroom (2 x 40 = 80) => 745 / 20 = 37 per layer: smaller, never zeroed in steady state.
+        let prot = SplitCfg { reserve: PROTECT_HEADROOM_PER_LAYER * N_LAYER as usize, ..base };
+        assert_eq!(PrefillSplit::build(&prot, &hot_head(115)).stats.filler, (825 - 80) / NL_ENC);
+        assert_eq!((825 - 80) / NL_ENC, 37);
+        // A reserve past the free slots: no filler, never an underflow.
+        let over = SplitCfg { reserve: 5000, ..base };
+        assert_eq!(PrefillSplit::build(&over, &hot_head(115)).stats.filler, 0);
     }
 
     #[test]

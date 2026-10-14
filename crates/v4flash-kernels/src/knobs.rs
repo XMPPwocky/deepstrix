@@ -1068,12 +1068,13 @@ crate::knobs! {
     /// `V41_B1_PROTECT_OWNED` (default off; live, read per prefill miss / prefetch admission / long-job split): box 1's
     /// OWNED experts (`hot_set::box1_owns`) stay resident through prefill. A PREFILL row's `ensure` miss claims a slot
     /// skipping owned slots (as the late join), plain LRU only when nothing else is evictable; an admitted prefetch
-    /// does the same; a long job's split filler leaves room for box 1's resident non-owned experts + 2 slots/layer.
+    /// does the same; a long job's split filler leaves 2 slots/layer of headroom.
     /// (10-14: ~80% of decode's synchronous box-1 misses were owned experts PREFILL had evicted.)
     pub static B1_PROTECT_OWNED = Knob::flag("V41_B1_PROTECT_OWNED", false).live();
-    /// `V41_B1_REWARM_AFTER_PREFILL` (default off; live, read at each prefill -> decode switch): queue every OWNED but
-    /// non-resident expert (decoder layers first) for the background prefetcher through the hot-set pre-warm queue,
-    /// paced by `V41_B1_HOT_PREWARM_STEP` per decode step.
+    /// `V41_B1_REWARM_AFTER_PREFILL` (default off; live; needs `V41_B1_PROTECT_OWNED`): when a prefill burst ends with
+    /// no prefill job left, every OWNED but non-resident expert (decoder layers first, at most `hot_set::REWARM_MAX`)
+    /// goes on a LOW-priority rewarm queue for the background prefetcher, drained with what each decode step's
+    /// `V41_B1_HOT_PREWARM_STEP` budget leaves after the hot-set newcomers; ownership is re-checked at take time.
     pub static B1_REWARM_AFTER_PREFILL = Knob::flag("V41_B1_REWARM_AFTER_PREFILL", false).live();
 }
 

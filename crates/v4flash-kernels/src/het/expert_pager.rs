@@ -884,14 +884,38 @@ pub mod hot_set {
     pub fn requeue_prewarm(layer: i32, e: u32) {
         PREWARM.lock().unwrap_or_else(|p| p.into_inner()).push_front((layer, e));
     }
-    /// `V41_B1_REWARM_AFTER_PREFILL`: append `ids` to the pre-warm queue (in order), skipping ids already queued; the
-    /// hub drains it `V41_B1_HOT_PREWARM_STEP` per decode step. Returns the ids added.
-    pub fn queue_prewarm(ids: &[(i32, u32)]) -> usize {
-        let mut g = PREWARM.lock().unwrap_or_else(|p| p.into_inner());
-        let have: std::collections::HashSet<(i32, u32)> = g.iter().copied().collect();
-        let before = g.len();
-        g.extend(ids.iter().copied().filter(|k| !have.contains(k)));
-        g.len() - before
+    /// `V41_B1_REWARM_AFTER_PREFILL`: box 1's owned experts a prefill burst evicted, re-read in the background. Its OWN
+    /// queue, LOWER priority than the refresh newcomers (`PREWARM`): the hub drains it only with what a step's
+    /// `V41_B1_HOT_PREWARM_STEP` budget leaves after them. Capped at `REWARM_MAX`.
+    static REWARM: std::sync::Mutex<std::collections::VecDeque<(i32, u32)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+    pub const REWARM_MAX: usize = 4096;
+    /// Replace the rewarm queue with `ids` (in order; the newest burst's list supersedes an older one), at most
+    /// `REWARM_MAX`. Returns the ids queued.
+    pub fn set_rewarm(ids: &[(i32, u32)]) -> usize {
+        let mut g = REWARM.lock().unwrap_or_else(|p| p.into_inner());
+        g.clear();
+        g.extend(ids.iter().copied().take(REWARM_MAX));
+        g.len()
+    }
+    /// Up to `n` rewarm ids, re-checked at take time: an id box 1 no longer owns (a refresh moved it) is dropped
+    /// (residency is re-checked by `prefetch_now`).
+    pub fn take_rewarm(n: usize) -> Vec<(i32, u32)> {
+        let mut g = REWARM.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let Some(k) = g.pop_front() else { break };
+            if box1_owns(k.0, k.1) == Some(true) {
+                out.push(k);
+            }
+        }
+        out
+    }
+    /// A rewarm read the prefetcher could not take (in-flight cap): back to the front.
+    pub fn requeue_rewarm(layer: i32, e: u32) {
+        REWARM.lock().unwrap_or_else(|p| p.into_inner()).push_front((layer, e));
+    }
+    pub fn rewarm_queued() -> usize {
+        REWARM.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
     /// The pin ledger's "box 2 no longer owns it" (stale / lost): today's
     /// `!partition_box2` (the hash split before warm-up included), less the
@@ -2553,11 +2577,6 @@ impl ExpertPager {
     /// Owned slots protected prefill claims evicted anyway (nothing else was evictable), since start.
     pub fn protect_owned_fallback(&self) -> u64 {
         self.protect_owned_fallback
-    }
-
-    /// Resident experts `(layer, id)` for which `pred` holds.
-    pub fn resident_count_where(&self, pred: &dyn Fn(i32, u32) -> bool) -> usize {
-        self.res.slot_of.into_iter().filter(|(&(l, e), _)| pred(l, e)).count()
     }
 
     /// `V41_B1_REWARM_AFTER_PREFILL`: box 1's OWNED experts that are not resident, decoder layers

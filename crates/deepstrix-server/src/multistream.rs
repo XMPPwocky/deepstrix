@@ -1314,7 +1314,11 @@ impl Sched {
                     v4flash_kernels::het::b2_mirror::pin_enter_decode(),
                 ),
             };
-            if self.phase == Phase::Prefill && next == Phase::Decode && v4flash_kernels::knobs::B1_REWARM_AFTER_PREFILL.on() {
+            // Only when the prefill work is DONE (a decode burst in the middle of a long prefill is not the end of its
+            // evictions), and only with the owned set protected (else the rewarm reads just get evicted again).
+            if self.phase == Phase::Prefill && next == Phase::Decode && self.prefills.is_empty()
+                && v4flash_kernels::knobs::B1_REWARM_AFTER_PREFILL.on() && v4flash_kernels::knobs::B1_PROTECT_OWNED.on()
+            {
                 self.rewarm_due = true;
             }
             tracing::info!(from = ?self.phase, to = ?next, reason = ?reason, interrupt, live = self.streams.len(), prefills = self.prefills.len(),
@@ -2020,12 +2024,12 @@ impl Sched {
         let ring_settle_ms = self.dsp.as_mut().map(|d| d.settle_writes()).unwrap_or(0.0);
         if let Some(pg) = state.pager.as_mut() {
             pg.drain_prefetched()?;
-            // `V41_B1_REWARM_AFTER_PREFILL`: the burst's evictions of box 1's OWNED experts go back through the pre-warm
-            // queue below (decoder layers first), paced like the hot-set newcomers.
+            // `V41_B1_REWARM_AFTER_PREFILL`: the burst's evictions of box 1's OWNED experts (decoder layers first) go on the
+            // low-priority rewarm queue, drained below after the hot-set newcomers.
             if std::mem::take(&mut self.rewarm_due) {
                 let ids = pg.owned_not_resident();
-                let added = v4flash_kernels::het::expert_pager::hot_set::queue_prewarm(&ids);
-                tracing::info!(owned_not_resident = ids.len(), queued = added, per_step = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize(),
+                let queued = v4flash_kernels::het::expert_pager::hot_set::set_rewarm(&ids);
+                tracing::info!(owned_not_resident = ids.len(), queued, per_step = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize(),
                     protect_fallback = pg.protect_owned_fallback(), "b1 rewarm after prefill");
             }
             // HOT SPLIT pre-warm (design 5): box-1 newcomers of the last
@@ -2033,6 +2037,7 @@ impl Sched {
             let n = v4flash_kernels::knobs::B1_HOT_PREWARM_STEP.usize();
             if n > 0 {
                 let batch = v4flash_kernels::het::expert_pager::hot_set::take_prewarm(n);
+                let mut full = false;
                 for (i, &(l, e)) in batch.iter().enumerate() {
                     if pg.prefetch_now(l, e).is_none() {
                         // The in-flight cap is full: this one and the rest back to
@@ -2040,7 +2045,20 @@ impl Sched {
                         for &(l2, e2) in batch[i..].iter().rev() {
                             v4flash_kernels::het::expert_pager::hot_set::requeue_prewarm(l2, e2);
                         }
+                        full = true;
                         break;
+                    }
+                }
+                // Rewarm (`V41_B1_REWARM_AFTER_PREFILL`): only the budget the newcomers left, and only with room.
+                if !full && batch.len() < n && v4flash_kernels::knobs::B1_REWARM_AFTER_PREFILL.on() {
+                    let rw = v4flash_kernels::het::expert_pager::hot_set::take_rewarm(n - batch.len());
+                    for (i, &(l, e)) in rw.iter().enumerate() {
+                        if pg.prefetch_now(l, e).is_none() {
+                            for &(l2, e2) in rw[i..].iter().rev() {
+                                v4flash_kernels::het::expert_pager::hot_set::requeue_rewarm(l2, e2);
+                            }
+                            break;
+                        }
                     }
                 }
             }
