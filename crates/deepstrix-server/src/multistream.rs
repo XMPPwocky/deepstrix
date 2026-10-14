@@ -2296,6 +2296,9 @@ impl Sched {
         if profile {
             v4flash_kernels::het::trace::phase::reset();
         }
+        // Box-1 decode paging of THIS step (`hub_b1`, every step): counters at the step's start.
+        let b1_start = (pager.as_ref().map(|pg| pg.counters()), v4flash_core::hedge::ENGRAM.snapshot(), v4flash_core::hedge::EXPERT.snapshot(),
+            pager.as_ref().map_or(0, |pg| pg.protect_owned_fallback()));
         let t_fwd = Instant::now();
         // Two-lane pipelined step (default for >= 2 rows, `V41_MS_PIPELINE=0`
         // disables): lane B's layer runs under lane A's box-2 wait.
@@ -2666,10 +2669,13 @@ impl Sched {
                 // one observed rollup read 381 misses and 1.66 s of read inside a
                 // 295 ms forward. Snapshot at the top and bottom of THIS step to
                 // fix. Until then, treat a large value as "a prefill happened".
+                // Since 10-14 decode `ensure` is booked as decode: prefill + decode keeps these fields' meaning
+                // (every box-1 miss since the previous profiled step). The per-step decode split is `hub_b1`.
                 let c = pg.counters();
-                let (dm, dr) = (c.prefill_misses.saturating_sub(acc.last_misses), c.prefill_read_ns.saturating_sub(acc.last_read_ns));
-                acc.last_misses = c.prefill_misses;
-                acc.last_read_ns = c.prefill_read_ns;
+                let (all_m, all_r) = (c.prefill_misses + c.decode_misses, c.prefill_read_ns + c.decode_read_ns);
+                let (dm, dr) = (all_m.saturating_sub(acc.last_misses), all_r.saturating_sub(acc.last_read_ns));
+                acc.last_misses = all_m;
+                acc.last_read_ns = all_r;
                 if ev_on {
                     ev.insert("b1_misses".into(), dm as f64);
                     ev.insert("b1_read_ms".into(), dr as f64 / 1e6);
@@ -2878,6 +2884,13 @@ impl Sched {
             let s = self.streams.remove(r);
             finish(state, &mut self.arena, s, f)?;
         }
+        let b1 = b1_step(state.pager.as_ref(), &b1_start);
+        if ev_on {
+            let mut pairs: Vec<(&str, f64)> = vec![("step", step_id as f64), ("rows", b as f64)];
+            pairs.extend(b1.iter().copied());
+            v4flash_kernels::het::evtrace::emit_named(&v4flash_kernels::het::evtrace_kinds::HUB_B1, &pairs);
+        }
+        let b1v = |k: &str| b1.iter().find(|p| p.0 == k).map_or(0.0, |p| p.1);
         tracing::info!(rows = b, spec = ?spec_out, lanes = if lanes3 { 3 } else if pipelined { 2 } else { 1 },
             step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
@@ -2885,7 +2898,8 @@ impl Sched {
             chain_waits, chain_wait_us, ring_settle_ms = format!("{ring_settle_ms:.2}"),
             engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3),
             engram_t0_ms = format!("{:.2}", ENGRAM_TABLE_US[0].swap(0, Ordering::Relaxed) as f64 / 1e3),
-            engram_t1_ms = format!("{:.2}", ENGRAM_TABLE_US[1].swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, draft_ms = format!("{draft_wall_ms:.1}"), "ms.step");
+            engram_t1_ms = format!("{:.2}", ENGRAM_TABLE_US[1].swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, draft_ms = format!("{draft_wall_ms:.1}"),
+            b1_dec_misses = b1v("dec_misses"), b1_dec_read_ms = format!("{:.2}", b1v("dec_read_ms")), b1_dec_ensure_ms = format!("{:.2}", b1v("dec_ensure_ms")), "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),
@@ -2902,6 +2916,39 @@ impl Sched {
         log_hedges(step_id);
         Ok(())
     }
+}
+
+/// The step's `hub_b1` fields: pager counter deltas since `start` (taken before the forward), the hedge counters'
+/// deltas, the protected-claim fallbacks; `pf_*` = prefill paging since the previous step's end (`B1_LAST_END`).
+#[allow(clippy::type_complexity)]
+fn b1_step(
+    pg: Option<&v4flash_kernels::het::ExpertPager>,
+    start: &(Option<v4flash_kernels::het::expert_pager::PagerCounters>, [u64; 7], [u64; 7], u64),
+) -> Vec<(&'static str, f64)> {
+    static B1_LAST_END: std::sync::Mutex<Option<v4flash_kernels::het::expert_pager::PagerCounters>> = std::sync::Mutex::new(None);
+    let mut v: Vec<(&'static str, f64)> = Vec::with_capacity(11);
+    let (e1, x1) = (v4flash_core::hedge::ENGRAM.snapshot(), v4flash_core::hedge::EXPERT.snapshot());
+    if let (Some(pg), Some(c0)) = (pg, start.0) {
+        let c1 = pg.counters();
+        let d = c1 - c0;
+        v.push(("dec_requests", d.decode_requests as f64));
+        v.push(("dec_misses", d.decode_misses as f64));
+        v.push(("dec_read_ms", d.decode_read_ns as f64 / 1e6));
+        v.push(("dec_ensure_ms", d.decode_ensure_ns as f64 / 1e6));
+        if let Ok(mut last) = B1_LAST_END.lock() {
+            if let Some(l) = *last {
+                v.push(("pf_misses", c0.prefill_misses.saturating_sub(l.prefill_misses) as f64));
+                v.push(("pf_read_ms", c0.prefill_read_ns.saturating_sub(l.prefill_read_ns) as f64 / 1e6));
+            }
+            *last = Some(c1);
+        }
+        v.push(("protect_fallback", pg.protect_owned_fallback().saturating_sub(start.3) as f64));
+    }
+    v.push(("eng_hedge_fired", e1[1].saturating_sub(start.1[1]) as f64));
+    v.push(("eng_hedge_won_mirror", e1[4].saturating_sub(start.1[4]) as f64));
+    v.push(("exp_hedge_fired", x1[1].saturating_sub(start.2[1]) as f64));
+    v.push(("exp_hedge_won_mirror", x1[4].saturating_sub(start.2[4]) as f64));
+    v
 }
 
 /// Every `HEDGE_LOG_STEPS` decode steps, if any hedged read fired since the last line: the hedge counters of both sites

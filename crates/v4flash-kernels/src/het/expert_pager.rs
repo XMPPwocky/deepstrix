@@ -455,6 +455,10 @@ pub struct ExpertPager {
     prefill_rows: bool,
     /// Owned slots a protected claim still evicted (the fallback), since start.
     protect_owned_fallback: u64,
+    /// Wall time inside `ensure` (the hub thread blocked on box-1 residency: hits' bookkeeping, misses' reads and
+    /// uploads), by `count_as_prefill`.
+    prefill_ensure_ns: u64,
+    decode_ensure_ns: u64,
     /// SCAN REGION: while set, `ensure` may only take slots from `[lo, hi)`.
     ///
     /// Prefill is a scan, not a reuse workload: one 1024-token chunk touches
@@ -2422,6 +2426,8 @@ impl ExpertPager {
             count_as_prefill: false,
             prefill_rows: false,
             protect_owned_fallback: 0,
+            prefill_ensure_ns: 0,
+            decode_ensure_ns: 0,
             scan_window: None,
             device: igpu,
             prefill_requests: 0,
@@ -3753,6 +3759,18 @@ impl ExpertPager {
     }
 
     pub fn ensure(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<&[i32]> {
+        let t0 = std::time::Instant::now();
+        let r = self.ensure_core(layer, ids);
+        let ns = t0.elapsed().as_nanos() as u64;
+        if self.count_as_prefill {
+            self.prefill_ensure_ns += ns;
+        } else {
+            self.decode_ensure_ns += ns;
+        }
+        r.map(|()| self.remap.as_slice())
+    }
+
+    fn ensure_core(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<()> {
         // Misses are registered in `slot_of` BEFORE their bytes are read, so any
         // error after that (a read / O_DIRECT error, a reader panic, a HIP repack
         // failure) must release the ones that never landed: the scheduler fails
@@ -3762,7 +3780,7 @@ impl ExpertPager {
         self.prune_inflight()?;
         let mut c = Claims::default();
         match self.ensure_inner(layer, ids, &mut c) {
-            Ok(()) => Ok(&self.remap),
+            Ok(()) => Ok(()),
             Err(e) => {
                 self.res.release_unlanded(layer, &c);
                 if self.inflight_sets.is_empty() {
@@ -3773,7 +3791,7 @@ impl ExpertPager {
                 self.unpin_all_wait()?;
                 let mut c = Claims::default();
                 match self.ensure_inner(layer, ids, &mut c) {
-                    Ok(()) => Ok(&self.remap),
+                    Ok(()) => Ok(()),
                     Err(e) => {
                         self.res.release_unlanded(layer, &c);
                         Err(e)
@@ -4580,6 +4598,8 @@ impl ExpertPager {
             decode_n_runs: self.decode_n_runs,
             decode_n_direct: self.decode_n_direct,
             decode_n_raw: self.decode_n_raw,
+            prefill_ensure_ns: self.prefill_ensure_ns,
+            decode_ensure_ns: self.decode_ensure_ns,
         }
     }
 
@@ -4660,6 +4680,9 @@ pub struct PagerCounters {
     pub decode_n_runs: u64,
     pub decode_n_direct: u64,
     pub decode_n_raw: u64,
+    /// Wall time inside `ensure` by phase (`ExpertPager::decode_ensure_ns`).
+    pub prefill_ensure_ns: u64,
+    pub decode_ensure_ns: u64,
 }
 
 impl std::ops::Sub for PagerCounters {
@@ -4686,6 +4709,8 @@ impl std::ops::Sub for PagerCounters {
             decode_n_runs: self.decode_n_runs - o.decode_n_runs,
             decode_n_direct: self.decode_n_direct - o.decode_n_direct,
             decode_n_raw: self.decode_n_raw - o.decode_n_raw,
+            prefill_ensure_ns: self.prefill_ensure_ns - o.prefill_ensure_ns,
+            decode_ensure_ns: self.decode_ensure_ns - o.decode_ensure_ns,
         }
     }
 }

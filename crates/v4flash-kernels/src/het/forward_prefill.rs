@@ -12085,7 +12085,9 @@ impl HeterogeneousEngine {
                     // `ensure`, which otherwise books it as decode), and bound
                     // where its misses may land only if asked to.
                     if !speculative_append() {
-                        pg.set_count_as_prefill(true);
+                        // Book it by ROW KIND (10-14; KNOWN audit A3): decode rows (`Arena`) as decode, prefill rows as
+                        // prefill. Accounting only: `count_as_prefill` selects counters, nothing else.
+                        pg.set_count_as_prefill(!c.arena_rows);
                         // Never narrower than this layer's set: `claim`
                         // refuses to evict a slot the same call already uses.
                         let scan = prefill_scan_slots().max(ids.len());

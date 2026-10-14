@@ -7,7 +7,7 @@ use super::evtrace::Kind;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Every hub/box-2 kind (added to `evtrace`'s header list).
-pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED, &HUB_LH2];
+pub static ALL: &[&Kind] = &[&HUB_REQ, &HUB_STEP, &HUB_PHASE, &STEP_DEV, &B2_REQ, &B2_READ, &B2_ENSURE, &B2_WRITE, &HUB_EMBED, &HUB_LH2, &HUB_B1];
 
 // ---- hub: step context for per-request records ----
 
@@ -146,6 +146,21 @@ pub static HUB_STEP: Kind = Kind {
         // Tier B (see above)
         "dev_skipped", "t_fwd_sync",
     ),
+};
+
+/// Box 1's DECODE paging of one decode step (multistream), EVERY step (not only profiled ones), joined to `hub_step`
+/// by `step` (`hub_step` is at its field limit): pager counter deltas from the step's start to its end -- misses,
+/// requests, read ms and the wall the hub spent in `ensure` (`dec_ensure_ms`), booked by ROW KIND since 10-14 (decode
+/// `ensure` used to be booked as prefill) -- plus the step's hedged reads (`v4flash_core::hedge`: fired / won by the
+/// mirror, Engram and expert) and the protected-claim fallbacks (`V41_B1_PROTECT_OWNED`). `pf_*` = prefill paging
+/// that ran since the previous decode step ended (a prefill tick between steps).
+pub static HUB_B1: Kind = Kind {
+    id: 16,
+    name: "hub_b1",
+    fields: &[
+        "step", "rows", "dec_requests", "dec_misses", "dec_read_ms", "dec_ensure_ms", "pf_misses", "pf_read_ms",
+        "eng_hedge_fired", "eng_hedge_won_mirror", "exp_hedge_fired", "exp_hedge_won_mirror", "protect_fallback",
+    ],
 };
 
 /// Per-step counters of the predicted-miss look-ahead prefetch
