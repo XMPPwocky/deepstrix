@@ -1041,6 +1041,14 @@ crate::knobs! {
     /// `ensure`. Needs `V41_PREFILL_PIN_INFLIGHT` and the late readers, which start only with `V41_PREFILL_COLD_STAGES`
     /// > 0 in the hub's environment (static, default 0): a live flip without them does nothing.
     pub static PREFILL_COLD_ASYNC = Knob::flag("V41_PREFILL_COLD_ASYNC", false).live();
+    /// `V41_PREFILL_COLD_ASYNC_RANGE` (default off; live, read at the start of each range pass): the same LATE reads
+    /// as `V41_PREFILL_COLD_ASYNC`, in the passes OUTSIDE layer-outer windows -- a job's chunked encoder chunks
+    /// (`prefill_job_chunk` below one window) and EVERY CED replay (`prefill_job_finish`) -- which otherwise read the
+    /// `V41_PREFILL_COLD_B1` share synchronously in `ensure` on the hub thread (~3.5 ms per miss, 10-14 TTFT analysis).
+    /// Same schedule as the window pass (join of unit t at the launch of unit t+1, or in its own post), same pins,
+    /// same exactness argument (tests/late_exactness.rs `late_pass_matches_main_pass_range`). Independent of
+    /// `V41_PREFILL_COLD_ASYNC`; needs `V41_PREFILL_PIN_INFLIGHT` and the late readers (`V41_PREFILL_COLD_STAGES` > 0).
+    pub static PREFILL_COLD_ASYNC_RANGE = Knob::flag("V41_PREFILL_COLD_ASYNC_RANGE", false).live();
     /// `V41_PREFILL_COLD_LATE_MAX_LAYER` (default 20; live): NEW late reads per layer per window (~ box 1's spare pool
     /// slots per layer beyond decode's owned set).
     pub static PREFILL_COLD_LATE_MAX_LAYER = Knob::int("V41_PREFILL_COLD_LATE_MAX_LAYER", 20, 0, 384).live();

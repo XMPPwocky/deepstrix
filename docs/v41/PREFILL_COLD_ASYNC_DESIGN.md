@@ -147,3 +147,24 @@ task's join in `Op::Post` -> 1. 6 per-lane pending-late record -> 1. 7 join befo
 -> 1. 9 remap stage done-event -> 2.2 step 2. 10 cancel = drop queued + wait running -> 2.3. 11 negative-pick assert ->
 2.2 step 3. Verified safe by r2: the deferred push/moe_done (no wait on unit t between launch(t) and launch(t+1); `sev`
 reuse ordered for U >= 3), builder/devcount/reduce over the private remap, pass/window boundaries.
+
+## 11. Range passes outside windows (`V41_PREFILL_COLD_ASYNC_RANGE`, 2026-10-14)
+
+Why: the 10-14 TTFT analysis (1,251 jobs) found short prefills paging-bound: for < 2K fresh tokens, 2.71 s (p50) of the
+5.64 s TTFT is box-1 SYNCHRONOUS reads, ~620 of the ~760 misses per job the `V41_PREFILL_COLD_B1` share. Those reads
+happen in the passes that are NOT layer-outer windows -- a short job's chunked encoder chunks (`prefill_job_chunk`,
+layers 0-20 `KvSourceOnly`) and EVERY job's CED replay (`prefill_job_finish`, layers 20-39) -- which run through
+`pipelined_range_impl`, where stage 2 never applied.
+
+What: `pipelined_range_impl` takes `late_ok` (true only from those two call sites; every public wrapper passes false).
+With the knob on (plus `V41_PREFILL_PIN_INFLIGHT`, running late readers, no prefill hot split in the range) it runs
+`pipelined_range_late` instead of its own loop: the SAME op order (warm-up `pre_A pre_B`, then `post_A(L) pre_A(L+1)
+post_B(L) pre_B(L+1)`, cool-down) -- which is `lm_schedule::ops` at U = 2 -- with each pre split into its four phases so
+a unit with late ids parks its carry, joined after the next unit's prep and before its launch (section 1), or at the
+start of its own post when no unit follows first (lane B empty; the last lane-layer). Setup / teardown are the window
+pass's: one iGPU sync, the pin pass, `LATE_PASS` + the per-layer budget (per range pass), cancel + unpin on every exit.
+Route, the late join, the private remap and the late MoE pass are unchanged code.
+
+Gate: `tests/late_exactness.rs::late_pass_matches_main_pass_range` -- FORCE_LATE resident picks in the encoder chunks
+only (verdict at encoder layer 0) and in the replay only (verdict at replay layer 20, with the encoder bit-identical to
+the reference's: its KV and its layer-0 MoE), each with a bit-identical null and a dropped-late negative control.

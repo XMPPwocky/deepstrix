@@ -350,6 +350,19 @@ enum RangeSeed<'a> {
     Device { residual: &'a DeviceBuffer<f32>, carry: &'a DeviceBuffer<f32>, row0: usize },
 }
 
+/// The two lanes of a range pass (`pipelined_range_impl`), for the late driver (`pipelined_range_late`).
+#[derive(Clone, Copy)]
+struct RangeLanes<'a> {
+    tokens_a: &'a [i32],
+    tokens_b: &'a [i32],
+    pos0_a: u32,
+    pos0_b: u32,
+    vis_a: Option<&'a [(u32, u32)]>,
+    vis_b: Option<&'a [(u32, u32)]>,
+    b_a: usize,
+    b_b: usize,
+}
+
 /// `V41_CED` (default on under the `v41` feature): encoder-only prefill +
 /// Decoder SWA Bounded Replay in `forward_prefill_pipelined` (last-token
 /// path). `V41_CED=0` restores the exact all-40-layer prefill.
@@ -2165,10 +2178,10 @@ impl HeterogeneousEngine {
             }),
         };
         if job.ced {
-            let cut = self.forward_prompt_batch_v2_pipelined_range(
-                bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, chunk_input, chunk_tokens, chunk_pos0,
+            let cut = self.pipelined_range_impl(
+                bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, RangeSeed::Host { hcs: chunk_input, carry: None }, chunk_tokens, chunk_pos0,
                 None, Some(&job.image_spans), pager.as_deref_mut(), chunk_engram.as_deref(),
-                0..split + 1, CedMode::KvSourceOnly, None,
+                0..split + 1, CedMode::KvSourceOnly, true,
             )?;
             if cut != b_a {
                 return Err(eyre!("PrefillJob: CED lane cut {cut} != planned {b_a}"));
@@ -2275,9 +2288,9 @@ impl HeterogeneousEngine {
         // The replay is always its job's LAST unit (design 2.1).
         self.remote_set_last_unit(true);
         let _last_guard = LastUnitGuard(self);
-        let b_a = self.forward_prompt_batch_v2_pipelined_range(
-            bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, &seg_hcs, &seg_tokens, seg_pos0,
-            None, None, pager.as_deref_mut(), None, split..N_LAYER as usize, CedMode::Replay, Some(&seg_carry),
+        let b_a = self.pipelined_range_impl(
+            bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, RangeSeed::Host { hcs: &seg_hcs, carry: Some(&seg_carry) }, &seg_tokens, seg_pos0,
+            None, None, pager.as_deref_mut(), None, split..N_LAYER as usize, CedMode::Replay, true,
         )?;
         let (src_bd, last_idx) = if b_seg > b_a { (&*bd_b, b_seg - b_a - 1) } else { (&*bd_a, b_a - 1) };
         let logits = self.head_from_row(head_scratch, src_bd, last_idx, weights)?;
@@ -3230,7 +3243,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<usize> {
         self.pipelined_range_impl(
             bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, RangeSeed::Host { hcs: input_hcs, carry: seed_carry },
-            tokens, pos0, stats, image_spans, pager, engram_rows, layers, ced,
+            tokens, pos0, stats, image_spans, pager, engram_rows, layers, ced, false,
         )
     }
 
@@ -3265,7 +3278,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<usize> {
         self.pipelined_range_impl(
             bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, RangeSeed::Device { residual, carry, row0 },
-            tokens, pos0, None, image_spans, pager, engram_rows, layers, ced,
+            tokens, pos0, None, image_spans, pager, engram_rows, layers, ced, false,
         )
     }
 
@@ -3296,6 +3309,9 @@ impl HeterogeneousEngine {
         engram_rows: Option<&[Vec<f32>]>,
         layers: std::ops::Range<usize>,
         ced: CedMode,
+        // A prefill job's chunked encoder chunk or CED replay (`prefill_job_chunk` / `prefill_job_finish`): this pass
+        // may take box-1 cold picks LATE (`V41_PREFILL_COLD_ASYNC_RANGE`). Every other caller passes false.
+        late_ok: bool,
     ) -> eyre::Result<usize> {
         self.remote_set_phase_busy_poll(false);
         super::b2_mirror::expire_incoming();
@@ -3512,6 +3528,15 @@ impl HeterogeneousEngine {
         // they should use the single-lane forward_prompt_batch_v2.
         let mut stats_a = stats;
 
+        // LATE box-1 cold reads outside layer-outer windows (`V41_PREFILL_COLD_ASYNC_RANGE`): the same op order as the
+        // loop below with the four pre-MoE phases split so a unit with late ids parks its carry for its join.
+        if late_ok && self.range_late_on(lo..hi, &mode_of, bd_a, sd, weights, pager.as_deref()) {
+            let pg = pager.as_deref_mut().expect("range_late_on checked the pager");
+            let lanes = RangeLanes { tokens_a, tokens_b, pos0_a, pos0_b, vis_a: vis_a.as_deref(), vis_b: vis_b.as_deref(), b_a, b_b };
+            self.pipelined_range_late(bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, &lanes, stats_a, pg, engram_rows, lo, hi, ced)?;
+            return Ok(b_a);
+        }
+
         // Deep pipeline: queue lane A's L+1 pre-MoE immediately after lane A's
         // L post-MoE (NOT after lane B's L post-MoE). On the dgpu.compute FIFO
         // this means lane A's next layer can start as soon as lane A's MoE is
@@ -3683,6 +3708,260 @@ impl HeterogeneousEngine {
 
         self.dgpu.compute.synchronize()?;
         Ok(b_a)
+    }
+
+    /// `V41_PREFILL_COLD_ASYNC_RANGE` for a range pass over `layers` (read once, at its start): the knob, the pin pass it
+    /// needs (`V41_PREFILL_PIN_INFLIGHT`), running late readers, and no dGPU hot het-split on any MoE layer of the pass
+    /// (the late pass dispatches through the pager's pool only) -- the window pass's conditions (`prefill_job_lm_pass`).
+    /// The knob is read FIRST: off, nothing else is evaluated.
+    fn range_late_on(
+        &self,
+        layers: std::ops::Range<usize>,
+        mode_of: &impl Fn(usize) -> CedMode,
+        bd: &BatchDgpuScratch,
+        sd: &BatchDgpuShared,
+        weights: &HetModelWeights,
+        pager: Option<&super::expert_pager::ExpertPager>,
+    ) -> bool {
+        crate::knobs::PREFILL_COLD_ASYNC_RANGE.on()
+            && crate::knobs::PREFILL_PIN_INFLIGHT.on()
+            && pager.is_some_and(|p| p.late_on())
+            && !layers
+                .filter(|&l| mode_of(l) != CedMode::KvSourceOnly)
+                .any(|l| prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], bd, sd))
+    }
+
+    /// The range pass with LATE box-1 cold reads (`V41_PREFILL_COLD_ASYNC_RANGE`; design
+    /// docs/v41/PREFILL_COLD_ASYNC_DESIGN.md rev 3, applied outside layer-outer windows). The pass is the window pass's
+    /// schedule at U = 2 (`lm_schedule::ops`: Pre(t), Post(t-1), Pre(t+1), ...; task t = lane t % 2 of layer lo + t / 2):
+    /// a unit with late ids parks its carry, and its join runs inside the NEXT unit's pre (after that unit's chain, route
+    /// and prep, before its launch) -- or, when no unit follows before its own post (lane B empty, or the last lane-layer),
+    /// at the start of its post, as the window pass's last task. Setup and teardown as `prefill_job_lm_pass`: one iGPU
+    /// sync, the pin pass, the late flag and per-layer budget; at the end drop queued reads / wait running ones, wait all
+    /// pins, clear the flag -- on error too.
+    #[allow(clippy::too_many_arguments)]
+    fn pipelined_range_late(
+        &self,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        ln: &RangeLanes<'_>,
+        stats_a: Option<&mut PrefillStats>,
+        pg: &mut super::expert_pager::ExpertPager,
+        engram_rows: Option<&[Vec<f32>]>,
+        lo: usize,
+        hi: usize,
+        ced: CedMode,
+    ) -> eyre::Result<()> {
+        // iGPU work queued before the pass (a decode step) was never pinned: wait for it once.
+        self.igpu.compute.synchronize()?;
+        let pin_guard = PinPass::enter(true);
+        LATE_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
+        for a in LATE_SPENT.iter() {
+            a.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut pend: [Option<(usize, PreMoeCarry)>; 2] = [None, None];
+        let mut result = self.range_late_body(bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, ln, stats_a, pg, engram_rows, lo, hi, ced, &mut pend);
+        if result.is_ok() && pend.iter().any(Option::is_some) {
+            // Every late unit is joined before its own post; a KvSourceOnly unit has no MoE (fails closed).
+            result = Err(eyre!("late range pass L{lo}..{hi}: a unit's late join never ran"));
+        }
+        LATE_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+        let r = pg.late_cancel_all();
+        if result.is_ok() {
+            result = r;
+        }
+        // Every pinned dispatch done before the pins go away (a decode step's ensure must not see stale pins).
+        let r = pg.unpin_all_wait();
+        if result.is_ok() {
+            result = r;
+        }
+        drop(pin_guard);
+        let sync = self.dgpu.compute.synchronize();
+        result?;
+        sync
+    }
+
+    /// The body of [`Self::pipelined_range_late`]: the plain range loop (warm-up, steady state, cool-down) with each
+    /// pre-MoE split into its phases (`range_pre_late`) and each post preceded by its unit's own join if still pending
+    /// (`range_post_late`).
+    #[allow(clippy::too_many_arguments)]
+    fn range_late_body(
+        &self,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        ln: &RangeLanes<'_>,
+        mut stats_a: Option<&mut PrefillStats>,
+        pg: &mut super::expert_pager::ExpertPager,
+        engram_rows: Option<&[Vec<f32>]>,
+        lo: usize,
+        hi: usize,
+        ced: CedMode,
+        pend: &mut [Option<(usize, PreMoeCarry)>; 2],
+    ) -> eyre::Result<()> {
+        // The late pass's output buffers before any unit runs (a mid-pass hipMalloc can synchronize; review r3 #9).
+        self.set_current_cached(self.igpu.device)?;
+        for bi in [&mut *bi_a, &mut *bi_b] {
+            if bi.late_moe.as_ref().is_none_or(|x| x.len() < bi.ffn_moe.len()) {
+                bi.late_moe = Some(DeviceBuffer::new(self.igpu.device.id, bi.ffn_moe.len())?);
+            }
+        }
+        self.set_current_cached(self.dgpu.device)?;
+        let split = crate::config::CED_DECODER_START;
+        let mode_of = |l: usize| if l == split { ced } else { CedMode::Exact };
+        let RangeLanes { tokens_a, tokens_b, pos0_a, pos0_b, vis_a, vis_b, b_a, b_b } = *ln;
+
+        // Warm-up: layer lo's pre-MoE, both lanes.
+        let _t_pre_warm = LayerHostTimer::start(&LH_PRE);
+        self.stage_engram_lane(bd_a, lo, engram_rows, 0, b_a)?;
+        self.range_pre_late(0, lo, bd_a, bi_a, bd_b, bi_b, sd, si, &mut state.layers[lo], weights, pos0_a, tokens_a, vis_a,
+            stats_a.as_deref_mut(), pg, mode_of(lo), pend)?;
+        if b_b > 0 {
+            self.stage_engram_lane(bd_b, lo, engram_rows, b_a, b_b)?;
+            self.range_pre_late(1, lo, bd_b, bi_b, bd_a, bi_a, sd, si, &mut state.layers[lo], weights, pos0_b, tokens_b, vis_b,
+                None, pg, mode_of(lo), pend)?;
+        }
+        drop(_t_pre_warm);
+
+        // Steady state: post_X(L) then pre_X(L+1), lane A then lane B (the plain loop's order).
+        for layer in lo..(hi - 1) {
+            let hot_cur = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_a, sd);
+            let kv_src_next = crate::config::kv_source_of(layer + 1);
+            if let Some(src) = kv_src_next {
+                let st = state.layers[src].compressor.take();
+                state.layers[layer + 1].compressor = st;
+            }
+            let _t_post = LayerHostTimer::start(&LH_POST);
+            self.range_post_late(0, layer, bd_a, bi_a, sd, si, weights, pg, pend, b_a, hot_cur)?;
+            drop(_t_post);
+            std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
+            let _t_eng = LayerHostTimer::start(&LH_ENGRAM);
+            self.stage_engram_lane(bd_a, layer + 1, engram_rows, 0, b_a)?;
+            drop(_t_eng);
+            let _t_pre = LayerHostTimer::start(&LH_PRE);
+            self.range_pre_late(0, layer + 1, bd_a, bi_a, bd_b, bi_b, sd, si, &mut state.layers[layer + 1], weights, pos0_a, tokens_a,
+                vis_a, stats_a.as_deref_mut(), pg, mode_of(layer + 1), pend)?;
+            drop(_t_pre);
+            if b_b > 0 {
+                let _t_post_b = LayerHostTimer::start(&LH_POST);
+                self.range_post_late(1, layer, bd_b, bi_b, sd, si, weights, pg, pend, b_b, hot_cur)?;
+                drop(_t_post_b);
+                std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
+                let _t_eng_b = LayerHostTimer::start(&LH_ENGRAM);
+                self.stage_engram_lane(bd_b, layer + 1, engram_rows, b_a, b_b)?;
+                drop(_t_eng_b);
+                let _t_pre_b = LayerHostTimer::start(&LH_PRE);
+                self.range_pre_late(1, layer + 1, bd_b, bi_b, bd_a, bi_a, sd, si, &mut state.layers[layer + 1], weights, pos0_b, tokens_b,
+                    vis_b, None, pg, mode_of(layer + 1), pend)?;
+                drop(_t_pre_b);
+            }
+            if let Some(src) = kv_src_next {
+                let st = state.layers[layer + 1].compressor.take();
+                state.layers[src].compressor = st;
+            }
+        }
+
+        // Cool-down: the last layer's post, both lanes (a KvSourceOnly last layer has none).
+        let last = hi - 1;
+        if mode_of(last) != CedMode::KvSourceOnly {
+            let hot_last = prefill_hot_active(&weights.dgpu_layers[last], &weights.igpu_layers[last], bd_a, sd);
+            let _t_post_last = LayerHostTimer::start(&LH_POST);
+            self.range_post_late(0, last, bd_a, bi_a, sd, si, weights, pg, pend, b_a, hot_last)?;
+            std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
+            if b_b > 0 {
+                self.range_post_late(1, last, bd_b, bi_b, sd, si, weights, pg, pend, b_b, hot_last)?;
+                std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
+            }
+            drop(_t_post_last);
+        }
+        Ok(())
+    }
+
+    /// Pre-MoE of lane `lane` at `layer` in a late range pass: chain, route, prep; then the LATE join of the other
+    /// lane's parked unit (the immediately preceding pre: lanes alternate), AFTER this unit's prep and BEFORE its launch
+    /// (rev 3, 1; the window pass's `Op::Pre`); then the launch. A unit with late ids parks its carry in `pend[lane]`.
+    #[allow(clippy::too_many_arguments)]
+    fn range_pre_late(
+        &self,
+        lane: usize,
+        layer: usize,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        bdo: &mut BatchDgpuScratch,
+        bio: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        ls: &mut HetLayerState,
+        weights: &HetModelWeights,
+        pos0: u32,
+        tokens: &[i32],
+        vis: Option<&[(u32, u32)]>,
+        stats: Option<&mut PrefillStats>,
+        pg: &mut super::expert_pager::ExpertPager,
+        ced: CedMode,
+        pend: &mut [Option<(usize, PreMoeCarry)>; 2],
+    ) -> eyre::Result<()> {
+        let (dlw, ilw) = (&weights.dgpu_layers[layer], &weights.igpu_layers[layer]);
+        let sev = &self.sync_events_lane(lane).layers[layer];
+        let rows = RowLayout::Contiguous;
+        let mut c = self.pre_moe_chain(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev, Some(&mut *pg), ced, &rows)?;
+        c.lane = lane;
+        self.pre_moe_route(&mut c, bd, sd, sev, Some(&mut *pg), &rows)?;
+        // The join's claim cutoff, BEFORE ensure(t): it must not evict a slot this unit's ensure touches (review r3 #1).
+        let tk = pg.tick();
+        self.pre_moe_prep(&mut c, bd, bi, sd, si, dlw, ilw, sev, Some(&mut *pg))?;
+        let other = 1 - lane;
+        if let Some((lp, cp)) = pend[other].take() {
+            self.late_join_unit(cp, bdo, bio, sd, si, &weights.dgpu_layers[lp], &weights.igpu_layers[lp],
+                &self.sync_events_lane(other).layers[lp], pg, tk)?;
+        }
+        self.pre_moe_launch(&mut c, bd, bi, sd, si, dlw, ilw, sev, Some(&mut *pg))?;
+        if !c.late.is_empty() {
+            if pend[lane].is_some() {
+                return Err(eyre!("late range pass L{layer} lane {lane}: the lane's previous late unit was never joined"));
+            }
+            pend[lane] = Some((layer, c));
+        }
+        Ok(())
+    }
+
+    /// Post-MoE of lane `lane` at `layer` in a late range pass: the unit's own LATE join first if no later pre took it
+    /// (the window pass's last-task join in `Op::Post`), then `forward_layer_post_moe_v2`.
+    #[allow(clippy::too_many_arguments)]
+    fn range_post_late(
+        &self,
+        lane: usize,
+        layer: usize,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        weights: &HetModelWeights,
+        pg: &mut super::expert_pager::ExpertPager,
+        pend: &mut [Option<(usize, PreMoeCarry)>; 2],
+        b: usize,
+        hot: bool,
+    ) -> eyre::Result<()> {
+        if let Some((lp, cp)) = pend[lane].take() {
+            if lp != layer {
+                return Err(eyre!("late range pass: lane {lane}'s pending late unit is L{lp}, its post is L{layer}"));
+            }
+            let tk = pg.tick();
+            self.late_join_unit(cp, bd, bi, sd, si, &weights.dgpu_layers[lp], &weights.igpu_layers[lp],
+                &self.sync_events_lane(lane).layers[lp], pg, tk)?;
+        }
+        self.forward_layer_post_moe_v2(bd, b as u32, &self.sync_events_lane(lane).layers[layer], hot)
     }
 
     /// Chunked prefill driver. Processes `tokens` (length T)
@@ -13145,7 +13424,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<()> {
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
-        if pin_pass() && *CAPTURE_LAYER == Some(layer) {
+        if pin_pass() && CAPTURE_LAYER.contains(&layer) {
             ie.compute.synchronize()?;
             let n = (b as usize) * cs_n_embd;
             let mut v = vec![0f32; n];
@@ -14069,10 +14348,14 @@ pub fn late_pass() -> bool {
     LATE_PASS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// GATE ONLY (`V41_PREFILL_CAPTURE_MOE=<layer>`, tests/late_exactness.rs): during a layer-outer pass, each unit's final
-/// iGPU MoE output of that layer (`bi.ffn_moe` right before its push; after the late add for a late unit), in issue order.
-static CAPTURE_LAYER: std::sync::LazyLock<Option<i32>> =
-    std::sync::LazyLock::new(|| std::env::var("V41_PREFILL_CAPTURE_MOE").ok().and_then(|v| v.parse().ok()));
+/// GATE ONLY (`V41_PREFILL_CAPTURE_MOE=<layer>[,<layer>...]`, tests/late_exactness.rs): during a pin pass (a
+/// layer-outer pass, or a late range pass), each unit's final iGPU MoE output of those layers (`bi.ffn_moe` right
+/// before its push; after the late add for a late unit), in issue order. Unset / unparsable: no layer.
+static CAPTURE_LAYER: std::sync::LazyLock<Vec<i32>> = std::sync::LazyLock::new(|| {
+    std::env::var("V41_PREFILL_CAPTURE_MOE")
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default()
+});
 static MOE_CAPTURES: std::sync::Mutex<Vec<(i32, u32, Vec<f32>)>> = std::sync::Mutex::new(Vec::new());
 
 /// Take (and clear) the captured (layer, rows, values) MoE outputs.
