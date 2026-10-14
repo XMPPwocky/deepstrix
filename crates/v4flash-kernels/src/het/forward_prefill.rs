@@ -6244,7 +6244,14 @@ impl HeterogeneousEngine {
                     && mhc_arena_fused()
                     && mhc_pre_scaled_for(b)
                     && (b as usize) <= sd.mhc_counters.len();
-                let ok = ctx.is_none()
+                // `stage_b` with graphs OFF (production) builds `ctx` for every arena lane-layer, but
+                // nothing reads the context slot then: it is read only by a stage_b graph (replayed or
+                // captured: `stage_cap_ctx` returns before `ensure` / `StageSrc::Ctx` unless
+                // `ms_graphs()`). The launch G6 replaces would only have CARRIED the entry into the
+                // slot (R2, `stage_b.carry`); skipping that leaves the shadow and the slot agreeing
+                // (both still the previous entry), so a later `ensure` (graphs flipped on) writes it.
+                // Graphs ON keeps the carrier path (G6 excluded, as before).
+                let ok = (ctx.is_none() || !ms_graphs())
                     && !mhc_split_here
                     && fast_here
                     && layer != 0
@@ -10429,10 +10436,13 @@ impl HeterogeneousEngine {
         let defer_shared = prefill_presubmit() && remote_split_active();
         // Fusion group G4 (`V41_DGPU_G4_SHARED`, live): the shared expert's input quantize + the late
         // FFN mixes in one launch (`G4Shared::launch_qmix`) ahead of its GEMVs, on the direct decode
-        // shape it reproduces; the late mixes then ran.
+        // shape it reproduces; the late mixes then ran. Under `stage_b` with graphs OFF (production)
+        // `ctx` is Some but unused: `g.shared_expert`'s `stage_cap_ctx` runs it Direct (no `ensure`,
+        // no `_ind` launch) and the late mixes run direct (R1) -- the exact kernels G4 reproduces;
+        // neither writes nor reads the context slot. Graphs ON keeps the stage graphs (G4 excluded).
         let g4_on = !defer_shared
             && ffn_mix_late
-            && ctx.is_none()
+            && (ctx.is_none() || !ms_graphs())
             && mhc_fast()
             && crate::knobs::DGPU_G4_SHARED.on()
             && g4_shape_ok(dlw, b)
@@ -14033,6 +14043,18 @@ pub static G6_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static G6_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static G6_FLUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static G6_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`G4_LAUNCHES`, `G6_DEFERRED`, `G6_LAUNCHES`, `G6_FLUSHED`, `G6_DROPPED`] since the previous call
+/// (the `ms.step` line: one caller, the engine thread; the counters stay cumulative).
+pub fn fusion_counter_deltas() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::Mutex<[u64; 5]> = std::sync::Mutex::new([0; 5]);
+    let now = [G4_LAUNCHES.load(Relaxed), G6_DEFERRED.load(Relaxed), G6_LAUNCHES.load(Relaxed), G6_FLUSHED.load(Relaxed), G6_DROPPED.load(Relaxed)];
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    let d = std::array::from_fn(|i| now[i].wrapping_sub(last[i]));
+    *last = now;
+    d
+}
 
 /// Host wall inside the per-layer verify/prefill body, split by phase.
 ///

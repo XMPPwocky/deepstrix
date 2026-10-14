@@ -14,6 +14,13 @@
 //! adversarial activations (exact zeros, -0, all-zero 32-blocks, spikes, tiny values), synthetic Q8_0
 //! weights with extreme block scales. Negative control: one changed input value must show.
 //!
+//! The chain above is ALSO production's chain under `V41_MS_GRAPH_KEYS=stage_b` with
+//! `V41_MS_GRAPHS=0` (G4 engages there since 10-14): `g.shared_expert`'s `stage_cap_ctx` returns a
+//! `Direct` source before any `ensure` (no `_ind` twin, no context write) and the late mixes run as
+//! the R1 direct `launch_fast` (no carrier) -- the same kernels on the same buffers, and neither the
+//! chain nor G4 reads or writes the arena context slot (the slot side of that mode is checked in
+//! g6_boundary_bitexact::g6_boundary_matches_the_stage_b_direct_chain).
+//!
 //! Run: `cargo test --release --features v41 -p v4flash-kernels --test g4_shared_bitexact --
 //! --ignored --test-threads=1 --nocapture` (HIP_VISIBLE_DEVICES=0 = the dGPU on box 1). ~60 MB VRAM.
 #![cfg(feature = "v41")]

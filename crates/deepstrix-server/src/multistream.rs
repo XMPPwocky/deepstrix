@@ -2909,6 +2909,9 @@ impl Sched {
             v4flash_kernels::het::evtrace::emit_named(&v4flash_kernels::het::evtrace_kinds::HUB_B1, &pairs);
         }
         let b1v = |k: &str| b1.iter().find(|p| p.0 == k).map_or(0.0, |p| p.1);
+        // dGPU fusion groups G4 / G6 since the previous `ms.step` (lane-layers: G4 launches; G6 combines
+        // deferred by a Post, fused into the next chain, flushed as the old combine, dropped stale).
+        let [g4_n, g6_def, g6_n, g6_flush, g6_drop] = v4flash_kernels::het::forward_prefill::fusion_counter_deltas();
         tracing::info!(rows = b, spec = ?spec_out, lanes = if lanes3 { 3 } else if pipelined { 2 } else { 1 },
             step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
@@ -2917,7 +2920,8 @@ impl Sched {
             engram_gather_ms = format!("{:.2}", ENGRAM_GATHER_US.swap(0, Ordering::Relaxed) as f64 / 1e3),
             engram_t0_ms = format!("{:.2}", ENGRAM_TABLE_US[0].swap(0, Ordering::Relaxed) as f64 / 1e3),
             engram_t1_ms = format!("{:.2}", ENGRAM_TABLE_US[1].swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, draft_ms = format!("{draft_wall_ms:.1}"),
-            b1_dec_misses = b1v("dec_misses"), b1_dec_read_ms = format!("{:.2}", b1v("dec_read_ms")), b1_dec_ensure_ms = format!("{:.2}", b1v("dec_ensure_ms")), "ms.step");
+            b1_dec_misses = b1v("dec_misses"), b1_dec_read_ms = format!("{:.2}", b1v("dec_read_ms")), b1_dec_ensure_ms = format!("{:.2}", b1v("dec_ensure_ms")),
+            g4_n, g6_def, g6_n, g6_flush, g6_drop, "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),

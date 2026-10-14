@@ -18,6 +18,14 @@
 //! magnitudes. Plus a negative control (a 1-element change of the partial must show) and a mixed
 //! back-to-back sequence (b changes every launch, no syncs).
 //!
+//! `g6_boundary_matches_the_stage_b_direct_chain`: the same comparison in PRODUCTION's mode --
+//! `V41_MS_GRAPH_KEYS=stage_b` with `V41_MS_GRAPHS=0` (10-14): the chain's mHC launch is the R2
+//! CARRIER (`launch_fast_via` + `StageB::carry`: the lane-layer's context entry rides it into the
+//! slot), G6 carries nothing. Outputs compared as above, plus the context slot: after every case
+//! each `StageB`'s shadow must equal what its slot holds (or be `None`: the next `ensure` writes),
+//! and after the `ensure` a later stage_b stage would issue (graphs flipped on) both slots must hold
+//! the same entry (payload).
+//!
 //! Run: `cargo test --release --features v41 -p v4flash-kernels --test g6_boundary_bitexact --
 //! --ignored --test-threads=1 --nocapture` (HIP_VISIBLE_DEVICES=0 = the dGPU on box 1).
 #![cfg(feature = "v41")]
@@ -25,6 +33,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, PinnedBuffer, Stream};
 use v4flash_kernels::config::{HC_DIM, HC_MIX_DIM, N_EMBD, N_HC, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS};
 use v4flash_kernels::g6_boundary::{G6Combine, G6Mhc, G6Remote, G6_MAX_B};
+use v4flash_kernels::het::arena_ctx::{slot, ArenaCtx, StageB};
 use v4flash_kernels::het::engine::DeviceEngine;
 use v4flash_kernels::mhc_arena::{FastCollapse, FastMix, MIX_PRE_SCALED};
 
@@ -395,6 +404,211 @@ fn g6_boundary_is_bit_identical_to_the_chain() -> eyre::Result<()> {
             fails.push("mixed seq: g6 error word set".into());
         }
         eprintln!("mixed sequence: 200 launches each, compared every 50");
+    }
+    if !fails.is_empty() {
+        return Err(eyre!("{} failures", fails.len()));
+    }
+    Ok(())
+}
+
+/// The production chain under `stage_b` with graphs OFF: the combine as in `run_chain`, then the
+/// pre-attn mHC as `pre_moe_chain`'s R1/R2 launch -- `launch_fast_via` carrying `entry` into `sb`'s
+/// slot when `sb.carry` says the slot does not already hold it (V41_MS_CTX_CARRIER on).
+#[allow(clippy::too_many_arguments)]
+fn run_chain_stage_b(
+    e: &DeviceEngine,
+    s: &Stream,
+    sb: &StageB,
+    entry: &ArenaCtx,
+    l: &mut Lane,
+    sh: &mut Shared,
+    w: &Weights,
+    b: u32,
+    remote: bool,
+    write_carry: bool,
+) -> eyre::Result<()> {
+    let n = b as usize * N_EMBD as usize;
+    if remote {
+        let src = &l.remote_pin.as_slice()[..n];
+        l.remote_dev.slice_view_mut(0, n).copy_from_host_async(src, s)?;
+        e.hc_post.launch_from_split_batched_add2(s, &mut l.resid, &l.moe, &l.shared, &l.remote_dev, &l.after_attn, &l.split, N_HC, N_EMBD, N_HC, b)?;
+    } else {
+        e.hc_post.launch_from_split_batched_add(s, &mut l.resid, &l.moe, &l.shared, &l.after_attn, &l.split, N_HC, N_EMBD, N_HC, b)?;
+    }
+    let carried = sb.carry(entry);
+    let r = e.mhc_arena.launch_fast_via(
+        carried.as_ref().map(|c| (c, sb.slot_addr())),
+        s,
+        Some(FastMix {
+            weight: &w.w,
+            x: &l.resid,
+            scale: &w.scale,
+            base: &w.base,
+            mode: MIX_PRE_SCALED,
+            split_out: &mut l.split,
+            mix_out: &mut sh.mix,
+            counters: &mut sh.counters,
+            inv_rows: &mut sh.inv_rows,
+        }),
+        Some(FastCollapse { x: &l.resid, cur_out: &mut l.cur, norm_out: &mut l.norm, norm_w: &w.norm_w }),
+        &mut l.carry,
+        write_carry,
+        HC_DIM,
+        RMS_EPS,
+        SINKHORN_ITERS,
+        SINKHORN_EPS,
+        b,
+    );
+    if r.is_err() && carried.is_some() {
+        sb.forget();
+    }
+    r
+}
+
+/// A lane-layer's context entry as `arena_ctx_entry` builds it: per-layer weight slots (distinct
+/// fake addresses per layer: the slot only stores them), the lane's buffers, the canary log.
+fn entry_of(layer: u64, l: &Lane, log: u64) -> ArenaCtx {
+    let mut e = ArenaCtx::default();
+    let ws = [slot::Q_A, slot::Q_A_NORM, slot::Q_B, slot::KV, slot::KV_NORM, slot::WO_A, slot::WO_B, slot::SH_GATE, slot::SH_UP, slot::SH_DOWN];
+    for (i, sl) in ws.iter().enumerate() {
+        e.p[*sl] = 0x7f00_0000_0000 + (layer << 24) + ((i as u64) << 12);
+    }
+    for (j, sl) in slot::ROPE.iter().enumerate() {
+        e.p[*sl] = 0x3f80_0000_0000_0000 ^ (layer << 8) ^ j as u64;
+    }
+    e.p[slot::POS] = l.cur.raw() as u64;
+    e.p[slot::FFN_IN] = l.norm.raw() as u64;
+    e.p[slot::FFN_SHARED] = l.shared.raw() as u64;
+    e.log = log;
+    e
+}
+
+/// The slot invariant `ensure` relies on: the shadow is `None` (unknown) or what the slot holds.
+fn slot_ok(tag: &str, sb: &StageB) -> eyre::Result<Option<String>> {
+    let dev = sb.read_slot()?;
+    Ok(match sb.shadow() {
+        None => None,
+        Some(sh) if sh == dev => None,
+        Some(sh) => Some(format!("{tag}: shadow (seq {}) != slot (seq {}), payload equal: {}", sh.seq, dev.seq, sh.p == dev.p && sh.log == dev.log)),
+    })
+}
+
+#[test]
+#[ignore]
+fn g6_boundary_matches_the_stage_b_direct_chain() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let (dev, arch) = dgpu()?;
+    dev.set_current()?;
+    let e = DeviceEngine::for_arch(dev, &arch)?;
+    let id = e.device.id;
+    let s = Stream::new(id)?;
+    let sb_ref = StageB::new(id, &arch)?;
+    let sb_new = StageB::new(id, &arch)?;
+    let mut rng = Lcg(0x5b_ae_6c_46);
+    let w = weights(id, &mut rng)?;
+    let mut fails: Vec<String> = Vec::new();
+    let (mut n_cmp, mut n_carried) = (0usize, 0usize);
+    for b in 1..=G6_MAX_B {
+        let b2 = (G6_MAX_B + 1 - b).clamp(1, G6_MAX_B);
+        for (mode, write_carry) in [(1u32, true), (0, true), (2, true), (1, false)] {
+            let remote = mode != 0;
+            let (xa, xb) = (inputs(&mut rng), inputs(&mut rng));
+            let (mut ra, mut rb) = (Lane::new(id, &xa)?, Lane::new(id, &xb)?);
+            let (mut na, mut nb) = (Lane::new(id, &xa)?, Lane::new(id, &xb)?);
+            let (mut sr, mut sn) = (shared(id)?, shared(id)?);
+            // a step starts (`begin_step` forgets the shadow; the slot keeps the last step's entry)
+            sb_ref.forget();
+            sb_new.forget();
+            let mut last = ArenaCtx::default();
+            for pass in 0..2u64 {
+                // layer `pass + 1` of both lanes (the entries name the REF lanes' buffers: the payload
+                // is what both slots must end up agreeing on)
+                let (ea, eb) = (entry_of(pass + 1, &ra, 0x1000), entry_of(pass + 1, &rb, 0x1000));
+                let rem_b = remote && b % 2 == 0;
+                let w0 = sb_ref.counters().1;
+                run_chain_stage_b(&e, &s, &sb_ref, &ea, &mut ra, &mut sr, &w, b, remote, write_carry)?;
+                run_chain_stage_b(&e, &s, &sb_ref, &eb, &mut rb, &mut sr, &w, b2, rem_b, write_carry)?;
+                n_carried += (sb_ref.counters().1 - w0) as usize;
+                // production after the change: G6 in place of the carrier launch, no context write
+                run_g6m(&e, &s, &mut na, &mut sn, &w, b, mode, write_carry)?;
+                run_g6m(&e, &s, &mut nb, &mut sn, &w, b2, if rem_b { mode } else { 0 }, write_carry)?;
+                last = eb;
+            }
+            s.synchronize()?;
+            let tag = format!("stage_b b={b} (lane B {b2}) remote mode {mode} write_carry={write_carry}");
+            let mut f = diff(&format!("{tag} lane A"), &ra.snap()?, &na.snap()?);
+            f.extend(diff(&format!("{tag} lane B"), &rb.snap()?, &nb.snap()?));
+            let sbuf = |x: &Shared| -> eyre::Result<Vec<(&'static str, Vec<u32>)>> {
+                Ok(vec![
+                    ("mix", download(&x.mix)?.into_iter().map(f32::to_bits).collect()),
+                    ("inv_rows", download(&x.inv_rows)?.into_iter().map(f32::to_bits).collect()),
+                    ("counters", download(&x.counters)?),
+                ])
+            };
+            f.extend(diff(&format!("{tag} shared"), &sbuf(&sr)?, &sbuf(&sn)?));
+            if download(&sn.counters)?.iter().any(|&c| c != 0) {
+                f.push(format!("{tag}: mHC counters not zero after the launches"));
+            }
+            // the context slot: the invariant holds on both sides ...
+            f.extend(slot_ok(&format!("{tag} ref (carrier)"), &sb_ref)?);
+            f.extend(slot_ok(&format!("{tag} g6"), &sb_new)?);
+            if sb_ref.shadow().map(|x| x.p) != Some(last.p) {
+                f.push(format!("{tag}: the carrier did not leave the last lane-layer's entry in the ref slot"));
+            }
+            // ... and a later stage_b stage (graphs flipped on: `stage_cap_ctx` -> `ensure`) reads the
+            // SAME entry from both slots.
+            sb_ref.ensure(&s, &last)?;
+            sb_new.ensure(&s, &last)?;
+            s.synchronize()?;
+            let (dr, dn) = (sb_ref.read_slot()?, sb_new.read_slot()?);
+            if dr.p != dn.p || dr.log != dn.log || dn.p != last.p {
+                f.push(format!("{tag}: after ensure the slots differ (ref == last {}, g6 == last {})", dr.p == last.p, dn.p == last.p));
+            }
+            f.extend(slot_ok(&format!("{tag} ref after ensure"), &sb_ref)?);
+            f.extend(slot_ok(&format!("{tag} g6 after ensure"), &sb_new)?);
+            let sw = e.g6.sync_words()?;
+            let err = e.g6.error_word()?;
+            if err != 0 || sw.iter().enumerate().any(|(i, &v)| v != 0 && i != sw.len() - 32) {
+                f.push(format!("{tag}: g6 sync words not reset (err {err})"));
+            }
+            n_cmp += 2;
+            if !f.is_empty() {
+                eprintln!("FAIL {}", f.join("\n     "));
+            }
+            fails.extend(f);
+        }
+    }
+    eprintln!("G6 vs the stage_b direct chain: {n_cmp} lane comparisons (x2 passes), {n_carried} carrier writes, {} failures", fails.len());
+    if n_carried == 0 {
+        fails.push("the reference never carried an entry (the stage_b arm did not run)".into());
+    }
+
+    // ---- negative controls: a 1-element change of the partial must show (stage_b arm), and the slot
+    // check must see a shadow ahead of its slot (a carrier stamp whose launch never came)
+    {
+        let b = 4u32;
+        let x = inputs(&mut rng);
+        let (mut r, mut n) = (Lane::new(id, &x)?, Lane::new(id, &x)?);
+        let (mut sr, mut sn) = (shared(id)?, shared(id)?);
+        n.remote_pin.as_mut_slice()[N_EMBD as usize + 17] += 0.03125;
+        let en = entry_of(7, &r, 0x1000);
+        run_chain_stage_b(&e, &s, &sb_ref, &en, &mut r, &mut sr, &w, b, true, true)?;
+        run_g6(&e, &s, &mut n, &mut sn, &w, b, true, true)?;
+        s.synchronize()?;
+        let d = diff("negative control", &r.snap()?, &n.snap()?);
+        eprintln!("negative control (partial): {} buffers differ (expect >= 1)", d.len());
+        if d.is_empty() {
+            fails.push("negative control: a changed partial did not change any output".into());
+        }
+        let sb = StageB::new(id, &arch)?;
+        sb.ensure(&s, &entry_of(9, &r, 0x1000))?;
+        let _stamped = sb.carry(&entry_of(10, &r, 0x1000)); // the shadow moves, the slot does not
+        s.synchronize()?;
+        let d = slot_ok("negative control (slot)", &sb)?;
+        eprintln!("negative control (slot): {}", d.as_deref().unwrap_or("NOT detected"));
+        if d.is_none() {
+            fails.push("slot negative control: a shadow ahead of the slot was not detected".into());
+        }
     }
     if !fails.is_empty() {
         return Err(eyre!("{} failures", fails.len()));

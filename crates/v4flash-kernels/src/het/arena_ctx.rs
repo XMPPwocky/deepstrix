@@ -439,6 +439,22 @@ impl StageB {
         Some(e)
     }
 
+    /// The host shadow of the last enqueued entry (`None` = unknown: the next `ensure` writes).
+    pub fn shadow(&self) -> Option<ArenaCtx> {
+        *self.shadow.lock().unwrap()
+    }
+
+    /// The slot as the device holds it (a synchronous read; tests check `shadow` against it).
+    pub fn read_slot(&self) -> eyre::Result<ArenaCtx> {
+        let mut w = [0u64; ARENA_CTX_WORDS];
+        self.slot.copy_to_host(&mut w)?;
+        let mut e = ArenaCtx::default();
+        e.p.copy_from_slice(&w[..ARENA_CTX_SLOTS]);
+        e.seq = w[ARENA_CTX_SLOTS];
+        e.log = w[ARENA_CTX_SLOTS + 1];
+        Ok(e)
+    }
+
     /// Forget the shadow (an abnormal end: whatever was enqueued is not trusted).
     pub fn forget(&self) {
         *self.shadow.lock().unwrap() = None;
