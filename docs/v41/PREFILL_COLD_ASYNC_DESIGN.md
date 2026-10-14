@@ -168,3 +168,69 @@ Route, the late join, the private remap and the late MoE pass are unchanged code
 Gate: `tests/late_exactness.rs::late_pass_matches_main_pass_range` -- FORCE_LATE resident picks in the encoder chunks
 only (verdict at encoder layer 0) and in the replay only (verdict at replay layer 20, with the encoder bit-identical to
 the reference's: its KV and its layer-0 MoE), each with a bit-identical null and a dropped-late negative control.
+
+## 12. The replay's late reads, issued from the encoder's tail (`V41_PREFILL_EARLY_REPLAY`, 2026-10-14)
+
+Owner 10-14: cut TTFT by hiding the CED replay's expert reads under the encoder; "an extension of prefetch: on the last
+prefill batch, or the last encoder layer of a replay, we know we'll need decoder layers next". Hard rule: what is
+computed does not change -- only WHEN bytes are read; knob on / off bit-identical.
+
+### 12.1 Measured (10-14, short jobs n=64; hub log + evtrace, clock-corrected 1.5-1.7 s)
+- Replay 1.24 s p50, late JOIN WAIT 0.85 s p50 (0.8-1.0). ~320 new late reads per replay (16/layer = MAX 8 x 2 lanes),
+  ~6 GB. Box-1 drives during the replay: 4.45 GB/s, **E100 98% busy**, YMTC 41%: the replay is box-1-DISK bound.
+- Box 2 pages ~0.75 s (p50 sum of `page_us` over the replay's 40 requests), today hidden under box 1's joins: the
+  replay's floor with box 1's reads fully hidden is ~0.8-0.9 s, not ~0.45 s (box 2 becomes co-critical).
+- Encoder (range pass): 3.1 s p50, 1.77 GB/s, E100 48% / YMTC 24% busy: the slack is in the encoder.
+- What box 1 reads in the replay is NOT its home set: box-1-home = decode's owned hot set (113/layer), kept resident
+  (`V41_B1_PROTECT_OWNED` + rewarm; owned-not-resident after a prefill p50 1-2, p90 26-65 per JOB). The 0.85 s are the
+  LATE picks: box-2-home experts box 2 does not hold (mirror), `cold_b1_take` of them read by box 1.
+
+### 12.2 What can be read early, exactly
+- A replay layer's picks are known only at its route (layer L's router reads layer L-1's output): "read all 20 decoder
+  layers once layer 19 is done" is impossible, and issuing earlier inside the replay cannot help a saturated E100.
+  Bytes must move OUT of the replay, into the encoder's tail, so the replay's late set must be PREDICTED.
+- Predictor: decayed counts of the replay's own picks per (layer, expert) (x4/5 per replay), ranked among the experts
+  COLD right now exactly as the replay's route defines it (box-2 home, mirror says box 2 does not hold it, not on box 1).
+  Offline (10-12 pick trace, 143 replays, two-box residency proxy) recall of the late set at R per layer: R=8 0.26,
+  R=16 0.43, R=24 0.56, R=32 0.66 (random 0.08 / 0.15 / 0.23 / 0.31). Precision at R=16 ~0.4.
+- Plus the prefill read-ahead's own set (`readahead_layer`'s predicate: box-1-home, not resident) for decoder layers,
+  landed VISIBLE (the main pass reads box-1-home picks whatever their residency) -- small, see 12.1.
+
+### 12.3 Mechanism (extension of the late readers + read-ahead)
+- Reads: the late readers (`LateReader`), a second, LOWER-priority lane in their queue (`replay_early::ReadQueue`):
+  a late (demand) job always pops first; at most `V41_PREFILL_EARLY_READERS` (2) early reads run during the encoder,
+  `V41_PREFILL_EARLY_READERS_REPLAY` (1) during the replay. Own pinned stages (`V41_PREFILL_EARLY_STAGES`, static,
+  default 0 = feature absent): a late read's stage acceptance -- hence the late set -- never sees them.
+- TAIL START: the book opens when the encoder's remaining time, from this job's measured per-layer rate, drops to
+  `V41_PREFILL_EARLY_LEAD_MS` (1000, ~6 encoder layers of a short job), at the latest at its last MoE layer; in the job's
+  last chunk / last window only. LAYER-AHEAD: only layers below (first replay layer not yet routed) +
+  `V41_PREFILL_EARLY_DEPTH` (6) are issued; the window slides as the replay routes (`early_settle_below`).
+- SLOT-AWARE cap: early reads in flight + landed-unused <= min(`V41_PREFILL_EARLY_MAX` 160, box 1's free non-owned
+  slots at the open - `V41_PREFILL_EARLY_RESERVE` 400 = one replay's late budget). Landed early experts sit in PINNED
+  HIDDEN slots (key = `hidden_key`, `is_resident` false): the encoder's later chunks cannot evict them, routing cannot
+  see them. Landing only in pin passes, never evicting a slot used since the pass started or an owned one, no fallback.
+- USE: the replay's `late_read(layer, ids)` -- ids chosen exactly as with the knob off -- finds an early read of a pick
+  (landed / arrived / still reading) and ADOPTS it: registered in flight like a late read (the other lane shares it, as
+  off), no new read, no stage. The join publishes a landed hidden slot (the point where the off path lands the same
+  expert; one repack-stream event covers its earlier repack) or lands an adopted result like its own.
+- END: layers both lanes routed release their unused hidden slots (wasted); the replay's end closes the book; a job
+  that never reaches its replay expires after 60 s (`ensure`), another job's tail closes it.
+
+### 12.4 Exactness
+The late set, the late pass, its kernels, the landed bytes (same read, same repack) are the off path's. Classification
+inputs are untouched: hidden slots are invisible to `is_resident`; adoption happens only where the off path reads.
+Residual: hidden slots are claimed from LRU victims older than the pass, which can shift a LATER residency-dependent
+`cold_free` choice as any pool churn does (box 2's mirror is timing-dependent anyway; production classification is not
+run-to-run deterministic). Gate (`tests/late_exactness.rs::early_reads_match_off_replay`): deterministic late set
+(`COLD_B1=off`, `FORCE_LATE=N` in the replay, plan = that set via `V41_PREFILL_EARLY_GATE`), every arm from an empty
+pool: null bit-identical; early-on arms bit-identical to off (replay MoE captures, logits, seed rows, KV of all 40
+layers) with early reads USED; negative control (late pass dropped) must differ. Soak:
+`early_replay_soak_prod_selection` (production selection, pairs of runs, reads used, nothing left pinned / held).
+
+### 12.5 Expected effect
+At R=16 / layer with a 1 s lead at 2 readers (~1-1.6 GB before the replay), ~40% of layers 20-25's late bytes are
+already read: ~0.15-0.25 s of the 0.85 s join wait hidden (~0.3-0.4 s at most: box 2's ~0.8 s paging floor). Early
+reads during the replay mostly move bytes the E100 reads anyway (hits) and add the misses' bytes: A/B
+`V41_PREFILL_EARLY_READERS_REPLAY` 0 vs 1. Waste ~55-60% of early reads (~1 GB disk, <= 160 slots held, released per
+layer). Judge on per-job `replay_join_wait_ms` DOWN without `enc_join_wait_ms` UP (`prefill_job_replay` line, with
+`early_*` counters; both arms log them once early stages are configured).

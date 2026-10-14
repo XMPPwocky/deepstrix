@@ -41,6 +41,7 @@ pub mod prefill_loan;
 pub mod prefill_split;
 pub mod prefill_stats;
 pub mod remote_experts;
+pub mod replay_early;
 pub mod scratch;
 pub mod state;
 pub mod step_rows;

@@ -1059,6 +1059,42 @@ crate::knobs! {
     /// `V41_PREFILL_COLD_LATE_SKIP` (GATE ONLY, default off; live): the late join lands its reads and pushes but SKIPS
     /// the late MoE pass and its add -- the negative control: a missing contribution the gate must catch.
     pub static PREFILL_COLD_LATE_SKIP = Knob::flag("V41_PREFILL_COLD_LATE_SKIP", false).live();
+    /// `V41_PREFILL_EARLY_REPLAY` (default 0 = off; live, read when a job's last encoder chunk / window starts): EARLY
+    /// reads for the CED replay (docs/v41/PREFILL_COLD_ASYNC_DESIGN.md section 12). While the encoder runs, box 1's late
+    /// readers read, per decoder layer, this many of the experts the replay most likely reads late (decayed replay-pick
+    /// counts; only experts cold right now: box-2 home, not held by box 2, not on box 1) into HIDDEN pool slots that
+    /// routing cannot see. When the replay's `late_read` asks for one of them -- the same pick, chosen exactly as with the
+    /// knob off -- the read is already done (or under way) and the late join publishes the slot: WHAT is computed does not
+    /// change, only when the bytes were read. Needs the late range pass (`V41_PREFILL_COLD_ASYNC_RANGE`, its pins and
+    /// readers) and the early stages (`V41_PREFILL_EARLY_STAGES` > 0 in the hub's environment, static).
+    pub static PREFILL_EARLY_REPLAY = Knob::int("V41_PREFILL_EARLY_REPLAY", 0, 0, 64).live();
+    /// `V41_PREFILL_EARLY_READERS` (default 2; live, read per pump): early reads running at once during the ENCODER's
+    /// tail, at most (late reads always go first: their own queue lane; the rest of the readers stay theirs).
+    pub static PREFILL_EARLY_READERS = Knob::int("V41_PREFILL_EARLY_READERS", 2, 0, 16).live();
+    /// `V41_PREFILL_EARLY_READERS_REPLAY` (default 1; live, read per pump): the same during the REPLAY, whose own late
+    /// reads keep box 1's E100 ~98% busy (10-14): an early byte there that the replay does not use slows it. 0 = only
+    /// reads issued before the replay (still adopted when the replay asks for them).
+    pub static PREFILL_EARLY_READERS_REPLAY = Knob::int("V41_PREFILL_EARLY_READERS_REPLAY", 1, 0, 16).live();
+    /// `V41_PREFILL_EARLY_DEPTH` (default 6; live, read per pump): LAYER-AHEAD window, as the prefill read-ahead: early
+    /// reads only for decoder layers below (first layer the replay has not routed yet) + this. In the encoder's tail
+    /// that is layers 20 .. 20 + depth.
+    pub static PREFILL_EARLY_DEPTH = Knob::int("V41_PREFILL_EARLY_DEPTH", 6, 1, 20).live();
+    /// `V41_PREFILL_EARLY_LEAD_MS` (default 1000; live, read per encoder lane-layer): the TAIL START -- the book opens
+    /// when the encoder's remaining time, estimated from its measured per-layer rate in this job, drops to this (~6
+    /// encoder layers of a short job at ~165 ms/layer); the job's last encoder layer opens it in any case.
+    pub static PREFILL_EARLY_LEAD_MS = Knob::int("V41_PREFILL_EARLY_LEAD_MS", 1000, 0, 60_000).live();
+    /// `V41_PREFILL_EARLY_RESERVE` (default 400 = one replay's late budget, 20 layers x 20; live, read at the book's
+    /// open): box-1 free / non-owned slots left to the late landings of the rest of the job. Early reads in flight +
+    /// landed-unused never exceed (free non-owned slots - this), capped by `V41_PREFILL_EARLY_MAX`.
+    pub static PREFILL_EARLY_RESERVE = Knob::int("V41_PREFILL_EARLY_RESERVE", 400, 0, 100_000).live();
+    /// `V41_PREFILL_EARLY_MAX` (default 160; live, read at the book's open): early reads in flight + landed-unused, at
+    /// most (~3 GB of box-1 pool held for the replay).
+    pub static PREFILL_EARLY_MAX = Knob::int("V41_PREFILL_EARLY_MAX", 160, 0, 4096).live();
+    /// `V41_PREFILL_EARLY_GATE` (GATE ONLY, default 0 = off; live): the early plan is the replay's FORCED late set of
+    /// `V41_PREFILL_COLD_FORCE_LATE` = N -- every box-1-home decoder expert with `id % N == 0` not resident -- landed
+    /// hidden, so the exactness gate (tests/late_exactness.rs `early_reads_match_off_replay`) has early reads the replay
+    /// certainly adopts, with no cold selection (`V41_PREFILL_COLD_B1=off`).
+    pub static PREFILL_EARLY_GATE = Knob::int("V41_PREFILL_EARLY_GATE", 0, 0, 384).live();
     /// `V41_EXPERT_HEDGE_MS` (default 0 = off; live, pushed into `v4flash_core::hedge` by its hook): an expert
     /// weight-plane read through the striped mirror path (`read_range_into_direct_mirrored`, `V41_EXPERT_MIRROR_LAYOUT`)
     /// whose PRIMARY (E100) share is not back within this many ms is read from the mirror copy too, first answer wins

@@ -1328,6 +1328,9 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         {
             let env_n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
             pg.start_late_reader(std::path::Path::new(&cfg.gguf_path), env_n("V41_PREFILL_COLD_READERS", 8), env_n("V41_PREFILL_COLD_STAGES", 0))?;
+            // EARLY reads for the CED replay (`V41_PREFILL_EARLY_REPLAY`, design section 12): their own pinned stages,
+            // static (`V41_PREFILL_EARLY_STAGES`, default 0 = none: nothing of the feature runs; 8 = ~150 MB pinned).
+            pg.start_early_stages(env_n("V41_PREFILL_EARLY_STAGES", 0))?;
         }
         tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "expert pager ready");
         Some(pg)

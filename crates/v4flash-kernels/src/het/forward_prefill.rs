@@ -1110,7 +1110,16 @@ pub struct PrefillJob {
     /// prompt's whole-prompt inputs are ~15 GB of host RAM and a 35 s Engram
     /// gather up front; per chunk they are ~60 MB and ~150 ms.
     chunk_inputs: Option<(Vec<Vec<f32>>, Option<Vec<Vec<f32>>>)>,
+    /// This job's identity for the replay's EARLY reads (`V41_PREFILL_EARLY_REPLAY`): the pager keeps one early book, for
+    /// one job; another job's encoder closes it.
+    early_token: u64,
+    /// The pager's cumulative late join wait (ms) at the job's first unit / at its replay's start (per-job encoder and
+    /// replay join waits on the `prefill_job_replay` line, with early stages configured).
+    early_jw0: Option<u64>,
 }
+
+/// `PrefillJob::early_token`s.
+static EARLY_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl PrefillJob {
     pub fn new(
@@ -1160,6 +1169,8 @@ impl PrefillJob {
             engram_pin: Vec::new(),
             seed_pin: None,
             chunk_inputs: None,
+            early_token: EARLY_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            early_jw0: None,
         })
     }
     pub fn total(&self) -> usize { self.tokens.len() }
@@ -1847,6 +1858,13 @@ impl HeterogeneousEngine {
             self.igpu.compute.synchronize()?;
         }
         let _pin_pass = PinPass::enter(pin);
+        // Early reads (`V41_PREFILL_EARLY_REPLAY`) may land in a pin pass (its iGPU work so far is synchronized).
+        if pin {
+            if let Some(pg) = pager.as_deref_mut() {
+                pg.early_pass_start();
+            }
+        }
+        let t_pass = std::time::Instant::now();
         // Not with the dGPU hot het-split active on any layer of the pass (its own remap; the late pass dispatches through
         // the pager pool only). `prefill_hot_active`, not `hot_prefill_enabled()`: the latter defaults ON even with no hot
         // experts loaded (paged experts), which kept the late path off (gate run 1, 10-12).
@@ -1877,6 +1895,18 @@ impl HeterogeneousEngine {
                     let [lane0, lane1] = &mut lanes;
                     let ((bd, bi), (bdo, bio)) = if lane == 0 { (lane0, lane1) } else { (lane1, lane0) };
                     check_scratch_rows("layer-outer lane unit", un.rows, bd, bi, sd, si)?;
+                    // EARLY reads for the replay (`V41_PREFILL_EARLY_REPLAY`): the encoder's tail may open the book (rate
+                    // measured over this pass's layers so far, else the last one's); then land + issue.
+                    if let Some(pg) = pager.as_deref_mut() {
+                        if u == 0 && l < split {
+                            let rate = (l > a).then(|| t_pass.elapsed().as_secs_f64() * 1e3 / (l - a) as f64);
+                            if let Some(r) = rate {
+                                early_note_rate(r);
+                            }
+                            early_tail_check(pg, l, rate)?;
+                        }
+                        pg.early_pump()?;
+                    }
                     // Compressor lending (reuse layers borrow their KV source's store): once per layer, around its pres.
                     let lend_src = crate::config::kv_source_of(l);
                     if u == 0 {
@@ -2027,6 +2057,13 @@ impl HeterogeneousEngine {
             }
         }
         drop(exec);
+        if let Some(pg) = pager.as_deref_mut() {
+            pg.early_pass_end();
+        }
+        if b_end > a && b_end <= split {
+            // MoE layers only (the KvSourceOnly layer-20 pass is ~free and would understate the rate).
+            early_note_rate(t_pass.elapsed().as_secs_f64() * 1e3 / (b_end - a) as f64);
+        }
         if late_pass() {
             LATE_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
             if let Some(pg) = pager.as_deref_mut() {
@@ -2136,9 +2173,14 @@ impl HeterogeneousEngine {
             job.split = self.build_prefill_split(job, pager.as_deref());
         }
         let _split_guard = super::prefill_split::install(job.split.clone());
+        if job.early_jw0.is_none() {
+            job.early_jw0 = pager.as_deref().filter(|p| p.early_available()).and_then(|p| p.late_stats()).map(|s| s.6);
+        }
         if job.ced && job.lm_rows > 0 && self.lm_open_window(job, lane_caps, chunk_size)? {
             self.remote_set_last_unit(job.lm.as_ref().is_some_and(|w| w.last));
             let _last_guard = LastUnitGuard(self);
+            // The job's LAST window is the encoder's tail: it may open the replay's early book (`early_tail_check`).
+            let _early_tail = job.lm.as_ref().is_some_and(|w| w.last).then(|| EarlyTailGuard::enter(job.early_token));
             if job.lm.as_ref().is_some_and(|w| w.lo) {
                 return self.prefill_job_lm_pass(job, bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, pager);
             }
@@ -2151,6 +2193,8 @@ impl HeterogeneousEngine {
         // LAST unit: the chunk that ends the prompt (review r3: right on the no-window fallback paths too).
         self.remote_set_last_unit(is_last_chunk);
         let _last_guard = LastUnitGuard(self);
+        // The last encoder chunk is the encoder's tail: it may open the replay's early book (`early_tail_check`).
+        let _early_tail = (is_last_chunk && job.ced).then(|| EarlyTailGuard::enter(job.early_token));
         let (lazy_hcs, lazy_engram) = match job.chunk_inputs.take() {
             Some((mut h, mut e)) => {
                 // A SURPLUS is a prefix to keep: `next_chunk_range` predicted a layer-outer window and `lm_open_window` fell back
@@ -2299,15 +2343,49 @@ impl HeterogeneousEngine {
         // The replay is always its job's LAST unit (design 2.1).
         self.remote_set_last_unit(true);
         let _last_guard = LastUnitGuard(self);
-        let b_a = self.pipelined_range_impl(
+        // EARLY reads (`V41_PREFILL_EARLY_REPLAY`, design section 12): the replay keeps the book layer-ahead (opened at
+        // the encoder's tail; else here, with no lead). Its picks feed the plan's statistics, decayed per replay. With no
+        // early stages configured none of this runs.
+        let early_cfg = pager.as_deref().is_some_and(|p| p.early_available());
+        let jw_enc0 = if early_cfg { pager.as_deref().and_then(|p| p.late_stats()).map(|s| s.6) } else { None };
+        if let Some(pg) = pager.as_deref_mut().filter(|_| early_cfg) {
+            if super::replay_early::collecting() {
+                super::replay_early::decay();
+            }
+            if pg.early_job() != Some(job.early_token) {
+                early_open(pg, job.early_token)?;
+            }
+            pg.early_replay_start();
+        }
+        let replay = self.pipelined_range_impl(
             bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, RangeSeed::Host { hcs: &seg_hcs, carry: Some(&seg_carry) }, &seg_tokens, seg_pos0,
             None, None, pager.as_deref_mut(), None, split..N_LAYER as usize, CedMode::Replay, true,
-        )?;
+        );
+        // Close the book whatever happened (hidden slots back to the pool).
+        let early = match pager.as_deref_mut().filter(|_| early_cfg) {
+            Some(pg) => pg.early_finish()?,
+            None => None,
+        };
+        let b_a = replay?;
         let (src_bd, last_idx) = if b_seg > b_a { (&*bd_b, b_seg - b_a - 1) } else { (&*bd_a, b_a - 1) };
         let logits = self.head_from_row(head_scratch, src_bd, last_idx, weights)?;
         self.emit_prefill_perfetto()?;
-        tracing::info!(replay_tokens = b_seg, seg_pos0, elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f32()),
-            total_s = format!("{:.1}", job.started.elapsed().as_secs_f32()), "prefill_job_replay");
+        if early_cfg {
+            // Per job, both arms of an A/B: the encoder's and the replay's late join waits, and the early reads.
+            let jw_now = pager.as_deref().and_then(|p| p.late_stats()).map_or(0, |s| s.6);
+            let enc_jw = jw_enc0.zip(job.early_jw0).map_or(0, |(a, b)| a.saturating_sub(b));
+            let rep_jw = jw_enc0.map_or(0, |a| jw_now.saturating_sub(a));
+            let e = early.unwrap_or_default();
+            let mb = pager.as_deref().map_or(0, |p| p.expert_bytes()) as u64 * e.issued / 1_000_000;
+            tracing::info!(replay_tokens = b_seg, seg_pos0, elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f32()),
+                total_s = format!("{:.1}", job.started.elapsed().as_secs_f32()), enc_join_wait_ms = enc_jw, replay_join_wait_ms = rep_jw,
+                early = early.is_some(), early_issued = e.issued, early_landed = e.landed, early_readahead = e.readahead,
+                early_used = e.used(), early_used_landed = e.used_landed, early_used_inflight = e.used_inflight,
+                early_wasted = e.wasted, early_refused = e.land_refused, early_failed = e.failed, early_mb = mb, "prefill_job_replay");
+        } else {
+            tracing::info!(replay_tokens = b_seg, seg_pos0, elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f32()),
+                total_s = format!("{:.1}", job.started.elapsed().as_secs_f32()), "prefill_job_replay");
+        }
         dump_prefill_logits(&logits)?;
         Ok(logits)
     }
@@ -3773,9 +3851,12 @@ impl HeterogeneousEngine {
         self.igpu.compute.synchronize()?;
         let pin_guard = PinPass::enter(true);
         let late_guard = LatePassGuard::enter(true);
+        // Early reads may land in this pass (its iGPU work so far is synchronized; anything it touches is newer).
+        pg.early_pass_start();
         let stats0 = LatePassStats::begin(pg);
         let mut pend: [Option<(usize, PreMoeCarry)>; 2] = [None, None];
         let mut result = self.range_late_body(bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, ln, stats_a, pg, engram_rows, lo, hi, ced, &mut pend);
+        pg.early_pass_end();
         if result.is_ok() && pend.iter().any(Option::is_some) {
             // Every late unit is joined before its own post; a KvSourceOnly unit has no MoE (fails closed).
             result = Err(eyre!("late range pass L{lo}..{hi}: a unit's late join never ran"));
@@ -3832,6 +3913,12 @@ impl HeterogeneousEngine {
         let split = crate::config::CED_DECODER_START;
         let mode_of = |l: usize| if l == split { ced } else { CedMode::Exact };
         let RangeLanes { tokens_a, tokens_b, pos0_a, pos0_b, vis_a, vis_b, b_a, b_b } = *ln;
+        // The encoder's TAIL may open the replay's early book (`early_tail_check`, from this pass's measured rate).
+        let t_body = std::time::Instant::now();
+        let encoder = ced != CedMode::Replay;
+        if encoder {
+            early_tail_check(pg, lo, None)?;
+        }
 
         // Warm-up: layer lo's pre-MoE, both lanes.
         let _t_pre_warm = LayerHostTimer::start(&LH_PRE);
@@ -3860,6 +3947,15 @@ impl HeterogeneousEngine {
             let _t_eng = LayerHostTimer::start(&LH_ENGRAM);
             self.stage_engram_lane(bd_a, layer + 1, engram_rows, 0, b_a)?;
             drop(_t_eng);
+            if ced == CedMode::Replay {
+                // Both lanes have routed every layer <= `layer` (lane B's pre of `layer` ran last iteration): early reads
+                // of those layers can no longer be used; the read-ahead frontier moves to `layer + 1`.
+                pg.early_settle_below(layer as i32 + 1);
+            } else if encoder {
+                let ms = t_body.elapsed().as_secs_f64() * 1e3 / (layer + 1 - lo) as f64;
+                early_note_rate(ms);
+                early_tail_check(pg, layer + 1, Some(ms))?;
+            }
             let _t_pre = LayerHostTimer::start(&LH_PRE);
             self.range_pre_late(0, layer + 1, bd_a, bi_a, bd_b, bi_b, sd, si, &mut state.layers[layer + 1], weights, pos0_a, tokens_a,
                 vis_a, stats_a.as_deref_mut(), pg, mode_of(layer + 1), pend)?;
@@ -3926,6 +4022,8 @@ impl HeterogeneousEngine {
         let (dlw, ilw) = (&weights.dgpu_layers[layer], &weights.igpu_layers[layer]);
         let sev = &self.sync_events_lane(lane).layers[layer];
         let rows = RowLayout::Contiguous;
+        // EARLY reads for the replay (`V41_PREFILL_EARLY_REPLAY`): land what arrived, queue more (no book: nothing).
+        pg.early_pump()?;
         let mut c = self.pre_moe_chain(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev, Some(&mut *pg), ced, &rows)?;
         c.lane = lane;
         self.pre_moe_route(&mut c, bd, sd, sev, Some(&mut *pg), &rows)?;
@@ -11292,6 +11390,11 @@ impl HeterogeneousEngine {
                         }
                     }
                 }
+                // EARLY reads' statistics (`V41_PREFILL_EARLY_REPLAY`): a CED replay's picks (prefill rows at a decoder
+                // layer; host bookkeeping only, and only with early stages configured).
+                if !holder_rows && (b as usize) >= 64 && (layer as usize) >= crate::config::CED_DECODER_START && super::replay_early::collecting() {
+                    super::replay_early::note_picks(layer as usize, &sel_host);
+                }
                 for &sv in &sel_host {
                     if (0..N_EXPERT as i32).contains(&sv) && !seen[sv as usize] {
                         seen[sv as usize] = true;
@@ -14446,6 +14549,101 @@ static MOE_CAPTURES: std::sync::Mutex<Vec<(i32, u32, Vec<f32>)>> = std::sync::Mu
 /// Take (and clear) the captured (layer, rows, values) MoE outputs.
 pub fn take_moe_captures() -> Vec<(i32, u32, Vec<f32>)> {
     std::mem::take(&mut *MOE_CAPTURES.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// EARLY reads for the replay (`V41_PREFILL_EARLY_REPLAY`, design section 12): the job whose encoder TAIL may open
+/// the pager's early book (set around the job's last encoder chunk / window; 0 = none).
+static EARLY_TAIL_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The encoder's last measured ms per layer (f64 bits; 0 = none yet), for the tail start's remaining-time estimate.
+static EARLY_MS_PER_LAYER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct EarlyTailGuard;
+impl EarlyTailGuard {
+    fn enter(job: u64) -> Self {
+        EARLY_TAIL_JOB.store(job, std::sync::atomic::Ordering::Relaxed);
+        EarlyTailGuard
+    }
+}
+impl Drop for EarlyTailGuard {
+    fn drop(&mut self) {
+        EARLY_TAIL_JOB.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn early_note_rate(ms_per_layer: f64) {
+    if ms_per_layer.is_finite() && ms_per_layer > 0.0 {
+        EARLY_MS_PER_LAYER.store(ms_per_layer.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The TAIL START: in the encoder of the job set by `EarlyTailGuard`, about to run encoder `layer`, with `ms_per_layer`
+/// measured in this pass (`None`: the last pass's rate): open the early book once the remaining encoder time drops to
+/// `V41_PREFILL_EARLY_LEAD_MS` -- or at the encoder's last MoE layer in any case.
+fn early_tail_check(pg: &mut super::expert_pager::ExpertPager, layer: usize, ms_per_layer: Option<f64>) -> eyre::Result<()> {
+    let job = EARLY_TAIL_JOB.load(std::sync::atomic::Ordering::Relaxed);
+    if job == 0 || crate::knobs::PREFILL_EARLY_REPLAY.usize() == 0 || pg.early_job() == Some(job) {
+        return Ok(());
+    }
+    let split = crate::config::CED_DECODER_START;
+    let rate = ms_per_layer.or_else(|| {
+        let b = EARLY_MS_PER_LAYER.load(std::sync::atomic::Ordering::Relaxed);
+        (b != 0).then(|| f64::from_bits(b))
+    });
+    let remaining_ms = rate.map(|r| split.saturating_sub(layer) as f64 * r);
+    let lead = crate::knobs::PREFILL_EARLY_LEAD_MS.usize() as f64;
+    if layer + 1 >= split || remaining_ms.is_some_and(|m| m <= lead) {
+        early_open(pg, job)?;
+    }
+    Ok(())
+}
+
+/// Open job `job`'s early book: the PLAN, per decoder layer in order --
+///  - box-1 HOME experts not resident (the prefill read-ahead's own set, `readahead_layer`'s predicate): landed
+///    VISIBLE, the replay's main-pass `ensure` hits them;
+///  - then the `V41_PREFILL_EARLY_REPLAY` highest decayed replay-pick counts among the experts COLD right now exactly as
+///    the replay's route defines it (box-2 home, box 2 not holding it per the mirror, not on box 1): the experts the
+///    replay most likely gives box 1 to read LATE; landed HIDDEN, adopted by `late_read` if it asks for them.
+/// Only where the replay can take cold picks at all (the route's `cold_route` conditions + the late range pass).
+fn early_open(pg: &mut super::expert_pager::ExpertPager, job: u64) -> eyre::Result<()> {
+    let per_layer = crate::knobs::PREFILL_EARLY_REPLAY.usize();
+    if per_layer == 0 || !pg.early_available() {
+        return Ok(());
+    }
+    use super::expert_pager::{hot_set, partition_box2};
+    let split = crate::config::CED_DECODER_START as i32;
+    let gate_n = crate::knobs::PREFILL_EARLY_GATE.usize() as u32;
+    if gate_n > 0 {
+        // GATE ONLY: the replay's forced late set (box-1 home, `id % N == 0`), hidden; no cold selection involved.
+        let plan: Vec<(i32, u32)> = (split..N_LAYER as i32)
+            .flat_map(|l| (0..N_EXPERT).filter(move |e| e % gate_n == 0).map(move |e| (l, e)))
+            .filter(|&(l, e)| !partition_box2(l, e) && !pg.is_resident(l, e))
+            .collect();
+        return pg.early_begin(job, plan, Vec::new(), 0, crate::knobs::PREFILL_EARLY_MAX.usize());
+    }
+    if !(crate::knobs::PREFILL_COLD_ASYNC_RANGE.on()
+        && crate::knobs::PREFILL_PIN_INFLIGHT.on()
+        && remote_split_active()
+        && super::expert_pager::t2_partition()
+        && super::expert_pager::b1_page_misses()
+        && super::prefill_split::cold_b1_on(None))
+    {
+        return Ok(());
+    }
+    let counts = super::replay_early::counts_snapshot();
+    let cold = super::replay_early::plan_from_counts(&counts, per_layer, |l, e| {
+        !pg.is_resident(l, e) && partition_box2(l, e) && super::b2_mirror::lookup(l, e).is_some_and(|r| super::b2_mirror::nonres_for_miss(&r))
+    });
+    let mut visible: Vec<(i32, u32)> = Vec::new();
+    let mut plan: Vec<(i32, u32)> = Vec::with_capacity(cold.len());
+    for l in split..N_LAYER as i32 {
+        let own: Vec<(i32, u32)> = (0..N_EXPERT).filter(|&e| hot_set::box1_owns(l, e) == Some(true) && !pg.is_resident(l, e)).map(|e| (l, e)).collect();
+        plan.extend_from_slice(&own);
+        visible.extend_from_slice(&own);
+        plan.extend(cold.iter().copied().filter(|k| k.0 == l));
+    }
+    pg.early_begin(job, plan, visible, crate::knobs::PREFILL_EARLY_RESERVE.usize(), crate::knobs::PREFILL_EARLY_MAX.usize())?;
+    tracing::debug!(job, slot_cap = pg.early_slot_cap(), "replay early reads: book open");
+    Ok(())
 }
 
 fn late_budget_left(layer: usize) -> usize {

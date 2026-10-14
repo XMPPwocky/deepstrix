@@ -836,3 +836,385 @@ fn late_range_soak_prod_selection() -> eyre::Result<()> {
         Err(eyre!("LATE RANGE SOAK FAIL: {}", fail.join("; ")))
     }
 }
+
+/// EXACTNESS GATE for the replay's EARLY reads (`V41_PREFILL_EARLY_REPLAY`, docs/v41/PREFILL_COLD_ASYNC_DESIGN.md
+/// section 12): with the knob ON the replay must compute EXACTLY what it computes with it OFF -- early reads change
+/// only WHEN the late picks' bytes are read, never which picks are late, which pass computes them or how.
+///
+/// Deterministic late set: `V41_PREFILL_COLD_B1=off` (no cold selection) and `V41_PREFILL_COLD_FORCE_LATE=N` in the
+/// replay (box-1-home picks with `id % N == 0` go late), the early plan being that forced set (`V41_PREFILL_EARLY_GATE
+/// = N`). Every arm starts from an EMPTY box-1 pool (`ExpertPager::clear`), one ~1,500-token fresh job (chunked encoder,
+/// no window) on one weight load:
+///   A, A2 -- early off (A2 = the null: must be bit-identical to A);
+///   E, E2 -- early on (must be bit-identical to A: replay MoE captures, logits, encoder seed rows, KV of every layer),
+///            with early reads really USED by the replay's late reads (used_landed + used_inflight > 0);
+///   X     -- early on + `V41_PREFILL_COLD_LATE_SKIP` in the replay: the NEGATIVE CONTROL (must differ from A).
+/// After every arm: no slot pinned, every late and early stage back, no hidden slot left.
+/// Needs the hub DOWN (model loaded here), box 2 UP, the production env (sourced hub env file). Run it ALONE:
+/// ```text
+/// (prod env) V41_PREFILL_EARLY_STAGES=8 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels \
+///   --features v41 --release --test late_exactness -- --ignored --nocapture --exact early_reads_match_off_replay
+/// ```
+#[test]
+#[ignore]
+fn early_reads_match_off_replay() -> eyre::Result<()> {
+    install_panic_handler()?;
+    for (k, v) in [("V41_PAGED_EXPERTS", "1"), ("V41_PAGER_POOL_GB", "40")] {
+        if std::env::var(k).is_err() {
+            std::env::set_var(k, v);
+        }
+    }
+    if std::env::var("V41_REMOTE_ADDR").is_err() {
+        return Err(eyre!("the late pass exists only under the box-2 partition: set V41_REMOTE_ADDR (box 2 up)"));
+    }
+    let split = v4flash_kernels::config::CED_DECODER_START;
+    // Replay layers captured: the first, two later ones and the last (early reads cover the first `DEPTH` layers from
+    // the encoder's tail, the rest layer-ahead in the replay).
+    let rep_layers: Vec<i32> = std::env::var("GATE_REP_LAYERS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![split as i32, split as i32 + 3, split as i32 + 10, N_LAYER as i32 - 1]);
+    std::env::set_var("V41_PREFILL_CAPTURE_MOE", rep_layers.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(","));
+    for (k, v) in [("V41_PREFILL_PIN_INFLIGHT", "1"), ("V41_PREFILL_COLD_ASYNC_RANGE", "1"), ("V41_PREFILL_COLD_ASYNC", "0"),
+        ("V41_PREFILL_COLD_B1", "off")] {
+        std::env::set_var(k, v);
+    }
+    if std::env::var("V41_CED").as_deref() == Ok("0") {
+        return Err(eyre!("the replay under test is the CED replay; unset V41_CED=0"));
+    }
+    let dir = std::env::var("V41_HF_DIR").unwrap_or_else(|_| HF_DIR_DEFAULT.to_string());
+    let engram_dir = std::env::var("V41_ENGRAM_DIR").unwrap_or_else(|_| {
+        format!("{}/.cache/deepstrix/v41/engram", std::env::var("HOME").unwrap_or_default())
+    });
+    let dgpu = pick("gfx1201")?;
+    let igpu = pick("gfx1151")?;
+    let darch = dgpu.properties()?.gcn_arch_name;
+    let iarch = igpu.properties()?.gcn_arch_name;
+    let hf = V41HfWeights::open(&dir, None)?;
+    let src = WeightSrc::from(&hf);
+    let te = src.tensor("token_embd.weight").ok_or_else(|| eyre!("missing token_embd.weight"))?;
+    let te_dtype = te.dtype;
+    let te_bytes = src.read_tensor(te)?;
+    let embed = |tok: i32| -> eyre::Result<Vec<f32>> {
+        let mut r = vec![0f32; HC_DIM as usize];
+        embed_lookup(&te_bytes, te_dtype, tok, &mut r)?;
+        Ok(r)
+    };
+    eprintln!("loading weights (paged experts)...");
+    let weights = HetModelWeights::load_all(src, dgpu, igpu, &rope_for_layer)?;
+    let engine = HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, ExecMode::HetParallel)?;
+    let mut ds = DgpuScratch::alloc(dgpu)?;
+    let n_kv_max: u32 = 8192;
+    let lane_rows = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
+    let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut sd = BatchDgpuShared::alloc_rows_ctx(dgpu, lane_rows, n_kv_max)?;
+    let mut si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
+    let mut pg = ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, 0)?;
+    let stages = env_usize("V41_PREFILL_COLD_STAGES", 16).max(1);
+    let early_stages = env_usize("V41_PREFILL_EARLY_STAGES", 8).max(1);
+    pg.start_late_reader(Path::new(&dir), env_usize("V41_PREFILL_COLD_READERS", 8), stages)?;
+    pg.start_early_stages(early_stages)?;
+    if !pg.late_on() || !pg.early_available() {
+        return Err(eyre!("late readers / early stages did not start (GPU repack off?)"));
+    }
+    let hasher = EngramHash::load(Path::new(&engram_dir))?;
+    hasher.self_check()?;
+    let mut tables = Vec::new();
+    for &l in ENGRAM_LAYERS {
+        tables.push(EngramTable::open(pg.raw(), l as usize)?);
+    }
+    let ein = ENGRAM_IN as usize;
+    let prompt = synth_prompt(23, env_usize("GATE_TOKENS", 1500));
+    let rows_all = {
+        let hashes = hasher.hash_sequence(&prompt);
+        let mut out = vec![vec![0f32; prompt.len() * ein]; tables.len()];
+        for (li, tbl) in tables.iter().enumerate() {
+            for t in 0..prompt.len() {
+                tbl.gather_position(pg.raw(), &hashes[t][li], &mut out[li][t * ein..(t + 1) * ein])?;
+            }
+        }
+        out
+    };
+    let hcs: Vec<Vec<f32>> = prompt.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
+    let force_n = env_usize("GATE_FORCE_N", 7).to_string();
+    let per_layer = env_usize("GATE_EARLY_PER_LAYER", 16).to_string();
+
+    struct Arm {
+        logits: Vec<f32>,
+        caps: Vec<(i32, u32, Vec<f32>)>,
+        replay_rows: Vec<(i32, Vec<f32>, Vec<f32>)>,
+        state: HetModelState,
+        late_rep: u64,
+        early: Option<v4flash_kernels::het::replay_early::EarlyStats>,
+        windows: usize,
+    }
+    let late_count = |pg: &ExpertPager| pg.late_stats().map_or(0, |x| x.2 + x.3);
+    let mut fail: Vec<String> = Vec::new();
+    let mut arm = |name: &str, early_on: bool, skip: bool, pg: &mut ExpertPager, fail: &mut Vec<String>| -> eyre::Result<Arm> {
+        pg.clear();
+        let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+        zero_state(&mut st)?;
+        st.reset_in_place(dgpu, igpu)?;
+        let mut job = PrefillJob::new(prompt.clone(), hcs.clone(), Some(rows_all.clone()), None, 0, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?;
+        job.set_layer_major_rows(0)?;
+        let _ = v4flash_kernels::het::forward_prefill::take_moe_captures();
+        v4flash_kernels::knobs::PREFILL_EARLY_REPLAY.set(if early_on { per_layer.as_str() } else { "0" });
+        v4flash_kernels::knobs::PREFILL_EARLY_GATE.set(if early_on { force_n.as_str() } else { "0" });
+        v4flash_kernels::knobs::PREFILL_COLD_FORCE_LATE.set("0");
+        v4flash_kernels::knobs::PREFILL_COLD_LATE_SKIP.set("0");
+        let before = pg.early_last_stats();
+        while !job.chunks_done() {
+            engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut *pg))?;
+        }
+        let _ = v4flash_kernels::het::forward_prefill::take_moe_captures();
+        let replay_rows = job.replay_rows();
+        v4flash_kernels::knobs::PREFILL_COLD_FORCE_LATE.set(force_n.as_str());
+        v4flash_kernels::knobs::PREFILL_COLD_LATE_SKIP.set(if skip { "1" } else { "0" });
+        let l1 = late_count(pg);
+        let logits = engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut *pg))?;
+        st.restore_compressor_lending();
+        let late_rep = late_count(pg) - l1;
+        let caps = v4flash_kernels::het::forward_prefill::take_moe_captures();
+        for k in [&v4flash_kernels::knobs::PREFILL_COLD_FORCE_LATE, &v4flash_kernels::knobs::PREFILL_COLD_LATE_SKIP,
+            &v4flash_kernels::knobs::PREFILL_EARLY_REPLAY, &v4flash_kernels::knobs::PREFILL_EARLY_GATE] {
+            k.set("0");
+        }
+        let after = pg.early_last_stats();
+        let early = if early_on && after != before { after } else { None };
+        // Nothing left behind: pins, late and early stages, hidden slots.
+        if pg.pinned_slots() != 0 {
+            fail.push(format!("{name}: {} slots still pinned", pg.pinned_slots()));
+        }
+        if pg.late_free_stages() != stages || pg.early_free_stages() != early_stages {
+            fail.push(format!("{name}: stages not all back (late {} of {stages}, early {} of {early_stages})", pg.late_free_stages(), pg.early_free_stages()));
+        }
+        if pg.early_hidden_slots() != 0 || pg.early_job().is_some() {
+            fail.push(format!("{name}: early book still open / {} hidden slots", pg.early_hidden_slots()));
+        }
+        let a = Arm { logits, caps, replay_rows, state: st, late_rep, early, windows: job.lm_windows_run() };
+        eprintln!("  arm {name}: early {early_on} skip {skip}: late picks in the replay {}, captures {}, early {:?}, argmax {}",
+            a.late_rep, a.caps.len(), a.early, argmax(&a.logits));
+        Ok(a)
+    };
+    let a = arm("A (early off)", false, false, &mut pg, &mut fail)?;
+    let a2 = arm("A2 (early off, null)", false, false, &mut pg, &mut fail)?;
+    let e = arm("E (early on)", true, false, &mut pg, &mut fail)?;
+    let e2 = arm("E2 (early on, again)", true, false, &mut pg, &mut fail)?;
+    let x = arm("X (early on, replay late dropped)", true, true, &mut pg, &mut fail)?;
+
+    let rel = |p: &[f32], q: &[f32]| -> f64 {
+        let (mut d, mut n) = (0f64, 0f64);
+        for (u, v) in p.iter().zip(q) {
+            d += ((*u - *v) as f64).powi(2);
+            n += (*u as f64).powi(2);
+        }
+        (d / n.max(1e-30)).sqrt()
+    };
+    let same_caps = |p: &Arm, q: &Arm| p.caps.len() == q.caps.len() && p.caps.iter().zip(&q.caps).all(|(u, v)| u.0 == v.0 && u.1 == v.1 && u.2 == v.2);
+    for y in [&a, &a2, &e, &e2, &x] {
+        if y.windows != 0 {
+            fail.push("a layer-outer window ran: the range path was not the one under test".into());
+        }
+        if y.late_rep == 0 {
+            fail.push("an arm's replay counted no late picks: the forced late set is empty (GATE_FORCE_N?)".into());
+        }
+    }
+    if a.caps.is_empty() {
+        fail.push("no replay captures".into());
+    }
+    // The null first: without it there is no verdict.
+    if !same_caps(&a, &a2) || a.logits != a2.logits {
+        fail.push(format!("null not bit-identical (logits rel {:.3e}): no verdict", rel(&a.logits, &a2.logits)));
+    }
+    for (name, y) in [("E", &e), ("E2", &e2)] {
+        if !same_caps(&a, y) {
+            let worst = a.caps.iter().zip(&y.caps).map(|(u, v)| rel(&u.2, &v.2)).fold(0.0, f64::max);
+            fail.push(format!("{name}: replay MoE captures differ from A's (max rel-L2 {worst:.3e})"));
+        }
+        if y.logits != a.logits {
+            fail.push(format!("{name}: logits differ from A's (rel-L2 {:.3e})", rel(&a.logits, &y.logits)));
+        }
+        if y.replay_rows != a.replay_rows {
+            fail.push(format!("{name}: the encoder's replay seed rows differ from A's"));
+        }
+        let d = diff_states_in(&a.state, &y.state, 0..N_LAYER as usize)?;
+        if !d.is_empty() {
+            fail.push(format!("{name}: KV differs from A's: {}", d.join("; ")));
+        }
+        match y.early {
+            None => fail.push(format!("{name}: no early book closed: the early path never ran")),
+            Some(s) if s.used() == 0 => fail.push(format!("{name}: early reads issued {} but none USED by the replay", s.issued)),
+            Some(s) => eprintln!("{name}: early issued {} landed {} used {} (landed {}, in flight {}) wasted {} refused {}",
+                s.issued, s.landed, s.used(), s.used_landed, s.used_inflight, s.wasted, s.land_refused),
+        }
+    }
+    // The negative control: dropping the replay's late contribution MUST show.
+    if same_caps(&a, &x) || x.logits == a.logits {
+        fail.push("negative control: dropping the late pass changed nothing -- the comparison has no power".into());
+    }
+    eprintln!("logits rel-L2 vs A: null {:.3e}, E {:.3e}, E2 {:.3e}, X {:.3e}", rel(&a.logits, &a2.logits), rel(&a.logits, &e.logits),
+        rel(&a.logits, &e2.logits), rel(&a.logits, &x.logits));
+    if fail.is_empty() {
+        eprintln!("EARLY REPLAY GATE PASS");
+        Ok(())
+    } else {
+        Err(eyre!("EARLY REPLAY GATE FAIL: {}", fail.join("; ")))
+    }
+}
+
+/// SOAK of the replay's early reads under the PRODUCTION selection (`V41_PREFILL_COLD_B1=short`, FRAC 0.5, MAX 8, the
+/// late range pass; `V41_PREFILL_EARLY_REPLAY` = `GATE_EARLY_PER_LAYER`, default 16): `GATE_SOAK_PAIRS` (4) fresh short
+/// prompts, each run TWICE from an empty box-1 pool (the first run's replay feeds the pick statistics the second run's
+/// plan ranks by). Every job must finish without error (three-way exactly-once and the late-join checks fail the job),
+/// with finite logits; after every job no slot pinned, every late and early stage back, the book closed with no hidden
+/// slot; and over the soak early reads must be USED. Not an exactness gate (cold picks move between the boxes).
+/// ```text
+/// (prod env) V41_PREFILL_EARLY_STAGES=8 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels \
+///   --features v41 --release --test late_exactness -- --ignored --nocapture --exact early_replay_soak_prod_selection
+/// ```
+#[test]
+#[ignore]
+fn early_replay_soak_prod_selection() -> eyre::Result<()> {
+    install_panic_handler()?;
+    for (k, v) in [("V41_PAGED_EXPERTS", "1"), ("V41_PAGER_POOL_GB", "40"), ("V41_PREFILL_COLD_B1", "short"),
+        ("V41_PREFILL_COLD_B1_FRAC", "0.5"), ("V41_PREFILL_COLD_B1_MAX", "8")] {
+        if std::env::var(k).is_err() {
+            std::env::set_var(k, v);
+        }
+    }
+    if std::env::var("V41_REMOTE_ADDR").is_err() {
+        return Err(eyre!("cold picks exist only under the box-2 partition: set V41_REMOTE_ADDR (box 2 up)"));
+    }
+    for (k, v) in [("V41_PREFILL_PIN_INFLIGHT", "1"), ("V41_PREFILL_COLD_ASYNC_RANGE", "1"), ("V41_PREFILL_COLD_ASYNC", "0"),
+        ("V41_PREFILL_COLD_FORCE_LATE", "0"), ("V41_PREFILL_COLD_LATE_SKIP", "0"), ("V41_PREFILL_EARLY_GATE", "0")] {
+        std::env::set_var(k, v);
+    }
+    let per_layer = env_usize("GATE_EARLY_PER_LAYER", 16).to_string();
+    std::env::set_var("V41_PREFILL_EARLY_REPLAY", &per_layer);
+    let dir = std::env::var("V41_HF_DIR").unwrap_or_else(|_| HF_DIR_DEFAULT.to_string());
+    let engram_dir = std::env::var("V41_ENGRAM_DIR").unwrap_or_else(|_| {
+        format!("{}/.cache/deepstrix/v41/engram", std::env::var("HOME").unwrap_or_default())
+    });
+    let dgpu = pick("gfx1201")?;
+    let igpu = pick("gfx1151")?;
+    let darch = dgpu.properties()?.gcn_arch_name;
+    let iarch = igpu.properties()?.gcn_arch_name;
+    let hf = V41HfWeights::open(&dir, None)?;
+    let src = WeightSrc::from(&hf);
+    let te = src.tensor("token_embd.weight").ok_or_else(|| eyre!("missing token_embd.weight"))?;
+    let te_dtype = te.dtype;
+    let te_bytes = src.read_tensor(te)?;
+    let embed = |tok: i32| -> eyre::Result<Vec<f32>> {
+        let mut r = vec![0f32; HC_DIM as usize];
+        embed_lookup(&te_bytes, te_dtype, tok, &mut r)?;
+        Ok(r)
+    };
+    eprintln!("loading weights (paged experts)...");
+    let weights = HetModelWeights::load_all(src, dgpu, igpu, &rope_for_layer)?;
+    let engine = HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, ExecMode::HetParallel)?;
+    let mut ds = DgpuScratch::alloc(dgpu)?;
+    let n_kv_max: u32 = 8192;
+    let lane_rows = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
+    let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut sd = BatchDgpuShared::alloc_rows_ctx(dgpu, lane_rows, n_kv_max)?;
+    let mut si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
+    let mut pg = ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, 0)?;
+    let stages = env_usize("V41_PREFILL_COLD_STAGES", 16).max(1);
+    let early_stages = env_usize("V41_PREFILL_EARLY_STAGES", 8).max(1);
+    pg.start_late_reader(Path::new(&dir), env_usize("V41_PREFILL_COLD_READERS", 8), stages)?;
+    pg.start_early_stages(early_stages)?;
+    if !pg.late_on() || !pg.early_available() {
+        return Err(eyre!("late readers / early stages did not start (GPU repack off?)"));
+    }
+    let hasher = EngramHash::load(Path::new(&engram_dir))?;
+    hasher.self_check()?;
+    let mut tables = Vec::new();
+    for &l in ENGRAM_LAYERS {
+        tables.push(EngramTable::open(pg.raw(), l as usize)?);
+    }
+    let ein = ENGRAM_IN as usize;
+    let pairs = env_usize("GATE_SOAK_PAIRS", 4);
+    let base = env_usize("GATE_TOKENS", 1500);
+    let mut fail = Vec::new();
+    let (mut issued, mut used, mut used_landed, mut wasted) = (0u64, 0u64, 0u64, 0u64);
+    for j in 0..2 * pairs {
+        let p = j / 2;
+        let len = (base / 2 + (p * base) / (pairs.max(1) + 1)).max(200);
+        let prompt = synth_prompt(300 + p as u64, len);
+        let rows = {
+            let hashes = hasher.hash_sequence(&prompt);
+            let mut out = vec![vec![0f32; prompt.len() * ein]; tables.len()];
+            for (li, tbl) in tables.iter().enumerate() {
+                for t in 0..prompt.len() {
+                    tbl.gather_position(pg.raw(), &hashes[t][li], &mut out[li][t * ein..(t + 1) * ein])?;
+                }
+            }
+            out
+        };
+        let hcs: Vec<Vec<f32>> = prompt.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
+        pg.clear();
+        let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+        zero_state(&mut st)?;
+        st.reset_in_place(dgpu, igpu)?;
+        let mut job = PrefillJob::new(prompt.clone(), hcs, Some(rows), None, 0, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?;
+        job.set_layer_major_rows(0)?;
+        let before = pg.early_last_stats();
+        let jw0 = pg.late_stats().map_or(0, |x| x.6);
+        let mut jw_enc = 0u64;
+        let mut run = || -> eyre::Result<Vec<f32>> {
+            while !job.chunks_done() {
+                engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
+            }
+            jw_enc = pg.late_stats().map_or(0, |x| x.6) - jw0;
+            let logits = engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
+            st.restore_compressor_lending();
+            Ok(logits)
+        };
+        let r = run();
+        match r {
+            Ok(logits) => {
+                let jw_rep = pg.late_stats().map_or(0, |x| x.6) - jw0 - jw_enc;
+                let s = pg.early_last_stats().filter(|s| Some(*s) != before).unwrap_or_default();
+                issued += s.issued;
+                used += s.used();
+                used_landed += s.used_landed;
+                wasted += s.wasted;
+                let finite = logits.iter().all(|x| x.is_finite());
+                eprintln!("  job {j} (prompt {p}, run {}): {len} tokens: join wait encoder {jw_enc} ms replay {jw_rep} ms; early issued {} landed {} \
+                    (read-ahead {}) used {} (landed {}, in flight {}) wasted {} refused {}; argmax {}, finite {finite}",
+                    j % 2 + 1, s.issued, s.landed, s.readahead, s.used(), s.used_landed, s.used_inflight, s.wasted, s.land_refused, argmax(&logits));
+                if !finite {
+                    fail.push(format!("job {j}: non-finite logits"));
+                }
+            }
+            Err(e) => fail.push(format!("job {j} ({len} tokens) FAILED: {e:#}")),
+        }
+        if pg.pinned_slots() != 0 {
+            fail.push(format!("job {j}: {} slots still pinned", pg.pinned_slots()));
+        }
+        if pg.late_free_stages() != stages || pg.early_free_stages() != early_stages {
+            fail.push(format!("job {j}: stages not all back (late {} of {stages}, early {} of {early_stages})", pg.late_free_stages(), pg.early_free_stages()));
+        }
+        if pg.early_hidden_slots() != 0 || pg.early_job().is_some() {
+            fail.push(format!("job {j}: early book still open / {} hidden slots", pg.early_hidden_slots()));
+        }
+    }
+    eprintln!("soak: early issued {issued}, used {used} (landed {used_landed}), wasted {wasted}");
+    if issued == 0 {
+        fail.push("no early read issued (no plan: no cold candidates / no replay statistics?)".into());
+    } else if used == 0 {
+        fail.push(format!("{issued} early reads issued, none used by a replay"));
+    }
+    if fail.is_empty() {
+        eprintln!("EARLY REPLAY SOAK PASS");
+        Ok(())
+    } else {
+        Err(eyre!("EARLY REPLAY SOAK FAIL: {}", fail.join("; ")))
+    }
+}

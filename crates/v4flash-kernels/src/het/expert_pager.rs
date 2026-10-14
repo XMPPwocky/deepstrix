@@ -247,6 +247,70 @@ impl Residency {
         }
     }
 
+    /// A HIDDEN slot for an EARLY read of `key` (`V41_PREFILL_EARLY_REPLAY`): the first free slot in `lo..hi`, else the
+    /// LRU slot that is unpinned, not used since `cutoff` (the running pass's start: nothing this pass touched) and not
+    /// `skip`ped (decode's owned set, other hidden slots). NO fallback: `None` when nothing is eligible. The slot holds
+    /// `replay_early::hidden_key(key)` -- `slot_of` never answers `key` for it -- and is pinned until published or
+    /// released. Returns (slot, evicted key).
+    fn hide(&mut self, key: (i32, u32), lo: usize, hi: usize, cutoff: u64, skip: &dyn Fn((i32, u32)) -> bool) -> Option<(u32, Option<(i32, u32)>)> {
+        let hi = hi.min(self.slot_key.len());
+        let sl = match (lo..hi).find(|&sl| self.slot_key[sl].is_none()) {
+            Some(sl) => sl,
+            None => {
+                let mut best: Option<(u64, usize)> = None;
+                for sl in lo..hi {
+                    if self.pinned.get(sl).is_some_and(|&p| p > 0) || self.last_use[sl] > cutoff {
+                        continue;
+                    }
+                    if self.slot_key[sl].is_some_and(|k| super::replay_early::is_hidden_key(k) || skip(k)) {
+                        continue;
+                    }
+                    let t = self.last_use[sl];
+                    if best.is_none_or(|(bt, _)| t < bt) {
+                        best = Some((t, sl));
+                    }
+                }
+                best?.1
+            }
+        };
+        let old = self.slot_key[sl].take();
+        if let Some(o) = old {
+            self.slot_of.remove(&o);
+        }
+        let hk = super::replay_early::hidden_key(key);
+        self.slot_of.insert(hk, sl as u32);
+        self.slot_key[sl] = Some(hk);
+        self.pinned[sl] = self.pinned[sl].saturating_add(1);
+        Some((sl as u32, old))
+    }
+
+    /// A hidden slot of `key` becomes `key`'s resident slot (the late join, where the knob-off path lands it): unpinned,
+    /// touched. `false` if `slot` does not hold `key`'s hidden key.
+    fn publish_hidden(&mut self, key: (i32, u32), slot: u32) -> bool {
+        let hk = super::replay_early::hidden_key(key);
+        if self.slot_key.get(slot as usize) != Some(&Some(hk)) {
+            return false;
+        }
+        self.slot_of.remove(&hk);
+        self.slot_of.insert(key, slot);
+        self.slot_key[slot as usize] = Some(key);
+        self.pinned[slot as usize] = self.pinned[slot as usize].saturating_sub(1);
+        self.touch(slot);
+        true
+    }
+
+    /// Give a hidden slot of `key` back: free (stamp 0, reused first), unpinned.
+    fn release_hidden(&mut self, key: (i32, u32), slot: u32) {
+        let hk = super::replay_early::hidden_key(key);
+        if self.slot_key.get(slot as usize) != Some(&Some(hk)) {
+            return;
+        }
+        self.slot_of.remove(&hk);
+        self.slot_key[slot as usize] = None;
+        self.last_use[slot as usize] = 0;
+        self.pinned[slot as usize] = self.pinned[slot as usize].saturating_sub(1);
+    }
+
     /// `lru_victim` that also skips slots holding a key `skip` names; `None` when every candidate is skipped.
     fn lru_victim_skipping(&self, range: std::ops::Range<usize>, skip: &dyn Fn((i32, u32)) -> bool) -> Option<u32> {
         let mut best: Option<(u64, u32)> = None;
@@ -309,13 +373,18 @@ struct Claims {
 /// A pinned stage set (gate / up / down in HF layout, per-role sizes ~19 MB) moved between the pager and a LATE reader
 /// thread. Exactly one side owns it at a time (it travels inside a job and comes back inside the result), so moving the
 /// host pointers across threads is sound.
-struct LateStage([PinnedBuffer<u8>; 3]);
+/// The flag: an EARLY stage (`V41_PREFILL_EARLY_REPLAY`, `start_early_stages`), returned to the early free list, never to
+/// the late one -- so early reads can never take a stage a late read would have had (a late read's acceptance, and so
+/// the late set, is the knob-off one).
+struct LateStage([PinnedBuffer<u8>; 3], bool);
 unsafe impl Send for LateStage {}
 
 struct LateJob {
     layer: i32,
     id: u32,
     stage: LateStage,
+    /// Early reads: the `EarlyBook` generation that issued it (a result of another generation is stale). 0 for late.
+    gen: u32,
 }
 
 struct LateDone {
@@ -323,9 +392,16 @@ struct LateDone {
     id: u32,
     stage: LateStage,
     ok: Result<(), String>,
+    gen: u32,
 }
 
-type LateQueue = std::sync::Arc<(std::sync::Mutex<(std::collections::VecDeque<LateJob>, usize)>, std::sync::Condvar)>;
+impl LateDone {
+    fn early(&self) -> bool {
+        self.stage.1
+    }
+}
+
+type LateQueue = std::sync::Arc<(std::sync::Mutex<super::replay_early::ReadQueue<LateJob>>, std::sync::Condvar)>;
 
 /// Box-1 LATE reads (docs/v41/PREFILL_COLD_ASYNC_DESIGN.md rev 3, 2.3): a prefill cold pick given to box 1 is read by
 /// these threads while the hub keeps going; `ExpertPager::late_join` lands it before the unit's late MoE pass.
@@ -358,6 +434,58 @@ struct LateReader {
     remap_dev: [DeviceBuffer<i32>; 2],
     remap_stage: [PinnedBuffer<i32>; 2],
     remap_ev: [Option<Event>; 2],
+    /// EARLY reads for the CED replay (`V41_PREFILL_EARLY_REPLAY`, design section 12): their own stages (none unless
+    /// `start_early_stages` ran), the per-job book, and results read but not landed yet.
+    early_free: Vec<LateStage>,
+    early_stages: usize,
+    early: super::replay_early::EarlyBook,
+    early_arrived: Vec<LateDone>,
+    /// The running pin pass's start tick (`early_pass_start`): a hidden-slot claim never evicts a slot used since; and
+    /// whether the running pass may land at all (a pin pass that synchronized the iGPU at its start).
+    early_cutoff: u64,
+    early_can_land: bool,
+    /// Box-1-home (read-ahead) landings waiting for their repack event before they are published.
+    early_vis: std::collections::VecDeque<(Event, Vec<((i32, u32), u32)>)>,
+    /// The replay pass is running (its own early reader cap).
+    early_in_replay: bool,
+    /// Early reads in flight + landed-unused at most (set at begin from box 1's free non-owned slots).
+    early_slot_cap: usize,
+    /// The last closed book's counters (tests).
+    early_last: Option<super::replay_early::EarlyStats>,
+    /// The book expires (all released) if nothing pumps it for `EARLY_TTL` (a job dropped before its replay).
+    early_deadline: Option<std::time::Instant>,
+}
+
+/// An early book nobody pumped for this long is released (`ExpertPager::early_expire`).
+const EARLY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl LateReader {
+    /// A stage back to its own free list (early stages never feed late reads, and the reverse).
+    fn give_back(&mut self, st: LateStage) {
+        if st.1 {
+            self.early_free.push(st);
+        } else {
+            self.free.push(st);
+        }
+    }
+
+    /// Route a reader result: a late read's (or an early read the replay ADOPTED while it was reading) goes to `done`
+    /// for its join; an early read's is kept for landing or dropped (stale). Knob off: always `done`, as before.
+    fn accept(&mut self, d: LateDone) {
+        let key = (d.layer, d.id);
+        if !d.early() {
+            self.done.insert(key, d);
+            return;
+        }
+        use super::replay_early::Arrival;
+        match self.early.on_arrival(key, d.gen, d.ok.is_ok()) {
+            Arrival::ToJoin => {
+                self.done.insert(key, d);
+            }
+            Arrival::Keep => self.early_arrived.push(d),
+            Arrival::Drop => self.give_back(d.stage),
+        }
+    }
 }
 
 pub struct ExpertPager {
@@ -3782,6 +3910,10 @@ impl ExpertPager {
 
     pub fn ensure(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<&[i32]> {
         let t0 = std::time::Instant::now();
+        // An early book whose job never reached its replay (dropped / cancelled) gives its hidden slots back to decode.
+        if self.late.as_ref().is_some_and(|l| l.early_deadline.is_some_and(|d| t0 > d)) {
+            self.early_expire()?;
+        }
         let r = self.ensure_core(layer, ids);
         let ns = t0.elapsed().as_nanos() as u64;
         if self.count_as_prefill {
@@ -3900,13 +4032,9 @@ impl ExpertPager {
         let sizes = [self.routed.gate_bytes_per_expert, self.routed.up_bytes_per_expert, self.routed.down_bytes_per_expert];
         let mut free = Vec::with_capacity(stages);
         for _ in 0..stages {
-            free.push(LateStage([
-                PinnedBuffer::new_with_flags(sizes[0], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-                PinnedBuffer::new_with_flags(sizes[1], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-                PinnedBuffer::new_with_flags(sizes[2], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-            ]));
+            free.push(Self::late_stage(sizes, false)?);
         }
-        let queue: LateQueue = std::sync::Arc::new((std::sync::Mutex::new((std::collections::VecDeque::new(), 0)), std::sync::Condvar::new()));
+        let queue: LateQueue = std::sync::Arc::new((std::sync::Mutex::new(Default::default()), std::sync::Condvar::new()));
         let (tx, rx) = std::sync::mpsc::channel::<LateDone>();
         let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(readers));
         for i in 0..readers {
@@ -3923,12 +4051,12 @@ impl ExpertPager {
                     }
                 };
                 loop {
-                    let mut job = {
+                    // Late (demand) jobs first; an early one only under the early cap (`ReadQueue::pop`).
+                    let (mut job, early) = {
                         let (m, cv) = &*q;
                         let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
                         loop {
-                            if let Some(j) = g.0.pop_front() {
-                                g.1 += 1;
+                            if let Some(j) = g.pop() {
                                 break j;
                             }
                             g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
@@ -3938,10 +4066,10 @@ impl ExpertPager {
                     // cancel would wait forever (review r3 #3).
                     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::late_read_one(&owner, job.layer, job.id, &mut job.stage)))
                         .unwrap_or_else(|_| Err("late reader panicked".into()));
-                    let sent = tx.send(LateDone { layer: job.layer, id: job.id, stage: job.stage, ok });
+                    let sent = tx.send(LateDone { layer: job.layer, id: job.id, stage: job.stage, ok, gen: job.gen });
                     {
                         let (m, cv) = &*q;
-                        m.lock().unwrap_or_else(|p| p.into_inner()).1 -= 1;
+                        m.lock().unwrap_or_else(|p| p.into_inner()).finish(early);
                         cv.notify_all();
                     }
                     if sent.is_err() {
@@ -3960,7 +4088,40 @@ impl ExpertPager {
             queue, live, rx, free, inflight: Default::default(), done: HashMap::new(), busy: Default::default(), spare_events: Vec::new(), sizes,
             queued: 0, refused: 0, landed: 0, resident: 0, fallback: 0, owned_evict: 0, join_wait_ns: 0,
             remap_dev, remap_stage, remap_ev: [None, None],
+            early_free: Vec::new(), early_stages: 0, early: Default::default(), early_arrived: Vec::new(),
+            early_cutoff: 0, early_can_land: false, early_deadline: None,
+            early_vis: Default::default(), early_in_replay: false, early_slot_cap: 0, early_last: None,
         });
+        Ok(())
+    }
+
+    /// One pinned per-role stage set (`early` = the early pool's).
+    fn late_stage(sizes: [usize; 3], early: bool) -> eyre::Result<LateStage> {
+        Ok(LateStage(
+            [
+                PinnedBuffer::new_with_flags(sizes[0], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::new_with_flags(sizes[1], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::new_with_flags(sizes[2], v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+            ],
+            early,
+        ))
+    }
+
+    /// EARLY reads for the CED replay (`V41_PREFILL_EARLY_REPLAY`, design section 12): `stages` pinned stage sets of
+    /// their own (static, `V41_PREFILL_EARLY_STAGES`, default 0 = none: the live knob then does nothing, and nothing of
+    /// this runs -- not even the replay-pick statistics). Needs the late readers (`start_late_reader`) first.
+    pub fn start_early_stages(&mut self, stages: usize) -> eyre::Result<()> {
+        let Some(l) = self.late.as_mut() else { return Ok(()) };
+        if stages == 0 {
+            return Ok(());
+        }
+        for _ in 0..stages {
+            l.early_free.push(Self::late_stage(l.sizes, true)?);
+        }
+        l.early_stages = stages;
+        super::replay_early::set_collecting(true);
+        eprintln!("expert pager: replay EARLY reads available ({stages} stages of {:.1} MB pinned; live knob V41_PREFILL_EARLY_REPLAY)",
+            l.sizes.iter().sum::<usize>() as f64 / 1e6);
         Ok(())
     }
 
@@ -3997,7 +4158,9 @@ impl ExpertPager {
                 break;
             }
             let (ev, stages) = l.busy.pop_front().expect("non-empty");
-            l.free.extend(stages);
+            for st in stages {
+                l.give_back(st);
+            }
             l.spare_events.push(ev);
         }
         Ok(())
@@ -4015,18 +4178,40 @@ impl ExpertPager {
             if res || l.inflight.contains(&(layer, e)) {
                 continue;
             }
+            // EARLY (`V41_PREFILL_EARLY_REPLAY`): the replay asks for exactly the pick the knob-off path reads here; an
+            // early read of it serves this late read (registered in flight like one, so the other lane SHARES it, and
+            // joined like one). Book inactive (knob off): `No`, today's path.
+            let adopted = match l.early.adopt((layer, e)) {
+                super::replay_early::Adopt::No => false,
+                // Read, not landed: hand the result to the join, which lands it like a late read's (a result the
+                // book calls arrived but the list lost -- cannot happen -- is read normally).
+                super::replay_early::Adopt::Arrived => match l.early_arrived.iter().position(|d| (d.layer, d.id) == (layer, e)) {
+                    Some(i) => {
+                        let d = l.early_arrived.swap_remove(i);
+                        l.done.insert((layer, e), d);
+                        true
+                    }
+                    None => false,
+                },
+                super::replay_early::Adopt::Reading | super::replay_early::Adopt::Landed(_) => true,
+            };
+            if adopted {
+                l.inflight.insert((layer, e));
+                out.push(e);
+                continue;
+            }
             let Some(stage) = l.free.pop() else {
                 l.refused += 1;
                 continue;
             };
             l.inflight.insert((layer, e));
-            jobs.push(LateJob { layer, id: e, stage });
+            jobs.push(LateJob { layer, id: e, stage, gen: 0 });
             out.push(e);
         }
         if !jobs.is_empty() {
             l.queued += jobs.len() as u64;
             let (m, cv) = &*l.queue;
-            m.lock().unwrap_or_else(|p| p.into_inner()).0.extend(jobs);
+            m.lock().unwrap_or_else(|p| p.into_inner()).demand.extend(jobs);
             cv.notify_all();
         }
         Ok(out)
@@ -4052,29 +4237,51 @@ impl ExpertPager {
         let mut out = Vec::with_capacity(ids.len());
         let mut used: Vec<LateStage> = Vec::new();
         let mut waited_ns = 0u64;
+        // An EARLY read the replay adopted after it landed is published here (no repack in this join): the late pass must
+        // still wait for its (earlier) repack on the repack stream.
+        let mut need_ev = false;
         for &e in ids {
             let key = (layer, e);
             if let Some(&slot) = self.res.slot_of.get(&key) {
                 self.res.touch(slot);
                 if let Some(l) = self.late.as_mut() {
                     l.resident += 1;
-                    if l.inflight.remove(&key) {
+                    // An early read adopted after landing has no result to wait for: its hidden copy just goes back.
+                    let adopted_landed = l.early.take_adopted_landed(key);
+                    if let Some(hs) = adopted_landed {
+                        self.res.release_hidden(key, hs);
+                    }
+                    if l.inflight.remove(&key) && adopted_landed.is_none() {
                         // Its read is still running: take the result back so the stage returns (review r3 #5).
                         while !l.done.contains_key(&key) {
                             match l.rx.recv() {
-                                Ok(d) => {
-                                    l.done.insert((d.layer, d.id), d);
-                                }
+                                Ok(d) => l.accept(d),
                                 Err(_) => break,
                             }
                         }
+                        l.early.forget_adopted(key);
                         if let Some(d) = l.done.remove(&key) {
-                            l.free.push(d.stage);
+                            l.give_back(d.stage);
                         }
                     }
                 }
                 out.push((e, slot));
                 continue;
+            }
+            // EARLY, adopted after landing: the hidden slot becomes this expert's slot -- where the knob-off path lands it
+            // (same bytes: the same read and the same repack, done earlier).
+            if let Some(hs) = self.late.as_mut().and_then(|l| l.early.take_adopted_landed(key)) {
+                if self.res.publish_hidden(key, hs) {
+                    let l = self.late.as_mut().expect("checked");
+                    l.inflight.remove(&key);
+                    need_ev = true;
+                    out.push((e, hs));
+                    continue;
+                }
+                // Not our hidden slot any more (cannot happen): fall through to the sync fallback below.
+                if let Some(l) = self.late.as_mut() {
+                    l.inflight.remove(&key);
+                }
             }
             // Wait for its read if it is in flight; else (failed / evicted / never queued) read it here.
             let mut done: Option<LateDone> = None;
@@ -4084,9 +4291,7 @@ impl ExpertPager {
                     let tw = std::time::Instant::now();
                     while !l.done.contains_key(&key) {
                         match l.rx.recv() {
-                            Ok(d) => {
-                                l.done.insert((d.layer, d.id), d);
-                            }
+                            Ok(d) => l.accept(d),
                             // Every reader gone: the synchronous fallback below reads it (review r3 #4).
                             Err(_) => break,
                         }
@@ -4129,7 +4334,8 @@ impl ExpertPager {
             }
             out.push((e, slot));
         }
-        if !used.is_empty() {
+        if !used.is_empty() || need_ev {
+            // One event after this join's repacks; it also covers every earlier repack on the stream (an early landing's).
             let _dev = self.device.scoped_current()?;
             let l = self.late.as_mut().expect("checked");
             let ev = match l.spare_events.pop() {
@@ -4151,52 +4357,380 @@ impl ExpertPager {
     fn late_take_stage(&mut self) -> eyre::Result<LateStage> {
         self.late_reclaim()?;
         let l = self.late.as_mut().expect("late on");
-        if let Some(st) = l.free.pop() {
-            return Ok(st);
-        }
-        if let Some((ev, stages)) = l.busy.pop_front() {
-            ev.synchronize()?;
-            l.free.extend(stages);
-            l.spare_events.push(ev);
-            return Ok(l.free.pop().expect("a busy entry holds >= 1 stage"));
-        }
-        // Every stage is in a queued/running read or an unjoined result: take one from the results.
-        if let Some(k) = l.done.keys().next().copied() {
-            let d = l.done.remove(&k).expect("present");
-            l.inflight.remove(&k);
+        loop {
+            // An early stage serves a fallback too (it returns to the early list after its repack, by its flag).
+            if let Some(st) = l.free.pop().or_else(|| l.early_free.pop()) {
+                return Ok(st);
+            }
+            if let Some((ev, stages)) = l.busy.pop_front() {
+                ev.synchronize()?;
+                for st in stages {
+                    l.give_back(st);
+                }
+                l.spare_events.push(ev);
+                continue;
+            }
+            // Every stage is in a queued/running read or an unjoined result: take one from the results.
+            if let Some(k) = l.done.keys().next().copied() {
+                let d = l.done.remove(&k).expect("present");
+                l.inflight.remove(&k);
+                l.early.forget_adopted(k);
+                return Ok(d.stage);
+            }
+            // An early result waiting to land: its data is dropped (counted wasted at the book's finish).
+            if let Some(d) = l.early_arrived.pop() {
+                l.early.drop_arrived((d.layer, d.id));
+                return Ok(d.stage);
+            }
+            let d = l.rx.recv().map_err(|_| eyre!("late readers gone and every stage held"))?;
+            if d.early() {
+                // Route it (kept, handed to its join, or dropped -- each puts the stage somewhere this loop looks).
+                l.accept(d);
+                continue;
+            }
+            l.inflight.remove(&(d.layer, d.id));
             return Ok(d.stage);
         }
-        let d = l.rx.recv().map_err(|_| eyre!("late readers gone and every stage held"))?;
-        l.inflight.remove(&(d.layer, d.id));
-        Ok(d.stage)
     }
 
     /// End of a pass / error (rev 3, 2.3): drop QUEUED reads, WAIT for running ones (a pread cannot be aborted), drop
     /// unjoined results, wait for queued repacks; every stage back on the free list, registry empty.
     pub fn late_cancel_all(&mut self) -> eyre::Result<()> {
         let Some(l) = self.late.as_mut() else { return Ok(()) };
+        let mut queued_late: Vec<LateJob> = Vec::new();
         {
             let (m, cv) = &*l.queue;
             let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
-            for j in g.0.drain(..) {
-                l.free.push(j.stage);
-            }
-            while g.1 > 0 {
+            queued_late.extend(g.demand.drain(..));
+            // LATE reads only: an EARLY read (`V41_PREFILL_EARLY_REPLAY`) writes only its own stage and lands nothing
+            // until a later pump, so it may run on across the pass end (the replay is the next pass).
+            while g.running_demand() > 0 {
                 g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
             }
         }
-        while let Ok(d) = l.rx.try_recv() {
-            l.free.push(d.stage);
+        for j in queued_late {
+            l.give_back(j.stage);
         }
-        for (_, d) in l.done.drain() {
-            l.free.push(d.stage);
+        while let Ok(d) = l.rx.try_recv() {
+            if d.early() {
+                // An early read's result is kept for landing (or dropped as stale); one the replay adopted while it was
+                // reading belonged to this pass's joins: dropped like any unjoined late result.
+                let key = (d.layer, d.id);
+                if l.early.adopted_reading(key) {
+                    l.early.forget_adopted(key);
+                    l.give_back(d.stage);
+                } else {
+                    l.accept(d);
+                }
+            } else {
+                l.give_back(d.stage);
+            }
+        }
+        for (k, d) in l.done.drain().collect::<Vec<_>>() {
+            l.early.forget_adopted(k);
+            l.give_back(d.stage);
         }
         while let Some((ev, stages)) = l.busy.pop_front() {
             ev.synchronize()?;
-            l.free.extend(stages);
+            for st in stages {
+                l.give_back(st);
+            }
             l.spare_events.push(ev);
         }
         l.inflight.clear();
+        // Adopted-but-unjoined early slots (an error path): released; adopted-while-reading results arriving later are
+        // dropped (`forget`), so nothing is left in flight under the registry.
+        let rel = l.early.unjoined();
+        for (k, s) in rel {
+            self.res.release_hidden(k, s);
+        }
+        Ok(())
+    }
+
+    // ---- EARLY reads for the CED replay (`V41_PREFILL_EARLY_REPLAY`; docs/v41/PREFILL_COLD_ASYNC_DESIGN.md section 12) ----
+
+    /// Early reads are possible: late readers running and early stages allocated (`start_early_stages`).
+    pub fn early_available(&self) -> bool {
+        self.late_on() && self.late.as_ref().is_some_and(|l| l.early_stages > 0)
+    }
+
+    /// The open early book's job, if any.
+    pub fn early_job(&self) -> Option<u64> {
+        self.late.as_ref().filter(|l| l.early.active).map(|l| l.early.job)
+    }
+
+    /// Hidden slots now (landed early reads not yet published or released).
+    pub fn early_hidden_slots(&self) -> usize {
+        self.late.as_ref().map_or(0, |l| l.early.hidden_slots())
+    }
+
+    /// The last closed early book's counters (tests).
+    pub fn early_last_stats(&self) -> Option<super::replay_early::EarlyStats> {
+        self.late.as_ref().and_then(|l| l.early_last)
+    }
+
+    /// Bytes of one expert as a late / early read reads it (HF layout, all three roles).
+    pub fn expert_bytes(&self) -> usize {
+        self.late.as_ref().map_or(0, |l| l.sizes.iter().sum())
+    }
+
+    /// Early stages on their free list now (tests: all back after a job).
+    pub fn early_free_stages(&self) -> usize {
+        self.late.as_ref().map_or(0, |l| l.early_free.len())
+    }
+
+    /// Open job `job`'s early book with `plan` (absolute (layer, expert), issue order). An open book of the SAME job is
+    /// kept as it is; another job's is closed first (its hidden slots released, its queued reads dropped).
+    pub fn early_begin(&mut self, job: u64, plan: Vec<(i32, u32)>, visible: Vec<(i32, u32)>, reserve: usize, max: usize) -> eyre::Result<()> {
+        if !self.early_available() || self.early_job() == Some(job) {
+            return Ok(());
+        }
+        let _ = self.early_finish()?;
+        // Box 1's slots a prefill late landing may claim: free, or holding a non-owned, unpinned key. `reserve` of them
+        // stay for the late landings of the rest of the job (one replay's late budget by default).
+        let lo = {
+            let lo = self.dense_slots();
+            if lo >= self.n_slots as usize { 0 } else { lo }
+        };
+        let nonowned = (lo..self.n_slots as usize)
+            .filter(|&s| {
+                self.res.pinned[s] == 0
+                    && match self.res.slot_key[s] {
+                        None => true,
+                        Some(k) => !super::replay_early::is_hidden_key(k) && hot_set::box1_owns(k.0, k.1) != Some(true),
+                    }
+            })
+            .count();
+        let l = self.late.as_mut().expect("early_available");
+        let rel = l.early.begin(job, plan);
+        l.early.set_visible(visible);
+        l.early_slot_cap = nonowned.saturating_sub(reserve).min(max);
+        l.early_in_replay = false;
+        l.early_deadline = Some(std::time::Instant::now() + EARLY_TTL);
+        for (k, s) in rel {
+            self.res.release_hidden(k, s);
+        }
+        Ok(())
+    }
+
+    /// Box 1's free + non-owned unpinned slots now (logs, the slot cap).
+    pub fn early_slot_cap(&self) -> usize {
+        self.late.as_ref().map_or(0, |l| l.early_slot_cap)
+    }
+
+    /// The replay pass starts: early reads switch to the replay's reader cap (`V41_PREFILL_EARLY_READERS_REPLAY`).
+    pub fn early_replay_start(&mut self) {
+        if let Some(l) = self.late.as_mut() {
+            l.early_in_replay = true;
+        }
+    }
+
+    /// Publish box-1-home (read-ahead) landings whose repack has completed (`wait`: wait for all first). A key resident
+    /// some other way meanwhile gives its copy back.
+    fn early_publish_visible(&mut self, wait: bool) -> eyre::Result<()> {
+        loop {
+            let Some(l) = self.late.as_mut() else { return Ok(()) };
+            let Some((ev, _)) = l.early_vis.front() else { return Ok(()) };
+            if wait {
+                ev.synchronize()?;
+            } else if !ev.query()? {
+                return Ok(());
+            }
+            let (_, keys) = l.early_vis.pop_front().expect("front");
+            for (k, s) in keys {
+                // Published only while it is still box 1's own (owned: the main pass reads it whatever its residency,
+                // so publishing cannot change any pick's class); else, or resident some other way meanwhile, released.
+                if self.res.slot_of.has(k.0, k.1) || hot_set::box1_owns(k.0, k.1) != Some(true) {
+                    self.res.release_hidden(k, s);
+                    if let Some(l) = self.late.as_mut() {
+                        l.early.land_refused();
+                    }
+                } else if self.res.publish_hidden(k, s) {
+                    if let Some(l) = self.late.as_mut() {
+                        l.early.landed_visible();
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pin pass starts (after its iGPU sync): early landings in it never evict a slot used from now on, and may land.
+    pub fn early_pass_start(&mut self) {
+        let tick = self.res.tick;
+        if let Some(l) = self.late.as_mut() {
+            l.early_cutoff = tick;
+            l.early_can_land = true;
+        }
+    }
+
+    /// The pin pass ended: no landing until the next one starts.
+    pub fn early_pass_end(&mut self) {
+        if let Some(l) = self.late.as_mut() {
+            l.early_can_land = false;
+        }
+    }
+
+    /// THE PUMP (hub thread, once per lane-layer of a prefill pass while a book is open): route finished reads; land
+    /// arrived early reads in HIDDEN slots (pin passes only: `early_pass_start`); queue more early reads, at most
+    /// `V41_PREFILL_EARLY_READERS` of them reading at once (late reads always go first, `ReadQueue::pop`).
+    pub fn early_pump(&mut self) -> eyre::Result<()> {
+        if self.early_job().is_none() {
+            return Ok(());
+        }
+        self.late_reclaim()?;
+        let lru_lo = {
+            let lo = self.dense_slots();
+            if lo >= self.n_slots as usize { 0 } else { lo }
+        };
+        let n_slots = self.n_slots as usize;
+        let l = self.late.as_mut().expect("early_job");
+        l.early_deadline = Some(std::time::Instant::now() + EARLY_TTL);
+        while let Ok(d) = l.rx.try_recv() {
+            l.accept(d);
+        }
+        if l.early_can_land && !l.early_arrived.is_empty() {
+            let arrived = std::mem::take(&mut l.early_arrived);
+            let cutoff = l.early_cutoff;
+            let _dev = self.device.scoped_current()?;
+            let mut used: Vec<LateStage> = Vec::new();
+            let mut vis: Vec<((i32, u32), u32)> = Vec::new();
+            for d in arrived {
+                let key = (d.layer, d.id);
+                let l = self.late.as_mut().expect("early_job");
+                if !l.early.landing(key) {
+                    l.give_back(d.stage);
+                    continue;
+                }
+                // Resident or in a late read by now: not ours to land (the late path has it).
+                if self.res.slot_of.has(key.0, key.1) || l.inflight.contains(&key) {
+                    l.early.land_refused();
+                    l.give_back(d.stage);
+                    continue;
+                }
+                match self.res.hide(key, lru_lo, n_slots, cutoff, &|k| hot_set::box1_owns(k.0, k.1) == Some(true)) {
+                    None => {
+                        l.early.land_refused();
+                        l.give_back(d.stage);
+                    }
+                    Some((slot, _evicted)) => {
+                        let (rp, st) = (self.repack.as_ref().expect("late needs the GPU repack"), self.repack_stream.as_ref().expect("repack stream"));
+                        Self::repack_queue(rp, st, &mut self.routed, slot, &d.stage.0)?;
+                        if l.early.is_visible(key) {
+                            // Box-1 HOME (the read-ahead set): the main pass reads it whatever its residency, so it is
+                            // published -- but only once its repack has COMPLETED (a later pump, `early_publish_visible`):
+                            // an `ensure` hit does not wait on the repack stream.
+                            vis.push((key, slot));
+                        } else {
+                            l.early.landed(key, slot);
+                        }
+                        used.push(d.stage);
+                    }
+                }
+            }
+            if !used.is_empty() {
+                let l = self.late.as_mut().expect("early_job");
+                let ev = match l.spare_events.pop() {
+                    Some(ev) => ev,
+                    None => Event::new_no_timing()?,
+                };
+                ev.record(self.repack_stream.as_ref().expect("repack stream"))?;
+                l.busy.push_back((ev, used));
+                if !vis.is_empty() {
+                    let ev2 = Event::new_no_timing()?;
+                    ev2.record(self.repack_stream.as_ref().expect("repack stream"))?;
+                    l.early_vis.push_back((ev2, vis));
+                }
+            }
+        }
+        self.early_publish_visible(false)?;
+        // Readers: the encoder's tail and the replay have their own caps (the replay's disk is the E100-bound one).
+        let l = self.late.as_mut().expect("early_job");
+        let cap = if l.early_in_replay { crate::knobs::PREFILL_EARLY_READERS_REPLAY.usize() } else { crate::knobs::PREFILL_EARLY_READERS.usize() };
+        let depth = crate::knobs::PREFILL_EARLY_DEPTH.usize() as i32;
+        // SLOT-AWARE cap: reads in flight + landed-unused hidden slots never exceed `early_slot_cap` (set at the book's
+        // begin from box 1's free non-owned slots), so the late landings of the rest of the job keep their room.
+        let room = l.early_slot_cap.saturating_sub(l.early.pending() + l.early.hidden_slots());
+        let mut jobs: Vec<LateJob> = Vec::new();
+        while jobs.len() < room {
+            let Some(stage) = l.early_free.pop() else { break };
+            let (res, inflight) = (&self.res, &l.inflight);
+            match l.early.next_issue(depth, |k| !res.slot_of.has(k.0, k.1) && !inflight.contains(&k)) {
+                Some(k) => jobs.push(LateJob { layer: k.0, id: k.1, stage, gen: l.early.gen }),
+                None => {
+                    l.early_free.push(stage);
+                    break;
+                }
+            }
+        }
+        let (m, cv) = &*l.queue;
+        let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+        g.early_cap = cap;
+        g.early.extend(jobs);
+        drop(g);
+        cv.notify_all();
+        Ok(())
+    }
+
+    /// The replay has routed every layer below `layer`: early reads of those layers are over (hidden slots released,
+    /// queued reads dropped, results dropped on arrival).
+    pub fn early_settle_below(&mut self, layer: i32) {
+        let Some(l) = self.late.as_mut().filter(|l| l.early.active) else { return };
+        let rel = l.early.settle_below(layer);
+        let dropped: Vec<LateJob> = {
+            let (m, _) = &*l.queue;
+            let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+            let (keep, drop): (Vec<LateJob>, Vec<LateJob>) = g.early.drain(..).partition(|j| j.layer >= layer);
+            g.early.extend(keep);
+            drop
+        };
+        for j in dropped {
+            // Issued, never read: the book still lists it as reading -- it would drop on arrival; forget it now.
+            l.early.drop_unread((j.layer, j.id));
+            l.give_back(j.stage);
+        }
+        for (k, s) in rel {
+            self.res.release_hidden(k, s);
+        }
+    }
+
+    /// Close the job's early book (end of its replay, or a new job): queued early reads dropped, arrived ones dropped,
+    /// hidden slots released (reads still running drop on arrival). Returns the job's counters, `None` if no book was
+    /// open.
+    pub fn early_finish(&mut self) -> eyre::Result<Option<super::replay_early::EarlyStats>> {
+        if self.early_job().is_none() {
+            return Ok(None);
+        }
+        // Read-ahead landings still waiting for their repack: valid bytes, published once it is done.
+        self.early_publish_visible(true)?;
+        let Some(l) = self.late.as_mut().filter(|l| l.early.active) else { return Ok(None) };
+        l.early_in_replay = false;
+        let queued: Vec<LateJob> = {
+            let (m, _) = &*l.queue;
+            let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+            g.early.drain(..).collect()
+        };
+        for j in queued {
+            l.early.drop_unread((j.layer, j.id));
+            l.give_back(j.stage);
+        }
+        for d in std::mem::take(&mut l.early_arrived) {
+            l.give_back(d.stage);
+        }
+        let rel = l.early.finish();
+        let stats = l.early.stats;
+        l.early_last = Some(stats);
+        l.early_deadline = None;
+        for (k, s) in rel {
+            self.res.release_hidden(k, s);
+        }
+        Ok(Some(stats))
+    }
+
+    /// An open book nobody pumped for `EARLY_TTL` (its job never reached the replay): closed, with a warning.
+    pub fn early_expire(&mut self) -> eyre::Result<()> {
+        if let Some(st) = self.early_finish()? {
+            tracing::warn!(issued = st.issued, landed = st.landed, wasted = st.wasted, "replay early reads: book expired (its job never reached the replay); hidden slots released");
+        }
         Ok(())
     }
 
@@ -4891,6 +5425,55 @@ mod residency_tests {
         let s0 = r.claim((0, 1), 0, 2, 0).unwrap();
         r.release((0, 1), s0 + 1);
         assert_eq!(r.slot_of.get(&(0, 1)), Some(&s0));
+        consistent(&r);
+    }
+
+    /// EARLY reads (`V41_PREFILL_EARLY_REPLAY`): a hidden slot is invisible to every lookup of its real key, never a
+    /// victim while hidden, evicts only an unpinned, non-skipped slot not used since the cutoff (no fallback), and is
+    /// either PUBLISHED under its real key (the late join) or RELEASED (free, reused first).
+    #[test]
+    fn hidden_slots_are_invisible_until_published() {
+        let mut r = full(4);
+        let cutoff = r.tick;
+        r.touch(0); // used by the running pass: newer than the cutoff
+        let owned = |k: (i32, u32)| k == (0, 1);
+        let (s, old) = r.hide((25, 7), 0, 4, cutoff, &owned).expect("slot 2 is eligible");
+        assert_eq!((s, old), (2, Some((0, 2))), "not slot 0 (used since the cutoff), not slot 1 (skipped): the oldest other");
+        assert!(!r.slot_of.has(25, 7), "invisible under its real key");
+        assert!(r.slot_of.get(&(25, 7)).is_none());
+        assert_eq!(r.pinned[2], 1);
+        consistent(&r);
+        // Never a victim while hidden, for a claim or another hide.
+        let t = r.tick;
+        let c = r.claim((3, 3), 0, 4, t).unwrap();
+        assert_ne!(c, 2);
+        let (s2, _) = r.hide((26, 8), 0, 4, r.tick, &|_| false).expect("one unpinned slot left");
+        assert_ne!(s2, 2);
+        assert!(r.hide((27, 9), 0, 4, 0, &|_| false).is_none(), "nothing old enough: no fallback");
+        // Publish: resident under its key, unpinned, touched.
+        assert!(r.publish_hidden((25, 7), 2));
+        assert_eq!(r.slot_of.get(&(25, 7)), Some(&2));
+        assert!(r.slot_of.has(25, 7));
+        assert_eq!(r.pinned[2], 0);
+        assert_eq!(r.last_use[2], r.tick);
+        assert!(!r.publish_hidden((25, 7), 2), "already published");
+        // Release: free, stamp 0, unpinned.
+        r.release_hidden((26, 8), s2);
+        assert_eq!(r.slot_key[s2 as usize], None);
+        assert_eq!(r.last_use[s2 as usize], 0);
+        assert_eq!(r.pinned[s2 as usize], 0);
+        r.release_hidden((26, 8), s2); // twice: a no-op
+        assert_eq!(r.pinned[s2 as usize], 0);
+        consistent(&r);
+    }
+
+    /// A free slot is taken first (no eviction), whatever the cutoff.
+    #[test]
+    fn hide_takes_a_free_slot_first() {
+        let mut r = full(3);
+        r.release((0, 1), 1);
+        let (s, old) = r.hide((30, 1), 0, 3, 0, &|_| true).unwrap();
+        assert_eq!((s, old), (1, None));
         consistent(&r);
     }
 }
