@@ -409,6 +409,11 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         // Embedding work (the embed queue) is work too.
         let embed_work = state.embed.as_ref().is_some_and(|e| e.has_work());
         let idle = !sched.has_llm_work() && !embed_work;
+        if idle {
+            // Async snapshot saves finish and are indexed before the engine blocks (the next request's probe sees them),
+            // and before the heap trim below (their captured images are freed by then).
+            sched.saves_drain(&mut state);
+        }
         if idle && worked {
             // The serial loop trims after every request; here streams overlap,
             // so trim only when the last one has drained and nothing waits.
@@ -416,8 +421,6 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             trim_heap_and_log("host heap at idle");
         }
         if idle {
-            // Async snapshot saves finish and are indexed before the engine blocks (the next request's probe sees them).
-            sched.saves_drain(&mut state);
             // Clear `inflight` BEFORE blocking: the tick that finished the last
             // stream left it set, and the hang watchdog then aborted an IDLE
             // engine 30 min later (DEEPSTRIX_HANG_DEADLINE_MS) -- twice on
@@ -1753,14 +1756,17 @@ impl Sched {
         let need = snapshot::image_bytes(&pf.kv);
         let held = self.saver.as_ref().map_or(0, |s| s.in_flight_bytes());
         let cap = knobs::SNAPSHOT_ASYNC_MAX_MB.get().saturating_mul(1 << 20);
-        if held.saturating_add(need) > cap {
-            tracing::info!(need_mib = need >> 20, held_mib = held >> 20, cap_mib = cap >> 20, "multistream: async snapshot over the memory cap; saving synchronously");
+        let image_cap = knobs::SNAPSHOT_ASYNC_MAX_IMAGE_MB.get().saturating_mul(1 << 20);
+        if need > image_cap || held.saturating_add(need) > cap {
+            tracing::info!(need_mib = need >> 20, held_mib = held >> 20, cap_mib = cap >> 20, image_cap_mib = image_cap >> 20,
+                "multistream: async snapshot over a memory cap; saving synchronously");
             return false;
         }
         let t = Instant::now();
         let tokens: Vec<i32> = pf.prefix.clone();
         let req = match checkpoint_spans(&pf.p.req.image_spans, tokens.len()).and_then(|image_spans| {
-            snapshot::capture(&pf.kv, state.dgpu, state.igpu).map(|image| snapshot::SaveRequest { image, tokens, image_spans, session_id: pf.p.session_id.clone() })
+            snapshot::capture(&pf.kv, state.dgpu, state.igpu)
+                .map(|image| snapshot::SaveRequest { image, tokens, image_spans, session_id: pf.p.session_id.clone(), capture_ms: t.elapsed().as_millis() as u64 })
         }) {
             Ok(r) => r,
             Err(e) => {

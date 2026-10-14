@@ -366,6 +366,12 @@ pub struct SnapshotIndex {
     /// Letta passes `session_id` per request; we use it as a fast-path
     /// for the common single-conversation pattern.
     pub session_to_hash: HashMap<String, [u8; 32]>,
+    /// `Some` while the async saver commits (`AsyncSaver::finish`): an evicted directory is RENAMED aside
+    /// (`.old-<key>.e<n>-<pid>`, on the engine thread, so the key is free at once) and its path collected here for the
+    /// writer thread to delete; `None` (everywhere else): deleted in place, as before. A crash before the delete leaves
+    /// a stale `.old-` dir, which `load` removes (`save_dir_is_stale`).
+    trash: Option<Vec<PathBuf>>,
+    trash_seq: u64,
 }
 
 impl SnapshotIndex {
@@ -385,6 +391,8 @@ impl SnapshotIndex {
             total_bytes: 0,
             cap_bytes,
             session_to_hash: HashMap::new(),
+            trash: None,
+            trash_seq: 0,
         }
     }
 
@@ -588,7 +596,21 @@ impl SnapshotIndex {
             }
         }
         self.total_bytes = self.total_bytes.saturating_sub(entry.disk_bytes);
-        if let Err(e) = fs::remove_dir_all(&entry.dir) {
+        let removed = match self.trash.as_mut() {
+            Some(trash) => {
+                self.trash_seq += 1;
+                let aside = self.root.join(format!("{SAVE_OLD_PREFIX}{}.e{}-{}", hex::encode(entry.hash), self.trash_seq, std::process::id()));
+                match fs::rename(&entry.dir, &aside) {
+                    Ok(()) => {
+                        trash.push(aside);
+                        Ok(())
+                    }
+                    Err(_) => fs::remove_dir_all(&entry.dir),
+                }
+            }
+            None => fs::remove_dir_all(&entry.dir),
+        };
+        if let Err(e) = removed {
             tracing::warn!(dir = ?entry.dir, error = %e, "failed to remove evicted snapshot dir");
         } else {
             tracing::info!(
@@ -1163,6 +1185,15 @@ pub fn save(
 /// cannot replace a non-empty directory). On failure the previous snapshot is
 /// put back and `tmp` removed.
 fn commit_dir(tmp: &Path, dir: &Path, old: &Path) -> eyre::Result<()> {
+    if commit_dir_keep_old(tmp, dir, old)? {
+        let _ = fs::remove_dir_all(old);
+    }
+    Ok(())
+}
+
+/// [`commit_dir`] without the final delete of the replaced snapshot: returns whether one was moved to `old` (the async
+/// saver deletes it on its writer thread).
+fn commit_dir_keep_old(tmp: &Path, dir: &Path, old: &Path) -> eyre::Result<bool> {
     let replaced = dir.exists();
     if replaced {
         let _ = fs::remove_dir_all(old);
@@ -1178,10 +1209,7 @@ fn commit_dir(tmp: &Path, dir: &Path, old: &Path) -> eyre::Result<()> {
         let _ = fs::remove_dir_all(tmp);
         return Err(eyre!("snapshot.save: commit {dir:?}: {e}"));
     }
-    if replaced {
-        let _ = fs::remove_dir_all(old);
-    }
-    Ok(())
+    Ok(replaced)
 }
 
 /// The six blob streams of one snapshot, in the order `save` fills them per layer.
@@ -1493,37 +1521,46 @@ pub fn capture(state: &HetModelState, dgpu: Device, igpu: Device) -> eyre::Resul
     if state.layers.len() != N_LAYER as usize {
         return Err(eyre!("snapshot.capture: layer count {} != N_LAYER {}", state.layers.len(), N_LAYER));
     }
-    let mut blobs = Blobs { kv: Vec::new(), comp_kv: Vec::new(), comp_state: Vec::new(), index_comp_kv: Vec::new(), index_comp_state: Vec::new(), index_k: Vec::new() };
+    // Pre-sized from the exact live sizes: no Vec doubling while the reads append.
+    let z = blob_sizes(state);
+    let v = |n: u64| Vec::with_capacity(n as usize);
+    let mut blobs = Blobs { kv: v(z.kv), comp_kv: v(z.comp_kv), comp_state: v(z.comp_state), index_comp_kv: v(z.index_comp_kv), index_comp_state: v(z.index_comp_state), index_k: v(z.index_k) };
     let layers = read_layers(state, dgpu, igpu, &mut blobs)?;
     Ok(SnapshotImage { blobs, layers, n_kv_max: state.n_kv_max })
 }
 
 /// Host bytes [`capture`] would hold for `state` (its live prefixes; no device read): the async saver's memory cap.
 pub fn image_bytes(state: &HetModelState) -> u64 {
-    let mut n = 0u64;
+    let z = blob_sizes(state);
+    z.kv + z.comp_kv + z.comp_state + z.index_comp_kv + z.index_comp_state + z.index_k
+}
+
+/// The exact bytes `read_layers` appends to each blob for `state` (the same live-prefix arithmetic; no device read).
+fn blob_sizes(state: &HetModelState) -> Blobs<u64> {
+    let mut z = Blobs { kv: 0u64, comp_kv: 0, comp_state: 0, index_comp_kv: 0, index_comp_state: 0, index_k: 0 };
     for layer in &state.layers {
-        n += (layer.n_raw.min(SWA_WINDOW) as u64) * (N_HEAD_DIM as u64) * 2;
+        z.kv += (layer.n_raw.min(SWA_WINDOW) as u64) * (N_HEAD_DIM as u64) * 2;
         if let Some(c) = &layer.compressor {
-            n += match &c.comp_kv {
+            z.comp_kv += match &c.comp_kv {
                 CompKvStore::F16(_) => (c.n_comp as u64) * (c.head_dim as u64) * 2,
                 CompKvStore::Fp8 { .. } => (c.n_comp as u64) * FP8_KV_ROW_BYTES as u64,
                 CompKvStore::E2m1(_) => 0,
             };
             if c.index_k.is_some() {
-                n += (c.n_index_comp as u64) * E2M1_KEY_ROW_BYTES as u64;
+                z.index_k += (c.n_index_comp as u64) * E2M1_KEY_ROW_BYTES as u64;
             }
-            n += (c.state_kv.len() as u64) * 8;
+            z.comp_state += (c.state_kv.len() as u64) * 8;
         }
         if let Some(c) = &layer.indexer_compressor {
-            n += match &c.comp_kv {
+            z.index_comp_kv += match &c.comp_kv {
                 CompKvStore::F16(_) => (c.n_comp as u64) * (c.head_dim as u64) * 2,
                 CompKvStore::E2m1(_) => (c.n_comp as u64) * E2M1_KEY_ROW_BYTES as u64,
                 CompKvStore::Fp8 { .. } => 0,
             };
-            n += (c.state_kv.len() as u64) * 8;
+            z.index_comp_state += (c.state_kv.len() as u64) * 8;
         }
     }
-    n
+    z
 }
 
 /// Write `image` as the files of one snapshot into `dir` (the same files `save_files` writes for the state it was
@@ -1560,6 +1597,8 @@ pub struct SaveRequest {
     pub tokens: Vec<i32>,
     pub image_spans: Vec<ImageSpan>,
     pub session_id: Option<String>,
+    /// The engine-side `capture` time (device reads), for the saved line.
+    pub capture_ms: u64,
 }
 
 /// The snapshot key of a token sequence (`blake3_decoded`), shareable with the writer thread.
@@ -1576,6 +1615,12 @@ struct SaveJob {
     queued: std::time::Instant,
 }
 
+/// The writer thread's queue: saves, and directories the engine thread renamed aside to delete.
+enum WriterJob {
+    Save(SaveJob),
+    Delete(Vec<PathBuf>),
+}
+
 /// A written (not yet committed) snapshot.
 struct Written {
     tmp: PathBuf,
@@ -1588,7 +1633,9 @@ struct SaveDone {
     result: eyre::Result<Written>,
     bytes: u64,
     tokens: usize,
+    capture_ms: u64,
     wait_ms: u64,
+    hash_ms: u64,
     write_ms: u64,
 }
 
@@ -1598,7 +1645,7 @@ pub struct AsyncSaver {
     root: PathBuf,
     fingerprint: ModelFingerprint,
     key: SnapshotKeyFn,
-    worker: Option<(std::sync::mpsc::Sender<SaveJob>, std::sync::mpsc::Receiver<SaveDone>)>,
+    worker: Option<(std::sync::mpsc::Sender<WriterJob>, std::sync::mpsc::Receiver<SaveDone>)>,
     /// Submitted, not yet committed: seq -> the save's tokens (`drain_prefix_of`).
     pending: BTreeMap<u64, Vec<i32>>,
     in_flight_bytes: u64,
@@ -1623,18 +1670,31 @@ impl AsyncSaver {
     /// Queue `req` for the writer thread (started on first use). On error nothing was queued.
     pub fn submit(&mut self, req: SaveRequest) -> eyre::Result<()> {
         if self.worker.is_none() {
-            let (jtx, jrx) = std::sync::mpsc::channel::<SaveJob>();
+            let (jtx, jrx) = std::sync::mpsc::channel::<WriterJob>();
             let (dtx, drx) = std::sync::mpsc::channel::<SaveDone>();
             let (root, fingerprint, key) = (self.root.clone(), self.fingerprint.clone(), self.key.clone());
             std::thread::Builder::new().name("snapshot-save".into()).spawn(move || {
                 while let Ok(job) = jrx.recv() {
-                    let t = std::time::Instant::now();
+                    let job = match job {
+                        WriterJob::Save(j) => j,
+                        WriterJob::Delete(dirs) => {
+                            let t = std::time::Instant::now();
+                            for d in &dirs {
+                                if let Err(e) = fs::remove_dir_all(d) {
+                                    tracing::warn!(dir = ?d, error = %e, "snapshot writer: failed to delete an evicted snapshot dir");
+                                }
+                            }
+                            tracing::info!(dirs = dirs.len(), ms = t.elapsed().as_millis() as u64, "snapshot writer: evicted snapshot dirs deleted");
+                            continue;
+                        }
+                    };
                     let wait_ms = job.queued.elapsed().as_millis() as u64;
-                    let (bytes, tokens) = (job.req.image.bytes(), job.req.tokens.len());
+                    let (bytes, tokens, capture_ms) = (job.req.image.bytes(), job.req.tokens.len(), job.req.capture_ms);
                     let seq = job.seq;
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_job(&root, &fingerprint, &key, seq, job.req)))
+                    let mut times = (0u64, 0u64);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_job(&root, &fingerprint, &key, seq, job.req, &mut times)))
                         .unwrap_or_else(|_| Err(eyre!("snapshot writer panicked")));
-                    let done = SaveDone { seq, result, bytes, tokens, wait_ms, write_ms: t.elapsed().as_millis() as u64 };
+                    let done = SaveDone { seq, result, bytes, tokens, capture_ms, wait_ms, hash_ms: times.0, write_ms: times.1 };
                     if dtx.send(done).is_err() {
                         return;
                     }
@@ -1647,7 +1707,7 @@ impl AsyncSaver {
         let tokens = req.tokens.clone();
         let job = SaveJob { req, seq: self.seq, queued: std::time::Instant::now() };
         let (jtx, _) = self.worker.as_ref().expect("started above");
-        if jtx.send(job).is_err() {
+        if jtx.send(WriterJob::Save(job)).is_err() {
             self.worker = None;
             return Err(eyre!("snapshot writer thread gone"));
         }
@@ -1682,7 +1742,9 @@ impl AsyncSaver {
     }
 
     /// Wait (committing and indexing, in FIFO order) until no pending save's tokens are a prefix of `tokens`: before a
-    /// request's snapshot probe, so a save still being written that the probe could restore is not missed. Engine
+    /// request's snapshot probe, so a save still being written that the probe could restore is not missed. Token ids,
+    /// not decoded bytes: the probe matches keys by decoded bytes, but a candidate is restored only if its tokens are
+    /// a TOKEN prefix of the prompt (`start_prefill`'s `is_prefix`), so this is exactly the restorable set. Engine
     /// thread only.
     pub fn drain_prefix_of(&mut self, index: &mut SnapshotIndex, tokens: &[i32]) -> usize {
         self.drain_while(index, |p| tokens.starts_with(p))
@@ -1724,25 +1786,48 @@ impl AsyncSaver {
                 return;
             }
         };
+        // Renames and index changes here, on the engine thread; every DELETE (the replaced same-key snapshot, the
+        // lineage / global-cap evictions of `insert`) is renamed aside and goes to the writer thread.
         let t = std::time::Instant::now();
-        if let Err(e) = commit_dir(&w.tmp, &w.entry.dir, &w.old) {
-            tracing::error!(error = %e, tokens = done.tokens, "multistream: snapshot.save (async) commit failed");
-            return;
+        let mut trash = Vec::new();
+        match commit_dir_keep_old(&w.tmp, &w.entry.dir, &w.old) {
+            Ok(true) => trash.push(w.old.clone()),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(error = %e, tokens = done.tokens, "multistream: snapshot.save (async) commit failed");
+                return;
+            }
         }
         let (hash, sid, disk_bytes) = (w.entry.hash, w.entry.session_id.clone(), w.entry.disk_bytes);
+        index.trash = Some(Vec::new());
         index.insert(w.entry);
+        trash.extend(index.trash.take().unwrap_or_default());
         if let Some(sid) = sid {
             index.session_to_hash.insert(sid, hash);
         }
-        tracing::info!(tokens = done.tokens, image_mib = done.bytes >> 20, disk_mib = disk_bytes >> 20, wait_ms = done.wait_ms,
-            write_ms = done.write_ms, commit_ms = t.elapsed().as_millis() as u64, "multistream: snapshot saved (async)");
+        let evicted = trash.len();
+        if !trash.is_empty() {
+            let sent = self.worker.as_ref().is_some_and(|(jtx, _)| jtx.send(WriterJob::Delete(trash.clone())).is_ok());
+            if !sent {
+                for d in &trash {
+                    let _ = fs::remove_dir_all(d);
+                }
+            }
+        }
+        tracing::info!(tokens = done.tokens, image_mib = done.bytes >> 20, disk_mib = disk_bytes >> 20, capture_ms = done.capture_ms,
+            wait_ms = done.wait_ms, hash_ms = done.hash_ms, write_ms = done.write_ms, commit_ms = t.elapsed().as_millis() as u64,
+            dirs_to_delete = evicted, "multistream: snapshot saved (async)");
     }
 }
 
 /// The writer thread's work for one save: key, private directory, files (meta.json last). Not committed.
-fn write_job(root: &Path, fingerprint: &ModelFingerprint, key: &SnapshotKeyFn, seq: u64, req: SaveRequest) -> eyre::Result<Written> {
-    let SaveRequest { image, tokens, image_spans, session_id } = req;
+/// `times` = (hash ms, write ms).
+fn write_job(root: &Path, fingerprint: &ModelFingerprint, key: &SnapshotKeyFn, seq: u64, req: SaveRequest, times: &mut (u64, u64)) -> eyre::Result<Written> {
+    let SaveRequest { image, tokens, image_spans, session_id, .. } = req;
+    let t = std::time::Instant::now();
     let hash = key(&tokens, &image_spans);
+    times.0 = t.elapsed().as_millis() as u64;
+    let t = std::time::Instant::now();
     let dir = root.join(hex::encode(hash));
     // Unique per save (two saves of one key may be in flight, or a synchronous checkpoint of it); the `-<pid>` tail
     // keeps `save_dir_is_stale` working.
@@ -1753,6 +1838,7 @@ fn write_job(root: &Path, fingerprint: &ModelFingerprint, key: &SnapshotKeyFn, s
     let written = fs::create_dir_all(&tmp)
         .map_err(eyre::Report::from)
         .and_then(|()| write_image(image, &tokens, &image_spans, fingerprint, &tmp, session_id.as_deref()));
+    times.1 = t.elapsed().as_millis() as u64;
     match written {
         Ok((disk_bytes, now)) => Ok(Written {
             tmp,
@@ -2662,7 +2748,7 @@ mod async_save_tests {
         }
     }
     fn req(tokens: Vec<i32>, img: SnapshotImage, sid: Option<&str>) -> SaveRequest {
-        SaveRequest { image: img, tokens, image_spans: Vec::new(), session_id: sid.map(|s| s.to_string()) }
+        SaveRequest { image: img, tokens, image_spans: Vec::new(), session_id: sid.map(|s| s.to_string()), capture_ms: 0 }
     }
     fn save_dirs(root: &Path) -> Vec<String> {
         fs::read_dir(root)
@@ -2749,7 +2835,61 @@ mod async_save_tests {
         let e = idx.by_hash.values().next().unwrap();
         assert_eq!(fs::metadata(e.dir.join("kv.bin")).unwrap().len(), 6, "the later save wins");
         assert_eq!(idx.total_bytes(), e.disk_bytes);
-        assert!(save_dirs(&root).is_empty(), "leftover save dirs: {:?}", save_dirs(&root));
+        // The replaced snapshot was renamed aside at the commit; the writer deletes it.
+        let t = std::time::Instant::now();
+        while !save_dirs(&root).is_empty() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "leftover save dirs: {:?}", save_dirs(&root));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn evictions_at_commit_are_renamed_aside_and_deleted_off_thread() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 100_000);
+        // An old, big entry (LRU) that the next commit's global-cap pass must evict.
+        let old_hash = [7u8; 32];
+        let old_dir = root.join(hex::encode(old_hash));
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("tokens.bin"), b"x").unwrap();
+        idx.by_hash.insert(old_hash, IndexEntry { hash: old_hash, token_count: 1, last_used_unix: 1, disk_bytes: 1_000_000, dir: old_dir.clone(), session_id: None });
+        idx.by_last_used.insert((1, old_hash), ());
+        idx.total_bytes = 1_000_000;
+        let mut saver = AsyncSaver::new(root.clone(), fp(), key());
+        saver.submit(req(vec![1, 1], image(4, 0, 0), None)).unwrap();
+        assert_eq!(saver.drain(&mut idx), 1);
+        assert!(idx.trash.is_none(), "deferral is scoped to the async commit");
+        assert!(!idx.by_hash.contains_key(&old_hash), "the cap did not evict the old entry");
+        assert_eq!(idx.len(), 1, "the new snapshot is indexed");
+        assert!(!old_dir.exists(), "the evicted snapshot is still under its key");
+        // The writer deletes the renamed-aside dir.
+        let t = std::time::Instant::now();
+        while !save_dirs(&root).is_empty() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "renamed dirs never deleted: {:?}", save_dirs(&root));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Outside the async commit, eviction deletes in place, as before.
+        let h = *idx.by_hash.keys().next().unwrap();
+        let dir = idx.by_hash[&h].dir.clone();
+        idx.evict(&h, "test");
+        assert!(!dir.exists());
+        assert!(save_dirs(&root).is_empty());
+    }
+
+    #[test]
+    fn a_stale_renamed_aside_dir_is_removed_at_load() {
+        let root = unique_root();
+        let aside = root.join(format!("{SAVE_OLD_PREFIX}{}.e7-{}", hex::encode([3u8; 32]), std::process::id()));
+        fs::create_dir_all(&aside).unwrap();
+        fs::write(aside.join("meta.json"), b"{}").unwrap();
+        let idx = SnapshotIndex::load(root.clone(), fp(), 1 << 40).unwrap();
+        assert_eq!(idx.len(), 0);
+        assert!(!aside.exists(), "a stale .old- dir of this pid survived load");
+    }
+
+    #[test]
+    fn image_bytes_counts_every_blob() {
+        assert_eq!(image(4, 8, 3).bytes(), 15);
     }
 
     #[test]
