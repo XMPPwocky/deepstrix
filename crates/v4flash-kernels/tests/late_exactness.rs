@@ -26,8 +26,9 @@
 //!   BE / XE -- FORCE_LATE=N (XE: + LATE_SKIP) in the ENCODER chunks only, verdict on the encoder's first MoE layer
 //!              (`GATE_ENC_LAYER`, default 0: identical inputs in every arm);
 //!   BR / XR -- FORCE_LATE=N (XR: + LATE_SKIP) in the REPLAY only, verdict on the replay's first MoE layer
-//!              (`GATE_REP_LAYER`, default 20). The encoder of BR / XR runs as A's: its KV (layers 0-19) and its
-//!              layer-0 MoE must be BIT-IDENTICAL to A's (else no verdict), so the replay's inputs are A's.
+//!              (`GATE_REP_LAYER`, default 20). The encoder of BR / XR runs as A's: its replay seed rows (layer 19's
+//!              output + carry, compared before the replay), its KV (layers 0-20) and its layer-0 MoE must be
+//!              BIT-IDENTICAL to A's (else no verdict), so the replay's inputs are A's.
 //! PASS per path: null bit-identical, late vs main <= GATE_LAYER_TOL (1e-4), dropped >= GATE_NEG x late, late picks
 //! counted, no window ran, no slot left pinned. Run it ALONE (one model load per process; the capture layers are read
 //! once per process):
@@ -35,6 +36,16 @@
 //! (prod env) V41_PREFILL_PIN_INFLIGHT=1 V41_PREFILL_COLD_ASYNC_RANGE=1 V41_PREFILL_COLD_B1=off \
 //!   CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels --features v41 --release \
 //!   --test late_exactness -- --ignored --nocapture --exact late_pass_matches_main_pass_range
+//! ```
+//!
+//! SOAK, `late_range_soak_prod_selection`: the range path under the PRODUCTION selection (`V41_PREFILL_COLD_B1=short`,
+//! FRAC 0.5, MAX 8 unless the env says otherwise; no forced picks): `GATE_SOAK_JOBS` (6) fresh short jobs must finish
+//! without error, with late picks > 0 in the encoder chunks AND in the replays, finite logits, and every pin and stage
+//! back after each job. Run it ALONE:
+//! ```text
+//! (prod env) V41_PREFILL_PIN_INFLIGHT=1 V41_PREFILL_COLD_ASYNC_RANGE=1 \
+//!   CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels --features v41 --release \
+//!   --test late_exactness -- --ignored --nocapture --exact late_range_soak_prod_selection
 //! ```
 #![cfg(feature = "v41")]
 
@@ -534,6 +545,8 @@ fn late_pass_matches_main_pass_range() -> eyre::Result<()> {
         late_enc: u64,
         late_rep: u64,
         windows: usize,
+        /// The replay's input rows (token, residual, carry) as the encoder left them, before `prefill_job_finish`.
+        replay_rows: Vec<(i32, Vec<f32>, Vec<f32>)>,
         state: HetModelState,
     }
     let force_n = env_usize("GATE_FORCE_N", 7).to_string();
@@ -556,6 +569,7 @@ fn late_pass_matches_main_pass_range() -> eyre::Result<()> {
         }
         let l1 = late_count(pg);
         let caps_e = v4flash_kernels::het::forward_prefill::take_moe_captures();
+        let replay_rows = job.replay_rows();
         v4flash_kernels::knobs::PREFILL_COLD_FORCE_LATE.set(force_r);
         v4flash_kernels::knobs::PREFILL_COLD_LATE_SKIP.set(skip_r);
         let logits = engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut *pg))?;
@@ -572,6 +586,7 @@ fn late_pass_matches_main_pass_range() -> eyre::Result<()> {
             late_enc: l1 - l0,
             late_rep: l2 - l1,
             windows: job.lm_windows_run(),
+            replay_rows,
             state: st,
         };
         eprintln!("  arm {name}: enc force {force_e} skip {skip_e}, replay force {force_r} skip {skip_r}: {chunks} chunks, {} windows, \
@@ -634,9 +649,18 @@ fn late_pass_matches_main_pass_range() -> eyre::Result<()> {
         if x.late_enc != 0 || er != 0.0 {
             fail.push(format!("{name}: its encoder differs from A's (late picks {}, L{enc_layer} rel {er:.3e}): no replay verdict", x.late_enc));
         }
-        let d = diff_states_in(&a.state, &x.state, 0..split)?;
+        // The replay's seed rows (layer 19's output entering layer 20, and the mHC carry) bit for bit: they, with the
+        // KV below, are everything the replay reads from the encoder.
+        if x.replay_rows.is_empty() || x.replay_rows != a.replay_rows {
+            let first = x.replay_rows.iter().zip(&a.replay_rows).position(|(p, q)| p != q);
+            fail.push(format!("{name}: replay seed rows differ from A's ({} vs {} rows, first differing {first:?}): no replay verdict",
+                x.replay_rows.len(), a.replay_rows.len()));
+        }
+        // Encoder KV (layers 0-19) and layer 20's (written by the encoder's KvSourceOnly pass; its compressor is not
+        // touched by the replay, its raw window is rewritten from the identical seed rows before any MoE).
+        let d = diff_states_in(&a.state, &x.state, 0..split + 1)?;
         if !d.is_empty() {
-            fail.push(format!("{name}: encoder KV differs from A's: {}", d.join("; ")));
+            fail.push(format!("{name}: encoder / layer-{split} KV differs from A's: {}", d.join("; ")));
         }
     }
     // End-to-end logits: information only (f32 reassociation compounds through router / indexer near-ties).
@@ -653,5 +677,162 @@ fn late_pass_matches_main_pass_range() -> eyre::Result<()> {
         Ok(())
     } else {
         Err(eyre!("LATE RANGE GATE FAIL: {}", fail.join("; ")))
+    }
+}
+
+/// SOAK of the range path under the PRODUCTION selection (`V41_PREFILL_COLD_B1=short`, FRAC 0.5, MAX 8,
+/// `V41_PREFILL_COLD_ASYNC_RANGE=1`; env values win if set): several short jobs (chunked encoder + replay, no window),
+/// each must finish without error (three-way exactly-once, late join never ran, exclusion: all fail the job), with
+/// real late reads on BOTH the encoder chunks and the replay, finite logits, and every pin / stage back after each job.
+/// Not an exactness gate (cold picks move between the boxes: no bit-identical null exists); see the module doc.
+#[test]
+#[ignore]
+fn late_range_soak_prod_selection() -> eyre::Result<()> {
+    install_panic_handler()?;
+    for (k, v) in [("V41_PAGED_EXPERTS", "1"), ("V41_PAGER_POOL_GB", "40"), ("V41_PREFILL_COLD_B1", "short"),
+        ("V41_PREFILL_COLD_B1_FRAC", "0.5"), ("V41_PREFILL_COLD_B1_MAX", "8")] {
+        if std::env::var(k).is_err() {
+            std::env::set_var(k, v);
+        }
+    }
+    if std::env::var("V41_REMOTE_ADDR").is_err() {
+        return Err(eyre!("cold picks exist only under the box-2 partition: set V41_REMOTE_ADDR (box 2 up)"));
+    }
+    for (k, v) in [("V41_PREFILL_PIN_INFLIGHT", "1"), ("V41_PREFILL_COLD_ASYNC_RANGE", "1"), ("V41_PREFILL_COLD_ASYNC", "0"),
+        ("V41_PREFILL_COLD_FORCE_LATE", "0"), ("V41_PREFILL_COLD_LATE_SKIP", "0")] {
+        std::env::set_var(k, v);
+    }
+    if std::env::var("V41_CED").as_deref() == Ok("0") {
+        return Err(eyre!("the range path under test is the CED encoder + replay; unset V41_CED=0"));
+    }
+    let dir = std::env::var("V41_HF_DIR").unwrap_or_else(|_| HF_DIR_DEFAULT.to_string());
+    let engram_dir = std::env::var("V41_ENGRAM_DIR").unwrap_or_else(|_| {
+        format!("{}/.cache/deepstrix/v41/engram", std::env::var("HOME").unwrap_or_default())
+    });
+    let dgpu = pick("gfx1201")?;
+    let igpu = pick("gfx1151")?;
+    let darch = dgpu.properties()?.gcn_arch_name;
+    let iarch = igpu.properties()?.gcn_arch_name;
+    let hf = V41HfWeights::open(&dir, None)?;
+    let src = WeightSrc::from(&hf);
+    let te = src.tensor("token_embd.weight").ok_or_else(|| eyre!("missing token_embd.weight"))?;
+    let te_dtype = te.dtype;
+    let te_bytes = src.read_tensor(te)?;
+    let embed = |tok: i32| -> eyre::Result<Vec<f32>> {
+        let mut r = vec![0f32; HC_DIM as usize];
+        embed_lookup(&te_bytes, te_dtype, tok, &mut r)?;
+        Ok(r)
+    };
+    eprintln!("loading weights (paged experts)...");
+    let weights = HetModelWeights::load_all(src, dgpu, igpu, &rope_for_layer)?;
+    let engine = HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, ExecMode::HetParallel)?;
+    let mut ds = DgpuScratch::alloc(dgpu)?;
+    let n_kv_max: u32 = 8192;
+    let lane_rows = v4flash_kernels::het::batch_scratch::prefill_lane_rows();
+    let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut sd = BatchDgpuShared::alloc_rows_ctx(dgpu, lane_rows, n_kv_max)?;
+    let mut si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
+    let mut pg = ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, 0)?;
+    let stages = env_usize("V41_PREFILL_COLD_STAGES", 16).max(1);
+    pg.start_late_reader(Path::new(&dir), env_usize("V41_PREFILL_COLD_READERS", 8), stages)?;
+    if !pg.late_on() {
+        return Err(eyre!("late readers did not start (GPU repack off?)"));
+    }
+    let hasher = EngramHash::load(Path::new(&engram_dir))?;
+    hasher.self_check()?;
+    let mut tables = Vec::new();
+    for &l in ENGRAM_LAYERS {
+        tables.push(EngramTable::open(pg.raw(), l as usize)?);
+    }
+    let ein = ENGRAM_IN as usize;
+    use v4flash_kernels::het::prefill_split::{cold_totals, late_totals};
+    let late_now = |pg: &ExpertPager| {
+        let (sh, new, refd) = late_totals();
+        (sh + new, refd, pg.late_stats().map_or(0, |x| x.0))
+    };
+    let jobs = env_usize("GATE_SOAK_JOBS", 6);
+    let base = env_usize("GATE_TOKENS", 1500);
+    let (mut enc_late, mut rep_late, mut cold) = (0u64, 0u64, 0u64);
+    let mut fail = Vec::new();
+    for j in 0..jobs {
+        // 0.5x .. 1.33x the base length, a fresh prompt each (different experts per job).
+        let len = (base / 2 + (j * base) / (jobs.max(1) + 1)).max(200);
+        let prompt = synth_prompt(100 + j as u64, len);
+        let rows = {
+            let hashes = hasher.hash_sequence(&prompt);
+            let mut out = vec![vec![0f32; prompt.len() * ein]; tables.len()];
+            for (li, tbl) in tables.iter().enumerate() {
+                for t in 0..prompt.len() {
+                    tbl.gather_position(pg.raw(), &hashes[t][li], &mut out[li][t * ein..(t + 1) * ein])?;
+                }
+            }
+            out
+        };
+        let hcs: Vec<Vec<f32>> = prompt.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
+        let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+        zero_state(&mut st)?;
+        st.reset_in_place(dgpu, igpu)?;
+        let mut job = PrefillJob::new(prompt.clone(), hcs, Some(rows), None, 0, v4flash_kernels::het::batch_scratch::chunk_rows_cap())?;
+        job.set_layer_major_rows(0)?;
+        let c0 = cold_totals();
+        let l0 = late_now(&pg);
+        let mut run = || -> eyre::Result<(u64, u64, Vec<f32>)> {
+            while !job.chunks_done() {
+                engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
+            }
+            let e = late_now(&pg).0 - l0.0;
+            let l1 = late_now(&pg);
+            let logits = engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
+            st.restore_compressor_lending();
+            Ok((e, late_now(&pg).0 - l1.0, logits))
+        };
+        match run() {
+            Ok((e, r, logits)) => {
+                let c1 = cold_totals();
+                let c = (c1.1 - c0.1) + (c1.2 - c0.2) + (late_now(&pg).0 - l0.0);
+                enc_late += e;
+                rep_late += r;
+                cold += c;
+                let finite = logits.iter().all(|x| x.is_finite());
+                eprintln!("  job {j}: {len} tokens, {} windows: late picks encoder {e} replay {r}, cold picks {c}, stage refusals {}, argmax {}, finite {finite}",
+                    job.lm_windows_run(), late_now(&pg).1 - l0.1, argmax(&logits));
+                if !finite {
+                    fail.push(format!("job {j}: non-finite logits"));
+                }
+                if job.lm_windows_run() != 0 {
+                    fail.push(format!("job {j}: a layer-outer window ran: the range path was not the one under test"));
+                }
+            }
+            Err(e) => fail.push(format!("job {j} ({len} tokens) FAILED: {e:#}")),
+        }
+        if pg.pinned_slots() != 0 {
+            fail.push(format!("job {j}: {} slots still pinned", pg.pinned_slots()));
+        }
+        if pg.late_free_stages() != stages {
+            fail.push(format!("job {j}: {} of {stages} late stages free after the job", pg.late_free_stages()));
+        }
+    }
+    if let Some((q, rf, ld, res, fb, oe, wms)) = pg.late_stats() {
+        eprintln!("late reads: queued {q}, refused {rf}, landed {ld}, resident at join {res}, fallback {fb}, owned evictions {oe}, join wait {wms} ms");
+    }
+    if cold == 0 {
+        fail.push("no cold picks at all (box 2 held every pick): inconclusive, rerun after box 2 has paged / with more jobs".into());
+    } else {
+        if enc_late == 0 {
+            fail.push(format!("no late picks in the encoder chunks ({cold} cold picks)"));
+        }
+        if rep_late == 0 {
+            fail.push(format!("no late picks in the replays ({cold} cold picks)"));
+        }
+    }
+    eprintln!("soak: {jobs} jobs, late picks encoder {enc_late} replay {rep_late}, cold picks {cold}");
+    if fail.is_empty() {
+        eprintln!("LATE RANGE SOAK PASS");
+        Ok(())
+    } else {
+        Err(eyre!("LATE RANGE SOAK FAIL: {}", fail.join("; ")))
     }
 }

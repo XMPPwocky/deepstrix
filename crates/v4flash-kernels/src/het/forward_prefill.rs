@@ -1226,6 +1226,10 @@ impl PrefillJob {
     }
     /// Layer-major windows completed so far (0 = the job ran chunked).
     pub fn lm_windows_run(&self) -> usize { self.lm_windows }
+    /// The CED replay rows held for `prefill_job_finish`, in order: (token, residual `[HC_DIM]`, mHC carry) (gates).
+    pub fn replay_rows(&self) -> Vec<(i32, Vec<f32>, Vec<f32>)> {
+        self.replay.iter().map(|r| (r.tok, r.hc.clone(), r.carry.clone())).collect()
+    }
     pub fn chunks_done(&self) -> bool { self.chunk_start >= self.tokens.len() }
     pub fn pos0(&self) -> u32 { self.pos0 }
     pub fn tokens(&self) -> &[i32] { &self.tokens }
@@ -1843,10 +1847,9 @@ impl HeterogeneousEngine {
         // experts loaded (paged experts), which kept the late path off (gate run 1, 10-12).
         let hot_any = (a..b_end.min(split)).any(|l| prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], &*lanes[0].0, sd));
         let late_on = pin && crate::knobs::PREFILL_COLD_ASYNC.on() && !hot_any && pager.as_deref().is_some_and(|p| p.late_on());
-        LATE_PASS.store(late_on, std::sync::atomic::Ordering::Relaxed);
-        for a in LATE_SPENT.iter() {
-            a.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
+        // Cleared on drop however the pass ends (a panic included); the explicit clear below stays.
+        let _late_guard = LatePassGuard::enter(late_on);
+        let late_stats0 = if late_on { pager.as_deref().map(LatePassStats::begin) } else { None };
         let mut late_pend: [Option<(usize, PreMoeCarry)>; 2] = [None, None];
         if late_on {
             // The late pass's output buffers, before any unit runs (a mid-pass hipMalloc can synchronize; review r3 #9).
@@ -2027,6 +2030,9 @@ impl HeterogeneousEngine {
                     result = r;
                 }
             }
+        }
+        if let (Some(s0), Some(pg)) = (late_stats0, pager.as_deref()) {
+            s0.log(pg, "window", "encoder", a..b_end, win_rows, result.is_ok());
         }
         if pin_pass() {
             // Every pinned dispatch done before the pins go away (a decode step's ensure must not see stale pins).
@@ -3761,17 +3767,15 @@ impl HeterogeneousEngine {
         // iGPU work queued before the pass (a decode step) was never pinned: wait for it once.
         self.igpu.compute.synchronize()?;
         let pin_guard = PinPass::enter(true);
-        LATE_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
-        for a in LATE_SPENT.iter() {
-            a.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
+        let late_guard = LatePassGuard::enter(true);
+        let stats0 = LatePassStats::begin(pg);
         let mut pend: [Option<(usize, PreMoeCarry)>; 2] = [None, None];
         let mut result = self.range_late_body(bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, ln, stats_a, pg, engram_rows, lo, hi, ced, &mut pend);
         if result.is_ok() && pend.iter().any(Option::is_some) {
             // Every late unit is joined before its own post; a KvSourceOnly unit has no MoE (fails closed).
             result = Err(eyre!("late range pass L{lo}..{hi}: a unit's late join never ran"));
         }
-        LATE_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(late_guard);
         let r = pg.late_cancel_all();
         if result.is_ok() {
             result = r;
@@ -3782,6 +3786,8 @@ impl HeterogeneousEngine {
             result = r;
         }
         drop(pin_guard);
+        let what = if ced == CedMode::Replay { "replay" } else { "encoder" };
+        stats0.log(pg, "range", what, lo..hi, ln.b_a + ln.b_b, result.is_ok());
         let sync = self.dgpu.compute.synchronize();
         result?;
         sync
@@ -5983,6 +5989,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<()> {
         let (layer, b, cs_n_embd, cs_n_used) = (c.layer, c.b, c.cs_n_embd, c.cs_n_used);
         let late = std::mem::take(&mut c.late);
+        LATE_JOINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
         let landed = pg.late_join(layer, &late, call_tick, &ie.compute)?;
@@ -11397,12 +11404,14 @@ impl HeterogeneousEngine {
                         }
                     }
                     let shared = late.len();
-                    let k = super::prefill_split::cold_b1_take(
+                    let want = super::prefill_split::cold_b1_take(
                         rest.len(),
                         crate::knobs::PREFILL_COLD_B1_FRAC.f64(),
                         crate::knobs::PREFILL_COLD_B1_MAX.usize(),
-                    )
-                    .min(late_budget_left(layer as usize));
+                    );
+                    let k = want.min(late_budget_left(layer as usize));
+                    // Over the layer's late budget: left to box 2 (counted for the per-pass line, `LatePassStats`).
+                    LATE_BUDGET_OVER.fetch_add((want - k) as u64, std::sync::atomic::Ordering::Relaxed);
                     let took = pg.late_read(layer as i32, &rest[..k])?;
                     if let Some(a) = LATE_SPENT.get(layer as usize) {
                         a.fetch_add(took.len() as u32, std::sync::atomic::Ordering::Relaxed);
@@ -14346,6 +14355,68 @@ static LATE_SPENT: [std::sync::atomic::AtomicU32; N_LAYER as usize] = [const { s
 
 pub fn late_pass() -> bool {
     LATE_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Late joins run (one per unit with late ids), cumulative (`LatePassStats`).
+static LATE_JOINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cold picks a late pass would have read on box 1 but the layer's `V41_PREFILL_COLD_LATE_MAX_LAYER` budget left to
+/// box 2, cumulative (`LatePassStats`).
+static LATE_BUDGET_OVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Scope guard for [`late_pass`] (window pass and range pass): set, with the per-layer budget reset, on entry;
+/// cleared on drop however the pass ends (an error or a panic included).
+struct LatePassGuard;
+impl LatePassGuard {
+    fn enter(on: bool) -> Self {
+        LATE_PASS.store(on, std::sync::atomic::Ordering::Relaxed);
+        for a in LATE_SPENT.iter() {
+            a.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        LatePassGuard
+    }
+}
+impl Drop for LatePassGuard {
+    fn drop(&mut self) {
+        LATE_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The counters of one late pass, for its `prefill late pass` line (path `window` = a layer-outer window pass
+/// (`V41_PREFILL_COLD_ASYNC`), `range` = a chunked encoder chunk or a CED replay (`V41_PREFILL_COLD_ASYNC_RANGE`)), so
+/// a live A/B can attribute late reads, joins and their waits to each path.
+struct LatePassStats {
+    t0: std::time::Instant,
+    pager: (u64, u64, u64, u64, u64, u64, u64),
+    totals: (u64, u64, u64),
+    joins: u64,
+    over: u64,
+}
+impl LatePassStats {
+    fn begin(pg: &super::expert_pager::ExpertPager) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        LatePassStats {
+            t0: std::time::Instant::now(),
+            pager: pg.late_stats().unwrap_or_default(),
+            totals: super::prefill_split::late_totals(),
+            joins: LATE_JOINS.load(Relaxed),
+            over: LATE_BUDGET_OVER.load(Relaxed),
+        }
+    }
+
+    fn log(self, pg: &super::expert_pager::ExpertPager, path: &str, what: &str, layers: std::ops::Range<usize>, rows: usize, ok: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (q0, rf0, ld0, res0, fb0, oe0, w0) = self.pager;
+        let (q, rf, ld, res, fb, oe, w) = pg.late_stats().unwrap_or_default();
+        let (sh0, new0, ref0) = self.totals;
+        let (sh, new, refd) = super::prefill_split::late_totals();
+        tracing::info!(
+            path, what, layers = format!("{}..{}", layers.start, layers.end), rows, ok,
+            late_new = new - new0, late_shared = sh - sh0, stage_refused = refd - ref0, budget_over = LATE_BUDGET_OVER.load(Relaxed) - self.over,
+            joins = LATE_JOINS.load(Relaxed) - self.joins, queued = q - q0, landed = ld - ld0, resident_at_join = res - res0,
+            fallback = fb - fb0, owned_evict = oe - oe0, join_wait_ms = w - w0, pager_refused = rf - rf0,
+            ms = self.t0.elapsed().as_millis() as u64, "prefill late pass"
+        );
+    }
 }
 
 /// GATE ONLY (`V41_PREFILL_CAPTURE_MOE=<layer>[,<layer>...]`, tests/late_exactness.rs): during a pin pass (a
