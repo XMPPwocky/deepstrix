@@ -1154,7 +1154,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // positions, so allocate a stub; the legacy handler refuses to run on it.
     #[cfg(feature = "v41")]
     // DSpark on the arena (`V41_MS_DSPARK`) runs no request on the legacy path either.
-    let legacy_ctx = if crate::multistream::enabled() && (mtp.is_none() || crate::ms_dspark::enabled()) {
+    // `serial_attn` (above) is this exact condition, negated: one evaluation for both, so they cannot drift.
+    let legacy_ctx = if !serial_attn {
         LEGACY_STUB_CTX.min(cfg.n_kv_max)
     } else {
         cfg.n_kv_max

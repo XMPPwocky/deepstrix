@@ -8823,7 +8823,25 @@ impl HeterogeneousEngine {
                     (sd.indexer_topk_scratch.len(), indexer_topk_scratch_per_row(n_idx_max)),
                     (sd.cand_block_score.len(), if cand_build { nb_stride as usize } else { 0 }),
                 ])
-                .map_err(|e| eyre!("L{layer}: {e}"))?;
+                .map_err(|e| eyre!("L{layer}: {e}"))?
+                .min(super::batch_scratch::idx_block_rows_max());
+                if super::forward_layer::candidate_pool_enabled() {
+                    let rows_n = &n_comp_after[..b as usize];
+                    if cand_build {
+                        bd.candidate_built_n.clear();
+                        bd.candidate_built_n.extend_from_slice(rows_n);
+                    } else if layer > crate::config::CANDIDATE_SOURCE_LAYER {
+                        // The keep bits cover each row's blocks at the layer-20 build; a mask row reaching past them
+                        // would silently drop blocks. Cheap host assert on counts already here (review r1 S2).
+                        let built = &bd.candidate_built_n;
+                        if built.len() < rows_n.len() {
+                            return Err(eyre!("L{layer}: candidate mask over {} rows, but this lane's layer-20 build covered {}", rows_n.len(), built.len()));
+                        }
+                        if let Some(i) = (0..rows_n.len()).find(|&i| rows_n[i] > built[i]) {
+                            return Err(eyre!("L{layer}: candidate mask row {i} reaches {} keys, past its layer-20 build ({})", rows_n[i], built[i]));
+                        }
+                    }
+                }
                 let score_gemm = std::env::var("INDEXER_SCORE_VARIANT").map(|v| v == "gemm").unwrap_or(true);
                 if score_gemm && arena.is_none() {
                     // f16 Q for the gemm, all rows at once (the blocks take row views of it). Arena rows (decode)

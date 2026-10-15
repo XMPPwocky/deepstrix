@@ -187,8 +187,8 @@ fn host<T: Copy + Default>(b: &DeviceBuffer<T>) -> eyre::Result<Vec<T>> {
 #[test]
 fn indexer_row_blocks_match_full_pitch() -> eyre::Result<()> {
     install_panic_handler()?;
-    let n_idx_max = env_u32("IRB_N_IDX", 40_000);
-    let batch = env_u32("IRB_BATCH", 64) as usize;
+    let n_idx_max = env_u32("IRB_N_IDX", 40_003);
+    let batch = env_u32("IRB_BATCH", 61) as usize;
     let block_req = env_u32("IRB_BLOCK", 16) as usize;
     let mut rng = Rng(0x1D3_B10C_5EED_0015);
     let mut ran = false;
@@ -203,14 +203,29 @@ fn indexer_row_blocks_match_full_pitch() -> eyre::Result<()> {
         let wmma = IndexerScoreWmma::for_arch(&arch)?;
         let cand = CandidateBlocks::for_arch(&arch)?;
         let topk = IndexerTopkBitonic::for_arch(&arch)?;
-        let layers = [layer(&d, &stream, &arch, &mut rng, n_idx_max as usize, batch)?,
-                      layer(&d, &stream, &arch, &mut rng, n_idx_max as usize, batch)?];
-        // Per-row n_idx, rising with the row like a prefill unit (row i sees i more keys), floor 600.
-        let n_idx_host: Vec<u32> = (0..batch).map(|i| (n_idx_max - (batch - 1 - i) as u32 * 37).max(600)).collect();
+        // Packed keys run KEY_BASE_SPAN rows past n_idx_max so the arena rows can start at distinct bases (a wrong or
+        // unsliced per-row base then reads other keys and changes the selection).
+        const KEY_BASE_SPAN: usize = 3 * 192;
+        let layers = [layer(&d, &stream, &arch, &mut rng, n_idx_max as usize + KEY_BASE_SPAN, batch)?,
+                      layer(&d, &stream, &arch, &mut rng, n_idx_max as usize + KEY_BASE_SPAN, batch)?];
+        // Per-row n_idx, mixed depths behind one launch-wide n_idx_max (streams of different lengths in one step):
+        // every 7th row at 3000 (one-sort top-k, vacuous candidates), the next at 12000 (vacuous candidates: t == 0),
+        // the rest rising with the row like a prefill unit (row i sees i more keys), floor 600. The last row carries
+        // n_idx_max (batch 61: 60 % 7 = 4).
+        let n_idx_host: Vec<u32> = (0..batch)
+            .map(|i| match i % 7 {
+                0 => 3000.min(n_idx_max),
+                1 => 12000.min(n_idx_max),
+                _ => (n_idx_max - (batch - 1 - i) as u32 * 37).max(600),
+            })
+            .collect();
+        if n_idx_host.iter().copied().max() != Some(n_idx_max) {
+            return Err(eyre!("test shape: no row at n_idx_max (pick a batch whose last row is not a short one)"));
+        }
         let mut n_idx = DeviceBuffer::<u32>::new(d.id, batch)?;
         n_idx.copy_from_host(&n_idx_host)?;
         let mut keys_base = DeviceBuffer::<u32>::new(d.id, batch)?;
-        keys_base.fill_zero()?;
+        keys_base.copy_from_host(&(0..batch).map(|i| (i % 4) as u32 * 192).collect::<Vec<u32>>())?;
 
         let old_stride = ATTN_MIXED_MAX_KEYS;
         let new_stride = indexer_scores_stride(n_idx_max);

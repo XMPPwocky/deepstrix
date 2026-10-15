@@ -311,6 +311,10 @@ pub struct BatchDgpuScratch {
     /// it to its pool (written = must persist): the bits outlive a loan end between layer 20 and 24-36.
     pub candidate_bits: DeviceBuffer<u32>,
     pub candidate_threshold: DeviceBuffer<u32>,
+    /// Host: each row's reachable count at the layer-20 build that wrote `candidate_bits` (empty = no build on this
+    /// lane yet). The masks at 24-36 assert their rows' counts do not exceed it: past the build's blocks the bits are
+    /// 0 / stale, so a deeper mask row would silently lose blocks (review r1 S2).
+    pub candidate_built_n: Vec<u32>,
 
     /// `[B, HC_DIM]` — per-token residual (cross-layer flow).
     pub residual: DeviceBuffer<f32>,
@@ -564,7 +568,7 @@ pub const MHC_SPLIT_MAX_ROWS: u32 = 16;
 ///   is next written in P2 of the following layer.
 /// * **R3** (`r3_arena`): `indexer_q` (written P5i matvec_q, last read by
 ///   the indexer score kernel) and `indexer_topk_scratch` (written by the
-///   topk kernel that runs after the score kernel). Both at offset 0.
+///   topk kernel that runs after the score kernel). Side by side since 2026-10-15 (row blocks: a block's top-k must not clobber the next block's Q).
 ///
 /// ~629 MiB at rows=512: attn_active_comp_kv 256, attn_scores 128, R1
 /// arena 96.5, q_normed/R2 64, attn_cur / attn_input_norm / ffn_cur 8
@@ -726,7 +730,7 @@ pub struct BatchDgpuShared {
     pub verify_partials: DeviceBuffer<f32>,
     // ---- CSA indexer per-token scratch (P5i) ----
     /// `[B, N_INDEXER_HEAD * N_INDEXER_HEAD_DIM]` — per-token indexer Q
-    /// (matvec(attn_q_b) output, then RoPE + QAT in place). R3 view @0:
+    /// (matvec(attn_q_b) output, then RoPE + QAT in place). R3 view, first:
     /// written by matvec_q, last read by the indexer score kernel (P5i).
     pub indexer_q: DeviceBuffer<f32>,
     /// f16 copy of `indexer_q` for the GEMM-shaped score kernel (2026-09-08),
@@ -751,7 +755,7 @@ pub struct BatchDgpuShared {
     /// read by the gather (both P5i). 1 MiB at rows=512.
     pub indexer_selected: DeviceBuffer<i32>,
     /// `[B, (max_chunks + n_groups) * INDEXER_TOP_K]` — batched bitonic
-    /// topk per-chunk candidates scratch (two-level tree merge). R3 view
+    /// topk per-chunk candidates scratch (two-level tree merge). R3 view after indexer_q
     /// @0: written + read only inside the topk launch (P5i), which runs
     /// after the score kernel's last read of `indexer_q`.
     pub indexer_topk_scratch: DeviceBuffer<u32>,
@@ -1257,7 +1261,7 @@ fn indexer_scores_len(rows: usize) -> usize {
     (rows * keys).min(others.max(floor))
 }
 /// Minimum `indexer_scores` budget: one block covers `b x pitch <= 16M` keys, i.e. a 16-row decode step to the full 1M
-/// (prefill sets get more: their R1 union already holds `q`, 134 MB at 1024 rows = a 512-row unit to ~65K context).
+/// (prefill sets get more: their R1 union already holds `q`, 134 MB at 1024 rows = a 512-row unit to ~65K keys: ~65K context at the ratio-1 layers, ~131K at ratio 2).
 pub const INDEXER_SCORES_BUDGET_BYTES: usize = 64 << 20;
 /// Row pitch of one batched indexer launch: its widest row (`n_idx_max`) rounded up to the gemm's 64-row K tile
 /// (`ISG_TILE_ROWS`; also keeps rows 16-B aligned for the float4 top-k select). Every kernel of the launch (score,
@@ -1270,6 +1274,15 @@ pub fn indexer_scores_stride(n_idx_max: u32) -> u32 {
 /// no bound): all of them when every buffer fits, else as many whole 8-token gemm groups as fit them all. An error
 /// (the caller's layer fails, no partial selection) when not even one row fits: the buffers are sized so that cannot
 /// happen below the cap.
+/// `V41_IDX_BLOCK_ROWS_MAX` (STATIC; unset / 0 = no cap): caps the batched indexer's rows per block. A GATE knob
+/// (review r1 S1): it drives the multi-block path through the production code at any context, where the selection
+/// must not change; production never sets it (the budgets split only at deep contexts).
+pub fn idx_block_rows_max() -> usize {
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_IDX_BLOCK_ROWS_MAX").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(usize::MAX)
+    });
+    *V
+}
 pub fn indexer_block_rows(b: usize, bounds: &[(usize, usize)]) -> Result<usize, String> {
     let fit = bounds.iter().map(|&(cap, per_row)| cap.checked_div(per_row).unwrap_or(usize::MAX)).min().unwrap_or(usize::MAX);
     if fit == 0 {
@@ -1340,7 +1353,7 @@ pub fn r1_arena_bytes(rows: usize) -> usize {
     .unwrap()
 }
 
-/// R3 arena byte size: max(indexer_q, indexer_topk_scratch).
+/// R3 arena byte size: indexer_q + indexer_topk_scratch (side by side).
 pub fn r3_arena_bytes(rows: usize) -> usize {
     // Side by side, not a union (2026-10-15): see the carve in `alloc_rows_ctx_opts`.
     align256(indexer_q_len(rows) * 4) + align256(indexer_topk_scratch_len(rows) * 4)
@@ -1383,6 +1396,7 @@ impl BatchDgpuScratch {
             indexer_nsparse_saved: { let mut z = mk_i32(1)?; z.fill_zero()?; z },
             dump_layer_pos: u64::MAX,
             indexer_saved_store: -1,
+            candidate_built_n: Vec::new(),
             candidate_bits: if crate::het::forward_layer::candidate_pool_enabled() {
                 let mut z = DeviceBuffer::new(id, b * candidate_bit_words())?;
                 z.fill_zero()?;
@@ -1777,7 +1791,7 @@ impl BatchDgpuShared {
             None
         };
 
-        // ---- R3 arena: indexer_q / indexer_topk_scratch @0.
+        // ---- R3 arena: indexer_q, then indexer_topk_scratch.
         let r3_arena: DeviceBuffer<u8> = DeviceBuffer::new(id, r3_arena_bytes(rows))?;
         // indexer_q, THEN the top-k scratch (2026-10-15; they were both @0): under row blocks a block's top-k runs
         // before the next block's score reads its rows of the f32 Q (the mw kernels; the gemm reads indexer_q16).
