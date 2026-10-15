@@ -8825,6 +8825,15 @@ impl HeterogeneousEngine {
                 ])
                 .map_err(|e| eyre!("L{layer}: {e}"))?
                 .min(super::batch_scratch::idx_block_rows_max());
+                if block_rows < b as usize {
+                    // Proof the multi-block path ran (review r2 G2: a gate must see it, not infer it): the first 16 per
+                    // process, then every 4096th.
+                    static SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let k = SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k < 16 || k % 4096 == 0 {
+                        eprintln!("indexer row blocks: L{layer} b={b} block={block_rows} pitch={idx_stride} n_idx_max={n_idx_max} (split #{})", k + 1);
+                    }
+                }
                 if super::forward_layer::candidate_pool_enabled() {
                     let rows_n = &n_comp_after[..b as usize];
                     if cand_build {

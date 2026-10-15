@@ -755,8 +755,8 @@ pub struct BatchDgpuShared {
     /// read by the gather (both P5i). 1 MiB at rows=512.
     pub indexer_selected: DeviceBuffer<i32>,
     /// `[B, (max_chunks + n_groups) * INDEXER_TOP_K]` — batched bitonic
-    /// topk per-chunk candidates scratch (two-level tree merge). R3 view after indexer_q
-    /// @0: written + read only inside the topk launch (P5i), which runs
+    /// topk per-chunk candidates scratch (two-level tree merge). R3 view after indexer_q:
+    /// written + read only inside the topk launch (P5i), which runs
     /// after the score kernel's last read of `indexer_q`.
     pub indexer_topk_scratch: DeviceBuffer<u32>,
     /// `[B]` — per-token n_index_comp uploaded once per ratio==4 layer
@@ -1269,11 +1269,6 @@ pub const INDEXER_SCORES_BUDGET_BYTES: usize = 64 << 20;
 pub fn indexer_scores_stride(n_idx_max: u32) -> u32 {
     n_idx_max.max(1).next_multiple_of(64)
 }
-/// Rows per block for `b` rows given the block-local buffers as `(capacity, per_row)` element counts (the scores at
-/// the launch pitch, the top-k scratch at its ladder, the candidate block scores at their block count; `per_row` 0 =
-/// no bound): all of them when every buffer fits, else as many whole 8-token gemm groups as fit them all. An error
-/// (the caller's layer fails, no partial selection) when not even one row fits: the buffers are sized so that cannot
-/// happen below the cap.
 /// `V41_IDX_BLOCK_ROWS_MAX` (STATIC; unset / 0 = no cap): caps the batched indexer's rows per block. A GATE knob
 /// (review r1 S1): it drives the multi-block path through the production code at any context, where the selection
 /// must not change; production never sets it (the budgets split only at deep contexts).
@@ -1283,6 +1278,11 @@ pub fn idx_block_rows_max() -> usize {
     });
     *V
 }
+/// Rows per block for `b` rows given the block-local buffers as `(capacity, per_row)` element counts (the scores at
+/// the launch pitch, the top-k scratch at its ladder, the candidate block scores at their block count; `per_row` 0 =
+/// no bound): all of them when every buffer fits, else as many whole 8-token gemm groups as fit them all. An error
+/// (the caller's layer fails, no partial selection) when not even one row fits: the buffers are sized so that cannot
+/// happen below the cap.
 pub fn indexer_block_rows(b: usize, bounds: &[(usize, usize)]) -> Result<usize, String> {
     let fit = bounds.iter().map(|&(cap, per_row)| cap.checked_div(per_row).unwrap_or(usize::MAX)).min().unwrap_or(usize::MAX);
     if fit == 0 {
