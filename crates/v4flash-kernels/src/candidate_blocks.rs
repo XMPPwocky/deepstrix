@@ -199,6 +199,74 @@ impl CandidateBlocks {
     /// The loaded module (tests: explicit-symbol launches).
     pub fn module(&self) -> &Module { &self.module }
 
+    /// u32 words of keep bits a row of `n_comp` positions needs (one bit per block).
+    pub fn n_bit_words(n_comp: u32) -> u32 {
+        Self::n_blocks(n_comp).div_ceil(32)
+    }
+
+    /// [`Self::launch_build`] that also turns the cut into KEEP BITS for the layers above (2026-10-15): `bits` row
+    /// `b` at `b * nw_stride` words, bit `j` of word `w` = block `32w + j` kept, by `candidate_mask_apply`'s own
+    /// predicate. `block_score` is then a transient of this call (any `batch * nb_stride` scratch); `threshold`
+    /// likewise. [`Self::launch_mask_bits`] reproduces [`Self::launch_mask`] bit for bit from the bits alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_build_bits(
+        &self,
+        stream: &Stream,
+        scores: &DeviceBuffer<f32>,
+        block_score: &mut DeviceBuffer<f32>,
+        threshold: &mut DeviceBuffer<u32>,
+        bits: &mut DeviceBuffer<u32>,
+        n_per: v4flash_hip::sys::hipDeviceptr_t,
+        stride: u32,
+        nb_stride: u32,
+        nw_stride: u32,
+        n_comp_max: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_comp_max == 0 {
+            return Ok(());
+        }
+        if nb_stride < Self::n_blocks(n_comp_max) || nw_stride < Self::n_bit_words(n_comp_max) {
+            return Err(eyre!(
+                "candidate build: strides {nb_stride} blocks / {nw_stride} words below n_comp_max {n_comp_max}'s {} / {}",
+                Self::n_blocks(n_comp_max), Self::n_bit_words(n_comp_max)
+            ));
+        }
+        if block_score.len() < batch as usize * nb_stride as usize || bits.len() < batch as usize * nw_stride as usize {
+            return Err(eyre!("candidate build: block_score {} / bits {} too small for {batch} rows", block_score.len(), bits.len()));
+        }
+        self.launch_build(stream, scores, block_score, threshold, n_per, stride, nb_stride, n_comp_max, batch)?;
+        const T: u32 = 256;
+        let f = self.module.get_function("candidate_keep_bits")?;
+        let cfg = LaunchConfig { grid: (Self::n_bit_words(n_comp_max).div_ceil(T), batch, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [bits.raw(), block_score.raw(), threshold.raw(), n_per, nb_stride, nw_stride, CANDIDATE_BLOCK_SIZE])
+    }
+
+    /// [`Self::launch_mask`] from the keep bits [`Self::launch_build_bits`] left.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mask_bits(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        bits: &DeviceBuffer<u32>,
+        n_per: v4flash_hip::sys::hipDeviceptr_t,
+        stride: u32,
+        nw_stride: u32,
+        n_comp_max: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_comp_max == 0 {
+            return Ok(());
+        }
+        if nw_stride < Self::n_bit_words(n_comp_max) || bits.len() < batch as usize * nw_stride as usize {
+            return Err(eyre!("candidate mask: {} bit words at stride {nw_stride} too few for {batch} rows of {n_comp_max}", bits.len()));
+        }
+        const T: u32 = 256;
+        let f = self.module.get_function("candidate_mask_apply_bits")?;
+        let cfg = LaunchConfig { grid: (n_comp_max.div_ceil(T), batch, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [scores.raw(), bits.raw(), n_per, stride, nw_stride, CANDIDATE_BLOCK_SIZE])
+    }
+
     /// LEVEL TWO, at an index source ABOVE the candidate source (24/28/32/36):
     /// `-inf` every position outside the published candidate blocks, so the
     /// top-k that follows selects only from within them. Mirrors

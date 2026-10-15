@@ -15,7 +15,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::candidate_blocks::CandidateBlocks;
 use v4flash_kernels::config::{N_INDEXER_HEAD, N_INDEXER_HEAD_DIM};
-use v4flash_kernels::het::batch_scratch::{indexer_block_rows, indexer_scores_stride, indexer_topk_scratch_per_row};
+use v4flash_kernels::het::batch_scratch::{candidate_bit_words, indexer_block_rows, indexer_scores_stride, indexer_topk_scratch_per_row};
 use v4flash_kernels::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 use v4flash_kernels::weight_contract::f32_to_f16_bits;
 use v4flash_kernels::{IndexKvE2m1, IndexerQat, IndexerScoreWmma, IndexerTopkBitonic, ATTN_MIXED_MAX_KEYS, INDEXER_TOP_K};
@@ -89,19 +89,23 @@ enum Score {
     MwRows,
 }
 
-/// Buffers one path owns (the lane's selection / candidate state and the shared score + top-k scratch).
+/// Buffers one path owns (the lane's selection / candidate state and the shared score, top-k and block-score scratch).
 struct Path {
     scores: DeviceBuffer<f32>,
     topk_scratch: DeviceBuffer<u32>,
     done: DeviceBuffer<u32>,
     sel: [DeviceBuffer<i32>; 2],
+    /// OLD: the lane's f32 block scores at the cap's block count. NEW: the shared transient (block-local).
     block_score: DeviceBuffer<f32>,
     threshold: DeviceBuffer<u32>,
+    /// NEW only: the lane's keep bits at the cap's word pitch.
+    bits: DeviceBuffer<u32>,
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Production order for one layer: score -> (build | mask) -> top-k, at `stride`, `block` rows at a time
-/// (`block >= b` = the old single launch).
+/// One layer in production order: score -> (build | mask) -> top-k. `old`: the pre-2026-10-15 code (pitch = the cap,
+/// f32 block scores carried at the cap's block count, `launch_build` / `launch_mask`). New: `stride` = the launch's
+/// pitch, `block` rows at a time, block scores block-local at the launch's block count, keep bits carried.
 fn run_layer(
     stream: &Stream,
     wmma: &IndexerScoreWmma,
@@ -117,10 +121,12 @@ fn run_layer(
     stride: u32,
     block: usize,
     b: usize,
+    old: bool,
 ) -> eyre::Result<()> {
     let q_row = NH * DIM;
-    let nb_stride = CandidateBlocks::n_blocks(ATTN_MIXED_MAX_KEYS);
-    let nbs = nb_stride as usize;
+    let nb_old = CandidateBlocks::n_blocks(ATTN_MIXED_MAX_KEYS);
+    let nb_new = CandidateBlocks::n_blocks(stride);
+    let nw = candidate_bit_words();
     let tk = INDEXER_TOP_K as usize;
     let mut r0 = 0usize;
     while r0 < b {
@@ -139,14 +145,29 @@ fn run_layer(
                 wmma.launch_batched_mw_e2m1_rows(stream, &mut p.scores, &q_v, &hw_v, &l.packed, &n_per, n_idx_max, stride, nb, Some(&kb_v))?;
             }
         }
-        if which == 0 {
-            let mut bs_v = p.block_score.slice_view_mut(r0 * nbs, n * nbs);
-            let mut th_v = p.threshold.slice_view_mut(r0, n);
-            cand.launch_build(stream, &p.scores, &mut bs_v, &mut th_v, n_per.raw(), stride, nb_stride, n_idx_max, nb)?;
-        } else {
-            let bs_v = p.block_score.slice_view(r0 * nbs, n * nbs);
-            let th_v = p.threshold.slice_view(r0, n);
-            cand.launch_mask(stream, &mut p.scores, &bs_v, &th_v, n_per.raw(), stride, nb_stride, n_idx_max, nb)?;
+        match (old, which) {
+            (true, 0) => {
+                let nbs = nb_old as usize;
+                let mut bs_v = p.block_score.slice_view_mut(r0 * nbs, n * nbs);
+                let mut th_v = p.threshold.slice_view_mut(r0, n);
+                cand.launch_build(stream, &p.scores, &mut bs_v, &mut th_v, n_per.raw(), stride, nb_old, n_idx_max, nb)?;
+            }
+            (true, _) => {
+                let nbs = nb_old as usize;
+                let bs_v = p.block_score.slice_view(r0 * nbs, n * nbs);
+                let th_v = p.threshold.slice_view(r0, n);
+                cand.launch_mask(stream, &mut p.scores, &bs_v, &th_v, n_per.raw(), stride, nb_old, n_idx_max, nb)?;
+            }
+            (false, 0) => {
+                let mut th_v = p.threshold.slice_view_mut(r0, n);
+                let mut bits_v = p.bits.slice_view_mut(r0 * nw, n * nw);
+                cand.launch_build_bits(stream, &p.scores, &mut p.block_score, &mut th_v, &mut bits_v, n_per.raw(), stride, nb_new,
+                    nw as u32, n_idx_max, nb)?;
+            }
+            (false, _) => {
+                let bits_v = p.bits.slice_view(r0 * nw, n * nw);
+                cand.launch_mask_bits(stream, &mut p.scores, &bits_v, n_per.raw(), stride, nw as u32, n_idx_max, nb)?;
+            }
         }
         let mut sel_v = p.sel[which].slice_view_mut(r0 * tk, n * tk);
         let n_words = (ATTN_MIXED_MAX_KEYS + 31) / 32;
@@ -194,36 +215,43 @@ fn indexer_row_blocks_match_full_pitch() -> eyre::Result<()> {
         let old_stride = ATTN_MIXED_MAX_KEYS;
         let new_stride = indexer_scores_stride(n_idx_max);
         let levels: usize = v4flash_kernels::indexer::topk_merge_levels(old_stride, INDEXER_TOP_K).iter().map(|&n| n as usize).sum();
-        let nbs = CandidateBlocks::n_blocks(ATTN_MIXED_MAX_KEYS) as usize;
-        let mk = |score_elems: usize| -> eyre::Result<Path> {
+        let nb_old = CandidateBlocks::n_blocks(ATTN_MIXED_MAX_KEYS) as usize;
+        let nb_new = CandidateBlocks::n_blocks(new_stride) as usize;
+        // NEW buffers hold `block_req` rows of every block-local member (scores, top-k, block scores) -- the forced block.
+        let topk_new = block_req * indexer_topk_scratch_per_row(n_idx_max).max(1);
+        let block = indexer_block_rows(batch, &[
+            (block_req * new_stride as usize, new_stride as usize),
+            (topk_new, indexer_topk_scratch_per_row(n_idx_max)),
+            (block_req * nb_new, nb_new),
+        ])
+        .map_err(|e| eyre!(e))?;
+        let mk = |old: bool| -> eyre::Result<Path> {
             let mut p = Path {
-                scores: DeviceBuffer::new(d.id, score_elems)?,
-                topk_scratch: DeviceBuffer::new(d.id, batch * levels.max(1))?,
+                scores: DeviceBuffer::new(d.id, if old { batch * old_stride as usize } else { block_req * new_stride as usize })?,
+                topk_scratch: DeviceBuffer::new(d.id, if old { batch * levels.max(1) } else { topk_new })?,
                 done: DeviceBuffer::new(d.id, batch)?,
                 sel: [DeviceBuffer::new(d.id, batch * INDEXER_TOP_K as usize)?, DeviceBuffer::new(d.id, batch * INDEXER_TOP_K as usize)?],
-                block_score: DeviceBuffer::new(d.id, batch * nbs)?,
+                block_score: DeviceBuffer::new(d.id, if old { batch * nb_old } else { block_req * nb_new })?,
                 threshold: DeviceBuffer::new(d.id, batch)?,
+                bits: DeviceBuffer::new(d.id, batch * candidate_bit_words())?,
             };
             for s in p.sel.iter_mut() {
                 s.fill_zero()?;
             }
             p.block_score.fill_zero()?;
             p.threshold.fill_zero()?;
+            p.bits.fill_zero()?;
             Ok(p)
         };
-        // Reference: the old layout. New: the per-launch pitch in a buffer that holds `block_req` rows of it.
-        let cap_new = block_req * new_stride as usize;
-        let block = indexer_block_rows(cap_new, new_stride, batch * levels.max(1), indexer_topk_scratch_per_row(n_idx_max), batch)
-            .map_err(|e| eyre!(e))?;
         println!("device {} ({arch}): n_idx_max {n_idx_max}, batch {batch}, pitch {old_stride} -> {new_stride}, block {block} rows",
             d.id);
         for kind in [Score::Gemm, Score::MwRows] {
             let label = if kind == Score::Gemm { "gemm (prefill)" } else { "mw rows (arena/decode)" };
-            let mut a = mk(batch * old_stride as usize)?;
-            let mut bp = mk(cap_new)?;
+            let mut a = mk(true)?;
+            let mut bp = mk(false)?;
             for (which, l) in layers.iter().enumerate() {
-                run_layer(&stream, &wmma, &cand, &topk, &mut a, l, which, kind, &n_idx, &keys_base, n_idx_max, old_stride, batch, batch)?;
-                run_layer(&stream, &wmma, &cand, &topk, &mut bp, l, which, kind, &n_idx, &keys_base, n_idx_max, new_stride, block, batch)?;
+                run_layer(&stream, &wmma, &cand, &topk, &mut a, l, which, kind, &n_idx, &keys_base, n_idx_max, old_stride, batch, batch, true)?;
+                run_layer(&stream, &wmma, &cand, &topk, &mut bp, l, which, kind, &n_idx, &keys_base, n_idx_max, new_stride, block, batch, false)?;
             }
             stream.synchronize()?;
             for which in 0..2 {
@@ -233,15 +261,16 @@ fn indexer_row_blocks_match_full_pitch() -> eyre::Result<()> {
                         i / INDEXER_TOP_K as usize, i % INDEXER_TOP_K as usize, sa[i], sb[i]));
                 }
             }
-            let (ba, bb) = (host(&a.block_score)?, host(&bp.block_score)?);
-            if ba.iter().zip(&bb).any(|(x, y)| x.to_bits() != y.to_bits()) {
-                return Err(eyre!("{label}: candidate block scores differ"));
-            }
             if host(&a.threshold)? != host(&bp.threshold)? {
                 return Err(eyre!("{label}: candidate thresholds differ"));
             }
+            // The mask must have bitten (not the vacuous regime), or this compares nothing.
+            let cut = host(&a.threshold)?.iter().filter(|&&t| t != 0).count();
+            if cut == 0 {
+                return Err(eyre!("{label}: no row past the candidate threshold: raise IRB_N_IDX above 16384"));
+            }
             let picked = host(&a.sel[1])?.iter().filter(|&&v| v >= 0).count();
-            println!("  {label}: both layers' selections bit-identical ({} rows x {INDEXER_TOP_K}, {picked} valid picks), candidates identical", batch);
+            println!("  {label}: both layers' selections bit-identical ({batch} rows x {INDEXER_TOP_K}, {picked} valid picks; {cut} rows cut by the candidate mask)");
         }
 
         // Timing: the gemm alone, all rows, at the old pitch vs the new one.
@@ -273,15 +302,16 @@ fn indexer_block_rows_arithmetic() {
     assert_eq!(indexer_scores_stride(65), 128);
     assert_eq!(indexer_scores_stride(368_640), 368_640);
     // Fits: all rows in one block (the ordinary case: nothing changes but the pitch).
-    assert_eq!(indexer_block_rows(512 * 4096, 4096, usize::MAX, 4096, 512), Ok(512));
-    assert_eq!(indexer_block_rows(100, 64, 0, 0, 0), Ok(1));
+    assert_eq!(indexer_block_rows(512, &[(512 * 4096, 4096), (usize::MAX, 4096)]), Ok(512));
+    assert_eq!(indexer_block_rows(0, &[(100, 64), (0, 0)]), Ok(1));
     // Scores do not fit: whole 8-row gemm groups.
-    assert_eq!(indexer_block_rows(100 * 1024, 1024, usize::MAX, 512, 512), Ok(96));
-    assert_eq!(indexer_block_rows(5 * 1024, 1024, usize::MAX, 512, 512), Ok(5));
-    // The top-k scratch binds instead.
-    assert_eq!(indexer_block_rows(512 * 1024, 1024, 40 * 9216, 9216, 512), Ok(40));
-    assert!(indexer_block_rows(1023, 1024, usize::MAX, 0, 4).is_err());
-    assert!(indexer_block_rows(4096, 1024, 100, 512, 4).is_err());
+    assert_eq!(indexer_block_rows(512, &[(100 * 1024, 1024), (usize::MAX, 512)]), Ok(96));
+    assert_eq!(indexer_block_rows(512, &[(5 * 1024, 1024), (usize::MAX, 512)]), Ok(5));
+    // The top-k scratch binds instead; and a third bound (the candidate block scores) that binds.
+    assert_eq!(indexer_block_rows(512, &[(512 * 1024, 1024), (usize::MAX, 0), (24 * 1000, 1000)]), Ok(24));
+    assert_eq!(indexer_block_rows(512, &[(512 * 1024, 1024), (40 * 9216, 9216)]), Ok(40));
+    assert!(indexer_block_rows(4, &[(1023, 1024), (usize::MAX, 0)]).is_err());
+    assert!(indexer_block_rows(4, &[(4096, 1024), (100, 512)]).is_err());
     // The ladder: nothing at <= 4096 keys (one sort), one level to 8 chunks, then folds by 8.
     assert_eq!(indexer_topk_scratch_per_row(4096), 0);
     assert_eq!(indexer_topk_scratch_per_row(8192), 1024);

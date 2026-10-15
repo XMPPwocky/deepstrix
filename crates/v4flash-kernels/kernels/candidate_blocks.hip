@@ -213,3 +213,58 @@ void candidate_mask_apply(
         scores[(size_t)b * stride + p] = -INFINITY;
     }
 }
+
+// ---- Keep BITS (2026-10-15, ctx-1m). The level-two layers need only WHICH blocks made the cut, not their scores:
+// the source layer (20) turns block_score + threshold into one bit per block with candidate_mask_apply's own
+// predicate, and the lane carries those bits (1/32 of the f32 block scores) to layers 24-36. block_score is then a
+// transient of the source layer's build. Bit-identical masks: candidate_mask_apply_bits drops exactly the positions
+// candidate_mask_apply drops.
+
+// One thread per 32-block word: bits[b*nw_stride + w], bit j = keep(block 32w + j).
+extern "C" __global__ __launch_bounds__(CB_THREADS)
+void candidate_keep_bits(
+    unsigned int* __restrict__ bits,
+    const float* __restrict__ block_score,
+    const unsigned int* __restrict__ threshold,
+    const unsigned int* __restrict__ n_per,
+    unsigned int nb_stride,
+    unsigned int nw_stride,
+    unsigned int cb_size)
+{
+    const unsigned int b = blockIdx.y;
+    const unsigned int n = n_per[b];
+    const unsigned int n_blocks = (n + cb_size - 1u) / cb_size;
+    const unsigned int w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= (n_blocks + 31u) / 32u) return;
+    const unsigned int t = threshold[b];
+    unsigned int word = 0u;
+    for (unsigned int j = 0; j < 32u; ++j) {
+        const unsigned int blk = w * 32u + j;
+        if (blk >= n_blocks) break;
+        const float bs = block_score[(size_t)b * nb_stride + blk];
+        // candidate_mask_apply: t == 0 keeps everything; else drop when below the threshold or -inf.
+        const bool keep = (t == 0u) || !(cb_key(bs) < t || bs == -INFINITY);
+        word |= (keep ? 1u : 0u) << j;
+    }
+    bits[(size_t)b * nw_stride + w] = word;
+}
+
+// scores[b][p] = -inf for every position whose block's keep bit is clear.
+extern "C" __global__ __launch_bounds__(CB_THREADS)
+void candidate_mask_apply_bits(
+    float* __restrict__ scores,
+    const unsigned int* __restrict__ bits,
+    const unsigned int* __restrict__ n_per,
+    unsigned int stride,
+    unsigned int nw_stride,
+    unsigned int cb_size)
+{
+    const unsigned int b = blockIdx.y;
+    const unsigned int n = n_per[b];
+    const unsigned int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    const unsigned int blk = p / cb_size;
+    if (((bits[(size_t)b * nw_stride + (blk >> 5)] >> (blk & 31u)) & 1u) == 0u) {
+        scores[(size_t)b * stride + p] = -INFINITY;
+    }
+}

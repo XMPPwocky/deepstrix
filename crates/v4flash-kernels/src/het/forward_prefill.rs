@@ -8813,9 +8813,17 @@ impl HeterogeneousEngine {
                 // row 0 of the buffer). Rows are independent through all three kernels, so the selection is the same
                 // bit for bit; at ordinary depths there is one block, as before.
                 let idx_stride = indexer_scores_stride(n_idx_max);
-                let block_rows = indexer_block_rows(sd.indexer_scores.len(), idx_stride, sd.indexer_topk_scratch.len(),
-                    indexer_topk_scratch_per_row(n_idx_max), b as usize)
-                    .map_err(|e| eyre!("L{layer}: {e}"))?;
+                // Candidate block scores (layer 20's build only) at THIS launch's block count; the lane's keep bits
+                // are at the cap's constant word pitch (`candidate_bit_words`), shared by the build and the masks.
+                let cand_build = super::forward_layer::candidate_pool_enabled() && layer == crate::config::CANDIDATE_SOURCE_LAYER;
+                let nb_stride = crate::candidate_blocks::CandidateBlocks::n_blocks(idx_stride);
+                let nw_stride = super::batch_scratch::candidate_bit_words();
+                let block_rows = indexer_block_rows(b as usize, &[
+                    (sd.indexer_scores.len(), idx_stride as usize),
+                    (sd.indexer_topk_scratch.len(), indexer_topk_scratch_per_row(n_idx_max)),
+                    (sd.cand_block_score.len(), if cand_build { nb_stride as usize } else { 0 }),
+                ])
+                .map_err(|e| eyre!("L{layer}: {e}"))?;
                 let score_gemm = std::env::var("INDEXER_SCORE_VARIANT").map(|v| v == "gemm").unwrap_or(true);
                 if score_gemm && arena.is_none() {
                     // f16 Q for the gemm, all rows at once (the blocks take row views of it). Arena rows (decode)
@@ -8824,7 +8832,6 @@ impl HeterogeneousEngine {
                         b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
                 }
                 let q_row = (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize;
-                let nb_stride = crate::candidate_blocks::CandidateBlocks::n_blocks(ATTN_MIXED_MAX_KEYS);
                 let mut r0 = 0usize;
                 while r0 < b as usize {
                     let n = block_rows.min(b as usize - r0);
@@ -8958,36 +8965,36 @@ impl HeterogeneousEngine {
                 // inside them. Wiring decode alone would make prefill and decode
                 // pick different positions on those four layers, which is the
                 // prefill/decode divergence class this engine has been bitten by.
-                // `candidate_block_score` / `candidate_threshold` are the LANE's (they carry from layer 20 to 24-36),
-                // per row at `nb_stride`, so the block takes its rows' views of them.
+                // The cut carries from layer 20 to 24-36 as the LANE's keep bits (`bd.candidate_bits`, rows at the
+                // constant `nw_stride`), so each block takes its rows' view of them; the block scores are a transient
+                // of the build in the shared set (block-local, at this launch's `nb_stride`).
                 if super::forward_layer::candidate_pool_enabled() {
                     let _t = de.events.stage("k.indexer.candidates", &de.compute)?;
-                    let nbs = nb_stride as usize;
-                    if layer == crate::config::CANDIDATE_SOURCE_LAYER {
-                        let mut bs_v = bd.candidate_block_score.slice_view_mut(r0 * nbs, n * nbs);
+                    if cand_build {
                         let mut th_v = bd.candidate_threshold.slice_view_mut(r0, n);
-                        de.candidate_blocks.launch_build(
+                        let mut bits_v = bd.candidate_bits.slice_view_mut(r0 * nw_stride, n * nw_stride);
+                        de.candidate_blocks.launch_build_bits(
                             &de.compute,
                             &sd.indexer_scores,
-                            &mut bs_v,
+                            &mut sd.cand_block_score,
                             &mut th_v,
+                            &mut bits_v,
                             n_per.raw(),
                             idx_stride,
                             nb_stride,
+                            nw_stride as u32,
                             n_idx_max,
                             nb,
                         )?;
                     } else if layer > crate::config::CANDIDATE_SOURCE_LAYER {
-                        let bs_v = bd.candidate_block_score.slice_view(r0 * nbs, n * nbs);
-                        let th_v = bd.candidate_threshold.slice_view(r0, n);
-                        de.candidate_blocks.launch_mask(
+                        let bits_v = bd.candidate_bits.slice_view(r0 * nw_stride, n * nw_stride);
+                        de.candidate_blocks.launch_mask_bits(
                             &de.compute,
                             &mut sd.indexer_scores,
-                            &bs_v,
-                            &th_v,
+                            &bits_v,
                             n_per.raw(),
                             idx_stride,
-                            nb_stride,
+                            nw_stride as u32,
                             n_idx_max,
                             nb,
                         )?;

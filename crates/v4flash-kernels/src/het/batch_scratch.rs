@@ -304,7 +304,12 @@ pub struct BatchDgpuScratch {
     /// lanes / ready-first) runs the other lane's layer 20 in between. In the
     /// shared scratch, lane A's row i was masked with lane B's row i -- another
     /// STREAM's blocks and threshold in the arena -- on 16 of 40 layers.
-    pub candidate_block_score: DeviceBuffer<f32>,
+    ///
+    /// 2026-10-15: the lane carries KEEP BITS (`[rows, ceil(n_blocks(MAX_KEYS) / 32)]` u32, 1/32 of the f32 block
+    /// scores: 191 MB per 1024-row lane at --ctx 368640, 537 MB at 1M, now 6 / 17 MB); the block scores are a
+    /// transient of layer 20's build (`BatchDgpuShared::cand_block_score`). Zeroed at alloc so the prefill loan pins
+    /// it to its pool (written = must persist): the bits outlive a loan end between layer 20 and 24-36.
+    pub candidate_bits: DeviceBuffer<u32>,
     pub candidate_threshold: DeviceBuffer<u32>,
 
     /// `[B, HC_DIM]` — per-token residual (cross-layer flow).
@@ -730,6 +735,10 @@ pub struct BatchDgpuShared {
     /// per-token flag for the threshold top-k fast path (2026-09-08): 1 = selected,
     /// 0 = fall through to the bitonic chain. `[rows]` u32.
     pub indexer_topk_done: DeviceBuffer<u32>,
+    /// Layer 20's candidate block scores, a transient of `CandidateBlocks::launch_build_bits` (the lane's
+    /// `candidate_bits` carry the cut to 24-36). Row block `r` at `r * n_blocks(pitch)`; a budget
+    /// (`cand_block_score_len`) the batched indexer's row blocks fit. 1 element when the pool is off.
+    pub cand_block_score: DeviceBuffer<f32>,
     /// `[B, N_INDEXER_HEAD]` — per-token head_weights (matvec(proj)
     /// output, post-scale).
     pub indexer_head_weights: DeviceBuffer<f32>,
@@ -1256,16 +1265,15 @@ pub const INDEXER_SCORES_BUDGET_BYTES: usize = 128 << 20;
 pub fn indexer_scores_stride(n_idx_max: u32) -> u32 {
     n_idx_max.max(1).next_multiple_of(64)
 }
-/// Rows per block for `b` rows at `stride` in an `indexer_scores` of `cap_elems` f32 and a top-k scratch of
-/// `topk_cap` u32 at `topk_per_row` u32 a row: all of them when they fit, else as many whole 8-token gemm groups as
-/// fit both. An error (the caller's layer fails, no partial selection) when not even one row fits: the buffers are
-/// sized so that cannot happen below the cap.
-pub fn indexer_block_rows(cap_elems: usize, stride: u32, topk_cap: usize, topk_per_row: usize, b: usize) -> Result<usize, String> {
-    let fit = (cap_elems / stride as usize).min(topk_cap.checked_div(topk_per_row).unwrap_or(usize::MAX));
+/// Rows per block for `b` rows given the block-local buffers as `(capacity, per_row)` element counts (the scores at
+/// the launch pitch, the top-k scratch at its ladder, the candidate block scores at their block count; `per_row` 0 =
+/// no bound): all of them when every buffer fits, else as many whole 8-token gemm groups as fit them all. An error
+/// (the caller's layer fails, no partial selection) when not even one row fits: the buffers are sized so that cannot
+/// happen below the cap.
+pub fn indexer_block_rows(b: usize, bounds: &[(usize, usize)]) -> Result<usize, String> {
+    let fit = bounds.iter().map(|&(cap, per_row)| cap.checked_div(per_row).unwrap_or(usize::MAX)).min().unwrap_or(usize::MAX);
     if fit == 0 {
-        return Err(format!(
-            "indexer row block: scores hold {cap_elems} f32 at pitch {stride}, top-k scratch {topk_cap} u32 at {topk_per_row} a row: not one row"
-        ));
+        return Err(format!("indexer row block: no buffer of {bounds:?} (capacity, per row) holds one row"));
     }
     if fit >= b {
         return Ok(b.max(1));
@@ -1292,6 +1300,23 @@ fn indexer_topk_scratch_len(rows: usize) -> usize {
     let floor = indexer_q_len(rows).max(INDEXER_TOPK_BUDGET_BYTES / 4).max(8 * per_row);
     (rows * per_row).min(floor)
 }
+/// Keep-bit words per row of the lane's candidate bits: the cap's blocks, 32 a word. A constant row pitch (layer 20
+/// writes, 24-36 read at the same pitch whatever each launch's score pitch).
+pub fn candidate_bit_words() -> usize {
+    crate::candidate_blocks::CandidateBlocks::n_bit_words(ATTN_MIXED_MAX_KEYS) as usize
+}
+/// `BatchDgpuShared::cand_block_score` f32: layer 20's block scores, a transient of the build (the bits carry the cut).
+/// A budget like `indexer_scores_len`: [`CAND_SCORE_BUDGET_BYTES`] and one 8-row group at the cap, never more than
+/// `rows x n_blocks(cap)`; row blocks fit it at the launch's own block count.
+fn cand_block_score_len(rows: usize) -> usize {
+    if !crate::het::forward_layer::candidate_pool_enabled() {
+        return 1;
+    }
+    let nb = crate::candidate_blocks::CandidateBlocks::n_blocks(ATTN_MIXED_MAX_KEYS) as usize;
+    (rows * nb).min((CAND_SCORE_BUDGET_BYTES / 4).max(8 * nb))
+}
+/// Minimum block-score budget: one block covers a 512-row unit to ~500K keys.
+pub const CAND_SCORE_BUDGET_BYTES: usize = 32 << 20;
 /// Minimum top-k merge scratch budget: one block covers a 512-row unit to ~100K keys.
 pub const INDEXER_TOPK_BUDGET_BYTES: usize = 32 << 20;
 /// u32 the batched top-k's merge ladder needs PER ROW at `n_idx_max` (`indexer::topk_merge_levels`, summed).
@@ -1317,7 +1342,8 @@ pub fn r1_arena_bytes(rows: usize) -> usize {
 
 /// R3 arena byte size: max(indexer_q, indexer_topk_scratch).
 pub fn r3_arena_bytes(rows: usize) -> usize {
-    align256(indexer_q_len(rows) * 4).max(align256(indexer_topk_scratch_len(rows) * 4))
+    // Side by side, not a union (2026-10-15): see the carve in `alloc_rows_ctx_opts`.
+    align256(indexer_q_len(rows) * 4) + align256(indexer_topk_scratch_len(rows) * 4)
 }
 
 impl BatchDgpuScratch {
@@ -1357,12 +1383,10 @@ impl BatchDgpuScratch {
             indexer_nsparse_saved: { let mut z = mk_i32(1)?; z.fill_zero()?; z },
             dump_layer_pos: u64::MAX,
             indexer_saved_store: -1,
-            candidate_block_score: if crate::het::forward_layer::candidate_pool_enabled() {
-                DeviceBuffer::new(
-                    id,
-                    b * (crate::attention::ATTN_MIXED_MAX_KEYS as usize)
-                        .div_ceil(crate::config::CANDIDATE_BLOCK_SIZE as usize),
-                )?
+            candidate_bits: if crate::het::forward_layer::candidate_pool_enabled() {
+                let mut z = DeviceBuffer::new(id, b * candidate_bit_words())?;
+                z.fill_zero()?;
+                z
             } else {
                 DeviceBuffer::new(id, 1)?
             },
@@ -1755,9 +1779,15 @@ impl BatchDgpuShared {
 
         // ---- R3 arena: indexer_q / indexer_topk_scratch @0.
         let r3_arena: DeviceBuffer<u8> = DeviceBuffer::new(id, r3_arena_bytes(rows))?;
-        let indexer_q = Carver::new(&r3_arena).take::<f32>(indexer_q_len(rows));
-        let indexer_topk_scratch =
-            Carver::new(&r3_arena).take::<u32>(indexer_topk_scratch_len(rows));
+        // indexer_q, THEN the top-k scratch (2026-10-15; they were both @0): under row blocks a block's top-k runs
+        // before the next block's score reads its rows of the f32 Q (the mw kernels; the gemm reads indexer_q16).
+        let (indexer_q, indexer_topk_scratch) = {
+            let mut c = Carver::new(&r3_arena);
+            let q = c.take::<f32>(indexer_q_len(rows));
+            let t = c.take::<u32>(indexer_topk_scratch_len(rows));
+            debug_assert!(c.off <= r3_arena.len());
+            (q, t)
+        };
 
         // ---- R2: out-proj temporaries carved from q_normed (dead from
         // P5a's last read until the next layer's P2 write).
@@ -1874,6 +1904,7 @@ impl BatchDgpuShared {
             // Batched IndexerTopk selected: [B, top_k] = 1 MiB at rows=512.
             indexer_selected: DeviceBuffer::new(id, b * INDEXER_TOP_K as usize)?,
             indexer_topk_scratch,
+            cand_block_score: DeviceBuffer::new(id, cand_block_score_len(rows))?,
             n_index_comp_per_b: DeviceBuffer::new(id, b)?,
             // Dense per-token top-K gather target — only ever written by the
             // CSA gather, which cannot run when no layer is gathered.
