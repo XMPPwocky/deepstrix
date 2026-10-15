@@ -35,7 +35,7 @@ use crate::routing::hash_router_select;
 use super::image_spans::{self, ImageSpan};
 
 use super::batch_scratch::{
-    indexer_block_rows, indexer_scores_stride, BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared,
+    indexer_block_rows, indexer_scores_stride, indexer_topk_scratch_per_row, BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared,
     G6Pending, G6PendingRemote, B_MAX,
 };
 use super::engine::HeterogeneousEngine;
@@ -8813,7 +8813,8 @@ impl HeterogeneousEngine {
                 // row 0 of the buffer). Rows are independent through all three kernels, so the selection is the same
                 // bit for bit; at ordinary depths there is one block, as before.
                 let idx_stride = indexer_scores_stride(n_idx_max);
-                let block_rows = indexer_block_rows(sd.indexer_scores.len(), idx_stride, b as usize)
+                let block_rows = indexer_block_rows(sd.indexer_scores.len(), idx_stride, sd.indexer_topk_scratch.len(),
+                    indexer_topk_scratch_per_row(n_idx_max), b as usize)
                     .map_err(|e| eyre!("L{layer}: {e}"))?;
                 let score_gemm = std::env::var("INDEXER_SCORE_VARIANT").map(|v| v == "gemm").unwrap_or(true);
                 if score_gemm && arena.is_none() {

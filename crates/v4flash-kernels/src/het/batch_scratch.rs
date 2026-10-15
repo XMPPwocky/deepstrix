@@ -1256,13 +1256,16 @@ pub const INDEXER_SCORES_BUDGET_BYTES: usize = 128 << 20;
 pub fn indexer_scores_stride(n_idx_max: u32) -> u32 {
     n_idx_max.max(1).next_multiple_of(64)
 }
-/// Rows per block for `b` rows at `stride` in an `indexer_scores` of `cap_elems` f32: all of them when they fit, else
-/// as many whole 8-token gemm groups as fit. An error (the caller's layer fails, no partial selection) when not even one
-/// row fits: the buffer is sized so that cannot happen below the cap.
-pub fn indexer_block_rows(cap_elems: usize, stride: u32, b: usize) -> Result<usize, String> {
-    let fit = cap_elems / stride as usize;
+/// Rows per block for `b` rows at `stride` in an `indexer_scores` of `cap_elems` f32 and a top-k scratch of
+/// `topk_cap` u32 at `topk_per_row` u32 a row: all of them when they fit, else as many whole 8-token gemm groups as
+/// fit both. An error (the caller's layer fails, no partial selection) when not even one row fits: the buffers are
+/// sized so that cannot happen below the cap.
+pub fn indexer_block_rows(cap_elems: usize, stride: u32, topk_cap: usize, topk_per_row: usize, b: usize) -> Result<usize, String> {
+    let fit = (cap_elems / stride as usize).min(topk_cap.checked_div(topk_per_row).unwrap_or(usize::MAX));
     if fit == 0 {
-        return Err(format!("indexer_scores holds {cap_elems} f32, less than one row at pitch {stride}"));
+        return Err(format!(
+            "indexer row block: scores hold {cap_elems} f32 at pitch {stride}, top-k scratch {topk_cap} u32 at {topk_per_row} a row: not one row"
+        ));
     }
     if fit >= b {
         return Ok(b.max(1));
@@ -1280,10 +1283,20 @@ fn indexer_topk_scratch_len(rows: usize) -> usize {
     // walks (`indexer::topk_merge_levels`). It used to hardcode exactly two
     // levels here and in `scratch.rs` and a third time in the launcher; the
     // launcher then hard-errored past 262,144 compressed positions, mid-layer.
-    let per_row: u32 = crate::indexer::topk_merge_levels(ATTN_MIXED_MAX_KEYS, INDEXER_TOP_K)
-        .iter()
-        .sum();
-    rows * per_row as usize
+    //
+    // 2026-10-15: a BUDGET, like `indexer_scores_len` (rows x the ladder at the cap was 222 MB at 1024 lane rows and
+    // --ctx 368640, 614 MB at 1M): the batched indexer's row blocks also fit this ([`indexer_block_rows`] with
+    // [`indexer_topk_scratch_per_row`] at the launch's own widest row). At least what R3 holds for `indexer_q` and
+    // [`INDEXER_TOPK_BUDGET_BYTES`], and one 8-row group at the cap; never more than the old size.
+    let per_row = indexer_topk_scratch_per_row(ATTN_MIXED_MAX_KEYS);
+    let floor = indexer_q_len(rows).max(INDEXER_TOPK_BUDGET_BYTES / 4).max(8 * per_row);
+    (rows * per_row).min(floor)
+}
+/// Minimum top-k merge scratch budget: one block covers a 512-row unit to ~100K keys.
+pub const INDEXER_TOPK_BUDGET_BYTES: usize = 32 << 20;
+/// u32 the batched top-k's merge ladder needs PER ROW at `n_idx_max` (`indexer::topk_merge_levels`, summed).
+pub fn indexer_topk_scratch_per_row(n_idx_max: u32) -> usize {
+    crate::indexer::topk_merge_levels(n_idx_max.max(1), INDEXER_TOP_K).iter().map(|&n| n as usize).sum()
 }
 
 /// R1 arena byte size: the largest of its offset-0 members and the hot

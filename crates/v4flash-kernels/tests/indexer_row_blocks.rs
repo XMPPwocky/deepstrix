@@ -15,7 +15,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::candidate_blocks::CandidateBlocks;
 use v4flash_kernels::config::{N_INDEXER_HEAD, N_INDEXER_HEAD_DIM};
-use v4flash_kernels::het::batch_scratch::{indexer_block_rows, indexer_scores_stride};
+use v4flash_kernels::het::batch_scratch::{indexer_block_rows, indexer_scores_stride, indexer_topk_scratch_per_row};
 use v4flash_kernels::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 use v4flash_kernels::weight_contract::f32_to_f16_bits;
 use v4flash_kernels::{IndexKvE2m1, IndexerQat, IndexerScoreWmma, IndexerTopkBitonic, ATTN_MIXED_MAX_KEYS, INDEXER_TOP_K};
@@ -213,7 +213,8 @@ fn indexer_row_blocks_match_full_pitch() -> eyre::Result<()> {
         };
         // Reference: the old layout. New: the per-launch pitch in a buffer that holds `block_req` rows of it.
         let cap_new = block_req * new_stride as usize;
-        let block = indexer_block_rows(cap_new, new_stride, batch).map_err(|e| eyre!(e))?;
+        let block = indexer_block_rows(cap_new, new_stride, batch * levels.max(1), indexer_topk_scratch_per_row(n_idx_max), batch)
+            .map_err(|e| eyre!(e))?;
         println!("device {} ({arch}): n_idx_max {n_idx_max}, batch {batch}, pitch {old_stride} -> {new_stride}, block {block} rows",
             d.id);
         for kind in [Score::Gemm, Score::MwRows] {
@@ -272,10 +273,17 @@ fn indexer_block_rows_arithmetic() {
     assert_eq!(indexer_scores_stride(65), 128);
     assert_eq!(indexer_scores_stride(368_640), 368_640);
     // Fits: all rows in one block (the ordinary case: nothing changes but the pitch).
-    assert_eq!(indexer_block_rows(512 * 4096, 4096, 512), Ok(512));
-    assert_eq!(indexer_block_rows(100, 64, 0), Ok(1));
-    // Does not fit: whole 8-row gemm groups.
-    assert_eq!(indexer_block_rows(100 * 1024, 1024, 512), Ok(96));
-    assert_eq!(indexer_block_rows(5 * 1024, 1024, 512), Ok(5));
-    assert!(indexer_block_rows(1023, 1024, 4).is_err());
+    assert_eq!(indexer_block_rows(512 * 4096, 4096, usize::MAX, 4096, 512), Ok(512));
+    assert_eq!(indexer_block_rows(100, 64, 0, 0, 0), Ok(1));
+    // Scores do not fit: whole 8-row gemm groups.
+    assert_eq!(indexer_block_rows(100 * 1024, 1024, usize::MAX, 512, 512), Ok(96));
+    assert_eq!(indexer_block_rows(5 * 1024, 1024, usize::MAX, 512, 512), Ok(5));
+    // The top-k scratch binds instead.
+    assert_eq!(indexer_block_rows(512 * 1024, 1024, 40 * 9216, 9216, 512), Ok(40));
+    assert!(indexer_block_rows(1023, 1024, usize::MAX, 0, 4).is_err());
+    assert!(indexer_block_rows(4096, 1024, 100, 512, 4).is_err());
+    // The ladder: nothing at <= 4096 keys (one sort), one level to 8 chunks, then folds by 8.
+    assert_eq!(indexer_topk_scratch_per_row(4096), 0);
+    assert_eq!(indexer_topk_scratch_per_row(8192), 1024);
+    assert!(indexer_topk_scratch_per_row(1_048_576) > indexer_topk_scratch_per_row(368_640));
 }
