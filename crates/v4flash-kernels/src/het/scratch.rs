@@ -291,6 +291,14 @@ impl DgpuScratch {
     }
 
     pub fn alloc(dgpu_device: Device) -> eyre::Result<Self> {
+        Self::alloc_opts(dgpu_device, true)
+    }
+
+    /// `serial_attn = false`: `attn_scores` is a 1-element stub (2026-10-15). Its only readers are the B=1 serial
+    /// decode attention launchers (`forward_token*`), which the multistream server never runs (its legacy state is
+    /// a stub the serial handler refuses); at `N_HEAD x ATTN_MIXED_MAX_KEYS` f32 it was 94 MB of dGPU at --ctx 368640
+    /// and 270 MB at 1M. Those launchers assert the buffer holds the full layout, so a stray call fails loudly.
+    pub fn alloc_opts(dgpu_device: Device, serial_attn: bool) -> eyre::Result<Self> {
         dgpu_device.set_current()?;
         let device_id = dgpu_device.id;
         // M60: selected+ew in ONE allocation → single 48-B peer push on the
@@ -347,7 +355,7 @@ impl DgpuScratch {
 
             attn_scores: DeviceBuffer::new(
                 device_id,
-                (N_HEAD as usize) * (ATTN_MIXED_MAX_KEYS as usize),
+                if serial_attn { (N_HEAD as usize) * (ATTN_MIXED_MAX_KEYS as usize) } else { 1 },
             )?,
             attn_n_raw_per_b1: DeviceBuffer::new(device_id, 1)?,
             attn_n_raw_offset_per_b1: {

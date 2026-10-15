@@ -114,6 +114,22 @@ pub const V41_MAX_CTX: u32 = 368_640;
 pub const ATTN_MIXED_MAX_KEYS: u32 =
     V41_MAX_CTX + crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
 
+/// The B=1 decode attention launchers index `scores[h * ATTN_MIXED_MAX_KEYS + k]` (f32, or f16 in the same bytes for
+/// the `_f16s` scorer): the buffer must hold that layout. `DgpuScratch::alloc_opts(_, false)` (the multistream server,
+/// which never runs the serial decode) leaves a 1-element stub, so a stray call stops here instead of writing past it.
+/// The bound is the f16 half, the smallest layout any of these kernels uses.
+fn check_b1_scores(launcher: &str, scores: &DeviceBuffer<f32>, n_head: u32) -> eyre::Result<()> {
+    let need = (n_head as usize * ATTN_MIXED_MAX_KEYS as usize).div_ceil(2);
+    if scores.len() < need {
+        return Err(eyre!(
+            "{launcher}: scores hold {} f32, the B=1 layout needs >= {need} (n_head {n_head} x {ATTN_MIXED_MAX_KEYS} keys); \
+             a serial-decode call on a multistream DgpuScratch stub?",
+            scores.len()
+        ));
+    }
+    Ok(())
+}
+
 /// FLOOR stride (in keys) of the `attn_scores` scratch buffer per
 /// (batch, head). The stride actually used is per-launch — see
 /// [`attn_scores_stride`] — and is never below this value, so V4-Flash's
@@ -547,6 +563,7 @@ impl AttentionMixed {
         n_raw: u32,
         n_comp: u32,
     ) -> eyre::Result<()> {
+        check_b1_scores("launch_score", scores, n_head)?;
         if n_raw + n_comp > ATTN_MIXED_MAX_KEYS {
             return Err(eyre!(
                 "attention_mixed_score: n_raw+n_comp={} exceeds cap {ATTN_MIXED_MAX_KEYS}",
@@ -592,6 +609,7 @@ impl AttentionMixed {
         n_raw: u32,
         n_comp: u32,
     ) -> eyre::Result<()> {
+        check_b1_scores("launch_softmax_wsum", scores, n_head)?;
         let function = self.module.get_function("attention_mixed_softmax_wsum")?;
         let comp_kv_ptr = comp_kv
             .map(|b| b.raw())
@@ -624,6 +642,7 @@ impl AttentionMixed {
         head_dim: u32,
         n_total_max: u32,
     ) -> eyre::Result<()> {
+        check_b1_scores("launch_score_b1_htiled_wmma", scores_g, n_head)?;
         if n_total_max == 0 {
             return Ok(());
         }
@@ -668,6 +687,7 @@ impl AttentionMixed {
         head_dim: u32,
         n_total_max: u32,
     ) -> eyre::Result<()> {
+        check_b1_scores("launch_score_b1_htiled_wmma_f16s", scores_g, n_head)?;
         if n_total_max == 0 {
             return Ok(());
         }
@@ -707,6 +727,7 @@ impl AttentionMixed {
         n_raw: u32,
         n_comp: u32,
     ) -> eyre::Result<()> {
+        check_b1_scores("launch_softmax_only", scores, n_head)?;
         let function = self.module.get_function("attention_mixed_softmax_only")?;
         let cfg = LaunchConfig { grid: (n_head, 1, 1), block: (32, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [
@@ -734,6 +755,7 @@ impl AttentionMixed {
         n_comp: u32,
         k_split: u32,
     ) -> eyre::Result<()> {
+        check_b1_scores("launch_wsum_b1_htiled_ksplit_ldsv", scores, n_head)?;
         if head_dim != 512 || n_head % 16 != 0 {
             return Err(eyre!(
                 "launch_wsum_b1_htiled_ksplit_ldsv: requires head_dim=512 and n_head%16==0 (got {head_dim}, {n_head})"
@@ -798,6 +820,7 @@ impl AttentionMixed {
         n_raw: u32,
         n_comp: u32,
     ) -> eyre::Result<()> {
+        check_b1_scores("launch_softmax_wsum_ldsv", scores, n_head)?;
         if head_dim != 512 {
             return Err(eyre!(
                 "launch_softmax_wsum_ldsv requires head_dim==512, got {head_dim}"

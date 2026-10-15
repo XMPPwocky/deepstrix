@@ -1842,9 +1842,16 @@ impl BatchDgpuShared {
             //
             // Doubled when DEEPSTRIX_F32_SCORES=1 so the f32-scores
             // kernel pair has the headroom it needs.
+            // Only `V41_VERIFY_DECODE_ATTN` (a debug instrument) reads it; at N_HEAD x the cap f32 it was 94 MB of
+            // idle dGPU at --ctx 368640 (270 MB at 1M) whenever the instrument is off. The instrument errors on the
+            // 1-element stub (`forward_prefill`), so allocating on its flag cannot be wrong silently.
             verify_scores: DeviceBuffer::new(
                 id,
-                if with_verify { N_HEAD as usize * crate::attention::ATTN_MIXED_MAX_KEYS as usize } else { 1 },
+                if with_verify && super::forward_prefill::verify_decode_attn() {
+                    N_HEAD as usize * crate::attention::ATTN_MIXED_MAX_KEYS as usize
+                } else {
+                    1
+                },
             )?,
             verify_inv: DeviceBuffer::new(id, N_HEAD as usize)?,
             verify_partials: DeviceBuffer::new(

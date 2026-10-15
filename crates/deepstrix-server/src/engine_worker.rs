@@ -1095,7 +1095,13 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         tracing::info!(path = %path, "perfetto device trace attached");
     }
     let engine = engine;
-    let dgpu_scratch = DgpuScratch::alloc(dgpu)?;
+    // The serial decode's attention scores only when the serial path can run: the same condition that gives the
+    // legacy state a stub below (`legacy_ctx`), so the multistream server saves N_HEAD x ATTN_MIXED_MAX_KEYS f32.
+    #[cfg(feature = "v41")]
+    let serial_attn = !(crate::multistream::enabled() && (mtp.is_none() || crate::ms_dspark::enabled()));
+    #[cfg(not(feature = "v41"))]
+    let serial_attn = true;
+    let dgpu_scratch = DgpuScratch::alloc_opts(dgpu, serial_attn)?;
     let igpu_scratch = IgpuScratch::alloc(igpu)?;
     // Decode attention writes `n_raw + n_comp` scores per head into
     // `DgpuScratch.attn_scores`, which is sized at ATTN_MIXED_MAX_KEYS.
