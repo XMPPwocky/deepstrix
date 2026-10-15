@@ -35,7 +35,8 @@ use crate::routing::hash_router_select;
 use super::image_spans::{self, ImageSpan};
 
 use super::batch_scratch::{
-    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, G6Pending, G6PendingRemote, B_MAX,
+    indexer_block_rows, indexer_scores_stride, BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared,
+    G6Pending, G6PendingRemote, B_MAX,
 };
 use super::engine::HeterogeneousEngine;
 use super::prefill_stats::PrefillStats;
@@ -8800,6 +8801,37 @@ impl HeterogeneousEngine {
                         b * N_INDEXER_HEAD,
                     )?;
                 }
+                // Score -> candidates -> top-k, in ROW BLOCKS at a PER-LAUNCH row pitch (2026-10-15).
+                //
+                // The scores' row pitch was ATTN_MIXED_MAX_KEYS (the --ctx cap) for every launch, which cost three
+                // ways: `sd.indexer_scores` had to be `rows x cap` f32 (1.5 GB of the prefill loan set at 1024 lane rows
+                // and --ctx 368640, +4 KB per token of cap); every score kernel stamps -inf over [n_comp, pitch) of
+                // every row (~0.76 GB of stores per 512-row unit per index layer, whatever the context); and the gemm
+                // splits its grid over the PITCH, so below ~93K keys one split of 64 WGs did all the work. The pitch
+                // is now the widest row of this launch rounded up to the gemm's 64-row K tile (`indexer_scores_stride`),
+                // and when `b x pitch` exceeds the buffer the rows go in blocks that fit (each block's scores start at
+                // row 0 of the buffer). Rows are independent through all three kernels, so the selection is the same
+                // bit for bit; at ordinary depths there is one block, as before.
+                let idx_stride = indexer_scores_stride(n_idx_max);
+                let block_rows = indexer_block_rows(sd.indexer_scores.len(), idx_stride, b as usize)
+                    .map_err(|e| eyre!("L{layer}: {e}"))?;
+                let score_gemm = std::env::var("INDEXER_SCORE_VARIANT").map(|v| v == "gemm").unwrap_or(true);
+                if score_gemm && arena.is_none() {
+                    // f16 Q for the gemm, all rows at once (the blocks take row views of it). Arena rows (decode)
+                    // score with the mw kernel straight from f32 Q, so they skip the cast, as before.
+                    de.q8k.launch_cast_f16(&de.compute, &mut sd.indexer_q16, &sd.indexer_q,
+                        b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
+                }
+                let q_row = (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize;
+                let nb_stride = crate::candidate_blocks::CandidateBlocks::n_blocks(ATTN_MIXED_MAX_KEYS);
+                let mut r0 = 0usize;
+                while r0 < b as usize {
+                    let n = block_rows.min(b as usize - r0);
+                    let nb = n as u32;
+                    let n_per = sd.n_index_comp_per_b.slice_view(r0, n);
+                    let q_v = sd.indexer_q.slice_view(r0 * q_row, n * q_row);
+                    let q16_v = sd.indexer_q16.slice_view(r0 * q_row, n * q_row);
+                    let hw_v = sd.indexer_head_weights.slice_view(r0 * N_INDEXER_HEAD as usize, n * N_INDEXER_HEAD as usize);
                 {
                     let _t = de.events.stage("k.indexer.score_wmma", &de.compute)?;
                     // Default mw since M52 (2026-06-09): multi-wave Q-staging
@@ -8815,7 +8847,6 @@ impl HeterogeneousEngine {
                     // 68% of matrix peak vs 15% for mw; bit-exact). mw / sw
                     // stay selectable via INDEXER_SCORE_VARIANT.
                     // Read per call (not LazyLock) so in-process A/B sweeps can flip it.
-                    let score_gemm = std::env::var("INDEXER_SCORE_VARIANT").map(|v| v == "gemm").unwrap_or(true);
                     let v41_rows = v41_idx_keys;
                     let ics_e2m1 = ics_opt.and_then(|i| match &i.comp_kv {
                         CompKvStore::E2m1(r) => Some(r),
@@ -8830,44 +8861,43 @@ impl HeterogeneousEngine {
                             if v41_rows.is_none() {
                                 return Err(eyre!("L{layer}: arena rows need the V4.1 index-K store"));
                             }
+                            let kb_v = arena_keys_base.map(|k| k.slice_view(r0, n));
                             wmma.launch_batched_mw_e2m1_rows(
                                 &de.compute,
                                 &mut sd.indexer_scores,
-                                &sd.indexer_q,
-                                &sd.indexer_head_weights,
+                                &q_v,
+                                &hw_v,
                                 rows,
-                                &sd.n_index_comp_per_b,
+                                &n_per,
                                 n_idx_max,
-                                ATTN_MIXED_MAX_KEYS,
-                                b,
-                                arena_keys_base,
+                                idx_stride,
+                                nb,
+                                kb_v.as_ref(),
                             )?;
                         } else if score_gemm {
-                            de.q8k.launch_cast_f16(&de.compute, &mut sd.indexer_q16, &sd.indexer_q,
-                                b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
                             wmma.launch_batched_gemm_e2m1(
                                 &de.compute,
                                 &mut sd.indexer_scores,
-                                &sd.indexer_q16,
-                                &sd.indexer_head_weights,
+                                &q16_v,
+                                &hw_v,
                                 rows,
-                                &sd.n_index_comp_per_b,
+                                &n_per,
                                 n_idx_max,
-                                ATTN_MIXED_MAX_KEYS,
-                                b,
+                                idx_stride,
+                                nb,
                                 0,
                             )?;
                         } else if *SCORE_MW {
                             wmma.launch_batched_mw_e2m1(
                                 &de.compute,
                                 &mut sd.indexer_scores,
-                                &sd.indexer_q,
-                                &sd.indexer_head_weights,
+                                &q_v,
+                                &hw_v,
                                 rows,
-                                &sd.n_index_comp_per_b,
+                                &n_per,
                                 n_idx_max,
-                                ATTN_MIXED_MAX_KEYS,
-                                b,
+                                idx_stride,
+                                nb,
                             )?;
                         } else {
                             return Err(eyre!(
@@ -8878,49 +8908,47 @@ impl HeterogeneousEngine {
                     } else if arena.is_some() {
                         return Err(eyre!("L{layer}: arena rows need the packed V4.1 index-K store"));
                     } else if score_gemm {
-                        de.q8k.launch_cast_f16(&de.compute, &mut sd.indexer_q16, &sd.indexer_q,
-                            b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
                         wmma.launch_batched_gemm(
                             &de.compute,
                             &mut sd.indexer_scores,
-                            &sd.indexer_q16,
-                            &sd.indexer_head_weights,
+                            &q16_v,
+                            &hw_v,
                             ics_opt.expect("f16 indexer key path requires indexer_compressor").comp_kv
                                 .f16()
                                 .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
-                            &sd.n_index_comp_per_b,
+                            &n_per,
                             n_idx_max,
-                            ATTN_MIXED_MAX_KEYS,
-                            b,
+                            idx_stride,
+                            nb,
                             0,
                         )?;
                     } else if *SCORE_MW {
                         wmma.launch_batched_mw(
                             &de.compute,
                             &mut sd.indexer_scores,
-                            &sd.indexer_q,
-                            &sd.indexer_head_weights,
+                            &q_v,
+                            &hw_v,
                             ics_opt.expect("f16 indexer key path requires indexer_compressor").comp_kv
                                 .f16()
                                 .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
-                            &sd.n_index_comp_per_b,
+                            &n_per,
                             n_idx_max,
-                            ATTN_MIXED_MAX_KEYS,
-                            b,
+                            idx_stride,
+                            nb,
                         )?;
                     } else {
                         wmma.launch_batched(
                             &de.compute,
                             &mut sd.indexer_scores,
-                            &sd.indexer_q,
-                            &sd.indexer_head_weights,
+                            &q_v,
+                            &hw_v,
                             ics_opt.expect("f16 indexer key path requires indexer_compressor").comp_kv
                                 .f16()
                                 .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
-                            &sd.n_index_comp_per_b,
+                            &n_per,
                             n_idx_max,
-                            ATTN_MIXED_MAX_KEYS,
-                            b,
+                            idx_stride,
+                            nb,
                         )?;
                     }
                 }
@@ -8929,34 +8957,38 @@ impl HeterogeneousEngine {
                 // inside them. Wiring decode alone would make prefill and decode
                 // pick different positions on those four layers, which is the
                 // prefill/decode divergence class this engine has been bitten by.
+                // `candidate_block_score` / `candidate_threshold` are the LANE's (they carry from layer 20 to 24-36),
+                // per row at `nb_stride`, so the block takes its rows' views of them.
                 if super::forward_layer::candidate_pool_enabled() {
                     let _t = de.events.stage("k.indexer.candidates", &de.compute)?;
-                    let nb_stride = crate::candidate_blocks::CandidateBlocks::n_blocks(
-                        ATTN_MIXED_MAX_KEYS,
-                    );
+                    let nbs = nb_stride as usize;
                     if layer == crate::config::CANDIDATE_SOURCE_LAYER {
+                        let mut bs_v = bd.candidate_block_score.slice_view_mut(r0 * nbs, n * nbs);
+                        let mut th_v = bd.candidate_threshold.slice_view_mut(r0, n);
                         de.candidate_blocks.launch_build(
                             &de.compute,
                             &sd.indexer_scores,
-                            &mut bd.candidate_block_score,
-                            &mut bd.candidate_threshold,
-                            sd.n_index_comp_per_b.raw(),
-                            ATTN_MIXED_MAX_KEYS,
+                            &mut bs_v,
+                            &mut th_v,
+                            n_per.raw(),
+                            idx_stride,
                             nb_stride,
                             n_idx_max,
-                            b,
+                            nb,
                         )?;
                     } else if layer > crate::config::CANDIDATE_SOURCE_LAYER {
+                        let bs_v = bd.candidate_block_score.slice_view(r0 * nbs, n * nbs);
+                        let th_v = bd.candidate_threshold.slice_view(r0, n);
                         de.candidate_blocks.launch_mask(
                             &de.compute,
                             &mut sd.indexer_scores,
-                            &bd.candidate_block_score,
-                            &bd.candidate_threshold,
-                            sd.n_index_comp_per_b.raw(),
-                            ATTN_MIXED_MAX_KEYS,
+                            &bs_v,
+                            &th_v,
+                            n_per.raw(),
+                            idx_stride,
                             nb_stride,
                             n_idx_max,
-                            b,
+                            nb,
                         )?;
                     }
                 }
@@ -8964,23 +8996,27 @@ impl HeterogeneousEngine {
                     let _t = de.events.stage("k.indexer.topk_bitonic", &de.compute)?;
                     // INDEXER_TOPK_SELECT=0 disables the threshold fast path.
                     let topk_select = std::env::var("INDEXER_TOPK_SELECT").map(|v| v != "0").unwrap_or(true);
+                    let tk = INDEXER_TOP_K as usize;
+                    // S2: the selection goes into the LANE's scratch so it survives
+                    // to the reuse layers below. `sd` is shared and would alias with
+                    // the other lane at the same layer.
+                    let mut sel_v = bd.indexer_sel_saved.slice_view_mut(r0 * tk, n * tk);
                     de.indexer_topk_bitonic.launch_batched(
                         &de.compute,
-                        // S2: write the selection into the LANE's scratch so it survives
-                        // to the reuse layers below. `sd` is shared and would alias with
-                        // the other lane at the same layer.
-                        &mut bd.indexer_sel_saved,
+                        &mut sel_v,
                         None, // no CSA bitmap consumer in batched prefill
                         &mut sd.indexer_topk_scratch,
                         &sd.indexer_scores,
-                        &sd.n_index_comp_per_b,
+                        &n_per,
                         n_idx_max,
-                        ATTN_MIXED_MAX_KEYS,
+                        idx_stride,
                         n_words_per_b as u32,
                         INDEXER_TOP_K,
-                        b,
+                        nb,
                         if topk_select { Some(&mut sd.indexer_topk_done) } else { None },
                     )?;
+                }
+                    r0 += n;
                 }
                 // Gather selected rows from the MAIN compressor's comp_kv
                 // (head_dim=512) into a dense per-batch buffer. Attention

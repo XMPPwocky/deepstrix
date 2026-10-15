@@ -1232,8 +1232,42 @@ fn indexer_scratch_keys() -> usize {
         0
     }
 }
+/// `indexer_scores` f32 elements (2026-10-15). Was `rows x ATTN_MIXED_MAX_KEYS` -- 1.5 GB at 1024 lane rows and
+/// --ctx 368640, growing 4 KB per token of cap -- because every launch used the cap as its row pitch. The batched
+/// indexer now pitches each launch at its widest row ([`indexer_scores_stride`]) and goes in row blocks when
+/// `rows x pitch` does not fit ([`indexer_block_rows`]), so this is a BUDGET: what the R1 union already holds for its
+/// other members, at least [`INDEXER_SCORES_BUDGET_BYTES`] and one 8-row gemm group at the widest possible pitch, never
+/// more than the old `rows x cap`.
 fn indexer_scores_len(rows: usize) -> usize {
-    rows * indexer_scratch_keys()
+    let keys = indexer_scratch_keys();
+    if keys == 0 {
+        return 0;
+    }
+    let others = [flat_len(rows), q_len(rows), BatchDgpuHotScratch::r1_view_bytes(rows) / 4].into_iter().max().unwrap();
+    let floor = (INDEXER_SCORES_BUDGET_BYTES / 4).max(8 * indexer_scores_stride(keys as u32) as usize);
+    (rows * keys).min(others.max(floor))
+}
+/// Minimum `indexer_scores` budget: one block covers `b x pitch <= 32M` keys, i.e. a 512-row unit to ~65K context and
+/// a 16-row decode step to the full 1M.
+pub const INDEXER_SCORES_BUDGET_BYTES: usize = 128 << 20;
+/// Row pitch of one batched indexer launch: its widest row (`n_idx_max`) rounded up to the gemm's 64-row K tile
+/// (`ISG_TILE_ROWS`; also keeps rows 16-B aligned for the float4 top-k select). Every kernel of the launch (score,
+/// candidate build / mask, top-k) takes it as `n_idx_stride` and reads / writes nothing past it.
+pub fn indexer_scores_stride(n_idx_max: u32) -> u32 {
+    n_idx_max.max(1).next_multiple_of(64)
+}
+/// Rows per block for `b` rows at `stride` in an `indexer_scores` of `cap_elems` f32: all of them when they fit, else
+/// as many whole 8-token gemm groups as fit. An error (the caller's layer fails, no partial selection) when not even one
+/// row fits: the buffer is sized so that cannot happen below the cap.
+pub fn indexer_block_rows(cap_elems: usize, stride: u32, b: usize) -> Result<usize, String> {
+    let fit = cap_elems / stride as usize;
+    if fit == 0 {
+        return Err(format!("indexer_scores holds {cap_elems} f32, less than one row at pitch {stride}"));
+    }
+    if fit >= b {
+        return Ok(b.max(1));
+    }
+    Ok(if fit >= 8 { fit / 8 * 8 } else { fit })
 }
 fn indexer_q_len(rows: usize) -> usize {
     rows * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize
