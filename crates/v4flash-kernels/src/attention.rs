@@ -92,8 +92,15 @@ pub const ATTN_MIXED_MAX_KEYS: u32 = 82176;
 /// `scored_keys_are_gathered` reads `V41_INDEX_K` at RUNTIME, which is the
 /// env-dependence that caused the truncation bug documented below; any split
 /// must resolve the mode at startup and hard-error if it changes.
+///
+/// RAISED 2026-10-15, 368_640 -> 1_048_576 (1M: the model's YaRN length, 65536 x 16), branch ctx-1m. What made the
+/// cap expensive was every buffer sized by it, ~8.1 KB of dGPU per token of cap; now the batched indexer pitches each
+/// launch at its own widest row in budgeted row blocks (scores, top-k scratch, candidate block scores), the candidate
+/// pool carries keep bits, and the idle B=1 / verify score buffers are stubs on the multistream server. What still
+/// scales: the prefill job's KV state (~2.8 KB per token of `--ctx`, the runtime flag, not this), the lane keep bits
+/// (16 B per row per 1K tokens), and the drafter's iGPU scores (N_HEAD x this x f32, iGPU). `--ctx` stays a launch flag.
 #[cfg(feature = "v41")]
-pub const V41_MAX_CTX: u32 = 368_640;
+pub const V41_MAX_CTX: u32 = 1_048_576;
 
 /// RAISED 2026-09-18 from `131_072 + SWA_WINDOW`, closing a SILENT TRUNCATION.
 ///

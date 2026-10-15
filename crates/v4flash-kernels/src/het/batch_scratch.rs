@@ -1256,9 +1256,9 @@ fn indexer_scores_len(rows: usize) -> usize {
     let floor = (INDEXER_SCORES_BUDGET_BYTES / 4).max(8 * indexer_scores_stride(keys as u32) as usize);
     (rows * keys).min(others.max(floor))
 }
-/// Minimum `indexer_scores` budget: one block covers `b x pitch <= 32M` keys, i.e. a 512-row unit to ~65K context and
-/// a 16-row decode step to the full 1M.
-pub const INDEXER_SCORES_BUDGET_BYTES: usize = 128 << 20;
+/// Minimum `indexer_scores` budget: one block covers `b x pitch <= 16M` keys, i.e. a 16-row decode step to the full 1M
+/// (prefill sets get more: their R1 union already holds `q`, 134 MB at 1024 rows = a 512-row unit to ~65K context).
+pub const INDEXER_SCORES_BUDGET_BYTES: usize = 64 << 20;
 /// Row pitch of one batched indexer launch: its widest row (`n_idx_max`) rounded up to the gemm's 64-row K tile
 /// (`ISG_TILE_ROWS`; also keeps rows 16-B aligned for the float4 top-k select). Every kernel of the launch (score,
 /// candidate build / mask, top-k) takes it as `n_idx_stride` and reads / writes nothing past it.
