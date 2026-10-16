@@ -35,7 +35,7 @@ use crate::routing::hash_router_select;
 use super::image_spans::{self, ImageSpan};
 
 use super::batch_scratch::{
-    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, G6Pending, G6PendingRemote, B_MAX,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, G6Pending, G6PendingRemote, SxKind, SxPending, B_MAX,
 };
 use super::engine::HeterogeneousEngine;
 use super::prefill_stats::PrefillStats;
@@ -4203,6 +4203,52 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// `V41_DGPU_SX_DEFER`: dispatch lane `lane`'s deferred shared expert, if any -- exactly the call
+    /// its chain (or `pre_moe_prep`) skipped, with the same arguments, enqueued now on `de.compute`.
+    /// `Ok(false)` = nothing was pending. The pending entry is taken BEFORE the launches, so an error
+    /// inside them can never dispatch it twice.
+    pub fn sx_flush(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        sd: &mut BatchDgpuShared,
+        weights: &HetModelWeights,
+        lane: usize,
+        why: SxFlush,
+    ) -> eyre::Result<bool> {
+        let Some(p) = bd.sx_pending.take() else { return Ok(false) };
+        let dlw = weights
+            .dgpu_layers
+            .get(p.layer as usize)
+            .filter(|d| d.layer_idx == p.layer)
+            .ok_or_else(|| eyre!("sx_flush: no dGPU weights with layer_idx {} for the deferred shared expert ({:?})", p.layer, p.kind))?;
+        let _ctx = super::trace::ctx_layer(p.layer as usize, lane);
+        self.set_current_cached(self.dgpu.device)?;
+        match p.kind {
+            SxKind::G4 => self.issue_g4(sd, bd, dlw, p.b)?,
+            SxKind::Chain => self.issue_shared_expert_prefill(sd, bd, dlw, p.b, p.layer as usize, p.dump_pos, p.cap_ok, false)?,
+            SxKind::Presubmit => self.issue_shared_expert_prefill(sd, bd, dlw, p.b, p.layer as usize, p.dump_pos, p.cap_ok, true)?,
+        }
+        SX_FLUSHED[why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// `V41_DGPU_SX_DEFER`, trigger (a): lane `except` just enqueued a chain; dispatch every other
+    /// lane's deferred shared expert behind it (lane order).
+    fn sx_flush_others(
+        &self,
+        lanes: &mut [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev)],
+        sd: &mut BatchDgpuShared,
+        weights: &HetModelWeights,
+        except: usize,
+    ) -> eyre::Result<()> {
+        for (j, (bd, _, _)) in lanes.iter_mut().enumerate() {
+            if j != except {
+                self.sx_flush(bd, sd, weights, j, SxFlush::OtherChain)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Stage 10, the batched shared expert, as a callable unit.
     ///
     /// Extracted so it can be issued at EITHER of two points in `pre_moe`:
@@ -5635,8 +5681,50 @@ impl HeterogeneousEngine {
     /// Replies are matched by seq and box 2 may answer out of order (it parks a
     /// request that is paging, `REQ_FLAG_OOO`), so a lane posts as soon as ITS
     /// reply is in; some lane's reply always arrives, so the loop cannot stall.
+    ///
+    /// `V41_DGPU_SX_DEFER` (static, default off): each lane's shared expert is DISPATCHED later
+    /// on the same stream instead of at the end of its chain (`SxPending`): (a) right after
+    /// another lane's chain is enqueued, (b) right before the lane's own Post, (c) when this call
+    /// returns, error or not (this wrapper). Same kernels, same inputs, same outputs.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_step_arena_ready_first(
+        &self,
+        lanes: &mut [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev)],
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        arena: &mut KvArena,
+        rows: &StepRows,
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        engram_rows: &mut LazyEngramRows<'_>,
+        pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<Vec<RowTables>> {
+        let r = self.forward_step_arena_ready_first_body(lanes, sd, si, arena, rows, weights, input_hcs, tokens, engram_rows, pager);
+        // (c) Nothing deferred outlives the driver. A normal end already dispatched everything (every
+        // lane's last Post flushed its own, and the body's exit flush ran before the final sync), so
+        // only an error path finds work here: dispatched (its inputs are in the lane's scratch), a
+        // failure to dispatch logged and left for the next step's start to drop.
+        let mut leftover = 0usize;
+        for (j, (bd, _, _)) in lanes.iter_mut().enumerate() {
+            if bd.sx_pending.is_some() {
+                leftover += 1;
+                if let Err(e) = self.sx_flush(bd, sd, weights, j, SxFlush::Exit) {
+                    tracing::warn!(lane = j, error = %e, "V41_DGPU_SX_DEFER: a deferred shared expert could not be dispatched at the driver's exit");
+                }
+            }
+            bd.sx_defer = false;
+        }
+        match r {
+            Ok(_) if leftover != 0 => Err(eyre!(
+                "forward_step_arena_ready_first: {leftover} lane(s) returned with a deferred shared expert after a normal end (the exit flush did not run)"
+            )),
+            r => r,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_step_arena_ready_first_body(
         &self,
         lanes: &mut [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev)],
         sd: &mut BatchDgpuShared,
@@ -5705,6 +5793,13 @@ impl HeterogeneousEngine {
             // G6: nothing deferred survives a step (an aborted one leaves its combine behind).
             bd.g6_pending = None;
             bd.g6_allow = None;
+            // `V41_DGPU_SX_DEFER`: the same for a deferred shared expert (the wrapper's exit flush
+            // normally leaves none; one here is from an exit whose dispatch failed).
+            if let Some(p) = bd.sx_pending.take() {
+                SX_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(lane = i, pending = ?p, "V41_DGPU_SX_DEFER: stale deferred shared expert dropped at step start");
+            }
+            bd.sx_defer = crate::knobs::DGPU_SX_DEFER.on();
             for (k, hc) in input_hcs[lo..hi].iter().enumerate() {
                 let mut slot = bd.residual.slice_view_mut(k * HC_DIM as usize, HC_DIM as usize);
                 slot.copy_from_host(hc)?;
@@ -5729,26 +5824,32 @@ impl HeterogeneousEngine {
         macro_rules! chain {
             ($i:expr, $l:expr) => {{
                 let (i, l): (usize, usize) = ($i, $l);
-                let _ctx = super::trace::ctx_layer(l, i);
-                let (lo, hi) = (offs[i], offs[i + 1]);
-                let (bd, bi, dev) = &mut lanes[i];
-                stage(self, bd, l, lo, hi - lo)?;
-                let t = &tables[i];
-                let sev = &self.sync_events_lane(i).layers[l];
-                // `lh.pre_moe` on the arena driver = the chain enqueue's host
-                // time (the verify path's `LH_PRE` scopes never ran here).
-                let _t_pre = LayerHostTimer::start(&LH_PRE);
-                let mut c = arena.state.with_kv_source(l, |ls| {
-                    let rl = RowLayout::Arena { tables: t, dev: &**dev, next_router: weights.dgpu_layers.get(l + 1), next_router2: weights.dgpu_layers.get(l + 2) };
-                    self.pre_moe_chain(bd, bi, sd, si, ls, &weights.dgpu_layers[l], &weights.igpu_layers[l], 0, &tokens[lo..hi], None, None,
-                        sev, pager.as_deref_mut(), CedMode::Exact, &rl)
-                })?;
-                // Look-ahead hints read SHARED scratch (`sd.look_sel*`) that the
-                // other lane's chain may overwrite before this lane routes (the
-                // copy path; the readback pack captures them in stream order).
-                c.lookahead_hints_ok = false;
-                // Lanes are not in lockstep: never hold the daemon for a partner.
-                c.partner_follows = false;
+                let c = {
+                    let _ctx = super::trace::ctx_layer(l, i);
+                    let (lo, hi) = (offs[i], offs[i + 1]);
+                    let (bd, bi, dev) = &mut lanes[i];
+                    stage(self, bd, l, lo, hi - lo)?;
+                    let t = &tables[i];
+                    let sev = &self.sync_events_lane(i).layers[l];
+                    // `lh.pre_moe` on the arena driver = the chain enqueue's host
+                    // time (the verify path's `LH_PRE` scopes never ran here).
+                    let _t_pre = LayerHostTimer::start(&LH_PRE);
+                    let mut c = arena.state.with_kv_source(l, |ls| {
+                        let rl = RowLayout::Arena { tables: t, dev: &**dev, next_router: weights.dgpu_layers.get(l + 1), next_router2: weights.dgpu_layers.get(l + 2) };
+                        self.pre_moe_chain(bd, bi, sd, si, ls, &weights.dgpu_layers[l], &weights.igpu_layers[l], 0, &tokens[lo..hi], None, None,
+                            sev, pager.as_deref_mut(), CedMode::Exact, &rl)
+                    })?;
+                    // Look-ahead hints read SHARED scratch (`sd.look_sel*`) that the
+                    // other lane's chain may overwrite before this lane routes (the
+                    // copy path; the readback pack captures them in stream order).
+                    c.lookahead_hints_ok = false;
+                    // Lanes are not in lockstep: never hold the daemon for a partner.
+                    c.partner_follows = false;
+                    c
+                };
+                // `V41_DGPU_SX_DEFER` trigger (a): the other lanes' deferred shared experts go
+                // BEHIND this chain (its router -> box-2 submit no longer queues behind them).
+                self.sx_flush_others(lanes, sd, weights, i)?;
                 c
             }};
         }
@@ -5774,6 +5875,10 @@ impl HeterogeneousEngine {
                 let _ctx = super::trace::ctx_layer(l, i);
                 let bl = (offs[i + 1] - offs[i]) as u32;
                 let (bd, _, _) = &mut lanes[i];
+                // `V41_DGPU_SX_DEFER` trigger (b): the combine (here, or G6's in the next chain)
+                // reads `ffn_shared`; dispatch this lane's deferred shared expert first (before the
+                // Post's wait on the MoE event, so it does not wait for it).
+                self.sx_flush(bd, sd, weights, i, SxFlush::Post)?;
                 let hot = prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], bd, sd);
                 // G6: this lane's next call is its chain of layer l + 1 (Ph::Post below), so the Post
                 // may defer the combine into that chain's pre-attn launch.
@@ -5924,6 +6029,11 @@ impl HeterogeneousEngine {
             }
         }
         READY_FIRST_SPINS.fetch_add(spins, std::sync::atomic::Ordering::Relaxed);
+        // `V41_DGPU_SX_DEFER` trigger (c), before the step's sync: every lane's last Post dispatched
+        // its own, so this finds nothing unless a lane ended without one.
+        for (j, (bd, _, _)) in lanes.iter_mut().enumerate() {
+            self.sx_flush(bd, sd, weights, j, SxFlush::Exit)?;
+        }
         self.dgpu.compute.synchronize()?;
         self.note_fwd_sync();
         Ok(tables)
@@ -6190,6 +6300,11 @@ impl HeterogeneousEngine {
         rows: &RowLayout<'_>,
     ) -> eyre::Result<PreMoeCarry> {
         let layer = dlw.layer_idx;
+        // `V41_DGPU_SX_DEFER`: the lane's previous shared expert was dispatched by its Post (the
+        // driver flushes before every Post); one still pending here means a driver skipped that.
+        if let Some(p) = bd.sx_pending {
+            return Err(eyre!("L{layer}: the shared expert of layer {} ({:?}) is still deferred at this lane's next chain (a driver skipped its flush)", p.layer, p.kind));
+        }
         let arena: Option<(&RowTables, &RowTablesDev)> = match &rows {
             RowLayout::Arena { tables, dev, .. } => Some((*tables, *dev)),
             RowLayout::Contiguous => None,
@@ -10447,7 +10562,19 @@ impl HeterogeneousEngine {
             && crate::knobs::DGPU_G4_SHARED.on()
             && g4_shape_ok(dlw, b)
             && !super::engine::subtensor_dump_armed(layer as usize);
-        if g4_on {
+        // `V41_DGPU_SX_DEFER` (ready-first only: `bd.sx_defer`): leave the same call for the driver
+        // to dispatch later on this stream (`sx_flush`). What runs between here and the flush --
+        // this lane's route / prep / launch / probe, other lanes' Posts and chains -- never writes
+        // what it reads (this lane's `ffn_input_norm`, G4 also `after_attn_hc` / `split` /
+        // `hc_pre_carry`: all per-lane, next written by this lane's next chain or its Post) and never
+        // reads what it writes (`ffn_shared`, G4's `split` / `hc_pre_carry`: first read by this
+        // lane's combine and next collapse, after the flush; its `sd` temporaries are written before
+        // they are read inside the dispatch). See `sx_defer_here`.
+        let sx_defer = !defer_shared && bd.sx_defer && sx_defer_here(layer as usize);
+        if sx_defer {
+            bd.sx_pending = Some(SxPending { layer, b, kind: if g4_on { SxKind::G4 } else { SxKind::Chain }, dump_pos, cap_ok });
+            SX_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else if g4_on {
             self.issue_g4(sd, bd, dlw, b)?;
         } else if !defer_shared {
             self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok, false)?;
@@ -12263,7 +12390,16 @@ impl HeterogeneousEngine {
         // shared expert entirely in that case, so without this the layer would add
         // a stale `ffn_shared` and be silently wrong.
         if defer_shared {
-            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok, true)?;
+            if bd.sx_defer && sx_defer_here(layer as usize) {
+                // `V41_DGPU_SX_DEFER`: the same call, dispatched by the driver (see `pre_moe_chain`).
+                if let Some(p) = bd.sx_pending {
+                    return Err(eyre!("L{layer}: a shared expert ({:?} of layer {}) is already deferred", p.kind, p.layer));
+                }
+                bd.sx_pending = Some(SxPending { layer, b, kind: SxKind::Presubmit, dump_pos, cap_ok });
+                SX_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok, true)?;
+            }
         }
         let pager_window;
         let (routed_src, moe_remap, moe_packed): (
@@ -13501,6 +13637,11 @@ impl HeterogeneousEngine {
         sev: &super::engine::LayerSyncEvents,
         hot_active: bool,
     ) -> eyre::Result<()> {
+        // `V41_DGPU_SX_DEFER`: the combine below (or G6's, deferred into the next chain) reads
+        // `ffn_shared`; the driver dispatches a deferred shared expert before calling this.
+        if let Some(p) = bd.sx_pending {
+            return Err(eyre!("L{}: Post with the shared expert still deferred ({:?}): its combine would read a stale ffn_shared", p.layer, p.kind));
+        }
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
         de.compute.wait_event(&sev.moe_arrived)?;
@@ -14023,6 +14164,17 @@ impl HeterogeneousEngine {
 /// Fusion group G4 (`V41_DGPU_G4_SHARED`): lane-layers whose input quantize + late mixes ran as `g4_qmix`.
 pub static G4_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `V41_DGPU_SX_DEFER`'s own preconditions for one lane-layer (beside the ready-first driver's
+/// `bd.sx_defer`):
+/// - graphs OFF (`V41_MS_GRAPHS=0`, production): with graphs ON the shared expert keeps its place
+///   (its `g.shared_expert` stage graph and the stage_b context slot stay as they were gated);
+/// - no mHC split (`V41_MS_MHC_SPLIT`, OFF): its `de.hc` mixes write `sd.mix` beside `de.compute`,
+///   which G4 also writes;
+/// - no sub-tensor dump armed on the layer (the dump syncs the stream inside the dispatch).
+pub fn sx_defer_here(layer: usize) -> bool {
+    crate::knobs::DGPU_SX_DEFER.on() && !ms_graphs() && !ms_mhc_split() && !super::engine::subtensor_dump_armed(layer)
+}
+
 /// Fusion group G4's shape: the decode shared expert on the dp4a arm with Q8_0 weights (whose input
 /// quantize `g4_qmix` absorbs; its GEMVs are issued as before). Pure (knobs read at startup).
 pub fn g4_shape_ok(dlw: &DgpuLayerWeights, b: u32) -> bool {
@@ -14044,12 +14196,36 @@ pub static G6_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static G6_FLUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static G6_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// [`G4_LAUNCHES`, `G6_DEFERRED`, `G6_LAUNCHES`, `G6_FLUSHED`, `G6_DROPPED`] since the previous call
-/// (the `ms.step` line: one caller, the engine thread; the counters stay cumulative).
-pub fn fusion_counter_deltas() -> [u64; 5] {
+/// `V41_DGPU_SX_DEFER`: lane-layer shared experts a chain (or `pre_moe_prep`) left pending.
+pub static SX_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ... dispatched, by trigger (`SxFlush` order): (a) right after another lane's chain, (b) right
+/// before the lane's own Post, (c) at the driver's exit (normal end: none expected; an error).
+pub static SX_FLUSHED: [std::sync::atomic::AtomicU64; 3] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+/// ... found still pending at a step's start (left behind by a driver exit whose flush failed).
+pub static SX_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why a deferred shared expert is dispatched (`HeterogeneousEngine::sx_flush`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SxFlush {
+    /// (a) another lane's chain was just enqueued.
+    OtherChain = 0,
+    /// (b) this lane's Post is next (its combine reads `ffn_shared`).
+    Post = 1,
+    /// (c) the driver is leaving (end of step, or an error).
+    Exit = 2,
+}
+
+/// [`G4_LAUNCHES`, `G6_DEFERRED`, `G6_LAUNCHES`, `G6_FLUSHED`, `G6_DROPPED`, `SX_DEFERRED`,
+/// `SX_FLUSHED` (a, b, c), `SX_DROPPED`] since the previous call (the `ms.step` line: one caller, the
+/// engine thread; the counters stay cumulative).
+pub fn fusion_counter_deltas() -> [u64; 10] {
     use std::sync::atomic::Ordering::Relaxed;
-    static LAST: std::sync::Mutex<[u64; 5]> = std::sync::Mutex::new([0; 5]);
-    let now = [G4_LAUNCHES.load(Relaxed), G6_DEFERRED.load(Relaxed), G6_LAUNCHES.load(Relaxed), G6_FLUSHED.load(Relaxed), G6_DROPPED.load(Relaxed)];
+    static LAST: std::sync::Mutex<[u64; 10]> = std::sync::Mutex::new([0; 10]);
+    let now = [
+        G4_LAUNCHES.load(Relaxed), G6_DEFERRED.load(Relaxed), G6_LAUNCHES.load(Relaxed), G6_FLUSHED.load(Relaxed), G6_DROPPED.load(Relaxed),
+        SX_DEFERRED.load(Relaxed), SX_FLUSHED[0].load(Relaxed), SX_FLUSHED[1].load(Relaxed), SX_FLUSHED[2].load(Relaxed), SX_DROPPED.load(Relaxed),
+    ];
     let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
     let d = std::array::from_fn(|i| now[i].wrapping_sub(last[i]));
     *last = now;
@@ -14959,6 +15135,31 @@ mod lm_tests {
             s = e;
         }
         assert!(subs.last().unwrap().1 <= 4096);
+    }
+}
+
+#[cfg(test)]
+mod sx_defer_tests {
+    use super::{sx_defer_here, SxFlush, SX_FLUSHED};
+    use crate::knobs::{Kind, DGPU_SX_DEFER};
+
+    /// `V41_DGPU_SX_DEFER` is STATIC and OFF by default (production unchanged until gated), and the
+    /// lane-layer precondition never holds with the knob off.
+    #[test]
+    fn sx_defer_is_a_static_default_off_knob() {
+        assert!(!DGPU_SX_DEFER.live, "V41_DGPU_SX_DEFER must be static");
+        assert!(matches!(DGPU_SX_DEFER.kind, Kind::Flag(false)), "V41_DGPU_SX_DEFER must default off");
+        if !DGPU_SX_DEFER.on() {
+            assert!((0..64).all(|l| !sx_defer_here(l)));
+        }
+    }
+
+    /// The trigger counters: one slot per trigger, (a) / (b) / (c) in the `ms.step` order.
+    #[test]
+    fn sx_flush_triggers_index_their_counters() {
+        let ix = [SxFlush::OtherChain as usize, SxFlush::Post as usize, SxFlush::Exit as usize];
+        assert_eq!(ix, [0, 1, 2]);
+        assert_eq!(SX_FLUSHED.len(), ix.len());
     }
 }
 

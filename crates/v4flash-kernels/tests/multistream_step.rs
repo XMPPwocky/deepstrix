@@ -101,6 +101,22 @@
 //!        stage_b (the one-lane driver; plus each stream of G5e's arena alone,
 //!        b = 1) == their legacy run, with the counters checked as above.
 //!
+//!   SX   DEFERRED SHARED EXPERT (`V41_DGPU_SX_DEFER`, static): the ready-first driver dispatches
+//!        each lane's shared expert behind the other lane's next chain / before its own Post
+//!        instead of at the end of its chain. It engages only with graphs OFF, so the gate runs
+//!        the G5 arms with `MS_G5_GRAPHS=0` (production's `V41_MS_GRAPHS=0`; graphs go back on
+//!        for G6, whose schedule-0 arms then also compare graphs-on / not-deferred against the
+//!        graphs-off G5e logits). Every ready-first arm checks the `SX_*` counters: knob on =>
+//!        every lane-layer of G5e deferred (`steps x N_LAYER x 2`), every deferral dispatched by
+//!        trigger (a) or (b), none at the exit, none dropped; knob off => none deferred. And the
+//!        two-run bit-for-bit comparison: run 1 (knob unset) with `MS_SAVE_LOGITS=dir` writes the
+//!        ready-first arms' logits (`sx_{rf,spec2,spec2_hold,h2,h2_hold}_s*_t*.bin`; G5e = plain
+//!        streams split between the lanes, i.e. non-ordered cuts; G5g = ordered cuts through one
+//!        stream's block; G5h = cuts between / through two streams' blocks); run 2
+//!        (`V41_DGPU_SX_DEFER=1`) with `MS_COMPARE_LOGITS=dir` must match every one of them bit
+//!        for bit (and its in-process G5e / G5g / G5h gates compare it against the lockstep and
+//!        one-lane drivers, which never defer).
+//!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
 //! HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 \
@@ -357,6 +373,32 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // G5a-h run LEGACY keys whatever the default (`stage_b` since 2026-10-06): their logits are G6's
     // legacy references, and G6's arms expect the stage_b cache empty when they start.
     v4flash_kernels::knobs::MS_GRAPH_KEYS.set("legacy");
+    // SX gate (module doc): `MS_G5_GRAPHS=0` = the G5 arms in production's graphs-off mode.
+    let g5_graphs = std::env::var("MS_G5_GRAPHS").ok();
+    if let Some(v) = &g5_graphs {
+        eyre::ensure!(v4flash_kernels::knobs::MS_GRAPHS.set(v), "MS_G5_GRAPHS={v}: not a flag value");
+        eprintln!("SX: G5 arms with V41_MS_GRAPHS={v}; V41_DGPU_SX_DEFER={}", v4flash_kernels::knobs::DGPU_SX_DEFER.on());
+    }
+    let sx_snap = || -> [u64; 5] {
+        use std::sync::atomic::Ordering::Relaxed;
+        use v4flash_kernels::het::forward_prefill::{SX_DEFERRED, SX_DROPPED, SX_FLUSHED};
+        [SX_DEFERRED.load(Relaxed), SX_FLUSHED[0].load(Relaxed), SX_FLUSHED[1].load(Relaxed), SX_FLUSHED[2].load(Relaxed), SX_DROPPED.load(Relaxed)]
+    };
+    // The SX counters of one ready-first arm between two snapshots; `want` = the lane-layers that
+    // must have deferred (when every step of the arm went through the ready-first driver).
+    let mut sx_fail: Vec<String> = Vec::new();
+    let sx_check = |arm: &str, before: [u64; 5], after: [u64; 5], want: Option<u64>| -> Option<String> {
+        let [d, a, b, c, drop] = std::array::from_fn::<u64, 5, _>(|k| after[k] - before[k]);
+        let engaged = v4flash_kernels::knobs::DGPU_SX_DEFER.on() && !v4flash_kernels::knobs::MS_GRAPHS.on();
+        eprintln!("SX {arm}: deferred {d} (a: behind another chain {a}, b: at the Post {b}, c: at the exit {c}; dropped {drop}){}",
+            want.map_or(String::new(), |w| format!(" of {w} lane-layers")));
+        let bad = if engaged {
+            d == 0 || a + b + c != d || c != 0 || drop != 0 || want.is_some_and(|w| d != w)
+        } else {
+            d + a + b + c + drop != 0
+        };
+        bad.then(|| format!("{arm}: SX counters deferred {d} a {a} b {b} c {c} dropped {drop} (engaged {engaged}, want {want:?})"))
+    };
     // HOT SPLIT gate arm G-il (docs/v41/HOT_SPLIT_DESIGN.md 7): `MS_HOT_SPLIT=interleave` seeds the
     // hot set with a fixed Zipf count table and refreshes it into the interleave, holder fallback
     // OFF, so every G5 arm routes by one fixed placement (nothing refreshes it during the run: the
@@ -978,9 +1020,16 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         }
         Ok((out, waits))
     };
+    let sx0 = sx_snap();
     let (logits_spec2, waits_ord) = run_spec2(&mut arena_spec2, &slots_spec2, false, false)?;
+    let sx1 = sx_snap();
     let (logits_spec2_hold, waits_hold) = run_spec2(&mut arena_spec2_hold, &slots_spec2_hold, true, false)?;
+    let sx2 = sx_snap();
     let (logits_spec2_unord, _) = run_spec2(&mut arena_spec2_unord, &slots_spec2_unord, true, true)?;
+    let sx3 = sx_snap();
+    sx_fail.extend(sx_check("G5g spec2", sx0, sx1, None));
+    sx_fail.extend(sx_check("G5g spec2_hold", sx1, sx2, None));
+    sx_fail.extend(sx_check("G5g spec2_unord", sx2, sx3, None));
     let (mut g5g_ord, mut g5g_hold, mut g5g_spec, mut g5g_unord) = (0usize, 0usize, 0usize, 0usize);
     for s in 0..n_streams {
         for t in 0..n_steps {
@@ -1150,8 +1199,12 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         Ok((out, waits, cuts))
     };
     let (logits_h1, _, _) = run_pairs(&mut arena_h[0], &slots_h[0], H::One)?;
+    let sx0 = sx_snap();
     let (logits_h2, waits_h2, cuts_h2) = run_pairs(&mut arena_h[1], &slots_h[1], H::Two { hold: false, unordered: false })?;
+    sx_fail.extend(sx_check("G5h h2", sx0, sx_snap(), None));
+    let sx0 = sx_snap();
     let (logits_h2_hold, waits_h2_hold, _) = run_pairs(&mut arena_h[2], &slots_h[2], H::Two { hold: true, unordered: false })?;
+    sx_fail.extend(sx_check("G5h h2_hold", sx0, sx_snap(), None));
     let (logits_h2_unord, _, _) = run_pairs(&mut arena_h[3], &slots_h[3], H::Two { hold: true, unordered: true })?;
     let (mut g5h_one, mut g5h_two, mut g5h_hold, mut g5h_unord) = (0usize, 0usize, 0usize, 0usize);
     for s in 0..n_streams {
@@ -1302,6 +1355,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut logits_rf: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
     let mut seqs_rf: Vec<Vec<i32>> = prompts.clone();
     let mut step_ms_rf = Vec::new();
+    let sx_rf0 = sx_snap();
     for t in 0..n_steps {
         let toks: Vec<i32> = (0..n_streams).map(|s| cont[s][t]).collect();
         let mut rows_b = vec![vec![0f32; n_streams * ein]; ENGRAM_LAYERS.len()];
@@ -1333,6 +1387,53 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         }
     }
     eprintln!("ready-first step wall (S={n_streams}, 2 lanes, incl. head): {:?} ms", step_ms_rf.iter().map(|x| (*x * 10.0).round() / 10.0).collect::<Vec<_>>());
+    // Every lane-layer of every G5e step defers (no dumps, graphs off): steps x N_LAYER x 2 lanes.
+    sx_fail.extend(sx_check("G5e rf", sx_rf0, sx_snap(), Some((n_steps * v4flash_kernels::config::N_LAYER as usize * 2) as u64)));
+
+    // SX: the ready-first arms' logits, saved (run 1) or compared bit for bit (run 2).
+    {
+        let sx_arms: [(&str, &Vec<Vec<Vec<f32>>>); 5] = [
+            ("rf", &logits_rf),
+            ("spec2", &logits_spec2),
+            ("spec2_hold", &logits_spec2_hold),
+            ("h2", &logits_h2),
+            ("h2_hold", &logits_h2_hold),
+        ];
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        if let Ok(dir) = std::env::var("MS_SAVE_LOGITS") {
+            std::fs::create_dir_all(&dir)?;
+            for (name, lg) in sx_arms {
+                for (s, rows) in lg.iter().enumerate() {
+                    for (t, l) in rows.iter().enumerate() {
+                        std::fs::write(format!("{dir}/sx_{name}_s{s}_t{t}.bin"), f32s(l))?;
+                    }
+                }
+            }
+            eprintln!("SX: saved the ready-first arms' logits to {dir}");
+        }
+        if let Ok(dir) = std::env::var("MS_COMPARE_LOGITS") {
+            let (mut n_rows, mut n_diff, mut missing) = (0usize, 0usize, 0usize);
+            for (name, lg) in sx_arms {
+                let mut arm_diff = 0usize;
+                for (s, rows) in lg.iter().enumerate() {
+                    for (t, l) in rows.iter().enumerate() {
+                        n_rows += 1;
+                        match std::fs::read(format!("{dir}/sx_{name}_s{s}_t{t}.bin")) {
+                            Ok(b) if b == f32s(l) => {}
+                            Ok(_) => arm_diff += 1,
+                            Err(_) => missing += 1,
+                        }
+                    }
+                }
+                eprintln!("SX compare {name}: {arm_diff} (stream, step) rows differ from {dir}");
+                n_diff += arm_diff;
+            }
+            eprintln!("SX compare: {n_diff} of {n_rows} rows differ, {missing} missing (want 0 / 0)");
+            if n_diff != 0 || missing != 0 || n_rows == 0 {
+                sx_fail.push(format!("{n_diff} of {n_rows} ready-first rows differ from the saved run in {dir} ({missing} missing)"));
+            }
+        }
+    }
 
     if let Ok(dir) = std::env::var("MS_SAVE_LOGITS") {
         let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
@@ -1350,6 +1451,11 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // 4e. G6 -- (stage, rows)-keyed arena graphs (GRAPH_KEYS_DESIGN.md 3; the arenas above). Runs in
     // THIS process after the legacy arms (the knob flips between steps, legacy graphs exist).
     let mut g6_fail: Vec<String> = Vec::new();
+    if g5_graphs.is_some() {
+        // SX gate: G6 is about graphs; its schedule-0 arms then compare graphs-on (shared expert in
+        // place) against the graphs-off G5e logits above.
+        v4flash_kernels::knobs::MS_GRAPHS.set("1");
+    }
     {
         use v4flash_kernels::knobs::{MS_CTX_CARRIER, MS_CTX_CHECK, MS_GRAPH_KEYS, MS_TAINT_PROBE};
         let mut g6_logits: Vec<Vec<Vec<Vec<f32>>>> = Vec::new();
@@ -1788,6 +1894,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     }
     if !g6_fail.is_empty() {
         return Err(eyre!("G6 failed ((stage, rows)-keyed graphs): {}", g6_fail.join("; ")));
+    }
+    if !sx_fail.is_empty() {
+        return Err(eyre!("SX failed (V41_DGPU_SX_DEFER): {}", sx_fail.join("; ")));
     }
     Ok(())
 }

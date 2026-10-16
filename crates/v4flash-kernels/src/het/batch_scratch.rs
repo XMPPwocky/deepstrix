@@ -239,6 +239,35 @@ fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
 /// Costs 3 slots * 128 rows * N_EMBD * 4 B ~= 11 MB.
 pub const MTP_CAP_ROWS: usize = 128;
 
+/// Which call dispatches a deferred shared expert (`V41_DGPU_SX_DEFER`): the call the decode chain
+/// (or, under `V41_PREFILL_PRESUBMIT`, `pre_moe_prep`) would have made in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SxKind {
+    /// Fusion group G4: `issue_g4` (input quantize + the late FFN mixes + the GEMVs).
+    G4,
+    /// `issue_shared_expert_prefill(.., deferred = false)` (the chain's own position).
+    Chain,
+    /// `issue_shared_expert_prefill(.., deferred = true)` (`V41_PREFILL_PRESUBMIT`: after the submit).
+    Presubmit,
+}
+
+/// A lane-layer's shared expert the decode chain left for the ready-first driver to DISPATCH later
+/// on the same stream (`V41_DGPU_SX_DEFER`): flushed right after another lane's chain is enqueued,
+/// or right before this lane's Post (its combine reads `ffn_shared`), or at the driver's exit.
+/// Everything it reads is per-lane (`ffn_input_norm`; G4 also `after_attn_hc`) and stays unwritten
+/// until this lane's next chain; its shared-scratch temporaries are written before they are read
+/// inside the dispatch itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SxPending {
+    /// `DgpuLayerWeights::layer_idx` of the chain that deferred it.
+    pub layer: i32,
+    pub b: u32,
+    pub kind: SxKind,
+    /// The chain's `dump_pos` and `cap_ok`, passed to the dispatch unchanged.
+    pub dump_pos: u32,
+    pub cap_ok: bool,
+}
+
 /// A combine `forward_layer_post_moe_v2` deferred into the next layer's `g6_boundary` launch
 /// (fusion group G6). Everything else it needs is in the lane's scratch: `ffn_moe_recv`,
 /// `ffn_shared`, `after_attn_hc`, `split`, and box 2's partial per `remote`.
@@ -486,6 +515,12 @@ pub struct BatchDgpuScratch {
     /// (`g6_boundary`). Taken by that `pre_moe_chain` (fused, or flushed as the old combine when the
     /// fused path does not apply there); dropped when stale (an aborted step).
     pub g6_pending: Option<G6Pending>,
+    /// `V41_DGPU_SX_DEFER`: set by the ready-first driver for the duration of a step (reset at its
+    /// exit, whatever the outcome): this lane's chain may leave its shared expert in `sx_pending`.
+    /// No other driver sets it.
+    pub sx_defer: bool,
+    /// The shared expert this lane's chain deferred (see [`SxPending`]); `None` outside a step.
+    pub sx_pending: Option<SxPending>,
     /// Request in flight on the remote shard for this lane's layer.
     ///
     /// Submitted in pre-MoE and awaited in POST-MoE, so box 2 computes its half
@@ -1432,6 +1467,8 @@ impl BatchDgpuScratch {
             mhc_ffn_split_pending: false,
             g6_allow: None,
             g6_pending: None,
+            sx_defer: false,
+            sx_pending: None,
             remote_ticket: None,
             remote_late: false,
             ev_req: [f64::NAN; 9],
