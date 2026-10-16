@@ -253,8 +253,9 @@ pub enum SxKind {
 
 /// A lane-layer's shared expert the decode chain left for the ready-first driver to DISPATCH later
 /// on the same stream (`V41_DGPU_SX_DEFER`): flushed right after another lane's chain is enqueued,
-/// or right before this lane's Post (its combine reads `ffn_shared`). Never launched at the driver's
-/// exit: a normal end has none left (asserted), an error exit DROPS it (the step is discarded).
+/// or when the driver has nothing to do and the dGPU stream has drained, or right before this lane's
+/// Post (its combine reads `ffn_shared`). Never launched at the driver's exit: a normal end has none
+/// left (asserted), an error exit DROPS it (the step is discarded).
 /// Everything it reads is per-lane (`ffn_input_norm`; G4 also `after_attn_hc`) and stays unwritten
 /// until this lane's next chain; its shared-scratch temporaries are written before they are read
 /// inside the dispatch itself.
@@ -266,8 +267,10 @@ pub struct SxPending {
     pub kind: SxKind,
     /// The chain's `dump_pos`, passed to the dispatch unchanged.
     pub dump_pos: u32,
-    /// `V41_MS_GRAPHS` when the chain deferred it: always false (`sx_defer_here`); the flush asserts
-    /// it and launches DIRECT whatever the live value is by then.
+    /// The chain's `cap_ok` (stage_b's `g.shared_expert` accounting only: the flush launches direct).
+    pub cap_ok: bool,
+    /// The ONE read of `V41_MS_GRAPHS` the deferral decision used (`sx_defer_here` requires it
+    /// false); the flush asserts it and launches DIRECT whatever the live value is by then.
     pub graphs_at_defer: bool,
 }
 

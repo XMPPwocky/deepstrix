@@ -102,21 +102,42 @@
 //!        b = 1) == their legacy run, with the counters checked as above.
 //!
 //!   SX   DEFERRED SHARED EXPERT (`V41_DGPU_SX_DEFER`, static): the ready-first driver dispatches
-//!        each lane's shared expert behind the other lane's next chain / before its own Post
-//!        instead of at the end of its chain. It engages only with graphs OFF, so the gate runs
-//!        the G5 arms with `MS_G5_GRAPHS=0` (production's `V41_MS_GRAPHS=0`; graphs go back on
-//!        for G6, whose schedule-0 arms then also compare graphs-on / not-deferred against the
-//!        graphs-off G5e logits). Every ready-first arm checks the `SX_*` counters: knob on =>
-//!        every lane-layer of G5e deferred (`steps x N_LAYER x 2`), every deferral dispatched by
-//!        trigger (a) or (b), none dropped (nothing launches at a driver exit; an error exit drops,
-//!        and every arm here must end normally); knob off => none deferred. And the
-//!        two-run bit-for-bit comparison: run 1 (knob unset) with `MS_SAVE_LOGITS=dir` writes the
-//!        ready-first arms' logits (`sx_{rf,spec2,spec2_hold,h2,h2_hold}_s*_t*.bin`; G5e = plain
-//!        streams split between the lanes, i.e. non-ordered cuts; G5g = ordered cuts through one
-//!        stream's block; G5h = cuts between / through two streams' blocks); run 2
-//!        (`V41_DGPU_SX_DEFER=1`) with `MS_COMPARE_LOGITS=dir` must match every one of them bit
-//!        for bit (and its in-process G5e / G5g / G5h gates compare it against the lockstep and
-//!        one-lane drivers, which never defer).
+//!        each lane's shared expert behind the other lane's next chain (a), on an idle loop with
+//!        the dGPU drained (d), or before its own Post (b), instead of at the end of its chain. It
+//!        engages only with graphs OFF, so the gate runs the G5 arms with `MS_G5_GRAPHS=0`
+//!        (production's `V41_MS_GRAPHS=0`; graphs go back on for G6, whose schedule-0 arms then also
+//!        compare graphs-on / not-deferred against the graphs-off G5e logits).
+//!        Counters per ready-first arm (G5e rf, G5g spec2 / hold / unord, G5h h2 / hold): knob on =>
+//!        deferred == a + b + d > 0, none dropped (nothing launches at a driver exit; an error exit
+//!        drops, and every arm here must end normally), and on G5e: deferred == steps x N_LAYER x 2,
+//!        G4 launches == deferred when `V41_DGPU_G4_SHARED` is on (every shared expert went through
+//!        G4 at a flush), G6 deferred > 0 when `V41_DGPU_G6_BOUNDARY` is on with a box 2 (the
+//!        deferred-combine interaction ran); knob off => all zero. NO VACUOUS PASS: the knob on with
+//!        graphs on (`MS_G5_GRAPHS` unset) FAILS, and so does `MS_COMPARE_LOGITS` with nothing
+//!        engaged unless `MS_SX_NULL=1` (the null run, below).
+//!        Negative control (knob on, `MS_SX_NEG=0` skips it): a fresh arena runs 2 more G5e-style
+//!        steps with `SX_TEST_SKIP` (every flush DROPS its shared expert, so each combine reads a
+//!        stale `ffn_shared`): its logits MUST differ from G5e's and the skip counter must move.
+//!        Two-run bit-for-bit compare: `MS_SAVE_LOGITS=dir` also writes the ready-first arms' logits
+//!        (`sx_{rf,spec2,spec2_hold,h2,h2_hold}_s*_t*.bin`: G5e = plain streams split between the
+//!        lanes, non-ordered cuts; G5g = ordered cuts through one stream's block; G5h = cuts between /
+//!        through two streams' blocks); `MS_COMPARE_LOGITS=dir` compares this run's with them.
+//!        THE GATE (box 1 + box 2 attached, hub down; production's fusion knobs -- the same in every
+//!        run; add any other decode knob the hub env sets):
+//!        ```text
+//!        COMMON="HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 \
+//!          V41_REMOTE_ADDR=<box 2 addr:port> V41_REMOTE_SPLIT=1 V41_REMOTE_SPLIT_DECODE=1 \
+//!          V41_DGPU_G4_SHARED=1 V41_DGPU_G6_BOUNDARY=1 MS_G5_GRAPHS=0 MS_STREAMS=4 MS_STEPS=6"
+//!        # null: knob off twice (cross-process determinism of the ready-first arms)
+//!        env $COMMON MS_SAVE_LOGITS=/tmp/sx_off1 cargo test ... multistream_step
+//!        env $COMMON MS_SX_NULL=1 MS_COMPARE_LOGITS=/tmp/sx_off1 cargo test ... multistream_step
+//!        # the change: knob on vs the knob-off run (includes the negative-control arm)
+//!        env $COMMON V41_DGPU_SX_DEFER=1 MS_COMPARE_LOGITS=/tmp/sx_off1 cargo test ... multistream_step
+//!        ```
+//!        G6 (`V41_DGPU_G6_BOUNDARY`) fuses a Post's combine only with box 2's partial
+//!        (`remote_ffn_moe`), so the deferred-combine interaction needs box 2 attached;
+//!        `V41_REMOTE_SPLIT_DECODE` steers the single-stream decode oracle only (the arena drivers
+//!        follow `V41_REMOTE_SPLIT`).
 //!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
@@ -380,25 +401,46 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         eyre::ensure!(v4flash_kernels::knobs::MS_GRAPHS.set(v), "MS_G5_GRAPHS={v}: not a flag value");
         eprintln!("SX: G5 arms with V41_MS_GRAPHS={v}; V41_DGPU_SX_DEFER={}", v4flash_kernels::knobs::DGPU_SX_DEFER.on());
     }
-    let sx_snap = || -> [u64; 4] {
+    // [deferred, a, b, d, dropped, G4 launches, G6 deferred, G6 launches]
+    let sx_snap = || -> [u64; 8] {
         use std::sync::atomic::Ordering::Relaxed;
-        use v4flash_kernels::het::forward_prefill::{SX_DEFERRED, SX_DROPPED, SX_FLUSHED};
-        [SX_DEFERRED.load(Relaxed), SX_FLUSHED[0].load(Relaxed), SX_FLUSHED[1].load(Relaxed), SX_DROPPED.load(Relaxed)]
+        use v4flash_kernels::het::forward_prefill::{G4_LAUNCHES, G6_DEFERRED, G6_LAUNCHES, SX_DEFERRED, SX_DROPPED, SX_FLUSHED};
+        [
+            SX_DEFERRED.load(Relaxed), SX_FLUSHED[0].load(Relaxed), SX_FLUSHED[1].load(Relaxed), SX_FLUSHED[2].load(Relaxed), SX_DROPPED.load(Relaxed),
+            G4_LAUNCHES.load(Relaxed), G6_DEFERRED.load(Relaxed), G6_LAUNCHES.load(Relaxed),
+        ]
     };
+    let sx_knob = v4flash_kernels::knobs::DGPU_SX_DEFER.on();
+    let sx_engaged = || sx_knob && !v4flash_kernels::knobs::MS_GRAPHS.on();
+    let sx_null = std::env::var("MS_SX_NULL").as_deref() == Ok("1");
     // The SX counters of one ready-first arm between two snapshots; `want` = the lane-layers that
     // must have deferred (when every step of the arm went through the ready-first driver).
     let mut sx_fail: Vec<String> = Vec::new();
-    let sx_check = |arm: &str, before: [u64; 4], after: [u64; 4], want: Option<u64>| -> Option<String> {
-        let [d, a, b, drop] = std::array::from_fn::<u64, 4, _>(|k| after[k] - before[k]);
-        let engaged = v4flash_kernels::knobs::DGPU_SX_DEFER.on() && !v4flash_kernels::knobs::MS_GRAPHS.on();
-        eprintln!("SX {arm}: deferred {d} (a: behind another chain {a}, b: at the Post {b}; dropped {drop}){}",
-            want.map_or(String::new(), |w| format!(" of {w} lane-layers")));
-        let bad = if engaged {
-            d == 0 || a + b != d || drop != 0 || want.is_some_and(|w| d != w)
-        } else {
-            d + a + b + drop != 0
-        };
-        bad.then(|| format!("{arm}: SX counters deferred {d} a {a} b {b} dropped {drop} (engaged {engaged}, want {want:?})"))
+    // `want` = Some(lane-layers) on an arm where every step went through the ready-first driver
+    // (G5e): then the deferral count is exact and the G4 / G6 interactions are checked too.
+    let sx_check = |arm: &str, before: [u64; 8], after: [u64; 8], want: Option<u64>| -> Option<String> {
+        let [d, a, b, dd, drop, g4, g6_def, g6_n] = std::array::from_fn::<u64, 8, _>(|k| after[k] - before[k]);
+        let engaged = sx_engaged();
+        eprintln!("SX {arm}: deferred {d} (a: behind another chain {a}, b: at the Post {b}, d: idle {dd}; dropped {drop}); G4 launches {g4}, G6 deferred {g6_def} / fused {g6_n}{}",
+            want.map_or(String::new(), |w| format!("; {w} lane-layers")));
+        let mut why: Vec<String> = Vec::new();
+        if sx_knob && !engaged {
+            why.push("V41_DGPU_SX_DEFER=1 but the deferral cannot engage (graphs on: set MS_G5_GRAPHS=0)".into());
+        }
+        if engaged {
+            if d == 0 || a + b + dd != d || drop != 0 || want.is_some_and(|w| d != w) {
+                why.push(format!("deferred {d} != a {a} + b {b} + d {dd}, or none, or dropped {drop}, or != {want:?}"));
+            }
+            if want.is_some() && v4flash_kernels::knobs::DGPU_G4_SHARED.on() && g4 != d {
+                why.push(format!("G4 on: {g4} G4 launches for {d} deferred shared experts"));
+            }
+            if want.is_some() && v4flash_kernels::knobs::DGPU_G6_BOUNDARY.pick() != 0 && std::env::var("V41_REMOTE_ADDR").is_ok() && g6_def == 0 {
+                why.push("G6 on with a box 2 but no combine was deferred (the deferred-combine interaction did not run)".into());
+            }
+        } else if d + a + b + dd + drop != 0 {
+            why.push(format!("not engaged but deferred {d} a {a} b {b} d {dd} dropped {drop}"));
+        }
+        (!why.is_empty()).then(|| format!("{arm}: {}", why.join("; ")))
     };
     // HOT SPLIT gate arm G-il (docs/v41/HOT_SPLIT_DESIGN.md 7): `MS_HOT_SPLIT=interleave` seeds the
     // hot set with a fixed Zipf count table and refreshes it into the interleave, holder fallback
@@ -524,6 +566,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut arena_pipe = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_stag = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_rf = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    // SX negative control's arena (G5e's admissions), only when the knob is on.
+    let mut arena_sxneg: Option<KvArena> =
+        if v4flash_kernels::knobs::DGPU_SX_DEFER.on() { Some(KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?) } else { None };
     let mut arena_spec = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_spec_true = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_spec2 = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
@@ -604,6 +649,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut slots_pipe: Vec<u32> = Vec::new();
     let mut slots_stag: Vec<u32> = Vec::new();
     let mut slots_rf: Vec<u32> = Vec::new();
+    let mut slots_sxneg: Vec<u32> = Vec::new();
     let mut slots_spec: Vec<u32> = Vec::new();
     let mut slots_spec_true: Vec<u32> = Vec::new();
     let mut slots_spec2: Vec<u32> = Vec::new();
@@ -627,6 +673,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         slots_pipe.push(arena_pipe.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         slots_stag.push(arena_stag.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         slots_rf.push(arena_rf.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
+        if let Some(a) = arena_sxneg.as_mut() {
+            slots_sxneg.push(a.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
+        }
         let cap_spec = cap + ARENA_ROWS_PER_STREAM;
         slots_spec.push(arena_spec.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
         slots_spec_true.push(arena_spec_true.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
@@ -1391,6 +1440,58 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // Every lane-layer of every G5e step defers (no dumps, graphs off): steps x N_LAYER x 2 lanes.
     sx_fail.extend(sx_check("G5e rf", sx_rf0, sx_snap(), Some((n_steps * v4flash_kernels::config::N_LAYER as usize * 2) as u64)));
 
+    // SX negative control (module doc): the G5e schedule on a fresh arena with every flush DROPPED
+    // (`SX_TEST_SKIP`): each combine reads a stale `ffn_shared`, so the logits MUST differ from G5e.
+    if let Some(arena_sxneg) = arena_sxneg.as_mut().filter(|_| sx_engaged() && std::env::var("MS_SX_NEG").as_deref() != Ok("0")) {
+        use std::sync::atomic::Ordering::Relaxed;
+        use v4flash_kernels::het::forward_prefill::{SX_TEST_SKIP, SX_TEST_SKIPPED};
+        let neg_steps = n_steps.min(2);
+        let mut seqs_n: Vec<Vec<i32>> = prompts.clone();
+        let (mut n_rows, mut n_diff) = (0usize, 0usize);
+        let skipped0 = SX_TEST_SKIPPED.load(Relaxed);
+        SX_TEST_SKIP.store(true, Relaxed);
+        let res = (|| -> eyre::Result<()> {
+            for t in 0..neg_steps {
+                let toks: Vec<i32> = (0..n_streams).map(|s| cont[s][t]).collect();
+                let mut rows_b = vec![vec![0f32; n_streams * ein]; ENGRAM_LAYERS.len()];
+                let mut hcs = Vec::with_capacity(n_streams);
+                for s in 0..n_streams {
+                    let pos = seqs_n[s].len();
+                    seqs_n[s].push(toks[s]);
+                    for (li, r) in engram.rows_at(pg.raw(), &seqs_n[s], pos)?.iter().enumerate() {
+                        rows_b[li][s * ein..(s + 1) * ein].copy_from_slice(r);
+                    }
+                    hcs.push(embed(toks[s])?);
+                }
+                {
+                    let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev); 2] =
+                        [(&mut bd_a, &mut bi_a, &mut dev), (&mut bd_b, &mut bi_b, &mut dev_b)];
+                    engine.forward_step_arena_ready_first(
+                        &mut lanes, &mut sd, &mut si, arena_sxneg, &StepRows::plain(&slots_sxneg)?, &weights,
+                        &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b)), Some(&mut pg),
+                    )?;
+                }
+                for &sl in &slots_sxneg {
+                    arena_sxneg.accept(sl, 1, &engine.dgpu.compute)?;
+                }
+                let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
+                all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
+                for s in 0..n_streams {
+                    n_rows += 1;
+                    n_diff += usize::from(all[s * nv..(s + 1) * nv] != logits_rf[s][t][..]);
+                }
+            }
+            Ok(())
+        })();
+        SX_TEST_SKIP.store(false, Relaxed);
+        res?;
+        let skipped = SX_TEST_SKIPPED.load(Relaxed) - skipped0;
+        eprintln!("SX negative control (flush skipped): {n_diff} of {n_rows} rows differ from G5e (want > 0), {skipped} shared experts dropped");
+        if n_diff == 0 || skipped == 0 {
+            sx_fail.push(format!("negative control: skipping the flush changed {n_diff} of {n_rows} rows ({skipped} dropped) -- the gate cannot see a missing shared expert"));
+        }
+    }
+
     // SX: the ready-first arms' logits, saved (run 1) or compared bit for bit (run 2).
     {
         let sx_arms: [(&str, &Vec<Vec<Vec<f32>>>); 5] = [
@@ -1413,6 +1514,14 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             eprintln!("SX: saved the ready-first arms' logits to {dir}");
         }
         if let Ok(dir) = std::env::var("MS_COMPARE_LOGITS") {
+            if !sx_engaged() && !sx_null {
+                sx_fail.push(format!(
+                    "MS_COMPARE_LOGITS={dir} with the deferral NOT engaged (V41_DGPU_SX_DEFER={sx_knob}, graphs on: {}): \
+                     a vacuous compare (MS_SX_NULL=1 marks the knob-off null run)",
+                    v4flash_kernels::knobs::MS_GRAPHS.on()
+                ));
+            }
+            eprintln!("SX compare: {} run against {dir}", if sx_engaged() { "deferral" } else { "NULL (knob off)" });
             let (mut n_rows, mut n_diff, mut missing) = (0usize, 0usize, 0usize);
             for (name, lg) in sx_arms {
                 let mut arm_diff = 0usize;

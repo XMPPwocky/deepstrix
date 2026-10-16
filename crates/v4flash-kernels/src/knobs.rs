@@ -961,13 +961,14 @@ crate::knobs! {
     /// the decode shared expert (G4's launch + GEMVs, or the plain chain; ~92 us per lane-layer) is
     /// not enqueued at the end of its lane's chain but DISPATCHED later on the same in-order dGPU
     /// stream (`BatchDgpuScratch::sx_pending`): right after the OTHER lane's next chain is enqueued
-    /// (so that chain no longer queues behind it), else right before this lane's Post (its combine
+    /// (so that chain no longer queues behind it), else when the driver has nothing ready and the
+    /// dGPU stream has drained (it idles anyway), else right before this lane's Post (its combine
     /// reads `ffn_shared`). Never launched at the driver's exit: an error exit drops what is
     /// pending (the step is discarded). Same kernels, inputs and outputs, only the enqueue position
     /// moves; the flush always launches direct. Only where no graph can capture it (`V41_MS_GRAPHS`
     /// off at defer time), no mHC split, no dumps; the lockstep / pipelined / single-lane drivers
     /// and prefill never defer. Counters `forward_prefill::SX_*` (`ms.step` sx_def / sx_a / sx_b /
-    /// sx_drop).
+    /// sx_d / sx_drop: sx_b = the share whose ~92 us landed on its own lane's path).
     pub static DGPU_SX_DEFER = Knob::flag("V41_DGPU_SX_DEFER", false);
     pub static DGPU_G6_BOUNDARY = Knob::choice("V41_DGPU_G6_BOUNDARY", 0, &[&["off", "0"], &["early", "1", "on"], &["zc"]]).live();
     /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
