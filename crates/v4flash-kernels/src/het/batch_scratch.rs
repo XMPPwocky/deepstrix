@@ -253,7 +253,8 @@ pub enum SxKind {
 
 /// A lane-layer's shared expert the decode chain left for the ready-first driver to DISPATCH later
 /// on the same stream (`V41_DGPU_SX_DEFER`): flushed right after another lane's chain is enqueued,
-/// or right before this lane's Post (its combine reads `ffn_shared`), or at the driver's exit.
+/// or right before this lane's Post (its combine reads `ffn_shared`). Never launched at the driver's
+/// exit: a normal end has none left (asserted), an error exit DROPS it (the step is discarded).
 /// Everything it reads is per-lane (`ffn_input_norm`; G4 also `after_attn_hc`) and stays unwritten
 /// until this lane's next chain; its shared-scratch temporaries are written before they are read
 /// inside the dispatch itself.
@@ -263,9 +264,11 @@ pub struct SxPending {
     pub layer: i32,
     pub b: u32,
     pub kind: SxKind,
-    /// The chain's `dump_pos` and `cap_ok`, passed to the dispatch unchanged.
+    /// The chain's `dump_pos`, passed to the dispatch unchanged.
     pub dump_pos: u32,
-    pub cap_ok: bool,
+    /// `V41_MS_GRAPHS` when the chain deferred it: always false (`sx_defer_here`); the flush asserts
+    /// it and launches DIRECT whatever the live value is by then.
+    pub graphs_at_defer: bool,
 }
 
 /// A combine `forward_layer_post_moe_v2` deferred into the next layer's `g6_boundary` launch
@@ -516,7 +519,8 @@ pub struct BatchDgpuScratch {
     /// fused path does not apply there); dropped when stale (an aborted step).
     pub g6_pending: Option<G6Pending>,
     /// `V41_DGPU_SX_DEFER`: set by the ready-first driver for the duration of a step (reset at its
-    /// exit, whatever the outcome): this lane's chain may leave its shared expert in `sx_pending`.
+    /// exit, whatever the outcome; pending entries are dropped on an error exit): this lane's chain
+    /// may leave its shared expert in `sx_pending`.
     /// No other driver sets it.
     pub sx_defer: bool,
     /// The shared expert this lane's chain deferred (see [`SxPending`]); `None` outside a step.

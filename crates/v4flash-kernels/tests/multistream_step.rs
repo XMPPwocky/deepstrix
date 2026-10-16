@@ -108,7 +108,8 @@
 //!        for G6, whose schedule-0 arms then also compare graphs-on / not-deferred against the
 //!        graphs-off G5e logits). Every ready-first arm checks the `SX_*` counters: knob on =>
 //!        every lane-layer of G5e deferred (`steps x N_LAYER x 2`), every deferral dispatched by
-//!        trigger (a) or (b), none at the exit, none dropped; knob off => none deferred. And the
+//!        trigger (a) or (b), none dropped (nothing launches at a driver exit; an error exit drops,
+//!        and every arm here must end normally); knob off => none deferred. And the
 //!        two-run bit-for-bit comparison: run 1 (knob unset) with `MS_SAVE_LOGITS=dir` writes the
 //!        ready-first arms' logits (`sx_{rf,spec2,spec2_hold,h2,h2_hold}_s*_t*.bin`; G5e = plain
 //!        streams split between the lanes, i.e. non-ordered cuts; G5g = ordered cuts through one
@@ -379,25 +380,25 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         eyre::ensure!(v4flash_kernels::knobs::MS_GRAPHS.set(v), "MS_G5_GRAPHS={v}: not a flag value");
         eprintln!("SX: G5 arms with V41_MS_GRAPHS={v}; V41_DGPU_SX_DEFER={}", v4flash_kernels::knobs::DGPU_SX_DEFER.on());
     }
-    let sx_snap = || -> [u64; 5] {
+    let sx_snap = || -> [u64; 4] {
         use std::sync::atomic::Ordering::Relaxed;
         use v4flash_kernels::het::forward_prefill::{SX_DEFERRED, SX_DROPPED, SX_FLUSHED};
-        [SX_DEFERRED.load(Relaxed), SX_FLUSHED[0].load(Relaxed), SX_FLUSHED[1].load(Relaxed), SX_FLUSHED[2].load(Relaxed), SX_DROPPED.load(Relaxed)]
+        [SX_DEFERRED.load(Relaxed), SX_FLUSHED[0].load(Relaxed), SX_FLUSHED[1].load(Relaxed), SX_DROPPED.load(Relaxed)]
     };
     // The SX counters of one ready-first arm between two snapshots; `want` = the lane-layers that
     // must have deferred (when every step of the arm went through the ready-first driver).
     let mut sx_fail: Vec<String> = Vec::new();
-    let sx_check = |arm: &str, before: [u64; 5], after: [u64; 5], want: Option<u64>| -> Option<String> {
-        let [d, a, b, c, drop] = std::array::from_fn::<u64, 5, _>(|k| after[k] - before[k]);
+    let sx_check = |arm: &str, before: [u64; 4], after: [u64; 4], want: Option<u64>| -> Option<String> {
+        let [d, a, b, drop] = std::array::from_fn::<u64, 4, _>(|k| after[k] - before[k]);
         let engaged = v4flash_kernels::knobs::DGPU_SX_DEFER.on() && !v4flash_kernels::knobs::MS_GRAPHS.on();
-        eprintln!("SX {arm}: deferred {d} (a: behind another chain {a}, b: at the Post {b}, c: at the exit {c}; dropped {drop}){}",
+        eprintln!("SX {arm}: deferred {d} (a: behind another chain {a}, b: at the Post {b}; dropped {drop}){}",
             want.map_or(String::new(), |w| format!(" of {w} lane-layers")));
         let bad = if engaged {
-            d == 0 || a + b + c != d || c != 0 || drop != 0 || want.is_some_and(|w| d != w)
+            d == 0 || a + b != d || drop != 0 || want.is_some_and(|w| d != w)
         } else {
-            d + a + b + c + drop != 0
+            d + a + b + drop != 0
         };
-        bad.then(|| format!("{arm}: SX counters deferred {d} a {a} b {b} c {c} dropped {drop} (engaged {engaged}, want {want:?})"))
+        bad.then(|| format!("{arm}: SX counters deferred {d} a {a} b {b} dropped {drop} (engaged {engaged}, want {want:?})"))
     };
     // HOT SPLIT gate arm G-il (docs/v41/HOT_SPLIT_DESIGN.md 7): `MS_HOT_SPLIT=interleave` seeds the
     // hot set with a fixed Zipf count table and refreshes it into the interleave, holder fallback
