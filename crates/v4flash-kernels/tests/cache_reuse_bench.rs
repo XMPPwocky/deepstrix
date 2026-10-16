@@ -7,7 +7,7 @@
 //! Measured per (M size, M load policy, S size, S load policy):
 //!   [flush: 512 MB passes HT, LU, RT] -> M cold -> S MB of other weights -> M re-read
 //! and, as the best case, [flush] -> M cold -> M warm (immediately). HT evicts M whatever its hint,
-//! LU marks those lines evictable, RT restores the ordinary state (sanity row: vs an RT-only flush).
+//! LU marks those lines evictable, RT restores the ordinary state (sanity row: vs a PRISTINE RT-only-flush baseline taken before any hinted load).
 //!
 //! How to read it:
 //!   Q1-A: cold/warm for RT on 44/55 MB must be clearly > 1 (the IC can hold M at all); the
@@ -401,9 +401,45 @@ fn q1(dev: &Device, t_start: Instant, failures: &mut Vec<String>, summary: &mut 
     // The per-rep FLUSH: three passes over the 512 MB other buffer. HT evicts M's lines whatever
     // hint they were loaded with; LU (last use) then marks those HT lines evictable, so the RT
     // pass replaces them and leaves the cache in the ordinary RT state. The sanity row in Q1-A
-    // compares this against an RT-only flush.
+    // compares this against the PRISTINE baseline below.
     const FLUSH_LDS: [Ld; 3] = [Ld::Aux(2), Ld::Aux(3), Ld::Aux(0)];
     const NF: usize = 3; // ops of the flush; timed ops start at st[NF]
+
+    // PRISTINE baseline, FIRST: 44 MB RT cold/warm after an RT-only flush, before any HT / LU /
+    // NT_HT load has run on this device (if hinted lines were sticky, a baseline taken later would
+    // be polluted the same way as the rows it is meant to check). Only RT loads and the fill's
+    // stores run before it.
+    if !check_flush(&mut b, &other, flush_rows, &mut out_s, &other_sums, &[Ld::Aux(0)], "Q1")? {
+        summary.push(format!("Q1 ABORTED: flush checksums wrong (dword3 {:#010x}; try CACHE_PROBE_W3)", b.probe.w3));
+        return Ok(());
+    }
+    let pristine = {
+        let rows = rows_for(44 * MB);
+        let m = DeviceBuffer::<u8>::new(id, rows as usize * ROW_BYTES as usize)?;
+        let seed = 0x0F44;
+        b.fill(m.raw(), m.byte_len(), seed)?;
+        for _ in 0..30 {
+            b.launch(&rd(other.raw(), flush_rows, Ld::Aux(0), &out_s))?; // RT-only clock ramp
+        }
+        b.s.synchronize()?;
+        let ops = [
+            rd(other.raw(), flush_rows, Ld::Aux(0), &out_s),
+            rd(m.raw(), rows, Ld::Aux(0), &out_m),
+            rd(m.raw(), rows, Ld::Aux(0), &out_m),
+        ];
+        let r = b.measure(&ops, n, "Q1 pristine")?;
+        let ok = b.check(&out_m, &expected_row_sums(rows, seed), "Q1 pristine 44 MB RT")?;
+        eprintln!(
+            "    PRISTINE 44 MB RT (RT-only flush, before any hinted load): cold {:.1} us, warm {:.1} us, x{:.2}{}",
+            r[1].med,
+            r[2].med,
+            r[1].med / r[2].med,
+            if ok { "" } else { "  CHECKSUM BAD" }
+        );
+        (r[1].med, r[2].med)
+    };
+
+    // Now the hinted flush passes themselves.
     if !check_flush(&mut b, &other, flush_rows, &mut out_s, &other_sums, &FLUSH_LDS, "Q1")? {
         summary.push(format!("Q1 ABORTED: flush checksums wrong (dword3 {:#010x}; try CACHE_PROBE_W3)", b.probe.w3));
         return Ok(());
@@ -466,22 +502,27 @@ fn q1(dev: &Device, t_start: Instant, failures: &mut Vec<String>, summary: &mut 
             );
             a_of.insert((mb, ld), (c.med, w.med));
 
-            // Sanity: the 3-pass flush must leave the same state an RT-only flush does.
+            // Sanity: the 3-pass flush (after HT / LU / NT_HT loads have run) must give the
+            // PRISTINE RT-only numbers measured before any hinted load touched the dGPU.
             if mb == 44 && ld == Ld::Aux(0) {
-                let ops = [
-                    rd(other.raw(), flush_rows, Ld::Aux(0), &out_s),
-                    rd(m.raw(), rows, ld, &out_m),
-                    rd(m.raw(), rows, ld, &out_m),
-                ];
-                let r = b.measure(&ops, n, "Q1-A sanity")?;
-                let (rc, rw) = (r[1].med, r[2].med);
-                let off = ((rc - c.med) / c.med).abs().max(((rw - w.med) / w.med).abs());
-                let verdict = if off <= 0.05 { "match" } else { "MISMATCH (>5%): the HT/LU passes leave a different cache state" };
+                let (pc, pw) = pristine;
+                let off = ((pc - c.med) / pc).abs().max(((pw - w.med) / pw).abs());
+                let verdict = if off <= 0.05 {
+                    "match".to_string()
+                } else {
+                    format!(
+                        "MISMATCH ({:.0}% > 5%): hinted lines change the cache state (sticky HT?) -- Q1 rows are suspect",
+                        100.0 * off
+                    )
+                };
                 eprintln!(
-                    "  sanity 44 MB RT: HT+LU+RT flush cold/warm {:.1}/{:.1} us vs RT-only flush {rc:.1}/{rw:.1} us -> {verdict}",
+                    "  sanity 44 MB RT: HT+LU+RT flush cold/warm {:.1}/{:.1} us vs PRISTINE RT-only {pc:.1}/{pw:.1} us -> {verdict}",
                     c.med, w.med
                 );
-                summary.push(format!("Q1 flush sanity (44 MB RT, 3-pass vs RT-only flush): {verdict}"));
+                summary.push(format!(
+                    "Q1 flush sanity (44 MB RT cold/warm, 3-pass flush {:.1}/{:.1} vs pristine RT-only {pc:.1}/{pw:.1} us): {verdict}",
+                    c.med, w.med
+                ));
             }
         }
         drop(m);
