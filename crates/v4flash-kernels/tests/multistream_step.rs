@@ -122,12 +122,28 @@
 //!        (`sx_{rf,spec2,spec2_hold,h2,h2_hold}_s*_t*.bin`: G5e = plain streams split between the
 //!        lanes, non-ordered cuts; G5g = ordered cuts through one stream's block; G5h = cuts between /
 //!        through two streams' blocks); `MS_COMPARE_LOGITS=dir` compares this run's with them.
-//!        THE GATE (box 1 + box 2 attached, hub down; production's fusion knobs -- the same in every
-//!        run; add any other decode knob the hub env sets):
+//!        THE GATE (box 1 + box 2 attached, hub down). The SAME env in every run:
+//!        - CARRY, at the hub's production values (copy each from the hub's effective knob table,
+//!          `<V41_KNOBS_FILE>.effective`, or its env file): `V41_DGPU_G1_FUSED`, `V41_DGPU_QKV_FRONT`,
+//!          `V41_ATTN_G3`, `V41_ATTN_G3_KERNEL`, `V41_DGPU_G4_SHARED`, `V41_DGPU_G6_BOUNDARY`,
+//!          `V41_MOE_PAIR_DEC`, `V41_MOE_DOWN_DN3`; and set `V41_REMOTE_ADDR=<box 2>`,
+//!          `V41_REMOTE_SPLIT=1`, `V41_REMOTE_SPLIT_DECODE=1`, `V41_INDEX_K=1`,
+//!          `V41_CANDIDATE_POOL=1`, `V41_CED=1`, `V41_PAGED_EXPERTS=1`, `MS_G5_GRAPHS=0`
+//!          (production's `V41_MS_GRAPHS=0` for the G5 arms; do NOT set `V41_MS_GRAPHS=0` itself:
+//!          G6 needs graphs on), `MS_STREAMS=4`, `MS_STEPS=6`.
+//!        - UNSET (residency-dependent routing / paging: a cross-run compare would see placement,
+//!          not the change): every `V41_SUB*` (the cache prior `V41_SUB=3` and the mode-2
+//!          substitution read box-2 residency), every `V41_B1_HOT_*` (hot-set refresh / placement),
+//!          every `V41_B2_MISS_PREFETCH*`, `V41_B2_PIN*`, `MS_HOT_SPLIT`. The harness FAILS before
+//!          running when any of these is set in an SX run (knob on, `MS_G5_GRAPHS`,
+//!          `MS_COMPARE_LOGITS` or `MS_SX_NULL` set), and when the knob or a compare runs with G6 on
+//!          and no box 2 (`V41_REMOTE_ADDR` unset: not the production config).
 //!        ```text
-//!        COMMON="HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 \
+//!        COMMON="HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 V41_CED=1 \
 //!          V41_REMOTE_ADDR=<box 2 addr:port> V41_REMOTE_SPLIT=1 V41_REMOTE_SPLIT_DECODE=1 \
-//!          V41_DGPU_G4_SHARED=1 V41_DGPU_G6_BOUNDARY=1 MS_G5_GRAPHS=0 MS_STREAMS=4 MS_STEPS=6"
+//!          V41_DGPU_G1_FUSED=<prod> V41_DGPU_QKV_FRONT=<prod> V41_ATTN_G3=<prod> V41_ATTN_G3_KERNEL=<prod> \
+//!          V41_DGPU_G4_SHARED=<prod, 1> V41_DGPU_G6_BOUNDARY=<prod, 1> V41_MOE_PAIR_DEC=<prod> V41_MOE_DOWN_DN3=<prod> \
+//!          MS_G5_GRAPHS=0 MS_STREAMS=4 MS_STEPS=6"
 //!        # null: knob off twice (cross-process determinism of the ready-first arms)
 //!        env $COMMON MS_SAVE_LOGITS=/tmp/sx_off1 cargo test ... multistream_step
 //!        env $COMMON MS_SX_NULL=1 MS_COMPARE_LOGITS=/tmp/sx_off1 cargo test ... multistream_step
@@ -137,7 +153,7 @@
 //!        G6 (`V41_DGPU_G6_BOUNDARY`) fuses a Post's combine only with box 2's partial
 //!        (`remote_ffn_moe`), so the deferred-combine interaction needs box 2 attached;
 //!        `V41_REMOTE_SPLIT_DECODE` steers the single-stream decode oracle only (the arena drivers
-//!        follow `V41_REMOTE_SPLIT`).
+//!        follow `V41_REMOTE_SPLIT`). The run prints the carried knobs' values ("SX env:").
 //!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
@@ -413,6 +429,41 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let sx_knob = v4flash_kernels::knobs::DGPU_SX_DEFER.on();
     let sx_engaged = || sx_knob && !v4flash_kernels::knobs::MS_GRAPHS.on();
     let sx_null = std::env::var("MS_SX_NULL").as_deref() == Ok("1");
+    // SX preflight (module doc, THE GATE): an SX run must be the production configuration and must
+    // not route by residency. Fail before the long run, loudly.
+    let sx_run = sx_knob || g5_graphs.is_some() || sx_null || std::env::var("MS_COMPARE_LOGITS").is_ok();
+    if sx_run {
+        let carried = [
+            "V41_DGPU_G1_FUSED", "V41_DGPU_QKV_FRONT", "V41_ATTN_G3", "V41_ATTN_G3_KERNEL", "V41_DGPU_G4_SHARED", "V41_DGPU_G6_BOUNDARY",
+            "V41_MOE_PAIR_DEC", "V41_MOE_DOWN_DN3", "V41_REMOTE_ADDR", "V41_REMOTE_SPLIT", "V41_REMOTE_SPLIT_DECODE", "V41_INDEX_K",
+            "V41_CANDIDATE_POOL", "V41_CED", "V41_PAGED_EXPERTS", "V41_DGPU_SX_DEFER", "MS_G5_GRAPHS",
+        ];
+        eprintln!(
+            "SX env: {}",
+            carried.iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_else(|_| "<unset>".into()))).collect::<Vec<_>>().join(" ")
+        );
+        let forbidden: Vec<String> = std::env::vars()
+            .map(|(k, _)| k)
+            .filter(|k| {
+                k.starts_with("V41_SUB") || k.starts_with("V41_B1_HOT_") || k.starts_with("V41_B2_MISS_PREFETCH") || k.starts_with("V41_B2_PIN") || k == "MS_HOT_SPLIT"
+            })
+            .collect();
+        if v4flash_kernels::het::b2_mirror::mode() == 3 {
+            return Err(eyre!("SX gate: V41_SUB=3 (the cache prior) is set: it routes by box-2 residency, so a cross-run compare is invalid; unset it"));
+        }
+        if !forbidden.is_empty() {
+            return Err(eyre!("SX gate: residency-dependent knobs are set ({}); unset them (module doc, THE GATE)", forbidden.join(", ")));
+        }
+        if (sx_knob || std::env::var("MS_COMPARE_LOGITS").is_ok())
+            && v4flash_kernels::knobs::DGPU_G6_BOUNDARY.pick() != 0
+            && std::env::var("V41_REMOTE_ADDR").is_err()
+        {
+            return Err(eyre!(
+                "SX gate: V41_DGPU_G6_BOUNDARY is on but no box 2 is attached (V41_REMOTE_ADDR unset): not the production config \
+                 (G6 fuses only with box 2's partial, so the deferred-combine interaction would not run)"
+            ));
+        }
+    }
     // The SX counters of one ready-first arm between two snapshots; `want` = the lane-layers that
     // must have deferred (when every step of the arm went through the ready-first driver).
     let mut sx_fail: Vec<String> = Vec::new();
@@ -434,8 +485,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             if want.is_some() && v4flash_kernels::knobs::DGPU_G4_SHARED.on() && g4 != d {
                 why.push(format!("G4 on: {g4} G4 launches for {d} deferred shared experts"));
             }
-            if want.is_some() && v4flash_kernels::knobs::DGPU_G6_BOUNDARY.pick() != 0 && std::env::var("V41_REMOTE_ADDR").is_ok() && g6_def == 0 {
-                why.push("G6 on with a box 2 but no combine was deferred (the deferred-combine interaction did not run)".into());
+            // (G6 on without a box 2 already failed the preflight.)
+            if want.is_some() && v4flash_kernels::knobs::DGPU_G6_BOUNDARY.pick() != 0 && g6_def == 0 {
+                why.push("G6 on but no combine was deferred (the deferred-combine interaction did not run)".into());
             }
         } else if d + a + b + dd + drop != 0 {
             why.push(format!("not engaged but deferred {d} a {a} b {b} d {dd} dropped {drop}"));
