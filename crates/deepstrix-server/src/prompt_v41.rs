@@ -35,9 +35,9 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_core::BpeVocab;
 
 use crate::dsml::to_json_hf;
-use crate::openai::types::{ChatMessage, ContentPart, Role, ToolCall, ToolDef};
+use crate::openai::types::{ChatCompletionRequest, ChatMessage, ContentPart, Role, ToolCall, ToolDef};
 use crate::prompt::{
-    encode_segments, Seg, ASSISTANT_TEXT, BOS_TEXT, EOS_TEXT, THINK_BEGIN_TEXT, THINK_END_TEXT, USER_TEXT,
+    encode_segments, ReasoningEffort, Seg, ASSISTANT_TEXT, BOS_TEXT, EOS_TEXT, THINK_BEGIN_TEXT, THINK_END_TEXT, USER_TEXT,
 };
 use crate::prompt_v41_templates::{
     REASONING_EFFORT_FMT_PREFIX, REASONING_EFFORT_FMT_SUFFIX, TOOLS_HEAD, TOOLS_TAIL,
@@ -618,6 +618,91 @@ pub fn render_prompt_v41(
         ));
     }
     let (segs, image_order) = build_v41(messages, tools, thinking, effort, context)?;
+    Ok((encode_segments(vocab, &segs, image_placeholder), image_order))
+}
+
+// ----- request-level entry point (what `handler::chat_completions` renders) -----
+
+/// The 4-state effort and the explicit numeric budget (if any) a request
+/// asks for. `default_effort` is the operator default
+/// (`--default-reasoning-effort`) for a request that names none.
+///
+/// A NUMERIC `reasoning_effort` ("88" or 88) is V4.1's native 1..=100
+/// budget: thinking on, budget as given (0 = off). Clients that spread their
+/// effort ladder over numbers (prime-agent's thinkingLevelMap) get finer
+/// grain than the three named tiers.
+pub fn request_effort(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> Result<(ReasoningEffort, Option<u8>), String> {
+    let numeric_budget: Option<u8> = req
+        .reasoning_effort
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|n| if (0..=100).contains(&n) { Ok(n as u8) } else { Err(format!("reasoning_effort {n} outside 0..=100")) })
+        .transpose()?;
+    let effort = match numeric_budget {
+        Some(0) => ReasoningEffort::Off,
+        Some(n) if n >= 100 => ReasoningEffort::Max,
+        Some(n) if n > 50 => ReasoningEffort::High,
+        Some(_) => ReasoningEffort::Low,
+        None => ReasoningEffort::from_request_fields_with_default(
+            req.reasoning.as_deref(),
+            req.reasoning_effort.as_deref(),
+            default_effort,
+        )?,
+    };
+    Ok((effort, numeric_budget))
+}
+
+/// The V4.1 thinking flag and 1..=100 budget for a request.
+pub fn request_thinking_v41(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> Result<(bool, V41Effort), String> {
+    let (effort, numeric_budget) = request_effort(req, default_effort)?;
+    // The 4-state effort carries the thinking flag; V4.1 wants a 1..=100
+    // budget alongside it. An explicit integer in the request wins.
+    let budget = numeric_budget
+        .filter(|&n| n >= 1)
+        .map(V41Effort)
+        // A named level ("minimal" = 25, ...): `reasoning_effort` wins, else letta's `reasoning`.
+        .or_else(|| match req.reasoning_effort.as_deref() {
+            Some(s) => V41Effort::from_name(s),
+            None => req.reasoning.as_deref().and_then(V41Effort::from_name),
+        })
+        .unwrap_or(match effort {
+            ReasoningEffort::Off | ReasoningEffort::Low => V41Effort(50),
+            ReasoningEffort::High => V41Effort(75),
+            ReasoningEffort::Max => V41Effort(100),
+        });
+    Ok((effort.thinking_enabled(), budget))
+}
+
+/// The request's prompt segments and image order — exactly what the server
+/// renders for `/v1/chat/completions` (`handler::chat_completions`), from the
+/// request as deserialized. `tests/oracle_prompt.rs` diffs this against
+/// DeepSeek's reference implementation.
+pub fn request_segments_v41(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> eyre::Result<(Vec<Seg>, Vec<usize>)> {
+    let (thinking, budget) = request_thinking_v41(req, default_effort).map_err(|e| eyre!(e))?;
+    // V4.1's separate `context` block: nothing in the OpenAI API maps to it.
+    build_v41(&req.messages, req.tools.as_deref(), thinking, budget, None)
+}
+
+/// [`request_segments_v41`] as text.
+pub fn render_request_text_v41(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> eyre::Result<String> {
+    Ok(request_segments_v41(req, default_effort)?.0.iter().map(Seg::text).collect())
+}
+
+/// [`request_segments_v41`] as token ids (see [`render_prompt_v41`] for
+/// `image_placeholder` and the returned image order).
+pub fn render_request_v41(
+    vocab: &BpeVocab,
+    req: &ChatCompletionRequest,
+    default_effort: ReasoningEffort,
+    image_placeholder: Option<i32>,
+) -> eyre::Result<(Vec<i32>, Vec<usize>)> {
+    if image_placeholder.is_none() && req.messages.iter().any(|m| m.has_images()) {
+        return Err(eyre!(
+            "V4.1 prompt: a message has image parts but the loaded vocab has no `{}` token",
+            v4flash_vision::IMAGE_PLACEHOLDER
+        ));
+    }
+    let (segs, image_order) = request_segments_v41(req, default_effort)?;
     Ok((encode_segments(vocab, &segs, image_placeholder), image_order))
 }
 
