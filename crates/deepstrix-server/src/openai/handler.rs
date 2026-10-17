@@ -30,8 +30,8 @@ impl Drop for CancelOnDrop {
     }
 }
 
-use crate::dsml::{DsmlEvent, DsmlScanner};
-use crate::engine_worker::{accumulate, EngineHandle, GenerateReq, SubmitError, WorkerEvent};
+use crate::dsml::{DsmlEvent, OutputSplitter, SplitEvent};
+use crate::engine_worker::{accumulate_with, EngineHandle, GenerateReq, SubmitError, WorkerEvent};
 use crate::openai::error::ApiError;
 use crate::openai::sse::{
     encode_chunk, reasoning_delta, role_delta, text_delta, tool_call_args_delta,
@@ -333,6 +333,12 @@ pub async fn chat_completions(
     })?;
 
     let tok_dsml = engine.vocab.dsml_id;
+    // A required / named tool choice ends the V4.1 prompt inside an open
+    // `<｜DSML｜ calls>` block: the output scanner starts in it.
+    #[cfg(feature = "v41")]
+    let start_in_tool_calls = crate::prompt_v41::request_starts_in_tool_calls(&req, engine.default_reasoning_effort);
+    #[cfg(not(feature = "v41"))]
+    let start_in_tool_calls = false;
     if stream {
         // The cancel guard moves into the SSE driver. When the
         // SSE response (and its task) is dropped — e.g. client
@@ -350,6 +356,7 @@ pub async fn chat_completions(
             prompt_tokens_count,
             tok_dsml,
             stop,
+            start_in_tool_calls,
         ));
         let stream = poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx));
         Ok(Sse::new(stream)
@@ -357,7 +364,7 @@ pub async fn chat_completions(
             .into_response())
     } else {
         let guard = CancelOnDrop(cancel);
-        let result = accumulate(rx, tok_dsml, stop).await.map_err(ApiError::from)?;
+        let result = accumulate_with(rx, tok_dsml, stop, start_in_tool_calls).await.map_err(ApiError::from)?;
         // Also how a stop-string match ends the generation (`openai::stop`).
         drop(guard);
         let completion_tokens = result.completion_tokens;
@@ -564,6 +571,7 @@ async fn drive_sse_stream(
     prompt_tokens: u32,
     tok_dsml: Option<i32>,
     stop: Vec<String>,
+    start_in_tool_calls: bool,
 ) {
     let created = unix_now();
     let send = |delta: ChunkDelta,
@@ -587,7 +595,8 @@ async fn drive_sse_stream(
     // to a sentinel that never matches — effectively disabling DSML
     // detection.
     let scanner_tok_dsml = tok_dsml.unwrap_or(-1);
-    let mut scanner = DsmlScanner::new(scanner_tok_dsml);
+    // Reasoning / content split + the scanner, shared with `accumulate`.
+    let mut splitter = OutputSplitter::new(scanner_tok_dsml, start_in_tool_calls);
     let mut sent_tool_index: u32 = 0;
     let mut saw_tool = false;
     let mut finish_reason: &'static str = "stop";
@@ -642,19 +651,22 @@ async fn drive_sse_stream(
                 reasoning,
             } => {
                 n_chunks += 1;
-                if reasoning {
-                    let s = drain_valid_utf8(&mut reasoning_pending, &bytes);
-                    if !s.is_empty()
-                        && out.send(send(reasoning_delta(s), None)).await.is_err()
-                    {
-                        return;
-                    }
-                    continue;
-                }
-                // Drive the scanner with the actual token-id + bytes;
-                // it suppresses TOK_DSML bytes regardless and emits
-                // clean Text/ToolCall events.
-                for de in scanner.push_token(token_id, &bytes) {
+                // The splitter drives the scanner with the actual token-id
+                // + bytes; it suppresses TOK_DSML bytes regardless and
+                // emits clean Reasoning/Text/ToolCall events.
+                for se in splitter.push(token_id, &bytes, reasoning) {
+                    let de = match se {
+                        SplitEvent::Reasoning(b) => {
+                            let s = drain_valid_utf8(&mut reasoning_pending, &b);
+                            if !s.is_empty()
+                                && out.send(send(reasoning_delta(s), None)).await.is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        SplitEvent::Dsml(de) => de,
+                    };
                     match de {
                         DsmlEvent::Text(t) => {
                             let s = stop.push(&drain_valid_utf8(&mut content_pending, &t));
@@ -738,10 +750,22 @@ async fn drive_sse_stream(
                 // tags) — stream them exactly like live ones. A call the
                 // token cap cut off is dropped, not repaired, and the
                 // turn reports "length" below, not "tool_calls".
-                for de in scanner.finish(matches!(
+                for se in splitter.finish(matches!(
                     finish,
                     crate::engine_worker::FinishReason::Length
                 )) {
+                    let de = match se {
+                        SplitEvent::Reasoning(b) => {
+                            let s = drain_valid_utf8(&mut reasoning_pending, &b);
+                            if !s.is_empty()
+                                && out.send(send(reasoning_delta(s), None)).await.is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        SplitEvent::Dsml(de) => de,
+                    };
                     match de {
                         DsmlEvent::Text(t) => {
                             let s = stop.push(&drain_valid_utf8(&mut content_pending, &t));
@@ -825,7 +849,7 @@ async fn drive_sse_stream(
                         return;
                     }
                 }
-                finish_reason = if saw_tool && !scanner.cut_by_length() {
+                finish_reason = if saw_tool && !splitter.scanner().cut_by_length() {
                     "tool_calls"
                 } else {
                     finish.as_openai()
@@ -858,7 +882,7 @@ async fn drive_sse_stream(
     // bad-DSML *before* any text/tool deltas the retry will fire; for
     // bad-DSML *after* we've already streamed text, letta will surface
     // the error without retrying even though we mark it retryable.
-    if scanner.saw_malformed() {
+    if splitter.scanner().saw_malformed() {
         tracing::warn!(
             "stream: scanner saw malformed DSML; reporting finish_reason=internal_error"
         );
@@ -900,7 +924,7 @@ async fn drive_sse_stream(
 /// `tests/oracle_prompt.rs` diff the STREAMING output path against DeepSeek's
 /// reference parser, not only `accumulate`. Not used by the server.
 #[doc(hidden)]
-pub async fn sse_transcript(evs: Vec<WorkerEvent>, tok_dsml: Option<i32>, stop: Vec<String>) -> Vec<serde_json::Value> {
+pub async fn sse_transcript(evs: Vec<WorkerEvent>, tok_dsml: Option<i32>, stop: Vec<String>, start_in_tool_calls: bool) -> Vec<serde_json::Value> {
     let (wtx, wrx) = tokio::sync::mpsc::channel(evs.len() + 1);
     for e in evs {
         if wtx.send(e).await.is_err() {
@@ -910,7 +934,7 @@ pub async fn sse_transcript(evs: Vec<WorkerEvent>, tok_dsml: Option<i32>, stop: 
     drop(wtx);
     let (tx, mut sse_rx) = tokio::sync::mpsc::channel(64);
     let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
-    let driver = drive_sse_stream("id".into(), "m".into(), wrx, tx, guard, false, 0, tok_dsml, stop);
+    let driver = drive_sse_stream("id".into(), "m".into(), wrx, tx, guard, false, 0, tok_dsml, stop, start_in_tool_calls);
     let collect = async move {
         let mut out = Vec::new();
         while let Some(Ok(ev)) = sse_rx.recv().await {
@@ -976,7 +1000,7 @@ mod tests {
         let (tx, mut sse_rx) = tokio::sync::mpsc::channel(1024);
         let stop = stop.iter().map(|s| s.to_string()).collect();
         let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
-        drive_sse_stream("id".into(), "m".into(), wrx, tx, guard, true, 5, Some(128825), stop).await;
+        drive_sse_stream("id".into(), "m".into(), wrx, tx, guard, true, 5, Some(128825), stop, false).await;
         let sse = Sse::new(poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx)));
         let body = axum::body::to_bytes(sse.into_response().into_body(), usize::MAX).await.unwrap();
         let mut seen = Seen::default();

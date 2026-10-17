@@ -3454,12 +3454,19 @@ fn finish_decode(
         if next == TOK_THINK_BEGIN {
             in_think = true;
             // Token itself is suppressed.
-        } else if next == TOK_THINK_END {
-            in_think = false;
+        } else if next == TOK_THINK_END && !in_think {
             // Token itself is suppressed.
-        } else if let Some(bytes) = state.vocab.token_text(next) {
+        } else if let Some(bytes) = if next == TOK_THINK_END { Some(&[][..]) } else { state.vocab.token_text(next) } {
             let t_stream = std::time::Instant::now();
-            let raw = gpt2_decode_token(bytes, &state.byte_decoder);
+            // `</think>`'s bytes are suppressed, but the consumer is told
+            // WHERE the reasoning ended (an empty non-reasoning chunk; see
+            // `dsml::OutputSplitter`).
+            let raw = if next == TOK_THINK_END {
+                in_think = false;
+                Vec::new()
+            } else {
+                gpt2_decode_token(bytes, &state.byte_decoder)
+            };
             // Always emit, even for empty raw — TOK_DSML's bytes are
             // routinely the model's primary signal and must be visible
             // to the scanner even though their bytes get suppressed
@@ -5512,11 +5519,23 @@ pub struct GenerateResult {
 /// then: `completion_tokens` is the number of tokens received and
 /// `prompt_tokens` is 0 (the handler counts the prompt itself).
 pub async fn accumulate(
-    mut rx: mpsc::Receiver<WorkerEvent>,
+    rx: mpsc::Receiver<WorkerEvent>,
     tok_dsml: Option<i32>,
     stop: Vec<String>,
 ) -> eyre::Result<GenerateResult> {
-    use crate::dsml::{DsmlEvent, DsmlScanner};
+    accumulate_with(rx, tok_dsml, stop, false).await
+}
+
+/// [`accumulate`] for a generation that starts inside a `<｜DSML｜ calls>`
+/// block when `start_in_tool_calls` (a required / named `tool_choice`,
+/// `prompt_v41::request_starts_in_tool_calls`).
+pub async fn accumulate_with(
+    mut rx: mpsc::Receiver<WorkerEvent>,
+    tok_dsml: Option<i32>,
+    stop: Vec<String>,
+    start_in_tool_calls: bool,
+) -> eyre::Result<GenerateResult> {
+    use crate::dsml::{DsmlEvent, OutputSplitter, SplitEvent};
     use crate::openai::stop::StopMatcher;
     use crate::openai::types::{ToolCall, ToolCallFunction};
 
@@ -5527,7 +5546,9 @@ pub async fn accumulate(
     let mut pending: Vec<u8> = Vec::new();
     let mut reasoning_pending: Vec<u8> = Vec::new();
     let mut last: Option<(u32, u32, FinishReason)> = None;
-    let mut scanner = DsmlScanner::new(tok_dsml.unwrap_or(-1));
+    // Reasoning / content split and the DSML scanner (`dsml::OutputSplitter`,
+    // shared with the SSE path).
+    let mut splitter = OutputSplitter::new(tok_dsml.unwrap_or(-1), start_in_tool_calls);
     let mut sm = StopMatcher::new(stop);
     let mut n_chunks: u32 = 0;
 
@@ -5544,6 +5565,37 @@ pub async fn accumulate(
         String::from_utf8(drained).unwrap()
     }
 
+    // Returns true when a stop string matched (the caller stops reading).
+    let apply = |ev: SplitEvent,
+                     text: &mut String,
+                     reasoning: &mut String,
+                     tool_calls: &mut Vec<ToolCall>,
+                     saw_tool: &mut bool,
+                     pending: &mut Vec<u8>,
+                     reasoning_pending: &mut Vec<u8>,
+                     sm: &mut StopMatcher|
+     -> bool {
+        match ev {
+            SplitEvent::Reasoning(b) => reasoning.push_str(&drain_valid_utf8(reasoning_pending, &b)),
+            SplitEvent::Dsml(DsmlEvent::Text(b)) => {
+                let s = drain_valid_utf8(pending, &b);
+                text.push_str(&sm.push(&s));
+                if sm.hit() {
+                    return true;
+                }
+            }
+            SplitEvent::Dsml(DsmlEvent::ToolCall { id, name, arguments, .. }) => {
+                // Text on the far side of a tool frame is not
+                // contiguous with the held-back tail.
+                text.push_str(&sm.flush());
+                *saw_tool = true;
+                tool_calls.push(ToolCall { id, kind: "function".into(), function: ToolCallFunction { name, arguments } });
+            }
+            SplitEvent::Dsml(DsmlEvent::ToolCallsEnd) => *saw_tool = true,
+        }
+        false
+    };
+
     'recv: while let Some(ev) = rx.recv().await {
         match ev {
             WorkerEvent::Chunk {
@@ -5552,34 +5604,10 @@ pub async fn accumulate(
                 reasoning: is_reasoning,
             } => {
                 n_chunks += 1;
-                if is_reasoning {
-                    reasoning.push_str(&drain_valid_utf8(&mut reasoning_pending, &bytes));
-                    continue;
-                }
-                for de in scanner.push_token(token_id, &bytes) {
-                    match de {
-                        DsmlEvent::Text(b) => {
-                            let s = drain_valid_utf8(&mut pending, &b);
-                            text.push_str(&sm.push(&s));
-                            if sm.hit() {
-                                tracing::info!(completion_tokens = n_chunks, "non-streaming: stop sequence matched; cancelling the generation");
-                                break 'recv;
-                            }
-                        }
-                        DsmlEvent::ToolCall {
-                            id, name, arguments, ..
-                        } => {
-                            // Text on the far side of a tool frame is not
-                            // contiguous with the held-back tail.
-                            text.push_str(&sm.flush());
-                            saw_tool = true;
-                            tool_calls.push(ToolCall {
-                                id,
-                                kind: "function".into(),
-                                function: ToolCallFunction { name, arguments },
-                            });
-                        }
-                        DsmlEvent::ToolCallsEnd => saw_tool = true,
+                for se in splitter.push(token_id, &bytes, is_reasoning) {
+                    if apply(se, &mut text, &mut reasoning, &mut tool_calls, &mut saw_tool, &mut pending, &mut reasoning_pending, &mut sm) {
+                        tracing::info!(completion_tokens = n_chunks, "non-streaming: stop sequence matched; cancelling the generation");
+                        break 'recv;
                     }
                 }
             }
@@ -5602,27 +5630,9 @@ pub async fn accumulate(
     // after it.
     if !sm.hit() {
         let length_cut = matches!(last, Some((_, _, FinishReason::Length)));
-        for de in scanner.finish(length_cut) {
-            match de {
-                DsmlEvent::Text(b) => {
-                    let s = drain_valid_utf8(&mut pending, &b);
-                    text.push_str(&sm.push(&s));
-                    if sm.hit() {
-                        break;
-                    }
-                }
-                DsmlEvent::ToolCall {
-                    id, name, arguments, ..
-                } => {
-                    text.push_str(&sm.flush());
-                    saw_tool = true;
-                    tool_calls.push(ToolCall {
-                        id,
-                        kind: "function".into(),
-                        function: ToolCallFunction { name, arguments },
-                    });
-                }
-                DsmlEvent::ToolCallsEnd => saw_tool = true,
+        for se in splitter.finish(length_cut) {
+            if apply(se, &mut text, &mut reasoning, &mut tool_calls, &mut saw_tool, &mut pending, &mut reasoning_pending, &mut sm) {
+                break;
             }
         }
     }
@@ -5642,8 +5652,8 @@ pub async fn accumulate(
         reasoning.push_str(&String::from_utf8_lossy(&reasoning_pending));
     }
     let (p, c, f) = last.ok_or_else(|| eyre!("worker closed without Done"))?;
-    let saw_malformed = scanner.saw_malformed();
-    let saw_tool = saw_tool && !scanner.cut_by_length();
+    let saw_malformed = splitter.scanner().saw_malformed();
+    let saw_tool = saw_tool && !splitter.scanner().cut_by_length();
     Ok(GenerateResult {
         text,
         reasoning: (!reasoning.is_empty()).then_some(reasoning),
@@ -5745,16 +5755,17 @@ mod accumulate_tests {
         assert_eq!(r.tool_calls.len(), 1);
         let args: serde_json::Value = serde_json::from_str(&r.tool_calls[0].function.arguments).unwrap();
         assert_eq!(args["path"], "a\nObservation: b");
-        assert_eq!(r.text, "Reading.\n\n");
+        assert_eq!(r.text, "Reading.", "the newlines before the calls block are dropped");
         assert_eq!(r.completion_tokens, 13, "no match: the worker's own counts");
     }
 
     #[tokio::test]
     async fn held_back_partial_is_released_at_a_tool_frame() {
         // "\n\n" is a prefix of the stop: held until the frame proves it
-        // cannot complete.
+        // cannot complete -- and then dropped with the calls block's
+        // leading newlines (the reference parser's content is "Reading.").
         let r = run(tool_turn(), &["\n\nObservation"]).await;
-        assert_eq!(r.text, "Reading.\n\n");
+        assert_eq!(r.text, "Reading.");
         assert_eq!(r.tool_calls.len(), 1);
     }
 

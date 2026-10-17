@@ -29,7 +29,12 @@
 //!
 //!   CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p deepstrix-server \
 //!       --features v41 --release --test oracle_prompt
+//!
+//! V4.1 builds only (`prompt::SERVER_DEFAULT_EFFORT` is the V4.1 default
+//! there).
+#![cfg(feature = "v41")]
 
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::OnceLock;
 
 use deepseek_recipe::openai::ChatCompletionRequest as OracleRequest;
@@ -39,7 +44,7 @@ use deepseek_recipe::stream::{InferenceChunk, InferenceFinishReason, StreamProce
 use deepseek_recipe::util::append_delta::AppendDelta;
 use deepseek_recipe_encoding::v4::dsv41::DeepseekV41Encoding;
 use deepseek_recipe_encoding::PromptEncoding;
-use deepstrix_server::engine_worker::{accumulate, FinishReason, WorkerEvent};
+use deepstrix_server::engine_worker::{accumulate_with, FinishReason, WorkerEvent};
 use deepstrix_server::openai::types::ChatCompletionRequest;
 use deepstrix_server::prompt::{ReasoningEffort, Seg};
 use deepstrix_server::prompt_v41;
@@ -61,9 +66,9 @@ const IMG_OURS: &str = "<\u{ff5c}deepseek_image\u{ff5c}>";
 const IMG_ORACLE: &str = "<\u{ff5c}image\u{ff5c}>";
 
 /// What the server uses for a request that names no effort
-/// (`--default-reasoning-effort`'s compiled-in default).
+/// (`--default-reasoning-effort`'s compiled-in default for this build).
 fn server_default_effort() -> ReasoningEffort {
-    deepstrix_server::prompt::DEFAULT_EFFORT
+    deepstrix_server::prompt::SERVER_DEFAULT_EFFORT
 }
 
 fn oracle_prompt(req: &Value) -> Result<String, String> {
@@ -165,18 +170,50 @@ fn hf_style_ids(v: &Vocab, text: &str) -> Vec<i32> {
 /// oracle's prompt. They may differ ONLY where client text spells an added
 /// token (the server never lets client text become a control token:
 /// KNOWN_DEVIATIONS CLIENT_SPECIALS_INERT).
-fn check_ids(req: &Value, oracle: &str) -> Result<(), String> {
-    let Some(v) = vocab() else { return Ok(()) };
+enum IdCheck {
+    /// Identical ids (or no tokenizer available).
+    Compared,
+    /// Not comparable: client text spells an added token.
+    ClientSpecials,
+}
+
+/// The request with every added-token spelling removed from its strings.
+fn sanitize(v: &Value) -> Value {
+    let Some(voc) = vocab() else { return v.clone() };
+    match v {
+        Value::String(s) => {
+            let mut s = s.clone();
+            loop {
+                let before = s.len();
+                for (lit, _) in &voc.added {
+                    s = s.replace(lit.as_str(), "");
+                }
+                if s.len() == before {
+                    break;
+                }
+            }
+            Value::String(s)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(sanitize).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), sanitize(v))).collect()),
+        other => other.clone(),
+    }
+}
+
+fn check_ids(req: &Value, oracle: &str) -> Result<IdCheck, String> {
+    let Some(v) = vocab() else { return Ok(IdCheck::Compared) };
     let r = ours_request(req)?;
     let segs = prompt_v41::request_segments_v41(&r, server_default_effort()).map_err(|e| format!("{e:#}"))?.0;
     let (ours, _) = prompt_v41::render_request_v41(&v.bpe, &r, server_default_effort(), v.image_id).map_err(|e| format!("{e:#}"))?;
     let reference = hf_style_ids(v, oracle);
     if ours == reference {
-        return Ok(());
+        STATS.ids_identical.fetch_add(1, Relaxed);
+        return Ok(IdCheck::Compared);
     }
     let client_spells_special = segs.iter().any(|s| matches!(s, Seg::Client(t) if v.added.iter().any(|(lit, _)| t.contains(lit.as_str()))));
     if client_spells_special {
-        return Ok(());
+        STATS.ids_client_specials.fetch_add(1, Relaxed);
+        return Ok(IdCheck::ClientSpecials);
     }
     let at = ours.iter().zip(&reference).position(|(a, b)| a != b).unwrap_or(ours.len().min(reference.len()));
     Err(format!(
@@ -197,13 +234,48 @@ fn check_prompt(req: &Value) -> Result<(), String> {
             if a != b {
                 return Err(format!("prompts differ: {}", diff(&a, &b)));
             }
-            check_ids(req, &a)
+            STATS.identical.fetch_add(1, Relaxed);
+            match check_ids(req, &a)? {
+                IdCheck::Compared => Ok(()),
+                // Client text spells a special token: ids legitimately
+                // differ there. Re-check the same conversation with those
+                // spellings removed so the id leg still covers it.
+                IdCheck::ClientSpecials => {
+                    let clean = sanitize(req);
+                    match (oracle_prompt(&clean), ours_prompt(&clean)) {
+                        (Ok(a), Ok(b)) if a == b => match check_ids(&clean, &a)? {
+                            IdCheck::Compared => Ok(()),
+                            IdCheck::ClientSpecials => Err("sanitize left a special-token spelling".into()),
+                        },
+                        (Ok(a), Ok(b)) => Err(format!("sanitized prompts differ: {}", diff(&a, &b))),
+                        (Err(_), Err(_)) => Ok(()),
+                        (o, u) => Err(format!("sanitized request: oracle {:?} vs ours {:?}", o.err(), u.err())),
+                    }
+                }
+            }
         }
-        (Err(_), Err(_)) => Ok(()),
+        (Err(_), Err(_)) => {
+            STATS.both_reject.fetch_add(1, Relaxed);
+            Ok(())
+        }
         (Err(e), Ok(_)) => Err(format!("oracle rejects, ours accepts: {e}")),
         (Ok(_), Err(e)) => Err(format!("oracle accepts, ours rejects: {e}")),
     }
 }
+
+/// Coverage counters, printed by `prompt_matches_oracle` (--nocapture).
+struct Stats {
+    identical: AtomicUsize,
+    both_reject: AtomicUsize,
+    ids_identical: AtomicUsize,
+    ids_client_specials: AtomicUsize,
+}
+static STATS: Stats = Stats {
+    identical: AtomicUsize::new(0),
+    both_reject: AtomicUsize::new(0),
+    ids_identical: AtomicUsize::new(0),
+    ids_client_specials: AtomicUsize::new(0),
+};
 
 fn cases() -> u32 {
     std::env::var("ORACLE_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(512)
@@ -263,7 +335,7 @@ fn atom() -> BoxedStrategy<String> {
         1 => pick(&["\u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645}", "\u{5E9}\u{5DC}\u{5D5}\u{5DD}", "\u{202E}abc\u{202C}", "\u{200F}x\u{200E}"]),
         1 => pick(&["e\u{301}", "a\u{308}\u{332}", "Z\u{335}\u{30D}\u{31F}", "\u{1100}\u{1161}\u{11A8}"]),
         4 => pick(&["", " ", "  ", "\n", "\n\n", "\t", "\r\n", " \n", "\n\n\n", "\u{a0}", "\u{3000}"]),
-        3 => pick(ADVERSARIAL),
+        2 => pick(ADVERSARIAL),
         2 => pick(&["{\"a\": 1, \"b\": [true, null]}", "fn main() { println!(\"hi\"); }", "<div class=\"x\">a &amp; b</div>", "a & b < c > d \"q\" 'r'", "C:\\path\\to\\file", "100%", "1e-06", "$PATH"]),
         1 => "\\PC{1,6}",
         1 => pick(&["\u{0}", "\u{7}", "\u{1b}[31m", "\u{feff}", "\u{fffd}", "\u{10ffff}"]),
@@ -555,6 +627,9 @@ struct ConvG {
     turns: Vec<TurnG>,
     /// Restart call ids at call_0 in every tool turn (clients do).
     per_turn_ids: bool,
+    /// Spell the recipe's image placeholder `<｜image｜>` in the first user
+    /// text (both sides must reject).
+    image_token: bool,
 }
 
 fn conversation() -> BoxedStrategy<ConvG> {
@@ -586,9 +661,10 @@ fn conversation() -> BoxedStrategy<ConvG> {
             prop_oneof![9 => rich_content().prop_map(Some), 1 => Just(None)],
             prop::collection::vec(turn(), 0..7),
             any::<bool>(),
+            prop::bool::weighted(0.03),
         ),
     )
-        .prop_map(|((system, tools, empty_tools_field, tool_choice, thinking, effort), (response_format, json_hint, lead_user, turns, per_turn_ids))| ConvG {
+        .prop_map(|((system, tools, empty_tools_field, tool_choice, thinking, effort), (response_format, json_hint, lead_user, turns, per_turn_ids, image_token))| ConvG {
             system,
             tools,
             empty_tools_field,
@@ -600,6 +676,7 @@ fn conversation() -> BoxedStrategy<ConvG> {
             lead_user,
             turns,
             per_turn_ids,
+            image_token,
         })
         .boxed()
 }
@@ -620,6 +697,12 @@ impl ConvG {
                         Value::Array(a)
                     }
                     other => other,
+                };
+            }
+            if self.image_token {
+                c = match c {
+                    Value::String(s) => Value::String(format!("{s} <\u{ff5c}image\u{ff5c}>")),
+                    _ => Value::String("<\u{ff5c}image\u{ff5c}>".into()),
                 };
             }
             msgs.push(json!({"role": "user", "content": c}));
@@ -725,6 +808,14 @@ fn prompt_matches_oracle() {
         let req = conv.to_request();
         check_prompt(&req).map_err(|e| format!("{e}\nrequest: {}", serde_json::to_string(&req).unwrap()))
     });
+    eprintln!(
+        "prompt_matches_oracle: {} identical prompts ({} with identical token ids, {} where client text spells a special \
+         token: CLIENT_SPECIALS_INERT), {} rejected by both",
+        STATS.identical.load(Relaxed),
+        STATS.ids_identical.load(Relaxed),
+        STATS.ids_client_specials.load(Relaxed),
+        STATS.both_reject.load(Relaxed)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -767,7 +858,9 @@ fn vector_request(input: &Value) -> Value {
         }
         if m["role"] == "tool" {
             let id = pending.pop().unwrap_or_default();
-            m["tool_call_id"] = json!(id);
+            if m.get("tool_call_id").is_none() {
+                m["tool_call_id"] = json!(id);
+            }
         }
         if let Some(parts) = m.get_mut("content").and_then(|c| c.as_array_mut()) {
             for p in parts {
@@ -814,7 +907,7 @@ fn official_vectors_expressible_as_requests() {
         assert_eq!(oracle_cmp, golden, "vector {i}: deepseek-recipe vs encoding.py golden: {}", diff(&golden, oracle_cmp));
         let ours = ours_prompt(&req).unwrap_or_else(|e| panic!("vector {i}: ours: {e}"));
         assert_eq!(ours, oracle, "vector {i}: ours vs deepseek-recipe: {}", diff(&oracle, &ours));
-        check_ids(&req, &oracle).unwrap_or_else(|e| panic!("vector {i}: {e}"));
+        assert!(matches!(check_ids(&req, &oracle), Ok(IdCheck::Compared)), "vector {i}: token ids");
     }
 }
 
@@ -836,102 +929,231 @@ fn official_vectors_not_expressible_as_requests() {
     }
 }
 
+/// The hand-picked edge cases of `tests/fixtures/v41_prompts.json` (rendered
+/// by encoding.py, `scripts/v41_oracle/gen_prompt_vectors.py`; this replaces
+/// the old `tests/v41_prompt_vectors.rs`, which pinned the server to
+/// encoding.py). As requests they must render exactly as deepseek-recipe;
+/// which of them ALSO match encoding.py's bytes is pinned below (the rest
+/// fall in the references' disagreement classes).
+#[test]
+fn fixture_edge_cases_match_oracle() {
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v41_prompts.json")).unwrap();
+    let cases: Vec<Value> = serde_json::from_str(&raw).unwrap();
+    let mut agree_with_encoding_py = Vec::new();
+    for c in &cases {
+        let name = c["name"].as_str().unwrap();
+        // A numeric effort goes out as a string: the server's extension takes
+        // "33" (a JSON integer is a deserialize error on both sides).
+        let effort = match &c["reasoning_effort"] {
+            Value::Number(n) => json!(n.to_string()),
+            other => other.clone(),
+        };
+        let mut input = json!({"messages": c["messages"], "thinking_mode": c["thinking_mode"], "reasoning_effort": effort});
+        if !c["context"].is_null() {
+            // encoding.py's `context` (render a suffix without BOS) has no request form.
+            assert!(oracle_prompt(&vector_request(&input)).is_ok(), "{name}");
+            continue;
+        }
+        let msgs = input["messages"].as_array_mut().unwrap();
+        if let Some(t) = msgs[0].as_object_mut().unwrap().remove("tools") {
+            input["tools"] = t;
+        }
+        let message_format = input["messages"].as_array().unwrap().iter().any(|m| m.get("response_format").is_some());
+        let req = vector_request(&input);
+        let oracle = oracle_prompt(&req);
+        let ours = ours_prompt(&req);
+        if c["reasoning_effort"].is_i64() {
+            let req = req.clone();
+            // NUMERIC_REASONING_EFFORT: the server's extension.
+            assert!(oracle.is_err(), "{name}: the oracle accepts a numeric effort now");
+            let ours = ours.unwrap();
+            assert!(ours.contains(&format!("Reasoning Effort: {} (", c["reasoning_effort"])), "{name}: {ours}");
+            continue;
+        }
+        let oracle = oracle.unwrap_or_else(|e| panic!("{name}: oracle: {e}"));
+        let ours = ours.unwrap_or_else(|e| panic!("{name}: ours: {e}"));
+        assert_eq!(ours, oracle, "{name}: ours vs deepseek-recipe: {}", diff(&oracle, &ours));
+        let expected = c["expected"].as_str().unwrap();
+        let last_assistant = req["messages"].as_array().unwrap().last().unwrap()["role"] == "assistant";
+        let cmp = if last_assistant { strip_generation_prompt(&oracle) } else { oracle.as_str() };
+        if cmp == expected && !message_format {
+            agree_with_encoding_py.push(name);
+        } else {
+            eprintln!("{name}: deepseek-recipe vs encoding.py: {}", diff(cmp, expected));
+        }
+    }
+    assert_eq!(
+        agree_with_encoding_py,
+        [
+            "shipped_1",
+            "shipped_5",
+            "chat_mode",
+            "thinking_default_effort",
+            "thinking_effort_max",
+            "no_system",
+            "assistant_history_kept_with_tools",
+            "tool_call_and_two_results",
+            "tool_result_then_user_text",
+        ],
+        "which hand-picked cases deepseek-recipe and encoding.py agree on"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Secondary oracle: the checkpoint's encoding.py vs deepseek-recipe
 // ---------------------------------------------------------------------------
 
 /// Map an OpenAI request to `encoding.encode_messages` arguments the way the
 /// checkpoint's README / `load_cases` do: tools on messages[0], thinking
-/// mode, effort name. `drop_thinking` is set by the caller.
-fn encoding_py_case(req: &Value, drop_thinking: bool) -> Option<Value> {
+/// mode, effort name. `drop_thinking` is encoding.py's knob (its default is
+/// true; the recipe has no such step).
+///
+/// With `neutralize`, the input is first rewritten so that encoding.py sees
+/// the conversation the recipe renders, one rewrite per known disagreement
+/// class; the returned names are the classes whose rewrite changed the input.
+fn encoding_py_case(req: &Value, drop_thinking: bool, neutralize: bool) -> Option<(Value, Vec<&'static str>)> {
     let o: OracleRequest = serde_json::from_value(req.clone()).ok()?;
     let conv = o.convert(ConversionOptions::default()).ok()?.conversation;
-    let mut msgs = req["messages"].as_array()?.clone();
     if conv.tool_choice != deepseek_recipe_core::tools::ToolChoice::Auto || req.get("response_format").is_some() {
         return None; // request-level features encoding.py has no input for
     }
-    if let Some(t) = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())) {
-        msgs[0]["tools"] = t.clone();
+    let mut msgs = req["messages"].as_array()?.clone();
+    let mut tools: Option<Value> = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())).cloned();
+    let mut classes = Vec::new();
+    if neutralize {
+        let text_of = |c: &Value| -> String {
+            match c {
+                Value::String(s) => s.clone(),
+                Value::Array(a) => a.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n\n"),
+                _ => String::new(),
+            }
+        };
+        // The recipe drops empty system messages.
+        let before = msgs.len();
+        msgs.retain(|m| !(m["role"] == "system" && text_of(&m["content"]).is_empty()));
+        if msgs.len() != before {
+            classes.push("EMPTY_SYSTEM_DROPPED");
+        }
+        // `content: []` is "" in the recipe (a "\n\n"-joined nothing).
+        for m in msgs.iter_mut() {
+            if m["role"] == "user" && m["content"].as_array().is_some_and(|a| a.is_empty()) {
+                m["content"] = json!([{"type": "text", "text": ""}]);
+                classes.push("EMPTY_PARTS_USER_JOIN");
+            }
+        }
+        // The recipe renders {"name", "description" ("" if absent), "parameters"} only.
+        if let Some(t) = tools.as_mut() {
+            let normalized: Vec<Value> = t
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| {
+                    let f = &t["function"];
+                    json!({"type": "function", "function": {
+                        "name": f["name"],
+                        "description": f.get("description").filter(|d| !d.is_null()).cloned().unwrap_or(json!("")),
+                        "parameters": f.get("parameters").filter(|p| !p.is_null()).cloned().unwrap_or(json!({})),
+                    }})
+                })
+                .collect();
+            // (Serialized: `Value` equality ignores key order.)
+            if Value::Array(normalized.clone()).to_string() != t.to_string() {
+                classes.push("TOOL_SCHEMA_NORMALIZED");
+            }
+            *t = Value::Array(normalized);
+        }
+        // The recipe parses `arguments` once: anything but a JSON object is
+        // {"arguments": <raw>} (encoding.py also decodes double-encoded JSON).
+        for m in msgs.iter_mut() {
+            let Some(tcs) = m.get_mut("tool_calls").and_then(|t| t.as_array_mut()) else { continue };
+            for tc in tcs {
+                let raw = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
+                if serde_json::from_str::<serde_json::Map<String, Value>>(&raw).is_ok() {
+                    continue;
+                }
+                let double = serde_json::from_str::<Value>(&raw)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| serde_json::from_str::<serde_json::Map<String, Value>>(s).is_ok()))
+                    .unwrap_or(false);
+                if double {
+                    classes.push("DOUBLE_ENCODED_ARGUMENTS");
+                }
+                tc["function"]["arguments"] = json!(json!({"arguments": raw}).to_string());
+            }
+        }
+        // The recipe creates an empty first system message for the tools.
+        if tools.is_some() && msgs.first().is_some_and(|m| m["role"] != "system") {
+            msgs.insert(0, json!({"role": "system", "content": ""}));
+            classes.push("TOOLS_WITHOUT_SYSTEM");
+        }
+    }
+    if let Some(t) = tools {
+        msgs[0]["tools"] = t;
     }
     let effort = conv.reasoning_effort.map(|e| match e {
         deepseek_recipe_core::conversation::ReasoningEffort::Low => "low",
         deepseek_recipe_core::conversation::ReasoningEffort::Max => "max",
         _ => "high",
     });
-    Some(json!({
-        "messages": msgs,
-        "thinking_mode": if conv.thinking_mode { "thinking" } else { "chat" },
-        "reasoning_effort": effort,
-        "drop_thinking": drop_thinking,
-    }))
+    classes.dedup();
+    Some((
+        json!({
+            "messages": msgs,
+            "thinking_mode": if conv.thinking_mode { "thinking" } else { "chat" },
+            "reasoning_effort": effort,
+            "drop_thinking": drop_thinking,
+        }),
+        classes,
+    ))
 }
 
-/// Disagreement classes between the two references, found by this test (see
-/// the report in the commit message). Each is a predicate on the request; a
-/// difference no class explains fails the test.
-fn classify_oracle_disagreement(req: &Value, recipe: &str, py: &str) -> Option<&'static str> {
+/// Disagreements no input rewrite can neutralize (structural rendering
+/// choices), as predicates on the request.
+fn structural_disagreement(req: &Value) -> Option<&'static str> {
     let msgs = req["messages"].as_array().unwrap();
-    let last_role = msgs.last().map(|m| m["role"].as_str().unwrap_or("")).unwrap_or("");
-    // 1. Generation prompt after a final assistant / first-system / reminder message.
-    if !matches!(last_role, "user" | "tool") && strip_generation_prompt(recipe) == py {
-        return Some("GEN_PROMPT_ALWAYS");
-    }
-    let text_of = |c: &Value| -> String {
-        match c {
-            Value::String(s) => s.clone(),
-            Value::Array(a) => a.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n\n"),
-            _ => String::new(),
-        }
-    };
-    if msgs.iter().any(|m| m["role"] == "system" && text_of(&m["content"]).is_empty()) {
-        return Some("EMPTY_SYSTEM_DROPPED");
-    }
-    let has_tools = req.get("tools").and_then(|t| t.as_array()).is_some_and(|a| !a.is_empty());
-    if has_tools && msgs.first().is_some_and(|m| m["role"] != "system") {
-        return Some("TOOLS_WITHOUT_SYSTEM");
-    }
-    if has_tools {
-        let normalized = req["tools"].as_array().unwrap().iter().all(|t| {
-            let f = t["function"].as_object().unwrap();
-            let keys: Vec<&str> = f.keys().map(|k| k.as_str()).collect();
-            keys == ["name", "description", "parameters"]
-        });
-        if !normalized {
-            return Some("TOOL_SCHEMA_NORMALIZED");
-        }
-    }
-    let floats_big = recipe.contains("e1") || recipe.contains("e2") || py.contains("e+");
-    if floats_big {
-        return Some("FLOAT_POSITIVE_EXPONENT");
-    }
-    let double_encoded = msgs.iter().filter_map(|m| m["tool_calls"].as_array()).flatten().any(|tc| {
+    // Tool-call `arguments` are JSON TEXT: the recipe (and the server) parse
+    // it with serde_json, whose default float parser is not correctly
+    // rounded; Python's is. A literal the two parse differently prints
+    // differently (e.g. 1.2345678901234567e+20).
+    let misparsed = msgs.iter().filter_map(|m| m["tool_calls"].as_array()).flatten().any(|tc| {
         let a = tc["function"]["arguments"].as_str().unwrap_or("");
-        serde_json::from_str::<Value>(a).is_ok_and(|v| v.is_string())
+        a.split(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-')))
+            .filter(|t| t.contains(['.', 'e', 'E']) && t.chars().any(|c| c.is_ascii_digit()))
+            .any(|t| match (serde_json::from_str::<f64>(t), t.parse::<f64>()) {
+                (Ok(a), Ok(b)) => a.to_bits() != b.to_bits(),
+                _ => false,
+            })
     });
-    if double_encoded {
-        return Some("DOUBLE_ENCODED_ARGUMENTS");
+    if misparsed {
+        return Some("SERDE_FLOAT_PARSE: serde_json's (non-correctly-rounded) float parse of tool-call arguments, shared by the recipe and the server");
     }
-    if req["messages"].as_array().unwrap().iter().any(|m| m["role"] == "latest_reminder") {
-        return Some("LATEST_REMINDER_TRANSITION");
+    // encoding.py renders a latest_reminder AFTER the assistant header that a
+    // preceding user / mid-system message gets; the recipe before its own.
+    if msgs.iter().any(|m| m["role"] == "latest_reminder") {
+        return Some("LATEST_REMINDER_ORDER");
     }
     // encoding.py emits `<｜Assistant｜>` only as the transition after a user
-    // (or mid-conversation system) message; the recipe renders it on every
-    // assistant message (first message, after another assistant, after the
-    // leading system message).
-    let header_only_after_user = msgs.iter().enumerate().any(|(i, m)| {
-        m["role"] == "assistant" && (i == 0 || matches!(msgs[i - 1]["role"].as_str(), Some("assistant")) || (i == 1 && msgs[0]["role"] == "system"))
-    });
-    if header_only_after_user {
+    // (or mid-conversation system) message; the recipe on every assistant
+    // message (first message, after another assistant, after the leading
+    // system message). Judged on the messages the recipe keeps (empty
+    // system messages dropped).
+    let empty = |m: &Value| match &m["content"] {
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n\n").is_empty(),
+        _ => true,
+    };
+    let msgs: Vec<&Value> = msgs.iter().filter(|m| !(m["role"] == "system" && empty(m))).collect();
+    if msgs.iter().enumerate().any(|(i, m)| {
+        m["role"] == "assistant" && (i == 0 || msgs[i - 1]["role"] == "assistant" || (i == 1 && msgs[0]["role"] == "system"))
+    }) {
         return Some("ASSISTANT_HEADER_ONLY_AFTER_USER");
-    }
-    // A user message with `content: []` merges into the previous user turn
-    // as nothing in encoding.py, as "" joined by "\n\n" in the recipe.
-    if msgs.iter().any(|m| m["role"] == "user" && m["content"].as_array().is_some_and(|a| a.is_empty())) {
-        return Some("EMPTY_PARTS_USER_JOIN");
     }
     None
 }
 
+/// DeepSeek's two references -- deepseek-recipe (primary) and the
+/// checkpoint's encoding.py -- on the same generated requests: every
+/// difference must fall in a named class. Report: `--nocapture`.
 #[test]
 fn secondary_oracle_encoding_py_vs_recipe() {
     let dir = std::env::var("ENCODING_PY_DIR").unwrap_or_else(|_| "/weights2/dsv4.1f-1017/encoding".into());
@@ -943,17 +1165,22 @@ fn secondary_oracle_encoding_py_vs_recipe() {
     let n: usize = std::env::var("ENCODING_PY_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
     let mut runner = TestRunner::new_with_rng(Config::default(), proptest::test_runner::TestRng::deterministic_rng(proptest::test_runner::RngAlgorithm::ChaCha));
     let strategy = conversation();
-    let mut reqs = Vec::new();
+    // Per request: raw input, neutralized input, neutralized + drop_thinking.
+    let mut reqs: Vec<(Value, String, Vec<&'static str>)> = Vec::new();
     let mut lines = String::new();
     for _ in 0..n {
         let req = strategy.new_tree(&mut runner).unwrap().current().to_request();
         let Ok(recipe) = oracle_prompt(&req) else { continue };
-        for drop in [false, true] {
-            let Some(case) = encoding_py_case(&req, drop) else { continue };
-            lines.push_str(&case.to_string());
+        let (Some((raw, _)), Some((neu, classes)), Some((dropped, _))) =
+            (encoding_py_case(&req, false, false), encoding_py_case(&req, false, true), encoding_py_case(&req, true, true))
+        else {
+            continue;
+        };
+        for c in [raw, neu, dropped] {
+            lines.push_str(&c.to_string());
             lines.push('\n');
-            reqs.push((req.clone(), recipe.clone(), drop));
         }
+        reqs.push((req, recipe, classes));
     }
     let mut child = std::process::Command::new("python3")
         .args(["-I", driver, &dir])
@@ -969,36 +1196,46 @@ fn secondary_oracle_encoding_py_vs_recipe() {
     }
     let out = child.wait_with_output().unwrap();
     let outs: Vec<Value> = String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(outs.len(), reqs.len(), "driver output count");
+    assert_eq!(outs.len(), 3 * reqs.len(), "driver output count");
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut bump = |k: &str| *counts.entry(k.to_string()).or_default() += 1;
     let mut unexplained = Vec::new();
-    for ((req, recipe, drop), out) in reqs.iter().zip(outs) {
-        let key = |k: &str| format!("drop_thinking={drop}: {k}");
-        let Some(py) = out["ok"].as_str() else {
-            let why = out["err"].as_str().unwrap_or("").split(':').next().unwrap_or("").to_string();
-            let what = if why == "ValueError" && out["err"].as_str().unwrap_or("").contains("image") { "image placeholder text" } else { "other" };
-            *counts.entry(key(&format!("encoding.py rejects ({why}: {what}), recipe accepts"))).or_default() += 1;
-            if what == "other" && !*drop {
-                eprintln!("encoding.py rejects: {} -- {}", out["err"], serde_json::to_string(req).unwrap().chars().take(300).collect::<String>());
+    for ((req, recipe, classes), out) in reqs.iter().zip(outs.chunks(3)) {
+        let (Some(raw), Some(neu), Some(dropped)) = (out[0]["ok"].as_str(), out[1]["ok"].as_str(), out[2]["ok"].as_str()) else {
+            let err = out[0]["err"].as_str().or(out[1]["err"].as_str()).unwrap_or("");
+            if err.contains("image") {
+                bump("encoding.py rejects, recipe accepts: client text spelling <｜deepseek_image｜> (each rejects ITS placeholder spelling)");
+            } else {
+                unexplained.push(format!("encoding.py rejects: {err}: {}", serde_json::to_string(req).unwrap()));
             }
             continue;
         };
-        let py = py.to_string();
-        if *recipe == py {
-            *counts.entry(key("identical")).or_default() += 1;
+        if dropped != neu {
+            bump("DROP_THINKING: encoding.py's default drop_thinking=True drops completed turns' reasoning; the recipe keeps it");
+        }
+        if raw == recipe {
+            bump("identical");
             continue;
         }
-        if *drop {
-            // drop_thinking=True is encoding.py's DEFAULT; the recipe never drops.
-            *counts.entry(key("differs (DROP_THINKING and/or the classes below)")).or_default() += 1;
+        let gen_prompt = neu != recipe && strip_generation_prompt(recipe) == neu;
+        if neu == recipe || gen_prompt {
+            for c in classes {
+                bump(c);
+            }
+            if gen_prompt {
+                bump("GEN_PROMPT_ALWAYS: the recipe always ends with the next-turn header");
+            }
+            if classes.is_empty() && !gen_prompt {
+                unexplained.push(format!("raw differs but no class applies: {}", serde_json::to_string(req).unwrap()));
+            }
             continue;
         }
-        match classify_oracle_disagreement(req, recipe, &py) {
-            Some(c) => *counts.entry(key(c)).or_default() += 1,
-            None => unexplained.push(format!("{}\n  recipe vs encoding.py: {}", serde_json::to_string(req).unwrap(), diff(recipe, &py))),
+        match structural_disagreement(req) {
+            Some(c) => bump(c),
+            None => unexplained.push(format!("{}\n  recipe vs encoding.py (neutralized {classes:?}): {}", serde_json::to_string(req).unwrap(), diff(recipe, neu))),
         }
     }
-    eprintln!("secondary oracle (encoding.py vs deepseek-recipe), {} generated cases:", reqs.len());
+    eprintln!("secondary oracle (encoding.py vs deepseek-recipe), {} generated requests:", reqs.len());
     for (k, v) in &counts {
         eprintln!("  {v:6}  {k}");
     }
@@ -1016,6 +1253,7 @@ fn secondary_oracle_encoding_py_vs_recipe() {
 #[derive(Debug, Clone, PartialEq)]
 enum Piece {
     T(String),
+    ThinkBegin,
     ThinkEnd,
     Dsml,
     Eos,
@@ -1047,9 +1285,15 @@ struct OutputG {
     /// Ends with EOS (else the token cap cut it).
     eos: bool,
     stop: Vec<String>,
+    /// `tool_choice: "required"` (thinking off): the prompt ends with the
+    /// opening `<｜DSML｜ calls>\n`, so the output starts with an invoke.
+    required: bool,
     /// Random byte split points for the server's tokens, char split points
     /// for the oracle's text chunks.
     seed: u64,
+    /// Explicit pieces instead of the ones the fields describe (truncation
+    /// and the deviation tests).
+    override_pieces: Option<Vec<Piece>>,
 }
 
 /// Output text that both parsers read as plain text: no markup spelling
@@ -1085,15 +1329,27 @@ fn output() -> BoxedStrategy<OutputG> {
         (out_text(), prop_oneof![3 => Just(""), 1 => Just("\n"), 1 => Just("\n\n"), 1 => Just("\n\n\n")]).prop_map(|(a, b)| format!("{b}{a}")),
         prop_oneof![2 => Just(Vec::new()), 2 => prop::collection::vec(call, 1..4)],
         prop::bool::weighted(0.9),
-        prop_oneof![4 => Just(Vec::new()), 1 => prop::collection::vec("[a-z]{1,3}|\n|\\.", 1..3)],
+        prop_oneof![4 => Just(Vec::new()), 1 => prop::collection::vec("[a-z]{1,3}|\\.", 1..3)],
+        prop::bool::weighted(0.15),
         any::<u64>(),
     )
-        .prop_map(|(thinking, reasoning, close_think, content, calls, eos, stop, seed)| OutputG { thinking, reasoning, close_think, content, calls, eos, stop, seed })
+        .prop_map(|(thinking, reasoning, close_think, content, calls, eos, stop, required, seed)| {
+            if required {
+                // Required: no reasoning, no content, at least one call.
+                let calls = if calls.is_empty() { vec![OCallG { name: 0, params: Vec::new() }] } else { calls };
+                OutputG { thinking: false, reasoning: String::new(), close_think: false, content: String::new(), calls, eos, stop, required, seed, override_pieces: None }
+            } else {
+                OutputG { thinking, reasoning, close_think, content, calls, eos, stop, required, seed, override_pieces: None }
+            }
+        })
         .boxed()
 }
 
 impl OutputG {
     fn pieces(&self) -> Vec<Piece> {
+        if let Some(p) = &self.override_pieces {
+            return p.clone();
+        }
         let mut p = Vec::new();
         if self.thinking {
             p.push(Piece::T(self.reasoning.clone()));
@@ -1101,11 +1357,15 @@ impl OutputG {
                 p.push(Piece::ThinkEnd);
             }
         }
-        p.push(Piece::T(self.content.clone()));
+        if !self.required {
+            p.push(Piece::T(self.content.clone()));
+        }
         if !self.calls.is_empty() {
-            p.push(Piece::T("\n\n<".into()));
-            p.push(Piece::Dsml);
-            p.push(Piece::T(" calls>\n".into()));
+            if !self.required {
+                p.push(Piece::T("\n\n<".into()));
+                p.push(Piece::Dsml);
+                p.push(Piece::T(" calls>\n".into()));
+            }
             for (i, c) in self.calls.iter().enumerate() {
                 if i > 0 {
                     p.push(Piece::T("\n".into()));
@@ -1150,6 +1410,9 @@ impl OutputG {
             .collect();
         let mut r = json!({"model": "m", "messages": [{"role": "user", "content": "q"}], "tools": tools,
                            "thinking": {"type": if self.thinking { "enabled" } else { "disabled" }}});
+        if self.required {
+            r["tool_choice"] = json!("required");
+        }
         if !self.stop.is_empty() {
             r["stop"] = json!(self.stop);
         }
@@ -1200,6 +1463,7 @@ fn oracle_parse(o: &OutputG, chunked: bool) -> Result<Parsed, String> {
     for p in o.pieces() {
         match p {
             Piece::T(t) => text.push_str(&t),
+            Piece::ThinkBegin => text.push_str("<think>"),
             Piece::ThinkEnd => text.push_str("</think>"),
             Piece::Dsml => text.push_str(DSML_TEXT),
             Piece::Eos => break,
@@ -1246,7 +1510,8 @@ fn tokio_stream_iter(chunks: Vec<InferenceChunk>) -> impl futures_util::Stream<I
 
 /// The worker's event stream for an output: what `engine_worker` /
 /// `multistream` send (TOK_THINK_* suppressed, `reasoning` = in_think, EOS
-/// ends the turn with Stop, a missing EOS = the token cap). Text pieces are
+/// ends the turn with Stop, a missing EOS = the token cap; `</think>` is an
+/// empty non-reasoning chunk). Text pieces are
 /// split at random BYTE positions (tokens can end mid-character).
 fn worker_events(o: &OutputG, rng: &mut Rng) -> Vec<WorkerEvent> {
     let mut evs = Vec::new();
@@ -1265,7 +1530,15 @@ fn worker_events(o: &OutputG, rng: &mut Rng) -> Vec<WorkerEvent> {
                     i += len;
                 }
             }
+            Piece::ThinkBegin => {
+                in_think = true;
+                n += 1;
+            }
             Piece::ThinkEnd => {
+                // Suppressed bytes; the worker marks where the reasoning ended.
+                if in_think {
+                    evs.push(WorkerEvent::Chunk { token_id: deepstrix_server::tokens::TOK_THINK_END, bytes: Vec::new(), reasoning: false });
+                }
                 in_think = false;
                 n += 1;
             }
@@ -1293,7 +1566,7 @@ fn ours_parse_nonstream(o: &OutputG) -> Parsed {
             tx.send(e).await.unwrap();
         }
         drop(tx);
-        accumulate(rx, Some(DSML_ID), o.stop.clone()).await.unwrap()
+        accumulate_with(rx, Some(DSML_ID), o.stop.clone(), o.required).await.unwrap()
     });
     let (finish, msg) = deepstrix_server::openai::handler::nonstream_message(result);
     Parsed {
@@ -1307,7 +1580,7 @@ fn ours_parse_nonstream(o: &OutputG) -> Parsed {
 fn ours_parse_stream(o: &OutputG) -> Parsed {
     let mut rng = Rng(o.seed.rotate_left(29) | 1);
     let evs = worker_events(o, &mut rng);
-    let chunks = runtime().block_on(deepstrix_server::openai::handler::sse_transcript(evs, Some(DSML_ID), o.stop.clone()));
+    let chunks = runtime().block_on(deepstrix_server::openai::handler::sse_transcript(evs, Some(DSML_ID), o.stop.clone(), o.required));
     let mut p = Parsed { content: String::new(), reasoning: String::new(), tool_calls: Vec::new(), finish: String::new() };
     let mut args: Vec<String> = Vec::new();
     for c in chunks {
@@ -1372,13 +1645,458 @@ fn output_parse_matches_oracle() {
 // ---------------------------------------------------------------------------
 
 /// Every known, deliberate difference from deepseek-recipe (id, summary).
+/// Each one is pinned by a test below (or by the properties above, which
+/// assert the exact allowance). Changing one is an owner decision.
 pub const KNOWN_DEVIATIONS: &[(&str, &str)] = &[
+    // Representation only.
     ("IMAGE_PLACEHOLDER_SPELLING", "prompt text spells id 129264 <｜deepseek_image｜> (checkpoint tokenizer.json), the oracle <｜image｜> (its bundled tokenizer); same token id"),
-    ("CLIENT_SPECIALS_INERT", "client text spelling a special token (<｜User｜>, </think>, ｜DSML｜ ...) is BPE'd as text; the oracle's HF tokenization makes it the control token. Prompt bytes identical, ids differ"),
+    ("EMPTY_FIELD_NULL", "an empty content / reasoning_content is null in our response, \"\" in the oracle's"),
     ("TOKEN_IDS_VIA_OUR_BPE", "the id leg tokenizes the oracle prompt HF-style with the server's BPE; the oracle's own HF tokenizer object needs a direct `tokenizers` dev-dependency"),
-    ("TOKEN_DRIVEN_SCANNER", "output parsing keys on the DSML/think special TOKENS; markup spelled as plain text by the model is content to us, markup to the text-driven oracle"),
-    ("EMPTY_FIELD_NULL", "an empty content/reasoning_content is null in our response, \"\" in the oracle's"),
+    // Security: the prompt bytes are identical, the ids are not.
+    ("CLIENT_SPECIALS_INERT", "client text spelling a special token (<｜User｜>, </think>, ｜DSML｜ ...) is BPE'd as text; the oracle's HF tokenization makes it the control token"),
+    // Request leniency: the oracle rejects (400), the server renders.
+    ("TOOL_RESULT_STRUCTURE", "tool results need not answer the immediately preceding assistant's calls one-to-one (missing / extra / unknown-id / orphan tool messages, duplicate call ids)"),
+    ("EMPTY_OR_NULL_FIELDS", "`tool_calls: []`, an assistant with neither content nor tool calls, `content: null` / absent on system / user / tool"),
+    ("TOOL_DEFINITION_VALIDATION", "tool names outside [A-Za-z0-9_-]{1,128}, `parameters` that are not a JSON Schema of type object, non-function tool entries (skipped)"),
+    ("LENIENT_ROLES_AND_PARTS", "the `developer` role, bare-string / `input_text` / unknown content parts, Anthropic `image` / `input_image` parts, local-path image URLs"),
+    ("EFFORT_EXTENSIONS", "numeric reasoning_effort (\"1\"..\"100\", \"0\" = off), off / disabled / false / \"\" / ultra"),
+    // Both accept, the prompt differs.
+    ("EFFORT_MINIMAL_25", "reasoning_effort \"minimal\" renders budget 25 (owner 10-11); the oracle maps it to low = 50"),
+    ("EFFORT_XHIGH_MAX", "reasoning_effort \"xhigh\" renders budget 100 (Hermes clamps max -> xhigh); the oracle maps it to 75"),
+    ("REASONING_FIELD", "letta's `reasoning` field sets the effort when `reasoning_effort` is absent; the oracle ignores the field"),
+    // Output parsing.
+    ("TOKEN_DRIVEN_SCANNER", "output parsing keys on the DSML / think special TOKENS; markup spelled as plain text by the model is content to us, markup to the text-driven oracle"),
+    ("TRUNCATED_TOOL_CALL", "a call the token cap cut off is dropped (finish length); the oracle returns it with truncated arguments"),
+    ("EOS_MID_TOOL_CALL", "EOS inside a call: the server repairs it (closes the tags), or reports finish internal_error when no call is recoverable; the oracle returns whatever it parsed"),
+    ("MALFORMED_DSML", "an unknown DSML tag or orphan close: finish internal_error (non-streaming drops content and calls); the oracle parses leniently"),
+    ("HALLUCINATED_CALLS_BLOCK", "a calls block with no invoke: its text is returned as content and scanning continues; the oracle drops it and everything after"),
+    ("INVALID_JSON_PARAMETER", "a string=\"false\" value that is not JSON becomes a JSON string; the oracle splices it raw (invalid arguments JSON)"),
+    ("TOOL_CALLS_WITHOUT_TOOLS", "DSML in the output is parsed as tool calls even when the request declared no tools (or tool_choice none); the oracle returns it as content"),
+    ("THINK_IN_CONTENT", "a <think> token after the content started is dropped; the oracle keeps the text \"<think>\""),
+    ("OUTPUT_JSON_MODE", "response_format json_object: the server returns the model's text as is; the oracle blanks everything around the first JSON value to spaces"),
 ];
+
+/// The deviations are exactly those named above (a new deviation must be
+/// added there, with its test).
+#[test]
+fn known_deviations_are_unique_and_documented() {
+    let mut names: Vec<&str> = KNOWN_DEVIATIONS.iter().map(|(n, _)| *n).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), KNOWN_DEVIATIONS.len());
+}
+
+// ----- truncated outputs -----
+
+/// A well-formed output cut after `k` pieces, ended by EOS or the token cap.
+fn truncated_output() -> BoxedStrategy<(OutputG, usize, bool)> {
+    output()
+        .prop_flat_map(|o| {
+            let n = o.pieces().len();
+            (Just(o), 0..=n, any::<bool>())
+        })
+        .boxed()
+}
+
+/// Cut anywhere: outside a calls block the two parse identically (the cut
+/// is ordinary end of text); inside one, the server's TRUNCATED_TOOL_CALL /
+/// EOS_MID_TOOL_CALL / MALFORMED_DSML deviations apply, and nothing else may
+/// differ: the same content and reasoning, the same COMPLETED calls.
+#[test]
+fn truncated_output_matches_oracle_or_named() {
+    run_prop("truncated output", truncated_output(), |(o, k, eos)| {
+        let mut pieces: Vec<Piece> = o.pieces().into_iter().filter(|p| *p != Piece::Eos).take(*k).collect();
+        let first_dsml = pieces.iter().position(|p| *p == Piece::Dsml);
+        let in_block = first_dsml.is_some() || o.required;
+        if *eos {
+            pieces.push(Piece::Eos);
+        }
+        let cut = CutOutput { o: o.clone(), pieces: pieces.clone() };
+        let oracle = cut.oracle()?;
+        let ours = cut.ours_nonstream();
+        let stream = cut.ours_stream();
+        if !in_block {
+            if ours != oracle || stream != oracle {
+                return Err(format!("cut outside a block: oracle {oracle:?}\n   ours {ours:?}\n stream {stream:?}\n pieces {pieces:?}"));
+            }
+            return Ok(());
+        }
+        if ours.finish == "internal_error" {
+            return Ok(()); // EOS_MID_TOOL_CALL / MALFORMED_DSML
+        }
+        let invoke_opened = pieces.iter().any(|p| matches!(p, Piece::T(t) if t.starts_with(" invoke name=")));
+        if !invoke_opened {
+            // HALLUCINATED_CALLS_BLOCK: a block cut before its first invoke;
+            // the server surfaces the block's text (the structural newline)
+            // as content.
+            return Ok(());
+        }
+        let completed = pieces.iter().filter(|p| matches!(p, Piece::T(t) if t == " invoke>")).count();
+        for (name, got) in [("non-streaming", &ours), ("streaming", &stream)] {
+            if got.reasoning != oracle.reasoning || got.content != oracle.content {
+                return Err(format!("{name}: cut inside a block changed content/reasoning: oracle {oracle:?}\n   ours {got:?}\n pieces {pieces:?}"));
+            }
+            let n = completed.min(oracle.tool_calls.len());
+            if got.tool_calls.len() < n || got.tool_calls[..n] != oracle.tool_calls[..n] {
+                return Err(format!("{name}: completed calls differ: oracle {oracle:?}\n   ours {got:?}\n pieces {pieces:?}"));
+            }
+        }
+        Ok(())
+    });
+}
+
+/// An output given as explicit pieces (for truncation and the deviation tests).
+struct CutOutput {
+    o: OutputG,
+    pieces: Vec<Piece>,
+}
+
+impl CutOutput {
+    fn with(&self) -> OutputG {
+        let mut o = self.o.clone();
+        o.eos = self.pieces.last() == Some(&Piece::Eos);
+        o
+    }
+    fn oracle(&self) -> Result<Parsed, String> {
+        oracle_parse_pieces(&self.with(), &self.pieces, true)
+    }
+    fn ours_nonstream(&self) -> Parsed {
+        ours_parse_pieces(&self.with(), &self.pieces, false)
+    }
+    fn ours_stream(&self) -> Parsed {
+        ours_parse_pieces(&self.with(), &self.pieces, true)
+    }
+}
+
+fn oracle_parse_pieces(o: &OutputG, pieces: &[Piece], chunked: bool) -> Result<Parsed, String> {
+    let mut o = o.clone();
+    o.override_pieces = Some(pieces.to_vec());
+    oracle_parse(&o, chunked)
+}
+
+fn ours_parse_pieces(o: &OutputG, pieces: &[Piece], stream: bool) -> Parsed {
+    let mut o = o.clone();
+    o.override_pieces = Some(pieces.to_vec());
+    if stream {
+        ours_parse_stream(&o)
+    } else {
+        ours_parse_nonstream(&o)
+    }
+}
+
+// ----- request leniency / rejection parity -----
+
+/// One change to a valid request, and what the server does with it.
+#[derive(Debug, Clone, Copy)]
+enum Mutation {
+    // The oracle rejects; the server rejects too.
+    RegexFormat,
+    DuplicateToolNames,
+    UnknownThinkingType,
+    UnknownToolChoice,
+    SystemImage,
+    ReasoningImageToken,
+    ArgumentsImageToken,
+    // The oracle rejects; the server renders (named leniency).
+    OrphanToolResult,
+    MissingToolResult,
+    UnknownToolResultId,
+    DuplicateCallIds,
+    EmptyToolCalls,
+    AssistantWithoutContent,
+    NullUserContent,
+    ToolNameCharset,
+    ParametersNotObject,
+    NonFunctionTool,
+    DeveloperRole,
+    BareStringPart,
+    AnthropicImagePart,
+    LocalImagePath,
+    NumericEffort,
+    OffEffort,
+}
+
+impl Mutation {
+    const ALL: [Mutation; 23] = [
+        Mutation::RegexFormat,
+        Mutation::DuplicateToolNames,
+        Mutation::UnknownThinkingType,
+        Mutation::UnknownToolChoice,
+        Mutation::SystemImage,
+        Mutation::ReasoningImageToken,
+        Mutation::ArgumentsImageToken,
+        Mutation::OrphanToolResult,
+        Mutation::MissingToolResult,
+        Mutation::UnknownToolResultId,
+        Mutation::DuplicateCallIds,
+        Mutation::EmptyToolCalls,
+        Mutation::AssistantWithoutContent,
+        Mutation::NullUserContent,
+        Mutation::ToolNameCharset,
+        Mutation::ParametersNotObject,
+        Mutation::NonFunctionTool,
+        Mutation::DeveloperRole,
+        Mutation::BareStringPart,
+        Mutation::AnthropicImagePart,
+        Mutation::LocalImagePath,
+        Mutation::NumericEffort,
+        Mutation::OffEffort,
+    ];
+
+    /// `None`: the server rejects as the oracle does; `Some(name)`: the
+    /// server accepts (the KNOWN_DEVIATIONS entry).
+    fn leniency(self) -> Option<&'static str> {
+        use Mutation::*;
+        match self {
+            RegexFormat | DuplicateToolNames | UnknownThinkingType | UnknownToolChoice | SystemImage | ReasoningImageToken | ArgumentsImageToken => None,
+            OrphanToolResult | MissingToolResult | UnknownToolResultId | DuplicateCallIds => Some("TOOL_RESULT_STRUCTURE"),
+            EmptyToolCalls | AssistantWithoutContent | NullUserContent => Some("EMPTY_OR_NULL_FIELDS"),
+            ToolNameCharset | ParametersNotObject | NonFunctionTool => Some("TOOL_DEFINITION_VALIDATION"),
+            DeveloperRole | BareStringPart | AnthropicImagePart | LocalImagePath => Some("LENIENT_ROLES_AND_PARTS"),
+            NumericEffort | OffEffort => Some("EFFORT_EXTENSIONS"),
+        }
+    }
+
+    fn apply(self, req: &mut Value) {
+        use Mutation::*;
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "calc", "arguments": "{}"}});
+        let tool = |id: &str| json!({"role": "tool", "tool_call_id": id, "content": "r"});
+        let push = |req: &mut Value, ms: Vec<Value>| req["messages"].as_array_mut().unwrap().extend(ms);
+        let ensure_tools = |req: &mut Value| {
+            if req.get("tools").and_then(|t| t.as_array()).is_none_or(|a| a.is_empty()) {
+                req["tools"] = json!([{"type": "function", "function": {"name": "calc", "parameters": {"type": "object", "properties": {}}}}]);
+            }
+            req.as_object_mut().unwrap().remove("tool_choice");
+        };
+        match self {
+            RegexFormat => req["response_format"] = json!({"type": "regex", "regex": "a+"}),
+            DuplicateToolNames => {
+                ensure_tools(req);
+                let first = req["tools"][0].clone();
+                req["tools"].as_array_mut().unwrap().push(first);
+            }
+            UnknownThinkingType => req["thinking"] = json!({"type": "sometimes"}),
+            UnknownToolChoice => {
+                ensure_tools(req);
+                req["tool_choice"] = json!("always");
+            }
+            SystemImage => push(req, vec![json!({"role": "system", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]})]),
+            ReasoningImageToken => push(req, vec![json!({"role": "assistant", "content": "a", "reasoning_content": "see <\u{ff5c}image\u{ff5c}>"})]),
+            ArgumentsImageToken => push(req, vec![json!({"role": "assistant", "content": "", "tool_calls": [{"id": "x", "type": "function", "function": {"name": "calc", "arguments": "{\"a\": \"<\u{ff5c}image\u{ff5c}>\"}"}}]}), tool("x")]),
+            OrphanToolResult => push(req, vec![json!({"role": "user", "content": "u"}), tool("orphan")]),
+            MissingToolResult => push(req, vec![json!({"role": "assistant", "content": "", "tool_calls": [call("m1"), call("m2")]}), tool("m1")]),
+            UnknownToolResultId => push(req, vec![json!({"role": "assistant", "content": "", "tool_calls": [call("k1")]}), tool("k2")]),
+            DuplicateCallIds => push(req, vec![json!({"role": "assistant", "content": "", "tool_calls": [call("d"), call("d")]}), tool("d"), tool("d")]),
+            EmptyToolCalls => push(req, vec![json!({"role": "assistant", "content": "x", "tool_calls": []})]),
+            AssistantWithoutContent => push(req, vec![json!({"role": "assistant", "content": null})]),
+            NullUserContent => push(req, vec![json!({"role": "user", "content": null})]),
+            ToolNameCharset => {
+                ensure_tools(req);
+                req["tools"].as_array_mut().unwrap().push(json!({"type": "function", "function": {"name": "ns.tool"}}));
+            }
+            ParametersNotObject => {
+                ensure_tools(req);
+                req["tools"].as_array_mut().unwrap().push(json!({"type": "function", "function": {"name": "zero_args", "parameters": {}}}));
+            }
+            NonFunctionTool => {
+                ensure_tools(req);
+                req["tools"].as_array_mut().unwrap().push(json!({"type": "web_search"}));
+            }
+            DeveloperRole => push(req, vec![json!({"role": "developer", "content": "d"})]),
+            BareStringPart => push(req, vec![json!({"role": "user", "content": ["bare"]})]),
+            AnthropicImagePart => push(req, vec![json!({"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}]})]),
+            LocalImagePath => push(req, vec![json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "/tmp/x.png"}}]})]),
+            NumericEffort | OffEffort => {
+                // Thinking may turn on: drop a tool choice thinking forbids.
+                req.as_object_mut().unwrap().remove("thinking");
+                req.as_object_mut().unwrap().remove("tool_choice");
+                req["reasoning_effort"] = json!(if matches!(self, NumericEffort) { "33" } else { "off" });
+            }
+        }
+    }
+}
+
+/// Every mutation of a valid request: the oracle rejects; the server rejects
+/// too, or accepts under exactly the named leniency.
+#[test]
+fn rejections_match_or_are_named() {
+    let strategy = (conversation(), prop::sample::select(&Mutation::ALL[..]));
+    run_prop("rejection parity", strategy, |(conv, m)| {
+        let base = conv.to_request();
+        if oracle_prompt(&base).is_err() {
+            return Ok(()); // only valid bases
+        }
+        let mut req = base;
+        m.apply(&mut req);
+        let oracle = oracle_prompt(&req);
+        let ours = ours_prompt(&req);
+        match (oracle, ours, m.leniency()) {
+            (Ok(_), _, _) => Err(format!("{m:?}: the oracle accepts it now: {}", serde_json::to_string(&req).unwrap())),
+            (Err(_), Err(_), None) => Ok(()),
+            (Err(_), Ok(_), Some(_)) => Ok(()),
+            (Err(e), Ok(_), None) => Err(format!("{m:?}: oracle rejects ({e}), ours accepts")),
+            (Err(_), Err(e), Some(name)) => Err(format!("{m:?}: ours rejects ({e}) though {name} says it accepts")),
+        }
+    });
+}
+
+// ----- both accept, the prompt differs -----
+
+fn effort_line(prompt: &str) -> Option<&str> {
+    prompt.split("Reasoning Effort: ").nth(1).and_then(|s| s.split(' ').next())
+}
+
+#[test]
+fn deviation_effort_minimal_xhigh_and_reasoning_field() {
+    let base = json!({"model": "m", "messages": [{"role": "user", "content": "q"}]});
+    let with = |k: &str, v: &str| {
+        let mut r = base.clone();
+        r[k] = json!(v);
+        r
+    };
+    // EFFORT_MINIMAL_25
+    let r = with("reasoning_effort", "minimal");
+    assert_eq!(effort_line(&oracle_prompt(&r).unwrap()), Some("50"));
+    assert_eq!(effort_line(&ours_prompt(&r).unwrap()), Some("25"));
+    // EFFORT_XHIGH_MAX
+    let r = with("reasoning_effort", "xhigh");
+    assert_eq!(effort_line(&oracle_prompt(&r).unwrap()), Some("75"));
+    assert_eq!(effort_line(&ours_prompt(&r).unwrap()), Some("100"));
+    // REASONING_FIELD
+    let r = with("reasoning", "max");
+    assert_eq!(effort_line(&oracle_prompt(&r).unwrap()), Some("75"));
+    assert_eq!(effort_line(&ours_prompt(&r).unwrap()), Some("100"));
+    // Everything else on the ladder is identical.
+    for e in ["none", "low", "medium", "high", "max"] {
+        let r = with("reasoning_effort", e);
+        assert_eq!(ours_prompt(&r).unwrap(), oracle_prompt(&r).unwrap(), "{e}");
+    }
+    // An explicit `thinking` wins over the effort on both sides.
+    let mut r = with("reasoning_effort", "max");
+    r["thinking"] = json!({"type": "disabled"});
+    assert_eq!(ours_prompt(&r).unwrap(), oracle_prompt(&r).unwrap());
+    assert!(effort_line(&ours_prompt(&r).unwrap()).is_none());
+}
+
+// ----- output deviations -----
+
+fn pieces_output(thinking: bool, pieces: Vec<Piece>) -> CutOutput {
+    let o = OutputG {
+        thinking,
+        reasoning: String::new(),
+        close_think: false,
+        content: String::new(),
+        calls: Vec::new(),
+        eos: true,
+        stop: Vec::new(),
+        required: false,
+        seed: 7,
+        override_pieces: None,
+    };
+    CutOutput { o, pieces }
+}
+
+fn t(s: &str) -> Piece {
+    Piece::T(s.to_string())
+}
+
+/// `<｜DSML｜ calls>\n<｜DSML｜ invoke name="calc">\n` + `rest`.
+fn calls_head(rest: Vec<Piece>) -> Vec<Piece> {
+    let mut v = vec![t("\n\n<"), Piece::Dsml, t(" calls>\n<"), Piece::Dsml, t(" invoke name=\"calc\">\n")];
+    v.extend(rest);
+    v
+}
+
+#[test]
+fn deviation_truncated_tool_call_is_dropped() {
+    // TRUNCATED_TOOL_CALL: the token cap inside a string parameter.
+    let c = pieces_output(false, calls_head(vec![t("<"), Piece::Dsml, t(" parameter name=\"query\" string=\"true\">rm -rf /tm")]));
+    let oracle = c.oracle().unwrap();
+    assert_eq!(oracle.tool_calls.len(), 1, "the oracle returns the cut call");
+    assert_eq!(oracle.finish, "length");
+    let ours = c.ours_nonstream();
+    assert!(ours.tool_calls.is_empty(), "ours drops it: {ours:?}");
+    assert_eq!(ours.finish, "length");
+}
+
+#[test]
+fn deviation_eos_mid_tool_call_is_repaired() {
+    // EOS_MID_TOOL_CALL: EOS inside the parameter body.
+    let mut p = calls_head(vec![t("<"), Piece::Dsml, t(" parameter name=\"query\" string=\"true\">ls")]);
+    p.push(Piece::Eos);
+    let c = pieces_output(false, p);
+    let oracle = c.oracle().unwrap();
+    assert!(matches!(&oracle.tool_calls[0].1, Value::String(s) if s.starts_with("<unparsed>")), "oracle: truncated JSON {oracle:?}");
+    let ours = c.ours_nonstream();
+    assert_eq!(ours.tool_calls, vec![("calc".to_string(), json!({"query": "ls"}))], "ours closes the tags");
+}
+
+#[test]
+fn deviation_malformed_dsml_is_an_internal_error() {
+    // MALFORMED_DSML: an unknown tag inside the invoke.
+    let mut p = calls_head(vec![t("<"), Piece::Dsml, t(" command name=\"ls\">x</"), Piece::Dsml, t(" command>\n</"), Piece::Dsml, t(" invoke>\n</"), Piece::Dsml, t(" calls>")]);
+    p.insert(0, t("Doing it."));
+    p.push(Piece::Eos);
+    let c = pieces_output(false, p);
+    let oracle = c.oracle().unwrap();
+    assert_eq!(oracle.content, "Doing it.");
+    let ours = c.ours_nonstream();
+    assert_eq!(ours.finish, "internal_error");
+    assert_eq!(ours.content, "", "non-streaming drops content on malformed DSML");
+}
+
+#[test]
+fn deviation_hallucinated_calls_block_is_content() {
+    // HALLUCINATED_CALLS_BLOCK
+    let c = pieces_output(false, vec![t("a\n\n<"), Piece::Dsml, t(" calls>\nnot a call\n</"), Piece::Dsml, t(" calls>\nafter"), Piece::Eos]);
+    let oracle = c.oracle().unwrap();
+    assert_eq!(oracle.content, "a");
+    let ours = c.ours_nonstream();
+    assert_eq!(ours.content, "a\nnot a call\n\nafter");
+}
+
+#[test]
+fn deviation_invalid_json_parameter_becomes_a_string() {
+    // INVALID_JSON_PARAMETER
+    let mut p = calls_head(vec![t("<"), Piece::Dsml, t(" parameter name=\"limit\" string=\"false\">ten</"), Piece::Dsml, t(" parameter>\n</"), Piece::Dsml, t(" invoke>\n</"), Piece::Dsml, t(" calls>")]);
+    p.push(Piece::Eos);
+    let c = pieces_output(false, p);
+    let oracle = c.oracle().unwrap();
+    assert!(matches!(&oracle.tool_calls[0].1, Value::String(s) if s.starts_with("<unparsed>")), "{oracle:?}");
+    assert_eq!(c.ours_nonstream().tool_calls[0].1, json!({"limit": "ten"}));
+}
+
+#[test]
+fn deviation_tool_calls_without_tools_are_parsed() {
+    // TOOL_CALLS_WITHOUT_TOOLS: a request without tools; the oracle's
+    // parser then leaves DSML as content.
+    let mut p = calls_head(vec![t("\n</"), Piece::Dsml, t(" invoke>\n</"), Piece::Dsml, t(" calls>")]);
+    p.push(Piece::Eos);
+    let c = pieces_output(false, p.clone());
+    let req: OracleRequest = serde_json::from_value(json!({"model": "m", "messages": [{"role": "user", "content": "q"}], "thinking": {"type": "disabled"}})).unwrap();
+    let conv = req.convert(ConversionOptions::default()).unwrap();
+    assert!(!conv.parsing_options.parse_tool_calls, "the oracle does not parse tool calls without tools");
+    assert_eq!(c.ours_nonstream().tool_calls.len(), 1, "ours always does");
+}
+
+#[test]
+fn deviation_think_in_content_is_dropped() {
+    // THINK_IN_CONTENT: the oracle reads a later `<think>` as text; the
+    // worker suppresses the token (and the splitter keeps reading content).
+    let c = pieces_output(false, vec![t("a"), Piece::ThinkBegin, t("b"), Piece::Eos]);
+    assert_eq!(c.oracle().unwrap().content, "a<think>b");
+    assert_eq!(c.ours_nonstream().content, "ab");
+    assert_eq!(c.ours_stream().content, "ab");
+}
+
+#[test]
+fn deviation_output_json_mode_is_verbatim() {
+    // OUTPUT_JSON_MODE: the oracle's json_object parsing blanks the text
+    // around the JSON value.
+    let req: OracleRequest = serde_json::from_value(json!({"model": "m", "messages": [{"role": "user", "content": "reply in JSON"}], "thinking": {"type": "disabled"}, "response_format": {"type": "json_object"}})).unwrap();
+    let conv = req.convert(ConversionOptions::default()).unwrap();
+    assert!(conv.parsing_options.parse_json_output);
+}
 
 #[test]
 fn deviation_client_special_text_is_inert() {
@@ -1392,4 +2110,111 @@ fn deviation_client_special_text_is_inert() {
     let user_id = v.bpe.lookup_token_id("<\u{ff5c}User\u{ff5c}>").unwrap();
     assert_eq!(reference.iter().filter(|&&t| t == user_id).count(), 2, "HF makes the client's <｜User｜> a control token");
     assert_eq!(ours.iter().filter(|&&t| t == user_id).count(), 1, "ours keeps it text");
+}
+
+// ---------------------------------------------------------------------------
+// Divergence catalog: one minimal example per divergence the properties
+// found (and the server fixed), so each stays pinned by name.
+// ---------------------------------------------------------------------------
+
+fn user(c: &str) -> Value {
+    json!({"role": "user", "content": c})
+}
+
+fn weather_tool() -> Value {
+    json!({"type": "function", "function": {"name": "get_weather", "description": "Weather for a city",
+           "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}})
+}
+
+/// (name, request): the server must render each exactly as the oracle (or
+/// reject it as the oracle does).
+fn prompt_catalog() -> Vec<(&'static str, Value)> {
+    let call = |id: &str, args: &str| json!({"id": id, "type": "function", "function": {"name": "get_weather", "arguments": args}});
+    vec![
+        ("DEFAULT_EFFORT_75", json!({"messages": [user("hi")]})),
+        ("THINKING_FIELD_DISABLED", json!({"thinking": {"type": "disabled"}, "messages": [user("hi")]})),
+        ("THINKING_FIELD_ENABLED_EFFORT_NONE", json!({"thinking": {"type": "enabled"}, "reasoning_effort": "none", "messages": [user("hi")]})),
+        ("HISTORY_REASONING_KEPT", json!({"messages": [user("q1"), {"role": "assistant", "content": "a1", "reasoning_content": "r1"}, user("q2")]})),
+        ("HISTORY_EMPTY_THINK_BLOCK", json!({"messages": [user("q1"), {"role": "assistant", "content": "a1"}, user("q2")]})),
+        ("TOOLS_WITHOUT_SYSTEM_SEPARATOR", json!({"thinking": {"type": "disabled"}, "tools": [weather_tool()], "messages": [user("q")]})),
+        ("EMPTY_SYSTEM_DROPPED", json!({"thinking": {"type": "disabled"}, "messages": [{"role": "system", "content": ""}, user("q")]})),
+        ("EMPTY_MID_SYSTEM_DROPPED", json!({"thinking": {"type": "disabled"}, "messages": [user("q"), {"role": "assistant", "content": "a"}, {"role": "system", "content": ""}]})),
+        ("TRAILING_ASSISTANT_GEN_PROMPT", json!({"thinking": {"type": "disabled"}, "messages": [user("q"), {"role": "assistant", "content": "a"}]})),
+        ("ASSISTANT_FIRST_HEADER", json!({"messages": [{"role": "assistant", "content": "a"}, user("q")]})),
+        ("CONSECUTIVE_ASSISTANT_HEADERS", json!({"thinking": {"type": "disabled"}, "messages": [user("q"), {"role": "assistant", "content": "a"}, {"role": "assistant", "content": "b"}]})),
+        ("TOOL_SCHEMA_NORMALIZED", json!({"thinking": {"type": "disabled"}, "messages": [user("q")],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}, "strict": true}}]})),
+        ("ARGUMENTS_PARSED_ONCE", json!({"thinking": {"type": "disabled"}, "tools": [weather_tool()], "messages": [user("q"),
+            {"role": "assistant", "content": "", "tool_calls": [call("c1", "\"{\\\"city\\\": \\\"Paris\\\"}\"")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"}]})),
+        ("CONTENT_BEFORE_CALLS_VERBATIM", json!({"thinking": {"type": "disabled"}, "tools": [weather_tool()], "messages": [user("q"),
+            {"role": "assistant", "content": "Checking.\n\n", "tool_calls": [call("c1", "{\"city\": \"Paris\"}")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"}]})),
+        ("LATEST_REMINDER_ROLE", json!({"messages": [user("q"), {"role": "latest_reminder", "content": "Remember X."}]})),
+        ("TOOL_CHOICE_NONE", json!({"tool_choice": "none", "tools": [weather_tool()], "messages": [user("q")]})),
+        ("TOOL_CHOICE_REQUIRED", json!({"tool_choice": "required", "thinking": {"type": "disabled"}, "tools": [weather_tool()], "messages": [user("q")]})),
+        ("TOOL_CHOICE_REQUIRED_WITH_THINKING_REJECTED", json!({"tool_choice": "required", "tools": [weather_tool()], "messages": [user("q")]})),
+        ("TOOL_CHOICE_NAMED", json!({"thinking": {"type": "disabled"}, "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            "tools": [weather_tool(), {"type": "function", "function": {"name": "other", "parameters": {"type": "object"}}}], "messages": [user("q")]})),
+        ("RESPONSE_FORMAT_JSON_OBJECT", json!({"response_format": {"type": "json_object"}, "messages": [user("Answer in JSON.")]})),
+        ("RESPONSE_FORMAT_JSON_WITHOUT_THE_WORD_REJECTED", json!({"response_format": {"type": "json_object"}, "messages": [user("Answer.")]})),
+        ("IMAGE_TOKEN_TEXT_REJECTED", json!({"messages": [user("see <\u{ff5c}image\u{ff5c}>")]})),
+        ("DUPLICATE_TOOL_NAMES_REJECTED", json!({"tools": [weather_tool(), weather_tool()], "messages": [user("q")]})),
+        ("TOOL_CALL_TYPE_OPTIONAL", json!({"thinking": {"type": "disabled"}, "tools": [weather_tool()], "messages": [user("q"),
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "get_weather", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "r"}]})),
+    ]
+}
+
+#[test]
+fn divergence_catalog_prompts() {
+    for (name, mut req) in prompt_catalog() {
+        req["model"] = json!("m");
+        if let Err(e) = check_prompt(&req) {
+            panic!("{name}: {e}");
+        }
+    }
+}
+
+/// (name, thinking, output pieces): parsed exactly as by the oracle.
+fn output_catalog() -> Vec<(&'static str, bool, Vec<Piece>)> {
+    let block = |pre: &str| {
+        let mut v = vec![t(&format!("{pre}\n\n<")), Piece::Dsml, t(" calls>\n<"), Piece::Dsml, t(" invoke name=\"get_weather\">\n<"), Piece::Dsml];
+        v.extend([t(" parameter name=\"city\" string=\"true\">Paris</"), Piece::Dsml, t(" parameter>\n</"), Piece::Dsml, t(" invoke>\n</"), Piece::Dsml, t(" calls>"), Piece::Eos]);
+        v
+    };
+    vec![
+        ("NEWLINES_BEFORE_CALLS_DROPPED", false, block("Checking.")),
+        ("CONTENT_LEADING_NEWLINES_DROPPED", false, vec![t("\n\nHello"), Piece::Eos]),
+        ("REASONING_NEWLINES_TRIMMED", true, vec![t("\n\nplan\n\n"), Piece::ThinkEnd, t("\nanswer"), Piece::Eos]),
+        ("TOOL_CALL_FROM_REASONING", true, {
+            let mut v = vec![t("plan")];
+            v.extend(block(""));
+            v
+        }),
+        ("V41_ATTRIBUTES_RAW", false, vec![
+            t("<"), Piece::Dsml, t(" calls>\n<"), Piece::Dsml, t(" invoke name=\"get_weather\">\n<"), Piece::Dsml,
+            t(" parameter name=\"city\" string=\"true\">a &amp; b &lt;/\u{ff5c}DSML\u{ff5c}parameter></"), Piece::Dsml,
+            t(" parameter>\n</"), Piece::Dsml, t(" invoke>\n</"), Piece::Dsml, t(" calls>"), Piece::Eos,
+        ]),
+        ("PARTIAL_MATCH_NEWLINE_KEPT", false, block("x<")),
+        ("REASONING_PARTIAL_MATCH_NEWLINE_KEPT", true, vec![t("a<\n\n"), Piece::ThinkEnd, t("b"), Piece::Eos]),
+    ]
+}
+
+#[test]
+fn divergence_catalog_outputs() {
+    for (name, thinking, pieces) in output_catalog() {
+        let c = pieces_output(thinking, pieces);
+        let oracle = c.oracle().unwrap();
+        for (path, ours) in [("non-streaming", c.ours_nonstream()), ("streaming", c.ours_stream())] {
+            assert_eq!(ours, oracle, "{name} ({path})");
+        }
+    }
+    // A required tool choice: the output starts inside the calls block.
+    let mut c = pieces_output(false, vec![t("<"), Piece::Dsml, t(" invoke name=\"get_weather\">\n</"), Piece::Dsml, t(" invoke>\n</"), Piece::Dsml, t(" calls>"), Piece::Eos]);
+    c.o.required = true;
+    let oracle = c.oracle().unwrap();
+    assert_eq!(c.ours_nonstream(), oracle, "TOOL_CHOICE_REQUIRED_OUTPUT (non-streaming)");
+    assert_eq!(c.ours_stream(), oracle, "TOOL_CHOICE_REQUIRED_OUTPUT (streaming)");
 }
