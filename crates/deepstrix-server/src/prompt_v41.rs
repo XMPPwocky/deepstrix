@@ -1,50 +1,63 @@
-//! DeepSeek-V4.1 chat encoding — a port of the text path of the checkpoint's
-//! `encoding/encoding.py` (`encode_messages`), which is a Python encoder, not
-//! a Jinja template. Byte-exactness is checked by
-//! `tests/v41_prompt_vectors.rs` against vectors the reference produced
-//! (`scripts/v41_oracle/gen_prompt_vectors.py`).
+//! DeepSeek-V4.1 chat encoding for `/v1/chat/completions` — a port of
+//! DeepSeek's official reference implementation, `deepseek-recipe`
+//! (github.com/deepseek-ai/deepseek-recipe, released with
+//! DeepSeek-V4.1-Flash-1017): the OpenAI request conversion
+//! (`protocol/openai/chat_completion/request/convert.rs`) and the V4.1 prompt
+//! rendering (`deepseek-recipe-encoding/src/v4/{mod,dsv41}.rs`). Identity is
+//! checked by `tests/oracle_prompt.rs`, which diffs this module against the
+//! reference crates on property-generated requests (bytes and token ids).
 //!
-//! V4.1 vs V4-Flash (`prompt.rs`): DSML tag names carry a leading space and the
-//! block is ` calls` (`<｜DSML｜ calls>`, `<｜DSML｜ invoke …>`, `<｜DSML｜ parameter …>`);
-//! reasoning effort is a numeric budget line ("Reasoning Effort: N (range
-//! 1-100, …)", named low/high/max → 50/75/100, thinking mode only, before the
-//! first message and preceded by `<｜System｜>`); mid-conversation system
-//! messages are allowed and count as user turns for the assistant header; tool
-//! results are merged into the user turn as `<tool_result>…</tool_result>`
-//! blocks; the assistant turn is reasoning + `</think>` + content + tool calls +
-//! EOS; reasoning before the last user turn is dropped unless any message
-//! carries tools; an optional context prefix suppresses the BOS.
+//! The checkpoint's `encoding/encoding.py` is a second reference; it and the
+//! recipe disagree in places (reasoning of completed turns is DROPPED by
+//! encoding.py's default `drop_thinking=True` and KEPT by the recipe; empty
+//! system messages; tool-schema normalization; float exponents; ...). This
+//! module follows the recipe; `tests/oracle_prompt.rs::
+//! secondary_oracle_encoding_py_vs_recipe` lists the classes.
+//!
+//! Shape of a prompt: BOS; for message 0 a `<｜System｜>` prefix when it is a
+//! system message or thinking is on, then (thinking only) the effort line
+//! "Reasoning Effort: N (range 1-100, …)\n\n"; system messages
+//! `<｜System｜>content` (the request's tools and `json_object` format appended
+//! to the first one, which is created empty when missing); a user message
+//! `<｜User｜>content`, joined to a preceding user / tool message by "\n\n"
+//! instead; a tool result `<tool_result>…</tool_result>` the same way;
+//! `<｜latest_reminder｜>content`; every assistant message
+//! `<｜Assistant｜>` + (`<think>reasoning</think>` in thinking mode except at
+//! index 0, else `</think>`) + content + DSML tool calls + EOS; then ALWAYS the
+//! generation prompt `<｜Assistant｜><think>` / `</think>` (plus
+//! "\n\n<｜DSML｜ calls>\n" for a required tool choice).
 //!
 //! Segments: `Seg::Ours` = markup and special tokens (tokenised with the
 //! specials), `Seg::Client` = text supplied by the client (never a control
-//! token) — the same contract as `prompt.rs`.
+//! token) — the same contract as `prompt.rs`. The reference tokenizes the
+//! whole string with specials enabled, so a client string spelling a special
+//! token is a control token there and text here (the one deliberate
+//! token-level difference; the prompt BYTES are identical).
 //!
-//! Images (`encoding.py::_process_image_blocks`): every image content block
-//! becomes the `<｜deepseek_image｜>` placeholder — inline among a user
-//! message's parts, or inline inside a `<tool_result>` body — joined with
-//! the surrounding text by "\n\n" like any other block. The placeholder is
-//! always a `Seg::Ours` so it tokenises to the special id (`image_token_id`
-//! 129264); client text spelling it out BPE-splits. `vision_prompt::
-//! expand_images` then replaces each placeholder id with the image span.
-//! Images on system / assistant messages are rejected (as in `prompt.rs`).
-//!
-//! Not supported (no request field for them): the `latest_reminder` role, the
-//! message-level `response_format`, `task` special tokens.
+//! Images: every image part becomes the `<｜deepseek_image｜>` placeholder
+//! (`Seg::Ours`, id 129264 — the recipe's bundled tokenizer spells the same id
+//! `<｜image｜>`), joined with the message's other parts by "\n\n";
+//! `vision_prompt::expand_images` replaces each placeholder id with the image
+//! span. Images on system / assistant messages are rejected, as is client
+//! text spelling the recipe's placeholder `<｜image｜>`.
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::BpeVocab;
 
-use crate::dsml::to_json_hf;
-use crate::openai::types::{ChatCompletionRequest, ChatMessage, ContentPart, Role, ToolCall, ToolDef};
+use crate::openai::types::{ChatCompletionRequest, ChatMessage, ContentPart, Role, ToolCall};
 use crate::prompt::{
     encode_segments, ReasoningEffort, Seg, ASSISTANT_TEXT, BOS_TEXT, EOS_TEXT, THINK_BEGIN_TEXT, THINK_END_TEXT, USER_TEXT,
 };
 use crate::prompt_v41_templates::{
-    REASONING_EFFORT_FMT_PREFIX, REASONING_EFFORT_FMT_SUFFIX, TOOLS_HEAD, TOOLS_TAIL,
+    REASONING_EFFORT_FMT_PREFIX, REASONING_EFFORT_FMT_SUFFIX, RESPONSE_FORMAT_PREFIX, TOOLS_HEAD, TOOLS_TAIL,
 };
 
 pub const SYSTEM_TEXT: &str = "<\u{ff5c}System\u{ff5c}>";
+pub const LATEST_REMINDER_TEXT: &str = "<\u{ff5c}latest_reminder\u{ff5c}>";
 const DSML: &str = "\u{ff5c}DSML\u{ff5c}";
+/// The recipe's image placeholder spelling; client text carrying it is
+/// rejected (`protocol/validation.rs::image_special_token_not_allowed`).
+const RECIPE_IMAGE_TOKEN: &str = "<\u{ff5c}image\u{ff5c}>";
 
 /// V4.1 reasoning effort: an integer budget in 1..=100. Named levels map to
 /// 25 (minimal) / 50 / 75 / 100; the reference default is "high".
@@ -55,6 +68,7 @@ impl V41Effort {
     pub const DEFAULT: V41Effort = V41Effort(75);
 
     /// Case-insensitive. "minimal" (OpenAI / Hermes ladders) is 25 (owner 10-11): below "low", thinking still on.
+    /// (KNOWN DEVIATION: the recipe maps "minimal" to low = 50.)
     pub fn from_name(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "minimal" => Some(V41Effort(25)),
@@ -90,538 +104,373 @@ impl V41Effort {
     }
 }
 
-// ----- internal message form (the reference's post-merge messages) -----
+// ----- JSON as the reference writes it -----
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum R {
-    System,
-    User,
-    Assistant,
-}
-
-/// One piece of a tool-result body: text, or an image part (rendered as the
-/// placeholder inline, where `_process_image_blocks` puts it).
-#[derive(Clone, Debug)]
-enum Part {
-    Text(String),
-    /// Ordinal of this image among the request messages' images, in message
-    /// order (the order the handler collects their pixels in).
-    Image(usize),
-}
-
-#[derive(Clone, Debug)]
-enum Block {
-    Text(String),
-    /// An image part of a user message → the placeholder (see `Part::Image`).
-    Image(usize),
-    ToolResult(Vec<Part>),
-}
-
-#[derive(Clone, Debug)]
-struct Msg {
-    role: R,
-    /// Plain content (system / assistant / user without blocks). `None` on a
-    /// system message only for the synthetic tools carrier (`build_v41`).
-    content: Option<String>,
-    /// User content blocks after `merge_tool_messages`.
-    blocks: Option<Vec<Block>>,
-    /// Tool result blocks carry the call id for `sort_tool_results_by_call_order`.
-    block_ids: Vec<Option<String>>,
-    tool_calls: Vec<ToolCall>,
-    reasoning: Option<String>,
-    /// Tools attached to this message (the reference attaches the request's
-    /// tools to message 0 and renders them only on a system message; see
-    /// `build_v41` for a conversation that does not start with one).
-    tools: Option<Vec<ToolDef>>,
-}
-
-fn text_of(m: &ChatMessage) -> eyre::Result<Option<String>> {
-    if m.parts.iter().any(|p| matches!(p, ContentPart::Image(_))) {
-        return Err(eyre!(
-            "V4.1 prompt: message ({:?}) has image parts; images are only supported in user and \
-             tool-result messages",
-            m.role
-        ));
-    }
-    Ok(m.content.clone())
-}
-
-/// A user message's content blocks (`parts` when it carries images — the
-/// deserializer keeps `parts` only then — else the text view).
-fn user_blocks(m: &ChatMessage, next_img: &mut usize) -> Vec<Block> {
-    if m.parts.is_empty() {
-        return vec![Block::Text(m.content.clone().unwrap_or_default())];
-    }
-    m.parts
-        .iter()
-        .map(|p| match p {
-            ContentPart::Text(t) => Block::Text(t.clone()),
-            ContentPart::Image(_) => {
-                *next_img += 1;
-                Block::Image(*next_img - 1)
+/// `deepseek_recipe_core::util::json_formatter::stringify_python_style`:
+/// `json.dumps`-like spaced separators (", " and ": "), non-ASCII unescaped,
+/// serde_json's float digits with single-digit negative exponents
+/// re-packaged the Python way ("1e-05", "1e-06"). The digits are whatever
+/// serde_json's formatter writes (zmij since serde_json 1.0.14x: "1e+30",
+/// as `json.dumps`); the reference links the same serde_json, so this
+/// formats through it rather than through `dsml::to_json_hf`'s own repr.
+pub fn to_json_recipe(v: &serde_json::Value) -> String {
+    use serde_json::ser::{CompactFormatter, Formatter};
+    use std::io::{self, Write};
+    struct RecipeFormatter;
+    impl Formatter for RecipeFormatter {
+        fn begin_array_value<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+            w.write_all(if first { b"" } else { b", " })
+        }
+        fn begin_object_key<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+            w.write_all(if first { b"" } else { b", " })
+        }
+        fn begin_object_value<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+            w.write_all(b": ")
+        }
+        fn write_f64<W: ?Sized + Write>(&mut self, w: &mut W, value: f64) -> io::Result<()> {
+            let mut buf = Vec::with_capacity(32);
+            CompactFormatter.write_f64(&mut buf, value)?;
+            if !buf.contains(&b'e') {
+                let (sign, rest): (&[u8], &[u8]) = match buf.strip_prefix(b"-") {
+                    Some(rest) => (b"-", rest),
+                    None => (b"", &buf),
+                };
+                if let Some(fraction) = rest.strip_prefix(b"0.") {
+                    let zeros = fraction.iter().take_while(|&&b| b == b'0').count();
+                    if zeros >= 4 {
+                        if let [first_digit, rest_digits @ ..] = &fraction[zeros..] {
+                            w.write_all(sign)?;
+                            w.write_all(std::slice::from_ref(first_digit))?;
+                            if !rest_digits.is_empty() {
+                                w.write_all(b".")?;
+                                w.write_all(rest_digits)?;
+                            }
+                            return write!(w, "e-{:02}", zeros + 1);
+                        }
+                    }
+                }
+            } else if let [mantissa @ .., b'e', b'-', digit] = buf.as_slice() {
+                w.write_all(mantissa)?;
+                return write!(w, "e-0{}", *digit as char);
             }
-        })
-        .collect()
-}
-
-/// A tool message's result body as parts.
-fn tool_parts(m: &ChatMessage, next_img: &mut usize) -> Vec<Part> {
-    if m.parts.is_empty() {
-        return vec![Part::Text(m.content.clone().unwrap_or_default())];
+            w.write_all(&buf)
+        }
     }
-    m.parts
-        .iter()
-        .map(|p| match p {
-            ContentPart::Text(t) => Part::Text(t.clone()),
-            ContentPart::Image(_) => {
-                *next_img += 1;
-                Part::Image(*next_img - 1)
-            }
-        })
-        .collect()
+    let mut buf = Vec::with_capacity(128);
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, RecipeFormatter);
+    match serde::Serialize::serialize(v, &mut ser) {
+        Ok(()) => String::from_utf8(buf).unwrap_or_else(|_| "null".into()),
+        Err(_) => "null".into(),
+    }
 }
 
-/// `merge_tool_messages`: tool messages become `<tool_result>` blocks in the
-/// preceding user turn (or a new one); consecutive user turns merge.
-fn merge(messages: &[ChatMessage]) -> eyre::Result<Vec<Msg>> {
-    let mut out: Vec<Msg> = Vec::new();
+// ----- the reference's conversation (deepseek_recipe_core::messages::InputMessage) -----
+
+#[derive(Clone, Debug)]
+enum Im {
+    System(Vec<Seg>),
+    /// `images`: each image's ordinal among the request messages' images in
+    /// message order (the order the handler collects their pixels in).
+    User { segs: Vec<Seg>, images: Vec<usize> },
+    Assistant { content: String, reasoning: Option<String>, tool_calls: Vec<ToolCall> },
+    Tool { segs: Vec<Seg>, images: Vec<usize>, id: String },
+    Reminder(String),
+}
+
+/// A function tool after `convert_tools` (`deepseek_recipe_core::tools::ToolDefinition`).
+#[derive(Clone, Debug)]
+struct ToolDefinition {
+    name: String,
+    description: Option<String>,
+    parameters: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolChoice {
+    Auto,
+    None,
+    Required,
+}
+
+/// The reference's `Conversation`: everything rendering needs.
+#[derive(Clone, Debug)]
+struct Conversation {
+    messages: Vec<Im>,
+    thinking: bool,
+    effort: V41Effort,
+    tools: Vec<ToolDefinition>,
+    tool_choice: ToolChoice,
+    json_object: bool,
+}
+
+fn has_recipe_image_token(s: &str) -> bool {
+    s.contains(RECIPE_IMAGE_TOKEN)
+}
+
+fn image_token_error() -> eyre::Report {
+    eyre!(
+        "The sub-string \"{RECIPE_IMAGE_TOKEN}\" in your input is not allowed for this API. Please remove \
+         \"{RECIPE_IMAGE_TOKEN}\" from your input and try again."
+    )
+}
+
+/// `ChatCompletionRequestContent::into_content`: a string as is; content
+/// parts joined by "\n\n" with every image as the placeholder. (Our
+/// deserializer keeps `parts` only when there is an image; otherwise
+/// `content` is already the "\n\n"-joined text view.)
+fn content_segs(m: &ChatMessage, next_img: &mut usize) -> (Vec<Seg>, Vec<usize>) {
+    if m.parts.is_empty() {
+        return (vec![Seg::Client(m.content.clone().unwrap_or_default())], Vec::new());
+    }
+    let mut segs = Vec::new();
+    let mut images = Vec::new();
+    for (i, p) in m.parts.iter().enumerate() {
+        if i > 0 {
+            segs.push(Seg::Ours("\n\n".into()));
+        }
+        match p {
+            ContentPart::Text(t) => segs.push(Seg::Client(t.clone())),
+            ContentPart::Image(_) => {
+                segs.push(Seg::Ours(v4flash_vision::IMAGE_PLACEHOLDER.to_string()));
+                images.push(*next_img);
+                *next_img += 1;
+            }
+        }
+    }
+    (segs, images)
+}
+
+fn segs_text(segs: &[Seg]) -> String {
+    segs.iter().map(Seg::text).collect()
+}
+
+/// `transform_messages` + the image-token check. The reference also rejects
+/// tool messages that do not answer the immediately preceding assistant's
+/// calls one-to-one, assistant messages with neither content nor tool calls,
+/// and empty `tool_calls` arrays; the server renders those (KNOWN DEVIATION
+/// TOOL_RESULT_STRUCTURE_NOT_ENFORCED, see tests/oracle_prompt.rs).
+fn transform_messages(messages: &[ChatMessage]) -> eyre::Result<Vec<Im>> {
+    if messages.is_empty() {
+        return Err(eyre!("Empty input messages"));
+    }
+    let carries_token = messages.iter().any(|m| {
+        m.content.as_deref().is_some_and(has_recipe_image_token)
+            || m.parts.iter().any(|p| matches!(p, ContentPart::Text(t) if has_recipe_image_token(t)))
+            || m.reasoning_content.as_deref().is_some_and(has_recipe_image_token)
+            || m.tool_calls.iter().any(|tc| has_recipe_image_token(&tc.function.name) || has_recipe_image_token(&tc.function.arguments))
+    });
+    if carries_token {
+        return Err(image_token_error());
+    }
+    let mut out = Vec::with_capacity(messages.len());
     let mut next_img = 0usize;
     for m in messages {
         match m.role {
-            Role::Tool => {
-                let block = Block::ToolResult(tool_parts(m, &mut next_img));
-                let id = m.tool_call_id.clone();
-                match out.last_mut() {
-                    Some(last) if last.role == R::User && last.blocks.is_some() => {
-                        last.blocks.as_mut().unwrap().push(block);
-                        last.block_ids.push(id);
-                    }
-                    _ => out.push(Msg {
-                        role: R::User,
-                        content: None,
-                        blocks: Some(vec![block]),
-                        block_ids: vec![id],
-                        tool_calls: vec![],
-                        reasoning: None,
-                        tools: None,
-                    }),
+            Role::System => {
+                if m.has_images() {
+                    return Err(eyre!("Image in system message is unsupported"));
+                }
+                let (segs, _) = content_segs(m, &mut next_img);
+                if !segs_text(&segs).is_empty() {
+                    out.push(Im::System(segs));
                 }
             }
             Role::User => {
-                let blocks = user_blocks(m, &mut next_img);
-                let n = blocks.len();
-                match out.last_mut() {
-                    Some(last) if last.role == R::User && last.blocks.is_some() => {
-                        last.blocks.as_mut().unwrap().extend(blocks);
-                        last.block_ids.extend(std::iter::repeat_n(None, n));
-                    }
-                    _ => out.push(Msg {
-                        role: R::User,
-                        content: None,
-                        blocks: Some(blocks),
-                        block_ids: vec![None; n],
-                        tool_calls: vec![],
-                        reasoning: None,
-                        tools: None,
-                    }),
-                }
+                let (segs, images) = content_segs(m, &mut next_img);
+                out.push(Im::User { segs, images });
             }
-            Role::System | Role::Assistant => out.push(Msg {
-                role: if m.role == Role::System { R::System } else { R::Assistant },
-                // A client system message always has content (null → ""):
-                // `None` marks the synthetic tools carrier.
-                content: if m.role == Role::System {
-                    Some(text_of(m)?.unwrap_or_default())
-                } else {
-                    text_of(m)?
-                },
-                blocks: None,
-                block_ids: vec![],
-                tool_calls: m.tool_calls.clone(),
-                reasoning: m.reasoning_content.clone(),
-                tools: None,
-            }),
+            Role::Assistant => {
+                if m.has_images() {
+                    return Err(eyre!("Image in assistant message is unsupported"));
+                }
+                out.push(Im::Assistant {
+                    content: m.content.clone().unwrap_or_default(),
+                    reasoning: m.reasoning_content.clone(),
+                    tool_calls: m.tool_calls.clone(),
+                });
+            }
+            Role::Tool => {
+                let (segs, images) = content_segs(m, &mut next_img);
+                out.push(Im::Tool { segs, images, id: m.tool_call_id.clone().unwrap_or_default() });
+            }
+            Role::LatestReminder => {
+                if m.has_images() {
+                    return Err(eyre!("Image in latest_reminder message is unsupported"));
+                }
+                out.push(Im::Reminder(m.content.clone().unwrap_or_default()));
+            }
         }
     }
     Ok(out)
 }
 
-/// `sort_tool_results_by_call_order`: within a user turn, order the tool
-/// result blocks by the preceding assistant's tool-call order.
-fn sort_tool_results(msgs: &mut [Msg]) {
-    let mut order: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for m in msgs.iter_mut() {
-        match m.role {
-            R::Assistant if !m.tool_calls.is_empty() => {
-                order.clear();
-                for (i, tc) in m.tool_calls.iter().enumerate() {
-                    if !tc.id.is_empty() {
-                        order.insert(tc.id.clone(), i);
+/// `normalize_messages` (V4.1: mid-conversation system messages kept):
+/// consecutive user messages merge, joined by "\n\n"; then
+/// `sort_tool_results_by_call_order`.
+fn normalize_messages(messages: Vec<Im>) -> Vec<Im> {
+    let mut normalized: Vec<Im> = Vec::with_capacity(messages.len());
+    for m in messages {
+        match (m, normalized.last_mut()) {
+            (Im::User { segs, images }, Some(Im::User { segs: prev, images: prev_images })) => {
+                prev.push(Seg::Ours("\n\n".into()));
+                prev.extend(segs);
+                prev_images.extend(images);
+            }
+            (m, _) => normalized.push(m),
+        }
+    }
+    sort_tool_results_by_call_order(&mut normalized);
+    normalized
+}
+
+/// Within each run of user / tool messages, order the tool messages by the
+/// position of their call id in the last assistant's tool calls (unknown
+/// ids first, stable).
+fn sort_tool_results_by_call_order(messages: &mut [Im]) {
+    let mut order: Vec<String> = Vec::new();
+    let mut idx = 0;
+    while idx < messages.len() {
+        match &messages[idx] {
+            Im::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                order = tool_calls.iter().map(|tc| tc.id.clone()).collect();
+                idx += 1;
+            }
+            Im::User { .. } | Im::Tool { .. } => {
+                let start = idx;
+                while idx < messages.len() && matches!(messages[idx], Im::User { .. } | Im::Tool { .. }) {
+                    idx += 1;
+                }
+                let tool_idxs: Vec<usize> = (start..idx).filter(|&i| matches!(messages[i], Im::Tool { .. })).collect();
+                if tool_idxs.len() > 1 && !order.is_empty() {
+                    let mut tools: Vec<Im> = tool_idxs.iter().map(|&i| messages[i].clone()).collect();
+                    tools.sort_by_key(|m| match m {
+                        Im::Tool { id, .. } => order.iter().position(|o| o == id).unwrap_or(0),
+                        _ => 0,
+                    });
+                    for (&i, t) in tool_idxs.iter().zip(tools) {
+                        messages[i] = t;
                     }
                 }
             }
-            R::User => {
-                let Some(blocks) = m.blocks.as_mut() else { continue };
-                let idxs: Vec<usize> = (0..blocks.len()).filter(|&i| matches!(blocks[i], Block::ToolResult(_))).collect();
-                if idxs.len() > 1 && !order.is_empty() {
-                    let mut tool_blocks: Vec<(usize, Block, Option<String>)> =
-                        idxs.iter().map(|&i| (i, blocks[i].clone(), m.block_ids[i].clone())).collect();
-                    // Python `sorted` is stable; key = order of the call id (0 if unknown).
-                    tool_blocks.sort_by_key(|(_, _, id)| id.as_deref().and_then(|s| order.get(s)).copied().unwrap_or(0));
-                    for (slot, (_, b, id)) in idxs.iter().zip(tool_blocks.into_iter()) {
-                        blocks[*slot] = b;
-                        m.block_ids[*slot] = id;
-                    }
-                }
+            _ => idx += 1,
+        }
+    }
+}
+
+/// `convert_tools`: function tools as `{name, description, parameters}`,
+/// the tool choice applied. `tool_choice: "none"` drops every tool; a named
+/// choice keeps only that tool and requires it (as "required" does), which
+/// thinking mode does not support.
+///
+/// KNOWN DEVIATIONS (accepted here, rejected by the reference): tool names
+/// outside `[A-Za-z0-9_-]{1,128}`, `parameters` that are not a JSON Schema of
+/// type object, and non-`function` entries (skipped, as before).
+fn convert_tools(req: &ChatCompletionRequest, thinking: bool) -> eyre::Result<(Vec<ToolDefinition>, ToolChoice)> {
+    enum Choice {
+        Absent,
+        Mode(ToolChoice),
+        Named(String),
+    }
+    let choice = match &req.tool_choice {
+        None | Some(serde_json::Value::Null) => Choice::Absent,
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "none" => Choice::Mode(ToolChoice::None),
+            "auto" => Choice::Mode(ToolChoice::Auto),
+            "required" => Choice::Mode(ToolChoice::Required),
+            other => return Err(eyre!("tool_choice: unknown mode {other:?} (expected none, auto or required)")),
+        },
+        Some(serde_json::Value::Object(o)) => {
+            let name = o.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str());
+            match (o.get("type").and_then(|t| t.as_str()), name) {
+                (Some("function"), Some(n)) => Choice::Named(n.to_string()),
+                _ => return Err(eyre!("tool_choice: expected {{\"type\": \"function\", \"function\": {{\"name\": …}}}}")),
             }
-            _ => {}
         }
-    }
-}
-
-/// The reference's last-user definition: a user, or a system message that is
-/// not the first message.
-fn last_user_index(msgs: &[Msg]) -> isize {
-    for i in (0..msgs.len()).rev() {
-        if msgs[i].role == R::User || (msgs[i].role == R::System && i > 0) {
-            return i as isize;
-        }
-    }
-    -1
-}
-
-/// `_drop_thinking_messages`: keep everything, but strip reasoning from
-/// assistant turns before the last user turn.
-fn drop_thinking(msgs: &[Msg]) -> Vec<Msg> {
-    let lu = last_user_index(msgs);
-    let mut out = Vec::with_capacity(msgs.len());
-    for (i, m) in msgs.iter().enumerate() {
-        if m.role == R::Assistant && (i as isize) < lu {
-            let mut c = m.clone();
-            c.reasoning = None;
-            out.push(c);
-        } else {
-            out.push(m.clone());
-        }
-    }
-    out
-}
-
-/// The tool block, split by PROVENANCE so the `Seg::Ours` / `Seg::Client`
-/// boundary lands in the right place.
-///
-/// `TOOLS_HEAD`/`TOOLS_TAIL` are OUR markup — they demonstrate the DSML syntax,
-/// so their `｜DSML｜` markers must tokenise to the real special id. Only the
-/// SCHEMAS are client-supplied and must stay inert (a tool description
-/// containing a literal `｜DSML｜` must never become a control token).
-///
-/// Emitting the whole block as `Seg::Client` (what this did) BPE'd our own
-/// instructions as ordinary text, so the model was shown look-alike DSML and
-/// faithfully imitated it — producing output the scanner correctly refuses to
-/// parse (it ignores DSML-looking bytes that carry no TOK_DSML). Net effect:
-/// every tool call came back as literal markup in `content` with
-/// `tool_calls: null`, and the scanner logged nothing at all.
-fn tools_segs(tools: &[ToolDef], out: &mut Vec<Seg>) {
-    // tools_from_openai_format: the function object as given (name re-assigned
-    // to itself; namespaces are not supported here), json.dumps(ensure_ascii=False).
-    let schemas: Vec<String> = tools.iter().map(|t| to_json_hf(&t.function)).collect();
-    out.push(Seg::Ours(TOOLS_HEAD.to_string()));
-    out.push(Seg::Client(schemas.join("\n")));
-    out.push(Seg::Ours(TOOLS_TAIL.to_string()));
-}
-
-/// Flat-string form of [`tools_segs`] (tests / diagnostics only — it loses the
-/// provenance split, so never feed it to the tokeniser).
-#[cfg(test)]
-fn tools_text(tools: &[ToolDef]) -> String {
-    let schemas: Vec<String> = tools.iter().map(|t| to_json_hf(&t.function)).collect();
-    format!("{TOOLS_HEAD}{}{TOOLS_TAIL}", schemas.join("\n"))
-}
-
-/// `encode_arguments_to_dsml`: the tool call's arguments (a JSON string,
-/// possibly double-encoded) → parameter tags.
-fn push_tool_call(out: &mut Vec<Seg>, tc: &ToolCall) {
-    let mut args: serde_json::Value = serde_json::Value::String(tc.function.arguments.clone());
-    for _ in 0..2 {
-        match &args {
-            serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
-                Ok(v) => args = v,
-                Err(_) => break,
-            },
-            _ => break,
-        }
-    }
-    let obj = match args {
-        serde_json::Value::Object(o) => o,
-        _ => {
-            let mut o = serde_json::Map::new();
-            o.insert("arguments".to_string(), serde_json::Value::String(tc.function.arguments.clone()));
-            o
-        }
+        Some(other) => return Err(eyre!("tool_choice: unsupported value {other}")),
     };
-    out.push(Seg::Ours(format!("<{DSML} invoke name=\"")));
-    out.push(Seg::Client(tc.function.name.clone()));
-    out.push(Seg::Ours("\">\n".to_string()));
-    let n = obj.len();
-    for (i, (k, v)) in obj.iter().enumerate() {
-        let (is_str, body) = match v {
-            serde_json::Value::String(s) => (true, s.clone()),
-            other => (false, to_json_hf(other)),
+    if matches!(choice, Choice::Mode(ToolChoice::None)) {
+        return Ok((Vec::new(), ToolChoice::None));
+    }
+    let tools: Vec<&crate::openai::types::ToolDef> =
+        req.tools.as_deref().unwrap_or(&[]).iter().filter(|t| t.kind == "function").collect();
+    if tools.is_empty() {
+        return Ok((Vec::new(), ToolChoice::Auto));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut definitions = Vec::with_capacity(tools.len());
+    for (i, t) in tools.iter().enumerate() {
+        let f = t.function.as_object().ok_or_else(|| eyre!("tools.{i}.function: expected an object"))?;
+        let name = f
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| eyre!("tools.{i}.function.name: expected a string"))?
+            .to_string();
+        if !names.insert(name.clone()) {
+            return Err(eyre!("Tool names must be unique"));
+        }
+        let description = match f.get("description") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(_) => return Err(eyre!("tools.{i}.function.description: expected a string")),
         };
-        out.push(Seg::Ours(format!("<{DSML} parameter name=\"")));
-        out.push(Seg::Client(k.clone()));
-        out.push(Seg::Ours(format!("\" string=\"{}\">", if is_str { "true" } else { "false" })));
-        out.push(Seg::Client(body));
-        out.push(Seg::Ours(format!("</{DSML} parameter>")));
-        if i + 1 < n {
-            out.push(Seg::Ours("\n".to_string()));
-        }
-    }
-    out.push(Seg::Ours(format!("\n</{DSML} invoke>")));
-}
-
-/// `render_message`.
-/// `images` receives each emitted placeholder's image ordinal, in prompt order.
-fn render_message(out: &mut Vec<Seg>, images: &mut Vec<usize>, index: usize, msgs: &[Msg], thinking: bool, drop: bool, effort: V41Effort) {
-    let m = &msgs[index];
-    let lu = last_user_index(msgs);
-    let effort_prompt = if index == 0 && thinking {
-        Some(format!("{REASONING_EFFORT_FMT_PREFIX}{}{REASONING_EFFORT_FMT_SUFFIX}", effort.0))
-    } else {
-        None
-    };
-    if index == 0 && (effort_prompt.is_some() || m.role == R::System) {
-        out.push(Seg::Ours(SYSTEM_TEXT.to_string()));
-    }
-    if let Some(e) = effort_prompt {
-        out.push(Seg::Ours(e));
-    }
-    match m.role {
-        R::System => {
-            if index > 0 {
-                out.push(Seg::Ours(SYSTEM_TEXT.to_string()));
-            }
-            // The synthetic tools carrier has no content and so no
-            // content/tools separator either (as `prompt.rs` renders tools
-            // without a system message).
-            if let Some(c) = &m.content {
-                out.push(Seg::Client(c.clone()));
-            }
-            if let Some(tools) = m.tools.as_ref().filter(|t| !t.is_empty()) {
-                if m.content.is_some() {
-                    out.push(Seg::Ours("\n\n".to_string()));
-                }
-                tools_segs(tools, out);
-            }
-        }
-        R::User => {
-            out.push(Seg::Ours(USER_TEXT.to_string()));
-            match &m.blocks {
-                Some(blocks) => {
-                    for (i, b) in blocks.iter().enumerate() {
-                        if i > 0 {
-                            out.push(Seg::Ours("\n\n".to_string()));
-                        }
-                        match b {
-                            Block::Text(t) => out.push(Seg::Client(t.clone())),
-                            Block::Image(k) => {
-                                images.push(*k);
-                                out.push(Seg::Ours(v4flash_vision::IMAGE_PLACEHOLDER.to_string()));
-                            }
-                            Block::ToolResult(parts) => {
-                                out.push(Seg::Ours("<tool_result>".to_string()));
-                                for (j, p) in parts.iter().enumerate() {
-                                    if j > 0 {
-                                        out.push(Seg::Ours("\n\n".to_string()));
-                                    }
-                                    match p {
-                                        Part::Text(t) => out.push(Seg::Client(t.clone())),
-                                        Part::Image(k) => {
-                                            images.push(*k);
-                                            out.push(Seg::Ours(v4flash_vision::IMAGE_PLACEHOLDER.to_string()));
-                                        }
-                                    }
-                                }
-                                out.push(Seg::Ours("</tool_result>".to_string()));
-                            }
-                        }
-                    }
-                }
-                None => out.push(Seg::Client(m.content.clone().unwrap_or_default())),
-            }
-        }
-        R::Assistant => {
-            if thinking && (!drop || (index as isize) > lu) {
-                out.push(Seg::Client(m.reasoning.clone().unwrap_or_default()));
-                out.push(Seg::Ours(THINK_END_TEXT.to_string()));
-            }
-            // DELIBERATE deviation from the reference (as in `prompt.rs`):
-            // before a calls block, strip the content's trailing whitespace.
-            // The model's own output is `<text>\n\n<｜DSML｜ calls>` and the
-            // scanner hands the "\n\n" back in `content`, so replaying it
-            // verbatim grows four newlines where the live KV cache has two.
-            let content = m.content.as_deref().unwrap_or_default();
-            let content = if m.tool_calls.is_empty() {
-                content
-            } else {
-                content.trim_end_matches(['\n', '\r', '\t', ' '])
-            };
-            if !content.is_empty() {
-                out.push(Seg::Client(content.to_string()));
-            }
-            if !m.tool_calls.is_empty() {
-                out.push(Seg::Ours(format!("\n\n<{DSML} calls>\n")));
-                for (i, tc) in m.tool_calls.iter().enumerate() {
-                    if i > 0 {
-                        out.push(Seg::Ours("\n".to_string()));
-                    }
-                    push_tool_call(out, tc);
-                }
-                out.push(Seg::Ours(format!("\n</{DSML} calls>")));
-            }
-            out.push(Seg::Ours(EOS_TEXT.to_string()));
-        }
-    }
-    // Transition: no header if the next message is not an assistant turn.
-    if index + 1 < msgs.len() && msgs[index + 1].role != R::Assistant {
-        return;
-    }
-    if m.role == R::User || (m.role == R::System && index > 0) {
-        out.push(Seg::Ours(ASSISTANT_TEXT.to_string()));
-        let tok = if (!drop && thinking) || (drop && thinking && (index as isize) >= lu) {
-            THINK_BEGIN_TEXT
-        } else {
-            THINK_END_TEXT
+        let parameters = match f.get("parameters") {
+            None | Some(serde_json::Value::Null) => serde_json::json!({}),
+            Some(p) => p.clone(),
         };
-        out.push(Seg::Ours(tok.to_string()));
+        definitions.push(ToolDefinition { name, description, parameters });
     }
-}
-
-/// `_encode_messages_text`. `thinking` = thinking mode (else chat mode);
-/// `effort` applies in thinking mode only; `context` is a rendered-before
-/// prefix (no BOS is emitted when it is present, as in the reference).
-pub fn build_segments_v41(
-    messages: &[ChatMessage],
-    tools: Option<&[ToolDef]>,
-    thinking: bool,
-    effort: V41Effort,
-    context: Option<&[ChatMessage]>,
-) -> eyre::Result<Vec<Seg>> {
-    Ok(build_v41(messages, tools, thinking, effort, context)?.0)
-}
-
-/// The segments plus, per emitted image placeholder in prompt order, the
-/// ordinal of its image among `messages`' images in message order. The two
-/// orders differ when `sort_tool_results` reorders image-carrying tool
-/// results; pairing pixels by message order then swapped pictures.
-fn build_v41(
-    messages: &[ChatMessage],
-    tools: Option<&[ToolDef]>,
-    thinking: bool,
-    effort: V41Effort,
-    context: Option<&[ChatMessage]>,
-) -> eyre::Result<(Vec<Seg>, Vec<usize>)> {
-    if messages.is_empty() {
-        return Err(eyre!("V4.1 prompt: messages array is empty"));
-    }
-    let ctx_raw = context.unwrap_or(&[]);
-    let mut ctx = merge(ctx_raw)?;
-    let mut msgs = merge(messages)?;
-    // tools attach to message 0 of the whole conversation (the reference's
-    // load_cases), which renders them only if it is a system message. The
-    // reference's caller always supplies one; an OpenAI request need not, and
-    // then the model would see no tool schemas at all (while `any_tools` still
-    // keeps the reasoning). Prepend a content-less system message to carry
-    // them, which renders the block the way `prompt.rs` does without a system
-    // prompt. Into the context when there is one, so a context rendered
-    // earlier as `messages` had the same carrier at the same index.
-    if let Some(t) = tools.filter(|t| !t.is_empty()) {
-        let head = if ctx.is_empty() { &mut msgs } else { &mut ctx };
-        if !matches!(head.first(), Some(m) if m.role == R::System) {
-            head.insert(
-                0,
-                Msg {
-                    role: R::System,
-                    content: None,
-                    blocks: None,
-                    block_ids: vec![],
-                    tool_calls: vec![],
-                    reasoning: None,
-                    tools: None,
-                },
-            );
+    let choice = match choice {
+        Choice::Named(name) => {
+            if !names.contains(&name) {
+                return Err(eyre!("tool_choice: no tool named '{name}' was specified"));
+            }
+            definitions.retain(|t| t.name == name);
+            ToolChoice::Required
         }
-        head[0].tools = Some(t.to_vec());
-    }
-    let ctx_len = ctx.len();
-    let mut full: Vec<Msg> = ctx.clone();
-    full.extend(msgs.drain(..));
-    sort_tool_results(&mut full);
-    sort_tool_results(&mut ctx);
-
-    let mut out: Vec<Seg> = Vec::new();
-    if ctx_len == 0 {
-        out.push(Seg::Ours(BOS_TEXT.to_string()));
-    }
-    let any_tools = full.iter().any(|m| m.tools.as_ref().is_some_and(|t| !t.is_empty()));
-    let effective_drop = !any_tools;
-    let (rendered, context_len) = if thinking && effective_drop {
-        let dropped = drop_thinking(&full);
-        let num = dropped.len() - drop_thinking(&ctx).len();
-        let cl = dropped.len() - num;
-        (dropped, cl)
-    } else {
-        (full, ctx_len)
+        Choice::Mode(ToolChoice::Required) => ToolChoice::Required,
+        _ => ToolChoice::Auto,
     };
-    // Only the `messages` part renders (`context_len..`), so every ordinal
-    // pushed here indexes `messages`' images.
-    let mut images = Vec::new();
-    for idx in context_len..rendered.len() {
-        render_message(&mut out, &mut images, idx, &rendered, thinking, effective_drop, effort);
+    if choice == ToolChoice::Required && thinking {
+        return Err(eyre!("Thinking mode does not support this tool_choice"));
     }
-    Ok((out, images))
-}
-
-/// The rendered prompt as text — exactly what the reference `encode_messages` returns.
-pub fn render_prompt_text_v41(
-    messages: &[ChatMessage],
-    tools: Option<&[ToolDef]>,
-    thinking: bool,
-    effort: V41Effort,
-    context: Option<&[ChatMessage]>,
-) -> eyre::Result<String> {
-    Ok(build_segments_v41(messages, tools, thinking, effort, context)?.iter().map(Seg::text).collect())
-}
-
-/// Token ids: markup/specials via the vocab's special ids, client text via BPE.
-///
-/// `image_placeholder` is the vocab id of `<｜deepseek_image｜>` (129264 in
-/// V4.1's tokenizer.json; `EngineHandle::image_placeholder_id`). Every image
-/// part renders as exactly one placeholder id. Returns the token ids and,
-/// per placeholder in prompt order, the index of its image among the
-/// request messages' images in message order: the caller must hand
-/// `vision_prompt::expand_images` the images in THAT order. A request with
-/// images and no placeholder id is an error.
-pub fn render_prompt_v41(
-    vocab: &BpeVocab,
-    messages: &[ChatMessage],
-    tools: Option<&[ToolDef]>,
-    thinking: bool,
-    effort: V41Effort,
-    context: Option<&[ChatMessage]>,
-    image_placeholder: Option<i32>,
-) -> eyre::Result<(Vec<i32>, Vec<usize>)> {
-    if image_placeholder.is_none() && messages.iter().chain(context.unwrap_or(&[])).any(|m| m.has_images()) {
-        return Err(eyre!(
-            "V4.1 prompt: a message has image parts but the loaded vocab has no `{}` token",
-            v4flash_vision::IMAGE_PLACEHOLDER
-        ));
+    if definitions.iter().any(|t| {
+        has_recipe_image_token(&t.name)
+            || t.description.as_deref().is_some_and(has_recipe_image_token)
+            || has_recipe_image_token(&to_json_recipe(&t.parameters))
+    }) {
+        return Err(image_token_error());
     }
-    let (segs, image_order) = build_v41(messages, tools, thinking, effort, context)?;
-    Ok((encode_segments(vocab, &segs, image_placeholder), image_order))
+    Ok((definitions, choice))
 }
 
-// ----- request-level entry point (what `handler::chat_completions` renders) -----
+/// `convert_response_format`: `json_object` (the conversation must mention
+/// "json"), `text` / `json_schema` (accepted, ignored), `regex` rejected.
+fn convert_response_format(req: &ChatCompletionRequest, messages: &[Im]) -> eyre::Result<bool> {
+    let Some(rf) = req.response_format.as_ref().filter(|v| !v.is_null()) else { return Ok(false) };
+    match rf.get("type").and_then(|t| t.as_str()) {
+        Some("json_object") => {
+            let mentions_json = messages.iter().any(|m| {
+                let text = match m {
+                    Im::System(s) | Im::User { segs: s, .. } | Im::Tool { segs: s, .. } => segs_text(s),
+                    Im::Assistant { content, .. } => content.clone(),
+                    Im::Reminder(s) => s.clone(),
+                };
+                text.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"json"))
+            });
+            if !mentions_json {
+                return Err(eyre!(
+                    "Prompt must contain the word 'json' in some form to use 'response_format' of type 'json_object'."
+                ));
+            }
+            Ok(true)
+        }
+        Some("text") | Some("json_schema") => Ok(false),
+        Some("regex") => Err(eyre!("response_format: only text and json_object are supported")),
+        _ => Err(eyre!("response_format: expected a type of text, json_object or json_schema")),
+    }
+}
+
+// ----- effort / thinking -----
 
 /// The 4-state effort and the explicit numeric budget (if any) a request
 /// asks for. `default_effort` is the operator default
@@ -630,7 +479,8 @@ pub fn render_prompt_v41(
 /// A NUMERIC `reasoning_effort` ("88" or 88) is V4.1's native 1..=100
 /// budget: thinking on, budget as given (0 = off). Clients that spread their
 /// effort ladder over numbers (prime-agent's thinkingLevelMap) get finer
-/// grain than the three named tiers.
+/// grain than the three named tiers. (KNOWN DEVIATION: the reference accepts
+/// only none/minimal/low/medium/high/xhigh/max.)
 pub fn request_effort(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> Result<(ReasoningEffort, Option<u8>), String> {
     let numeric_budget: Option<u8> = req
         .reasoning_effort
@@ -652,35 +502,205 @@ pub fn request_effort(req: &ChatCompletionRequest, default_effort: ReasoningEffo
     Ok((effort, numeric_budget))
 }
 
-/// The V4.1 thinking flag and 1..=100 budget for a request.
+/// The V4.1 thinking flag and 1..=100 budget for a request
+/// (`ChatCompletionRequest::resolve_thinking`): an explicit `thinking`
+/// (`enabled` / `adaptive` / `disabled`) wins over `reasoning_effort`, which
+/// wins over the default; thinking without a named effort is "high" (75).
 pub fn request_thinking_v41(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> Result<(bool, V41Effort), String> {
     let (effort, numeric_budget) = request_effort(req, default_effort)?;
-    // The 4-state effort carries the thinking flag; V4.1 wants a 1..=100
-    // budget alongside it. An explicit integer in the request wins.
+    let thinking = match req.thinking.as_ref() {
+        Some(t) => t.enabled()?,
+        None => effort.thinking_enabled(),
+    };
+    // An explicit integer in the request wins; then a named level ("minimal"
+    // = 25, ...: `reasoning_effort` wins, else letta's `reasoning`); then the
+    // 4-state level, where Off (thinking forced on by `thinking`) is the
+    // reference's default "high".
     let budget = numeric_budget
         .filter(|&n| n >= 1)
         .map(V41Effort)
-        // A named level ("minimal" = 25, ...): `reasoning_effort` wins, else letta's `reasoning`.
         .or_else(|| match req.reasoning_effort.as_deref() {
             Some(s) => V41Effort::from_name(s),
             None => req.reasoning.as_deref().and_then(V41Effort::from_name),
         })
         .unwrap_or(match effort {
-            ReasoningEffort::Off | ReasoningEffort::Low => V41Effort(50),
-            ReasoningEffort::High => V41Effort(75),
+            ReasoningEffort::Low => V41Effort(50),
+            ReasoningEffort::Off | ReasoningEffort::High => V41Effort(75),
             ReasoningEffort::Max => V41Effort(100),
         });
-    Ok((effort.thinking_enabled(), budget))
+    Ok((thinking, budget))
 }
 
-/// The request's prompt segments and image order — exactly what the server
-/// renders for `/v1/chat/completions` (`handler::chat_completions`), from the
-/// request as deserialized. `tests/oracle_prompt.rs` diffs this against
-/// DeepSeek's reference implementation.
+// ----- rendering (`EncodingV4::render_conversation`) -----
+
+fn tools_segs(tools: &[ToolDefinition], out: &mut Vec<Seg>) {
+    // `render_tool_prompt`: each tool as {"name", "description" ("" when
+    // absent), "parameters"}, one per line. TOOLS_HEAD/TOOLS_TAIL are OUR
+    // markup (their `｜DSML｜` must tokenise to the special id); only the
+    // schemas are client text.
+    let schemas: Vec<String> = tools
+        .iter()
+        .map(|t| {
+            to_json_recipe(&serde_json::json!({
+                "name": t.name,
+                "description": t.description.as_deref().unwrap_or_default(),
+                "parameters": t.parameters,
+            }))
+        })
+        .collect();
+    out.push(Seg::Ours(TOOLS_HEAD.to_string()));
+    out.push(Seg::Client(schemas.join("\n")));
+    out.push(Seg::Ours(TOOLS_TAIL.to_string()));
+}
+
+/// `render_tool_arguments`: the arguments as a JSON object (anything else
+/// becomes `{"arguments": <raw string>}`); string values raw with
+/// `string="true"`, the rest as JSON with `string="false"`.
+fn push_tool_call(out: &mut Vec<Seg>, tc: &ToolCall) {
+    let args = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&tc.function.arguments).unwrap_or_else(|_| {
+        let mut o = serde_json::Map::new();
+        o.insert("arguments".to_string(), serde_json::Value::String(tc.function.arguments.clone()));
+        o
+    });
+    out.push(Seg::Ours(format!("<{DSML} invoke name=\"")));
+    out.push(Seg::Client(tc.function.name.clone()));
+    out.push(Seg::Ours("\">\n".to_string()));
+    for (i, (k, v)) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(Seg::Ours("\n".to_string()));
+        }
+        let (is_str, body) = match v {
+            serde_json::Value::String(s) => (true, s.clone()),
+            other => (false, to_json_recipe(other)),
+        };
+        out.push(Seg::Ours(format!("<{DSML} parameter name=\"")));
+        out.push(Seg::Client(k.clone()));
+        out.push(Seg::Ours(format!("\" string=\"{}\">", if is_str { "true" } else { "false" })));
+        out.push(Seg::Client(body));
+        out.push(Seg::Ours(format!("</{DSML} parameter>")));
+    }
+    out.push(Seg::Ours(format!("\n</{DSML} invoke>")));
+}
+
+/// `render_message` for message `index`. `images` receives each emitted
+/// placeholder's image ordinal, in prompt order.
+fn render_message(out: &mut Vec<Seg>, images: &mut Vec<usize>, messages: &[Im], index: usize, conv: &Conversation) {
+    let m = &messages[index];
+    let prev = index.checked_sub(1).map(|i| &messages[i]);
+    let effort_prompt = (index == 0 && conv.thinking)
+        .then(|| format!("{REASONING_EFFORT_FMT_PREFIX}{}{REASONING_EFFORT_FMT_SUFFIX}", conv.effort.0));
+    if index == 0 && (effort_prompt.is_some() || matches!(m, Im::System(_))) {
+        out.push(Seg::Ours(SYSTEM_TEXT.to_string()));
+    }
+    if let Some(e) = effort_prompt {
+        out.push(Seg::Ours(e));
+    }
+    let after_user = matches!(prev, Some(Im::User { .. } | Im::Tool { .. }));
+    match m {
+        Im::System(segs) => {
+            if index > 0 {
+                out.push(Seg::Ours(SYSTEM_TEXT.to_string()));
+            }
+            out.extend(segs.iter().cloned());
+        }
+        Im::User { segs, images: imgs } => {
+            out.push(Seg::Ours(if after_user { "\n\n" } else { USER_TEXT }.to_string()));
+            out.extend(segs.iter().cloned());
+            images.extend(imgs);
+        }
+        Im::Reminder(s) => {
+            out.push(Seg::Ours(LATEST_REMINDER_TEXT.to_string()));
+            out.push(Seg::Client(s.clone()));
+        }
+        Im::Tool { segs, images: imgs, .. } => {
+            out.push(Seg::Ours(if after_user { "\n\n" } else { USER_TEXT }.to_string()));
+            out.push(Seg::Ours("<tool_result>".to_string()));
+            out.extend(segs.iter().cloned());
+            out.push(Seg::Ours("</tool_result>".to_string()));
+            images.extend(imgs);
+        }
+        Im::Assistant { content, reasoning, tool_calls } => {
+            out.push(Seg::Ours(ASSISTANT_TEXT.to_string()));
+            if conv.thinking && index > 0 {
+                out.push(Seg::Ours(THINK_BEGIN_TEXT.to_string()));
+                out.push(Seg::Client(reasoning.clone().unwrap_or_default()));
+                out.push(Seg::Ours(THINK_END_TEXT.to_string()));
+            } else {
+                out.push(Seg::Ours(THINK_END_TEXT.to_string()));
+            }
+            out.push(Seg::Client(content.clone()));
+            if !tool_calls.is_empty() {
+                out.push(Seg::Ours(format!("\n\n<{DSML} calls>\n")));
+                for (i, tc) in tool_calls.iter().enumerate() {
+                    if i > 0 {
+                        out.push(Seg::Ours("\n".to_string()));
+                    }
+                    push_tool_call(out, tc);
+                }
+                out.push(Seg::Ours(format!("\n</{DSML} calls>")));
+            }
+            out.push(Seg::Ours(EOS_TEXT.to_string()));
+        }
+    }
+}
+
+fn render_conversation(mut conv: Conversation) -> (Vec<Seg>, Vec<usize>) {
+    let mut messages = std::mem::take(&mut conv.messages);
+    let has_tools = conv.tool_choice != ToolChoice::None && !conv.tools.is_empty();
+    if has_tools || conv.json_object {
+        if !matches!(messages.first(), Some(Im::System(_))) {
+            messages.insert(0, Im::System(Vec::new()));
+        }
+        if let Some(Im::System(segs)) = messages.first_mut() {
+            if has_tools {
+                segs.push(Seg::Ours("\n\n".to_string()));
+                tools_segs(&conv.tools, segs);
+            }
+            if conv.json_object {
+                segs.push(Seg::Ours(format!("\n\n{RESPONSE_FORMAT_PREFIX}")));
+                segs.push(Seg::Ours(to_json_recipe(&serde_json::json!({"type": "json_object"}))));
+            }
+        }
+    }
+    let mut out = vec![Seg::Ours(BOS_TEXT.to_string())];
+    let mut images = Vec::new();
+    for index in 0..messages.len() {
+        render_message(&mut out, &mut images, &messages, index, &conv);
+    }
+    out.push(Seg::Ours(ASSISTANT_TEXT.to_string()));
+    out.push(Seg::Ours(if conv.thinking { THINK_BEGIN_TEXT } else { THINK_END_TEXT }.to_string()));
+    if conv.tool_choice == ToolChoice::Required && !conv.tools.is_empty() {
+        out.push(Seg::Ours(format!("\n\n<{DSML} calls>\n")));
+    }
+    (out, images)
+}
+
+/// `ChatCompletionRequest::convert`, the parts that shape the prompt.
+fn convert(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> eyre::Result<Conversation> {
+    let (thinking, effort) = request_thinking_v41(req, default_effort).map_err(|e| eyre!(e))?;
+    let (tools, tool_choice) = convert_tools(req, thinking)?;
+    let messages = transform_messages(&req.messages)?;
+    let json_object = convert_response_format(req, &messages)?;
+    Ok(Conversation { messages: normalize_messages(messages), thinking, effort, tools, tool_choice, json_object })
+}
+
+// ----- request-level entry points (what `handler::chat_completions` renders) -----
+
+/// Whether the model's output starts INSIDE a `<｜DSML｜ calls>` block (a
+/// required / named tool choice: the prompt ends with the opening tag), so
+/// the output scanner must start in that frame.
+pub fn request_starts_in_tool_calls(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> bool {
+    let Ok((thinking, _)) = request_thinking_v41(req, default_effort) else { return false };
+    convert_tools(req, thinking).is_ok_and(|(tools, choice)| choice == ToolChoice::Required && !tools.is_empty())
+}
+
+/// The request's prompt segments and, per emitted image placeholder in
+/// prompt order, the ordinal of its image among the request messages' images
+/// in message order — exactly what the server renders for
+/// `/v1/chat/completions`, from the request as deserialized.
+/// `tests/oracle_prompt.rs` diffs this against DeepSeek's reference.
 pub fn request_segments_v41(req: &ChatCompletionRequest, default_effort: ReasoningEffort) -> eyre::Result<(Vec<Seg>, Vec<usize>)> {
-    let (thinking, budget) = request_thinking_v41(req, default_effort).map_err(|e| eyre!(e))?;
-    // V4.1's separate `context` block: nothing in the OpenAI API maps to it.
-    build_v41(&req.messages, req.tools.as_deref(), thinking, budget, None)
+    Ok(render_conversation(convert(req, default_effort)?))
 }
 
 /// [`request_segments_v41`] as text.
@@ -688,8 +708,12 @@ pub fn render_request_text_v41(req: &ChatCompletionRequest, default_effort: Reas
     Ok(request_segments_v41(req, default_effort)?.0.iter().map(Seg::text).collect())
 }
 
-/// [`request_segments_v41`] as token ids (see [`render_prompt_v41`] for
-/// `image_placeholder` and the returned image order).
+/// [`request_segments_v41`] as token ids: markup/specials via the vocab's
+/// special ids, client text via BPE. `image_placeholder` is the vocab id of
+/// `<｜deepseek_image｜>` (129264; `EngineHandle::image_placeholder_id`);
+/// every image part renders as exactly one placeholder id, and the caller
+/// must hand `vision_prompt::expand_images` the images in the returned order.
+/// A request with images and no placeholder id is an error.
 pub fn render_request_v41(
     vocab: &BpeVocab,
     req: &ChatCompletionRequest,
@@ -710,8 +734,14 @@ pub fn render_request_v41(
 mod tests {
     use super::*;
 
-    fn msgs(v: serde_json::Value) -> Vec<ChatMessage> {
-        v.as_array().unwrap().iter().map(|m| serde_json::from_value(m.clone()).unwrap()).collect()
+    fn req(v: serde_json::Value) -> ChatCompletionRequest {
+        let mut v = v;
+        v["model"] = serde_json::json!("m");
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn render(v: serde_json::Value) -> String {
+        render_request_text_v41(&req(v), ReasoningEffort::High).unwrap()
     }
 
     /// Named effort levels -> V4.1 budgets ("minimal" = 25, owner 10-11).
@@ -724,46 +754,35 @@ mod tests {
         assert_eq!(V41Effort::from_json(&serde_json::json!("minimal")).unwrap(), V41Effort(25));
     }
 
-    /// The `encoding/README.md` "OpenAI-style messages" example, byte for byte:
-    /// image parts render as the placeholder, parts joined by "\n\n".
+    /// The `encoding/README.md` "OpenAI-style messages" example: image parts
+    /// render as the placeholder, parts joined by "\n\n".
     #[test]
     fn user_image_part_renders_readme_example() {
-        let m = msgs(serde_json::json!([{
+        let s = render(serde_json::json!({"thinking": {"type": "disabled"}, "messages": [{
             "role": "user",
             "content": [
                 {"type": "text", "text": "第一张图"},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
                 {"type": "text", "text": "有什么内容？"}
             ]
-        }]));
-        let s = render_prompt_text_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
+        }]}));
         assert_eq!(
             s,
             "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>第一张图\n\n<\u{ff5c}deepseek_image\u{ff5c}>\n\n有什么内容？<\u{ff5c}Assistant\u{ff5c}></think>"
         );
         // The placeholder is OURS (a control segment); client text spelling it is not.
-        let segs = build_segments_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
+        let (segs, _) = request_segments_v41(
+            &req(serde_json::json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}]})),
+            ReasoningEffort::High,
+        )
+        .unwrap();
         assert!(segs.iter().any(|s| matches!(s, Seg::Ours(t) if t == v4flash_vision::IMAGE_PLACEHOLDER)));
-        let forged = msgs(serde_json::json!([{"role": "user", "content": "x <｜deepseek_image｜> y"}]));
-        let segs = build_segments_v41(&forged, None, false, V41Effort::DEFAULT, None).unwrap();
+        let (segs, _) =
+            request_segments_v41(&req(serde_json::json!({"messages": [{"role": "user", "content": "x <｜deepseek_image｜> y"}]})), ReasoningEffort::High)
+                .unwrap();
         assert!(segs.iter().all(|s| !matches!(s, Seg::Ours(t) if t == v4flash_vision::IMAGE_PLACEHOLDER)));
-    }
-
-    /// An image inside a tool result stays inline in the `<tool_result>` body
-    /// (`_process_image_blocks` recurses into tool_result content lists).
-    #[test]
-    fn tool_result_image_is_inline() {
-        let m = msgs(serde_json::json!([
-            {"role": "user", "content": "look"},
-            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "shot", "arguments": "{}"}}]},
-            {"role": "tool", "tool_call_id": "c1", "content": [
-                {"type": "text", "text": "screen:"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
-            ]}
-        ]));
-        let s = render_prompt_text_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
-        assert!(s.contains("<tool_result>screen:\n\n<\u{ff5c}deepseek_image\u{ff5c}></tool_result>"), "{s}");
-        assert_eq!(s.matches(v4flash_vision::IMAGE_PLACEHOLDER).count(), 1);
+        // The recipe's own spelling in client text is rejected, as there.
+        assert!(render_request_text_v41(&req(serde_json::json!({"messages": [{"role": "user", "content": "x <｜image｜>"}]})), ReasoningEffort::High).is_err());
     }
 
     /// Tool results that arrive out of call order are sorted into call order,
@@ -773,7 +792,7 @@ mod tests {
     #[test]
     fn image_order_follows_sorted_tool_results() {
         let img = |u: &str| serde_json::json!({"type": "image_url", "image_url": {"url": u}});
-        let m = msgs(serde_json::json!([
+        let r = req(serde_json::json!({"messages": [
             {"role": "user", "content": [{"type": "text", "text": "first"}, img("data:image/png;base64,AA==")]},
             {"role": "assistant", "content": "", "tool_calls": [
                 {"id": "a", "type": "function", "function": {"name": "shot", "arguments": "{}"}},
@@ -781,113 +800,55 @@ mod tests {
             ]},
             {"role": "tool", "tool_call_id": "b", "content": [{"type": "text", "text": "B"}, img("data:image/png;base64,Qg==")]},
             {"role": "tool", "tool_call_id": "a", "content": [{"type": "text", "text": "A"}, img("data:image/png;base64,QQ==")]}
-        ]));
-        let (segs, order) = build_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
+        ]}));
+        let (segs, order) = request_segments_v41(&r, ReasoningEffort::High).unwrap();
         let s: String = segs.iter().map(Seg::text).collect();
         assert!(s.find("<tool_result>A").unwrap() < s.find("<tool_result>B").unwrap(), "{s}");
+        assert!(s.contains("<tool_result>A\n\n<\u{ff5c}deepseek_image\u{ff5c}></tool_result>"), "{s}");
         // Message order: 0 = user's, 1 = B's, 2 = A's. Prompt order: user, A, B.
         assert_eq!(order, vec![0, 2, 1]);
     }
 
     #[test]
     fn images_on_assistant_are_rejected() {
-        let m = msgs(serde_json::json!([
+        let r = req(serde_json::json!({"messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [{"type": "text", "text": "a"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}
-        ]));
-        assert!(render_prompt_text_v41(&m, None, false, V41Effort::DEFAULT, None).is_err());
+        ]}));
+        assert!(render_request_text_v41(&r, ReasoningEffort::High).is_err());
     }
 
-    fn weather_tool() -> Vec<ToolDef> {
-        serde_json::from_value(serde_json::json!([{"type": "function", "function": {
-            "name": "get_weather", "description": "Weather for a city",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
-        }}]))
-        .unwrap()
-    }
-
-    /// Tools with no system message: the reference renders tools only on a
-    /// system message 0, so the schemas used to vanish (while the reasoning
-    /// was still kept as for a tool conversation). A content-less system
-    /// message now carries them, with no content/tools separator.
+    /// The reference's float spelling: Python-style small negative
+    /// exponents, serde_json's positive ones.
+    /// The reference's float spelling, which with serde_json's current
+    /// formatter (zmij) is also `json.dumps`'s.
     #[test]
-    fn tools_without_system_message_still_render() {
-        let tools = weather_tool();
-        let block = tools_text(&tools);
-        let m = msgs(serde_json::json!([{"role": "user", "content": "Weather in Paris?"}]));
-        let s = render_prompt_text_v41(&m, Some(&tools), false, V41Effort::DEFAULT, None).unwrap();
-        assert_eq!(s, format!("{BOS_TEXT}{SYSTEM_TEXT}{block}{USER_TEXT}Weather in Paris?{ASSISTANT_TEXT}{THINK_END_TEXT}"));
-        let s = render_prompt_text_v41(&m, Some(&tools), true, V41Effort(75), None).unwrap();
-        assert_eq!(
-            s,
-            format!(
-                "{BOS_TEXT}{SYSTEM_TEXT}{REASONING_EFFORT_FMT_PREFIX}75{REASONING_EFFORT_FMT_SUFFIX}{block}\
-                 {USER_TEXT}Weather in Paris?{ASSISTANT_TEXT}{THINK_BEGIN_TEXT}"
-            )
-        );
-        // With a system message (even an empty one) nothing changes: content,
-        // "\n\n", tools, exactly as the reference.
-        let m = msgs(serde_json::json!([{"role": "system", "content": ""}, {"role": "user", "content": "q"}]));
-        let s = render_prompt_text_v41(&m, Some(&tools), false, V41Effort::DEFAULT, None).unwrap();
-        assert_eq!(s, format!("{BOS_TEXT}{SYSTEM_TEXT}\n\n{block}{USER_TEXT}q{ASSISTANT_TEXT}{THINK_END_TEXT}"));
-        // An empty tools list is no tools.
-        let m = msgs(serde_json::json!([{"role": "user", "content": "q"}]));
-        let s = render_prompt_text_v41(&m, Some(&[]), false, V41Effort::DEFAULT, None).unwrap();
-        assert_eq!(s, format!("{BOS_TEXT}{USER_TEXT}q{ASSISTANT_TEXT}{THINK_END_TEXT}"));
-    }
-
-    /// The carrier goes into the context when there is one, so the rendered
-    /// `messages` part continues the context's own rendering unchanged.
-    #[test]
-    fn tools_without_system_message_with_context() {
-        let tools = weather_tool();
-        let all = msgs(serde_json::json!([
-            {"role": "user", "content": "q1"},
-            {"role": "assistant", "content": "a1"},
-            {"role": "user", "content": "q2"}
-        ]));
-        let whole = render_prompt_text_v41(&all, Some(&tools), false, V41Effort::DEFAULT, None).unwrap();
-        let head = render_prompt_text_v41(&all[..2], Some(&tools), false, V41Effort::DEFAULT, None).unwrap();
-        let tail = render_prompt_text_v41(&all[2..], Some(&tools), false, V41Effort::DEFAULT, Some(&all[..2])).unwrap();
-        assert!(whole.contains(&tools_text(&tools)));
-        assert_eq!(format!("{head}{tail}"), whole);
-    }
-
-    /// The scanner returns the "\n\n" before `<｜DSML｜ calls>` in `content`;
-    /// replaying it must give the two newlines the model emitted (and the
-    /// reference renders), not four.
-    #[test]
-    fn replayed_tool_call_content_is_trimmed_before_calls() {
-        let tools = weather_tool();
-        let tc = serde_json::json!([{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]);
-        let calls = format!(
-            "<{DSML} calls>\n<{DSML} invoke name=\"get_weather\">\n<{DSML} parameter name=\"city\" string=\"true\">Paris</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} calls>"
-        );
-        for (content, want) in [("\n\n", ""), ("Checking.\n\n", "Checking."), ("Checking. \r\n", "Checking.")] {
-            let m = msgs(serde_json::json!([
-                {"role": "system", "content": "sys"},
-                {"role": "user", "content": "Weather in Paris?"},
-                {"role": "assistant", "content": content, "reasoning_content": "r", "tool_calls": tc},
-                {"role": "tool", "tool_call_id": "c1", "content": "sunny"}
-            ]));
-            let s = render_prompt_text_v41(&m, Some(&tools), true, V41Effort(75), None).unwrap();
-            let want = format!("{ASSISTANT_TEXT}{THINK_BEGIN_TEXT}r{THINK_END_TEXT}{want}\n\n{calls}{EOS_TEXT}");
-            assert!(s.contains(&want), "content {content:?}: {s}");
+    fn recipe_json_floats() {
+        let cases = [
+            (1e-6, "1e-06"),
+            (1e-5, "1e-05"),
+            (0.0001, "0.0001"),
+            (2.5e-3, "0.0025"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1e30, "1e+30"),
+            (6.02e23, "6.02e+23"),
+            (3.0, "3.0"),
+            (-0.0, "-0.0"),
+            (1e-10, "1e-10"),
+            (5e-324, "5e-324"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(to_json_recipe(&serde_json::json!(v)), want, "{v:e}");
+            assert_eq!(crate::dsml::to_json_hf(&serde_json::json!(v)), want, "{v:e} (json.dumps)");
         }
-        // Without tool calls the content is replayed verbatim.
-        let m = msgs(serde_json::json!([
-            {"role": "user", "content": "q"},
-            {"role": "assistant", "content": "a\n\n"},
-            {"role": "user", "content": "q2"}
-        ]));
-        let s = render_prompt_text_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
-        assert!(s.contains(&format!("a\n\n{EOS_TEXT}")), "{s}");
+        assert_eq!(to_json_recipe(&serde_json::json!({"a": [1, "é"], "b": null})), "{\"a\": [1, \"é\"], \"b\": null}");
     }
 
-    /// Synthetic agent conversation (system prompt, tool schemas, `rounds` of
+    /// Synthetic agent request (system prompt, tool schemas, `rounds` of
     /// reasoning + tool call + tool result with code/log/JSON output, a user
     /// message every 10 rounds). Deterministic; no real traffic.
-    pub(crate) fn synth_agent_conversation(rounds: usize) -> (Vec<ChatMessage>, Vec<ToolDef>) {
+    pub(crate) fn synth_agent_request(rounds: usize) -> ChatCompletionRequest {
         let prose = "The agent reads the repository, runs the tests, and reports what changed. \
                      Keep answers short; cite file:line; never invent output. ";
         let code = "    fn step(&mut self, rows: usize) -> eyre::Result<()> {\n        let t = Instant::now();\n        \
@@ -897,9 +858,9 @@ mod tests {
                    completion_tokens=347 tok_per_s=\"21.49\" finish=Stop sha=3f9a1c0b77de\n";
         let json = "{\"files\": [{\"path\": \"crates/v4flash-kernels/src/het/mtp.rs\", \"lines\": 2251, \"changed\": true}, \
                     {\"path\": \"docs/v41/KNOWN_BUGS.md\", \"lines\": 1460, \"changed\": false}], \"ok\": true}\n";
-        let tools: Vec<ToolDef> = (0..12)
+        let tools: Vec<serde_json::Value> = (0..12)
             .map(|i| {
-                serde_json::from_value(serde_json::json!({"type": "function", "function": {
+                serde_json::json!({"type": "function", "function": {
                     "name": format!("tool_{i}"),
                     "description": prose.repeat(4),
                     "parameters": {"type": "object", "properties": {
@@ -907,8 +868,7 @@ mod tests {
                         "timeout": {"type": "integer", "description": "Seconds."},
                         "path": {"type": "string", "description": "An absolute path."}
                     }, "required": ["command"]}
-                }}))
-                .unwrap()
+                }})
             })
             .collect();
         let mut v = vec![serde_json::json!({"role": "system", "content": prose.repeat(60)})];
@@ -928,7 +888,7 @@ mod tests {
             v.push(serde_json::json!({"role": "tool", "tool_call_id": id,
                 "content": format!("{}{}{}", code.repeat(4), log.repeat(8), json.repeat(4))}));
         }
-        (msgs(serde_json::Value::Array(v)), tools)
+        req(serde_json::json!({"messages": v, "tools": tools}))
     }
 
     /// The BPE cost of ONE long pre-tokenizer piece (a symbol / whitespace /
@@ -966,9 +926,9 @@ mod tests {
         });
         let vocab = BpeVocab::from_tokenizer_json(&tj, Some("joyai-llm".to_string())).unwrap();
         let rounds: usize = std::env::var("SYNTH_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(250);
-        let (m, tools) = synth_agent_conversation(rounds);
+        let r = synth_agent_request(rounds);
         let t = std::time::Instant::now();
-        let (segs, _) = build_v41(&m, Some(&tools), true, V41Effort::DEFAULT, None).unwrap();
+        let (segs, _) = request_segments_v41(&r, ReasoningEffort::High).unwrap();
         let t_build = t.elapsed();
         let text: String = segs.iter().map(Seg::text).collect();
         let t = std::time::Instant::now();
@@ -984,7 +944,7 @@ mod tests {
         eprintln!(
             "rounds {rounds}: {} messages, {} bytes, {} tokens | build {:.1} ms | encode_segments {:.1} ms | \
              pre-tokenize {:.1} ms ({} pieces, longest {} bytes) | plain encode {:.1} ms ({} tokens)",
-            m.len(), text.len(), ids.len(), t_build.as_secs_f64() * 1e3, t_enc.as_secs_f64() * 1e3,
+            r.messages.len(), text.len(), ids.len(), t_build.as_secs_f64() * 1e3, t_enc.as_secs_f64() * 1e3,
             t_pre.as_secs_f64() * 1e3, pieces.len(), maxp, t_plain.as_secs_f64() * 1e3, ids2.len()
         );
     }
