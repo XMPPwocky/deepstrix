@@ -602,3 +602,137 @@ At G = 4 the kernel's work divides evenly: 8 score tasks over 8 waves (G = 6: 12
 **Risks.** The packed kernel is the default on Laguna's global layers (`laguna_het.rs`, commit 118c42d: chunked prefill with q_offset > 0 and a ring `kv_capacity`), but has not run at G = 4. Its numerics differ from `fa2` at f16 rounding (G1/G3/G4 bound it). A kernel fault on the production GPU would take the hub down, hence G0–G3 in a window before the knob is flipped live. Rolling back is the knob.
 
 **Review (2026-10-10): APPROVE WITH CHANGES**, all taken: G2's warm-cache timing (cache flush), bit-identity of the moved `fa2` path (G1, G4), the NaN-tail case (G1), G0, short-input rows, pass bars for G4, `#undef HGP_G` in the g4 file (a `-DHGP_G` in `DEEPSTRIX_KERNEL_CFLAGS` reaches both units), the packed wrapper requiring head_dim 128 (its epilogue writes all 128 dims), the stale "env-gated OFF" comments. Rejected as follow-ups, not needed to ship: two KV heads per WG (nothing shared across KV heads; LDS ~85 KB), HG_BR = 32 (16-row M tile hard-wired; LDS ~76 KB). Follow-ups after G2, each under an `#ifdef` in the g4 build only: b128 K/V staging loads, Q fragments held in registers (at G = 4 each wave keeps one score task; only with VGPR headroom), KV-first grid order.
+
+## 19. Attention: `qe_attn_g4`, keys on M with Q / P / O in registers (final design, 2026-10-17)
+
+**Status: BUILT, compile-verified, never launched.** Branch `worktree-attn-opt` (base 725ad1c). One kernel source, one implementer; the cells below are compile-time variants of it, not independent kernels. G0 (offline) passes; W0 and G1–G3 need the one GPU window, G4 the production hub.
+
+**Why.** §18's packed kernel keeps Q and P in LDS; ATT on Laguna showed 82 % LDS-operand stalls at G = 6 and a VGPR × LDS Pareto wall near 14 % of peak. llama.cpp's fattn-mma-f16 reaches 22–25 % on this GPU. The July rowpar rewrite (keys on M, P in registers) lost 1.75× only because K and V shared one LDS buffer and the loads serialized (`docs/laguna/PREFILL_ATTN_ROWPAR_DESIGN.md` §10). This design keeps the rowpar orientation, gives K and V^T their own fragment-native buffers, and pipelines the operand reads.
+
+### 19.1 Orientation and lane maps
+
+gfx12 wave32 `v_wmma_f32_16x16x16_f16` (verified in-repo): A elem e of lane L = (m = L&15, k = 8(L>>4)+e); B = (k = 8(L>>4)+e, n = L&15); C = (m = 8(L>>4)+e, n = L&15).
+
+- S^T = K · Q^T: A = K (m = key, k = d), B = Q^T held in VGPRs for the whole kernel.
+- The C of S^T is, element for element, the B operand of O^T = V^T · P^T: P is the RNE f16 pack of the scores in place, never leaves registers.
+- O^T accumulates in f32 VGPRs; lane L holds d = 16dt + 8(L>>4) + e of its own column, so the output row segment is 16 contiguous bytes.
+
+### 19.2 Geometry
+
+- Column n = L&15 of a wave's 16-wide N tile = (token n>>2, head 4·hq + (n&3)): each wave owns 4 tokens × the 4 query heads of a KV head. G = 4 fills N exactly.
+- **NW16 (primary, `qe_attn_g4_n16`, `-mcumode`)**: 512 threads = 16 waves = 8 per SIMD on one CU; one WG = 64 query tokens × 4 heads; 3 LDS stages (48 KB); 1 WG per CU.
+- **NW8 (`qe_attn_g4_n8`, `-mcumode`)**: 256 threads, 32 tokens, 2 stages (32 KB), 2 WGs per CU (the second WG fills bubbles, at 2× L2 traffic); signal after compute (the joined pattern) — the fallback if W0e fails.
+- **WGP16**: the NW16 source and symbol built without `-mcumode` (2 WGs per WGP, 96 of 128 KB).
+- Grid `(n_head / 4, ceil(batch / rows))`, x fastest: all WGs of a head sweep keys from the segment start at the same per-tile rate (L2 serves 7 of 8 reads). `qb = gridDim.y − 1 − blockIdx.y`: longest-first (LPT). A 1024-row sub-batch at NW16 is 128 WGs on 64 CUs, two rounds.
+
+### 19.3 Files
+
+| File | What |
+|---|---|
+| `kernels/qwen3_attn_g4.hip` | the kernel (roofline comment at the top); `#ifdef QA_CELL_NW8` → NW8 |
+| `kernels/qwen3_attn_g4n8.hip` | `#define QA_CELL_NW8` + include |
+| `kernels/qwen3_attn_g4wgp.hip` | include, built without `-mcumode` |
+| `kernels/qwen3_embed_f16.inc` | `qe_f16`, shared by `qwen3_embed.hip` and the kernel's epilogue |
+| `kernels/qwen3_embed.hip` | `qe_qk_norm_rope(k_tiles)`, `qe_v_frag` |
+| `kernels/qe_attn_w0.hip`, `qe_attn_w0wgp.hip` | the W0 probes |
+| `build.rs` | `CU_MODE_STEMS` (`-mcumode` for the CU cells and the W0 probes) |
+| `src/qwen3_embed.rs` | `AttnPath`, `G4Cell`, `KvLayout`, `G4Out`, `set_attention`, `attention_path`, `attn_g4`, `v_frag`, host twins, `Layer0Capture`, H1–H5 |
+| `src/qe_attn_w0.rs`, `tests/qe_attn_g4_w0.rs` | W0 |
+| `tests/gqa_attention.rs` | G1 `qe_attn_g4_correctness`, G2 in `gqa_attn_prefill_qwen_bench` |
+| `tests/qwen3_embed_gpu.rs` | G1b, G3 (`tiny_gpu_g4_matches_cpu`, `real_gpu_g4_layer0_attention`, `real_gpu_matches_cpu` with `QWEN3_EMBED_ATTN=g4`) |
+| `scripts/qe_attn_g4_g0.sh` + `.py` | G0a / G0b |
+| `deepstrix-server`: `knobs.rs`, `embed_phase.rs` | `V41_EMBED_ATTN` = fa2 / packed / g4 / g4n8 / g4wgp (live, default fa2) |
+
+### 19.4 Layout and producers
+
+Per kv head h and per 32-key tile T of ABSOLUTE phase rows, 512 chunks × 16 B = 8 KB per tile per buffer:
+
+- `kc` chunk `(ks*2 + kb)*32 + L` (ks 0..7, kb 0..1): half e = `K[32T + 16kb + (L&15)][16ks + 8(L>>4) + e]`
+- `vc` chunk `(kb*8 + dt)*32 + L` (kb 0..1, dt 0..7): half e = `V[32T + 16kb + 8(L>>4) + e][16dt + (L&15)]`
+- tile offset `((size_t)h * n_tiles + T) * 4096` halfs, `n_tiles = phase_tokens.div_ceil(32)` from the SIZING.
+
+Every operand fragment is 512 contiguous bytes: one lane-linear `ds_load_b128` at an immediate offset, conflict-free by construction. Both buffers are pure permutations of the same `qe_f16` bits as the row-major path.
+
+- **K**: `qe_qk_norm_rope` gains `k_tiles` (0 = row-major, unchanged); in tile mode K goes through `qe_k_frag_index`, the grid is `(rows, n_head + n_kv_head)` and a V head is a trap (invariant).
+- **V**: `qe_v_frag`, grid (tiles touched, n_kv_head), block 256: qkv f32 → `qe_f16` → LDS `[32][136]` → 16-B chunk stores. The straddled first tile of an unaligned sub-batch is read-modify-written (keys below row0 kept); keys ≥ row0 + rows written 0 (the next sub-batch rewrites them; the phase-end pad stays 0).
+- **Sizing**: kc / vc = `round_up(T, 32) · kv_width · 2` bytes each in every mode (identical at T = 16,384). `attn_out` stays (a later phase may run fa2).
+
+### 19.5 Per-key-tile schedule (NW16)
+
+```
+prologue: Q^T (8 x global_load_b128), O = 0, m = -inf, la = lb = 0
+          load(t0); store(t0 -> stage 0); if t0+1 <= t1: load(t0+1); SIGNAL
+for t = t0..t1:
+  WAIT                                  # tile t in `stage`; stage (t+1)%3 held t-2: free
+  if t+1 <= t1: [edge zero-fill]; ds_store_b128 x2 -> next stage
+  if t+2 <= t1: global_load_b128 x2 (tile t+2)        # in flight for all of compute(t)
+  if t < t1:   SIGNAL (s_wait_dscnt 0; s_barrier_signal)   # before compute: one tile of slack
+  if wave active and t <= wave's last tile:
+    QK: 16 ds_load_b128 (10 hoisted) + 16 WMMA; mask (diagonal / segment-start tiles only)
+    max: max3 tree + permlanex16; tmc = tm * c
+    if ballot(tmc > m): exact rescale with corr = (mn == m) ? 1 : exp2(m - mn)
+    P: p = v_exp_f32(fma(s, c, -m)) x16; la/lb += p; RNE cvt + pack -> P^T in place
+    PV: 16 ds_load_b128 (3 ahead, sched_group_barrier) + 16 WMMA, 8 independent chains
+epilogue: lt = la + lb + xchg16; trap unless 0 < lt < inf; O / lt -> qe_f16 -> x16
+```
+
+NW8 moves the signal to after PV (2 stages: the next store overwrites the stage just read). Hazard proof, skew bound (one tile) and the split-barrier argument: see the kernel source; W0e checks the early re-arrive on the hardware.
+
+### 19.6 Budgets (compiled, `scripts/qe_attn_g4_g0.sh`)
+
+| Cell | VGPRs | SGPRs | scratch | LDS | occupancy | wgp_mode |
+|---|---|---|---|---|---|---|
+| `qe_attn_g4_n16` (CU) | 177 | 28 | 0 | 49,152 | 8 | 0 |
+| `qe_attn_g4_n8` (CU) | 185 | 27 | 0 | 32,768 | 8 | 0 |
+| `qe_attn_g4_n16` (WGP) | 177 | 28 | 0 | 49,152 | 8 | 1 |
+| `qe_v_frag` | 27 | 16 | 0 | 8,704 | 16 | — |
+
+Steady path per wave per 32-key tile (NW16, from the CFG's longest non-side header→latch path): 32 `v_wmma`, 32 `ds_load_b128`, 2 `ds_store_b128`, 2 `global_load_b128`, 16 `v_exp_f32` (+1 in the rescale block), **66 non-trans VALU** (16 fma, 16 cvt, 8 pack, 7 max3 + 2 max, 7 dual-add + 2 add, 1 permlanex16 + 1 mov, 1 mul, 1 cmp, 3 staging / LDS-stage addresses + 1 PV base), 1 `s_barrier_signal` + 1 `s_barrier_wait`, 0 `global_inv`; the signal precedes the first QK `ds_load` with no `s_wait_loadcnt` after the t+2 loads; 15 of 16 PV WMMAs pipelined (`s_wait_dscnt` ≥ 1). NW8: 67 VALU, 4 + 4 staging ops, signal after the last WMMA.
+
+### 19.7 Exactness (argued up front)
+
+- f16 Q/K/V, f32 accumulation for both products, f32 running max and sum, P rounded once RNE (`v_cvt_f16_f32`), l from the unrounded f32 p, `O · (1/l)` in f32 then one `qe_f16` (the same function as `qe_cast_f16`). The layouts are bit permutations (H1, G1b).
+- exp2 fold: c = RN(scale · log2 e) on the host; the max on raw s (c > 0); p = `v_exp_f32(RN(s·c − m))`: ≤ ~2e-6 absolute in log2, ~300× below P's f16 rounding.
+- Exact skip (`QA_LAZY_TAU = 0`): lanes whose max did not move get corr = 1.0 by the select; tile t0: exp2(−inf) = 0. TAU = 8 only as a compile-time A/B.
+- Masking selects −inf (fma(−inf) = −inf, exp2 = +0); keys outside [seg0, wg_qmax] are zeroed in K and V on edge tiles so no NaN reaches a WMMA; padding lanes compute a duplicated real row and never store.
+- The score max uses `v_max3_num_f32` / `v_max_num_f32` (inline asm): exactly max() on non-NaN inputs (scores, −inf); `fmaxf` made the compiler canonicalize every WMMA result first (~7 issue slots per tile). `QA_MAX_PORTABLE` builds the `fmaxf` form.
+- H3 (the host emulation of the kernel loop) vs f64: worst max abs 1.86e-4 over the gate geometry (bar 2e-3); its negative controls (no edge fill → NaN; no mask → fails) hold.
+- Rejected by the bar: fp8/bf8 WMMA, f16-accumulate WMMA, `v_exp_f16` / packed-f16 softmax, RTZ packs, Q prescaled in f16, SWMMAC.
+
+### 19.8 Roofline and expected rate
+
+- 16,384-token input: 7.92e13 causal FLOPs per forward; the depth-16K 1024-row launch 2.66e11 FLOP over ~84 MB (one K/V sweep) = 3170 FLOP/B vs a 304 FLOP/B ridge: compute-bound.
+- Issue ceiling per wave per tile: 512 WMMA clk vs 66 VALU + 16 exp = 86.2 % (79.8 % if exp is quarter-rate) × the sustained WMMA-only rate (84 % on RDNA3.5; W0a) ≈ 72 %. Losses: rescale ~1.5 %, LDS latency + barriers at 1 WG/CU 3–6 %, prologue/epilogue/LPT tails/576 launches 2–3 %, mask tiles < 0.5 %.
+- **Expected ~55 % of 194.6 TF (45–65 %)**: 16K attention ~0.74 s (0.63–0.90) vs 15.8 s; 11,412 tokens ~0.36 s; the 16K forward 17.9 → ~2.9 s (then Q8-GEMM-bound). Co-issue under WMMA (W0b) → ~65–70 %; quarter-rate exp → ~50 %.
+- Unreachable rest: the exact softmax's per-score VALU must issue on the WMMA's port (no async matrix pipe, no VMEM→LDS DMA on gfx1201: `global_load_lds_dwordx4` is rejected); removing it means fp8 / f16 accumulate / approximate exp / RTZ, all excluded.
+- Load-bearing assumption: L2 lockstep reuse (G2's per-key slope must be flat within ±10 %); with zero reuse a 16K forward reads ~0.65 TB ≈ 1.0 s and is DRAM-bound.
+
+### 19.9 Rust, call site, knob
+
+- `Qwen3EmbedKernels::set_attention(AttnPath)` replaces `set_packed_attention`; `attention_path(cfg)` keeps packed's fall-back to fa2 and makes G4 on an unsupported shape an ERROR.
+- `attn_g4` checks every precondition (shape, batch ≥ 1, seg0 ≤ q_abs0, q_abs0 + batch ≤ n_tiles·32, buffer lengths, pitch, 16-B alignment, c finite > 0, 32-bit byte offsets) and returns an error naming it; the kernel traps unless `blockDim.x == QA_NT && 4·gridDim.x == n_head`, and the symbol names the cell (`_n16` / `_n8`), so a stray `-D` cannot silently mismatch the launch.
+- `layer()`: in G4 mode `qk_norm_rope(G4Tiles)` + `v_frag` per sub-batch, one `attn_g4` per segment straight into `x16` (free after the QKV GEMM) at the O-projection's pitch, no `cast_f16`.
+- `V41_EMBED_ATTN` (live, per phase): `fa2` (default) / `packed` / `g4` / `g4n8` / `g4wgp`; `ms.embed`'s `attn` field logs the path taken. The default flips to `g4` only after G4.
+
+### 19.10 Deviations from the reviewed design (each forced or strictly better)
+
+1. **kv_group 4·2^s, not only 4.** The kernel takes `kv_shift` (kv head = blockIdx.x >> kv_shift), grid x = n_head / 4. Forced by the gate list's kv_group 8 case; production (shift 0) differs by one SALU shift, and consecutive WGs then share a kv head (better L2 reuse). The device assert `4·gridDim.x == n_head` is the design's.
+2. **Score max by `v_max3_num_f32` inline asm** (−6 VALU per tile; see 19.7). Exactly max() on the operands that can occur.
+3. **Wave-uniform values via `readfirstlane`** (wave index) and **SGPR tile bases with one shared 32-bit byte offset for K and V** (saddr addressing): the design's "SGPR-based staging addresses" polish, taken now (−4 VALU; per-wave tests become scalar branches). Pure addressing, no numerics.
+4. **G1 / G2 live in `tests/gqa_attention.rs`** (the task's test binary), not a new `tests/qwen3_attn_g4.rs`; **W0 probes in a new `qe_attn_w0.hip`** (built in CU mode, plus a WGP twin for probe d) rather than `wmma_probe.hip`, so the existing probe module is unchanged.
+5. **G3's layer-0 capture** is a gates-only `EmbedBuffers::capture` hook (`Layer0Capture`, `None` in production): layer 0's q16, attention output (x16) and kc / vc, compared with an f64 oracle computed from that run's own inputs; the hook also asserts layer-0 q16 / K / V are bit-identical across paths on the real weights.
+
+### 19.11 Gates
+
+Offline (done): **G0** `scripts/qe_attn_g4_g0.sh` (inside `nix develop`; also checks the cargo-built code objects' instruction streams are identical); **H1** `g4_layout_is_a_bijection`; **H2** `g4_lane_maps_reproduce_tile_products` (exact, with negative controls); **H3** `g4_kernel_model_matches_reference`; **H4** `g4_v_frag_rmw_matches_one_shot`; **H5** `g4_sizing_rounds_kv_to_tiles` (and `default_loan_is_about_575_mb` still holds). Run: `cargo test --release -p v4flash-kernels --features v41 --lib qwen3_embed::`.
+
+Window (one; exclusive GPUs, box 2 attached, live knob file neutralised; server down for G1–G3), in this order:
+
+1. **W0** `--test qe_attn_g4_w0` (~10 min): (e) barrier re-arrive FIRST — on a hang or a stale read, G1–G3 run `g4n8` only; (a) WMMA rate; (b) the VALU-mix slope; (c) exp rate; (d) ds_load_b128 B/clk/CU, CU vs WGP; (f) fma_mix vs cvt (polish only).
+2. **G1** `qe_attn_g4_correctness` (bar 2e-3, fa2 null, f16 out = `qe_f16(f32 out)`, guard rows untouched, two runs identical, a flipped-hi-bit pack must fail).
+3. **G1b** `qe_attn_g4_producer_bit_identity` (sub-batches 1024 / 64 / 48 / 8).
+4. **G2** `gqa_attn_prefill_qwen_bench` (all five arms; pass: g4 ≥ 40 % of peak at 16K, per-key spread within ±10 %, fa2's 36-layer sum within ±20 % of 15.8 s; the best arm becomes the default).
+5. **G3** `tiny_gpu_g4_matches_cpu`, `real_gpu_g4_layer0_attention`, `QWEN3_EMBED_ATTN=g4 real_gpu_matches_cpu` (adds the 48-row-sub-batch run).
+6. **G4** production (as §18): same binary; the knob at fa2 bit-identical to today's hub; then g4: cosine ≥ 0.9999 vs those vectors, `e2e_smoke` ≥ 0.998, phase times on the 11,412 / 16,384-token texts. Rollback = the knob.
+
+Polish left after the window (each ≤ 1.5 %): `v_fma_mixlo/hi` P pack (−8 VALU) only if W0f shows it bit-identical; `v_dot2`-based l (A/B only); last-layer pruning to the pooled rows; a segment-table single launch for short-input corpora.

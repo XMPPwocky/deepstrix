@@ -25,6 +25,7 @@
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::iq2_xxs_tables::f16_to_f32;
+use v4flash_kernels::qwen3_embed::{g4_pack_kv, AttnPath, G4Cell, G4Out, Qwen3EmbedKernels, G4_TILE_KEYS};
 use v4flash_kernels::GqaAttention;
 
 // ---------------------------------------------------------------------------
@@ -1435,12 +1436,253 @@ fn gqa_attn_g4_module_fa2_identical_and_kv_tail_ignored() -> eyre::Result<()> {
     Ok(())
 }
 
-/// `fa2` vs the packed kernel at G = 4 on the embed phase's attention calls
-/// (Qwen3-Embedding-4B: 32 / 8 / 128; one 1024-row sub-batch at a time, causal
-/// over everything before it). Prints µs per call and effective TFLOPS (causal
-/// FLOPs), and the sum over the 16 sub-batches of one 16,384-token input x 36
-/// layers = that input's attention seconds (production fa2: ~15.8 s). Design §18, G2.
-///   nix develop -c cargo test --release -p v4flash-kernels --test gqa_attention \
+/// `qe_f16` on the host: clamp to +-65504 (NaN passes), RNE.
+fn qe_f16_host(x: f32) -> u16 {
+    f32_to_f16(if x.is_nan() { x } else { x.clamp(-65504.0, 65504.0) })
+}
+
+/// f32 causal attention, the `run_prefill_wmma_case` reference generalized to a
+/// segment: query row i (phase row `q_abs0 + i`) attends keys `seg0 ..= q_abs0 + i`
+/// of row-major `k` / `v` (`[row][n_kv_head][head_dim]`). Rows split over threads.
+#[allow(clippy::too_many_arguments)]
+fn cpu_attn_segment(q: &[f32], k: &[f32], v: &[f32], n_head: usize, n_kv_head: usize, head_dim: usize, batch: usize, q_abs0: usize, seg0: usize, scale: f32) -> Vec<f32> {
+    let g = n_head / n_kv_head;
+    let row = n_head * head_dim;
+    let mut out = vec![0f32; batch * row];
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(32);
+    let per = batch.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (ci, chunk) in out.chunks_mut(per * row).enumerate() {
+            s.spawn(move || {
+                for (li, orow) in chunk.chunks_mut(row).enumerate() {
+                    let i = ci * per + li;
+                    for h in 0..n_head {
+                        let kh = h / g;
+                        let qh = &q[(i * n_head + h) * head_dim..][..head_dim];
+                        let keys = seg0..=q_abs0 + i;
+                        let sc: Vec<f32> = keys
+                            .clone()
+                            .map(|j| {
+                                let kr = &k[(j * n_kv_head + kh) * head_dim..][..head_dim];
+                                qh.iter().zip(kr).map(|(a, b)| a * b).sum::<f32>() * scale
+                            })
+                            .collect();
+                        let m = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let w: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
+                        let inv = 1.0 / w.iter().sum::<f32>();
+                        let oh = &mut orow[h * head_dim..][..head_dim];
+                        for (j, wj) in keys.zip(&w) {
+                            let vr = &v[(j * n_kv_head + kh) * head_dim..][..head_dim];
+                            for d in 0..head_dim {
+                                oh[d] += wj * inv * vr[d];
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+/// One `qe_attn_g4` gate case (design §19.11 G1): phase rows `0 .. n_tiles * 32` of
+/// K/V (another segment's finite data before `seg0`; past the launch's last query
+/// either f16 NaN (`tail_nan`, a later sub-batch / the phase pad) or finite data (the
+/// next segment)), packed on the host into the G4 layout with one spare tile
+/// (capacity > n_kv_total). Every cell in `cells` against the CPU reference, F32
+/// out; the f16 out must be `qe_f16(f32 out)` bit for bit with rows and columns
+/// outside the launch untouched; two runs bit-identical. Null: `fa2` on the same
+/// row-major K/V. Returns (worst g4 max abs, fa2 max abs).
+#[allow(clippy::too_many_arguments)]
+fn run_g4_case(
+    k: &mut Qwen3EmbedKernels,
+    fa2: &GqaAttention,
+    device: &Device,
+    stream: &Stream,
+    seed: u64,
+    seg0: usize,
+    q_abs0: usize,
+    batch: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    tail_nan: bool,
+    cells: &[G4Cell],
+) -> eyre::Result<(f32, f32)> {
+    let hd = 128usize;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let c_log2 = scale * std::f32::consts::LOG2_E;
+    let end = q_abs0 + batch;
+    let n_tiles = end.div_ceil(G4_TILE_KEYS) + 1;
+    let rows = n_tiles * G4_TILE_KEYS;
+    let kvw = n_kv_head * hd;
+    let mut rng = Lcg(seed);
+    let mut kv_bits = |r: usize| -> (u16, f32) {
+        let (b, x) = round_f16(rng.next_f32());
+        if r >= end && tail_nan { (0x7E00, f32::NAN) } else { (b, x) }
+    };
+    let (mut k_bits, mut k_f, mut v_bits, mut v_f) = (vec![0u16; rows * kvw], vec![0f32; rows * kvw], vec![0u16; rows * kvw], vec![0f32; rows * kvw]);
+    for i in 0..rows * kvw {
+        (k_bits[i], k_f[i]) = kv_bits(i / kvw);
+        (v_bits[i], v_f[i]) = kv_bits(i / kvw);
+    }
+    let mut rng = Lcg(seed ^ 0x51ed);
+    let (q_bits, q_f): (Vec<u16>, Vec<f32>) = (0..batch * n_head * hd).map(|_| round_f16(rng.next_f32())).unzip();
+    let expect = cpu_attn_segment(&q_f, &k_f, &v_f, n_head, n_kv_head, hd, batch, q_abs0, seg0, scale);
+    let (kc_h, vc_h) = g4_pack_kv(&k_bits, &v_bits, rows, n_kv_head, n_tiles, 0x7E00);
+    let up = |b: &[u16]| -> eyre::Result<DeviceBuffer<u16>> {
+        let mut d: DeviceBuffer<u16> = DeviceBuffer::new(device.id, b.len())?;
+        d.copy_from_host(b)?;
+        Ok(d)
+    };
+    let (d_q, d_kc, d_vc) = (up(&q_bits)?, up(&kc_h)?, up(&vc_h)?);
+    let n_out = batch * n_head * hd;
+    let (nh, nkv, nt, b) = (n_head as u32, n_kv_head as u32, n_tiles as u32, batch as u32);
+    let max_abs = |got: &[f32]| got.iter().zip(&expect).map(|(g, e)| (g - e).abs()).fold(0f32, |a, x| if x.is_nan() { f32::INFINITY } else { a.max(x) });
+    let mut worst = 0f32;
+    for &cell in cells {
+        k.set_attention(AttnPath::G4(cell))?;
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let mut d_o: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_out)?;
+            k.attn_g4(stream, G4Out::F32(&mut d_o), &d_q, &d_kc, &d_vc, nh, nkv, nt, b, q_abs0 as u32, seg0 as u32, c_log2)?;
+            stream.synchronize()?;
+            let mut h = vec![0f32; n_out];
+            d_o.copy_to_host(&mut h)?;
+            runs.push(h);
+        }
+        assert!(runs[0].iter().zip(&runs[1]).all(|(a, b)| a.to_bits() == b.to_bits()), "{cell:?}: two runs differ");
+        assert!(runs[0].iter().all(|x| x.is_finite()), "{cell:?} seg0 {seg0} q_abs0 {q_abs0} B {batch}: non-finite output");
+        // The production F16 store: rows at a pitch past n_head * 128, one guard row above
+        // and below and the pad columns pre-filled with a sentinel that must survive.
+        let pitch = n_head * hd + 8;
+        const SENT: u16 = 0x3C01;
+        let mut d16 = up(&vec![SENT; (batch + 2) * pitch])?;
+        {
+            let mut view = d16.slice_view_mut(pitch, (batch - 1) * pitch + n_head * hd);
+            k.attn_g4(stream, G4Out::F16 { buf: &mut view, pitch: pitch as u32 }, &d_q, &d_kc, &d_vc, nh, nkv, nt, b, q_abs0 as u32, seg0 as u32, c_log2)?;
+        }
+        stream.synchronize()?;
+        let mut h16 = vec![0u16; (batch + 2) * pitch];
+        d16.copy_to_host(&mut h16)?;
+        for r in 0..batch + 2 {
+            for col in 0..pitch {
+                let got = h16[r * pitch + col];
+                if r == 0 || r == batch + 1 || col >= n_head * hd {
+                    assert_eq!(got, SENT, "{cell:?}: f16 out wrote outside the launch (row {r} col {col})");
+                } else {
+                    let want = qe_f16_host(runs[0][(r - 1) * n_head * hd + col]);
+                    assert_eq!(got, want, "{cell:?}: f16 out != qe_f16(f32 out) at row {} col {col}", r - 1);
+                }
+            }
+        }
+        let e = max_abs(&runs[0]);
+        eprintln!("qe_attn_g4 {cell:?}: seg0 {seg0} q_abs0 {q_abs0} B {batch} n_head {n_head}/{n_kv_head} tail {} -> max_abs {e:.3e}", if tail_nan { "NaN" } else { "data" });
+        worst = worst.max(e);
+    }
+    // Null: fa2 over the same row-major K/V from the segment start (kv_capacity covers
+    // the tail, which fa2 must ignore too).
+    let (d_k, d_v) = (up(&k_bits)?, up(&v_bits)?);
+    let kc = d_k.slice_view(seg0 * kvw, (rows - seg0) * kvw);
+    let vc = d_v.slice_view(seg0 * kvw, (rows - seg0) * kvw);
+    let mut d_o: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_out)?;
+    fa2.prefill_flash_wmma_fa2(stream, &mut d_o, &d_q, &kc, &vc, b, nh, nkv, hd as u32, (q_abs0 - seg0) as u32, scale, 0, (rows - seg0) as u32, true)?;
+    stream.synchronize()?;
+    let mut h = vec![0f32; n_out];
+    d_o.copy_to_host(&mut h)?;
+    Ok((worst, max_abs(&h)))
+}
+
+/// G1 (design §19.11): `qe_attn_g4`, all three cells, against the CPU reference on
+/// the embed's call geometry: q_abs0 - seg0 in {0, 5, 100, 512, 1024} x batch in {1,
+/// 7, 77, 130, 1024}, segment starts off the 32-key grid, kv_group 4 (32 / 8) and 8
+/// (64 / 8), keys past the launch NaN (later sub-batch, phase pad) or another
+/// segment's data. Bar 2e-3 (expect ~2e-4); `fa2` on the same cases is the null.
+/// Negative control: a host pack with the lane hi bit flipped must fail the bar.
+///   nix develop -c cargo test --release -p v4flash-kernels --features v41 --test gqa_attention \
+///       -- --ignored --nocapture qe_attn_g4_correctness
+#[test]
+#[ignore]
+fn qe_attn_g4_correctness() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let device = pick_dgpu()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    let mut k = Qwen3EmbedKernels::for_arch(&arch)?;
+    let fa2 = GqaAttention::for_arch_group4(&arch)?;
+    let stream = Stream::new(device.id)?;
+    const TOL: f32 = 2.0e-3;
+    let cells = [G4Cell::Cu16, G4Cell::Cu8, G4Cell::Wgp16];
+    let (mut worst, mut worst_fa2) = (0f32, 0f32);
+    let mut n = 0u64;
+    for &dq in &[0usize, 5, 100, 512, 1024] {
+        for &batch in &[1usize, 7, 77, 130, 1024] {
+            n += 1;
+            // Alternate aligned / unaligned segment starts and NaN / data tails.
+            let seg0 = if n % 2 == 0 { 37 } else { 0 };
+            let (e, ef) = run_g4_case(&mut k, &fa2, &device, &stream, 0x6a4 ^ n << 8, seg0, seg0 + dq, batch, 32, 8, n % 3 != 0, &cells)?;
+            assert!(e < TOL, "qe_attn_g4: seg0 {seg0} dq {dq} B {batch}: max_abs {e:.3e} >= {TOL:.3e} (fa2 null {ef:.3e})");
+            worst = worst.max(e);
+            worst_fa2 = worst_fa2.max(ef);
+        }
+    }
+    // kv_group 8 (two consecutive WGs per kv head) and a second segment of a packed buffer.
+    for &(seg0, q_abs0, batch) in &[(0usize, 0usize, 130usize), (37, 137, 77), (300, 1324, 1024)] {
+        let (e, ef) = run_g4_case(&mut k, &fa2, &device, &stream, 0x6a8 ^ q_abs0 as u64, seg0, q_abs0, batch, 64, 8, true, &cells)?;
+        assert!(e < TOL, "qe_attn_g4 kv_group 8: seg0 {seg0} q_abs0 {q_abs0} B {batch}: max_abs {e:.3e}");
+        worst = worst.max(e);
+        worst_fa2 = worst_fa2.max(ef);
+    }
+    eprintln!("qe_attn_g4 G1: worst max_abs {worst:.3e} (fa2 null {worst_fa2:.3e})");
+    assert!(worst_fa2 < TOL, "the null failed: fa2 max_abs {worst_fa2:.3e}");
+
+    // Negative control: swap lanes L <-> L^16 inside every K chunk group (the hi bit of the
+    // K lane map) and the kernel must miss the bar.
+    let (seg0, q_abs0, batch, n_head, n_kv_head) = (0usize, 100usize, 130usize, 32usize, 8usize);
+    let hd = 128usize;
+    let end = q_abs0 + batch;
+    let n_tiles = end.div_ceil(G4_TILE_KEYS);
+    let rows = n_tiles * G4_TILE_KEYS;
+    let mut rng = Lcg(0xbad);
+    let (k_bits, k_f): (Vec<u16>, Vec<f32>) = (0..rows * n_kv_head * hd).map(|_| round_f16(rng.next_f32())).unzip();
+    let (v_bits, v_f): (Vec<u16>, Vec<f32>) = (0..rows * n_kv_head * hd).map(|_| round_f16(rng.next_f32())).unzip();
+    let (q_bits, q_f): (Vec<u16>, Vec<f32>) = (0..batch * n_head * hd).map(|_| round_f16(rng.next_f32())).unzip();
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let expect = cpu_attn_segment(&q_f, &k_f, &v_f, n_head, n_kv_head, hd, batch, q_abs0, seg0, scale);
+    let (mut kc_h, vc_h) = g4_pack_kv(&k_bits, &v_bits, rows, n_kv_head, n_tiles, 0);
+    for chunk_group in kc_h.chunks_mut(32 * 8) {
+        let (lo, hi) = chunk_group.split_at_mut(16 * 8);
+        lo.swap_with_slice(hi);
+    }
+    let up = |b: &[u16]| -> eyre::Result<DeviceBuffer<u16>> {
+        let mut d: DeviceBuffer<u16> = DeviceBuffer::new(device.id, b.len())?;
+        d.copy_from_host(b)?;
+        Ok(d)
+    };
+    let (d_q, d_kc, d_vc) = (up(&q_bits)?, up(&kc_h)?, up(&vc_h)?);
+    let mut d_o: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * hd)?;
+    k.set_attention(AttnPath::G4(G4Cell::Cu16))?;
+    k.attn_g4(&stream, G4Out::F32(&mut d_o), &d_q, &d_kc, &d_vc, n_head as u32, n_kv_head as u32, n_tiles as u32, batch as u32, q_abs0 as u32, seg0 as u32, scale * std::f32::consts::LOG2_E)?;
+    stream.synchronize()?;
+    let mut got = vec![0f32; batch * n_head * hd];
+    d_o.copy_to_host(&mut got)?;
+    let e = got.iter().zip(&expect).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max);
+    eprintln!("qe_attn_g4 negative control (K lane hi bit flipped): max_abs {e:.3e}");
+    assert!(e >= TOL, "negative control: a wrong K layout still met the bar ({e:.3e})");
+    Ok(())
+}
+
+/// The embed phase's attention calls, every kernel (design §18 G2 and §19.11 G2):
+/// `fa2`, packed G = 4, and `qe_attn_g4` in its three cells (g4 = 16 waves CU mode,
+/// g4n8 = 8 waves CU mode, g4wgp = 16 waves WGP mode) on Qwen3-Embedding-4B's shape
+/// (32 / 8 / 128; one 1024-row sub-batch at a time, causal over everything before
+/// it; g4 reads the fragment-native K/V layout and writes f16 straight into an x16
+/// buffer at pitch 4104, as in production). Every call follows a 256 MB flush and is
+/// timed alone. Prints per depth (1K..16K) us, TFLOPS and % of the 194.6 TFLOPS f16
+/// peak; the 36-layer sum over the 16 sub-batches of one 16,384-token input
+/// (production fa2: ~15.8 s); the us-per-1K-keys slope from 4K to 16K (flat within
+/// +-10 % = L2 lockstep reuse held); short inputs; one warm (no flush) row.
+/// G2 pass: g4 >= 40 % of peak at 16K, slope flat, fa2 sum within +-20 % of 15.8 s.
+///   nix develop -c cargo test --release -p v4flash-kernels --features v41 --test gqa_attention \
 ///       -- --ignored --nocapture gqa_attn_prefill_qwen_bench
 #[test]
 #[ignore]
@@ -1453,9 +1695,11 @@ fn gqa_attn_prefill_qwen_bench() -> eyre::Result<()> {
     let stream = Stream::new(device.id)?;
     let (n_head, n_kv_head, head_dim) = (32usize, 8usize, 128usize);
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let c_log2 = scale * std::f32::consts::LOG2_E;
     let (batch, total) = (1024usize, 16384usize);
     const ITERS: usize = 10;
     const WARMUP: usize = 2;
+    const PEAK_TFLOPS: f64 = 194.6;
 
     let mut rng = Lcg(0x9e37);
     let mut q_bits = vec![0u16; batch * n_head * head_dim];
@@ -1469,36 +1713,54 @@ fn gqa_attn_prefill_qwen_bench() -> eyre::Result<()> {
         k_bits[i] = round_f16(rng.next_f32()).0;
         v_bits[i] = round_f16(rng.next_f32()).0;
     }
-    let mut d_q: DeviceBuffer<u16> = DeviceBuffer::new(device.id, q_bits.len())?;
-    d_q.copy_from_host(&q_bits)?;
-    let mut d_k: DeviceBuffer<u16> = DeviceBuffer::new(device.id, k_bits.len())?;
-    d_k.copy_from_host(&k_bits)?;
-    let mut d_v: DeviceBuffer<u16> = DeviceBuffer::new(device.id, v_bits.len())?;
-    d_v.copy_from_host(&v_bits)?;
+    let n_tiles = total / G4_TILE_KEYS;
+    let (kc_bits, vc_bits) = g4_pack_kv(&k_bits, &v_bits, total, n_kv_head, n_tiles, 0);
+    let up = |b: &[u16]| -> eyre::Result<DeviceBuffer<u16>> {
+        let mut d: DeviceBuffer<u16> = DeviceBuffer::new(device.id, b.len())?;
+        d.copy_from_host(b)?;
+        Ok(d)
+    };
+    let (d_q, d_k, d_v, d_kc, d_vc) = (up(&q_bits)?, up(&k_bits)?, up(&v_bits)?, up(&kc_bits)?, up(&vc_bits)?);
     let mut d_out: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
+    // x16 as the forward has it: act_pitch(4096) = 4104 halfs.
+    let pa = 4104usize;
+    let mut d_x16: DeviceBuffer<u16> = DeviceBuffer::new(device.id, batch * pa)?;
+    let mut g4k = Vec::new();
+    for cell in [G4Cell::Cu16, G4Cell::Cu8, G4Cell::Wgp16] {
+        let mut k = Qwen3EmbedKernels::for_arch(&arch)?;
+        k.set_attention(AttnPath::G4(cell))?;
+        g4k.push(k);
+    }
+    let arms = [AttnPath::Fa2, AttnPath::Packed, AttnPath::G4(G4Cell::Cu16), AttnPath::G4(G4Cell::Cu8), AttnPath::G4(G4Cell::Wgp16)];
 
-    let (nh, nkv, hd, b, cap) = (n_head as u32, n_kv_head as u32, head_dim as u32, batch as u32, total as u32);
+    let (nh, nkv, hd, cap) = (n_head as u32, n_kv_head as u32, head_dim as u32, total as u32);
     // Causal FLOPs of one call: QK and PV at 2 FLOPs per MAC; row i attends q_offset + i + 1 keys.
-    let flops = |q_offset: usize| 4.0 * (head_dim * n_head) as f64 * (batch * q_offset + batch * (batch + 1) / 2) as f64;
+    let flops = |q_offset: usize, b: usize| 4.0 * (head_dim * n_head) as f64 * (b * q_offset + b * (b + 1) / 2) as f64;
     // Production never runs attention on a warm cache: each sub-batch's GEMMs
     // stream ~120 MB of layer weights between attention calls, which flushes the
     // 64 MB Infinity Cache. So every timed call follows a 256 MB write and is
     // timed alone with events (review finding 1).
     let mut flush: DeviceBuffer<u8> = DeviceBuffer::new(device.id, 256 << 20)?;
     let (e0, e1) = (Event::new()?, Event::new()?);
-    let mut timed = |packed: bool, q_offset: usize, b: u32| -> eyre::Result<f64> {
+    let mut timed = |arm: AttnPath, q_offset: usize, b: u32, flush_each: bool| -> eyre::Result<f64> {
         let qo = q_offset as u32;
         let rows = b as usize * n_head * head_dim;
         let q = d_q.slice_view(0, rows);
         let mut o = d_out.slice_view_mut(0, rows);
+        let mut x = d_x16.slice_view_mut(0, (b as usize - 1) * pa + n_head * head_dim);
         let mut total = 0.0;
         for i in 0..WARMUP + ITERS {
-            flush.fill_zero_async(&stream)?;
+            if flush_each {
+                flush.fill_zero_async(&stream)?;
+            }
             e0.record(&stream)?;
-            if packed {
-                kernel.prefill_flash_wmma_fa2_hg_packed(&stream, &mut o, &q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, cap)?;
-            } else {
-                kernel.prefill_flash_wmma_fa2(&stream, &mut o, &q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, cap, true)?;
+            match arm {
+                AttnPath::Fa2 => kernel.prefill_flash_wmma_fa2(&stream, &mut o, &q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, cap, true)?,
+                AttnPath::Packed => kernel.prefill_flash_wmma_fa2_hg_packed(&stream, &mut o, &q, &d_k, &d_v, b, nh, nkv, hd, qo, scale, 0, cap)?,
+                AttnPath::G4(cell) => {
+                    let k = &g4k[match cell { G4Cell::Cu16 => 0, G4Cell::Cu8 => 1, G4Cell::Wgp16 => 2 }];
+                    k.attn_g4(&stream, G4Out::F16 { buf: &mut x, pitch: pa as u32 }, &q, &d_kc, &d_vc, nh, nkv, n_tiles as u32, b, qo, 0, c_log2)?;
+                }
             }
             e1.record(&stream)?;
             e1.synchronize()?;
@@ -1508,30 +1770,45 @@ fn gqa_attn_prefill_qwen_bench() -> eyre::Result<()> {
         }
         Ok(total / ITERS as f64)
     };
-    // Short inputs: one launch per input segment, so a small B at depth B (the
-    // whole input) gets few WGs packed (B/16 x 8) vs fa2 (B/32 x 32).
+    // Short inputs: one launch per input segment (a small B at depth B, the whole input).
     for &small in &[8u32, 64, 256, 1024] {
-        let (a, p) = (timed(false, 0, small)?, timed(true, 0, small)?);
-        eprintln!("qwen attn, a {small:4}-token input alone: fa2 {:7.1} us | packed G=4 {:7.1} us | {:.2}x", a * 1e6, p * 1e6, a / p);
+        let line: Vec<String> = arms
+            .iter()
+            .map(|&a| timed(a, 0, small, true).map(|s| format!("{} {:7.1} us", a.name(), s * 1e6)))
+            .collect::<eyre::Result<_>>()?;
+        eprintln!("qwen attn, a {small:4}-token input alone: {}", line.join(" | "));
     }
-    let (mut sum_fa2, mut sum_pk) = (0.0, 0.0);
-    for sb in 0..total / batch {
+    let n_sb = total / batch;
+    let mut t = vec![vec![0f64; n_sb]; arms.len()];
+    for sb in 0..n_sb {
         let q_offset = sb * batch;
-        let a = timed(false, q_offset, b)?;
-        let p = timed(true, q_offset, b)?;
-        sum_fa2 += a;
-        sum_pk += p;
-        if [0, 3, 7, 15].contains(&sb) {
-            let f = flops(q_offset);
-            eprintln!(
-                "qwen attn depth {:5}: fa2 {:8.0} us {:5.1} TFLOPS | packed G=4 {:8.0} us {:5.1} TFLOPS | {:.2}x",
-                q_offset + batch, a * 1e6, f / a / 1e12, p * 1e6, f / p / 1e12, a / p
-            );
+        let f = flops(q_offset, batch);
+        let mut line = Vec::new();
+        for (ai, &a) in arms.iter().enumerate() {
+            let s = timed(a, q_offset, batch as u32, true)?;
+            t[ai][sb] = s;
+            line.push(format!("{} {:8.0} us {:5.1} TF {:4.1}%", a.name(), s * 1e6, f / s / 1e12, f / s / 1e12 / PEAK_TFLOPS * 100.0));
         }
+        eprintln!("qwen attn depth {:5}: {}", q_offset + batch, line.join(" | "));
     }
-    eprintln!(
-        "qwen attn, one 16,384-token input x 36 layers: fa2 {:.2} s, packed G=4 {:.2} s ({:.2}x)",
-        sum_fa2 * 36.0, sum_pk * 36.0, sum_fa2 / sum_pk
-    );
+    let f16k = flops(total - batch, batch);
+    for (ai, &a) in arms.iter().enumerate() {
+        let sum: f64 = t[ai].iter().sum();
+        // us per 1K keys at each depth 4K..16K (a call at depth D reads ~D keys per row):
+        // flat = per-key cost independent of depth (K/V reuse in L2 held).
+        let per_k: Vec<f64> = (3..n_sb).map(|sb| t[ai][sb] * 1e6 / (((sb + 1) * batch) as f64 / 1024.0)).collect();
+        let (lo, hi) = per_k.iter().fold((f64::INFINITY, 0f64), |(l, h), &x| (l.min(x), h.max(x)));
+        let pct16 = f16k / t[ai][n_sb - 1] / 1e12 / PEAK_TFLOPS * 100.0;
+        eprintln!(
+            "qwen attn {:6}: one 16,384-token input x 36 layers {:6.2} s; depth 16K {:4.1} % of peak; us per 1K keys 4K..16K {:.1}..{:.1} (spread {:+.1} %)",
+            a.name(), sum * 36.0, pct16, lo, hi, (hi / lo - 1.0) * 100.0
+        );
+    }
+    // One warm row (no flush): what the MALL is worth at the deepest call.
+    let line: Vec<String> = arms
+        .iter()
+        .map(|&a| timed(a, total - batch, batch as u32, false).map(|s| format!("{} {:8.0} us", a.name(), s * 1e6)))
+        .collect::<eyre::Result<_>>()?;
+    eprintln!("qwen attn depth 16384 WARM (no flush): {}", line.join(" | "));
     Ok(())
 }

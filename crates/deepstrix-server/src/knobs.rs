@@ -199,8 +199,12 @@ v4flash_kernels::knobs! {
     /// `V41_EMBED_ATTN` (live, default `fa2`, read per phase): the forward's
     /// attention kernel. `fa2` = one WG per query head; `packed` = the full-group
     /// packed kernel, 4 query heads per WG sharing one K/V staging and softmax
-    /// pass (design §18; a model with kv_group not a multiple of 4 stays on fa2).
-    pub static EMBED_ATTN = Knob::choice("V41_EMBED_ATTN", 0, &[&["fa2"], &["packed"]]).live();
+    /// pass (design §18; a model with kv_group not a multiple of 4 stays on fa2);
+    /// `g4` / `g4n8` / `g4wgp` = `qe_attn_g4` (design §19: keys on M, Q/P/O in
+    /// VGPRs, the fragment-native K/V layout for the whole phase) in its 16-wave
+    /// CU-mode / 8-wave CU-mode / 16-wave WGP-mode cell. A model the G4 kernel
+    /// cannot run fails the phase (an error, never a silent fallback).
+    pub static EMBED_ATTN = Knob::choice("V41_EMBED_ATTN", 0, &[&["fa2"], &["packed"], &["g4"], &["g4n8"], &["g4wgp"]]).live();
 }
 
 #[cfg(test)]
@@ -257,6 +261,11 @@ mod tests {
         assert_eq!(p(&MS_PIPELINE_MIN_ROWS, "1"), Some(2), "never below 2");
         assert_eq!(p(&MS_ENGRAM_THREADS, "9999"), Some(512));
         assert_eq!(p(&MS_DSPARK_RING, "solo"), Some(1));
+        // The embed attention choices, in the order embed_phase maps them.
+        for (i, name) in ["fa2", "packed", "g4", "g4n8", "g4wgp"].into_iter().enumerate() {
+            assert_eq!(p(&EMBED_ATTN, name), Some(i as u64), "V41_EMBED_ATTN={name}");
+        }
+        assert_eq!(p(&EMBED_ATTN, "g5"), None);
         assert_eq!(p(&MS_CHECKPOINT_EVERY, "0"), Some(0), "0 = periodic checkpoints off");
     }
 }

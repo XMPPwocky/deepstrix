@@ -117,6 +117,7 @@ pub mod q6_k_dense;
 pub mod q8_0;
 pub mod q8_k;
 pub mod qwen3_embed;
+pub mod qe_attn_w0;
 pub mod dgpu_loan;
 pub mod mhc_pre_fused;
 pub mod mhc_arena;

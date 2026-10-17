@@ -27,7 +27,7 @@ use v4flash_hip::{Device, PinnedBuffer};
 use v4flash_kernels::dgpu_loan::{Donor, Loan};
 use v4flash_kernels::het::weights::HetModelWeights;
 use v4flash_kernels::het::HeterogeneousEngine;
-use v4flash_kernels::qwen3_embed::{self as fwd, EmbedBuffers, EmbedSizing, Qwen3EmbedKernels};
+use v4flash_kernels::qwen3_embed::{self as fwd, AttnPath, EmbedBuffers, EmbedSizing, G4Cell, Qwen3EmbedKernels};
 
 use crate::engine_worker::{SubmitError, WorkerProgress};
 use crate::knobs;
@@ -162,8 +162,9 @@ pub struct PhaseStats {
     pub nonfinite: usize,
     pub guard_violations: u32,
     pub ok: bool,
-    /// Attention ran on the packed kernel (`V41_EMBED_ATTN=packed`), else `fa2`.
-    pub attn_packed: bool,
+    /// The attention path the forward ran (`V41_EMBED_ATTN`, after the shape
+    /// check): `fa2`, `packed`, `g4`, `g4n8` or `g4wgp`; empty if no forward ran.
+    pub attn: &'static str,
 }
 
 /// The engine thread's embed state (`WorkerState::embed`).
@@ -545,7 +546,7 @@ impl EmbedCtx {
             wait_read_ms = st.wait_read_ms as u64, fwd_ms = st.fwd_ms as u64, return_ms = st.return_ms as u64,
             verify_ms = st.verify_ms as u64, pinned_ms = st.pinned_ms as u64, total_ms = st.total_ms as u64,
             nonfinite = st.nonfinite, guard_violations = st.guard_violations,
-            attn = if st.attn_packed { "packed" } else { "fa2" },
+            attn = st.attn,
             lent_mib = self.loan.lent_bytes() >> 20, "ms.embed"
         );
         use v4flash_kernels::het::{evtrace, evtrace_kinds};
@@ -575,8 +576,14 @@ impl EmbedCtx {
         // L1: nothing queued on the dGPU may still read a donor.
         dgpu.synchronize()?;
         let mut k = Qwen3EmbedKernels::for_arch(&self.arch)?;
-        k.set_packed_attention(knobs::EMBED_ATTN.pick() == 1);
-        st.attn_packed = k.attention_packed(&self.model.cfg);
+        k.set_attention(match knobs::EMBED_ATTN.pick() {
+            0 => AttnPath::Fa2,
+            1 => AttnPath::Packed,
+            2 => AttnPath::G4(G4Cell::Cu16),
+            3 => AttnPath::G4(G4Cell::Cu8),
+            _ => AttnPath::G4(G4Cell::Wgp16),
+        })?;
+        st.attn = k.attention_path(&self.model.cfg)?.name();
         let mut alloc = self.loan.allocator()?;
         let mut bufs = EmbedBuffers::carve(&mut alloc, self.sizing, &self.model.cfg, &self.model.layout)?;
         let inputs: Vec<&[u32]> = batch.iter().map(|(ri, ii)| self.active[*ri].inputs[*ii].as_slice()).collect();

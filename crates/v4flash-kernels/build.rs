@@ -75,6 +75,13 @@ fn export_kw_max_chunk() {
     }
 }
 
+/// Sources built with `-mcumode` (descriptor `workgroup_processor_mode` 0): a WG's
+/// LDS and waves stay on one CU. `qe_attn_g4`'s CU cells (design §19.3); the WGP arm
+/// (`qwen3_attn_g4wgp`) is the same source built without it; so are its W0 probes
+/// (`qe_attn_w0` / `qe_attn_w0wgp`). The flag is harmless on gfx1151 (whose bodies
+/// trap).
+const CU_MODE_STEMS: &[&str] = &["qwen3_attn_g4", "qwen3_attn_g4n8", "qe_attn_w0"];
+
 fn compile(hipcc: &str, src: &Path, arch: &str, out_dir: &Path) {
     let stem = src
         .file_stem()
@@ -82,6 +89,7 @@ fn compile(hipcc: &str, src: &Path, arch: &str, out_dir: &Path) {
         .to_str()
         .expect("utf8 stem");
     let out_path = out_dir.join(format!("{stem}_{arch}.hsaco"));
+    let cu_mode: &[&str] = if CU_MODE_STEMS.contains(&stem) { &["-mcumode"] } else { &[] };
 
     // Extra compile flags (e.g. -DOCC_PAD_FLOATS=N) for kernel experiments.
     let extra: Vec<String> = env::var("DEEPSTRIX_KERNEL_CFLAGS")
@@ -100,6 +108,7 @@ fn compile(hipcc: &str, src: &Path, arch: &str, out_dir: &Path) {
         .arg("--genco")
         .arg(format!("--offload-arch={arch}"))
         .args(model_flags)
+        .args(cu_mode)
         .args(&extra)
         .arg(src)
         .arg("-o")
