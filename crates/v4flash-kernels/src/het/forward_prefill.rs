@@ -5705,12 +5705,20 @@ impl HeterogeneousEngine {
     /// request that is paging, `REQ_FLAG_OOO`), so a lane posts as soon as ITS
     /// reply is in; some lane's reply always arrives, so the loop cannot stall.
     ///
-    /// `V41_DGPU_SX_DEFER` (static, default off): each lane's shared expert is DISPATCHED later
+    /// `V41_DGPU_SX_DEFER` (live, default off; SAMPLED ONCE here per step, see below): each lane's
+    /// shared expert is DISPATCHED later
     /// on the same stream instead of at the end of its chain (`SxPending`): (a) right after
     /// another lane's chain is enqueued, (d) when the loop finds nothing ready and `de.compute` has
     /// drained (the dGPU idles anyway), or (b) right before the lane's own Post. Same kernels, same
     /// inputs, same outputs. Nothing is ever launched at the exit: this wrapper DROPS whatever an
     /// error exit left pending (the step is discarded; the context may be faulted).
+    ///
+    /// The knob is read ONCE, here, and the body holds that value (`bd.sx_defer` of every lane) for
+    /// every lane-layer of the step: a flip in the knob file lands at the next step. The flushes and
+    /// the exit rules never read the knob (they act on what is pending), so an on step and an off
+    /// step can follow in any order: each starts and ends with nothing pending (asserted). The
+    /// sample of a step that ended normally is published for its `ms.step` line
+    /// ([`sx_step_sampled`], `sx_on`).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_step_arena_ready_first(
         &self,
@@ -5725,23 +5733,34 @@ impl HeterogeneousEngine {
         engram_rows: &mut LazyEngramRows<'_>,
         pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<Vec<RowTables>> {
-        let r = self.forward_step_arena_ready_first_body(lanes, sd, si, arena, rows, weights, input_hcs, tokens, engram_rows, pager);
+        // `V41_DGPU_SX_DEFER`: the step's ONE read (an atomic load), held for all of it.
+        let sx_on = crate::knobs::DGPU_SX_DEFER.on();
+        let r = self.forward_step_arena_ready_first_body(lanes, sd, si, arena, rows, weights, input_hcs, tokens, engram_rows, pager, sx_on);
         // Nothing deferred outlives the driver, and nothing is LAUNCHED here. A normal end has none
         // left (every lane's last Post flushed its own, checked in the body before its final sync);
         // an error exit (any `?` in the body, between a deferral and its flush included) DROPS
         // them: the step is discarded, `ffn_shared` & co. are per-lane buffers the next step
         // rewrites before reading, and launching onto a possibly faulted context is exactly wrong.
         let mut stale: Vec<String> = Vec::new();
+        // A normal end: every lane must still hold the step's sample (nothing re-decides mid-step).
+        let mut resampled: Vec<usize> = Vec::new();
         for (j, (bd, _, _)) in lanes.iter_mut().enumerate() {
             if let Some(p) = bd.sx_pending.take() {
                 SX_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 stale.push(format!("lane {j} L{} ({:?})", p.layer, p.kind));
             }
+            if r.is_ok() && bd.sx_defer != sx_on {
+                resampled.push(j);
+            }
             bd.sx_defer = false;
         }
-        match r {
+        let r = match r {
             Ok(_) if !stale.is_empty() => Err(eyre!(
                 "forward_step_arena_ready_first: a normal end left deferred shared experts pending (dropped): {}", stale.join(", ")
+            )),
+            Ok(_) if !resampled.is_empty() => Err(eyre!(
+                "forward_step_arena_ready_first: lanes {resampled:?} ended the step with sx_defer != the step's V41_DGPU_SX_DEFER sample ({sx_on}): \
+                 the per-step sample changed mid-step (a bug)"
             )),
             Err(e) => {
                 if !stale.is_empty() {
@@ -5750,7 +5769,11 @@ impl HeterogeneousEngine {
                 Err(e)
             }
             r => r,
-        }
+        };
+        // The `ms.step` line's `sx_on`: this step's sample when it ended normally, else -1 (no step
+        // line follows an error; a later non-ready-first step must not inherit it).
+        SX_STEP_ON.store(if r.is_ok() { sx_on as i8 } else { -1 }, std::sync::atomic::Ordering::Relaxed);
+        r
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5766,6 +5789,8 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         engram_rows: &mut LazyEngramRows<'_>,
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
+        // `V41_DGPU_SX_DEFER`, sampled once by the wrapper for this whole step.
+        sx_on: bool,
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
         super::b2_mirror::begin_step();
@@ -5829,7 +5854,14 @@ impl HeterogeneousEngine {
             if let Some(p) = bd.sx_pending {
                 return Err(eyre!("forward_step_arena_ready_first: lane {i} starts a step with the shared expert of L{} ({:?}) still deferred (a bug: every exit clears it)", p.layer, p.kind));
             }
-            bd.sx_defer = crate::knobs::DGPU_SX_DEFER.on();
+            // ... and resets `sx_defer` (no other driver sets it): one still set here would let
+            // another driver's chains defer with nobody to flush them.
+            if bd.sx_defer {
+                return Err(eyre!("forward_step_arena_ready_first: lane {i} starts a step with sx_defer still set (a bug: every exit resets it)"));
+            }
+            // The wrapper's ONE sample for the step (never re-read below: a live flip lands at the
+            // next step, so no lane-layer of this one can defer without its flush or flush twice).
+            bd.sx_defer = sx_on;
             for (k, hc) in input_hcs[lo..hi].iter().enumerate() {
                 let mut slot = bd.residual.slice_view_mut(k * HC_DIM as usize, HC_DIM as usize);
                 slot.copy_from_host(hc)?;
@@ -14279,8 +14311,9 @@ impl HeterogeneousEngine {
 /// Fusion group G4 (`V41_DGPU_G4_SHARED`): lane-layers whose input quantize + late mixes ran as `g4_qmix`.
 pub static G4_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `V41_DGPU_SX_DEFER`'s own preconditions for one lane-layer (beside the ready-first driver's
-/// `bd.sx_defer`):
+/// `V41_DGPU_SX_DEFER`'s own preconditions for one lane-layer, beside the ready-first driver's
+/// `bd.sx_defer` (the step's ONE sample of the live knob; this never reads the knob itself, so a
+/// flip mid-step cannot change a lane-layer's decision):
 /// - graphs OFF (`V41_MS_GRAPHS=0`, production): with graphs ON the shared expert keeps its place
 ///   (its `g.shared_expert` stage graph and the stage_b context slot stay as they were gated);
 /// - no mHC split (`V41_MS_MHC_SPLIT`, OFF): its `de.hc` mixes write `sd.mix` beside `de.compute`,
@@ -14288,7 +14321,7 @@ pub static G4_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// - no sub-tensor dump armed on the layer (the dump syncs the stream inside the dispatch).
 /// `graphs` = the caller's ONE read of `ms_graphs()`, which it also records in `SxPending`.
 pub fn sx_defer_here(layer: usize, graphs: bool) -> bool {
-    crate::knobs::DGPU_SX_DEFER.on() && !graphs && !ms_mhc_split() && !super::engine::subtensor_dump_armed(layer)
+    !graphs && !ms_mhc_split() && !super::engine::subtensor_dump_armed(layer)
 }
 
 /// Fusion group G4's shape: the decode shared expert on the dp4a arm with Q8_0 weights (whose input
@@ -14311,6 +14344,17 @@ pub static G6_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static G6_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static G6_FLUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static G6_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `V41_DGPU_SX_DEFER` (live): the value the last ready-first step that ended normally SAMPLED
+/// (1 / 0), or -1 (none since the last [`sx_step_sampled`]; an error exit stores -1).
+pub static SX_STEP_ON: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// The `ms.step` line's `sx_on` (one caller per step, after the step's forward): the sample of
+/// this step's ready-first driver (1 / 0), or -1 when the step ran another driver (the knob does
+/// nothing there). Resets to -1.
+pub fn sx_step_sampled() -> i8 {
+    SX_STEP_ON.swap(-1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// `V41_DGPU_SX_DEFER`: lane-layer shared experts a chain (or `pre_moe_prep`) left pending.
 pub static SX_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -15264,20 +15308,39 @@ mod lm_tests {
 
 #[cfg(test)]
 mod sx_defer_tests {
-    use super::{sx_defer_here, SxFlush, SX_FLUSHED};
+    use super::{sx_defer_here, sx_step_sampled, SxFlush, SX_FLUSHED, SX_STEP_ON};
     use crate::knobs::{Kind, DGPU_SX_DEFER};
 
-    /// `V41_DGPU_SX_DEFER` is STATIC and OFF by default (production unchanged until gated), and the
-    /// lane-layer precondition never holds with the knob off.
+    /// `V41_DGPU_SX_DEFER` is LIVE (sampled once per ready-first step) and OFF by default, and the
+    /// lane-layer precondition never reads the knob: a flip mid-step cannot change a lane-layer's
+    /// decision (the step's sample, `bd.sx_defer`, is the only knob input).
     #[test]
-    fn sx_defer_is_a_static_default_off_knob() {
-        assert!(!DGPU_SX_DEFER.live, "V41_DGPU_SX_DEFER must be static");
+    fn sx_defer_is_a_live_default_off_knob() {
+        assert!(DGPU_SX_DEFER.live, "V41_DGPU_SX_DEFER must be live");
         assert!(matches!(DGPU_SX_DEFER.kind, Kind::Flag(false)), "V41_DGPU_SX_DEFER must default off");
-        if !DGPU_SX_DEFER.on() {
-            assert!((0..64).all(|l| !sx_defer_here(l, false)));
-        }
+        let was = DGPU_SX_DEFER.show();
+        let here = || (0..64).map(|l| sx_defer_here(l, false)).collect::<Vec<_>>();
+        assert!(DGPU_SX_DEFER.set("0"));
+        let off = here();
+        assert!(DGPU_SX_DEFER.set("1"));
+        let on = here();
+        assert!(DGPU_SX_DEFER.set(&was));
+        assert_eq!(off, on, "sx_defer_here must not read the knob");
         // graphs ON never defers, knob or not
         assert!((0..64).all(|l| !sx_defer_here(l, true)));
+    }
+
+    /// The `ms.step` `sx_on` field: the sample of the step that ended normally, then -1 until the
+    /// next ready-first step.
+    #[test]
+    fn sx_step_sample_is_taken_once() {
+        use std::sync::atomic::Ordering::Relaxed;
+        SX_STEP_ON.store(1, Relaxed);
+        assert_eq!(sx_step_sampled(), 1);
+        assert_eq!(sx_step_sampled(), -1);
+        SX_STEP_ON.store(0, Relaxed);
+        assert_eq!(sx_step_sampled(), 0);
+        assert_eq!(sx_step_sampled(), -1);
     }
 
     /// The trigger counters: one slot per trigger, (a) / (b) / (d) in the `ms.step` order (no exit

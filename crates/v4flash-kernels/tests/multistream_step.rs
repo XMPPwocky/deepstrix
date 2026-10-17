@@ -101,7 +101,8 @@
 //!        stage_b (the one-lane driver; plus each stream of G5e's arena alone,
 //!        b = 1) == their legacy run, with the counters checked as above.
 //!
-//!   SX   DEFERRED SHARED EXPERT (`V41_DGPU_SX_DEFER`, static): the ready-first driver dispatches
+//!   SX   DEFERRED SHARED EXPERT (`V41_DGPU_SX_DEFER`, live since 10-17: sampled ONCE per
+//!        ready-first step, held for all its lane-layers): the ready-first driver dispatches
 //!        each lane's shared expert behind the other lane's next chain (a), on an idle loop with
 //!        the dGPU drained (d), or before its own Post (b), instead of at the end of its chain. It
 //!        engages only with graphs OFF, so the gate runs the G5 arms with `MS_G5_GRAPHS=0`
@@ -149,7 +150,19 @@
 //!        env $COMMON MS_SX_NULL=1 MS_COMPARE_LOGITS=/tmp/sx_off1 cargo test ... multistream_step
 //!        # the change: knob on vs the knob-off run (includes the negative-control arm)
 //!        env $COMMON V41_DGPU_SX_DEFER=1 MS_COMPARE_LOGITS=/tmp/sx_off1 cargo test ... multistream_step
+//!        # LIVE FLIP (opt-in arm, added to the change run): see "SX FLIP" below
+//!        env $COMMON V41_DGPU_SX_DEFER=1 MS_SX_FLIP=1 MS_COMPARE_LOGITS=/tmp/sx_off1 cargo test ... multistream_step
 //!        ```
+//!        SX FLIP (`MS_SX_FLIP=1`, opt-in; needs `MS_G5_GRAPHS=0`): after G5e (and the negative
+//!        control) the G5e schedule runs again on a fresh arena while a thread flips the knob
+//!        (`Knob::set`, the same atomic store the live watcher makes) every `MS_SX_FLIP_US` (default
+//!        300 us: many flips inside each step), the main thread also forcing on / off by step
+//!        parity at each step start. Each step's sample is read back (`sx_step_sampled`). Checks:
+//!        logits == G5e's bit for bit (G5e is itself compared to the knob-off run above, so this is
+//!        the knob-off output too); deferred == (steps that sampled ON) x N_LAYER x 2 exactly (a
+//!        flip leaking into a step would leave a partial count), deferred == a + b + d, 0 dropped,
+//!        and both values sampled (else vacuous). The knob is restored to its env value after.
+//!        Works in the null run too (`MS_SX_NULL=1 MS_SX_FLIP=1 ...`: G5e is then knob off).
 //!        G6 (`V41_DGPU_G6_BOUNDARY`) fuses a Post's combine only with box 2's partial
 //!        (`remote_ffn_moe`), so the deferred-combine interaction needs box 2 attached;
 //!        `V41_REMOTE_SPLIT_DECODE` steers the single-stream decode oracle only (the arena drivers
@@ -431,7 +444,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let sx_null = std::env::var("MS_SX_NULL").as_deref() == Ok("1");
     // SX preflight (module doc, THE GATE): an SX run must be the production configuration and must
     // not route by residency. Fail before the long run, loudly.
-    let sx_run = sx_knob || g5_graphs.is_some() || sx_null || std::env::var("MS_COMPARE_LOGITS").is_ok();
+    // SX FLIP (module doc): the opt-in live-flip arm.
+    let sx_flip = std::env::var("MS_SX_FLIP").as_deref() == Ok("1");
+    let sx_run = sx_knob || g5_graphs.is_some() || sx_null || sx_flip || std::env::var("MS_COMPARE_LOGITS").is_ok();
     if sx_run {
         let carried = [
             "V41_DGPU_G1_FUSED", "V41_DGPU_QKV_FRONT", "V41_ATTN_G3", "V41_ATTN_G3_KERNEL", "V41_DGPU_G4_SHARED", "V41_DGPU_G6_BOUNDARY",
@@ -454,7 +469,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         if !forbidden.is_empty() {
             return Err(eyre!("SX gate: residency-dependent knobs are set ({}); unset them (module doc, THE GATE)", forbidden.join(", ")));
         }
-        if (sx_knob || std::env::var("MS_COMPARE_LOGITS").is_ok())
+        if (sx_knob || sx_flip || std::env::var("MS_COMPARE_LOGITS").is_ok())
             && v4flash_kernels::knobs::DGPU_G6_BOUNDARY.pick() != 0
             && std::env::var("V41_REMOTE_ADDR").is_err()
         {
@@ -621,6 +636,8 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // SX negative control's arena (G5e's admissions), only when the knob is on.
     let mut arena_sxneg: Option<KvArena> =
         if v4flash_kernels::knobs::DGPU_SX_DEFER.on() { Some(KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?) } else { None };
+    // SX FLIP's arena (G5e's admissions), only with `MS_SX_FLIP=1`.
+    let mut arena_sxflip: Option<KvArena> = if sx_flip { Some(KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?) } else { None };
     let mut arena_spec = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_spec_true = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_spec2 = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
@@ -702,6 +719,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut slots_stag: Vec<u32> = Vec::new();
     let mut slots_rf: Vec<u32> = Vec::new();
     let mut slots_sxneg: Vec<u32> = Vec::new();
+    let mut slots_sxflip: Vec<u32> = Vec::new();
     let mut slots_spec: Vec<u32> = Vec::new();
     let mut slots_spec_true: Vec<u32> = Vec::new();
     let mut slots_spec2: Vec<u32> = Vec::new();
@@ -727,6 +745,9 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         slots_rf.push(arena_rf.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         if let Some(a) = arena_sxneg.as_mut() {
             slots_sxneg.push(a.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
+        }
+        if let Some(a) = arena_sxflip.as_mut() {
+            slots_sxflip.push(a.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         }
         let cap_spec = cap + ARENA_ROWS_PER_STREAM;
         slots_spec.push(arena_spec.admit_from_state(&st, cap_spec, pos, &engine.dgpu.compute)?);
@@ -1541,6 +1562,104 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         eprintln!("SX negative control (flush skipped): {n_diff} of {n_rows} rows differ from G5e (want > 0), {skipped} shared experts dropped");
         if n_diff == 0 || skipped == 0 {
             sx_fail.push(format!("negative control: skipping the flush changed {n_diff} of {n_rows} rows ({skipped} dropped) -- the gate cannot see a missing shared expert"));
+        }
+    }
+
+    // SX FLIP (module doc): the G5e schedule on a fresh arena while the live knob flips under it
+    // (mid-step included). Every step's output must equal G5e's, and every step must defer all of
+    // its lane-layers or none, per its ONE sample.
+    if let Some(arena_sxflip) = arena_sxflip.as_mut() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use v4flash_kernels::het::forward_prefill::sx_step_sampled;
+        use v4flash_kernels::knobs::DGPU_SX_DEFER;
+        if v4flash_kernels::knobs::MS_GRAPHS.on() {
+            sx_fail.push("MS_SX_FLIP=1 with graphs on: the deferral cannot engage (set MS_G5_GRAPHS=0)".into());
+        } else {
+            let period = std::time::Duration::from_micros(env_usize("MS_SX_FLIP_US", 300) as u64);
+            let stop = AtomicBool::new(false);
+            let mut seqs_f: Vec<Vec<i32>> = prompts.clone();
+            let (mut n_rows, mut n_diff, mut on_steps, mut off_steps) = (0usize, 0usize, 0usize, 0usize);
+            let before = sx_snap();
+            let res = std::thread::scope(|sc| -> eyre::Result<u64> {
+                let flipper = sc.spawn(|| {
+                    let (mut on, mut flips) = (false, 0u64);
+                    while !stop.load(Relaxed) {
+                        on = !on;
+                        DGPU_SX_DEFER.set(if on { "1" } else { "0" });
+                        flips += 1;
+                        std::thread::sleep(period);
+                    }
+                    flips
+                });
+                let r = (|| -> eyre::Result<()> {
+                    for t in 0..n_steps {
+                        let toks: Vec<i32> = (0..n_streams).map(|s| cont[s][t]).collect();
+                        let mut rows_b = vec![vec![0f32; n_streams * ein]; ENGRAM_LAYERS.len()];
+                        let mut hcs = Vec::with_capacity(n_streams);
+                        for s in 0..n_streams {
+                            let pos = seqs_f[s].len();
+                            seqs_f[s].push(toks[s]);
+                            for (li, r) in engram.rows_at(pg.raw(), &seqs_f[s], pos)?.iter().enumerate() {
+                                rows_b[li][s * ein..(s + 1) * ein].copy_from_slice(r);
+                            }
+                            hcs.push(embed(toks[s])?);
+                        }
+                        // Step parity at the start (the flipper may still win the race: the sample
+                        // read back below is what counts).
+                        DGPU_SX_DEFER.set(if t % 2 == 0 { "1" } else { "0" });
+                        let _ = sx_step_sampled();
+                        {
+                            let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev); 2] =
+                                [(&mut bd_a, &mut bi_a, &mut dev), (&mut bd_b, &mut bi_b, &mut dev_b)];
+                            engine.forward_step_arena_ready_first(
+                                &mut lanes, &mut sd, &mut si, arena_sxflip, &StepRows::plain(&slots_sxflip)?, &weights,
+                                &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b)), Some(&mut pg),
+                            )?;
+                        }
+                        match sx_step_sampled() {
+                            1 => on_steps += 1,
+                            0 => off_steps += 1,
+                            v => return Err(eyre!("SX FLIP step {t}: the ready-first step published no sample ({v})")),
+                        }
+                        for &sl in &slots_sxflip {
+                            arena_sxflip.accept(sl, 1, &engine.dgpu.compute)?;
+                        }
+                        let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
+                        all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
+                        for s in 0..n_streams {
+                            n_rows += 1;
+                            n_diff += usize::from(all[s * nv..(s + 1) * nv] != logits_rf[s][t][..]);
+                        }
+                    }
+                    Ok(())
+                })();
+                stop.store(true, Relaxed);
+                let flips = flipper.join().map_err(|_| eyre!("SX FLIP: the flipper thread panicked"))?;
+                r.map(|_| flips)
+            });
+            // Back to the env's value for the arms that follow (G6).
+            DGPU_SX_DEFER.set(if sx_knob { "1" } else { "0" });
+            let flips = res?;
+            let after = sx_snap();
+            let [d, a, b, dd, drop, ..] = std::array::from_fn::<u64, 8, _>(|k| after[k] - before[k]);
+            let want = (on_steps * v4flash_kernels::config::N_LAYER as usize * 2) as u64;
+            eprintln!(
+                "SX FLIP: {flips} flips every {period:?}; steps sampled on {on_steps} / off {off_steps}; deferred {d} (want {want}; a {a}, b {b}, d {dd}; dropped {drop}); \
+                 {n_diff} of {n_rows} rows differ from G5e (want 0)"
+            );
+            let mut why: Vec<String> = Vec::new();
+            if on_steps == 0 || off_steps == 0 {
+                why.push(format!("vacuous: steps sampled on {on_steps} / off {off_steps} (both needed)"));
+            }
+            if d != want || a + b + dd != d || drop != 0 {
+                why.push(format!("deferred {d} != {want} (= on steps x N_LAYER x 2), or != a {a} + b {b} + d {dd}, or dropped {drop}"));
+            }
+            if n_diff != 0 || n_rows == 0 {
+                why.push(format!("{n_diff} of {n_rows} rows differ from G5e"));
+            }
+            if !why.is_empty() {
+                sx_fail.push(format!("SX FLIP: {}", why.join("; ")));
+            }
         }
     }
 

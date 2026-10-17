@@ -530,8 +530,9 @@ pub struct BatchDgpuScratch {
     /// (`g6_boundary`). Taken by that `pre_moe_chain` (fused, or flushed as the old combine when the
     /// fused path does not apply there); dropped when stale (an aborted step).
     pub g6_pending: Option<G6Pending>,
-    /// `V41_DGPU_SX_DEFER`: set by the ready-first driver for the duration of a step (reset at its
-    /// exit, whatever the outcome; pending entries are dropped on an error exit): this lane's chain
+    /// `V41_DGPU_SX_DEFER`: set by the ready-first driver for the duration of a step to the step's
+    /// ONE sample of the live knob (reset at its exit, whatever the outcome; pending entries are
+    /// dropped on an error exit; a step start with it still set is an error): this lane's chain
     /// may leave its shared expert in `sx_pending`.
     /// No other driver sets it.
     pub sx_defer: bool,

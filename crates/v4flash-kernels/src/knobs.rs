@@ -957,7 +957,9 @@ crate::knobs! {
     /// (`ffn_mix_late`), the dp4a arm and Q8_0 shared weights; everything else keeps the chain.
     /// docs/v41/DECODE_OPT_KNOBS.md.
     pub static DGPU_G4_SHARED = Knob::flag("V41_DGPU_G4_SHARED", false).live();
-    /// `V41_DGPU_SX_DEFER` (default OFF; STATIC, read per decode lane-layer of the ready-first driver):
+    /// `V41_DGPU_SX_DEFER` (default OFF; LIVE since 10-17, SAMPLED ONCE per ready-first step -- one
+    /// load at the driver's entry, held for every lane-layer of that step, logged as `ms.step`
+    /// `sx_on`; a flip lands at the next step, never mid-step):
     /// the decode shared expert (G4's launch + GEMVs, or the plain chain; ~92 us per lane-layer) is
     /// not enqueued at the end of its lane's chain but DISPATCHED later on the same in-order dGPU
     /// stream (`BatchDgpuScratch::sx_pending`): right after the OTHER lane's next chain is enqueued
@@ -968,8 +970,11 @@ crate::knobs! {
     /// moves; the flush always launches direct. Only where no graph can capture it (`V41_MS_GRAPHS`
     /// off at defer time), no mHC split, no dumps; the lockstep / pipelined / single-lane drivers
     /// and prefill never defer. Counters `forward_prefill::SX_*` (`ms.step` sx_def / sx_a / sx_b /
-    /// sx_d / sx_drop: sx_b = the share whose ~92 us landed on its own lane's path).
-    pub static DGPU_SX_DEFER = Knob::flag("V41_DGPU_SX_DEFER", false);
+    /// sx_d / sx_drop: sx_b = the share whose ~92 us landed on its own lane's path). Live is safe:
+    /// nothing is allocated or sized by it (the deferral reuses the lane's scratch), the flushes
+    /// and exit rules never read it (they act on what is pending), and every step starts and ends
+    /// with nothing pending (asserted), so an on step and an off step can follow in any order.
+    pub static DGPU_SX_DEFER = Knob::flag("V41_DGPU_SX_DEFER", false).live();
     pub static DGPU_G6_BOUNDARY = Knob::choice("V41_DGPU_G6_BOUNDARY", 0, &[&["off", "0"], &["early", "1", "on"], &["zc"]]).live();
     /// `V41_B1_HOT_POLICY` (`interleave` default since 2026-10-10 | `top`; live, read at each hot-set refresh): who owns
     /// each layer's hot experts (docs/v41/HOT_SPLIT_DESIGN.md). `top` = box 1 owns the top

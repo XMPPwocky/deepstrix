@@ -2317,6 +2317,9 @@ impl Sched {
         // Box-1 decode paging of THIS step (`hub_b1`, every step): counters at the step's start.
         let b1_start = (pager.as_ref().map(|pg| pg.counters()), v4flash_core::hedge::ENGRAM.snapshot(), v4flash_core::hedge::EXPERT.snapshot(),
             pager.as_ref().map_or(0, |pg| pg.protect_owned_fallback()));
+        // `V41_DGPU_SX_DEFER` (live): clear the per-step sample so `sx_on` below is THIS step's
+        // (a step that skipped its line must not leak its value into a non-ready-first step).
+        let _ = v4flash_kernels::het::forward_prefill::sx_step_sampled();
         let t_fwd = Instant::now();
         // Two-lane pipelined step (default for >= 2 rows, `V41_MS_PIPELINE=0`
         // disables): lane B's layer runs under lane A's box-2 wait.
@@ -2451,6 +2454,10 @@ impl Sched {
         Ok::<_, eyre::Report>(targets)
         })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+        // `ms.step` `sx_on`: the value this step's ready-first driver sampled (1 / 0; one read for
+        // the whole step), -1 = another driver ran (the knob does nothing there). An A/B analyzer
+        // attributes steps to arms by it, not by the knob file's timestamps.
+        let sx_on = v4flash_kernels::het::forward_prefill::sx_step_sampled();
         // The forward's final dGPU sync returned (causality rule (b), N1).
         let t_fwd_sync = v4flash_kernels::het::forward_prefill::take_fwd_sync();
         if ev_on && t_fwd_sync.is_finite() {
@@ -2913,7 +2920,7 @@ impl Sched {
         // deferred by a Post, fused into the next chain, flushed as the old combine, dropped stale), and
         // `V41_DGPU_SX_DEFER` (shared experts deferred; dispatched (a) behind another lane's chain, (b) at
         // the lane's own Post -- on its own path --, (d) on an idle loop with the dGPU drained; dropped
-        // unlaunched by an error exit).
+        // unlaunched by an error exit); `sx_on` = the step's sample of the live knob (above).
         let [g4_n, g6_def, g6_n, g6_flush, g6_drop, sx_def, sx_a, sx_b, sx_d, sx_drop] =
             v4flash_kernels::het::forward_prefill::fusion_counter_deltas();
         tracing::info!(rows = b, spec = ?spec_out, lanes = if lanes3 { 3 } else if pipelined { 2 } else { 1 },
@@ -2925,7 +2932,7 @@ impl Sched {
             engram_t0_ms = format!("{:.2}", ENGRAM_TABLE_US[0].swap(0, Ordering::Relaxed) as f64 / 1e3),
             engram_t1_ms = format!("{:.2}", ENGRAM_TABLE_US[1].swap(0, Ordering::Relaxed) as f64 / 1e3), spec_streams = %spec_streams, live_emitted = %live_emitted, draft_ms = format!("{draft_wall_ms:.1}"),
             b1_dec_misses = b1v("dec_misses"), b1_dec_read_ms = format!("{:.2}", b1v("dec_read_ms")), b1_dec_ensure_ms = format!("{:.2}", b1v("dec_ensure_ms")),
-            g4_n, g6_def, g6_n, g6_flush, g6_drop, sx_def, sx_a, sx_b, sx_d, sx_drop, "ms.step");
+            g4_n, g6_def, g6_n, g6_flush, g6_drop, sx_on, sx_def, sx_a, sx_b, sx_d, sx_drop, "ms.step");
         if ev_on {
             let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
             for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),
