@@ -21,7 +21,9 @@
 //!
 //! Case counts: `ORACLE_CASES` (default 512) per property; a long run is
 //! `ORACLE_CASES=20000`. Failures persist to `proptest-regressions/`.
-//! Token ids need the V4.1 tokenizer (`V41_TOKENIZER_JSON`, default
+//! Token ids: the server's (`BpeVocab` + segments) vs the reference's (HF
+//! `tokenizers` on the same file, through deepseek-recipe's encode path),
+//! both from the V4.1 tokenizer (`V41_TOKENIZER_JSON`, default
 //! `/weights2/dsv4.1f-1017/tokenizer.json`); without it the id leg is skipped
 //! with a message. The secondary oracle (the checkpoint's `encoding.py`) runs
 //! in `secondary_oracle_encoding_py_vs_recipe` when `ENCODING_PY_DIR` (default
@@ -105,7 +107,10 @@ fn diff(a: &str, b: &str) -> String {
 
 struct Vocab {
     bpe: BpeVocab,
-    /// Every added token of tokenizer.json, as HF matches them in text.
+    /// The reference tokenizer: HF `tokenizers` on the same tokenizer.json.
+    hf: tokenizers::Tokenizer,
+    /// Every added token of tokenizer.json (to recognize client text that
+    /// spells one).
     added: Vec<(String, i32)>,
     image_id: Option<i32>,
 }
@@ -128,46 +133,25 @@ fn vocab() -> Option<&'static Vocab> {
             .collect();
         added.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
         let image_id = bpe.lookup_token_id(IMG_OURS);
-        Some(Vocab { bpe, added, image_id })
+        let hf = tokenizers::Tokenizer::from_file(&path).expect("HF tokenizers: load tokenizer.json");
+        Some(Vocab { bpe, hf, added, image_id })
     })
     .as_ref()
 }
 
-/// How HF `tokenizers` encodes a prompt string (`encode(text, false)`, as
-/// `deepseek_recipe_encoding::PromptEncoding::encode` does): every added-token
-/// literal, wherever it occurs, is its id (leftmost-longest); the gaps are
-/// BPE'd. The BPE itself is the server's (`BpeVocab::encode`) -- the oracle's
-/// HF tokenizer object is not reachable without a direct `tokenizers`
-/// dependency (KNOWN_DEVIATIONS note TOKEN_IDS_VIA_OUR_BPE).
-fn hf_style_ids(v: &Vocab, text: &str) -> Vec<i32> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    loop {
-        let hit = v
-            .added
-            .iter()
-            .filter_map(|(lit, id)| rest.find(lit.as_str()).map(|at| (at, lit.len(), *id)))
-            .min_by_key(|(at, len, _)| (*at, std::cmp::Reverse(*len)));
-        match hit {
-            Some((at, len, id)) => {
-                if at > 0 {
-                    out.extend(v.bpe.encode(&rest[..at]));
-                }
-                out.push(id);
-                rest = &rest[at + len..];
-            }
-            None => {
-                if !rest.is_empty() {
-                    out.extend(v.bpe.encode(rest));
-                }
-                return out;
-            }
-        }
-    }
+/// The reference token ids of a prompt string: the oracle's own encode path
+/// (`deepseek_recipe_encoding::TokenizerEncoder` for an HF `Tokenizer`,
+/// i.e. `encode(text, add_special_tokens = false)`), on the checkpoint's
+/// tokenizer.json. (deepseek-recipe's bundled V4.1 tokenizer is this file
+/// with id 129264 renamed `<｜image｜>`; the prompt here carries the
+/// checkpoint's spelling, see IMG_OURS.)
+fn reference_ids(v: &Vocab, text: &str) -> Vec<i32> {
+    use deepseek_recipe_encoding::TokenizerEncoder;
+    v.hf.encode_ids(text).expect("HF encode").into_iter().map(|t| t as i32).collect()
 }
 
-/// Token-id leg: the server's ids for the request vs HF-style ids of the
-/// oracle's prompt. They may differ ONLY where client text spells an added
+/// Token-id leg: the server's ids for the request vs the reference
+/// tokenizer's ids of the oracle's prompt. They may differ ONLY where client text spells an added
 /// token (the server never lets client text become a control token:
 /// KNOWN_DEVIATIONS CLIENT_SPECIALS_INERT).
 enum IdCheck {
@@ -205,7 +189,7 @@ fn check_ids(req: &Value, oracle: &str) -> Result<IdCheck, String> {
     let r = ours_request(req)?;
     let segs = prompt_v41::request_segments_v41(&r, server_default_effort()).map_err(|e| format!("{e:#}"))?.0;
     let (ours, _) = prompt_v41::render_request_v41(&v.bpe, &r, server_default_effort(), v.image_id).map_err(|e| format!("{e:#}"))?;
-    let reference = hf_style_ids(v, oracle);
+    let reference = reference_ids(v, oracle);
     if ours == reference {
         STATS.ids_identical.fetch_add(1, Relaxed);
         return Ok(IdCheck::Compared);
@@ -1651,7 +1635,6 @@ pub const KNOWN_DEVIATIONS: &[(&str, &str)] = &[
     // Representation only.
     ("IMAGE_PLACEHOLDER_SPELLING", "prompt text spells id 129264 <｜deepseek_image｜> (checkpoint tokenizer.json), the oracle <｜image｜> (its bundled tokenizer); same token id"),
     ("EMPTY_FIELD_NULL", "an empty content / reasoning_content is null in our response, \"\" in the oracle's"),
-    ("TOKEN_IDS_VIA_OUR_BPE", "the id leg tokenizes the oracle prompt HF-style with the server's BPE; the oracle's own HF tokenizer object needs a direct `tokenizers` dev-dependency"),
     // Security: the prompt bytes are identical, the ids are not.
     ("CLIENT_SPECIALS_INERT", "client text spelling a special token (<｜User｜>, </think>, ｜DSML｜ ...) is BPE'd as text; the oracle's HF tokenization makes it the control token"),
     // Request leniency: the oracle rejects (400), the server renders.
@@ -2106,7 +2089,7 @@ fn deviation_client_special_text_is_inert() {
     assert_eq!(ours_prompt(&req).unwrap(), oracle, "bytes identical");
     let r = ours_request(&req).unwrap();
     let (ours, _) = prompt_v41::render_request_v41(&v.bpe, &r, server_default_effort(), v.image_id).unwrap();
-    let reference = hf_style_ids(v, &oracle);
+    let reference = reference_ids(v, &oracle);
     let user_id = v.bpe.lookup_token_id("<\u{ff5c}User\u{ff5c}>").unwrap();
     assert_eq!(reference.iter().filter(|&&t| t == user_id).count(), 2, "HF makes the client's <｜User｜> a control token");
     assert_eq!(ours.iter().filter(|&&t| t == user_id).count(), 1, "ours keeps it text");

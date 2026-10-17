@@ -38,6 +38,9 @@ proptest = "=1.12.0"
 deepseek-recipe = { git = "https://github.com/deepseek-ai/deepseek-recipe", rev = "8cadfede7063c896b944e7bae05daa3549ae97ea" }
 deepseek-recipe-core = { git = "https://github.com/deepseek-ai/deepseek-recipe", rev = "8cadfede7063c896b944e7bae05daa3549ae97ea" }
 deepseek-recipe-encoding = { git = "https://github.com/deepseek-ai/deepseek-recipe", rev = "8cadfede7063c896b944e7bae05daa3549ae97ea" }
+# The reference tokenizer for the token-id leg (owner OK 2026-10-17): the
+# exact version deepseek-recipe already pulls in, so no crate is added.
+tokenizers = "=0.23.2"
 
 [[bin]]
 name = "deepstrix-server"
