@@ -1068,6 +1068,12 @@ impl V41HfWeights {
         self.st.mirror_complete()
     }
 
+    /// Every shard holding a routed expert has a verified mirror (`SafetensorsDir::mirror_covers_experts`): enough
+    /// for mirror-only expert reads even when the mirror leaves out the expert-free (Engram) shards.
+    pub fn mirror_covers_experts(&self) -> bool {
+        self.st.mirror_covers_experts()
+    }
+
     pub fn read_expert_hf_layout_direct(
         &self,
         vt: &VTensor,

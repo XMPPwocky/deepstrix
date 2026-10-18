@@ -2481,7 +2481,7 @@ fn b2_merge() -> bool {
 /// sizes the pinned staging sets.
 pub mod knobs {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    /// Every shard's mirror opened (`set_mirror_ok`, at `enable_paging`).
+    /// Every routed-expert shard has a VERIFIED mirror (`set_mirror_ok`, at `enable_paging`; `mirror_covers_experts`).
     static MIRROR_OK: AtomicBool = AtomicBool::new(false);
     const MAX: u64 = u32::MAX as u64;
     fn sync_mirror_frac(k: &crate::knobs::Knob) {
@@ -2678,7 +2678,7 @@ pub mod knobs {
     /// nor wait behind certain ones; and a request never waits on a
     /// speculative read already running on the E100 -- it reads the expert
     /// itself from the SN5000 and the late copy is discarded on landing.
-    /// Needs a usable mirror on EVERY shard (`set_mirror_ok`); otherwise it
+    /// Needs a verified mirror on every EXPERT shard (`set_mirror_ok`); otherwise it
     /// is `split` (a mirror-only read would silently fall back to the primary).
     /// Decode victims one prefill phase may take before it evicts its own
     /// oldest pages (mode-aware eviction, `V41_B2_MODE_EVICT`); read at the
@@ -6345,11 +6345,15 @@ impl ExpertShard {
     /// can serve any expert) and [`Self::ensure_layer`] pages in whatever the hub
     /// asks for, from this box's own disk.
     pub fn enable_paging(&mut self) -> eyre::Result<()> {
-        // `route=urgency` needs the mirror on every shard.
-        let mirror_ok = self.owner.mirror_complete();
+        // `route=urgency` needs a VERIFIED mirror (`v4flash_core::mirror_check`) on every shard holding a routed
+        // expert; a partial mirror without the hub-only Engram shards qualifies.
+        let mirror_ok = self.owner.mirror_covers_experts();
         knobs::set_mirror_ok(mirror_ok);
         if !mirror_ok && std::env::var_os("V41_EXPERT_MIRROR_DIR").is_some() {
-            eprintln!("expertd: expert mirror incomplete: route=urgency will act as route=split");
+            let (accepted, mismatched, missing) = v4flash_core::mirror_check::counters();
+            eprintln!(
+                "expertd: expert mirror does not cover every expert shard (verified {accepted}, MISMATCHED {mismatched}, missing {missing}): route=urgency will act as route=split"
+            );
         }
         for l in self.layers.iter_mut().flatten() {
             let cap = l.ids.len();
