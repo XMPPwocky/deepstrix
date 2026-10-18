@@ -527,6 +527,81 @@ impl RopeTail {
         ])
     }
 
+    /// `V41_ATTN_O_FP8`: [`Self::launch_inverse_quant_q8`] with the 1017 reference's act_quant in
+    /// place of the Q8_0 quantize (`rope_inv_quant_fp8`, same grid and launch): `heads` gets the
+    /// inverse rope, `xq` the e4m3 codes (bytes) of every 32-block, `xscale` its power-of-two scale
+    /// -- the FP8 `wo_a` input (`crate::fp8_wo_a`). Bit-exact with `act_quant_fp8::act_quant_row` of
+    /// the roped `heads` (tests/fp8_wo_a.rs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_inverse_quant_fp8(
+        &self,
+        stream: &Stream,
+        heads: &mut DeviceBuffer<f32>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        if n_head != 64 || head_dim != 512 || n_rot != 64 {
+            return Err(eyre!("rope_inv_quant_fp8: written for 64 x 512 heads, n_rot 64"));
+        }
+        if b == 0 {
+            return Ok(());
+        }
+        let n = (b as usize) * 32768;
+        if heads.len() < n || xq.len() < n || xscale.len() < n / 32 || pos_per_b.len() < b as usize {
+            return Err(eyre!("rope_inv_quant_fp8: buffers too small for b={b}"));
+        }
+        let (theta_scale, mscale_eff, corr_low, corr_high) = Self::device_args(params, n_rot);
+        let function = self.module.get_function("rope_inv_quant_fp8")?;
+        // `V41_GRID_PAD`: as rope_inv_quant_q8 (DO NOT REMOVE; see `crate::grid_pad`).
+        let cfg = LaunchConfig { grid: (64 + crate::grid_pad(), b, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [
+            heads.raw(), xq.raw(), xscale.raw(), pos_per_b.raw(),
+            theta_scale, params.freq_scale, params.ext_factor, mscale_eff, corr_low, corr_high
+        ])
+    }
+
+    /// [`Self::launch_inverse_quant_fp8`] through its `_ind` twin (operands and rope slots as
+    /// [`Self::launch_inverse_quant_q8_ind`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_inverse_quant_fp8_ind(
+        &self,
+        stream: &Stream,
+        ind: crate::het::arena_ctx::Ind,
+        rope_slots: [usize; 3],
+        heads: &mut DeviceBuffer<f32>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+    ) -> eyre::Result<()> {
+        if n_head != 64 || head_dim != 512 || n_rot != 64 {
+            return Err(eyre!("rope_inv_quant_fp8_ind: written for 64 x 512 heads, n_rot 64"));
+        }
+        if b == 0 {
+            return Ok(());
+        }
+        let n = (b as usize) * 32768;
+        if heads.len() < n || xq.len() < n || xscale.len() < n / 32 {
+            return Err(eyre!("rope_inv_quant_fp8_ind: buffers too small for b={b}"));
+        }
+        let function = self.module.get_function(&ind.symbol("rope_inv_quant_fp8"))?;
+        let cfg = LaunchConfig { grid: (64 + crate::grid_pad(), b, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
+        let p: [u64; 4] = [heads.raw() as u64, xq.raw() as u64, xscale.raw() as u64, pos_per_b.raw() as u64];
+        let q: [u64; 4] = std::array::from_fn(|i| ind.ptr(i, p[i]));
+        let r: [u64; 3] = rope_slots.map(|s| ind.slot_addr(s));
+        crate::het::arena_ctx::vet_ind(&ind, &p);
+        launch_kernel!(function, cfg, stream, [ind.mask(), ind.canary, ind.tag, q[0], q[1], q[2], q[3], r[0], r[1], r[2]])
+    }
+
     fn launch(
         &self,
         stream: &Stream,

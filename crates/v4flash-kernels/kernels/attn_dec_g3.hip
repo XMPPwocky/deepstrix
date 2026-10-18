@@ -43,6 +43,8 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
+#include "act_quant_fp8.inc"
+
 typedef _Float16 half8  __attribute__((ext_vector_type(8)));
 typedef float    float8 __attribute__((ext_vector_type(8)));
 typedef short    short8 __attribute__((ext_vector_type(8)));
@@ -150,7 +152,10 @@ __device__ __forceinline__ float g3_rot(float v, float partner, unsigned e, floa
 }
 
 // ---- the kernel body ----------------------------------------------------------------------------
-template <int PD>
+// O8 (`V41_ATTN_O_FP8`, entry `attn_dec_g3_o8`): the epilogue emits the 1017 reference's act_quant
+// of each 32-dim block (e4m3 codes into xq, the power-of-two scale into xscale: what
+// rope_inv_quant_fp8 writes) instead of its Q8_0 quantize; everything before it is unchanged.
+template <int PD, bool O8 = false>
 __device__ __forceinline__ void g3_body(
         float* heads_out, int8_t* xq, float* xscale,
         const float* sinks, const float* q, const _Float16* raw_kv,
@@ -347,6 +352,15 @@ __device__ __forceinline__ void g3_body(
         amax = fmaxf(amax, g3_xor<4>(amax));
         amax = fmaxf(amax, g3_xor<2>(amax));
         amax = fmaxf(amax, g3_xor<1>(amax));
+        if constexpr (O8) {
+            const int ex = aq_scale_exp(amax);
+            const size_t hbase = row + (size_t)head * 512u;
+            xq[hbase + d_lo] = (int8_t)aq_e4m3_code(v_lo[e], ex);
+            xq[hbase + d_hi] = (int8_t)aq_e4m3_code(v_hi[e], ex);
+            if (arow == 0u) xscale[(size_t)b * 1024u + head * 16u + wave] = aq_pow2(ex);
+            if (heads_out) { heads_out[hbase + d_lo] = v_lo[e]; heads_out[hbase + d_hi] = v_hi[e]; }
+            continue;
+        }
         const float d = amax / 127.0f;
         const float id = d != 0.0f ? 1.0f / d : 0.0f;
         int q_lo = (int)lrintf(v_lo[e] * id), q_hi = (int)lrintf(v_hi[e] * id);
@@ -389,6 +403,42 @@ extern "C" __global__ __launch_bounds__(512) void attn_dec_g3(
     g3_body<G3_PD>(heads_out, xq, xscale, sinks, q, raw_kv, comp_kv, sel, sel_stride, comp_base_per,
                    comp_kv_batch_stride, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
                    corr_low, corr_high, kq_scale, n_head, zero_row, meta, w_lds, tbl, s_inv, q_lds, rope_lds);
+#else
+    (void)heads_out; (void)xq; (void)xscale; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)sel;
+    (void)sel_stride; (void)comp_base_per; (void)comp_kv_batch_stride; (void)pos_per_b; (void)theta_scale;
+    (void)freq_scale; (void)ext_factor; (void)mscale_eff; (void)corr_low; (void)corr_high; (void)kq_scale;
+    (void)n_head; (void)zero_row; (void)meta;
+#endif
+}
+
+// `V41_ATTN_O_FP8`: the same block with the act_quant epilogue (g3_body<G3_PD, true>): xq gets the
+// e4m3 codes, xscale the per-32 power-of-two scales (what rope_inv_quant_fp8 writes).
+extern "C" __global__ __launch_bounds__(512) void attn_dec_g3_o8(
+        float          * heads_out,
+        int8_t         * xq,                // [B, 32768] e4m3 codes
+        float          * xscale,            // [B, 1024] power-of-two block scales
+        const float    * sinks,
+        const float    * q,
+        const _Float16 * raw_kv,
+        const _Float16 * comp_kv,
+        const int      * sel,
+        unsigned int     sel_stride,
+        const int      * comp_base_per,
+        unsigned int     comp_kv_batch_stride,
+        const int      * pos_per_b,
+        float theta_scale, float freq_scale, float ext_factor, float mscale_eff, float corr_low,
+        float corr_high, float kq_scale, unsigned int n_head,
+        const _Float16 * zero_row,
+        G3Meta meta) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __shared__ __attribute__((aligned(16))) _Float16 w_lds[HT * WSTRIDE];
+    __shared__ __attribute__((aligned(16))) _Float16 q_lds[HT * QSTRIDE];
+    __shared__ const _Float16* tbl[TBL_N];
+    __shared__ float s_inv[HT];
+    __shared__ float rope_lds[64];
+    g3_body<G3_PD, true>(heads_out, xq, xscale, sinks, q, raw_kv, comp_kv, sel, sel_stride, comp_base_per,
+                         comp_kv_batch_stride, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
+                         corr_low, corr_high, kq_scale, n_head, zero_row, meta, w_lds, tbl, s_inv, q_lds, rope_lds);
 #else
     (void)heads_out; (void)xq; (void)xscale; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)sel;
     (void)sel_stride; (void)comp_base_per; (void)comp_kv_batch_stride; (void)pos_per_b; (void)theta_scale;

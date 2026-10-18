@@ -74,12 +74,56 @@ def dequant_fp4(w_packed: torch.Tensor, s: torch.Tensor, block: int = 32) -> tor
 
 
 def _pow2_ceil(x: torch.Tensor) -> torch.Tensor:
-    """2^ceil(log2(x)) — matches fast_round_scale (ue8m0)."""
-    return torch.exp2(torch.ceil(torch.log2(x)))
+    """2^ceil(log2(x)) EXACTLY — matches fast_round_scale (ue8m0, kernel.py:22-37).
+    (Was exp2(ceil(log2(x))): f32 log2 rounds 2^k * (1 + 2^-23) to k once
+    |k| >= 8, one scale too small. Identical on every bf16 input, which is all
+    the reference ever feeds it; exact for f32 too now.) frexp: x = m * 2^e,
+    m in [0.5, 1), so ceil(log2 x) = e - 1 exactly when m == 0.5, else e."""
+    m, e = torch.frexp(x)
+    e = torch.where(m == 0.5, e - 1, e)
+    return torch.ldexp(torch.ones_like(x), e)
 
 
 def _fake_fp8(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.float8_e4m3fn).float()
+
+
+# V41_ORACLE_ATTN_O_FP8 -- the engine's V41_ATTN_O_FP8 switch, for the reference:
+#   unset / "ref": follow model.py (the 1017 model.py rounds the attention output `o`
+#                  through act_quant before wo_a, model.py:787 and :1073; older ones do not);
+#   "0":           skip that rounding (compare against an engine run with the knob off);
+#   "1":           require it: `attn_o_fp8_check()` raises when model.py never asked for it
+#                  (a pre-1017 model.py cannot be forced: the call is model.py's, not ours).
+# The `o` calls are the only IN-PLACE act_quant calls on a 4-D tensor
+# (o.view(bsz, seqlen, n_groups, -1)); the window-KV calls are 3-D [bsz, seqlen, 512].
+ATTN_O_FP8 = os.environ.get("V41_ORACLE_ATTN_O_FP8", "ref")
+assert ATTN_O_FP8 in ("ref", "0", "1"), f"V41_ORACLE_ATTN_O_FP8={ATTN_O_FP8!r}: expected ref, 0 or 1"
+ATTN_O_FP8_CALLS = 0
+
+
+def attn_o_fp8_check():
+    """Call at the end of a run: under V41_ORACLE_ATTN_O_FP8=1 the reference must
+    have rounded `o` at least once."""
+    if ATTN_O_FP8 == "1" and ATTN_O_FP8_CALLS == 0:
+        raise RuntimeError("V41_ORACLE_ATTN_O_FP8=1 but model.py never rounded the attention "
+                           "output (pre-1017 model.py? point V41_MODEL at the 1017 checkpoint)")
+    if ATTN_O_FP8 != "ref":
+        print(f"attn-o fp8: mode {ATTN_O_FP8}, {ATTN_O_FP8_CALLS} act_quant(o) calls "
+              f"({'applied' if ATTN_O_FP8 == '1' else 'skipped'})")
+
+
+def _attn_o_fp8_atexit():
+    # every driver (oracle.py, oracle_generate.py, the dspark scripts) gets the check
+    try:
+        attn_o_fp8_check()
+    except RuntimeError as e:
+        print(f"ERROR: {e}", flush=True)
+        os._exit(3)
+
+
+if ATTN_O_FP8 != "ref":
+    import atexit
+    atexit.register(_attn_o_fp8_atexit)
 
 
 def act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, inplace=False):
@@ -87,6 +131,11 @@ def act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, inpl
     scale is a power of two (2^ceil(log2(amax/448))), amax floored at 1e-4.
     Returns (y, s) like the kernel; if inplace, writes the dequantised value
     back into x and returns x."""
+    global ATTN_O_FP8_CALLS
+    if inplace and x.dim() == 4:  # the attention output `o` (see ATTN_O_FP8)
+        ATTN_O_FP8_CALLS += 1
+        if ATTN_O_FP8 == "0":
+            return x
     xf = x.float()
     n = xf.shape[-1]
     assert n % block_size == 0

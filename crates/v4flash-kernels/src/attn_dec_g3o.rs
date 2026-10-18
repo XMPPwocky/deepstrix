@@ -223,8 +223,42 @@ impl AttnDecG3o {
         scratch: Option<(&mut DeviceBuffer<u16>, &mut DeviceBuffer<u32>)>,
         ts: Option<&mut DeviceBuffer<u64>>,
     ) -> eyre::Result<()> {
+        self.launch_epi(crate::attn_dec_g3::G3Epilogue::Q8_0, stream, mode, heads_out, xq, xscale, zero_row, sinks, q,
+                        raw_kv, comp, rows, pos_per_b, n_head, head_dim, n_rot, params, scratch, ts)
+    }
+
+    /// [`Self::launch`] with the epilogue `epi`. `G3Epilogue::Fp8` (`V41_ATTN_O_FP8`) exists for the
+    /// W family only (`attn_g3o_{w,x}*_o8`; production's `V41_ATTN_G3_KERNEL` picks only W modes);
+    /// any other mode is an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_epi(
+        &self,
+        epi: crate::attn_dec_g3::G3Epilogue,
+        stream: &Stream,
+        mode: G3oMode,
+        heads_out: Option<&mut DeviceBuffer<f32>>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        zero_row: &DeviceBuffer<u16>,
+        sinks: &DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp: G3Comp<'_>,
+        rows: G3Rows<'_>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        params: &RopeParams,
+        scratch: Option<(&mut DeviceBuffer<u16>, &mut DeviceBuffer<u32>)>,
+        ts: Option<&mut DeviceBuffer<u64>>,
+    ) -> eyre::Result<()> {
         if n_head != 64 || head_dim != 512 || n_rot != 64 {
             return Err(eyre!("attn_dec_g3o: written for 64 x 512 heads, n_rot 64"));
+        }
+        let o8 = epi == crate::attn_dec_g3::G3Epilogue::Fp8;
+        if o8 && !matches!(mode, G3oMode::Whole { .. }) {
+            return Err(eyre!("attn_dec_g3o: the FP8 (act_quant) epilogue exists for the W family only, not {mode:?}"));
         }
         let b = rows.n_raw.len();
         if b == 0 {
@@ -336,12 +370,17 @@ impl AttnDecG3o {
                 launch_kernel!(ft, ct, stream, [args])
             }
             G3oMode::Whole { parts, warps } => {
-                let fw = self.module.get_function(match (parts, warps) {
-                    (1, 16) => "attn_g3o_w1",
-                    (2, 16) => "attn_g3o_w2",
-                    (4, 16) => "attn_g3o_w4",
-                    (1, 32) => "attn_g3o_x1",
-                    _ => "attn_g3o_x2",
+                let fw = self.module.get_function(match (parts, warps, o8) {
+                    (1, 16, false) => "attn_g3o_w1",
+                    (2, 16, false) => "attn_g3o_w2",
+                    (4, 16, false) => "attn_g3o_w4",
+                    (1, 32, false) => "attn_g3o_x1",
+                    (_, _, false) => "attn_g3o_x2",
+                    (1, 16, true) => "attn_g3o_w1_o8",
+                    (2, 16, true) => "attn_g3o_w2_o8",
+                    (4, 16, true) => "attn_g3o_w4_o8",
+                    (1, 32, true) => "attn_g3o_x1_o8",
+                    (_, _, true) => "attn_g3o_x2_o8",
                 })?;
                 let cw = LaunchConfig { grid: (4, b32, parts), block: (warps * 32, 1, 1), shared_mem_bytes: 0 };
                 launch_kernel!(fw, cw, stream, [args])

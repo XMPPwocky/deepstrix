@@ -2516,6 +2516,9 @@ fn launch_attn_g3(
     rope: &crate::RopeParams,
 ) -> eyre::Result<()> {
     use crate::attn_dec_g3o::G3oMode;
+    // `V41_ATTN_O_FP8` (static: the loaded wo_a is FP8): the epilogue writes the act_quant codes +
+    // scales the FP8 wo_a reads instead of the Q8_0 quantize, same launch.
+    let epi = if crate::fp8_wo_a::attn_o_fp8() { crate::attn_dec_g3::G3Epilogue::Fp8 } else { crate::attn_dec_g3::G3Epilogue::Q8_0 };
     let w = |parts| Some(G3oMode::Whole { parts, warps: 16 });
     let mode = match crate::knobs::ATTN_G3_KERNEL.pick() {
         1 => crate::attn_dec_g3o::auto_mode(n_raw, n_comp),
@@ -2526,7 +2529,8 @@ fn launch_attn_g3(
     };
     if let Some(mode) = mode {
         let _t = de.events.stage("k.attn.g3w", &de.compute)?;
-        return de.attn_g3o.launch(
+        return de.attn_g3o.launch_epi(
+            epi,
             &de.compute,
             mode,
             None,
@@ -2548,7 +2552,8 @@ fn launch_attn_g3(
         );
     }
     let _t = de.events.stage("k.attn.g3", &de.compute)?;
-    de.attn_g3.launch(
+    de.attn_g3.launch_epi(
+        epi,
         &de.compute,
         None,
         xq,
@@ -9787,6 +9792,59 @@ impl HeterogeneousEngine {
             .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
         let heads_rope_quant_fused = cfg!(feature = "v41") && dec_fuse(b) && grp_variant != "f16x"
             && N_HEAD == 64 && N_HEAD_DIM == 512 && N_ROT == 64;
+        // `V41_ATTN_O_FP8` (static; the loaded wo_a is the checkpoint's FP8): every arm takes the
+        // inverse rope + the reference's act_quant in ONE launch (rope_inv_quant_fp8, or the G3
+        // epilogue), then the FP8 wo_a -- the GEMV where the Q8_0 path ran its dp4a GEMV, the FP8
+        // WMMA GEMM where it ran f16x / lds_tiled. Launches: the dp4a / G3 arms keep their count;
+        // the f16x arm drops one (rope_inverse + cast_heads_f16 -> rope_inv_quant_fp8).
+        if crate::fp8_wo_a::attn_o_fp8() {
+            assert!(N_HEAD == 64 && N_HEAD_DIM == 512 && N_ROT == 64, "V41_ATTN_O_FP8: rope_inv_quant_fp8 is written for 64 x 512 heads, n_rot 64");
+            if g3 {
+                // done by the attention block's act_quant epilogue (`attn_dec_g3_o8` / `attn_g3o_*_o8`)
+            } else {
+                let _t = de.events.stage("k.output_proj.rope_inv_quant", &de.compute)?;
+                let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+                match cap.src.ind() {
+                    Some(ind) => de.rope.launch_inverse_quant_fp8_ind(
+                        &de.compute, ind.with(3, slot::POS), slot::ROPE,
+                        &mut sd.heads, &mut sd.heads_xq, &mut sd.heads_xscale, &pos_v, N_HEAD, N_HEAD_DIM, N_ROT, b,
+                    )?,
+                    None => de.rope.launch_inverse_quant_fp8(
+                        &de.compute, &mut sd.heads, &mut sd.heads_xq, &mut sd.heads_xscale, &pos_v,
+                        N_HEAD, N_HEAD_DIM, N_ROT, b, &dlw.rope_params,
+                    )?,
+                }
+            }
+            if !dec_skip_dead() {
+                // `V41_DEC_SKIP_DEAD=0` keeps the (dead here) heads16 cast, as on the Q8_0 path
+                let _t = de.events.stage("k.output_proj.cast_heads_f16", &de.compute)?;
+                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.heads16, &sd.heads,
+                    b, Q_FLAT, super::batch_scratch::f16_pitch(Q_FLAT))?;
+            }
+            let _t = de.events.stage("k.output_proj.grouped_matvec", &de.compute)?;
+            if super::engine::subtensor_dump_armed(layer as usize) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_f32_view(
+                    layer as usize,
+                    &format!("pf_heads_p{dump_pos}"),
+                    &sd.heads.slice_view(0, Q_FLAT as usize),
+                )?;
+            }
+            let (xq, xs) = if g3 { (&sd.g3_heads_xq, &sd.g3_heads_xscale) } else { (&sd.heads_xq, &sd.heads_xscale) };
+            if grp_variant == "dp4a" {
+                match cap.src.ind() {
+                    Some(ind) => de.fp8_wo_a.matvec_ind(
+                        &de.compute, ind.with(1, slot::WO_A), &mut sd.low, &dlw.attn_output_a.buffer,
+                        xq, xs, GROUP_DIM, RANK, N_GROUPS, b,
+                    )?,
+                    None => de.fp8_wo_a.matvec(
+                        &de.compute, &mut sd.low, &dlw.attn_output_a.buffer, xq, xs, GROUP_DIM, RANK, N_GROUPS, b,
+                    )?,
+                }
+            } else {
+                de.fp8_wo_a.gemm(&de.compute, &mut sd.low, &dlw.attn_output_a.buffer, xq, xs, GROUP_DIM, RANK, N_GROUPS, b)?;
+            }
+        } else {
         if heads_rope_quant_fused && g3 {
             // done by the attention block's epilogue (`V41_ATTN_G3`)
         } else if heads_rope_quant_fused {
@@ -9902,6 +9960,7 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
+        } // !attn_o_fp8
         // `V41_DEC_SKIP_DEAD`: low16 is read only by the wo_b f16x arm below.
         let out_variant = std::env::var("Q8_OUT_VARIANT")
             .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });

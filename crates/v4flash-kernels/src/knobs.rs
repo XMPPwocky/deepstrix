@@ -937,6 +937,18 @@ crate::knobs! {
     /// (tests/attn_g3o.rs bench_g3o_chain_wall, paired vs `g3`): -3.4 us/lane-layer at b = 1, -2.3 at
     /// b = 2, -1.0..-1.3 at b = 3, -0.4..-1.5 from b = 4 on long rows; docs/v41/DECODE_OPT_KNOBS.md.
     pub static ATTN_G3_KERNEL = Knob::choice("V41_ATTN_G3_KERNEL", 0, &[&["g3"], &["auto"], &["w1"], &["w2"], &["w4"]]).live();
+    /// `V41_ATTN_O_FP8` (default OFF; STATIC: it picks the `wo_a` weights loaded at startup): the
+    /// DeepSeek-V4.1-Flash-1017 reference's FP8 rounding of the attention output `o` before `wo_a`
+    /// (model.py:787 / :1073, `act_quant(o, 32, "ue8m0", inplace=True)`; `crate::act_quant_fp8`).
+    /// On: the dGPU loads the checkpoint's native e4m3 `wo_a` + e8m0 32x32 scales (as shipped,
+    /// instead of the Q8_0 conversion; HF checkpoints only), the epilogue that produced wo_a's
+    /// Q8_0 input emits the reference's e4m3 codes + power-of-two scales instead (rope_inv_quant_fp8,
+    /// attn_dec_g3_o8, attn_g3o_w*_o8, act_quant_fp8_wave), and wo_a runs FP8 x FP8 with f32
+    /// accumulation (`Fp8WoA`: v_dot4_f32_fp8_fp8 GEMV at <= 16 rows, FP8 WMMA GEMM above); the
+    /// DSpark drafter (iGPU, no FP8 dot) rounds then keeps its Q8_0 wo_a
+    /// (`q8_0_quantize_o8_wave`). Same launch count on every path. Off: today's path, the knob-off
+    /// kernels compile to identical ISA (scripts/isa_diff_kernels.py).
+    pub static ATTN_O_FP8 = Knob::flag("V41_ATTN_O_FP8", false);
     /// `V41_DGPU_G6_BOUNDARY` (default `off`; live, read at each decode Post of the ready-first
     /// driver): fusion group G6 -- the decode layer BOUNDARY (box 2's partial upload, the FFN combine
     /// `hc_post_from_split_batched_add2` / `_add`, and the next layer's `mhc_fast_batched` pre-attn

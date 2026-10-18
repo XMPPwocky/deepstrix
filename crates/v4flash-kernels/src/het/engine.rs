@@ -169,6 +169,8 @@ pub struct DeviceEngine {
     pub attn_g3: crate::attn_dec_g3::AttnDecG3,
     /// The G3-optimal kernels (`V41_ATTN_G3_KERNEL`).
     pub attn_g3o: crate::attn_dec_g3o::AttnDecG3o,
+    /// The FP8 `wo_a` kernels and the act_quant input quantize (`V41_ATTN_O_FP8`).
+    pub fp8_wo_a: crate::fp8_wo_a::Fp8WoA,
     pub rms_nw_mw: crate::RmsNormNoWeightMultiWG,
     /// On-device sampler. Used only on dGPU (logits live there) but
     /// instantiated on both arches so the engine struct stays symmetric.
@@ -293,6 +295,7 @@ impl DeviceEngine {
             attn_dec: crate::attention_dec::AttentionDec::for_arch(arch)?,
             attn_g3: crate::attn_dec_g3::AttnDecG3::for_arch(arch)?,
             attn_g3o: crate::attn_dec_g3o::AttnDecG3o::for_arch(arch)?,
+            fp8_wo_a: crate::fp8_wo_a::Fp8WoA::for_arch(arch)?,
             rms_nw_mw: crate::RmsNormNoWeightMultiWG::for_arch(arch)?,
             sampler: crate::Sampler::for_arch(arch)?,
             hc_post: HcPost::for_arch(arch)?,

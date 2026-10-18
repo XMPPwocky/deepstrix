@@ -142,7 +142,7 @@ pub fn q8_quant_wave() -> bool {
 /// +1 fixes every production grid 1024*b (b = 1..8) and 256*b, and the wave
 /// kernel's ceil(blocks/8) grids (512+1: 4.49 us, 256+1: 3.84 us). Worth
 /// ~10-11 us per lane-layer at 2 or 4 rows per lane (~0.4 ms/step per lane).
-fn q8_quant_grid_pad() -> u32 {
+pub(crate) fn q8_quant_grid_pad() -> u32 {
     static D: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("V41_Q8_QUANT_GRID_PAD").as_deref() != Ok("0")
     });
