@@ -12,7 +12,9 @@
 # ionice is pointless here: the NVMe queues use the `none` scheduler.
 #
 # Usage (on box 2):  nohup golden_run.sh <out_root> <case>... &
-#   case = short | agentic
+#   case = short | agentic | o8mid
+# V41_ATTN_O_FP8 goldens (the 1017 checkpoint): V41_MODEL=<1017 dir> and V41_ORACLE_ATTN_O_FP8=1
+# (rounding required, kernel.py) or =0 (the knob-off null); both are exported to the oracle.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT_ROOT=${1:?out root}; shift
@@ -54,6 +56,9 @@ for c in "$@"; do
     short)   run_case short --prompt "The capital of France is" ;;
     agentic) run_case agentic --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
     smoke)   run_case smoke --layers 2 --prompt "The capital of France is" ;;
+    # ~50 tokens: a golden-gate prompt of > 16 rows (the prefill f16x / FP8 GEMM arm) and a decoded tail
+    # (the dp4a / FP8 GEMV arm): GOLDEN_DECODE_FROM=32. The output dir is suffixed with the oracle mode.
+    o8mid)   run_case "o8mid_${V41_ORACLE_ATTN_O_FP8:-ref}" --prompt "In the spring of 1889 the engineers building the great iron tower in Paris met a problem nobody had planned for: the wind. Gustave Eiffel had computed the loads with care, but as the frame rose above the rooftops the" ;;
     *) echo "unknown case $c"; exit 2 ;;
   esac || { echo "[$(date -u +%T)] stopping after $c failed"; exit 1; }
 done

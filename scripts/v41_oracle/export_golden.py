@@ -73,7 +73,7 @@ def main():
             put(f"residual_L{l:02d}.f32", ld(f"layer_{l:02d}_residual.pt").reshape(T, -1), "f32")
 
     fx = {"tokens": T, "layers": L, "vocab": files["logits_all.f32"]["shape"][1], "spans": spans,
-          "source": {k: src_man.get(k) for k in ("model_dir", "config_sha256", "reference_model_py_sha256", "oracle_rev")},
+          "source": {k: src_man.get(k) for k in ("model_dir", "config_sha256", "reference_model_py_sha256", "attn_o_fp8", "oracle_rev")},
           "source_manifest_sha256": hashlib.sha256(open(os.path.join(a.src, "manifest.json"), "rb").read()).hexdigest(),
           "files": files}
     json.dump(fx, open(os.path.join(a.dst, "fixture.json"), "w"), indent=1)

@@ -288,8 +288,14 @@ def main():
             rev = subprocess.run(["git", "-C", HERE, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         except Exception:
             rev = ""
+        import kernel as shim  # the module model.py imported (HERE is sys.path[0])
+        # V41_ORACLE_ATTN_O_FP8 (kernel.py): whether this capture rounded the attention output before
+        # wo_a (the 1017 reference's act_quant(o)); the golden gate matches it to V41_ATTN_O_FP8
+        o8 = {"mode": shim.ATTN_O_FP8, "calls": shim.ATTN_O_FP8_CALLS,
+              "applied": shim.ATTN_O_FP8_CALLS > 0 and shim.ATTN_O_FP8 != "0"}
         json.dump({"tokens": len(ids), "layers": n_layers, "engram": layout is not None,
                    "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
+                   "attn_o_fp8": o8,
                    "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},
                   open(os.path.join(a.out, "manifest.json"), "w"), indent=1)
         print(f"manifest: {len(files)} files")
