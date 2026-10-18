@@ -725,6 +725,21 @@ impl V41HfWeights {
         Ok(())
     }
 
+    /// Whether this checkpoint's own reference (`inference/model.py`, shipped with the weights)
+    /// rounds the attention output through FP8 before `wo_a` -- the 1017 line
+    /// `act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)` (main attention + DSpark block;
+    /// absent from the earlier checkpoint). Returns the number of such calls and the checkpoint's
+    /// `.hf_fetch_rev` (repo + commit, for the log; "" when absent). The model.py text, not a
+    /// revision list, is the identity: it is the semantics `V41_ATTN_O_FP8` reproduces.
+    pub fn attn_o_rounding_calls(&self) -> eyre::Result<(usize, String)> {
+        let dir = self.st.dir();
+        let p = dir.join("inference").join("model.py");
+        let src = std::fs::read_to_string(&p).wrap_err_with(|| format!("read {}", p.display()))?;
+        let n = src.matches("act_quant(o, fp8_block_size").count();
+        let rev = std::fs::read_to_string(dir.join(".hf_fetch_rev")).unwrap_or_default().trim().to_string();
+        Ok((n, rev))
+    }
+
     /// An fp8 projection AS SHIPPED, for kernels that consume e4m3 directly (`V41_ATTN_O_FP8`'s
     /// `wo_a`): the `[out, in]` F8_E4M3 bytes of `layers.{layer}.{proj}.weight`, then the
     /// `[out/32, in/32]` F8_E8M0 block-scale bytes of its `.scale`, both verbatim (no dequant, no

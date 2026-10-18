@@ -946,8 +946,14 @@ crate::knobs! {
     /// attn_dec_g3_o8, attn_g3o_w*_o8, act_quant_fp8_wave), and wo_a runs FP8 x FP8 with f32
     /// accumulation (`Fp8WoA`: v_dot4_f32_fp8_fp8 GEMV at <= 16 rows, FP8 WMMA GEMM above); the
     /// DSpark drafter (iGPU, no FP8 dot) rounds then keeps its Q8_0 wo_a
-    /// (`q8_0_quantize_o8_wave`). Same launch count on every path. Off: today's path, the knob-off
-    /// kernels compile to identical ISA (scripts/isa_diff_kernels.py).
+    /// (`q8_0_quantize_o8_wave`). The rounding happens at the reference's points: bf16 of the
+    /// attention output, the inverse rope of those bf16 values rounded to bf16, act_quant of the bf16
+    /// `o` (rope_tail[_batched]_bf16 on the paths whose rope is its own launch). Launches: equal on
+    /// decode / G3 / legacy / drafter; the prefill f16x and non-fused dp4a arms one fewer (so their
+    /// captured graph has one node fewer -- the knob is static, one capture per process). Startup
+    /// asserts the checkpoint's own inference/model.py calls `act_quant(o, ...)`; snapshots carry the
+    /// setting (`SnapshotMeta::attn_o_fp8`: the other setting's are skipped, not deleted). Off: today's
+    /// path, the knob-off kernels compile to identical ISA (scripts/isa_diff_kernels.py).
     pub static ATTN_O_FP8 = Knob::flag("V41_ATTN_O_FP8", false);
     /// `V41_DGPU_G6_BOUNDARY` (default `off`; live, read at each decode Post of the ready-first
     /// driver): fusion group G6 -- the decode layer BOUNDARY (box 2's partial upload, the FFN combine

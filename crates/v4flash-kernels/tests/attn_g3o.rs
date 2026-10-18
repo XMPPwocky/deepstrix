@@ -614,13 +614,13 @@ fn g3o_bit_identical_to_the_chain() -> eyre::Result<()> {
 /// `V41_ATTN_O_FP8`: the act_quant epilogue of every G3 kernel production can pick (round 1's
 /// `attn_dec_g3_o8` and the W family `attn_g3o_{w1,w2,w4,x1,x2}_o8`) against the fp8 chain (fused
 /// attention -> `rope_inv_quant_fp8`), heads / codes / scales BIT FOR BIT, and the chain's codes /
-/// scales against the CPU emulation of the reference (`act_quant_fp8::act_quant_row` of the chain's
+/// scales against the CPU emulation of the reference (`act_quant_fp8::act_quant_row_bf16` of the chain's
 /// roped heads). Same lanes, rope sets, key layouts and rows as `g3o_bit_identical_to_the_chain`;
-/// also checks that the Q8_0 and fp8 chains leave the same `heads` (the epilogue is the only change).
+/// also checks the fp8 chain leaves the Q8_0 chain's attention output on dims 0..447 and bf16 values on the rope tail.
 #[test]
 #[ignore]
 fn g3o_o8_bit_identical_to_the_fp8_chain() -> eyre::Result<()> {
-    use v4flash_kernels::act_quant_fp8::act_quant_row;
+    use v4flash_kernels::act_quant_fp8::act_quant_row_bf16;
     install_panic_handler();
     let (dev, arch) = dgpu()?;
     dev.set_current()?;
@@ -645,11 +645,18 @@ fn g3o_o8_bit_identical_to_the_fp8_chain() -> eyre::Result<()> {
                     run_chain_epi(&k, &s, lane, &c, &params, false, G3Epilogue::Fp8)?;
                     s.synchronize()?;
                     let r = Ref { h: download(&lane.heads)?, q: download(&lane.xq)?, s: download(&lane.xs)? };
-                    let (dh_chain, _) = bits_diff_f32(&h_q8[..n], &r.h[..n]);
-                    // the CPU emulation of the reference on the roped heads
+                    // the attention output is the same (dims 0..447 of every head); the rope tail is
+                    // the bf16 rotation of the bf16 values (bf16-valued; its arithmetic is pinned by
+                    // tests/fp8_wo_a.rs rope_inv_quant_fp8_matches_the_cpu)
+                    let dh_chain = (0..n).filter(|&i| if i % 512 < 448 {
+                        h_q8[i].to_bits() != r.h[i].to_bits()
+                    } else {
+                        r.h[i].to_bits() & 0xFFFF != 0
+                    }).count();
+                    // the CPU emulation of the reference on the chain's heads (bf16 first)
                     let mut codes = vec![0u8; n];
                     let mut scales = vec![0f32; n / 32];
-                    act_quant_row(&r.h[..n], &mut codes, &mut scales);
+                    act_quant_row_bf16(&r.h[..n], &mut codes, &mut scales);
                     let dq_cpu = codes.iter().zip(&r.q[..n]).filter(|(a, b)| **a != **b as u8).count();
                     let (ds_cpu, _) = bits_diff_f32(&scales, &r.s[..n / 32]);
                     cpu_checked += n;

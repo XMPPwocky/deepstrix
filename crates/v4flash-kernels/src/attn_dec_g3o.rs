@@ -370,6 +370,9 @@ impl AttnDecG3o {
                 launch_kernel!(ft, ct, stream, [args])
             }
             G3oMode::Whole { parts, warps } => {
+                if o8 {
+                    crate::fp8_wo_a::count(crate::fp8_wo_a::Fp8Site::G3);
+                }
                 let fw = self.module.get_function(match (parts, warps, o8) {
                     (1, 16, false) => "attn_g3o_w1",
                     (2, 16, false) => "attn_g3o_w2",

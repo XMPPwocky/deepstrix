@@ -43,11 +43,20 @@
 //! discards it; the FP8-native `wo_a` path keeps it (as the f32 `2^e`) instead
 //! of re-deriving it.
 //!
-//! The reference's `o` is bf16 at this point (`sparse_attn` returns bf16 and
-//! the inverse RoPE writes back into it). The engine keeps `o` in f32 and does
-//! NOT round it to bf16 first (as for the window-KV `act_quant`,
-//! `kernels/fp4_kv_quant.hip` `fp8_act_quant_inplace`): every function here
-//! takes f32 and equals the reference exactly on every bf16 input.
+//! The reference's `o` is bf16 at this point, rounded at two points the engine
+//! reproduces ([`bf16_rne`]; device `aq_bf16`): `sparse_attn` stores its f32
+//! accumulator as bf16 (kernel.py:386-387, `o: T.Tensor[..., BF16]`), and
+//! `apply_rotary_emb(o[..., -64:], freqs_cis, True)` (model.py:392-406) rotates the
+//! bf16 values in f32 (`x.float()`, complex64 product) and writes bf16 back
+//! (`y.copy_(x)`). act_quant then reads the bf16 `o` (its amax AND its codes).
+//! Skipping the bf16 point is not a small change: f32 values just past an e4m3
+//! midpoint that bf16 rounds ONTO it round the other way (ties to even), and an
+//! f32 amax in (448 * 2^k, 449 * 2^k] that bf16 rounds to 448 * 2^k halves the
+//! block scale (`tests::bf16_points_*`). The block functions below are exact on
+//! their input; `*_bf16` round to bf16 first (the reference's act_quant input).
+//! (The window-KV `act_quant` -- `kernels/fp4_kv_quant.hip`
+//! `fp8_act_quant_inplace`, `kv_rms_rope_fp8` -- quantizes f32 without the bf16
+//! points: production numerics, unchanged here.)
 //!
 //! After the rounding the reference multiplies by `wo_a` dequantized to bf16
 //! (`convert.py` / `Linear` with `dtype = bf16`: `e4m3 * e8m0` per 32x32 block,
@@ -177,6 +186,29 @@ pub fn act_quant_row(x: &[f32], codes: &mut [u8], scales: &mut [f32]) {
         cb.copy_from_slice(&c);
         *s = pow2(e);
     }
+}
+
+/// f32 -> bf16, round to nearest, ties to even (torch / tilelang's cast), as the f32 it denotes.
+/// The device's `aq_bf16` (kernels/act_quant_fp8.inc), bit for bit: `(u + 0x7FFF + lsb) & !0xFFFF`.
+pub fn bf16_rne(x: f32) -> f32 {
+    assert!(x.is_finite(), "bf16_rne: {x} (the attention output is finite)");
+    let u = x.to_bits();
+    f32::from_bits(u.wrapping_add(0x7FFF + ((u >> 16) & 1)) & 0xFFFF_0000)
+}
+
+/// [`act_quant_row`] of the bf16 values of `x`: the reference's act_quant on its bf16 `o`
+/// (`x` already holds the rope tail at its own rounding point; see the module docs).
+pub fn act_quant_row_bf16(x: &[f32], codes: &mut [u8], scales: &mut [f32]) {
+    let xb: Vec<f32> = x.iter().map(|&v| bf16_rne(v)).collect();
+    act_quant_row(&xb, codes, scales)
+}
+
+/// [`act_quant_inplace`] of the bf16 values of `x`.
+pub fn act_quant_inplace_bf16(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = bf16_rne(*v);
+    }
+    act_quant_inplace(x)
 }
 
 /// The device Q8_0 quantize of one 32-block (`q8_0_quantize_f32_wave`):
@@ -522,6 +554,76 @@ mod tests {
     }
 
     #[test]
+    fn bf16_rne_rounds_to_nearest_even() {
+        for &v in &[0.0f32, -0.0, 1.0, -3.5, 448.0, 65536.0, 2f32.powi(-100)] {
+            assert_eq!(bf16_rne(v).to_bits(), v.to_bits(), "{v} is a bf16 value");
+        }
+        let one = 1.0f32;
+        assert_eq!(bf16_rne(one + 2f32.powi(-8)), 1.0, "tie -> even (mantissa 0)");
+        assert_eq!(bf16_rne(one + 3.0 * 2f32.powi(-8)), one + 2f32.powi(-6), "tie -> even (mantissa 2)");
+        assert_eq!(bf16_rne(one + 2f32.powi(-8) + 2f32.powi(-20)), one + 2f32.powi(-7), "above the tie -> up");
+        assert_eq!(bf16_rne(-(one + 2f32.powi(-8) + 2f32.powi(-20))), -(one + 2f32.powi(-7)));
+        // a carry into the exponent
+        assert_eq!(bf16_rne(2.0 - 2f32.powi(-10)), 2.0);
+        // every output is a bf16 value, and bf16 values are fixed points
+        let mut s = 99u64;
+        for _ in 0..100_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let x = f32::from_bits((s as u32) & 0x7EFF_FFFF); // finite, below the bf16 overflow
+            let r = bf16_rne(x);
+            assert_eq!(r.to_bits() & 0xFFFF, 0);
+            assert_eq!(bf16_rne(r), r);
+            // half a bf16 ulp: relative 2^-8 for normals, 2^-134 absolute in the subnormal range
+            assert!((r as f64 - x as f64).abs() <= ((x.abs() as f64) * 2f64.powi(-8)).max(2f64.powi(-134)), "{x:e} -> {r:e}");
+        }
+    }
+
+    /// An f32 just past an e4m3 midpoint that bf16 rounds ONTO the midpoint: the reference (bf16
+    /// first) ties to even, the f32 value would round the other way.
+    #[test]
+    fn bf16_points_midpoint_double_rounding() {
+        let mut x = [0.0f32; 32];
+        x[31] = 448.0; // pins s = 1
+        x[0] = 1.0625 + 2f32.powi(-12); // 1.0625 = midpoint of 1.0 (0x38) and 1.125 (0x39)
+        x[1] = -(1.0625 + 2f32.powi(-12));
+        x[2] = 1.1875 - 2f32.powi(-12); // midpoint of 1.125 / 1.25 from below: bf16 -> 1.1875 -> even 1.25
+        let (c_f32, e_f32) = act_quant_block(&x);
+        let mut cb = [0u8; 32];
+        let mut sb = [0f32; 1];
+        act_quant_row_bf16(&x, &mut cb, &mut sb);
+        assert_eq!(e_f32, 0);
+        assert_eq!(sb[0], 1.0);
+        assert_eq!((c_f32[0], c_f32[1], c_f32[2]), (0x39, 0xB9, 0x39), "f32: past / short of the midpoint");
+        assert_eq!((cb[0], cb[1], cb[2]), (0x38, 0xB8, 0x3A), "bf16 first: onto the midpoint, ties to even");
+    }
+
+    /// An f32 amax in (448 * 2^k, 449 * 2^k] rounds to 448 * 2^k in bf16: the reference keeps the
+    /// scale 2^k where the f32 amax would double it.
+    #[test]
+    fn bf16_points_amax_just_above_the_boundary() {
+        for k in [-12i32, -3, 0, 2, 9] {
+            let mut x = [0.0f32; 32];
+            x[0] = 448.5 * 2f32.powi(k);
+            x[1] = 1.0 * 2f32.powi(k);
+            x[2] = f32::from_bits((448.0 * 2f32.powi(k)).to_bits() + 1);
+            let (_, e_f32) = act_quant_block(&x);
+            assert_eq!(e_f32, k + 1, "f32 amax above 448 * 2^{k} doubles the scale");
+            let mut cb = [0u8; 32];
+            let mut sb = [0f32; 1];
+            act_quant_row_bf16(&x, &mut cb, &mut sb);
+            assert_eq!(sb[0], pow2(k), "bf16 amax 448 * 2^{k}: scale 2^{k}");
+            assert_eq!(cb[0], 0x7E, "448.5 * 2^{k} -> bf16 448 * 2^{k} -> code 448");
+            assert_eq!(cb[1], 0x38);
+            // 449.5 rounds to 450 in bf16: doubles there too
+            x[0] = 449.5 * 2f32.powi(k);
+            act_quant_row_bf16(&x, &mut cb, &mut sb);
+            assert_eq!(sb[0], pow2(k + 1));
+        }
+    }
+
+    #[test]
     fn q8_0_of_the_rounded_block() {
         let mut x = [0.0f32; 32];
         for (i, v) in x.iter_mut().enumerate() {
@@ -575,6 +677,37 @@ mod tests {
                 assert!((o - s).abs() <= 1e-12 * mag[bi * out_dim + r].max(1e-30), "row {r} b {bi}: {o} vs {s}");
             }
         }
+    }
+
+    /// f32 inputs (the engine's attention output) against torch: `x.to(bfloat16)` then the reference
+    /// arithmetic (`gen_act_quant_golden.py`). [`act_quant_row_bf16`] must match bit for bit; plain
+    /// [`act_quant_row`] on the f32 values must NOT (the fixture holds the double-rounding and the
+    /// amax-boundary cases), which is why every device caller rounds to bf16 first.
+    #[test]
+    fn f32_inputs_match_torch_through_bf16() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/act_quant_fp8");
+        let read = |n: &str| std::fs::read(format!("{dir}/{n}")).unwrap_or_else(|e| panic!("{dir}/{n}: {e}"));
+        let xb = read("x_f32.bin");
+        let codes = read("codes_bf16in_e4m3.bin");
+        let scales = read("scales_bf16in_e8m0.bin");
+        let n = xb.len() / 4;
+        assert!(n > 0 && n % 32 == 0 && codes.len() == n && scales.len() == n / 32);
+        let x: Vec<f32> = xb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let (mut c, mut s) = (vec![0u8; n], vec![0f32; n / 32]);
+        act_quant_row_bf16(&x, &mut c, &mut s);
+        assert_eq!(c, codes, "codes of the bf16 o");
+        let sb: Vec<u8> = s.iter().map(|&v| e8m0_byte(scale_exp_of(v))).collect();
+        assert_eq!(sb, scales, "scales of the bf16 o");
+        let (mut c32, mut s32) = (vec![0u8; n], vec![0f32; n / 32]);
+        act_quant_row(&x, &mut c32, &mut s32);
+        let dc = c32.iter().zip(&c).filter(|(a, b)| a != b).count();
+        let ds = s32.iter().zip(&s).filter(|(a, b)| a != b).count();
+        eprintln!("skipping the bf16 point: {dc} of {n} codes, {ds} of {} scales differ", n / 32);
+        assert!(dc > 0 && ds > 0, "the fixture must exercise both bf16-point cases");
+    }
+
+    fn scale_exp_of(s: f32) -> i32 {
+        ((s.to_bits() >> 23) & 0xFF) as i32 - 127
     }
 
     /// Golden vectors from the reference kernel's arithmetic re-implemented in

@@ -36,12 +36,15 @@
 // activation quantize
 // ------------------------------------------------------------------------------------------------
 // grid ceil(blocks / 8) [+ pad] x 256; lane i of wave w owns element i of block 8 * blockIdx.x + w.
+// Every kernel here first rounds x to bf16 (aq_bf16): the reference's act_quant input is the bf16
+// `o`; the rope tail of x is already bf16 (rope_tail[_batched]_bf16 ran before), so the rounding is
+// the attention output's one there.
 __device__ __forceinline__ void act_quant_fp8_wave_body(uint8_t* __restrict__ xq, float* __restrict__ xscale,
                                                         const float* __restrict__ x, uint32_t blocks) {
     const uint32_t b = blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (b >= blocks) return;
-    const float v = x[(size_t)b * 32u + lane];
+    const float v = aq_bf16(x[(size_t)b * 32u + lane]);   // the reference's bf16 `o`
     float amax = fabsf(v);
     for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(FW_FULL_WARP_MASK, amax, off));
     const int e = aq_scale_exp(amax);
@@ -53,15 +56,16 @@ extern "C" __global__ __launch_bounds__(256) void act_quant_fp8_wave(
     act_quant_fp8_wave_body(xq, xscale, x, blocks);
 }
 
-// The drafter's wo_a input: the reference's rounding, then q8_0_quantize_f32_wave's block math
-// (d = amax / 127, id = 1 / d, lrintf, clamp) on the rounded values -- what
-// `act_quant_inplace` followed by `quantize_input_batched` would write, in one launch.
+// The drafter's wo_a input: the reference's rounding (bf16, then act_quant), then
+// q8_0_quantize_f32_wave's block math (d = amax / 127, id = 1 / d, lrintf, clamp) on the rounded
+// values -- what `act_quant_inplace_bf16` followed by `quantize_input_batched` would write, in one
+// launch.
 extern "C" __global__ __launch_bounds__(256) void q8_0_quantize_o8_wave(
         int8_t* __restrict__ xq, float* __restrict__ xscale, const float* __restrict__ x, uint32_t blocks) {
     const uint32_t b = blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (b >= blocks) return;
-    const float v0 = x[(size_t)b * 32u + lane];
+    const float v0 = aq_bf16(x[(size_t)b * 32u + lane]);
     float a0 = fabsf(v0);
     for (int off = 16; off > 0; off >>= 1) a0 = fmaxf(a0, __shfl_xor_sync(FW_FULL_WARP_MASK, a0, off));
     const int e = aq_scale_exp(a0);
@@ -77,13 +81,13 @@ extern "C" __global__ __launch_bounds__(256) void q8_0_quantize_o8_wave(
     xq[(size_t)b * 32u + lane] = (int8_t)q;
 }
 
-// Test hook (tests/fp8_wo_a.rs): the in-place rounding alone, x <- dec(code) * 2^e per 32-block,
-// so the device arithmetic can be compared with `act_quant_inplace` bit for bit.
+// Test hook (tests/fp8_wo_a.rs): the in-place rounding alone, x <- dec(code(bf16(x))) * 2^e per
+// 32-block, so the device arithmetic can be compared with `act_quant_inplace_bf16` bit for bit.
 extern "C" __global__ __launch_bounds__(256) void act_quant_fp8_inplace_wave(float* __restrict__ x, uint32_t blocks) {
     const uint32_t b = blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (b >= blocks) return;
-    const float v = x[(size_t)b * 32u + lane];
+    const float v = aq_bf16(x[(size_t)b * 32u + lane]);
     float amax = fabsf(v);
     for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(FW_FULL_WARP_MASK, amax, off));
     const int e = aq_scale_exp(amax);

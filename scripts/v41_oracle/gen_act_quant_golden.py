@@ -129,7 +129,35 @@ def main():
                     ("codes_e4m3.bin", codes.view(torch.uint8)), ("scales_e8m0.bin", scales.view(torch.uint8))):
         b = bytes(t.contiguous().view(torch.uint8).flatten().tolist())
         open(os.path.join(OUT, name), "wb").write(b)
-    print(f"{x.shape[0]} blocks ({x.numel()} values) -> {OUT}")
+    # f32 inputs (the engine's attention output): the reference's act_quant input is their bf16
+    # rounding (torch's RNE cast) -- random f32 over many decades plus the two cases where skipping
+    # the bf16 point changes the result: just past an e4m3 midpoint, and amax in (448, 449] * 2^k
+    g = torch.Generator().manual_seed(18)
+    xf = [torch.randn(32, generator=g) * 10.0 ** d for d in range(-8, 4) for _ in range(8)]
+    vals = torch.arange(0, 0x7F, dtype=torch.uint8).view(torch.float8_e4m3fn).to(F32)
+    mids = (vals[:-1] + vals[1:]) / 2
+    for k in (-6, 0, 5):
+        for i in range(0, len(mids), 31):
+            b = torch.zeros(32)
+            ch = mids[i:i + 31] * 2.0 ** k
+            nudge = torch.where(torch.arange(len(ch)) % 2 == 0, 1.0, -1.0) * ch.abs() * 2.0 ** -12
+            b[:len(ch)] = ch + nudge
+            b[31] = 448.0 * 2.0 ** k
+            xf.append(b)
+    for k in (-12, -3, 0, 2, 9):
+        b = torch.randn(32, generator=g) * 2.0 ** k
+        b[0] = 448.5 * 2.0 ** k
+        xf.append(b)
+        b = torch.randn(32, generator=g) * 2.0 ** k
+        b[5] = -448.0 * 2.0 ** k * (1 + 2.0 ** -20)
+        xf.append(b)
+    xf = torch.stack(xf).to(F32)
+    yf, codes_f, scales_f = act_quant_ref(xf.to(torch.bfloat16))
+    for name, t in (("x_f32.bin", xf.view(torch.int32)), ("codes_bf16in_e4m3.bin", codes_f.view(torch.uint8)),
+                    ("scales_bf16in_e8m0.bin", scales_f.view(torch.uint8))):
+        b = bytes(t.contiguous().view(torch.uint8).flatten().tolist())
+        open(os.path.join(OUT, name), "wb").write(b)
+    print(f"{x.shape[0]} bf16 blocks ({x.numel()} values), {xf.shape[0]} f32 blocks -> {OUT}")
 
 
 if __name__ == "__main__":

@@ -5,12 +5,17 @@
 //! Operands:
 //!   * `o`: e4m3 codes `[b, 64 x 512]` (bytes, carried in the engine's `heads_xq: DeviceBuffer<i8>`)
 //!     and one power-of-two f32 scale per 32 dims (`heads_xscale`) -- the reference's
-//!     `act_quant(o, 32, "ue8m0")`, written by the epilogue that used to write the Q8_0 input
-//!     (`RopeTail::launch_inverse_quant_fp8`, `AttnDecG3` / `AttnDecG3o` with `o8`, or
-//!     [`Fp8WoA::act_quant`]);
+//!     `act_quant(o, 32, "ue8m0")` of its bf16 `o`, written by the epilogue that used to write the
+//!     Q8_0 input (`RopeTail::launch_inverse_quant_fp8`, `AttnDecG3` / `AttnDecG3o` with
+//!     `G3Epilogue::Fp8`, or [`Fp8WoA::act_quant`] after `RopeTail::launch_inverse_bf16`);
 //!   * `wo_a`: the checkpoint's e4m3 weight `[8192, 4096]` followed by its e8m0 block scales
 //!     `[256, 128]`, verbatim, in one device buffer ([`crate::act_quant_fp8::fp8_weight_bytes`];
-//!     loaded by `het::weights` from the HF view's `blk.N.attn_output_a_fp8.weight`).
+//!     loaded by `het::weights::load_fp8_wo_a` through `V41HfWeights::read_fp8_block32_raw`,
+//!     outside the presented tensor table).
+//!
+//! Graphs: the knob is static, so a process captures only one variant of each stage. With it on,
+//! the f16x (prefill) arm of the output projection has one node fewer (rope_inv_quant_fp8 replaces
+//! rope_inverse + cast_heads_f16); every other arm keeps its node count, different kernels.
 //!
 //! Kernels (gfx1201; the dot / WMMA bodies are stubs on gfx1151, which has no FP8 dot):
 //!   * [`Fp8WoA::matvec`] -- `fp8_grouped_gemv_tB{1..8}` / `fp8_grouped_gemv_rt`: one wave per output
@@ -37,6 +42,52 @@ pub const FP8_GEMM_TILE: u32 = 128;
 /// `V41_ATTN_O_FP8` (see `knobs::ATTN_O_FP8`): static, read once.
 pub fn attn_o_fp8() -> bool {
     crate::knobs::ATTN_O_FP8.on()
+}
+
+/// The `V41_ATTN_O_FP8` launch sites, counted per launch call (a graph capture counts once, its
+/// replays not): a gate proves which paths it ran (knob on: > 0 where the case reaches them; knob
+/// off: all 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fp8Site {
+    /// `rope_inv_quant_fp8` (+`_ind`): the fused inverse rope + act_quant (decode dp4a, prefill)
+    RopeInvQuant,
+    /// the G3 epilogue (`attn_dec_g3_o8`, `attn_g3o_*_o8`)
+    G3,
+    /// `rope_tail[_batched]_bf16`: the separate inverse rope (legacy single-token, drafter)
+    RopeBf16,
+    /// `act_quant_fp8_wave` (legacy single-token)
+    ActQuant,
+    /// `q8_0_quantize_o8_wave` (the drafter)
+    DrafterQ8,
+    /// the FP8 GEMV (+`_ind`)
+    Gemv,
+    /// the FP8 WMMA GEMM
+    Gemm,
+}
+
+const FP8_SITES: [(Fp8Site, &str); 7] = [
+    (Fp8Site::RopeInvQuant, "rope_inv_quant_fp8"),
+    (Fp8Site::G3, "g3_o8"),
+    (Fp8Site::RopeBf16, "rope_tail_bf16"),
+    (Fp8Site::ActQuant, "act_quant_fp8_wave"),
+    (Fp8Site::DrafterQ8, "q8_0_quantize_o8"),
+    (Fp8Site::Gemv, "fp8_gemv"),
+    (Fp8Site::Gemm, "fp8_gemm"),
+];
+static FP8_COUNTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+pub(crate) fn count(site: Fp8Site) {
+    FP8_COUNTS[site as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// (site name, launches so far) for every site.
+pub fn launch_counts() -> Vec<(&'static str, u64)> {
+    FP8_SITES.iter().map(|&(s, n)| (n, FP8_COUNTS[s as usize].load(std::sync::atomic::Ordering::Relaxed))).collect()
+}
+
+/// Launches of one site so far.
+pub fn launches(site: Fp8Site) -> u64 {
+    FP8_COUNTS[site as usize].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct Fp8WoA {
@@ -81,6 +132,7 @@ impl Fp8WoA {
         }
         let blocks = Self::quant_args(x, xq.len(), xscale.len(), n, batch, "act_quant_fp8")?;
         let function = self.module.get_function("act_quant_fp8_wave")?;
+        count(Fp8Site::ActQuant);
         let cfg = LaunchConfig { grid: (blocks.div_ceil(8) + crate::q8_0::q8_quant_grid_pad(), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [xq.raw(), xscale.raw(), x.raw(), blocks])
     }
@@ -93,6 +145,7 @@ impl Fp8WoA {
         }
         let blocks = Self::quant_args(x, xq.len(), xscale.len(), n, batch, "q8_0_quantize_o8")?;
         let function = self.module.get_function("q8_0_quantize_o8_wave")?;
+        count(Fp8Site::DrafterQ8);
         let cfg = LaunchConfig { grid: (blocks.div_ceil(8) + crate::q8_0::q8_quant_grid_pad(), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [xq.raw(), xscale.raw(), x.raw(), blocks])
     }
@@ -159,6 +212,7 @@ impl Fp8WoA {
         }
         self.check_mv("fp8_grouped_gemv", out, weight, xq, xscale, group_dim, rank, n_groups, batch)?;
         let function = self.module.get_function(Self::gemv_symbol(batch))?;
+        count(Fp8Site::Gemv);
         let cfg = Self::gemv_cfg(n_groups * rank, batch);
         launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), xq.raw(), xscale.raw(), group_dim, rank, n_groups, batch])
     }
@@ -174,6 +228,7 @@ impl Fp8WoA {
         }
         self.check_mv("fp8_grouped_gemv_ind", out, weight, xq, xscale, group_dim, rank, n_groups, batch)?;
         let function = self.module.get_function(&ind.symbol(Self::gemv_symbol(batch)))?;
+        count(Fp8Site::Gemv);
         let cfg = Self::gemv_cfg(n_groups * rank, batch);
         let (p_out, p_w, p_xq, p_xs) = (
             ind.ptr(0, out.raw() as u64),
@@ -197,6 +252,7 @@ impl Fp8WoA {
             return Err(eyre!("fp8_grouped_gemm_wmma: rank={rank} must be a multiple of {FP8_GEMM_TILE}"));
         }
         let function = self.module.get_function("fp8_grouped_gemm_wmma")?;
+        count(Fp8Site::Gemm);
         // o-row tiles fastest (the weight tile is shared by the WGs that run together)
         let cfg = LaunchConfig { grid: (batch.div_ceil(FP8_GEMM_TILE), rank / FP8_GEMM_TILE, n_groups), block: (256, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), xq.raw(), xscale.raw(), group_dim, rank, n_groups, batch])

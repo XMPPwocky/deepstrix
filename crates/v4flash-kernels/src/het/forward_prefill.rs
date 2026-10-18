@@ -9833,16 +9833,16 @@ impl HeterogeneousEngine {
             let (xq, xs) = if g3 { (&sd.g3_heads_xq, &sd.g3_heads_xscale) } else { (&sd.heads_xq, &sd.heads_xscale) };
             if grp_variant == "dp4a" {
                 match cap.src.ind() {
-                    Some(ind) => de.fp8_wo_a.matvec_ind(
+                    Some(ind) => de.fp8().matvec_ind(
                         &de.compute, ind.with(1, slot::WO_A), &mut sd.low, &dlw.attn_output_a.buffer,
                         xq, xs, GROUP_DIM, RANK, N_GROUPS, b,
                     )?,
-                    None => de.fp8_wo_a.matvec(
+                    None => de.fp8().matvec(
                         &de.compute, &mut sd.low, &dlw.attn_output_a.buffer, xq, xs, GROUP_DIM, RANK, N_GROUPS, b,
                     )?,
                 }
             } else {
-                de.fp8_wo_a.gemm(&de.compute, &mut sd.low, &dlw.attn_output_a.buffer, xq, xs, GROUP_DIM, RANK, N_GROUPS, b)?;
+                de.fp8().gemm(&de.compute, &mut sd.low, &dlw.attn_output_a.buffer, xq, xs, GROUP_DIM, RANK, N_GROUPS, b)?;
             }
         } else {
         if heads_rope_quant_fused && g3 {

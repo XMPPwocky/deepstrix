@@ -36,8 +36,8 @@
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::act_quant_fp8::{
-    act_quant_inplace, act_quant_row, e4m3fn_decode, f32_sum_bound, fp8_grouped_matvec_ref, fp8_weight_bytes,
-    q8_0_block_device,
+    act_quant_inplace_bf16, act_quant_row_bf16, bf16_rne, e4m3fn_decode, f32_sum_bound,
+    fp8_grouped_matvec_ref, fp8_weight_bytes, q8_0_block_device,
 };
 use v4flash_kernels::config::{GROUP_DIM, N_GROUPS, OUT_LOW, Q_FLAT, RANK};
 use v4flash_kernels::fp8_wo_a::Fp8WoA;
@@ -130,8 +130,27 @@ fn test_rows(rng: &mut Lcg, rows: usize) -> Vec<f32> {
     for _ in 0..8 {
         edge.push(std::array::from_fn(|_| rng.sym(1.0) * 10f32.powi(rng.below(12) as i32 - 9)));
     }
+    // f32 just past / short of every e4m3 midpoint by 2^-12 relative (bf16 rounds them ONTO the
+    // midpoint: ties to even), and amax in (448, 449] * 2^k (bf16 keeps the scale 2^k)
+    for k in [0i32, -9, 7] {
+        for ch in mids.chunks(31) {
+            let mut blk = [0.0f32; 32];
+            for (i, &m) in ch.iter().enumerate() {
+                let nudge = m.abs() * 2f32.powi(-12) * if i % 2 == 0 { 1.0 } else { -1.0 };
+                blk[i] = (m + nudge) * 2f32.powi(k);
+            }
+            blk[31] = 448.0 * 2f32.powi(k);
+            edge.push(blk);
+        }
+    }
+    for k in [-12i32, 0, 3] {
+        let mut blk: [f32; 32] = std::array::from_fn(|_| rng.sym(2f32.powi(k)));
+        blk[0] = 448.5 * 2f32.powi(k);
+        blk[1] = -f32::from_bits((448.0 * 2f32.powi(k)).to_bits() + 1);
+        edge.push(blk);
+    }
     let mut big: [f32; 32] = std::array::from_fn(|_| rng.sym(1e37));
-    big[0] = 3.0e38;
+    big[0] = 3.0e38; // bf16 3.0e38 (finite: bf16 max is 3.39e38)
     edge.push(big);
     let mut x = vec![0f32; rows * QF];
     for (bi, blk) in x.chunks_exact_mut(32).enumerate() {
@@ -182,7 +201,7 @@ fn act_quant_kernels_match_the_cpu_bit_for_bit() -> eyre::Result<()> {
             k.act_quant(&s, &mut xq, &mut xs, &dx, Q_FLAT, rows as u32)?;
             s.synchronize()?;
             let (mut codes, mut scales) = (vec![0u8; n], vec![0f32; n / 32]);
-            act_quant_row(&x, &mut codes, &mut scales);
+            act_quant_row_bf16(&x, &mut codes, &mut scales);
             let gq = download(&xq)?;
             let gs = download(&xs)?;
             let dq = codes.iter().zip(&gq).filter(|(a, b)| **a != **b as u8).count();
@@ -192,7 +211,7 @@ fn act_quant_kernels_match_the_cpu_bit_for_bit() -> eyre::Result<()> {
             k.act_quant_inplace(&s, &mut dxi, n as u32)?;
             s.synchronize()?;
             let mut y = x.clone();
-            act_quant_inplace(&mut y);
+            act_quant_inplace_bf16(&mut y);
             let gy = download(&dxi)?;
             let dy = y.iter().zip(&gy).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             // 3. the drafter's round-then-Q8_0
@@ -251,7 +270,10 @@ fn rope_inv_quant_fp8_matches_the_cpu() -> eyre::Result<()> {
             let n = x.len();
             let pos: Vec<i32> = (0..b).map(|i| (rng.below(900_000) + i as u64) as i32).collect();
             let dpos = upload(id, &pos)?;
-            let mut h_q8 = upload(id, &x)?;
+            // the Q8_0 kernel on the host-rounded bf16(x): its rotation of the bf16 values, which the
+            // fp8 kernel must reproduce and round to bf16 (the reference's apply_rotary_emb points)
+            let xb: Vec<f32> = x.iter().map(|&v| bf16_rne(v)).collect();
+            let mut h_q8 = upload(id, &xb)?;
             let mut h_f8 = upload(id, &x)?;
             let mut xq = zeros::<i8>(id, n)?;
             let mut xs = zeros::<f32>(id, n / 32)?;
@@ -262,16 +284,55 @@ fn rope_inv_quant_fp8_matches_the_cpu() -> eyre::Result<()> {
             s.synchronize()?;
             let hq = download(&h_q8)?;
             let hf = download(&h_f8)?;
-            let dh = hq.iter().zip(&hf).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            // heads: dims 0..447 keep the f32 input, 448..511 hold bf16(rotation of bf16(x))
+            let dh = (0..n).filter(|&i| {
+                let want = if i % 512 >= 448 { bf16_rne(hq[i]) } else { x[i] };
+                want.to_bits() != hf[i].to_bits()
+            }).count();
             let (mut codes, mut scales) = (vec![0u8; n], vec![0f32; n / 32]);
-            act_quant_row(&hf, &mut codes, &mut scales);
+            act_quant_row_bf16(&hf, &mut codes, &mut scales);
             let gq = download(&xq8)?;
             let gs = download(&xs8)?;
             let dq = codes.iter().zip(&gq).filter(|(a, b)| **a != **b as u8).count();
             let ds = scales.iter().zip(&gs).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-            if dh + dq + ds != 0 {
+            // the separate-launch paths (legacy single-token / drafter): rope_tail[_batched]_bf16 then
+            // act_quant_fp8_wave must leave the same codes as the fused kernel, given the same rotation
+            // arithmetic (rope_tail_batched vs rf_rot_pair are different kernels: compare each with
+            // its own Q8_0 twin on bf16 inputs instead)
+            let mut h_rb = upload(id, &x)?;
+            let mut h_rq = upload(id, &xb)?;
+            rope.launch_inverse_batched_bf16(&s, &mut h_rb, &dpos, 64, 512, 64, b as u32, &params)?;
+            rope.launch_inverse_batched(&s, &mut h_rq, &dpos, 64, 512, 64, b as u32, &params)?;
+            s.synchronize()?;
+            let rb = download(&h_rb)?;
+            let rq = download(&h_rq)?;
+            let dr = (0..n).filter(|&i| {
+                let want = if i % 512 >= 448 { bf16_rne(rq[i]) } else { x[i] };
+                want.to_bits() != rb[i].to_bits()
+            }).count();
+            if dh + dq + ds + dr != 0 {
                 bad += 1;
-                eprintln!("MISMATCH rope={pname} b={b}: heads vs q8 kernel {dh}, codes {dq}, scales {ds}");
+                eprintln!("MISMATCH rope={pname} b={b}: heads vs the bf16 rotation {dh}, codes {dq}, scales {ds}, \
+                           rope_tail_batched_bf16 {dr}");
+            }
+        }
+        {
+            let x = test_rows(&mut rng, 1);
+            let xb: Vec<f32> = x.iter().map(|&v| bf16_rne(v)).collect();
+            let pos = 123_457u32;
+            let mut a = upload(id, &x)?;
+            let mut q = upload(id, &xb)?;
+            rope.launch_inverse_bf16(&s, &mut a, 64, 512, 64, pos, &params)?;
+            rope.launch_inverse(&s, &mut q, 64, 512, 64, pos, &params)?;
+            s.synchronize()?;
+            let (av, qv) = (download(&a)?, download(&q)?);
+            let d = (0..QF).filter(|&i| {
+                let want = if i % 512 >= 448 { bf16_rne(qv[i]) } else { x[i] };
+                want.to_bits() != av[i].to_bits()
+            }).count();
+            if d != 0 {
+                bad += 1;
+                eprintln!("MISMATCH rope={pname}: rope_tail_bf16 {d}");
             }
         }
         eprintln!("rope {pname}: {} sizes checked", sizes.len());
@@ -300,7 +361,7 @@ fn random_weight(rng: &mut Lcg) -> Vec<u8> {
 fn random_acts(rng: &mut Lcg, b: usize) -> (Vec<u8>, Vec<f32>) {
     let x = test_rows(rng, b);
     let (mut codes, mut scales) = (vec![0u8; x.len()], vec![0f32; x.len() / 32]);
-    act_quant_row(&x, &mut codes, &mut scales);
+    act_quant_row_bf16(&x, &mut codes, &mut scales);
     (codes, scales)
 }
 
@@ -407,9 +468,19 @@ fn fp8_wo_a_matches_the_exact_product() -> eyre::Result<()> {
                 }
             }
             let nan = got.iter().filter(|v| !v.is_finite()).count();
-            eprintln!("{wname} {kind} b={b}: {} outputs checked, {} over the bound, {nan} non-finite, max |err| / sum|term| = {:.3e}",
-                      e.checked, e.over, e.worst_ratio);
-            if e.over + nan != 0 {
+            // HARD summation-order threshold: every product is exact and the scales are powers of two,
+            // so an output's error is f32 summation rounding only, at most (depth) * u * sum|term| to
+            // first order, depth = the additions any one term passes through:
+            //   GEMV: 8 chained v_dot4_f32_fp8_fp8 per block (<= 4 roundings each, however the
+            //         instruction adds) + the 4-block lane chain + the 5-level wave tree = 41;
+            //   GEMM: 2 chained 16-k WMMAs (<= 16 roundings each) + the 128-block FMA chain = 160.
+            // A reduced-precision accumulator (bf16 / f16 inside the WMMA or dot) errs ~2^-8..2^-11
+            // relative and fails this by orders of magnitude; observed f32 noise is ~1e-7.
+            let depth = if kind == "gemv" { 41.0 } else { 160.0 };
+            let ratio_max = depth * f64::powi(2.0, -24);
+            eprintln!("{wname} {kind} b={b}: {} outputs checked, {} over the bound, {nan} non-finite, max |err| / sum|term| = {:.3e} \
+                       (hard limit {ratio_max:.2e})", e.checked, e.over, e.worst_ratio);
+            if e.over + nan != 0 || !(e.worst_ratio <= ratio_max) {
                 bad += 1;
             }
         }

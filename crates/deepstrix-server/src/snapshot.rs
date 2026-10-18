@@ -316,6 +316,13 @@ pub struct SnapshotMeta {
     /// [`KV_EPOCH`] of the build that wrote the KV. Absent = 0.
     #[serde(default)]
     pub kv_epoch: u32,
+    /// `V41_ATTN_O_FP8` of the process that wrote the KV (the 1017 reference's FP8 rounding of the
+    /// attention output, `v4flash_kernels::fp8_wo_a`): every layer's KV past the first depends on
+    /// it, so a snapshot is restored only by a process with the same value (index scan: SKIPPED,
+    /// not deleted -- the other setting still owns it; restore: refused). Absent / not written
+    /// when false, so knob-off meta.json bytes are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attn_o_fp8: bool,
 }
 
 /// In-memory record of one on-disk snapshot.
@@ -420,12 +427,23 @@ impl SnapshotIndex {
         fingerprint: ModelFingerprint,
         cap_bytes: u64,
     ) -> eyre::Result<Self> {
+        Self::load_for(root, fingerprint, cap_bytes, v4flash_kernels::fp8_wo_a::attn_o_fp8())
+    }
+
+    /// [`Self::load`] for a process whose `V41_ATTN_O_FP8` is `attn_o_fp8` (tests: both settings).
+    pub fn load_for(
+        root: PathBuf,
+        fingerprint: ModelFingerprint,
+        cap_bytes: u64,
+        attn_o_fp8: bool,
+    ) -> eyre::Result<Self> {
         let mut idx = Self::new(root.clone(), fingerprint.clone(), cap_bytes);
         if !root.exists() {
             return Ok(idx);
         }
         let mut skipped_fingerprint = 0usize;
         let mut skipped_epoch = 0usize;
+        let mut skipped_attn_o_fp8 = 0usize;
         for entry in fs::read_dir(&root)? {
             let entry = entry?;
             let path = entry.path();
@@ -498,6 +516,12 @@ impl SnapshotIndex {
                 tracing::warn!(path = ?path, saw = meta.kv_epoch, want = KV_EPOCH, "snapshot KV epoch newer than this binary; skipping");
                 continue;
             }
+            // KV of the other `V41_ATTN_O_FP8` setting: valid for a process with that setting, so
+            // skipped (kept on disk, outside this index's accounting), never deleted.
+            if meta.attn_o_fp8 != attn_o_fp8 {
+                skipped_attn_o_fp8 += 1;
+                continue;
+            }
             let Some(hash_hex) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
@@ -526,6 +550,8 @@ impl SnapshotIndex {
             skipped_fingerprint,
             deleted_old_kv_epoch = skipped_epoch,
             kv_epoch = KV_EPOCH,
+            skipped_attn_o_fp8,
+            attn_o_fp8,
             "snapshot index loaded"
         );
         Ok(idx)
@@ -1477,6 +1503,7 @@ fn finish_files(
         session_id: session_id.map(|s| s.to_string()),
         image_spans: image_spans.to_vec(),
         kv_epoch: KV_EPOCH,
+        attn_o_fp8: v4flash_kernels::fp8_wo_a::attn_o_fp8(),
     };
     let mut total_bytes: u64 = tokens_bytes + kv_bytes;
     total_bytes += comp_kv_bytes;
@@ -1892,6 +1919,17 @@ pub struct RestoredSnapshot {
 /// count (a compressor of ratio r holds exactly `token_count / r` rows, a raw
 /// ring never more rows than tokens). A mismatch is a cache miss.
 fn check_meta(meta: &SnapshotMeta, fingerprint: &ModelFingerprint) -> eyre::Result<()> {
+    check_meta_for(meta, fingerprint, v4flash_kernels::fp8_wo_a::attn_o_fp8())
+}
+
+/// [`check_meta`] for a process whose `V41_ATTN_O_FP8` is `attn_o_fp8`.
+fn check_meta_for(meta: &SnapshotMeta, fingerprint: &ModelFingerprint, attn_o_fp8: bool) -> eyre::Result<()> {
+    if meta.attn_o_fp8 != attn_o_fp8 {
+        return Err(eyre!(
+            "snapshot.restore: written with V41_ATTN_O_FP8={} but this process runs {}: its KV comes from other attention-output numerics",
+            meta.attn_o_fp8 as u8, attn_o_fp8 as u8
+        ));
+    }
     if meta.format_version < MIN_FORMAT_VERSION || meta.format_version > FORMAT_VERSION {
         return Err(eyre!(
             "snapshot.restore: format_version mismatch (saw {}, want {}..={})",
@@ -2426,6 +2464,7 @@ mod retention_tests {
             session_id: None,
             image_spans: spans.clone(),
             kv_epoch: KV_EPOCH,
+            attn_o_fp8: false,
         };
         let j = serde_json::to_string(&meta).unwrap();
         let back: SnapshotMeta = serde_json::from_str(&j).unwrap();
@@ -2483,6 +2522,7 @@ mod retention_tests {
             session_id: None,
             image_spans: Vec::new(),
             kv_epoch: KV_EPOCH,
+            attn_o_fp8: false,
         }
     }
 
@@ -2499,6 +2539,51 @@ mod retention_tests {
         let pre: SnapshotMeta = serde_json::from_value(v).unwrap();
         assert_eq!(pre.kv_epoch, 0);
         assert!(check_meta(&pre, &fp()).is_err());
+    }
+
+    #[test]
+    fn attn_o_fp8_meta_is_compatible_only_with_its_own_setting() {
+        // knob-off meta.json bytes are unchanged (the field is not written when false) ...
+        let off = serde_json::to_value(meta_at(1000)).unwrap();
+        assert!(off.get("attn_o_fp8").is_none(), "attn_o_fp8 = false must not be serialized");
+        // ... and an existing meta.json (no field) reads as false
+        let pre: SnapshotMeta = serde_json::from_value(off).unwrap();
+        assert!(!pre.attn_o_fp8);
+        assert!(check_meta_for(&pre, &fp(), false).is_ok());
+        let e = check_meta_for(&pre, &fp(), true).unwrap_err();
+        assert!(format!("{e}").contains("V41_ATTN_O_FP8"), "{e}");
+        let mut on = meta_at(1000);
+        on.attn_o_fp8 = true;
+        let j = serde_json::to_value(&on).unwrap();
+        assert_eq!(j.get("attn_o_fp8"), Some(&serde_json::Value::Bool(true)));
+        let back: SnapshotMeta = serde_json::from_value(j).unwrap();
+        assert!(back.attn_o_fp8);
+        assert!(check_meta_for(&back, &fp(), true).is_ok());
+        assert!(check_meta_for(&back, &fp(), false).is_err());
+        // the live knob is off in tests: check_meta is the knob-off check
+        if std::env::var("V41_ATTN_O_FP8").is_err() {
+            assert!(check_meta(&pre, &fp()).is_ok() && check_meta(&back, &fp()).is_err());
+        }
+    }
+
+    #[test]
+    fn load_skips_but_keeps_the_other_attn_o_fp8_setting() {
+        let root = unique_root();
+        let write = |tag: u8, on: bool| {
+            let dir = root.join(hex::encode(h(tag)));
+            fs::create_dir_all(&dir).unwrap();
+            let mut m = meta_at(100);
+            m.attn_o_fp8 = on;
+            fs::write(dir.join("meta.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+            dir
+        };
+        let off = write(1, false);
+        let on = write(2, true);
+        let idx = SnapshotIndex::load_for(root.clone(), fp(), 1 << 40, false).unwrap();
+        assert!(idx.by_hash.contains_key(&h(1)) && !idx.by_hash.contains_key(&h(2)));
+        let idx = SnapshotIndex::load_for(root.clone(), fp(), 1 << 40, true).unwrap();
+        assert!(idx.by_hash.contains_key(&h(2)) && !idx.by_hash.contains_key(&h(1)));
+        assert!(off.exists() && on.exists(), "the other setting's snapshots are kept on disk");
     }
 
     #[test]

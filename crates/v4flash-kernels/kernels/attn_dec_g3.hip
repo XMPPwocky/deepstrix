@@ -338,29 +338,41 @@ __device__ __forceinline__ void g3_body(
         const float c_h = rope_lds[(d_hi - 448u) >> 1], s_h = rope_lds[32u + ((d_hi - 448u) >> 1)];
         #pragma unroll
         for (int e = 0; e < 8; e++) {
+            // O8: the reference rotates the bf16 attention output and stores bf16 (act_quant_fp8.inc
+            // aq_bf16); both lanes of a pair round before the exchange
+            if constexpr (O8) { v_lo[e] = aq_bf16(v_lo[e]); v_hi[e] = aq_bf16(v_hi[e]); }
             const float p_lo = g3_xor<1>(v_lo[e]), p_hi = g3_xor<1>(v_hi[e]);
             v_lo[e] = g3_rot(v_lo[e], p_lo, d_lo, c_l, s_l);
             v_hi[e] = g3_rot(v_hi[e], p_hi, d_hi, c_h, s_h);
+            if constexpr (O8) { v_lo[e] = aq_bf16(v_lo[e]); v_hi[e] = aq_bf16(v_hi[e]); }
         }
     }
     const size_t row = (size_t)b * 32768u;
     #pragma unroll
     for (int e = 0; e < 8; e++) {
         const unsigned head = h0 + kh + (unsigned)e;
+        if constexpr (O8) {
+            // act_quant of the bf16 `o` (amax and codes); heads_out keeps what the fp8 chain's
+            // `heads` holds (f32 attention output on 0..447, the bf16 rotation on 448..511)
+            const float b_lo = aq_bf16(v_lo[e]), b_hi = aq_bf16(v_hi[e]);
+            float am = fmaxf(fabsf(b_lo), fabsf(b_hi));
+            am = fmaxf(am, g3_xor<8>(am));
+            am = fmaxf(am, g3_xor<4>(am));
+            am = fmaxf(am, g3_xor<2>(am));
+            am = fmaxf(am, g3_xor<1>(am));
+            const int ex = aq_scale_exp(am);
+            const size_t hbase = row + (size_t)head * 512u;
+            xq[hbase + d_lo] = (int8_t)aq_e4m3_code(b_lo, ex);
+            xq[hbase + d_hi] = (int8_t)aq_e4m3_code(b_hi, ex);
+            if (arow == 0u) xscale[(size_t)b * 1024u + head * 16u + wave] = aq_pow2(ex);
+            if (heads_out) { heads_out[hbase + d_lo] = v_lo[e]; heads_out[hbase + d_hi] = v_hi[e]; }
+            continue;
+        }
         float amax = fmaxf(fabsf(v_lo[e]), fabsf(v_hi[e]));
         amax = fmaxf(amax, g3_xor<8>(amax));
         amax = fmaxf(amax, g3_xor<4>(amax));
         amax = fmaxf(amax, g3_xor<2>(amax));
         amax = fmaxf(amax, g3_xor<1>(amax));
-        if constexpr (O8) {
-            const int ex = aq_scale_exp(amax);
-            const size_t hbase = row + (size_t)head * 512u;
-            xq[hbase + d_lo] = (int8_t)aq_e4m3_code(v_lo[e], ex);
-            xq[hbase + d_hi] = (int8_t)aq_e4m3_code(v_hi[e], ex);
-            if (arow == 0u) xscale[(size_t)b * 1024u + head * 16u + wave] = aq_pow2(ex);
-            if (heads_out) { heads_out[hbase + d_lo] = v_lo[e]; heads_out[hbase + d_hi] = v_hi[e]; }
-            continue;
-        }
         const float d = amax / 127.0f;
         const float id = d != 0.0f ? 1.0f / d : 0.0f;
         int q_lo = (int)lrintf(v_lo[e] * id), q_hi = (int)lrintf(v_hi[e] * id);

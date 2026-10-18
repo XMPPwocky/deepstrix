@@ -222,6 +222,70 @@ impl RopeTail {
         self.launch_batched(stream, x, pos_per_b, n_head, head_dim, n_rot, b, params, true)
     }
 
+    /// `V41_ATTN_O_FP8`: [`Self::launch_inverse`] at the 1017 reference's rounding points
+    /// (`rope_tail_bf16`: the rotation reads bf16(x) and stores bf16 of its result, model.py
+    /// apply_rotary_emb on the bf16 `o`); same grid and arithmetic otherwise. Only the rope tail is
+    /// touched: the act_quant launch that follows rounds the other dims.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_inverse_bf16(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        pos: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        if n_rot % 2 != 0 || n_rot > head_dim || x.len() < (n_head * head_dim) as usize {
+            return Err(eyre!("rope_tail_bf16: n_rot={n_rot} head_dim={head_dim} x={} unsupported", x.len()));
+        }
+        let (theta_scale, mscale_eff, corr_low, corr_high) = Self::device_args(params, n_rot);
+        let function = self.module.get_function("rope_tail_bf16")?;
+        crate::fp8_wo_a::count(crate::fp8_wo_a::Fp8Site::RopeBf16);
+        let cfg = LaunchConfig { grid: (n_head, 1, 1), block: (n_rot / 2, 1, 1), shared_mem_bytes: 0 };
+        let inverse_i: i32 = 1;
+        launch_kernel!(function, cfg, stream, [
+            x.raw(), n_head, head_dim, n_rot, pos,
+            theta_scale, params.freq_scale, params.ext_factor, mscale_eff, corr_low, corr_high, inverse_i
+        ])
+    }
+
+    /// `V41_ATTN_O_FP8`: [`Self::launch_inverse_batched`] at the reference's rounding points
+    /// (`rope_tail_batched_bf16`, see [`Self::launch_inverse_bf16`]); same grid (incl. the
+    /// `V41_GRID_PAD` column).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_inverse_batched_bf16(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        if n_rot % 2 != 0 || n_rot > head_dim {
+            return Err(eyre!("rope_tail_batched_bf16: n_rot={n_rot} head_dim={head_dim} unsupported"));
+        }
+        if b == 0 {
+            return Ok(());
+        }
+        if x.len() < (b * n_head * head_dim) as usize || pos_per_b.len() < b as usize {
+            return Err(eyre!("rope_tail_batched_bf16: buffers too small for b={b}"));
+        }
+        let (theta_scale, mscale_eff, corr_low, corr_high) = Self::device_args(params, n_rot);
+        let function = self.module.get_function("rope_tail_batched_bf16")?;
+        crate::fp8_wo_a::count(crate::fp8_wo_a::Fp8Site::RopeBf16);
+        let cfg = LaunchConfig { grid: (n_head + crate::grid_pad(), 1, b), block: (n_rot / 2, 1, 1), shared_mem_bytes: 0 };
+        let inverse_i: i32 = 1;
+        launch_kernel!(function, cfg, stream, [
+            x.raw(), pos_per_b.raw(), n_head, head_dim, n_rot,
+            theta_scale, params.freq_scale, params.ext_factor, mscale_eff, corr_low, corr_high, inverse_i
+        ])
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_batched(
         &self,
@@ -558,6 +622,7 @@ impl RopeTail {
         }
         let (theta_scale, mscale_eff, corr_low, corr_high) = Self::device_args(params, n_rot);
         let function = self.module.get_function("rope_inv_quant_fp8")?;
+        crate::fp8_wo_a::count(crate::fp8_wo_a::Fp8Site::RopeInvQuant);
         // `V41_GRID_PAD`: as rope_inv_quant_q8 (DO NOT REMOVE; see `crate::grid_pad`).
         let cfg = LaunchConfig { grid: (64 + crate::grid_pad(), b, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [
@@ -594,6 +659,7 @@ impl RopeTail {
             return Err(eyre!("rope_inv_quant_fp8_ind: buffers too small for b={b}"));
         }
         let function = self.module.get_function(&ind.symbol("rope_inv_quant_fp8"))?;
+        crate::fp8_wo_a::count(crate::fp8_wo_a::Fp8Site::RopeInvQuant);
         let cfg = LaunchConfig { grid: (64 + crate::grid_pad(), b, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
         let p: [u64; 4] = [heads.raw() as u64, xq.raw() as u64, xscale.raw() as u64, pos_per_b.raw() as u64];
         let q: [u64; 4] = std::array::from_fn(|i| ind.ptr(i, p[i]));

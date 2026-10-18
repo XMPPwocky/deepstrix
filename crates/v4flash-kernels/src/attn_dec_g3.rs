@@ -198,6 +198,9 @@ impl AttnDecG3 {
             G3Epilogue::Q8_0 => "attn_dec_g3",
             G3Epilogue::Fp8 => "attn_dec_g3_o8",
         })?;
+        if epi == G3Epilogue::Fp8 {
+            crate::fp8_wo_a::count(crate::fp8_wo_a::Fp8Site::G3);
+        }
         let cfg = LaunchConfig { grid: (n_head / 16, b as u32, 1), block: (512, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [
             heads_ptr, xq.raw(), xscale.raw(), sinks.raw(), q.raw(), raw_kv.raw(),
