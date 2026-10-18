@@ -4,7 +4,7 @@
 //!   deepstrix-server --gguf <path> [--addr 127.0.0.1:8080] [--ctx 8192]
 //!                    [--snapshot-dir ~/.cache/deepstrix/snapshots]
 //!                    [--disk-cap-gb 100] [--default-top-p 0.95]
-//!                    [--default-reasoning-effort low]
+//!                    [--default-reasoning-effort high]
 //!
 //! Loads the V4-Flash model into a dedicated engine worker thread,
 //! then serves an OpenAI-compatible `/v1/chat/completions` endpoint
@@ -95,15 +95,17 @@ struct Args {
     default_top_p: f32,
     /// Reasoning effort applied when a request sends neither `reasoning`
     /// nor `reasoning_effort`. One of none/off/disabled/false, minimal/low,
-    /// medium/high, xhigh/max/ultra. Default "low" — the server's
-    /// historical behaviour.
+    /// medium/high, xhigh/max/ultra. Default: the build's
+    /// `prompt::SERVER_DEFAULT_EFFORT` -- "high" for V4.1 (DeepSeek's
+    /// reference default: thinking on, budget 75), "low" for V4-Flash (the
+    /// server's historical behaviour).
     ///
     /// WARNING: raising this changes the RENDERED PROMPT (high/max prepend
     /// a preamble to the system block), so every KV prefix cached under the
     /// old default stops matching and the whole snapshot cache has to be
     /// re-prefilled. Opt in deliberately.
-    #[arg(long = "default-reasoning-effort", default_value = "low")]
-    default_reasoning_effort: String,
+    #[arg(long = "default-reasoning-effort")]
+    default_reasoning_effort: Option<String>,
     /// Qwen3-Embedding Q8_0 GGUF: serves `POST /v1/embeddings` from this
     /// process as an exclusive embed phase between scheduler ticks
     /// (docs/v41/EMBED_PHASE_DESIGN.md). Its weights are never resident: each
@@ -143,10 +145,12 @@ async fn main() -> eyre::Result<()> {
         None => default_snapshot_dir()?,
     };
     let disk_cap_bytes = args.disk_cap_gb.saturating_mul(1024 * 1024 * 1024);
-    let default_reasoning_effort =
-        deepstrix_server::prompt::ReasoningEffort::parse_str(&args.default_reasoning_effort)
-            .map_err(|e| eyre!("--default-reasoning-effort: {e}"))?;
-    if default_reasoning_effort != deepstrix_server::prompt::DEFAULT_EFFORT {
+    let default_reasoning_effort = match args.default_reasoning_effort.as_deref() {
+        None => deepstrix_server::prompt::SERVER_DEFAULT_EFFORT,
+        Some(s) => deepstrix_server::prompt::ReasoningEffort::parse_str(s)
+            .map_err(|e| eyre!("--default-reasoning-effort: {e}"))?,
+    };
+    if default_reasoning_effort != deepstrix_server::prompt::SERVER_DEFAULT_EFFORT {
         tracing::warn!(
             effort = ?default_reasoning_effort,
             "--default-reasoning-effort is not the compiled-in default: requests that omit \

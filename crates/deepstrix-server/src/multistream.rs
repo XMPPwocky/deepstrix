@@ -3179,9 +3179,18 @@ fn emit(state: &WorkerState, s: &mut Stream, tok: i32) -> bool {
         return true; // the stop is decided by the caller; nothing to emit
     }
     if tok == TOK_THINK_BEGIN { s.in_think = true; return true; }
-    if tok == TOK_THINK_END { s.in_think = false; return true; }
-    let Some(bytes) = state.vocab.token_text(tok) else { return true };
-    let raw = gpt2_decode_token(bytes, &state.byte_decoder);
+    let raw = if tok == TOK_THINK_END {
+        // The token's bytes are suppressed, but the consumer is told WHERE the
+        // reasoning ended (an empty non-reasoning chunk): the reference output
+        // parser drops the newlines right before `</think>`, which
+        // `dsml::OutputSplitter` can only do knowing the reasoning closed.
+        let was_thinking = std::mem::replace(&mut s.in_think, false);
+        if !was_thinking { return true; }
+        Vec::new()
+    } else {
+        let Some(bytes) = state.vocab.token_text(tok) else { return true };
+        gpt2_decode_token(bytes, &state.byte_decoder)
+    };
     match s.tx.try_send(WorkerEvent::Chunk { token_id: tok, bytes: raw, reasoning: s.in_think }) {
         Ok(()) => { s.send_failures = 0; true }
         Err(mpsc::error::TrySendError::Full(_)) => {

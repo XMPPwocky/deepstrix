@@ -30,8 +30,8 @@ impl Drop for CancelOnDrop {
     }
 }
 
-use crate::dsml::{DsmlEvent, DsmlScanner};
-use crate::engine_worker::{accumulate, EngineHandle, GenerateReq, SubmitError, WorkerEvent};
+use crate::dsml::{DsmlEvent, OutputSplitter, SplitEvent};
+use crate::engine_worker::{accumulate_with, EngineHandle, GenerateReq, SubmitError, WorkerEvent};
 use crate::openai::error::ApiError;
 use crate::openai::sse::{
     encode_chunk, reasoning_delta, role_delta, text_delta, tool_call_args_delta,
@@ -42,7 +42,8 @@ use crate::openai::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Role, ToolCall,
     ToolCallFunction, Usage,
 };
-use crate::prompt::{render_prompt, ReasoningEffort};
+#[cfg_attr(feature = "v41", allow(unused_imports))]
+use crate::prompt::render_prompt;
 use crate::vision_prompt::{expand_images, ImageSpan, PreparedImage, VlPrompt};
 
 const DEFAULT_TEMPERATURE: f32 = 1.0;
@@ -216,30 +217,11 @@ pub async fn chat_completions(
     // the historical think-mode default). Unknown strings are an
     // invalid parameter → HTTP 400, matching the render_prompt
     // BadRequest convention below.
-    // A NUMERIC `reasoning_effort` ("88" or 88) is V4.1's native 1..=100
-    // budget: thinking on, budget as given (0 = off). Clients that spread
-    // their effort ladder over numbers (prime-agent's thinkingLevelMap) get
-    // finer grain than the three named tiers.
-    let numeric_budget: Option<u8> = req
-        .reasoning_effort
-        .as_deref()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .map(|n| {
-            if (0..=100).contains(&n) { Ok(n as u8) } else { Err(ApiError::BadRequest(format!("reasoning_effort {n} outside 0..=100"))) }
-        })
-        .transpose()?;
-    let effort = match numeric_budget {
-        Some(0) => ReasoningEffort::Off,
-        Some(n) if n >= 100 => ReasoningEffort::Max,
-        Some(n) if n > 50 => ReasoningEffort::High,
-        Some(_) => ReasoningEffort::Low,
-        None => ReasoningEffort::from_request_fields_with_default(
-            req.reasoning.as_deref(),
-            req.reasoning_effort.as_deref(),
-            engine.default_reasoning_effort,
-        )
-        .map_err(ApiError::BadRequest)?,
-    };
+    // A NUMERIC `reasoning_effort` is V4.1's native 1..=100 budget
+    // (`prompt_v41::request_effort`).
+    #[cfg_attr(feature = "v41", allow(unused_variables))]
+    let (effort, _numeric_budget) =
+        crate::prompt_v41::request_effort(&req, engine.default_reasoning_effort).map_err(ApiError::BadRequest)?;
     // Vision-Exp: image parts are allowed only when the worker loaded a
     // tower (`--mmproj`) AND the vocab has the placeholder token. Reject
     // up front with a clear 400 rather than failing inside the worker.
@@ -257,35 +239,16 @@ pub async fn chat_completions(
     // quality on tool paths and plausibly costs DSpark acceptance too -- the
     // drafter is predicting text it was trained to see in the other format.
     #[cfg(feature = "v41")]
-    let (tokens, image_order) = {
-        // The 4-state effort carries the thinking flag; V4.1 wants a 1..=100
-        // budget alongside it. An explicit integer in the request wins.
-        let budget = numeric_budget
-            .filter(|&n| n >= 1)
-            .map(crate::prompt_v41::V41Effort)
-            // A named level ("minimal" = 25, ...): `reasoning_effort` wins, else letta's `reasoning`.
-            .or_else(|| match req.reasoning_effort.as_deref() {
-                Some(s) => crate::prompt_v41::V41Effort::from_name(s),
-                None => req.reasoning.as_deref().and_then(crate::prompt_v41::V41Effort::from_name),
-            })
-            .unwrap_or(match effort {
-                ReasoningEffort::Off | ReasoningEffort::Low => {
-                    crate::prompt_v41::V41Effort(50)
-                }
-                ReasoningEffort::High => crate::prompt_v41::V41Effort(75),
-                ReasoningEffort::Max => crate::prompt_v41::V41Effort(100),
-            });
-        crate::prompt_v41::render_prompt_v41(
-            &engine.vocab,
-            &req.messages,
-            req.tools.as_deref(),
-            effort.thinking_enabled(),
-            budget,
-            None, // V4.1's separate `context` block: nothing in the OpenAI API maps to it
-            engine.image_placeholder_id,
-        )
-        .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?
-    };
+    // The whole request -> prompt mapping lives in `prompt_v41::request_segments_v41`
+    // so `tests/oracle_prompt.rs` diffs exactly this path against DeepSeek's
+    // reference implementation.
+    let (tokens, image_order) = crate::prompt_v41::render_request_v41(
+        &engine.vocab,
+        &req,
+        engine.default_reasoning_effort,
+        engine.image_placeholder_id,
+    )
+    .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     #[cfg(not(feature = "v41"))]
     let image_order: Vec<usize> = (0..req.messages.iter().map(|m| m.images().count()).sum()).collect();
     #[cfg(not(feature = "v41"))]
@@ -370,6 +333,12 @@ pub async fn chat_completions(
     })?;
 
     let tok_dsml = engine.vocab.dsml_id;
+    // A required / named tool choice ends the V4.1 prompt inside an open
+    // `<｜DSML｜ calls>` block: the output scanner starts in it.
+    #[cfg(feature = "v41")]
+    let start_in_tool_calls = crate::prompt_v41::request_starts_in_tool_calls(&req, engine.default_reasoning_effort);
+    #[cfg(not(feature = "v41"))]
+    let start_in_tool_calls = false;
     if stream {
         // The cancel guard moves into the SSE driver. When the
         // SSE response (and its task) is dropped — e.g. client
@@ -387,6 +356,7 @@ pub async fn chat_completions(
             prompt_tokens_count,
             tok_dsml,
             stop,
+            start_in_tool_calls,
         ));
         let stream = poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx));
         Ok(Sse::new(stream)
@@ -394,39 +364,11 @@ pub async fn chat_completions(
             .into_response())
     } else {
         let guard = CancelOnDrop(cancel);
-        let result = accumulate(rx, tok_dsml, stop).await.map_err(ApiError::from)?;
+        let result = accumulate_with(rx, tok_dsml, stop, start_in_tool_calls).await.map_err(ApiError::from)?;
         // Also how a stop-string match ends the generation (`openai::stop`).
         drop(guard);
-        // Malformed DSML wins over everything else — the turn is
-        // corrupted, don't pretend it succeeded as text/tool_calls.
-        // Drop both content and tool_calls so letta records an empty
-        // assistant turn with finish_reason="internal_error" rather
-        // than storing partial garbage that taints subsequent turns.
-        //
-        // Why "internal_error" and not "error": pi-ai forwards unknown
-        // finish_reasons verbatim as "Provider finish_reason: <reason>"
-        // and letta's retryable-error detector substring-matches that
-        // string against a fixed pattern list. "internal_error" is in
-        // the list (local-provider-errors.ts); bare "error" is not, so
-        // letta would surface a non-retryable hard error.
-        let (finish_reason, content, tool_calls) = if result.saw_malformed {
-            tracing::warn!(
-                "non-streaming: scanner saw malformed DSML; reporting finish_reason=internal_error"
-            );
-            ("internal_error", None, Vec::new())
-        } else if result.saw_tool {
-            ("tool_calls", if result.text.is_empty() {
-                None
-            } else {
-                Some(result.text)
-            }, result.tool_calls)
-        } else {
-            (result.finish_reason.as_openai(), if result.text.is_empty() {
-                None
-            } else {
-                Some(result.text)
-            }, result.tool_calls)
-        };
+        let completion_tokens = result.completion_tokens;
+        let (finish_reason, message) = nonstream_message(result);
         let resp = ChatCompletionResponse {
             id,
             object: "chat.completion",
@@ -434,27 +376,67 @@ pub async fn chat_completions(
             model,
             choices: vec![Choice {
                 index: 0,
-                message: ChatMessage {
-                    role: Role::Assistant,
-                    content,
-                    parts: Vec::new(),
-                    tool_calls,
-                    tool_call_id: None,
-                    name: None,
-                    // Kept on the malformed-DSML branch too: it is the
-                    // model's own reasoning, not the corrupted markup.
-                    reasoning_content: result.reasoning,
-                },
+                message,
                 finish_reason,
             }],
             usage: Usage {
                 prompt_tokens: prompt_tokens_count,
-                completion_tokens: result.completion_tokens,
-                total_tokens: prompt_tokens_count + result.completion_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens_count + completion_tokens,
             },
         };
         Ok(Json(resp).into_response())
     }
+}
+
+/// The non-streaming response's finish reason and assistant message for an
+/// accumulated generation (split out of `chat_completions` so
+/// `tests/oracle_prompt.rs` diffs exactly this mapping).
+pub fn nonstream_message(result: crate::engine_worker::GenerateResult) -> (&'static str, ChatMessage) {
+    // Malformed DSML wins over everything else — the turn is
+    // corrupted, don't pretend it succeeded as text/tool_calls.
+    // Drop both content and tool_calls so letta records an empty
+    // assistant turn with finish_reason="internal_error" rather
+    // than storing partial garbage that taints subsequent turns.
+    //
+    // Why "internal_error" and not "error": pi-ai forwards unknown
+    // finish_reasons verbatim as "Provider finish_reason: <reason>"
+    // and letta's retryable-error detector substring-matches that
+    // string against a fixed pattern list. "internal_error" is in
+    // the list (local-provider-errors.ts); bare "error" is not, so
+    // letta would surface a non-retryable hard error.
+    let (finish_reason, content, tool_calls) = if result.saw_malformed {
+        tracing::warn!(
+            "non-streaming: scanner saw malformed DSML; reporting finish_reason=internal_error"
+        );
+        ("internal_error", None, Vec::new())
+    } else if result.saw_tool {
+        ("tool_calls", if result.text.is_empty() {
+            None
+        } else {
+            Some(result.text)
+        }, result.tool_calls)
+    } else {
+        (result.finish_reason.as_openai(), if result.text.is_empty() {
+            None
+        } else {
+            Some(result.text)
+        }, result.tool_calls)
+    };
+    (
+        finish_reason,
+        ChatMessage {
+            role: Role::Assistant,
+            content,
+            parts: Vec::new(),
+            tool_calls,
+            tool_call_id: None,
+            name: None,
+            // Kept on the malformed-DSML branch too: it is the
+            // model's own reasoning, not the corrupted markup.
+            reasoning_content: result.reasoning,
+        },
+    )
 }
 
 /// GET /v1/models — minimal listing for letta's provider auth flow.
@@ -594,6 +576,7 @@ async fn drive_sse_stream(
     prompt_tokens: u32,
     tok_dsml: Option<i32>,
     stop: Vec<String>,
+    start_in_tool_calls: bool,
 ) {
     let created = unix_now();
     let send = |delta: ChunkDelta,
@@ -617,7 +600,8 @@ async fn drive_sse_stream(
     // to a sentinel that never matches — effectively disabling DSML
     // detection.
     let scanner_tok_dsml = tok_dsml.unwrap_or(-1);
-    let mut scanner = DsmlScanner::new(scanner_tok_dsml);
+    // Reasoning / content split + the scanner, shared with `accumulate`.
+    let mut splitter = OutputSplitter::new(scanner_tok_dsml, start_in_tool_calls);
     let mut sent_tool_index: u32 = 0;
     let mut saw_tool = false;
     let mut finish_reason: &'static str = "stop";
@@ -672,19 +656,22 @@ async fn drive_sse_stream(
                 reasoning,
             } => {
                 n_chunks += 1;
-                if reasoning {
-                    let s = drain_valid_utf8(&mut reasoning_pending, &bytes);
-                    if !s.is_empty()
-                        && out.send(send(reasoning_delta(s), None)).await.is_err()
-                    {
-                        return;
-                    }
-                    continue;
-                }
-                // Drive the scanner with the actual token-id + bytes;
-                // it suppresses TOK_DSML bytes regardless and emits
-                // clean Text/ToolCall events.
-                for de in scanner.push_token(token_id, &bytes) {
+                // The splitter drives the scanner with the actual token-id
+                // + bytes; it suppresses TOK_DSML bytes regardless and
+                // emits clean Reasoning/Text/ToolCall events.
+                for se in splitter.push(token_id, &bytes, reasoning) {
+                    let de = match se {
+                        SplitEvent::Reasoning(b) => {
+                            let s = drain_valid_utf8(&mut reasoning_pending, &b);
+                            if !s.is_empty()
+                                && out.send(send(reasoning_delta(s), None)).await.is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        SplitEvent::Dsml(de) => de,
+                    };
                     match de {
                         DsmlEvent::Text(t) => {
                             let s = stop.push(&drain_valid_utf8(&mut content_pending, &t));
@@ -768,10 +755,22 @@ async fn drive_sse_stream(
                 // tags) — stream them exactly like live ones. A call the
                 // token cap cut off is dropped, not repaired, and the
                 // turn reports "length" below, not "tool_calls".
-                for de in scanner.finish(matches!(
+                for se in splitter.finish(matches!(
                     finish,
                     crate::engine_worker::FinishReason::Length
                 )) {
+                    let de = match se {
+                        SplitEvent::Reasoning(b) => {
+                            let s = drain_valid_utf8(&mut reasoning_pending, &b);
+                            if !s.is_empty()
+                                && out.send(send(reasoning_delta(s), None)).await.is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        SplitEvent::Dsml(de) => de,
+                    };
                     match de {
                         DsmlEvent::Text(t) => {
                             let s = stop.push(&drain_valid_utf8(&mut content_pending, &t));
@@ -855,7 +854,7 @@ async fn drive_sse_stream(
                         return;
                     }
                 }
-                finish_reason = if saw_tool && !scanner.cut_by_length() {
+                finish_reason = if saw_tool && !splitter.scanner().cut_by_length() {
                     "tool_calls"
                 } else {
                     finish.as_openai()
@@ -888,7 +887,7 @@ async fn drive_sse_stream(
     // bad-DSML *before* any text/tool deltas the retry will fire; for
     // bad-DSML *after* we've already streamed text, letta will surface
     // the error without retrying even though we mark it retryable.
-    if scanner.saw_malformed() {
+    if splitter.scanner().saw_malformed() {
         tracing::warn!(
             "stream: scanner saw malformed DSML; reporting finish_reason=internal_error"
         );
@@ -923,6 +922,41 @@ async fn drive_sse_stream(
     let _ = out
         .send(Ok(Event::default().data("[DONE]".to_string())))
         .await;
+}
+
+/// Test hook: run the SSE driver over `evs` (the worker side closed after
+/// them) and return every `data:` payload except `[DONE]`, parsed. Lets
+/// `tests/oracle_prompt.rs` diff the STREAMING output path against DeepSeek's
+/// reference parser, not only `accumulate`. Not used by the server.
+#[doc(hidden)]
+pub async fn sse_transcript(evs: Vec<WorkerEvent>, tok_dsml: Option<i32>, stop: Vec<String>, start_in_tool_calls: bool) -> Vec<serde_json::Value> {
+    let (wtx, wrx) = tokio::sync::mpsc::channel(evs.len() + 1);
+    for e in evs {
+        if wtx.send(e).await.is_err() {
+            break;
+        }
+    }
+    drop(wtx);
+    let (tx, mut sse_rx) = tokio::sync::mpsc::channel(64);
+    let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+    let driver = drive_sse_stream("id".into(), "m".into(), wrx, tx, guard, false, 0, tok_dsml, stop, start_in_tool_calls);
+    let collect = async move {
+        let mut out = Vec::new();
+        while let Some(Ok(ev)) = sse_rx.recv().await {
+            out.push(ev);
+        }
+        out
+    };
+    let ((), events) = tokio::join!(driver, collect);
+    let sse = Sse::new(futures_util::stream::iter(events.into_iter().map(Ok::<Event, Infallible>)));
+    let body = axum::body::to_bytes(sse.into_response().into_body(), usize::MAX).await.unwrap_or_default();
+    std::str::from_utf8(&body)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .filter_map(|d| serde_json::from_str(d).ok())
+        .collect()
 }
 
 fn unix_now() -> u64 {
@@ -971,7 +1005,7 @@ mod tests {
         let (tx, mut sse_rx) = tokio::sync::mpsc::channel(1024);
         let stop = stop.iter().map(|s| s.to_string()).collect();
         let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
-        drive_sse_stream("id".into(), "m".into(), wrx, tx, guard, true, 5, Some(128825), stop).await;
+        drive_sse_stream("id".into(), "m".into(), wrx, tx, guard, true, 5, Some(128825), stop, false).await;
         let sse = Sse::new(poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx)));
         let body = axum::body::to_bytes(sse.into_response().into_body(), usize::MAX).await.unwrap();
         let mut seen = Seen::default();

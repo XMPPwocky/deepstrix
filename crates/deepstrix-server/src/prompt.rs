@@ -159,6 +159,16 @@ impl ReasoningEffort {
 /// `--default-reasoning-effort` instead.
 pub const DEFAULT_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
+/// The compiled-in `--default-reasoning-effort` of THIS build. V4.1: `High`
+/// -- DeepSeek's reference (deepseek-recipe, and `encoding.py`'s
+/// DEFAULT_REASONING_EFFORT) renders a request that names no effort with
+/// thinking on and budget 75; the V4.1 path used to inherit V4-Flash's `Low`
+/// (budget 50). V4-Flash keeps [`DEFAULT_EFFORT`].
+#[cfg(feature = "v41")]
+pub const SERVER_DEFAULT_EFFORT: ReasoningEffort = ReasoningEffort::High;
+#[cfg(not(feature = "v41"))]
+pub const SERVER_DEFAULT_EFFORT: ReasoningEffort = DEFAULT_EFFORT;
+
 /// The literal bytes of the `｜DSML｜` special token. The V4-Flash BPE
 /// does NOT auto-merge these bytes to the single special-token id at
 /// `vocab.encode()` time — it splits the chunk into 4 regular tokens
@@ -316,6 +326,9 @@ pub fn build_segments(
     if messages.is_empty() {
         return Err(eyre!("render_prompt: messages array is empty"));
     }
+    if let Some(i) = messages.iter().position(|m| m.role == Role::LatestReminder) {
+        return Err(eyre!("render_prompt: message {i}: the latest_reminder role is V4.1-only"));
+    }
     for (i, m) in messages.iter().enumerate() {
         if !m.has_images() {
             continue;
@@ -415,7 +428,8 @@ pub fn build_segments(
 
     for (i, m) in messages.iter().enumerate() {
         match m.role {
-            Role::System => continue,
+            // Rejected above.
+            Role::System | Role::LatestReminder => continue,
             Role::User => {
                 if in_user {
                     segs.push(Seg::Ours("\n\n".to_string()));

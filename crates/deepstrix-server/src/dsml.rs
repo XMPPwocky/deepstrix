@@ -453,6 +453,15 @@ pub struct DsmlScanner {
     /// the body slot is filled when we leave ParameterBody so
     /// dispatch_close("parameter") can finalize it.
     current_param: Option<(String, bool, Vec<u8>)>,
+    /// The last few content bytes emitted at top level (for
+    /// [`newlines_skipped_before`]).
+    recent_text: Vec<u8>,
+    /// The in-flight parameter is V4.1 markup (` parameter`, leading space):
+    /// its body is the model's raw text, exactly as DeepSeek's reference
+    /// parser keeps it. The V4-Flash escapes ([`push_dsml_parameter_text`],
+    /// [`push_dsml_json_literal`]) are never applied by the V4.1 renderer,
+    /// so un-escaping them would corrupt a literal `&lt;/｜DSML｜parameter>`.
+    param_raw: bool,
     /// Sticky flag: true once any unknown-tag fallback occurred
     /// (e.g. the model emitted `<｜DSML｜command name="ls"…>` instead
     /// of `<｜DSML｜parameter name="command"…>ls`) or an orphan
@@ -509,6 +518,16 @@ impl DsmlScanner {
 }
 
 impl DsmlScanner {
+    /// A scanner whose stream starts INSIDE a `<｜DSML｜ calls>` block: the
+    /// prompt of a required / named `tool_choice` ends with the opening tag
+    /// (`prompt_v41::request_starts_in_tool_calls`), so the model's first
+    /// tokens are an invoke.
+    pub fn new_in_tool_calls(tok_dsml: i32) -> Self {
+        let mut s = Self::new(tok_dsml);
+        s.frames.push(Frame::ToolCalls { next_invoke_index: 0 });
+        s
+    }
+
     pub fn new(tok_dsml: i32) -> Self {
         Self {
             tok_dsml,
@@ -517,6 +536,8 @@ impl DsmlScanner {
             tail: Vec::new(),
             buf: Vec::new(),
             current_param: None,
+            recent_text: Vec::new(),
+            param_raw: false,
             malformed: false,
             tool_calls_emitted: 0,
             saw_orphan_close: false,
@@ -797,7 +818,9 @@ impl DsmlScanner {
     /// open to receive it.
     fn finalize_current_param(&mut self) {
         if let Some((name, is_string, body_bytes)) = self.current_param.take() {
-            let body_str = if is_string {
+            let body_str = if self.param_raw {
+                String::from_utf8_lossy(&body_bytes).into_owned()
+            } else if is_string {
                 dsml_param_decode_string(&String::from_utf8_lossy(&body_bytes))
             } else {
                 dsml_param_decode_json_literal(&String::from_utf8_lossy(&body_bytes))
@@ -888,6 +911,14 @@ impl DsmlScanner {
                     self.buf.clear();
                 } else if is_open {
                     self.tail.truncate(self.tail.len() - 1);
+                    if self.mode == Mode::Text && self.frames.is_empty() {
+                        // The held newlines before the opener (see
+                        // `consume_text_bytes`) are dropped, as the
+                        // reference's matcher counts them.
+                        let run = self.tail.iter().rev().take_while(|&&b| b == b'\n').count();
+                        let keep = run - newlines_skipped_before(&self.recent_text, run, DSML_OPENER);
+                        self.tail.truncate(self.tail.len() - run + keep);
+                    }
                     self.flush_tail_to_current_mode(events);
                     self.mode = Mode::OpenHeader;
                     self.buf.clear();
@@ -962,10 +993,18 @@ impl DsmlScanner {
 
     fn consume_text_bytes(&mut self, bytes: &[u8], events: &mut Vec<DsmlEvent>) -> Vec<u8> {
         self.tail.extend_from_slice(bytes);
-        let hold = tag_lookahead(&self.tail);
+        let mut hold = tag_lookahead(&self.tail);
+        if self.frames.is_empty() && hold < 2 {
+            // Newlines right before a `<｜DSML｜` opener are dropped
+            // (DeepSeek's reference parser: content keeps "text", not
+            // "text\n\n", before a calls block), so hold them until the next
+            // token shows whether an opener follows.
+            hold += self.tail[..self.tail.len() - hold].iter().rev().take_while(|&&b| b == b'\n').count();
+        }
         if self.tail.len() > hold {
             let emit: Vec<u8> = self.tail.drain(..self.tail.len() - hold).collect();
             if self.frames.is_empty() {
+                note_recent(&mut self.recent_text, &emit);
                 events.push(DsmlEvent::Text(emit));
             } else if self.in_bare_tool_calls() {
                 // Possible hallucinated-block prose — keep it (see
@@ -1025,12 +1064,18 @@ impl DsmlScanner {
             self.mode = Mode::Text;
             return;
         }
+        // V4.1 tag names carry a leading space (` calls`, ` invoke`,
+        // ` parameter`); its attribute values are raw text (the V4.1
+        // renderer escapes nothing, and DeepSeek's reference parser decodes
+        // nothing). V4-Flash's are entity-escaped by `push_dsml_attr`.
+        let raw = head.starts_with(' ');
+        let attr = |name: &str| if raw { parse_attr_raw(trimmed, name) } else { parse_attr(trimmed, name) };
         if trimmed.starts_with("invoke") {
             // A real invoke: whatever text sat between <tool_calls>
             // and here was structural whitespace, not hallucinated
             // prose. Discard it.
             self.halluc_buf.clear();
-            let name = parse_attr(trimmed, "name").unwrap_or_default();
+            let name = attr("name").unwrap_or_default();
             let next_invoke_index = match self.frames.last_mut() {
                 Some(Frame::ToolCalls { next_invoke_index }) => {
                     let i = *next_invoke_index;
@@ -1048,11 +1093,12 @@ impl DsmlScanner {
             return;
         }
         if trimmed.starts_with("parameter") {
-            let name = parse_attr(trimmed, "name").unwrap_or_default();
-            let is_string = parse_attr(trimmed, "string")
+            let name = attr("name").unwrap_or_default();
+            let is_string = attr("string")
                 .map(|s| s == "true")
                 .unwrap_or(true);
             self.current_param = Some((name, is_string, Vec::new()));
+            self.param_raw = raw;
             self.buf.clear();
             self.mode = Mode::ParameterBody;
             return;
@@ -1168,6 +1214,32 @@ impl Default for DsmlScanner {
     }
 }
 
+const DSML_OPENER: &[u8] = "<\u{ff5c}DSML\u{ff5c}".as_bytes();
+const THINK_CLOSER: &[u8] = b"</think>";
+
+/// Keep the last 16 bytes of a text stream.
+fn note_recent(recent: &mut Vec<u8>, emitted: &[u8]) {
+    recent.extend_from_slice(emitted);
+    if recent.len() > 16 {
+        recent.drain(..recent.len() - 16);
+    }
+}
+
+/// How many of the `run` newlines right before `marker` DeepSeek's
+/// reference parser drops (`MatchState::NewlinesAndString`): all of them,
+/// except that a newline arriving while the text before it is a partial
+/// match of `marker` (it ends in a non-empty proper prefix, e.g. `<`)
+/// resets the match without being counted. `before` = the bytes just before
+/// the run.
+fn newlines_skipped_before(before: &[u8], run: usize, marker: &[u8]) -> usize {
+    let partial = (1..marker.len()).any(|k| before.ends_with(&marker[..k]));
+    if run > 0 && partial {
+        run - 1
+    } else {
+        run
+    }
+}
+
 /// Largest number of trailing bytes in `b` that are a strict prefix
 /// of `</` — i.e. could be the start of a closing tag waiting for
 /// TOK_DSML. Returns 0, 1 (just `<`), or 2 (`</`).
@@ -1182,11 +1254,15 @@ fn tag_lookahead(b: &[u8]) -> usize {
 }
 
 fn parse_attr(header: &str, attr: &str) -> Option<String> {
+    parse_attr_raw(header, attr).map(|v| dsml_attr_decode(&v))
+}
+
+fn parse_attr_raw(header: &str, attr: &str) -> Option<String> {
     let needle = format!("{attr}=\"");
     let start = header.find(&needle)? + needle.len();
     let rest = &header[start..];
     let end_rel = rest.find('"')?;
-    Some(dsml_attr_decode(&rest[..end_rel]))
+    Some(rest[..end_rel].to_string())
 }
 
 fn dsml_attr_decode(s: &str) -> String {
@@ -1254,6 +1330,163 @@ fn params_to_json(params: &[(String, bool, String)]) -> String {
         }
     }
     serde_json::Value::Object(map).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Output splitter: reasoning vs content, then the scanner.
+// ---------------------------------------------------------------------------
+
+/// One piece of an assistant turn as the client sees it.
+#[derive(Debug, Clone)]
+pub enum SplitEvent {
+    /// `reasoning_content` bytes (not UTF-8-validated, like `DsmlEvent::Text`).
+    Reasoning(Vec<u8>),
+    /// Content / tool calls, from the DSML scanner.
+    Dsml(DsmlEvent),
+}
+
+/// Any id that is not the DSML token, for bytes we feed the scanner ourselves.
+const SYNTHETIC_TOKEN: i32 = i32::MIN;
+
+/// Splits the worker's chunk stream (each chunk tagged `reasoning` = the
+/// worker's `in_think`) into reasoning and content the way DeepSeek's
+/// reference output parser (deepseek-recipe `stream/state_machine.rs`) does,
+/// then drives the DSML scanner with the content. Shared by the
+/// non-streaming (`engine_worker::accumulate`) and SSE
+/// (`handler::drive_sse_stream`) paths so both give the same message.
+///
+/// The reference's rules, on the special tokens the worker sees:
+/// * reasoning drops its leading newlines and the newlines right before
+///   `</think>` (newlines at the end of a stream with no `</think>` stay);
+/// * a `<｜DSML｜` opener INSIDE the reasoning ends it and starts the tool
+///   calls there (the model skipped `</think>`); the newlines before it are
+///   dropped;
+/// * content drops its leading newlines (and, in the scanner, the newlines
+///   right before a calls block);
+/// * once content has started, a later `<think>` does not re-open
+///   reasoning (the reference reads it as text; the worker suppresses the
+///   token's own bytes, so it is simply dropped here).
+pub struct OutputSplitter {
+    scanner: DsmlScanner,
+    tok_dsml: i32,
+    /// Reasoning is over (content or a tool call started).
+    reasoning_done: bool,
+    /// No reasoning byte kept yet: leading newlines are dropped.
+    reasoning_leading: bool,
+    /// Trailing reasoning bytes that may still be dropped: `\n*` or `\n*<`.
+    reasoning_held: Vec<u8>,
+    /// The last few reasoning bytes emitted (for `newlines_skipped_before`).
+    reasoning_recent: Vec<u8>,
+    /// No content byte kept yet: leading newlines are dropped.
+    content_leading: bool,
+}
+
+impl OutputSplitter {
+    /// `start_in_tool_calls`: see [`DsmlScanner::new_in_tool_calls`].
+    pub fn new(tok_dsml: i32, start_in_tool_calls: bool) -> Self {
+        let scanner = if start_in_tool_calls { DsmlScanner::new_in_tool_calls(tok_dsml) } else { DsmlScanner::new(tok_dsml) };
+        Self {
+            scanner,
+            tok_dsml,
+            reasoning_done: false,
+            reasoning_leading: true,
+            reasoning_held: Vec::new(),
+            reasoning_recent: Vec::new(),
+            content_leading: true,
+        }
+    }
+
+    pub fn scanner(&self) -> &DsmlScanner {
+        &self.scanner
+    }
+
+    pub fn push(&mut self, token_id: i32, bytes: &[u8], reasoning: bool) -> Vec<SplitEvent> {
+        let mut out = Vec::new();
+        if reasoning && !self.reasoning_done {
+            if token_id == self.tok_dsml && self.reasoning_held.ends_with(b"<") {
+                // A tool call straight out of the reasoning; the newlines
+                // before its opener are dropped.
+                let run = self.reasoning_held.len() - 1;
+                let keep = run - newlines_skipped_before(&self.reasoning_recent, run, DSML_OPENER);
+                if keep > 0 {
+                    out.push(SplitEvent::Reasoning(self.reasoning_held[..keep].to_vec()));
+                }
+                self.reasoning_held.clear();
+                self.reasoning_done = true;
+                self.content_leading = false;
+                self.feed_scanner(SYNTHETIC_TOKEN, b"<", &mut out);
+                self.feed_scanner(token_id, bytes, &mut out);
+            } else {
+                // Includes a stray DSML token: the reference reads its bytes
+                // as reasoning text.
+                self.push_reasoning(bytes, &mut out);
+            }
+            return out;
+        }
+        if !self.reasoning_done {
+            // First content: the reasoning ended with `</think>`. Newlines
+            // directly before it are dropped; a held `<` (and the newlines
+            // before it) was reasoning text after all.
+            self.reasoning_done = true;
+            let held = std::mem::take(&mut self.reasoning_held);
+            if held.ends_with(b"<") {
+                out.push(SplitEvent::Reasoning(held));
+            } else {
+                let keep = held.len() - newlines_skipped_before(&self.reasoning_recent, held.len(), THINK_CLOSER);
+                if keep > 0 {
+                    out.push(SplitEvent::Reasoning(held[..keep].to_vec()));
+                }
+            }
+        }
+        let mut bytes = bytes;
+        if self.content_leading && token_id != self.tok_dsml {
+            let n = bytes.iter().take_while(|&&b| b == b'\n').count();
+            bytes = &bytes[n..];
+            if bytes.is_empty() {
+                return out;
+            }
+        }
+        self.content_leading = false;
+        self.feed_scanner(token_id, bytes, &mut out);
+        out
+    }
+
+    /// End of the stream (`length_cut`: see [`DsmlScanner::finish`]).
+    pub fn finish(&mut self, length_cut: bool) -> Vec<SplitEvent> {
+        let mut out = Vec::new();
+        if !self.reasoning_held.is_empty() {
+            out.push(SplitEvent::Reasoning(std::mem::take(&mut self.reasoning_held)));
+        }
+        out.extend(self.scanner.finish(length_cut).into_iter().map(SplitEvent::Dsml));
+        out
+    }
+
+    fn push_reasoning(&mut self, bytes: &[u8], out: &mut Vec<SplitEvent>) {
+        for &b in bytes {
+            if self.reasoning_leading && b == b'\n' {
+                continue;
+            }
+            self.reasoning_leading = false;
+            self.reasoning_held.push(b);
+        }
+        let h = &self.reasoning_held;
+        let mut keep = h.len();
+        if keep > 0 && h[keep - 1] == b'<' {
+            keep -= 1;
+        }
+        while keep > 0 && h[keep - 1] == b'\n' {
+            keep -= 1;
+        }
+        if keep > 0 {
+            let emit: Vec<u8> = self.reasoning_held.drain(..keep).collect();
+            note_recent(&mut self.reasoning_recent, &emit);
+            out.push(SplitEvent::Reasoning(emit));
+        }
+    }
+
+    fn feed_scanner(&mut self, token_id: i32, bytes: &[u8], out: &mut Vec<SplitEvent>) {
+        out.extend(self.scanner.push_token(token_id, bytes).into_iter().map(SplitEvent::Dsml));
+    }
 }
 
 /// Convenience for the non-streaming path: take a token-id stream and
@@ -1504,7 +1737,8 @@ mod tests {
         assert_eq!(args["lines"], 3);
         assert!(ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
         let text: Vec<u8> = ev.iter().filter_map(|e| if let DsmlEvent::Text(b) = e { Some(b.clone()) } else { None }).flatten().collect();
-        assert_eq!(text, b"Reading.\n\n".to_vec(), "prose before the block");
+        // The newlines before the opener are dropped (as by the reference parser).
+        assert_eq!(text, b"Reading.".to_vec(), "prose before the block");
     }
 
     #[test]
@@ -1734,7 +1968,7 @@ mod tests {
         );
         assert!(all_calls(&ev).is_empty());
         assert!(!ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
-        assert_eq!(all_text(&ev), b"Cleaning.\n\n".to_vec());
+        assert_eq!(all_text(&ev), b"Cleaning.".to_vec());
         assert!(!sc.saw_malformed());
         assert!(sc.cut_by_length());
     }

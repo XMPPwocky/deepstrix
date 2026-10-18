@@ -22,6 +22,11 @@ pub enum Role {
     User,
     Assistant,
     Tool,
+    /// DeepSeek V4.1's `latest_reminder` role (`<｜latest_reminder｜>content`),
+    /// accepted by DeepSeek's reference Chat Completions adapter
+    /// (deepseek-recipe). V4.1 only: the V4-Flash renderer rejects it.
+    #[serde(rename = "latest_reminder")]
+    LatestReminder,
 }
 
 /// A single message in the conversation. OpenAI permits `content` to be
@@ -359,9 +364,15 @@ fn parse_content_parts(
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolCall {
     pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String, // "function"
+    /// "function". Optional on input, as in DeepSeek's reference adapter
+    /// (deepseek-recipe ignores it); always serialized.
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String,
     pub function: ToolCallFunction,
+}
+
+fn function_kind() -> String {
+    "function".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -436,9 +447,12 @@ pub struct ChatCompletionRequest {
     /// `prompt::ReasoningEffort::from_request_fields_with_default`:
     ///   ""|"none"|"off"|"disabled"|"false" → Off (no `<think>` phase)
     ///   absent/null                        → the operator default
-    ///                                        (`prompt::DEFAULT_EFFORT` =
-    ///                                        Low, overridable with
+    ///                                        (`prompt::SERVER_DEFAULT_EFFORT`:
+    ///                                        V4.1 High, V4-Flash Low;
+    ///                                        overridable with
     ///                                        `--default-reasoning-effort`)
+    /// (V4.1: `prompt_v41::request_thinking_v41` maps the level to the 1..=100
+    /// budget; an explicit `thinking` wins over it.)
     ///   "low"                              → Low (think on, no preamble)
     ///   "medium"|"high"|"xhigh"            → High (0731 "high" preamble)
     ///   "max"                              → Max  (0731 "max" preamble)
@@ -487,6 +501,41 @@ pub struct ChatCompletionRequest {
     /// JSON so an int bias (OpenAI's own examples) is not a 422.
     #[serde(default)]
     pub logit_bias: Option<serde_json::Map<String, serde_json::Value>>,
+    /// DeepSeek's thinking switch (`{"type": "enabled"|"adaptive"|"disabled"}`):
+    /// wins over `reasoning_effort` (V4.1, `prompt_v41::request_thinking_v41`).
+    #[serde(default)]
+    pub thinking: Option<ThinkingSpec>,
+    /// OpenAI `tool_choice`: "none" | "auto" | "required" |
+    /// `{"type": "function", "function": {"name": …}}`; validated and applied
+    /// by `prompt_v41` (V4.1; the V4-Flash path ignores it).
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI `response_format`: `json_object` adds the reference's response
+    /// format block to the system prompt; `text` / `json_schema` are accepted
+    /// and ignored; `regex` is rejected (V4.1; the V4-Flash path ignores it).
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
+}
+
+/// The request's `thinking` object.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThinkingSpec {
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Accepted, unused (as in the reference).
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
+}
+
+impl ThinkingSpec {
+    /// `enabled` / `adaptive` -> on, `disabled` -> off.
+    pub fn enabled(&self) -> Result<bool, String> {
+        match self.kind.as_str() {
+            "enabled" | "adaptive" => Ok(true),
+            "disabled" => Ok(false),
+            other => Err(format!("thinking.type {other:?}: expected enabled, adaptive or disabled")),
+        }
+    }
 }
 
 /// OpenAI `stop`: one string or an array of strings.
