@@ -112,9 +112,6 @@ pub fn stripe_plan(span: usize, cut: usize, stripes: usize) -> Vec<(usize, usize
     out
 }
 
-/// `hedge_handles`: data blocks (plus the last) compared between a shard and its mirror copy before hedging on it.
-pub const HEDGE_SAMPLE_BLOCKS: u64 = 16;
-
 pub struct SafetensorsDir {
     dir: PathBuf,
     files: Vec<Arc<File>>,
@@ -122,21 +119,28 @@ pub struct SafetensorsDir {
     /// `None` where the filesystem refused the flag. See that method for why.
     direct_files: Vec<Option<Arc<File>>>,
     /// `V41_EXPERT_MIRROR_DIR`: a second copy of the checkpoint on another
-    /// drive; per shard an `O_DIRECT` handle to the same-named file there
-    /// (None when absent). `read_range_into_direct_split` reads the tail of a
-    /// range from it concurrently with the head from `direct_files`, so ONE
-    /// expert miss is served by two drives (box 2, 2026-09-22).
+    /// drive; per shard an `O_DIRECT` handle to the same-named file there.
+    /// `read_range_into_direct_split` reads the tail of a range from it
+    /// concurrently with the head from `direct_files`, so ONE expert miss is
+    /// served by two drives (box 2, 2026-09-22). `None` when absent OR not a
+    /// copy of this shard (`crate::mirror_check`: identity, size, header,
+    /// sampled data -- never on size alone).
     mirror_files: Vec<Option<Arc<File>>>,
-    /// `V41_EXPERT_MIRROR_DIR` as opened (`hedge_handles` opens its own handles there).
-    mirror_dir: Option<PathBuf>,
     shard_names: Vec<String>,
     tensors: HashMap<String, StTensor>,
 }
 
 impl SafetensorsDir {
     /// Open every shard named by `model.safetensors.index.json` (or the single
-    /// `model.safetensors`) and parse all headers. Cheap: headers only.
+    /// `model.safetensors`) and parse all headers. Cheap: headers only (plus,
+    /// with `V41_EXPERT_MIRROR_DIR`, the mirror verification of
+    /// `crate::mirror_check`: two headers and a few 64 KiB samples per shard).
     pub fn open(dir: impl AsRef<Path>) -> eyre::Result<Self> {
+        Self::open_with_mirror(dir, std::env::var_os("V41_EXPERT_MIRROR_DIR").map(PathBuf::from))
+    }
+
+    /// `open` with the mirror dir given explicitly (`None` = no mirror) instead of read from `V41_EXPERT_MIRROR_DIR`.
+    pub fn open_with_mirror(dir: impl AsRef<Path>, mirror_dir: Option<PathBuf>) -> eyre::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let index_path = dir.join("model.safetensors.index.json");
         let shard_names: Vec<String> = if index_path.exists() {
@@ -166,7 +170,9 @@ impl SafetensorsDir {
 
         let mut files = Vec::with_capacity(shard_names.len());
         let mut direct_files: Vec<Option<Arc<File>>> = Vec::with_capacity(shard_names.len());
-        let mirror_dir: Option<std::path::PathBuf> = std::env::var_os("V41_EXPERT_MIRROR_DIR").map(std::path::PathBuf::from);
+        // The mirror must be the SAME checkpoint: a refused dir (HF identity / config / index) has no shard handles.
+        let mirror_ok = mirror_dir.as_ref().map(|m| crate::mirror_check::verify_dirs(&dir, m, shard_names.len()).is_ok());
+        let (mut mirror_missing, mut mirror_differs) = (0usize, 0usize);
         let mut mirror_files: Vec<Option<Arc<File>>> = Vec::with_capacity(shard_names.len());
         let mut tensors = HashMap::new();
         for (shard, sname) in shard_names.iter().enumerate() {
@@ -241,18 +247,50 @@ impl SafetensorsDir {
                     .ok()
                     .map(Arc::new),
             );
-            mirror_files.push(mirror_dir.as_ref().and_then(|d| {
-                let mp = d.join(path.file_name()?);
-                // Same size, or it is not a copy of this shard.
-                let same = std::fs::metadata(&mp).ok()?.len() == std::fs::metadata(&path).ok()?.len();
-                same.then(|| std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&mp).ok()).flatten().map(Arc::new)
-            }));
+            mirror_files.push(match (mirror_dir.as_ref(), mirror_ok) {
+                (Some(d), Some(true)) => {
+                    let mp = d.join(sname);
+                    match crate::mirror_check::verify_shard(&path, &mp) {
+                        crate::mirror_check::Verdict::Same => match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&mp) {
+                            Ok(f) => Some(Arc::new(f)),
+                            Err(e) => {
+                                eprintln!("safetensors: expert mirror {} verified but its O_DIRECT open failed ({e}): this shard reads the primary only", mp.display());
+                                None
+                            }
+                        },
+                        crate::mirror_check::Verdict::Missing => {
+                            mirror_missing += 1;
+                            None
+                        }
+                        crate::mirror_check::Verdict::Differs(_) => {
+                            mirror_differs += 1;
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            });
             files.push(Arc::new(f));
         }
-        if mirror_dir.is_some() {
-            eprintln!("safetensors: expert mirror {} shards of {} usable from {}", mirror_files.iter().filter(|m| m.is_some()).count(), shard_names.len(), mirror_dir.as_ref().unwrap().display());
+        if let Some(m) = mirror_dir.as_ref() {
+            let (acc, mis, miss) = crate::mirror_check::counters();
+            let usable = mirror_files.iter().filter(|m| m.is_some()).count();
+            eprintln!(
+                "safetensors: expert mirror {usable} shards of {} usable from {} ({}; process counters: accepted {acc} mismatched {mis} missing {miss})",
+                shard_names.len(),
+                m.display(),
+                match mirror_ok {
+                    Some(false) => "WHOLE MIRROR REJECTED: not the same checkpoint".to_string(),
+                    _ => format!(
+                        "verified: identity, size, header, {} x {} KiB samples; {mirror_differs} REJECTED as not a copy, {} missing",
+                        crate::mirror_check::SAMPLES,
+                        crate::mirror_check::SAMPLE_BYTES >> 10,
+                        mirror_missing
+                    ),
+                }
+            );
         }
-        Ok(Self { dir, files, direct_files, mirror_files, mirror_dir, shard_names, tensors })
+        Ok(Self { dir, files, direct_files, mirror_files, shard_names, tensors })
     }
 
     pub fn dir(&self) -> &Path {
@@ -622,56 +660,12 @@ impl SafetensorsDir {
     }
 
     /// HEDGED READS (`crate::hedge`): OWNED handles for shard `shard` -- the primary's BUFFERED handle (shared) and
-    /// a fresh O_DIRECT handle on the mirror's same-named file -- that detached hedge threads can keep past the caller.
-    /// `None` without a mirror dir, or when the mirror file's size, safetensors HEADER bytes or any of
-    /// `HEDGE_SAMPLE_BLOCKS + 1` sampled 4 KiB data blocks differ from the primary's (then it is not a copy of this shard
-    /// and must never answer for it).
+    /// the mirror's O_DIRECT handle -- that detached hedge threads can keep past the caller. `None` without a mirror
+    /// for this shard: the same handle every other mirror read uses, so it exists only when `crate::mirror_check`
+    /// accepted the shard at open (identity, size, header, sampled data).
     pub fn hedge_handles(&self, shard: usize) -> eyre::Result<Option<(std::sync::Arc<File>, std::sync::Arc<File>)>> {
-        let Some(dir) = self.mirror_dir.as_ref() else { return Ok(None) };
-        let name = self.shard_names.get(shard).ok_or_else(|| eyre!("hedge: no shard {shard}"))?;
-        let (pp, mp) = (self.dir.join(name), dir.join(name));
-        let same_size = matches!((std::fs::metadata(&pp), std::fs::metadata(&mp)), (Ok(a), Ok(b)) if a.len() == b.len());
-        if !same_size {
-            return Ok(None);
-        }
-        let header = |path: &Path| -> eyre::Result<Vec<u8>> {
-            let mut f = File::open(path).wrap_err_with(|| format!("open {}", path.display()))?;
-            let mut n = [0u8; 8];
-            f.read_exact(&mut n)?;
-            let n = u64::from_le_bytes(n);
-            if n > 256 << 20 {
-                return Err(eyre!("{}: header length {n} is implausible", path.display()));
-            }
-            let mut h = vec![0u8; 8 + n as usize];
-            h[..8].copy_from_slice(&n.to_le_bytes());
-            f.read_exact(&mut h[8..])?;
-            Ok(h)
-        };
-        if header(&pp)? != header(&mp)? {
-            eprintln!("hedge: {} differs from its mirror's header; no hedged reads for it", name);
-            return Ok(None);
-        }
-        // DATA too: `HEDGE_SAMPLE_BLOCKS` 4 KiB blocks at fixed offsets spread over the file (and its last block) must
-        // be byte-identical (buffered reads: one-off, at open).
-        let len = std::fs::metadata(&pp)?.len();
-        if len >= 4096 {
-            let (fa, fb) = (File::open(&pp)?, File::open(&mp)?);
-            let (mut a, mut b) = (vec![0u8; 4096], vec![0u8; 4096]);
-            let blocks = (len - 4096) / 4096;
-            for k in 0..=HEDGE_SAMPLE_BLOCKS {
-                let off = if k == HEDGE_SAMPLE_BLOCKS { len - 4096 } else { (blocks * k / HEDGE_SAMPLE_BLOCKS) * 4096 };
-                fa.read_exact_at(&mut a, off)?;
-                fb.read_exact_at(&mut b, off)?;
-                if a != b {
-                    eprintln!("hedge: {} differs from its mirror at byte {off}; no hedged reads for it", name);
-                    return Ok(None);
-                }
-            }
-        }
-        let Ok(mirror) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&mp) else {
-            return Ok(None);
-        };
-        Ok(Some((self.files[shard].clone(), Arc::new(mirror))))
+        let primary = self.files.get(shard).ok_or_else(|| eyre!("hedge: no shard {shard}"))?;
+        Ok(self.mirror_files.get(shard).cloned().flatten().map(|m| (primary.clone(), m)))
     }
 
     /// Tell the kernel this tensor's byte range is read RANDOMLY, so it stops
@@ -796,9 +790,22 @@ impl SafetensorsDir {
         matches!(self.mirror_files.get(shard), Some(Some(_)))
     }
 
-    /// Every shard has a usable mirror handle (same name, same size, O_DIRECT).
+    /// Every shard has a usable mirror handle (same name, verified a copy by `crate::mirror_check`, O_DIRECT).
     pub fn mirror_complete(&self) -> bool {
         !self.mirror_files.is_empty() && self.mirror_files.iter().all(|m| m.is_some())
+    }
+
+    /// Every shard holding a ROUTED-EXPERT tensor (`.ffn.experts.` in its name) has a verified mirror handle: what a
+    /// mirror-only expert read (box 2's `route=urgency`) needs. A partial mirror without the expert-free shards (the
+    /// Engram tables) qualifies; `false` when no shard holds an expert.
+    pub fn mirror_covers_experts(&self) -> bool {
+        let mut need = vec![false; self.mirror_files.len()];
+        for t in self.tensors.values() {
+            if t.name.contains(".ffn.experts.") {
+                need[t.shard] = true;
+            }
+        }
+        need.iter().any(|&n| n) && need.iter().zip(&self.mirror_files).all(|(&n, m)| !n || m.is_some())
     }
 
     /// `read_range_into_direct_padded`, with the range split at a 4096-aligned

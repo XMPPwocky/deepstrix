@@ -3002,7 +3002,8 @@ fn log_hedges(step: u64) {
     }
     tracing::info!(steps = HEDGE_LOG_STEPS, engram_calls = de[0], engram_fired = de[1], engram_chunks = de[2], engram_won_primary = de[3],
         engram_won_mirror = de[4], engram_rescued = de[5], engram_cap_skips = de[6], expert_calls = dx[0], expert_fired = dx[1],
-        expert_won_primary = dx[3], expert_won_mirror = dx[4], expert_rescued = dx[5], expert_cap_skips = dx[6], "b1 hedged reads");
+        expert_won_primary = dx[3], expert_won_mirror = dx[4], expert_rescued = dx[5], expert_cap_skips = dx[6],
+        mirror_shards_mismatched = v4flash_core::mirror_check::counters().1, "b1 hedged reads");
 }
 
 /// The image spans of the saved prefix `[0, n)`. A cut that straddles an image

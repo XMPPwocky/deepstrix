@@ -1337,6 +1337,14 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
             pg.start_late_reader(std::path::Path::new(&cfg.gguf_path), env_n("V41_PREFILL_COLD_READERS", 8), env_n("V41_PREFILL_COLD_STAGES", 0))?;
         }
         tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "expert pager ready");
+        if std::env::var_os("V41_EXPERT_MIRROR_DIR").is_some() {
+            let (accepted, mismatched, missing) = v4flash_core::mirror_check::counters();
+            if mismatched > 0 {
+                tracing::warn!(accepted, mismatched, missing, "expert mirror: {mismatched} shards are NOT a copy of the primary (MIRROR REJECTED lines above); they read the primary only");
+            } else {
+                tracing::info!(accepted, mismatched, missing, "expert mirror verified against the primary");
+            }
+        }
         Some(pg)
     } else {
         None

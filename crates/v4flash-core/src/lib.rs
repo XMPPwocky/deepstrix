@@ -16,6 +16,7 @@ pub mod heap;
 pub mod iq3_s_ref;
 pub mod kquants;
 pub mod mapped;
+pub mod mirror_check;
 pub mod qwen3_embed;
 pub mod safetensors;
 pub mod tokenizer;

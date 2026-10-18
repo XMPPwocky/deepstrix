@@ -570,7 +570,12 @@ pub async fn readyz(
     } else {
         (
             StatusCode::OK,
-            format!("ok inflight={inflight} stale_ms={stale_ms}\n"),
+            // `v4flash_core::mirror_check`: expert-mirror shards refused as not a copy of the primary (nonzero = a
+            // stale or half-copied mirror; those shards read the primary only) and absent from the mirror dir.
+            {
+                let (_, mis, miss) = v4flash_core::mirror_check::counters();
+                format!("ok inflight={inflight} stale_ms={stale_ms} mirror_mismatched={mis} mirror_missing={miss}\n")
+            },
         )
             .into_response()
     }

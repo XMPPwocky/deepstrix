@@ -1,6 +1,10 @@
 //! Box 2's drive routing, on a synthetic checkpoint (no model needed): a
 //! `model.safetensors` with two U8 tensors and a same-size MIRROR copy holding
-//! DIFFERENT bytes, so every read proves which drive it came from.
+//! DIFFERENT bytes in them, so every read proves which drive it came from.
+//! The mirror must still pass `mirror_check` (it is used only when it is a copy
+//! of the primary): x and y sit between its sampled windows, filler tensors
+//! around them are identical, so this mirror differs exactly where the check
+//! does not look (the sampling's blind spot, made explicit).
 //! `read_range_into_direct_split` at exactly 1 / 0 must read wholly from the
 //! mirror / primary (no clamped block on the other side); in between, a
 //! 4096-aligned head from the primary and the tail from the mirror; the small
@@ -26,22 +30,32 @@ impl Drop for Aligned { fn drop(&mut self) { unsafe { std::alloc::dealloc(self.p
 const NX: usize = 7 * 4096 + 123; // split path, not block-aligned
 const NY: usize = 3000; // < 2 blocks: the unsplit small-read path
 
-/// `model.safetensors` with tensors x (NX bytes) then y (NY bytes); data byte
-/// i (over both) = f(i).
+/// Data bytes before x (x then starts unaligned, past the first sampled window) and in total.
+const PRE: usize = (64 << 10) + 8192 + 123;
+const TOTAL: usize = 8 << 20;
+/// Fixed header length (padded), so the data starts at 4096.
+const HDR: usize = 4096 - 8;
+
+/// `model.safetensors` with tensors pre, x (NX bytes), y (NY bytes), post; byte
+/// i of x then y = f(i); pre / post hold the same filler in every copy.
 fn write_st(dir: &std::path::Path, f: impl Fn(usize) -> u8) {
     std::fs::create_dir_all(dir).unwrap();
+    let (x0, y0, p0) = (PRE, PRE + NX, PRE + NX + NY);
     let mut header = format!(
-        r#"{{"x":{{"dtype":"U8","shape":[{NX}],"data_offsets":[0,{NX}]}},"y":{{"dtype":"U8","shape":[{NY}],"data_offsets":[{NX},{}]}}}}"#,
-        NX + NY
+        r#"{{"pre":{{"dtype":"U8","shape":[{PRE}],"data_offsets":[0,{x0}]}},"x":{{"dtype":"U8","shape":[{NX}],"data_offsets":[{x0},{y0}]}},"y":{{"dtype":"U8","shape":[{NY}],"data_offsets":[{y0},{p0}]}},"post":{{"dtype":"U8","shape":[{}],"data_offsets":[{p0},{TOTAL}]}}}}"#,
+        TOTAL - p0
     )
     .into_bytes();
-    while header.len() % 8 != 0 {
-        header.push(b' ');
-    }
+    assert!(header.len() <= HDR);
+    header.resize(HDR, b' ');
     let mut out = (header.len() as u64).to_le_bytes().to_vec();
     out.extend_from_slice(&header);
-    out.extend((0..NX + NY).map(f));
+    out.extend((0..TOTAL).map(|i| if (x0..p0).contains(&i) { f(i - x0) } else { (i * 13 % 241) as u8 }));
     std::fs::write(dir.join("model.safetensors"), out).unwrap();
+    // x and y lie outside every sampled window: the mirror passes the check.
+    let wins = v4flash_core::mirror_check::sample_windows((8 + HDR) as u64, (8 + HDR + TOTAL) as u64);
+    let (lo, hi) = ((8 + HDR + x0) as u64, (8 + HDR + p0) as u64);
+    assert!(wins.iter().all(|&w| w + v4flash_core::mirror_check::SAMPLE_BYTES as u64 <= lo || w >= hi), "x/y overlap a sampled window: {wins:?}");
 }
 
 fn fp(i: usize) -> u8 { (i % 251) as u8 }
@@ -53,8 +67,7 @@ fn drive_routing_reads_the_right_drive() {
     let (prim, mirr) = (base.join("primary"), base.join("mirror"));
     write_st(&prim, fp);
     write_st(&mirr, fm);
-    std::env::set_var("V41_EXPERT_MIRROR_DIR", &mirr);
-    let st = SafetensorsDir::open(&prim).expect("open");
+    let st = SafetensorsDir::open_with_mirror(&prim, Some(mirr.clone())).expect("open");
     let x = st.get("x").expect("tensor x");
     let y = st.get("y").expect("tensor y");
     let mut buf = Aligned::new(SafetensorsDir::direct_capacity_for(NX));
@@ -66,7 +79,7 @@ fn drive_routing_reads_the_right_drive() {
         let _ = std::fs::remove_dir_all(&base);
         return;
     };
-    assert!(st.has_mirror(x.shard), "mirror not picked up (same size, same name)");
+    assert!(st.has_mirror(x.shard), "mirror not picked up (same size, header and sampled data)");
     assert_eq!(&buf.as_ref()[pad..pad + NX], &want(fp, 0, NX)[..], "padded: primary bytes");
     // Mirror, unsplit (the scale plane under mirror_only).
     buf.as_mut().fill(0);
@@ -101,8 +114,7 @@ fn drive_routing_reads_the_right_drive() {
     }
 
     // NO mirror: every route falls back to the primary.
-    std::env::remove_var("V41_EXPERT_MIRROR_DIR");
-    let st2 = SafetensorsDir::open(&prim).expect("open without mirror");
+    let st2 = SafetensorsDir::open_with_mirror(&prim, None).expect("open without mirror");
     let x2 = st2.get("x").unwrap();
     assert!(!st2.has_mirror(x2.shard));
     buf.as_mut().fill(0);

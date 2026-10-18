@@ -158,7 +158,7 @@ impl DirectFiles {
 }
 
 /// Open `p` with O_DIRECT, or buffered when the filesystem refuses it.
-fn open_direct(p: &Path) -> eyre::Result<(File, bool)> {
+pub(crate) fn open_direct(p: &Path) -> eyre::Result<(File, bool)> {
     match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(p) {
         Ok(f) => Ok((f, true)),
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
@@ -171,7 +171,7 @@ fn open_direct(p: &Path) -> eyre::Result<(File, bool)> {
 
 /// pread until `dst` is full or EOF (an aligned span may end past EOF; the
 /// tail stays as it was).
-fn read_full(f: &File, mut off: u64, dst: &mut [u8]) -> eyre::Result<()> {
+pub(crate) fn read_full(f: &File, mut off: u64, dst: &mut [u8]) -> eyre::Result<()> {
     let mut at = 0;
     while at < dst.len() {
         match f.read_at(&mut dst[at..], off) {
