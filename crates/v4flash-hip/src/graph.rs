@@ -137,7 +137,7 @@ impl GraphExec {
     pub fn launch(&self, stream: &Stream) -> eyre::Result<()> {
         crate::ring::record(
             stream.device_id(),
-            "graph launch",
+            crate::ring::K_GRAPH_LAUNCH,
             Some(std::panic::Location::caller()),
             stream.raw() as usize,
             [0, 0],
@@ -168,7 +168,7 @@ impl GraphExec {
         let b = &params.blockDim;
         crate::ring::record(
             self.device_id,
-            "graph set kernel params",
+            crate::ring::K_GRAPH_SET_PARAMS,
             Some(std::panic::Location::caller()),
             0,
             crate::ring::launch_dims((g.x, g.y, g.z), (b.x, b.y, b.z)),

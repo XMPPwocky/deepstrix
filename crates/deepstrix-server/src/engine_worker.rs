@@ -552,7 +552,9 @@ fn unix_now_ms() -> i64 {
 /// responses, then the process exits with `HIP_FATAL_EXIT_CODE` (ring dumped) for the supervisor to relaunch. A no-op
 /// without a sticky error, or in a process that did not `install_exit_on_fatal` (tests, tools).
 pub(crate) fn exit_if_hip_fatal(where_: &str) {
-    if v4flash_hip::fatal::get().is_some() && v4flash_hip::fatal::exit_on_fatal_installed() {
+    if let (Some(f), true) = (v4flash_hip::fatal::get(), v4flash_hip::fatal::exit_on_fatal_installed()) {
+        // The greppable marker again, BEFORE the grace (the first one was printed when the error was seen).
+        eprintln!("{} in=300ms reason=\"{where_}\"", v4flash_hip::fatal::marker(f, true));
         std::thread::sleep(Duration::from_millis(300));
         v4flash_hip::fatal::exit_now(where_);
     }

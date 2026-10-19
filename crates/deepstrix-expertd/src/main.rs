@@ -160,12 +160,22 @@ fn main() -> eyre::Result<()> {
     // file (`V41_KNOBS_FILE`, else `V41_B2_KNOBS` / ~/expertd-knobs.txt) every
     // second, SIGUSR2 at once. Before anything reads a knob.
     // Plus the kernel knobs box 2's own MoE reads, so they are LIVE here too (box 2's knob file): the f16-WMMA MXFP4 arm.
-    static KERNEL_KNOBS: [&v4flash_kernels::knobs::Knob; 1] = [&v4flash_kernels::knobs::MOE_WMMA_F16];
+    // And the pointer-registry mode (`V41_PTR_REGISTRY`, default warn, live) + the on-demand ring dump.
+    static KERNEL_KNOBS: [&v4flash_kernels::knobs::Knob; 3] = [
+        &v4flash_kernels::knobs::MOE_WMMA_F16,
+        &v4flash_kernels::knobs::PTR_REGISTRY,
+        &v4flash_kernels::knobs::HIP_RING_DUMP,
+    ];
     v4flash_kernels::knobs::start_with(
         &[v4flash_kernels::het::remote_experts::knobs::ALL, &KERNEL_KNOBS],
         Some(v4flash_kernels::het::remote_experts::knobs::path()),
         true,
     );
+    // Sticky HIP errors: recorded and logged always; exit only when asked (no supervisor on box 2).
+    if v4flash_kernels::het::remote_experts::knobs::HIP_FATAL_EXIT.on() {
+        v4flash_hip::fatal::install_exit_on_fatal(5000);
+        eprintln!("expertd: V41_B2_HIP_FATAL_EXIT=1 -- a sticky HIP error exits rc {}", v4flash_hip::fatal::HIP_FATAL_EXIT_CODE);
+    }
     // A frequency-ranked placement file beats a contiguous id range by a wide
     // margin on V4.1 (Zipfian routing); see `Assignment::from_placement_file`.
     let asg = match args.experts_file.as_deref() {

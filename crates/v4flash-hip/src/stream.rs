@@ -130,7 +130,7 @@ impl Stream {
     pub unsafe fn wait_value32_gte(&self, ptr: *mut u32, value: u32) -> eyre::Result<()> {
         let loc = std::panic::Location::caller();
         crate::ptr_registry::check_device("wait_value32 ptr", ptr as usize, 4, self.device_id, loc)?;
-        crate::ring::record(self.device_id, "wait value32", Some(loc), self.raw as usize, [4, 0], &[ptr as u64, value as u64]);
+        crate::ring::record(self.device_id, crate::ring::K_WAIT_VALUE32, Some(loc), self.raw as usize, [4, 0], &[ptr as u64, value as u64]);
         check_eyre(
             unsafe {
                 sys::hipStreamWaitValue32(
@@ -156,7 +156,7 @@ impl Stream {
     pub unsafe fn write_value32(&self, ptr: *mut u32, value: u32) -> eyre::Result<()> {
         let loc = std::panic::Location::caller();
         crate::ptr_registry::check_device("write_value32 ptr", ptr as usize, 4, self.device_id, loc)?;
-        crate::ring::record(self.device_id, "write value32", Some(loc), self.raw as usize, [4, 0], &[ptr as u64, value as u64]);
+        crate::ring::record(self.device_id, crate::ring::K_WRITE_VALUE32, Some(loc), self.raw as usize, [4, 0], &[ptr as u64, value as u64]);
         check_eyre(
             unsafe {
                 sys::hipStreamWriteValue32(self.raw, ptr as *mut std::ffi::c_void, value, 0)

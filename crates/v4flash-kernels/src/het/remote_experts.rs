@@ -2490,6 +2490,11 @@ pub mod knobs {
     crate::knobs! {
         /// `V41_B2_MERGE` (default on), key `merge`.
         pub static MERGE = Knob::flag("V41_B2_MERGE", true).alias("merge");
+        /// `V41_B2_HIP_FATAL_EXIT` (default OFF; STATIC): on a sticky HIP error (`v4flash_hip::fatal`) expertd exits
+        /// with rc 87 after the grace period. Off by default: box 2 runs under `nohup setsid ~/b2-dev.sh` with NO
+        /// supervisor, so exiting is a decision for whoever relaunches it; off, it records + logs the
+        /// `HIP-FATAL: ... exiting=no` marker and keeps running (every HIP call then fails).
+        pub static HIP_FATAL_EXIT = Knob::flag("V41_B2_HIP_FATAL_EXIT", false);
         /// `V41_B2_MERGE_WAIT_US` (default 400), key `merge_wait_us`.
         pub static MERGE_WAIT_US = Knob::int("V41_B2_MERGE_WAIT_US", 400, 0, MAX).alias("merge_wait_us");
         /// `V41_B2_MISS_PAR` (default 1, 1..=16), key `miss_par`.

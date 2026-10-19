@@ -3,16 +3,21 @@
 //! operations queued before it. [`dump`] prints them (the sticky-error exit in [`crate::fatal`], or on demand through
 //! the `V41_HIP_RING_DUMP` knob).
 //!
-//! Lock-free: a writer claims a slot with one `fetch_add` and writes it under a per-slot sequence number (a seqlock); a
-//! reader keeps only entries whose sequence did not move while it read them. ~17 relaxed stores + a TSC read per
-//! entry (`bench_record_ns`). `V41_HIP_RING=0` (STATIC) turns recording off.
+//! Lock-free: a writer takes a global index with one `fetch_add`, then CLAIMS its slot with a compare-exchange of the
+//! slot's sequence number from a complete OLDER entry (`2j + 2`, `j < i`) to "entry `i` being written" (`2i + 1`), and
+//! releases it as `2i + 2`. A writer that cannot claim (another writer still owns the slot, or a newer entry already
+//! landed there) DROPS its entry (`dropped`): no two writers ever store into one slot at once (review r1, 10-19). A
+//! reader keeps an entry only when the sequence was `2i + 2` before and after it read the fields. Every field is one
+//! atomic word and the kind is an interned index ([`intern`]), so even a discarded read never forms an invalid
+//! value. ~17 relaxed stores + a TSC read per entry (`bench_record_ns`). `V41_HIP_RING=0` (STATIC) turns recording off.
 //!
 //! Each entry: kind (kernel name or copy kind), grid / size, the first 8 argument words (copies: dst, src, bytes, ...),
 //! the thread's (layer, lane) context ([`scope`]), the call site's `Location`, a monotonic timestamp and the thread id.
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::panic::Location;
-use std::sync::atomic::{fence, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::LazyLock;
+use std::sync::atomic::{fence, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 /// Entries kept per device.
@@ -33,6 +38,95 @@ pub fn enabled() -> bool {
     *ON
 }
 
+// ---- interned kinds --------------------------------------------------------------------------------------------
+
+/// An entry's kind: an index into the builtin kinds or the interned kernel names.
+pub type KindId = u32;
+
+const BUILTIN: [&str; 14] = [
+    "?",
+    "HtoD",
+    "DtoH",
+    "HtoD async",
+    "DtoH async",
+    "DtoD",
+    "DtoD async",
+    "peer async",
+    "memset",
+    "memset async",
+    "graph launch",
+    "graph set kernel params",
+    "wait value32",
+    "write value32",
+];
+pub const K_UNKNOWN: KindId = 0;
+pub const K_HTOD: KindId = 1;
+pub const K_DTOH: KindId = 2;
+pub const K_HTOD_ASYNC: KindId = 3;
+pub const K_DTOH_ASYNC: KindId = 4;
+pub const K_DTOD: KindId = 5;
+pub const K_DTOD_ASYNC: KindId = 6;
+pub const K_PEER_ASYNC: KindId = 7;
+pub const K_MEMSET: KindId = 8;
+pub const K_MEMSET_ASYNC: KindId = 9;
+pub const K_GRAPH_LAUNCH: KindId = 10;
+pub const K_GRAPH_SET_PARAMS: KindId = 11;
+pub const K_WAIT_VALUE32: KindId = 12;
+pub const K_WRITE_VALUE32: KindId = 13;
+
+/// Interned names beyond the builtins (kernel symbols: a few hundred per process).
+const DYN_CAP: usize = 8192;
+static DYN: [OnceLock<&'static str>; DYN_CAP] = [const { OnceLock::new() }; DYN_CAP];
+static DYN_INDEX: Mutex<Option<HashMap<&'static str, KindId>>> = Mutex::new(None);
+
+/// The kind id of `name` (once per distinct name; a slow path: `Module::get_function`'s cache miss). Past the table's
+/// capacity the kind is recorded as `?`.
+pub fn intern(name: &'static str) -> KindId {
+    if let Some(i) = BUILTIN.iter().position(|b| *b == name) {
+        return i as KindId;
+    }
+    let mut g = DYN_INDEX.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(&id) = m.get(name) {
+        return id;
+    }
+    let slot = m.len();
+    if slot >= DYN_CAP {
+        return K_UNKNOWN;
+    }
+    // Under the lock: one setter per slot, set BEFORE the id is published.
+    let _ = DYN[slot].set(name);
+    let id = (BUILTIN.len() + slot) as KindId;
+    m.insert(name, id);
+    id
+}
+
+/// As [`intern`] for a borrowed name: copied (leaked) only the first time it is seen.
+pub fn intern_str(name: &str) -> KindId {
+    if let Some(i) = BUILTIN.iter().position(|b| *b == name) {
+        return i as KindId;
+    }
+    {
+        let g = DYN_INDEX.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(&id) = g.as_ref().and_then(|m| m.get(name)) {
+            return id;
+        }
+    }
+    intern(Box::leak(name.to_string().into_boxed_str()))
+}
+
+/// The name of a kind id (`?` for an id that was never interned).
+pub fn kind_name(id: KindId) -> &'static str {
+    let i = id as usize;
+    if i < BUILTIN.len() {
+        BUILTIN[i]
+    } else {
+        DYN.get(i - BUILTIN.len()).and_then(|c| c.get().copied()).unwrap_or("?")
+    }
+}
+
+// ---- clock -----------------------------------------------------------------------------------------------------
+
 /// The ring's clock origin: an `Instant` and the raw clock ([`ticks`]) at the same moment.
 struct Epoch {
     t0: Instant,
@@ -42,7 +136,7 @@ struct Epoch {
 static EPOCH: LazyLock<Epoch> = LazyLock::new(|| Epoch { t0: Instant::now(), ticks0: ticks() });
 
 /// The entry timestamp's raw clock: the TSC on x86-64 (invariant on this box's Zen parts; ~7 ns vs ~20 ns for
-/// `Instant::now`), nanoseconds since the epoch elsewhere. Converted at dump time ([`ticks_per_ns`]).
+/// `Instant::now`), nanoseconds since first use elsewhere. Converted at dump time ([`ticks_per_ns`]).
 #[inline(always)]
 fn ticks() -> u64 {
     #[cfg(target_arch = "x86_64")]
@@ -71,13 +165,14 @@ fn ticks_per_ns() -> f64 {
     }
 }
 
+// ---- the rings -------------------------------------------------------------------------------------------------
+
 struct Slot {
     /// `2i + 1` while entry `i` is being written, `2i + 2` once it is complete; 0 = never written.
     seq: AtomicU64,
     /// Raw clock (`ticks`), converted to ns since the epoch by `snapshot`.
     t_raw: AtomicU64,
-    kind_ptr: AtomicUsize,
-    kind_len: AtomicUsize,
+    kind: AtomicU32,
     loc: AtomicPtr<Location<'static>>,
     stream: AtomicUsize,
     dims: [AtomicU64; 2],
@@ -92,8 +187,7 @@ impl Slot {
         Slot {
             seq: AtomicU64::new(0),
             t_raw: AtomicU64::new(0),
-            kind_ptr: AtomicUsize::new(0),
-            kind_len: AtomicUsize::new(0),
+            kind: AtomicU32::new(0),
             loc: AtomicPtr::new(std::ptr::null_mut()),
             stream: AtomicUsize::new(0),
             dims: [const { AtomicU64::new(0) }; 2],
@@ -106,10 +200,13 @@ impl Slot {
 
 struct Ring {
     head: AtomicU64,
+    /// Entries a writer dropped because it could not claim its slot.
+    dropped: AtomicU64,
     slots: [Slot; RING_LEN],
 }
 
-static RINGS: [Ring; RING_DEVICES] = [const { Ring { head: AtomicU64::new(0), slots: [const { Slot::new() }; RING_LEN] } }; RING_DEVICES];
+static RINGS: [Ring; RING_DEVICES] =
+    [const { Ring { head: AtomicU64::new(0), dropped: AtomicU64::new(0), slots: [const { Slot::new() }; RING_LEN] } }; RING_DEVICES];
 
 fn ring_of(device: i32) -> usize {
     if (0..RING_DEVICES as i32 - 1).contains(&device) {
@@ -172,21 +269,26 @@ pub fn arg_word<T>(v: &T) -> u64 {
 
 /// Record one operation on `device`'s ring.
 #[inline]
-pub fn record(device: i32, kind: &'static str, loc: Option<&'static Location<'static>>, stream: usize, dims: [u64; 2], args: &[u64]) {
+pub fn record(device: i32, kind: KindId, loc: Option<&'static Location<'static>>, stream: usize, dims: [u64; 2], args: &[u64]) {
     if !enabled() {
         return;
     }
     let r = &RINGS[ring_of(device)];
     let i = r.head.fetch_add(1, Ordering::Relaxed);
     let s = &r.slots[(i % RING_LEN as u64) as usize];
-    s.seq.store(2 * i + 1, Ordering::Relaxed);
+    // Claim: the slot must hold a COMPLETE older entry (even, < 2i + 1); anything else means another writer owns it
+    // or a newer entry already landed -- drop this one rather than share the slot.
+    let prev = s.seq.load(Ordering::Relaxed);
+    if prev % 2 == 1 || prev > 2 * i || s.seq.compare_exchange(prev, 2 * i + 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        r.dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     fence(Ordering::Release);
     let (layer, lane) = ctx();
     let n = args.len().min(RING_ARGS);
     LazyLock::force(&EPOCH);
     s.t_raw.store(ticks(), Ordering::Relaxed);
-    s.kind_ptr.store(kind.as_ptr() as usize, Ordering::Relaxed);
-    s.kind_len.store(kind.len(), Ordering::Relaxed);
+    s.kind.store(kind, Ordering::Relaxed);
     s.loc.store(loc.map_or(std::ptr::null_mut(), |l| l as *const Location<'static> as *mut Location<'static>), Ordering::Relaxed);
     s.stream.store(stream, Ordering::Relaxed);
     s.dims[0].store(dims[0], Ordering::Relaxed);
@@ -216,9 +318,20 @@ pub struct Entry {
     pub tid: u64,
 }
 
-/// The entries of `device`'s ring, oldest first, and how many operations it has seen in total. Entries that were being
-/// written while this ran are skipped (`torn`).
-pub fn snapshot(device: i32) -> (Vec<Entry>, u64, usize) {
+/// What [`snapshot`] saw on one ring.
+pub struct Snapshot {
+    /// Entries, oldest first.
+    pub entries: Vec<Entry>,
+    /// Operations the ring has seen in total.
+    pub head: u64,
+    /// Entries skipped because they were being (re)written while read.
+    pub torn: usize,
+    /// Entries writers dropped (slot contention).
+    pub dropped: u64,
+}
+
+/// The entries of `device`'s ring, oldest first.
+pub fn snapshot(device: i32) -> Snapshot {
     let r = &RINGS[ring_of(device)];
     let (ticks0, tpn) = (EPOCH.ticks0, ticks_per_ns());
     let head = r.head.load(Ordering::Acquire);
@@ -233,8 +346,7 @@ pub fn snapshot(device: i32) -> (Vec<Entry>, u64, usize) {
             continue;
         }
         let t_raw = s.t_raw.load(Ordering::Relaxed);
-        let kp = s.kind_ptr.load(Ordering::Relaxed);
-        let kl = s.kind_len.load(Ordering::Relaxed);
+        let kind = s.kind.load(Ordering::Relaxed);
         let loc = s.loc.load(Ordering::Relaxed);
         let stream = s.stream.load(Ordering::Relaxed);
         let dims = [s.dims[0].load(Ordering::Relaxed), s.dims[1].load(Ordering::Relaxed)];
@@ -247,15 +359,24 @@ pub fn snapshot(device: i32) -> (Vec<Entry>, u64, usize) {
             torn += 1;
             continue;
         }
-        // SAFETY: the sequence did not move, so (kp, kl) is the pair one writer stored from a `&'static str`, and `loc`
-        // is null or a `&'static Location`.
-        let kind = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(kp as *const u8, kl)) };
+        // SAFETY: `loc` is null or a `&'static Location` some writer stored (every stored value is one).
         let loc = unsafe { loc.as_ref() };
         let unbias = |v: u64| ((v & 0xff_ffff) as i32) - 1;
         let t_ns = (t_raw.saturating_sub(ticks0) as f64 / tpn) as u64;
-        out.push(Entry { index: i, t_ns, kind, loc, stream, dims, args, layer: unbias(meta >> 16), lane: unbias(meta >> 40), tid });
+        out.push(Entry {
+            index: i,
+            t_ns,
+            kind: kind_name(kind),
+            loc,
+            stream,
+            dims,
+            args,
+            layer: unbias(meta >> 16),
+            lane: unbias(meta >> 40),
+            tid,
+        });
     }
-    (out, head, torn)
+    Snapshot { entries: out, head, torn, dropped: r.dropped.load(Ordering::Relaxed) }
 }
 
 fn fmt_entry(e: &Entry, now_ns: u64) -> String {
@@ -279,6 +400,23 @@ fn fmt_entry(e: &Entry, now_ns: u64) -> String {
     )
 }
 
+fn ring_name(d: i32) -> String {
+    if d == RING_DEVICES as i32 - 1 { "other".to_string() } else { format!("dev{d}") }
+}
+
+/// The last `n` entries of `device`'s ring (the pointer registry's warn-mode reports). Takes no registry lock.
+pub fn tail_string(device: i32, n: usize) -> String {
+    let now = EPOCH.t0.elapsed().as_nanos() as u64;
+    let snap = snapshot(device);
+    let es = &snap.entries[snap.entries.len().saturating_sub(n)..];
+    let mut s = format!("ring {} (last {} of {} ops):", ring_name(ring_of(device) as i32), es.len(), snap.head);
+    for e in es {
+        s.push_str("\n    ");
+        s.push_str(&fmt_entry(e, now));
+    }
+    s
+}
+
 /// The dump text (every non-empty ring), oldest entry first per ring.
 pub fn dump_string(reason: &str) -> String {
     let now = EPOCH.t0.elapsed().as_nanos() as u64;
@@ -287,13 +425,19 @@ pub fn dump_string(reason: &str) -> String {
         crate::ptr_registry::live_count()
     );
     for d in 0..RING_DEVICES as i32 {
-        let (es, head, torn) = snapshot(d);
-        if head == 0 {
+        let snap = snapshot(d);
+        if snap.head == 0 {
             continue;
         }
-        let name = if d == RING_DEVICES as i32 - 1 { "other".to_string() } else { format!("dev{d}") };
-        s.push_str(&format!("  ring {name}: {head} ops total, {} shown, {torn} torn (being written)\n", es.len()));
-        for e in &es {
+        s.push_str(&format!(
+            "  ring {}: {} ops total, {} shown, {} torn (being written), {} dropped (slot contention)\n",
+            ring_name(d),
+            snap.head,
+            snap.entries.len(),
+            snap.torn,
+            snap.dropped
+        ));
+        for e in &snap.entries {
             s.push_str("    ");
             s.push_str(&fmt_entry(e, now));
             s.push('\n');
@@ -316,21 +460,21 @@ pub fn launch_dims(grid: (u32, u32, u32), block: (u32, u32, u32)) -> [u64; 2] {
 mod tests {
     use super::*;
 
-    /// The tests own ring index 7 (device 7 is never used by a test that records otherwise).
+    /// The tests own ring 7 (wraparound) and ring 5 (stress); nothing else records there in this process.
     #[test]
     fn wraparound_keeps_the_last_entries_in_order() {
         let dev = 7;
         let _g = scope(12, 1);
         let here = Location::caller();
+        let (even, odd) = (intern("even_kernel"), intern("odd copy"));
         let total = RING_LEN as u64 * 3 + 5;
         for i in 0..total {
-            record(dev, if i % 2 == 0 { "even_kernel" } else { "odd copy" }, Some(here), 0x1234, [i, 0], &[i, i + 1, 0xdead]);
+            record(dev, if i % 2 == 0 { even } else { odd }, Some(here), 0x1234, [i, 0], &[i, i + 1, 0xdead]);
         }
-        let (es, head, torn) = snapshot(dev);
-        assert_eq!(head, total);
-        assert_eq!(torn, 0);
-        assert_eq!(es.len(), RING_LEN);
-        for (k, e) in es.iter().enumerate() {
+        let snap = snapshot(dev);
+        assert_eq!((snap.head, snap.torn, snap.dropped), (total, 0, 0));
+        assert_eq!(snap.entries.len(), RING_LEN);
+        for (k, e) in snap.entries.iter().enumerate() {
             let i = total - RING_LEN as u64 + k as u64;
             assert_eq!(e.index, i);
             assert_eq!(e.dims[0], i);
@@ -339,9 +483,68 @@ mod tests {
             assert_eq!((e.layer, e.lane), (12, 1));
             assert_eq!(e.loc.unwrap().line(), here.line());
         }
-        assert!(es.windows(2).all(|w| w[0].t_ns <= w[1].t_ns), "monotonic timestamps");
+        assert!(snap.entries.windows(2).all(|w| w[0].t_ns <= w[1].t_ns), "monotonic timestamps");
         let text = dump_string("test");
         assert!(text.contains("ring dev7") && text.contains("L12/lane1 odd copy") && text.contains("args [0x"), "{text}");
+        assert!(tail_string(dev, 2).contains("last 2 of"), "{}", tail_string(dev, 2));
+    }
+
+    #[test]
+    fn interning() {
+        assert_eq!(kind_name(K_HTOD_ASYNC), "HtoD async");
+        assert_eq!(intern("memset"), K_MEMSET, "builtins resolve to their constants");
+        let a = intern("ring_test_kernel_a");
+        assert_eq!(intern("ring_test_kernel_a"), a, "one id per name");
+        assert_ne!(intern("ring_test_kernel_b"), a);
+        assert_eq!(kind_name(a), "ring_test_kernel_a");
+        assert_eq!(kind_name(u32::MAX), "?");
+    }
+
+    /// Many writers wrap the ring many times while a reader snapshots it: every entry the reader keeps is internally
+    /// consistent (its kind, dims, args and location all come from ONE `record` call), whatever slot contention did.
+    #[test]
+    fn concurrent_writers_never_mix_entries() {
+        let dev = 5;
+        let kinds: Vec<KindId> = (0..8).map(|k| intern(Box::leak(format!("stress_kind_{k}").into_boxed_str()))).collect();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let checked = AtomicU64::new(0);
+        std::thread::scope(|sc| {
+            let reader = sc.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    for e in snapshot(dev).entries {
+                        let (t, n, k) = (e.args[0], e.args[1], e.args[2]);
+                        assert_eq!(e.args.len(), 4, "{e:?}");
+                        assert_eq!(e.kind, kind_name(k as KindId), "{e:?}");
+                        assert_eq!(e.dims, [n, t], "{e:?}");
+                        assert_eq!(e.args[3], t * 1_000_003 + n, "{e:?}");
+                        assert_eq!(e.stream as u64, t, "{e:?}");
+                        assert_eq!((e.layer, e.lane), (t as i32, (n % 7) as i32), "{e:?}");
+                        checked.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+            let writers: Vec<_> = (0..8u64)
+                .map(|t| {
+                    let kinds = &kinds;
+                    sc.spawn(move || {
+                        for n in 0..200_000u64 {
+                            let k = kinds[((t + n) % 8) as usize];
+                            let _g = scope(t as i32, (n % 7) as i32);
+                            record(dev, k, Some(Location::caller()), t as usize, [n, t], &[t, n, k as u64, t * 1_000_003 + n]);
+                        }
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.join().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            reader.join().unwrap();
+        });
+        let snap = snapshot(dev);
+        assert_eq!(snap.head, 8 * 200_000);
+        assert!(checked.load(Ordering::Relaxed) > 0, "the reader saw entries");
+        eprintln!("ring stress: {} entries checked, {} dropped by contention", checked.load(Ordering::Relaxed), snap.dropped);
     }
 
     #[test]
@@ -368,15 +571,16 @@ mod tests {
     }
 
     /// Cost of one entry, single thread. Run:
-    /// `cargo test --release -p v4flash-hip bench_record_ns -- --ignored --nocapture`.
+    /// `cargo test --release -p v4flash-hip --lib ring::tests::bench_record_ns -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn bench_record_ns() {
         let here = Location::caller();
+        let k = intern("bench");
         let iters = 2_000_000u64;
         let t = Instant::now();
         for i in 0..iters {
-            record(6, "bench", Some(here), 1, [i, 2], &[1, 2, 3, 4, 5, 6, 7, 8]);
+            record(6, k, Some(here), 1, [i, 2], &[1, 2, 3, 4, 5, 6, 7, 8]);
         }
         eprintln!("ring: record {:.1} ns/entry", t.elapsed().as_nanos() as f64 / iters as f64);
     }

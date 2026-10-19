@@ -5,7 +5,8 @@
 //! SCALAR argument was wrong. The MXFP4 MoE launchers (gate+up: kwide / WMMA / decode; down: kwide2 / small-b / dn3 /
 //! WMMA) now validate their arguments before launching ([`check`]):
 //!
-//! * every pointer argument lies inside a live registered allocation of the launch device (`v4flash_hip::ptr_registry`);
+//! * every pointer argument lies inside a live registered allocation of ITS device (`v4flash_hip::ptr_registry`), and
+//!   that device is the launch device or one the launch device has PEER access to (`ptr_registry::peer_enabled`);
 //! * a weight base inside a registered EXPERT POOL ([`register_pool`], captured when the pager pool / box-2 shard was
 //!   built) sits in the right role's buffer, on a slot boundary, with the pool's bytes-per-expert, the view inside the
 //!   pool, gate and up on the SAME slot, and the pool's shape (`n_rows`, `n_blocks`);
@@ -13,8 +14,10 @@
 //!   items and the kernel reads group ids from beyond the buffer), `chunk_size` in range, and the grid consistent with
 //!   rows / work items.
 //!
-//! A failure is an error `MoE launch arg corrupted: <arg> = <value>, expected <...> (<kernel>, layer L, lane N, call
-//! site)`, never a clamp. Layer / lane come from the thread's `v4flash_hip::ring::scope`. The validation itself
+//! A failure is `MoE launch arg corrupted: <arg> = <value>, expected <...> (<kernel>, layer L, lane N, call site)`,
+//! never a clamp. What it DOES follows `V41_PTR_REGISTRY` (`ptr_registry::mode`): `warn` (the default) reports it
+//! (rate-limited per call site, with the device's last ring entries) and launches exactly as before; `enforce` returns
+//! it as an error and does not launch; `off` skips the canary. Layer / lane come from the thread's `v4flash_hip::ring::scope`. The validation itself
 //! ([`validate`]) is pure, so it is unit-tested on a CPU.
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -135,11 +138,13 @@ pub struct Ptr {
     pub name: &'static str,
     pub ptr: usize,
     pub bytes: usize,
+    /// The buffer's own device id (the allocation's device for every view).
+    pub device: i32,
 }
 
 impl Ptr {
     pub fn of<T>(name: &'static str, b: &v4flash_hip::DeviceBuffer<T>) -> Self {
-        Ptr { name, ptr: b.raw() as usize, bytes: b.byte_len() }
+        Ptr { name, ptr: b.raw() as usize, bytes: b.byte_len(), device: b.device_id() }
     }
 }
 
@@ -182,9 +187,15 @@ fn bad(arg: &str, value: impl std::fmt::Display, expected: impl std::fmt::Displa
     format!("{arg} = {value}, expected {expected}")
 }
 
-/// The checks of the module doc, on `l` against `pools` and the liveness oracle `live(name, ptr, bytes)` (the pointer
-/// registry in production). `Err` = `"<arg> = <value>, expected <...>"`.
-pub fn validate(l: &MoeLaunch<'_>, pools: &[PoolBases], live: &dyn Fn(&str, usize, usize) -> Result<(), String>) -> Result<(), String> {
+/// The checks of the module doc, on `l` against `pools`, the liveness oracle `live(arg)` (the pointer registry in
+/// production, against the arg's own device) and `peer(launch device, arg device)` (`ptr_registry::peer_enabled`).
+/// `Err` = `"<arg> = <value>, expected <...>"`.
+pub fn validate(
+    l: &MoeLaunch<'_>,
+    pools: &[PoolBases],
+    live: &dyn Fn(&Ptr) -> Result<(), String>,
+    peer: &dyn Fn(i32, i32) -> bool,
+) -> Result<(), String> {
     if l.n_rows == 0 {
         return Err(bad("n_rows", 0, "> 0"));
     }
@@ -252,27 +263,43 @@ pub fn validate(l: &MoeLaunch<'_>, pools: &[PoolBases], live: &dyn Fn(&str, usiz
         }
     }
     for a in l.ptrs.iter().chain(l.weights.iter().map(|w| &w.arg)) {
-        live(a.name, a.ptr, a.bytes).map_err(|e| bad(a.name, format!("{:#x}", a.ptr), format!("inside a live dev{} allocation ({e})", l.device)))?;
+        live(a).map_err(|e| bad(a.name, format!("{:#x}", a.ptr), format!("inside a live dev{} allocation ({e})", a.device)))?;
+        if a.device != l.device && !peer(l.device, a.device) {
+            return Err(bad(
+                &format!("{} device", a.name),
+                format!("dev{}", a.device),
+                format!("dev{} (the launch device) or a device it has peer access to", l.device),
+            ));
+        }
     }
     Ok(())
 }
 
-/// [`validate`] against the registered pools and the pointer registry; the error names the kernel, the thread's
-/// (layer, lane) and the call site.
+/// [`validate`] against the registered pools, the pointer registry and the peer table; a failure names the kernel,
+/// the thread's (layer, lane) and the call site, and follows the registry's mode (module doc).
 pub fn check(l: &MoeLaunch<'_>, loc: &'static Location<'static>) -> eyre::Result<()> {
-    let pools = POOLS.read().unwrap_or_else(|p| p.into_inner());
-    let live = |name: &str, ptr: usize, bytes: usize| {
-        v4flash_hip::ptr_registry::check_device(name, ptr, bytes, l.device, loc).map_err(|e| e.to_string())
+    use v4flash_hip::ptr_registry;
+    if ptr_registry::mode() == ptr_registry::Mode::Off {
+        return Ok(());
+    }
+    let r = {
+        let pools = POOLS.read().unwrap_or_else(|p| p.into_inner());
+        let live = |a: &Ptr| ptr_registry::device_operand_ok(a.name, a.ptr, a.bytes, a.device, loc);
+        validate(l, &pools, &live, &ptr_registry::peer_enabled)
     };
-    validate(l, &pools, &live).map_err(|e| {
-        let (layer, lane) = v4flash_hip::ring::ctx();
-        eyre!(
-            "MoE launch arg corrupted: {e} ({}, layer {layer}, lane {lane}, call site {}:{})",
-            l.kernel,
-            loc.file(),
-            loc.line()
-        )
-    })
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let (layer, lane) = v4flash_hip::ring::ctx();
+            let msg = eyre!(
+                "MoE launch arg corrupted: {e} ({}, layer {layer}, lane {lane}, call site {}:{})",
+                l.kernel,
+                loc.file(),
+                loc.line()
+            );
+            ptr_registry::verdict(msg, l.device, loc)
+        }
+    }
 }
 
 /// The CALL-SITE half of the canary (forward_prefill's iGPU MoE): the expert weights a layer is about to launch on.
@@ -280,6 +307,14 @@ pub fn check(l: &MoeLaunch<'_>, loc: &'static Location<'static>) -> eyre::Result
 /// pool) each role's base must EQUAL the base captured when that pool was built + `slot0` slots, with the pool's
 /// bytes-per-expert, and the view must end inside the pool.
 pub fn check_routed(routed: &RoutedExpertWeights, pool: Option<(&str, usize)>, device: i32, loc: &'static Location<'static>) -> eyre::Result<()> {
+    use v4flash_hip::ptr_registry;
+    if ptr_registry::mode() == ptr_registry::Mode::Off {
+        return Ok(());
+    }
+    check_routed_inner(routed, pool, device, loc).or_else(|e| ptr_registry::verdict(e, device, loc))
+}
+
+fn check_routed_inner(routed: &RoutedExpertWeights, pool: Option<(&str, usize)>, device: i32, loc: &'static Location<'static>) -> eyre::Result<()> {
     let fail = |e: String| {
         let (layer, lane) = v4flash_hip::ring::ctx();
         eyre!("MoE launch arg corrupted: {e} (routed experts, layer {layer}, lane {lane}, call site {}:{})", loc.file(), loc.line())
@@ -346,8 +381,12 @@ mod tests {
         }
     }
 
-    fn live_all(_: &str, ptr: usize, _: usize) -> Result<(), String> {
-        if ptr >= 0x10_0000 && ptr < 0x80_0000 { Ok(()) } else { Err("not live".into()) }
+    fn live_all(a: &Ptr) -> Result<(), String> {
+        if a.ptr >= 0x10_0000 && a.ptr < 0x80_0000 { Ok(()) } else { Err("not live".into()) }
+    }
+
+    fn no_peers(a: i32, b: i32) -> bool {
+        a == b
     }
 
     struct Args {
@@ -358,13 +397,13 @@ mod tests {
     fn gate_up(gate_slot: usize, up_slot: usize, slots: usize) -> Args {
         Args {
             ptrs: vec![
-                Ptr { name: "mid", ptr: 0x40_0000, bytes: 4096 },
-                Ptr { name: "xq", ptr: 0x41_0000, bytes: 4096 },
-                Ptr { name: "work_items", ptr: 0x42_0000, bytes: 400 },
+                Ptr { name: "mid", ptr: 0x40_0000, bytes: 4096, device: 1 },
+                Ptr { name: "xq", ptr: 0x41_0000, bytes: 4096, device: 1 },
+                Ptr { name: "work_items", ptr: 0x42_0000, bytes: 400, device: 1 },
             ],
             weights: vec![
-                Weight { arg: Ptr { name: "gate_w_base", ptr: 0x10_0000 + gate_slot * GBPE, bytes: slots * GBPE }, role: Role::Gate, bpe: GBPE as u32 },
-                Weight { arg: Ptr { name: "up_w_base", ptr: 0x20_0000 + up_slot * GBPE, bytes: slots * GBPE }, role: Role::Up, bpe: GBPE as u32 },
+                Weight { arg: Ptr { name: "gate_w_base", ptr: 0x10_0000 + gate_slot * GBPE, bytes: slots * GBPE, device: 1 }, role: Role::Gate, bpe: GBPE as u32 },
+                Weight { arg: Ptr { name: "up_w_base", ptr: 0x20_0000 + up_slot * GBPE, bytes: slots * GBPE, device: 1 }, role: Role::Up, bpe: GBPE as u32 },
             ],
         }
     }
@@ -386,24 +425,24 @@ mod tests {
     }
 
     fn err(l: &MoeLaunch<'_>) -> String {
-        validate(l, &[pool()], &live_all).unwrap_err()
+        validate(l, &[pool()], &live_all, &no_peers).unwrap_err()
     }
 
     #[test]
     fn good_launches_pass() {
         let full = gate_up(0, 0, 16);
-        assert_eq!(validate(&launch(&full, 2304, 20, 50), &[pool()], &live_all), Ok(()));
+        assert_eq!(validate(&launch(&full, 2304, 20, 50), &[pool()], &live_all, &no_peers), Ok(()));
         let window = gate_up(4, 4, 8);
-        assert_eq!(validate(&launch(&window, 2304, 20, 100), &[pool()], &live_all), Ok(()));
+        assert_eq!(validate(&launch(&window, 2304, 20, 100), &[pool()], &live_all, &no_peers), Ok(()));
         // resident weights outside any pool: only liveness + scalars
         let mut res = gate_up(0, 0, 16);
         res.weights[0].arg.ptr = 0x50_0000;
         res.weights[1].arg.ptr = 0x60_0000;
-        assert_eq!(validate(&launch(&res, 64, 3, 1), &[pool()], &live_all), Ok(()));
+        assert_eq!(validate(&launch(&res, 64, 3, 1), &[pool()], &live_all, &no_peers), Ok(()));
         // a pool on ANOTHER device is not consulted
         let mut other = pool();
         other.device = 0;
-        assert_eq!(validate(&launch(&gate_up(0, 0, 16), 64, 3, 1), &[other], &live_all), Ok(()));
+        assert_eq!(validate(&launch(&gate_up(0, 0, 16), 64, 3, 1), &[other], &live_all, &no_peers), Ok(()));
     }
 
     #[test]
@@ -442,13 +481,20 @@ mod tests {
         garbage.ptrs[1].ptr = 0x6408_6bd4_6000;
         let e = err(&launch(&garbage, 2304, 20, 5));
         assert!(e.starts_with("xq = 0x64086bd46000, expected inside a live dev1 allocation (not live)"), "{e}");
+        // an operand on ANOTHER device: refused without peer access, accepted with it
+        let mut cross = gate_up(0, 0, 16);
+        cross.ptrs[0].device = 0;
+        let e = err(&launch(&cross, 2304, 20, 5));
+        assert!(e.starts_with("mid device = dev0, expected dev1 (the launch device) or a device it has peer access to"), "{e}");
+        let peer_1_to_0 = |a: i32, b: i32| a == b || (a, b) == (1, 0);
+        assert_eq!(validate(&launch(&cross, 2304, 20, 5), &[pool()], &live_all, &peer_1_to_0), Ok(()));
     }
 
     #[test]
     fn down_and_persistent() {
         let a = Args {
-            ptrs: vec![Ptr { name: "partials", ptr: 0x40_0000, bytes: 64 }],
-            weights: vec![Weight { arg: Ptr { name: "w_base", ptr: 0x30_0000, bytes: 16 * DBPE }, role: Role::Down, bpe: DBPE as u32 }],
+            ptrs: vec![Ptr { name: "partials", ptr: 0x40_0000, bytes: 64, device: 1 }],
+            weights: vec![Weight { arg: Ptr { name: "w_base", ptr: 0x30_0000, bytes: 16 * DBPE, device: 1 }, role: Role::Down, bpe: DBPE as u32 }],
         };
         let mut l = MoeLaunch {
             kernel: "mxfp4_matvec_par_by_expert_kwide2",
@@ -463,15 +509,15 @@ mod tests {
             grid: (320, 7, 1),
             grid_kind: Grid::RowsByItems { rows_per_wg: 16 },
         };
-        assert_eq!(validate(&l, &[pool()], &live_all), Ok(()));
+        assert_eq!(validate(&l, &[pool()], &live_all, &no_peers), Ok(()));
         l.n_blocks = 20;
-        assert!(validate(&l, &[pool()], &live_all).unwrap_err().starts_with("n_blocks = 20, expected 9 (k / 256 of pool test Down)"));
+        assert!(validate(&l, &[pool()], &live_all, &no_peers).unwrap_err().starts_with("n_blocks = 20, expected 9 (k / 256 of pool test Down)"));
         l.n_blocks = 9;
         l.grid = (24, 1, 1);
         l.grid_kind = Grid::Persistent;
-        assert_eq!(validate(&l, &[pool()], &live_all), Ok(()));
+        assert_eq!(validate(&l, &[pool()], &live_all, &no_peers), Ok(()));
         l.grid = (24, 2, 1);
-        assert!(validate(&l, &[pool()], &live_all).unwrap_err().starts_with("grid = (24, 2, 1), expected (wgs > 0, 1, 1)"));
+        assert!(validate(&l, &[pool()], &live_all, &no_peers).unwrap_err().starts_with("grid = (24, 2, 1), expected (wgs > 0, 1, 1)"));
     }
 
     /// `register_pool` + `check_routed` over fake (non-owning, never dereferenced) views: no GPU.
@@ -501,6 +547,15 @@ mod tests {
         let p = pools().into_iter().find(|p| p.name == "canary test pool").unwrap();
         assert_eq!((p.gate.rows, p.gate.n_blocks, p.down.rows, p.down.n_blocks), (2304, 20, 5120, 9));
         let here = Location::caller();
+        // WARN (the default): a corrupt view is reported and passes -- the launch goes ahead exactly as before.
+        use v4flash_hip::ptr_registry::{self, Mode};
+        ptr_registry::set_mode(Mode::Warn);
+        let drifted = routed(g + 4 * GBPE, u + 5 * GBPE, d + 4 * DBPE, 8);
+        let before = ptr_registry::misses();
+        check_routed(&drifted, Some(("canary test pool", 4)), 5, here).unwrap();
+        assert!(ptr_registry::misses() > before, "reported");
+        // ENFORCE: the rest of this test
+        ptr_registry::set_mode(Mode::Enforce);
         // the whole pool, and a window view at slot 4
         check_routed(&pool, Some(("canary test pool", 0)), 5, here).unwrap();
         let win = routed(g + 4 * GBPE, u + 4 * GBPE, d + 4 * DBPE, 8);

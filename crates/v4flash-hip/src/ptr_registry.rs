@@ -6,17 +6,29 @@
 //! (the prefill VRAM loan and the embed loan only VIEW those allocations), so each owning allocation registers its
 //! `[base, end)` here and deregisters in `Drop`. Every copy / memset in `buffer.rs` checks its device side (and an async
 //! host copy's pinned side) against the registry BEFORE calling HIP: a pointer outside every live allocation -- a garbage
-//! pointer, or a view that outlived its parent -- fails with an error naming the address, the nearest live ranges and
-//! the caller's `#[track_caller]` location, instead of reaching the DMA engine.
+//! pointer, or a view that outlived its parent -- is a MISS naming the address, the nearest live ranges and the caller's
+//! `#[track_caller]` location.
 //!
 //! Views (`slice_view` / `view_as` / `from_raw_parts`) do not register; they must lie inside a live range.
 //!
-//! `V41_PTR_REGISTRY=0` (also `off|false|no`) disables registration AND the checks; read once (STATIC), default ON.
+//! MODE ([`mode`]), `V41_PTR_REGISTRY = off | warn | enforce`, default **warn** (review r1: soak before enforcing):
+//! * `warn`: a miss logs a rate-limited (per call site) WARN with the full detail and the device's last ring entries,
+//!   then the operation proceeds EXACTLY as without the registry. Nothing on the hot path changes behaviour.
+//! * `enforce`: a miss is an `Err` before the HIP call (and the MoE canary refuses the launch).
+//! * `off`: no checks.
+//! Registration is decided ONCE from the env at the first allocation (on unless the env says `off`); the mode itself
+//! is LIVE ([`set_mode`], pushed by the hub's / box 2's `V41_PTR_REGISTRY` knob hook), so warn -> enforce needs no
+//! restart. A process that started `off` stays off (nothing registered).
+//! [`advisory`] scopes (the dGPU loan return) never refuse: refusing there can only end in an abort.
+//!
 //! Cost: one `RwLock` read + one `BTreeMap` predecessor lookup per checked side (see `bench_lookup_ns`).
-use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::panic::Location;
-use std::sync::{LazyLock, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{LazyLock, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{self, eyre};
 
@@ -66,16 +78,168 @@ impl fmt::Display for Range {
     }
 }
 
-/// `V41_PTR_REGISTRY` (STATIC, default ON): `0|off|false|no` disables registration and every check.
+// ---- mode ------------------------------------------------------------------------------------------------------
+
+/// What a miss does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Off,
+    Warn,
+    Enforce,
+}
+
+impl Mode {
+    /// `V41_PTR_REGISTRY`'s spelling (the knob table's `Choice` accepts the same words): `off|0|false|no`,
+    /// `enforce|1|on|true|yes`, anything else (unset included) = `warn`.
+    pub fn parse(s: Option<&str>) -> Mode {
+        match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("off" | "0" | "false" | "no") => Mode::Off,
+            Some("enforce" | "1" | "on" | "true" | "yes") => Mode::Enforce,
+            _ => Mode::Warn,
+        }
+    }
+}
+
+const MODE_UNSET: u8 = 255;
+static MODE: AtomicU8 = AtomicU8::new(MODE_UNSET);
+
+fn env_mode() -> Mode {
+    Mode::parse(std::env::var("V41_PTR_REGISTRY").ok().as_deref())
+}
+
+/// Registration on (STATIC: the env at first use is not `off`).
 pub fn enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| {
-        !matches!(
-            std::env::var("V41_PTR_REGISTRY").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-            Ok("0") | Ok("off") | Ok("false") | Ok("no")
-        )
-    });
+    static ON: LazyLock<bool> = LazyLock::new(|| env_mode() != Mode::Off);
     *ON
 }
+
+/// The current mode (LIVE).
+pub fn mode() -> Mode {
+    match MODE.load(Ordering::Relaxed) {
+        0 => Mode::Off,
+        1 => Mode::Warn,
+        2 => Mode::Enforce,
+        _ => {
+            let m = if enabled() { env_mode() } else { Mode::Off };
+            let _ = MODE.compare_exchange(MODE_UNSET, m as u8, Ordering::Relaxed, Ordering::Relaxed);
+            mode()
+        }
+    }
+}
+
+/// Switch the mode live. A process whose registration is off (started with `off`) cannot turn checks on: nothing is
+/// registered, so every operand would miss. Returns the mode now in force.
+pub fn set_mode(m: Mode) -> Mode {
+    if m != Mode::Off && !enabled() {
+        tracing::error!(wanted = ?m, "V41_PTR_REGISTRY: registration was off at startup; checks stay off until a restart");
+        MODE.store(Mode::Off as u8, Ordering::Relaxed);
+        return Mode::Off;
+    }
+    let old = MODE.swap(m as u8, Ordering::Relaxed);
+    if old != m as u8 {
+        tracing::warn!(mode = ?m, "V41_PTR_REGISTRY: mode changed");
+    }
+    m
+}
+
+thread_local! {
+    static ADVISORY: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// Restores the previous advisory state on drop.
+pub struct AdvisoryGuard {
+    prev: Option<&'static str>,
+}
+
+impl Drop for AdvisoryGuard {
+    fn drop(&mut self) {
+        ADVISORY.with(|c| c.set(self.prev));
+    }
+}
+
+/// Until the guard drops, this thread's misses never refuse (even in `enforce`): each is logged as a named ERROR
+/// (`why` says why refusing is worse) and the operation proceeds.
+pub fn advisory(why: &'static str) -> AdvisoryGuard {
+    AdvisoryGuard { prev: ADVISORY.with(|c| c.replace(Some(why))) }
+}
+
+/// Misses seen (all modes but off), for logs and tests.
+static MISSES: AtomicU64 = AtomicU64::new(0);
+
+pub fn misses() -> u64 {
+    MISSES.load(Ordering::Relaxed)
+}
+
+/// Per call site: (misses since the last log line, when it was logged).
+static REPORTED: Mutex<Option<HashMap<usize, (u64, Instant)>>> = Mutex::new(None);
+const REPORT_EVERY: Duration = Duration::from_secs(60);
+
+/// A miss in warn mode (or an advisory scope): one log line per call site per minute, with the count suppressed in
+/// between and `device`'s last ring entries. Never fails.
+pub fn report(msg: &str, device: i32, loc: &'static Location<'static>) {
+    MISSES.fetch_add(1, Ordering::Relaxed);
+    let key = loc as *const Location<'static> as usize;
+    let suppressed = {
+        let mut g = REPORTED.lock().unwrap_or_else(|p| p.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        match m.get_mut(&key) {
+            Some((n, last)) if now.duration_since(*last) < REPORT_EVERY => {
+                *n += 1;
+                return;
+            }
+            Some((n, last)) => {
+                let s = *n;
+                *n = 0;
+                *last = now;
+                s
+            }
+            None => {
+                m.insert(key, (0, now));
+                0
+            }
+        }
+    };
+    let tail = crate::ring::tail_string(device, 8);
+    match ADVISORY.with(|c| c.get()) {
+        Some(why) => tracing::error!(
+            suppressed,
+            advisory = why,
+            "PTR-REGISTRY MISS (advisory, NOT refused): {msg}\n  {tail}"
+        ),
+        None => tracing::warn!(suppressed, mode = ?mode(), "PTR-REGISTRY MISS (warn, NOT refused): {msg}\n  {tail}"),
+    }
+}
+
+/// A miss: `Err` in enforce mode outside an advisory scope, else [`report`] + `Ok`.
+pub fn verdict(e: eyre::Report, device: i32, loc: &'static Location<'static>) -> eyre::Result<()> {
+    if mode() == Mode::Enforce && ADVISORY.with(|c| c.get()).is_none() {
+        MISSES.fetch_add(1, Ordering::Relaxed);
+        return Err(e);
+    }
+    report(&e.to_string(), device, loc);
+    Ok(())
+}
+
+// ---- peers -----------------------------------------------------------------------------------------------------
+
+/// Bit `a * 8 + b`: device `a` may access device `b`'s memory (`Device::enable_peer_access` succeeded or was already
+/// enabled). Devices 0..8.
+static PEERS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_peer(accessor: i32, owner: i32) {
+    if (0..8).contains(&accessor) && (0..8).contains(&owner) {
+        PEERS.fetch_or(1 << (accessor * 8 + owner), Ordering::Relaxed);
+    }
+}
+
+/// May work queued on `accessor` touch `owner`'s device memory (same device, or peer access enabled)?
+pub fn peer_enabled(accessor: i32, owner: i32) -> bool {
+    accessor == owner
+        || ((0..8).contains(&accessor) && (0..8).contains(&owner) && PEERS.load(Ordering::Relaxed) & (1 << (accessor * 8 + owner)) != 0)
+}
+
+// ---- the registry ----------------------------------------------------------------------------------------------
 
 static REG: RwLock<BTreeMap<usize, Range>> = RwLock::new(BTreeMap::new());
 
@@ -88,18 +252,30 @@ fn write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<usize, Range>> {
 }
 
 /// Register an owning allocation. An allocation that overlaps a LIVE range means the bookkeeping is broken (a free
-/// that skipped `Drop`, or HIP handed out live memory): an error naming both ranges, never a silent overwrite.
-/// Zero-byte allocations (null or not) are not registered: nothing may be read or written through them.
+/// that skipped `Drop`, or HIP handed out live memory): `enforce` fails the allocation naming both ranges; `warn` /
+/// `off` report it and replace the stale entries (the allocation itself never fails). Zero-byte allocations are not
+/// registered: nothing may be read or written through them.
 pub(crate) fn register(base: usize, bytes: usize, device: i32, kind: Kind, loc: &'static Location<'static>) -> eyre::Result<()> {
     if !enabled() || bytes == 0 {
         return Ok(());
     }
     let r = Range { base, end: base.checked_add(bytes).ok_or_else(|| eyre!("ptr registry: [{base:#x} + {bytes}) overflows"))?, device, kind, loc };
-    let mut m = write();
-    if let Some(o) = overlapping(&m, r.base, r.end) {
-        return Err(eyre!("ptr registry: new allocation {r} overlaps the LIVE allocation {o} (a free skipped Drop, or the registry is stale)"));
+    let stale = {
+        let mut m = write();
+        let mut stale = Vec::new();
+        while let Some(o) = overlapping(&m, r.base, r.end) {
+            if mode() == Mode::Enforce {
+                return Err(eyre!("ptr registry: new allocation {r} overlaps the LIVE allocation {o} (a free skipped Drop, or the registry is stale)"));
+            }
+            m.remove(&o.base);
+            stale.push(o);
+        }
+        m.insert(base, r);
+        stale
+    };
+    for o in stale {
+        report(&format!("ptr registry: new allocation {r} overlapped the LIVE allocation {o}; the stale entry was replaced"), device, loc);
     }
-    m.insert(base, r);
     Ok(())
 }
 
@@ -154,22 +330,19 @@ fn err(what: &str, addr: usize, bytes: usize, problem: String, m: &BTreeMap<usiz
     )
 }
 
-/// A DEVICE-side operand of a copy / memset / kernel: `[addr, addr + bytes)` must lie inside ONE live allocation that is
-/// device memory of `device`, or pinned host memory (device-accessible from every device). `bytes == 0` touches nothing.
-pub fn check_device(what: &str, addr: usize, bytes: usize, device: i32, loc: &'static Location<'static>) -> eyre::Result<()> {
-    if !enabled() || bytes == 0 {
-        return Ok(());
-    }
+/// The miss (if any) of a DEVICE-side operand: `[addr, addr + bytes)` inside ONE live allocation that is device
+/// memory of `device` (the operand's own device id), or pinned host memory.
+fn device_miss(what: &str, addr: usize, bytes: usize, device: i32, loc: &'static Location<'static>) -> Option<eyre::Report> {
     let m = read();
     match m.range(..=addr).next_back().map(|(_, r)| r) {
         Some(r) if r.contains(addr, bytes) => {
             if r.kind == Kind::Device && r.device != device {
-                Err(err(what, addr, bytes, format!("lies in a dev{} allocation but the operand claims dev{device}", r.device), &m, loc))
+                Some(err(what, addr, bytes, format!("lies in a dev{} allocation but the operand claims dev{device}", r.device), &m, loc))
             } else {
-                Ok(())
+                None
             }
         }
-        Some(r) if addr < r.end => Err(err(
+        Some(r) if addr < r.end => Some(err(
             what,
             addr,
             bytes,
@@ -177,50 +350,77 @@ pub fn check_device(what: &str, addr: usize, bytes: usize, device: i32, loc: &'s
             &m,
             loc,
         )),
-        _ => Err(err(what, addr, bytes, "is not inside any live allocation (garbage pointer, or a view that outlived its parent)".into(), &m, loc)),
+        _ => Some(err(what, addr, bytes, "is not inside any live allocation (garbage pointer, or a view that outlived its parent)".into(), &m, loc)),
     }
 }
 
-/// The HOST side of an async copy that must be pinned (`copy_to_pinned_async`): inside one live PINNED range.
-pub fn check_pinned(what: &str, addr: usize, bytes: usize, loc: &'static Location<'static>) -> eyre::Result<()> {
-    if !enabled() || bytes == 0 {
+/// Is a DEVICE-side operand of a copy / memset / kernel live (see [`device_miss`])? `bytes == 0` touches nothing.
+/// The miss follows the [`mode`] ([`verdict`]).
+pub fn check_device(what: &str, addr: usize, bytes: usize, device: i32, loc: &'static Location<'static>) -> eyre::Result<()> {
+    if bytes == 0 || mode() == Mode::Off {
         return Ok(());
     }
-    let m = read();
-    match m.range(..=addr).next_back().map(|(_, r)| r) {
-        Some(r) if r.kind == Kind::Pinned && r.contains(addr, bytes) => Ok(()),
-        Some(r) if r.kind == Kind::Pinned && addr < r.end => Err(err(
-            what,
-            addr,
-            bytes,
-            format!("runs {} B past the end of its pinned buffer", addr + bytes - r.end),
-            &m,
-            loc,
-        )),
-        _ => Err(err(what, addr, bytes, "is not inside any live pinned buffer".into(), &m, loc)),
+    match device_miss(what, addr, bytes, device, loc) {
+        None => Ok(()),
+        Some(e) => verdict(e, device, loc),
     }
+}
+
+/// [`check_device`] as a plain answer, independent of the mode (the MoE canary decides itself).
+pub fn device_operand_ok(what: &str, addr: usize, bytes: usize, device: i32, loc: &'static Location<'static>) -> Result<(), String> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    device_miss(what, addr, bytes, device, loc).map_or(Ok(()), |e| Err(e.to_string()))
+}
+
+/// The HOST side of an async copy that must be pinned (`copy_to_pinned_async`): inside one live PINNED range.
+/// `device` = the copy's device (its ring goes into a warn-mode report).
+pub fn check_pinned(what: &str, addr: usize, bytes: usize, device: i32, loc: &'static Location<'static>) -> eyre::Result<()> {
+    if bytes == 0 || mode() == Mode::Off {
+        return Ok(());
+    }
+    let e = {
+        let m = read();
+        match m.range(..=addr).next_back().map(|(_, r)| r) {
+            Some(r) if r.kind == Kind::Pinned && r.contains(addr, bytes) => return Ok(()),
+            Some(r) if r.kind == Kind::Pinned && addr < r.end => err(
+                what,
+                addr,
+                bytes,
+                format!("runs {} B past the end of its pinned buffer", addr + bytes - r.end),
+                &m,
+                loc,
+            ),
+            _ => err(what, addr, bytes, "is not inside any live pinned buffer".into(), &m, loc),
+        }
+    };
+    verdict(e, device, loc)
 }
 
 /// A HOST slice handed to a copy (sync, or async from pageable memory): pageable memory is allowed (a Rust slice is
 /// valid by construction), but a slice that STARTS inside a registered allocation must END inside it -- the
 /// `from_raw_parts` over a pinned pack with a wrong length (forward_prefill's zero-copy pull) is exactly that case.
 /// (A host slice of DEVICE memory is legal on the APU: `DeviceBuffer::as_host_slice_mut`.)
-pub fn check_host(what: &str, addr: usize, bytes: usize, loc: &'static Location<'static>) -> eyre::Result<()> {
-    if !enabled() || bytes == 0 {
+pub fn check_host(what: &str, addr: usize, bytes: usize, device: i32, loc: &'static Location<'static>) -> eyre::Result<()> {
+    if bytes == 0 || mode() == Mode::Off {
         return Ok(());
     }
-    let m = read();
-    match m.range(..=addr).next_back().map(|(_, r)| r) {
-        Some(r) if addr < r.end && !r.contains(addr, bytes) => Err(err(
-            what,
-            addr,
-            bytes,
-            format!("starts in a live allocation and runs {} B past its end", addr + bytes - r.end),
-            &m,
-            loc,
-        )),
-        _ => Ok(()),
-    }
+    let e = {
+        let m = read();
+        match m.range(..=addr).next_back().map(|(_, r)| r) {
+            Some(r) if addr < r.end && !r.contains(addr, bytes) => err(
+                what,
+                addr,
+                bytes,
+                format!("starts in a live allocation and runs {} B past its end", addr + bytes - r.end),
+                &m,
+                loc,
+            ),
+            _ => return Ok(()),
+        }
+    };
+    verdict(e, device, loc)
 }
 
 #[cfg(test)]
@@ -233,13 +433,40 @@ pub(crate) mod tests {
         0x4800_0000_0000_0000 + (slot << 40)
     }
 
+    /// The lib tests run `enforce` (the env default is `warn`; `tests/ptr_registry_warn.rs` covers warn).
+    pub(crate) fn enforce() {
+        assert!(enabled(), "these tests need registration (V41_PTR_REGISTRY not off)");
+        set_mode(Mode::Enforce);
+    }
+
     #[track_caller]
     pub(crate) fn reg(base: usize, bytes: usize, device: i32, kind: Kind) {
         register(base, bytes, device, kind, Location::caller()).unwrap();
     }
 
     #[test]
+    fn modes_parse() {
+        assert_eq!(Mode::parse(None), Mode::Warn);
+        assert_eq!(Mode::parse(Some("warn")), Mode::Warn);
+        assert_eq!(Mode::parse(Some(" OFF ")), Mode::Off);
+        assert_eq!(Mode::parse(Some("0")), Mode::Off);
+        assert_eq!(Mode::parse(Some("enforce")), Mode::Enforce);
+        assert_eq!(Mode::parse(Some("1")), Mode::Enforce);
+        assert_eq!(Mode::parse(Some("garbage")), Mode::Warn);
+    }
+
+    #[test]
+    fn peers() {
+        assert!(peer_enabled(3, 3));
+        assert!(!peer_enabled(6, 7));
+        note_peer(6, 7);
+        assert!(peer_enabled(6, 7) && !peer_enabled(7, 6), "directional");
+        assert!(!peer_enabled(-1, 7) && !peer_enabled(6, 9));
+    }
+
+    #[test]
     fn insert_lookup_remove_adjacent_and_overlap() {
+        enforce();
         let b = fake_base(1);
         let here = Location::caller();
         reg(b, 0x1000, 1, Kind::Device);
@@ -265,6 +492,15 @@ pub(crate) mod tests {
         assert!(check_device("t", b + 0x3000, 0x100, 0, here).is_ok(), "pinned memory is device-accessible from any device");
         let e = check_device("t", b + 0x5000, 4, 1, here).unwrap_err().to_string();
         assert!(e.contains("not inside any live allocation") && e.contains("below [") && e.contains(&format!("{}:", file!())), "{e}");
+        assert!(device_operand_ok("t", b + 0x5000, 4, 1, here).unwrap_err().contains("not inside any live allocation"));
+        // advisory: even in enforce, a miss is reported and passes
+        {
+            let _a = advisory("test: refusing would be worse");
+            let before = misses();
+            assert!(check_device("t", b + 0x5000, 4, 1, here).is_ok());
+            assert!(misses() > before);
+        }
+        assert!(check_device("t", b + 0x5000, 4, 1, here).is_err(), "the advisory scope ended");
         // remove: the range is gone, its neighbours are not
         deregister(b + 0x1000, 0x1000);
         assert!(lookup(b + 0x1000).is_none());
@@ -278,27 +514,29 @@ pub(crate) mod tests {
 
     #[test]
     fn host_side_checks() {
+        enforce();
         let b = fake_base(2);
         let here = Location::caller();
         reg(b, 0x100, -1, Kind::Pinned);
         reg(b + 0x1000, 0x100, 0, Kind::Device);
-        assert!(check_pinned("t", b + 0x10, 0x10, here).is_ok());
-        assert!(check_pinned("t", b + 0x80, 0x100, here).unwrap_err().to_string().contains("past the end of its pinned buffer"));
-        assert!(check_pinned("t", b + 0x1000, 4, here).unwrap_err().to_string().contains("not inside any live pinned buffer"));
-        assert!(check_host("t", b + 0x10, 0xf0, here).is_ok());
-        assert!(check_host("t", b + 0xf0, 0x20, here).unwrap_err().to_string().contains("starts in a live allocation and runs 16 B past"));
-        assert!(check_host("t", b + 0x1000, 4, here).is_ok(), "a host slice of APU device memory");
-        assert!(check_host("t", b + 0x10f0, 0x20, here).unwrap_err().to_string().contains("runs 16 B past"));
-        assert!(check_host("t", b + 0x5000, 1 << 20, here).is_ok(), "pageable memory is not the registry's business");
+        assert!(check_pinned("t", b + 0x10, 0x10, 0, here).is_ok());
+        assert!(check_pinned("t", b + 0x80, 0x100, 0, here).unwrap_err().to_string().contains("past the end of its pinned buffer"));
+        assert!(check_pinned("t", b + 0x1000, 4, 0, here).unwrap_err().to_string().contains("not inside any live pinned buffer"));
+        assert!(check_host("t", b + 0x10, 0xf0, 0, here).is_ok());
+        assert!(check_host("t", b + 0xf0, 0x20, 0, here).unwrap_err().to_string().contains("starts in a live allocation and runs 16 B past"));
+        assert!(check_host("t", b + 0x1000, 4, 0, here).is_ok(), "a host slice of APU device memory");
+        assert!(check_host("t", b + 0x10f0, 0x20, 0, here).unwrap_err().to_string().contains("runs 16 B past"));
+        assert!(check_host("t", b + 0x5000, 1 << 20, 0, here).is_ok(), "pageable memory is not the registry's business");
         deregister(b, 0x100);
         deregister(b + 0x1000, 0x100);
     }
 
     /// Lookup cost at a production-like registry size (~5000 live allocations), single thread. Run:
-    /// `cargo test --release -p v4flash-hip bench_lookup_ns -- --ignored --nocapture`.
+    /// `cargo test --release -p v4flash-hip --lib ptr_registry::tests::bench_lookup_ns -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn bench_lookup_ns() {
+        enforce();
         let b = fake_base(3);
         let n = 5000usize;
         for i in 0..n {

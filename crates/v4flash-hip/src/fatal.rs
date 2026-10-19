@@ -12,9 +12,13 @@
 //!   * incompatible / invalid argument -> 1, invalid code object -> 300, invalid ISA -> 218 (rare)
 //!
 //! 719 is ALSO returned non-sticky by a launch over the kernel's launch bounds (`hip_module.cpp`), and 1 / 300 / 218 are
-//! ordinary errors, so the code alone does not tell: [`is_sticky`] PROBES -- after any failed call it asks `hipGetDevice`,
-//! which can fail only in that state. (700 is produced only by the error state in 7.2.3, and is treated as sticky
-//! without the probe.)
+//! ordinary errors, so the code alone does not tell: [`is_sticky`] PROBES -- after any failed call (700 included: the
+//! probe runs only on a failure, so it is free) it asks `hipGetDevice`, which can fail only in that state.
+//!
+//! The first sticky error prints ONE machine-greppable line at once, before any grace period ([`marker`]):
+//! `HIP-FATAL: code=700 name=hipErrorIllegalAddress call="hipMemcpyAsync(HtoD)" at=<file>:<line> thread=<name>
+//! exiting=rc87` (`exiting=no` in a process that does not exit on it), so an external watchdog can tell "the hub is
+//! exiting on its own" and stand down.
 //!
 //! A hub that saw one kept answering every request with HTTP 500 and never exited (10-18 23:50 UTC), so its supervisor
 //! never restarted it. Now [`check`](crate::check) records the FIRST sticky error (code, call, `#[track_caller]`
@@ -76,9 +80,6 @@ pub fn get() -> Option<&'static FatalHip> {
 
 /// Is the process in HIP's sticky GPU-error state? `code` is the error a call just returned (not `HIP_SUCCESS`).
 pub fn is_sticky(code: sys::hipError_t) -> bool {
-    if code == 700 {
-        return true;
-    }
     if code == 600 {
         // hipErrorNotReady: a status, never the error state.
         return false;
@@ -106,9 +107,12 @@ pub(crate) fn observe(code: sys::hipError_t, err: &crate::HipError, location: &'
         return; // another thread recorded first
     }
     let f = FATAL.get().expect("just set");
-    eprintln!("HIP-FATAL: {f}; the GPU is unusable for the life of this process");
+    let exiting = EXIT_ON_FATAL.load(Ordering::Acquire);
+    // The marker first, unbuffered, before anything can wait: an external watchdog greps for it.
+    eprintln!("{}", marker(f, exiting));
+    eprintln!("HIP-FATAL detail: {f}; the GPU is unusable for the life of this process");
     tracing::error!(code = f.code, context = f.context, file = f.location.file(), line = f.location.line(), "HIP-FATAL: {f}");
-    if EXIT_ON_FATAL.load(Ordering::Acquire) {
+    if exiting {
         let grace = GRACE_MS.load(Ordering::Relaxed);
         let spawned = std::thread::Builder::new().name("hip-fatal-backstop".into()).spawn(move || {
             std::thread::sleep(Duration::from_millis(grace));
@@ -119,6 +123,20 @@ pub(crate) fn observe(code: sys::hipError_t, err: &crate::HipError, location: &'
             exit_now("backstop thread spawn failed");
         }
     }
+}
+
+/// The one-line machine-greppable marker of the first sticky error (module doc).
+pub fn marker(f: &FatalHip, exiting: bool) -> String {
+    format!(
+        "HIP-FATAL: code={} name={} call=\"{}\" at={}:{} thread={} exiting={}",
+        f.code,
+        f.name,
+        f.context,
+        f.location.file(),
+        f.location.line(),
+        f.thread.replace(char::is_whitespace, "_"),
+        if exiting { format!("rc{HIP_FATAL_EXIT_CODE}") } else { "no".to_string() }
+    )
 }
 
 /// Exit the process on a sticky HIP error (the hub): the engine calls [`exit_now`] once it has failed its in-flight
@@ -167,11 +185,27 @@ pub fn exit_now(reason: &str) -> ! {
 
 #[cfg(test)]
 mod tests {
-    /// The two codes decided without the `hipGetDevice` probe (no HIP call on a CPU).
+    /// The one code decided without the `hipGetDevice` probe (no HIP call on a CPU).
     #[test]
-    fn illegal_address_is_sticky_not_ready_is_not() {
-        assert!(super::is_sticky(700));
+    fn not_ready_is_never_sticky() {
         assert!(!super::is_sticky(600));
         assert!(super::get().is_none(), "is_sticky only answers; recording is observe's");
+    }
+
+    #[test]
+    fn marker_is_one_greppable_line() {
+        let f = super::FatalHip {
+            code: 700,
+            name: "hipErrorIllegalAddress".into(),
+            message: "an illegal memory access was encountered".into(),
+            context: "hipMemcpyAsync(HtoD)",
+            location: std::panic::Location::caller(),
+            thread: "deepstrix engine".into(),
+            at: std::time::Instant::now(),
+        };
+        let m = super::marker(&f, true);
+        assert!(m.starts_with("HIP-FATAL: code=700 name=hipErrorIllegalAddress call=\"hipMemcpyAsync(HtoD)\" at="), "{m}");
+        assert!(m.ends_with("thread=deepstrix_engine exiting=rc87") && !m.contains('\n'), "{m}");
+        assert!(super::marker(&f, false).ends_with("exiting=no"));
     }
 }

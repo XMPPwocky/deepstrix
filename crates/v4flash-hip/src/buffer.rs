@@ -20,13 +20,13 @@ fn on_device(what: &'static str, raw: sys::hipDeviceptr_t, bytes: usize, device:
 
 /// Ring entry for a copy / memset: args = (dst, src, bytes).
 #[inline]
-fn ring_copy(device: i32, kind: &'static str, loc: Loc, stream: &Stream, dst: usize, src: usize, bytes: usize) {
+fn ring_copy(device: i32, kind: ring::KindId, loc: Loc, stream: &Stream, dst: usize, src: usize, bytes: usize) {
     ring::record(device, kind, Some(loc), stream.raw() as usize, [bytes as u64, 0], &[dst as u64, src as u64, bytes as u64]);
 }
 
 /// As [`ring_copy`] for the blocking calls (the null stream).
 #[inline]
-fn ring_copy_sync(device: i32, kind: &'static str, loc: Loc, dst: usize, src: usize, bytes: usize) {
+fn ring_copy_sync(device: i32, kind: ring::KindId, loc: Loc, dst: usize, src: usize, bytes: usize) {
     ring::record(device, kind, Some(loc), 0, [bytes as u64, 0], &[dst as u64, src as u64, bytes as u64]);
 }
 
@@ -41,7 +41,8 @@ fn ring_copy_sync(device: i32, kind: &'static str, loc: Loc, dst: usize, src: us
 ///
 /// Owning buffers are registered in [`ptr_registry`] (`[raw, raw + bytes)`, device,
 /// allocation site) and deregistered in Drop; every copy / memset checks its device
-/// side against the registry before calling HIP (`V41_PTR_REGISTRY=0` disables).
+/// side against the registry before calling HIP; a miss follows `V41_PTR_REGISTRY`
+/// (`warn` default: report and proceed; `enforce`: an error; `off`).
 pub struct DeviceBuffer<T> {
     raw: sys::hipDeviceptr_t,
     len: usize,
@@ -247,8 +248,8 @@ impl<T> DeviceBuffer<T> {
             return Ok(());
         }
         on_device("copy_from_host dst", self.raw, self.byte_len(), self.device_id, loc)?;
-        ptr_registry::check_host("copy_from_host src", src.as_ptr() as usize, self.byte_len(), loc)?;
-        ring_copy_sync(self.device_id, "HtoD", loc, self.raw as usize, src.as_ptr() as usize, self.byte_len());
+        ptr_registry::check_host("copy_from_host src", src.as_ptr() as usize, self.byte_len(), self.device_id, loc)?;
+        ring_copy_sync(self.device_id, ring::K_HTOD, loc, self.raw as usize, src.as_ptr() as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpy(
@@ -274,8 +275,8 @@ impl<T> DeviceBuffer<T> {
             ));
         }
         on_device("copy_to_host src", self.raw, self.byte_len(), self.device_id, loc)?;
-        ptr_registry::check_host("copy_to_host dst", dst.as_ptr() as usize, self.byte_len(), loc)?;
-        ring_copy_sync(self.device_id, "DtoH", loc, dst.as_ptr() as usize, self.raw as usize, self.byte_len());
+        ptr_registry::check_host("copy_to_host dst", dst.as_ptr() as usize, self.byte_len(), self.device_id, loc)?;
+        ring_copy_sync(self.device_id, ring::K_DTOH, loc, dst.as_ptr() as usize, self.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpy(
@@ -306,8 +307,8 @@ impl<T> DeviceBuffer<T> {
             return Ok(());
         }
         on_device("copy_from_host_async dst", self.raw, self.byte_len(), self.device_id, loc)?;
-        ptr_registry::check_host("copy_from_host_async src", src.as_ptr() as usize, self.byte_len(), loc)?;
-        ring_copy(self.device_id, "HtoD async", loc, stream, self.raw as usize, src.as_ptr() as usize, self.byte_len());
+        ptr_registry::check_host("copy_from_host_async src", src.as_ptr() as usize, self.byte_len(), self.device_id, loc)?;
+        ring_copy(self.device_id, ring::K_HTOD_ASYNC, loc, stream, self.raw as usize, src.as_ptr() as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpyAsync(
@@ -345,8 +346,8 @@ impl<T> DeviceBuffer<T> {
         // SAFETY: `dst_offset + len <= dst.len()` was checked above.
         let dst_ptr = unsafe { dst.as_mut_slice().as_mut_ptr().add(dst_offset) };
         on_device("copy_to_pinned_async src", self.raw, self.byte_len(), self.device_id, loc)?;
-        ptr_registry::check_pinned("copy_to_pinned_async dst", dst_ptr as usize, self.byte_len(), loc)?;
-        ring_copy(self.device_id, "DtoH async", loc, stream, dst_ptr as usize, self.raw as usize, self.byte_len());
+        ptr_registry::check_pinned("copy_to_pinned_async dst", dst_ptr as usize, self.byte_len(), self.device_id, loc)?;
+        ring_copy(self.device_id, ring::K_DTOH_ASYNC, loc, stream, dst_ptr as usize, self.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpyAsync(
@@ -393,7 +394,7 @@ impl<T> DeviceBuffer<T> {
         }
         on_device("copy_from_buffer_async dst", self.raw, self.byte_len(), self.device_id, loc)?;
         on_device("copy_from_buffer_async src", src.raw, self.byte_len(), src.device_id, loc)?;
-        ring_copy(self.device_id, "DtoD async", loc, stream, self.raw as usize, src.raw as usize, self.byte_len());
+        ring_copy(self.device_id, ring::K_DTOD_ASYNC, loc, stream, self.raw as usize, src.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpyAsync(
@@ -435,7 +436,7 @@ impl<T> DeviceBuffer<T> {
         }
         on_device("copy_from_buffer dst", self.raw, self.byte_len(), self.device_id, loc)?;
         on_device("copy_from_buffer src", src.raw, self.byte_len(), src.device_id, loc)?;
-        ring_copy_sync(self.device_id, "DtoD", loc, self.raw as usize, src.raw as usize, self.byte_len());
+        ring_copy_sync(self.device_id, ring::K_DTOD, loc, self.raw as usize, src.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpy(
@@ -469,7 +470,7 @@ impl<T> DeviceBuffer<T> {
         }
         on_device("copy_to_peer_async dst", dst.raw, self.byte_len(), dst.device_id, loc)?;
         on_device("copy_to_peer_async src", self.raw, self.byte_len(), self.device_id, loc)?;
-        ring_copy(stream.device_id(), "peer async", loc, stream, dst.raw as usize, self.raw as usize, self.byte_len());
+        ring_copy(stream.device_id(), ring::K_PEER_ASYNC, loc, stream, dst.raw as usize, self.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpyPeerAsync(
@@ -492,7 +493,7 @@ impl<T> DeviceBuffer<T> {
             return Ok(());
         }
         on_device("fill_zero", self.raw, self.byte_len(), self.device_id, loc)?;
-        ring_copy_sync(self.device_id, "memset", loc, self.raw as usize, 0, self.byte_len());
+        ring_copy_sync(self.device_id, ring::K_MEMSET, loc, self.raw as usize, 0, self.byte_len());
         check_eyre(
             unsafe { sys::hipMemset(self.raw, 0, self.byte_len()) },
             "hipMemset",
@@ -509,7 +510,7 @@ impl<T> DeviceBuffer<T> {
             return Ok(());
         }
         on_device("fill_zero_async", self.raw, self.byte_len(), self.device_id, loc)?;
-        ring_copy(self.device_id, "memset async", loc, stream, self.raw as usize, 0, self.byte_len());
+        ring_copy(self.device_id, ring::K_MEMSET_ASYNC, loc, stream, self.raw as usize, 0, self.byte_len());
         check_eyre(
             unsafe { sys::hipMemsetAsync(self.raw, 0, self.byte_len(), stream.raw()) },
             "hipMemsetAsync",
@@ -624,15 +625,13 @@ impl<T> Drop for PinnedBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ptr_registry::tests::{fake_base, reg};
+    use crate::ptr_registry::tests::{enforce, fake_base, reg};
 
     /// Every copy / memset path checks its pointers BEFORE calling HIP, so the failing cases run on a CPU: fake
     /// registered allocations, views into and around them, and a null-handle stream that never reaches HIP.
     #[test]
     fn copies_with_unregistered_pointers_fail_before_hip() {
-        if !ptr_registry::enabled() {
-            return; // V41_PTR_REGISTRY=0 in the test environment
-        }
+        enforce();
         let base = fake_base(10);
         reg(base, 4096, 1, Kind::Device);
         reg(base + 0x10_000, 4096, 2, Kind::Device);
