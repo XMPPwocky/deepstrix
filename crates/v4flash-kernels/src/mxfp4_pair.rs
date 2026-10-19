@@ -52,6 +52,72 @@ pub const MXFP4_GROUPED_MAX_MEMBERS: u32 = 8;
 /// per-lane `inner[pick]` registers).
 pub const MXFP4_GROUPED_MAX_PICKS: u32 = 16;
 
+/// The MoE launch-arg canary for a gate+up launch (`crate::moe_canary`): every pointer argument live, the weights on
+/// their pool's slots, the scalars and grid consistent. `extra` = the decode kernel's ticket.
+#[allow(clippy::too_many_arguments)]
+fn canary_gate_up(
+    kernel: &'static str,
+    stream: &Stream,
+    mid: &DeviceBuffer<f32>,
+    gate_w_base: &DeviceBuffer<u8>,
+    up_w_base: &DeviceBuffer<u8>,
+    xq: &DeviceBuffer<u8>,
+    expert_w: &DeviceBuffer<f32>,
+    group_count: &DeviceBuffer<i32>,
+    expert_members: &DeviceBuffer<i32>,
+    work_items: &DeviceBuffer<i32>,
+    n_work_items_dev: Option<&DeviceBuffer<i32>>,
+    extra: Option<crate::moe_canary::Ptr>,
+    gate_bpe: u32,
+    up_bpe: u32,
+    n_rows: u32,
+    n_blocks: u32,
+    n_work_items: u32,
+    chunk_size: u32,
+    cfg: &LaunchConfig,
+    grid_kind: crate::moe_canary::Grid,
+    loc: &'static std::panic::Location<'static>,
+) -> eyre::Result<()> {
+    use crate::moe_canary::{check, MoeLaunch, Ptr, Role, Weight};
+    let mut ptrs = [Ptr::of("mid", mid); 8];
+    let mut n = 1;
+    for p in [
+        Some(Ptr::of("xq", xq)),
+        Some(Ptr::of("expert_w", expert_w)),
+        Some(Ptr::of("group_count", group_count)),
+        Some(Ptr::of("expert_members", expert_members)),
+        Some(Ptr::of("work_items", work_items)),
+        n_work_items_dev.map(|c| Ptr::of("n_work_items_dev", c)),
+        extra,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ptrs[n] = p;
+        n += 1;
+    }
+    let weights = [
+        Weight { arg: Ptr::of("gate_w_base", gate_w_base), role: Role::Gate, bpe: gate_bpe },
+        Weight { arg: Ptr::of("up_w_base", up_w_base), role: Role::Up, bpe: up_bpe },
+    ];
+    check(
+        &MoeLaunch {
+            kernel,
+            device: stream.device_id(),
+            ptrs: &ptrs[..n],
+            weights: &weights,
+            n_rows,
+            n_blocks,
+            n_work_items,
+            work_items_len: work_items.len(),
+            chunk_size,
+            grid: cfg.grid,
+            grid_kind,
+        },
+        loc,
+    )
+}
+
 pub struct Mxfp4PairMatvec {
     module: Module,
     /// The int8-WMMA module (gfx1151 only), see [`Self::launch_fused_swiglu_wmma_ex`].
@@ -475,6 +541,7 @@ impl Mxfp4PairMatvec {
     /// (<= `work_items.len()`): work-groups past the device count exit at once,
     /// so the host never reads the count back (`V41_MOE_WI_DEVCOUNT`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_fused_swiglu_kwide_ex(
         &self,
         stream: &Stream,
@@ -515,6 +582,11 @@ impl Mxfp4PairMatvec {
         }
         let function = self.module.get_function("mxfp4_pair_matvec_fused_swiglu_kwide")?;
         let cfg = LaunchConfig { grid: (n_rows / 8, n_work_items, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        canary_gate_up(
+            function.name(), stream, mid, gate_w_base, up_w_base, xq, expert_w, group_count, expert_members, work_items,
+            n_work_items_dev, None, gate_bpe, up_bpe, n_rows, n_blocks, n_work_items, chunk_size, &cfg,
+            crate::moe_canary::Grid::RowsByItems { rows_per_wg: 8 }, std::panic::Location::caller(),
+        )?;
         launch_kernel!(
             function,
             cfg,
@@ -536,6 +608,7 @@ impl Mxfp4PairMatvec {
     /// with bsums (production q8_k_quantize writes them). gfx1151 only.
     /// Selected by `dispatch::moe_gate_up_chunked_rows` (`V41_MOE_WMMA_GATEUP`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_fused_swiglu_wmma_ex(
         &self,
         stream: &Stream,
@@ -568,6 +641,7 @@ impl Mxfp4PairMatvec {
     /// (kernels/mxfp4_moe_wmma_f16.hip: same symbol, args, grid and 32-member chunk; NOT bit-exact vs the int8 arm,
     /// f32 re-association). Selected by `dispatch::moe_gate_up_chunked_rows` (`V41_MOE_WMMA_F16`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_fused_swiglu_wmma_arm(
         &self,
         f16: bool,
@@ -612,6 +686,11 @@ impl Mxfp4PairMatvec {
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        canary_gate_up(
+            function.name(), stream, mid, gate_w_base, up_w_base, xq, expert_w, group_count, expert_members, work_items,
+            n_work_items_dev, None, gate_bpe, up_bpe, n_rows, n_blocks, n_work_items, chunk_size, &cfg,
+            crate::moe_canary::Grid::RowsByItems { rows_per_wg: MXFP4_WMMA_ROWS_PER_WG }, std::panic::Location::caller(),
+        )?;
         launch_kernel!(
             function,
             cfg,
@@ -637,6 +716,7 @@ impl Mxfp4PairMatvec {
     /// `n_rows`; gfx1151 only. 1 launch, like kwide.
     /// Selected by `dispatch::moe_gate_up_chunked_rows` (`V41_MOE_PAIR_DEC`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_fused_swiglu_dec_ex(
         &self,
         stream: &Stream,
@@ -674,6 +754,7 @@ impl Mxfp4PairMatvec {
     /// None = static) (tests / bench: every geometry and order must give the same
     /// bits; `sink` is the extra argument of the bench-only load-only entries).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_fused_swiglu_dec_raw(
         &self,
         symbol: &str,
@@ -737,6 +818,11 @@ impl Mxfp4PairMatvec {
         let tk = ticket.map_or(std::ptr::null_mut(), |t| t.raw());
         let function = module.get_function(symbol)?;
         let cfg = LaunchConfig { grid: (wgs, 1, 1), block: (waves * 32, 1, 1), shared_mem_bytes: 0 };
+        canary_gate_up(
+            function.name(), stream, mid, gate_w_base, up_w_base, xq, expert_w, group_count, expert_members, work_items,
+            n_work_items_dev, ticket.map(|t| crate::moe_canary::Ptr::of("ticket", t)), gate_bpe, up_bpe, n_rows, n_blocks,
+            n_work_items, chunk_size, &cfg, crate::moe_canary::Grid::Persistent, std::panic::Location::caller(),
+        )?;
         match sink {
             None => launch_kernel!(
                 function,

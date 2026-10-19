@@ -78,6 +78,7 @@ pub mod laguna_het;
 pub mod laguna_het_moe;
 pub mod laguna_moe_tiled;
 pub mod moe_group_builder;
+pub mod moe_canary;
 pub mod oracle;
 pub mod router_topk;
 pub mod weight_contract;

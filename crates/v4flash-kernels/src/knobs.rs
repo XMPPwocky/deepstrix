@@ -1094,11 +1094,36 @@ crate::knobs! {
     /// goes on a LOW-priority rewarm queue for the background prefetcher, drained with what each decode step's
     /// `V41_B1_HOT_PREWARM_STEP` budget leaves after the hot-set newcomers; ownership is re-checked at take time.
     pub static B1_REWARM_AFTER_PREFILL = Knob::flag("V41_B1_REWARM_AFTER_PREFILL", false).live();
+    /// `V41_PTR_REGISTRY` (default ON; STATIC): the live allocation registry behind every copy's pointer check and the
+    /// MoE launch-arg canary (`v4flash_hip::ptr_registry`, HIP 700 instrumentation 2026-10-19). `v4flash_hip` reads the
+    /// env itself at the first allocation (it cannot read this table); listed here for the effective table, and the
+    /// hook reports a disagreement.
+    pub static PTR_REGISTRY = Knob::flag("V41_PTR_REGISTRY", true).hook(ptr_registry_hook);
+    /// `V41_HIP_RING_DUMP` (default 0; live): write a NEW non-zero value (1, then 2, ...) to dump the HIP launch / copy
+    /// ring (`v4flash_hip::ring`: the last 64 launches / copies / memsets per device) to stderr once per change. The
+    /// sticky-HIP-error exit dumps it unasked.
+    pub static HIP_RING_DUMP = Knob::int("V41_HIP_RING_DUMP", 0, 0, u32::MAX as u64).live().hook(hip_ring_dump_hook);
 }
 
 /// Pushes `V41_EXPERT_HEDGE_MS` into the core read path (it cannot read this crate's knobs).
 fn expert_hedge_hook(k: &Knob) {
     v4flash_core::hedge::set_expert_hedge_ms(k.get());
+}
+
+/// `V41_PTR_REGISTRY`: `v4flash_hip` parsed the same env; a disagreement means the two parsers drifted.
+fn ptr_registry_hook(k: &Knob) {
+    if k.on() != v4flash_hip::ptr_registry::enabled() {
+        tracing::error!(knob = k.on(), registry = v4flash_hip::ptr_registry::enabled(), "V41_PTR_REGISTRY: the knob table and v4flash_hip disagree");
+    }
+}
+
+/// `V41_HIP_RING_DUMP`: dump the ring once per new non-zero value.
+fn hip_ring_dump_hook(k: &Knob) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let v = k.get();
+    if v != 0 && LAST.swap(v, Ordering::Relaxed) != v {
+        v4flash_hip::ring::dump(&format!("knob V41_HIP_RING_DUMP={v}"));
+    }
 }
 
 #[cfg(test)]

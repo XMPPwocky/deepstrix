@@ -112,6 +112,7 @@ impl Device {
     /// is destroyed — otherwise a buffer's `hipFree` runs an implicit
     /// per-buffer `SyncAllStreams` that can orphan a not-yet-executed
     /// cross-device wait and busy-spin forever.
+    #[track_caller]
     pub fn synchronize(&self) -> eyre::Result<()> {
         self.set_current()?;
         check_eyre(unsafe { sys::hipDeviceSynchronize() }, "hipDeviceSynchronize")

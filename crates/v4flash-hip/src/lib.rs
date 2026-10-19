@@ -8,6 +8,9 @@
 //! - [`Event`]    — events for sync + timing
 //! - [`DeviceBuffer`] / [`PinnedBuffer`] — typed RAII buffers
 //! - [`Module`] / [`Function`] — kernel loading + launch
+//! - [`ptr_registry`] — live allocation ranges; every copy checks its pointers against them
+//! - [`ring`] — the last launches / copies per device, dumped on a sticky error
+//! - [`fatal`] — sticky (GPU-in-error) HIP codes: record the first, exit for the supervisor
 //!
 //! All functions return `color_eyre::eyre::Result<T>`. Binaries should
 //! call [`install_panic_handler`] from main to enable pretty backtraces.
@@ -19,6 +22,9 @@ mod buffer;
 mod device;
 mod error;
 mod event;
+pub mod fatal;
+pub mod ptr_registry;
+pub mod ring;
 mod graph;
 #[macro_use]
 mod launch;

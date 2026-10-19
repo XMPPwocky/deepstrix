@@ -138,6 +138,16 @@ async fn main() -> eyre::Result<()> {
     // Every knob resolved and logged once, the live ones watched
     // (`V41_KNOBS_FILE` + their legacy files), before anything reads one.
     v4flash_kernels::knobs::start(&[v4flash_kernels::knobs::ALL, deepstrix_server::knobs::ALL]);
+    // A sticky HIP error (GPU in the error state, e.g. 700 after a memory fault) makes every later HIP call fail for
+    // the life of the process: exit for the supervisor instead of serving 500s forever (10-18). The engine exits once
+    // its in-flight requests got their error; a backstop exits after the grace period regardless.
+    v4flash_hip::fatal::install_exit_on_fatal(5000);
+    tracing::info!(
+        exit_code = v4flash_hip::fatal::HIP_FATAL_EXIT_CODE,
+        ptr_registry = v4flash_hip::ptr_registry::enabled(),
+        hip_ring = v4flash_hip::ring::enabled(),
+        "HIP instrumentation: sticky HIP errors exit the process; copies checked against live allocations; launch/copy ring on"
+    );
 
     let args = Args::parse();
     let snapshot_root = match args.snapshot_dir {

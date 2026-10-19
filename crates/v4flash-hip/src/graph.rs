@@ -133,7 +133,16 @@ impl GraphExec {
 
     /// Launch the graph on `stream`. Single async API call irrespective
     /// of how many nodes the graph contains — this is the whole point.
+    #[track_caller]
     pub fn launch(&self, stream: &Stream) -> eyre::Result<()> {
+        crate::ring::record(
+            stream.device_id(),
+            "graph launch",
+            Some(std::panic::Location::caller()),
+            stream.raw() as usize,
+            [0, 0],
+            &[self.raw as u64],
+        );
         check_eyre(
             unsafe { sys::hipGraphLaunch(self.raw, stream.raw()) },
             "hipGraphLaunch",
@@ -149,11 +158,22 @@ impl GraphExec {
     /// `node` must be a kernel node that exists in the graph this
     /// `GraphExec` was instantiated from. `params` must be valid for
     /// the kernel ABI.
+    #[track_caller]
     pub unsafe fn set_kernel_node_params(
         &self,
         node: sys::hipGraphNode_t,
         params: &sys::hipKernelNodeParams,
     ) -> eyre::Result<()> {
+        let g = &params.gridDim;
+        let b = &params.blockDim;
+        crate::ring::record(
+            self.device_id,
+            "graph set kernel params",
+            Some(std::panic::Location::caller()),
+            0,
+            crate::ring::launch_dims((g.x, g.y, g.z), (b.x, b.y, b.z)),
+            &[self.raw as u64, node as u64, params.func as u64],
+        );
         check_eyre(
             unsafe { sys::hipGraphExecKernelNodeSetParams(self.raw, node, params) },
             "hipGraphExecKernelNodeSetParams",

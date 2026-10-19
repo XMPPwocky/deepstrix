@@ -89,6 +89,63 @@ pub const DN3_GEOMS: &[Dn3Geom] = &[
 /// reduce replaced by an XOR fold (same stream, queue, LDS staging, activation loads).
 pub const DN3_BENCH_REFS: &[Dn3Geom] = &[dn3q("mxfp4_matvec_par_by_expert_dn3q_r2w4b", 2, 4, 140)];
 
+/// The MoE launch-arg canary for a by-expert down launch (`crate::moe_canary`): every pointer argument live, the
+/// weights on their pool's slots, the scalars and grid consistent.
+#[allow(clippy::too_many_arguments)]
+fn canary_down(
+    kernel: &'static str,
+    stream: &Stream,
+    partials: &DeviceBuffer<f32>,
+    w_base: &DeviceBuffer<u8>,
+    xq_base: &DeviceBuffer<u8>,
+    group_count: &DeviceBuffer<i32>,
+    expert_members: &DeviceBuffer<i32>,
+    work_items: &DeviceBuffer<i32>,
+    n_work_items_dev: Option<&DeviceBuffer<i32>>,
+    dbpe: u32,
+    n_rows: u32,
+    n_blocks_in: u32,
+    n_work_items: u32,
+    chunk_size: u32,
+    cfg: &LaunchConfig,
+    grid_kind: crate::moe_canary::Grid,
+    loc: &'static std::panic::Location<'static>,
+) -> eyre::Result<()> {
+    use crate::moe_canary::{check, MoeLaunch, Ptr, Role, Weight};
+    let mut ptrs = [
+        Ptr::of("partials", partials),
+        Ptr::of("xq_base", xq_base),
+        Ptr::of("group_count", group_count),
+        Ptr::of("expert_members", expert_members),
+        Ptr::of("work_items", work_items),
+        Ptr::of("work_items", work_items),
+    ];
+    let n = match n_work_items_dev {
+        Some(c) => {
+            ptrs[5] = Ptr::of("n_work_items_dev", c);
+            6
+        }
+        None => 5,
+    };
+    let weights = [Weight { arg: Ptr::of("w_base", w_base), role: Role::Down, bpe: dbpe }];
+    check(
+        &MoeLaunch {
+            kernel,
+            device: stream.device_id(),
+            ptrs: &ptrs[..n],
+            weights: &weights,
+            n_rows,
+            n_blocks: n_blocks_in,
+            n_work_items,
+            work_items_len: work_items.len(),
+            chunk_size,
+            grid: cfg.grid,
+            grid_kind,
+        },
+        loc,
+    )
+}
+
 pub struct Mxfp4Matvec {
     module: Module,
     /// The int8-WMMA module (gfx1151 only), see [`Self::launch_by_expert_wmma_ex`].
@@ -195,6 +252,7 @@ impl Mxfp4Matvec {
     /// return without writing otherwise), so any other value is refused here.
     /// Selected by `dispatch::moe_down_mxfp4` for rows <= 8 (`V41_MOE_DOWN_DN2`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_by_expert_smallb_ex(
         &self,
         stream: &Stream,
@@ -229,6 +287,7 @@ impl Mxfp4Matvec {
     /// BIT-IDENTICAL partials, in the production geometry [`DN3_DEFAULT`]. Compiled for
     /// `n_blocks_in` = 9 only; `n_rows` must be a multiple of the rows per work-group.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_by_expert_dn3_ex(
         &self,
         stream: &Stream,
@@ -257,6 +316,7 @@ impl Mxfp4Matvec {
     /// [`Self::launch_by_expert_dn3_ex`] in an explicit geometry (tests / benches: every
     /// entry of [`DN3_GEOMS`] is bit-identical to dn2).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_by_expert_dn3_geom(
         &self,
         geom: Dn3Geom,
@@ -311,6 +371,11 @@ impl Mxfp4Matvec {
                 block: (32 * geom.waves, 1, 1),
                 shared_mem_bytes: 0,
             };
+            canary_down(
+                function.name(), stream, partials, w_base, xq_base, group_count, expert_members, work_items,
+                n_work_items_dev, dbpe, n_rows, n_blocks_in, n_work_items, chunk_size, &cfg,
+                crate::moe_canary::Grid::Persistent, std::panic::Location::caller(),
+            )?;
             return launch_kernel!(function, cfg, stream, [
                 partials.raw(), w_base.raw(), xq_base.raw(),
                 group_count.raw(), expert_members.raw(), work_items.raw(),
@@ -326,6 +391,11 @@ impl Mxfp4Matvec {
                 block: (32 * geom.waves, 1, 1),
                 shared_mem_bytes: 0,
             };
+            canary_down(
+                function.name(), stream, partials, w_base, xq_base, group_count, expert_members, work_items,
+                n_work_items_dev, dbpe, n_rows, n_blocks_in, n_work_items, chunk_size, &cfg,
+                crate::moe_canary::Grid::Persistent, std::panic::Location::caller(),
+            )?;
             return launch_kernel!(function, cfg, stream, [
                 partials.raw(), w_base.raw(), xq_base.raw(),
                 group_count.raw(), expert_members.raw(), work_items.raw(),
@@ -338,6 +408,11 @@ impl Mxfp4Matvec {
             block: (32 * geom.waves, 1, 1),
             shared_mem_bytes: 0,
         };
+        canary_down(
+            function.name(), stream, partials, w_base, xq_base, group_count, expert_members, work_items,
+            n_work_items_dev, dbpe, n_rows, n_blocks_in, n_work_items, chunk_size, &cfg,
+            crate::moe_canary::Grid::RowsByItems { rows_per_wg }, std::panic::Location::caller(),
+        )?;
         launch_kernel!(function, cfg, stream, [
             partials.raw(), w_base.raw(), xq_base.raw(),
             group_count.raw(), expert_members.raw(), work_items.raw(),
@@ -354,6 +429,7 @@ impl Mxfp4Matvec {
     /// needs Q8_K midq with bsums. gfx1151 only. Selected by
     /// `dispatch::moe_down_mxfp4` for rows >= 128 (`V41_MOE_WMMA_DOWN`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_by_expert_wmma_ex(
         &self,
         stream: &Stream,
@@ -383,6 +459,7 @@ impl Mxfp4Matvec {
     /// (kernels/mxfp4_moe_wmma_f16.hip: same symbol, args, grid and 32-member chunk; NOT bit-exact vs the int8 arm,
     /// f32 re-association). Selected by `dispatch::moe_down_mxfp4` (`V41_MOE_WMMA_F16`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_by_expert_wmma_arm(
         &self,
         f16: bool,
@@ -424,6 +501,12 @@ impl Mxfp4Matvec {
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        canary_down(
+            function.name(), stream, partials, w_base, xq_base, group_count, expert_members, work_items,
+            n_work_items_dev, dbpe, n_rows, n_blocks_in, n_work_items, chunk_size, &cfg,
+            crate::moe_canary::Grid::RowsByItems { rows_per_wg: crate::mxfp4_pair::MXFP4_WMMA_ROWS_PER_WG },
+            std::panic::Location::caller(),
+        )?;
         launch_kernel!(function, cfg, stream, [
             partials.raw(), w_base.raw(), xq_base.raw(),
             group_count.raw(), expert_members.raw(), work_items.raw(),
@@ -583,6 +666,7 @@ impl Mxfp4Matvec {
     /// 16, weights unpacked once per (row, block). Caller zeroes
     /// `partials` and pairs with `q2_k_reduce_partials`.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_by_expert_kwide2(
         &self,
         stream: &Stream,
@@ -613,6 +697,7 @@ impl Mxfp4Matvec {
     /// (<= `work_items.len()`): work-groups past the device count exit at once
     /// (`V41_MOE_WI_DEVCOUNT`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn launch_by_expert_kwide2_ex(
         &self,
         stream: &Stream,
@@ -642,6 +727,7 @@ impl Mxfp4Matvec {
     /// The kwide2-geometry launch (grid (n_rows/16, n_work_items) x 256) of
     /// `sym`: `mxfp4_matvec_par_by_expert_kwide2` or its small-b twin.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     fn launch_by_expert_sym(
         &self,
         sym: &str,
@@ -681,6 +767,11 @@ impl Mxfp4Matvec {
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        canary_down(
+            function.name(), stream, partials, w_base, xq_base, group_count, expert_members, work_items,
+            n_work_items_dev, dbpe, n_rows, n_blocks_in, n_work_items, chunk_size, &cfg,
+            crate::moe_canary::Grid::RowsByItems { rows_per_wg: 16 }, std::panic::Location::caller(),
+        )?;
         launch_kernel!(function, cfg, stream, [
             partials.raw(), w_base.raw(), xq_base.raw(),
             group_count.raw(), expert_members.raw(), work_items.raw(),

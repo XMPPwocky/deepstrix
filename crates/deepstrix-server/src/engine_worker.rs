@@ -547,6 +547,22 @@ fn unix_now_ms() -> i64 {
 /// can unstick. A clean shutdown would just hang too. The on-disk KV
 /// snapshot is persisted at every turn-end (`save_live_if_dirty`),
 /// so the next start replays from there cheaply.
+/// A sticky HIP error (`v4flash_hip::fatal`) leaves the GPU unusable for the life of the process. The engine loops
+/// call this once their in-flight requests got their error: a short grace lets the HTTP handlers write those
+/// responses, then the process exits with `HIP_FATAL_EXIT_CODE` (ring dumped) for the supervisor to relaunch. A no-op
+/// without a sticky error, or in a process that did not `install_exit_on_fatal` (tests, tools).
+pub(crate) fn exit_if_hip_fatal(where_: &str) {
+    if v4flash_hip::fatal::get().is_some() && v4flash_hip::fatal::exit_on_fatal_installed() {
+        std::thread::sleep(Duration::from_millis(300));
+        v4flash_hip::fatal::exit_now(where_);
+    }
+}
+
+/// The error text a request gets when a sticky HIP error ends the process.
+pub(crate) fn hip_fatal_message() -> Option<String> {
+    v4flash_hip::fatal::get().map(|f| format!("engine error: {f}; the server is restarting"))
+}
+
 pub fn run_watchdog(progress: WorkerProgress, deadline_ms: i64, poll_ms: u64) {
     loop {
         std::thread::sleep(Duration::from_millis(poll_ms));
@@ -1861,6 +1877,7 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                 let t_req = std::time::Instant::now();
                 if let Err(e) = handle_generate_stream(&mut state, req, session_id, cancel, &tx) {
                     let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
+                    exit_if_hip_fatal("serial engine: request failed on a sticky HIP error");
                     // A mid-layer failure leaves box-2 requests in flight; drain them
                     // or every later request dies on a ticket/seq mismatch.
                     let n = state.engine.remote_drain_in_flight();

@@ -5,8 +5,30 @@ use std::ptr;
 use color_eyre::eyre::{self, eyre};
 
 use crate::error::check_eyre;
+use crate::ptr_registry::{self, Kind};
+use crate::ring;
 use crate::stream::Stream;
 use crate::sys;
+
+type Loc = &'static std::panic::Location<'static>;
+
+/// A device-side operand must lie inside one live allocation of `device` (or pinned memory): `ptr_registry`.
+#[inline]
+fn on_device(what: &'static str, raw: sys::hipDeviceptr_t, bytes: usize, device: i32, loc: Loc) -> eyre::Result<()> {
+    ptr_registry::check_device(what, raw as usize, bytes, device, loc)
+}
+
+/// Ring entry for a copy / memset: args = (dst, src, bytes).
+#[inline]
+fn ring_copy(device: i32, kind: &'static str, loc: Loc, stream: &Stream, dst: usize, src: usize, bytes: usize) {
+    ring::record(device, kind, Some(loc), stream.raw() as usize, [bytes as u64, 0], &[dst as u64, src as u64, bytes as u64]);
+}
+
+/// As [`ring_copy`] for the blocking calls (the null stream).
+#[inline]
+fn ring_copy_sync(device: i32, kind: &'static str, loc: Loc, dst: usize, src: usize, bytes: usize) {
+    ring::record(device, kind, Some(loc), 0, [bytes as u64, 0], &[dst as u64, src as u64, bytes as u64]);
+}
 
 /// Typed device-side buffer. Owned; freed on drop. The `device_id` field
 /// is informational — HIP doesn't tag allocations with a device, so we
@@ -16,6 +38,10 @@ use crate::sys;
 /// `is_view = true` means this struct refers to a sub-range of another
 /// allocation (created via [`DeviceBuffer::slice_view`] /
 /// [`DeviceBuffer::slice_view_mut`]); Drop skips `hipFree` for views.
+///
+/// Owning buffers are registered in [`ptr_registry`] (`[raw, raw + bytes)`, device,
+/// allocation site) and deregistered in Drop; every copy / memset checks its device
+/// side against the registry before calling HIP (`V41_PTR_REGISTRY=0` disables).
 pub struct DeviceBuffer<T> {
     raw: sys::hipDeviceptr_t,
     len: usize,
@@ -75,6 +101,10 @@ impl<T> DeviceBuffer<T> {
         // device, so without this the buffer silently lands wherever ambient state points.
         let _guard = crate::device::Device::scoped(device_id)?;
         check_eyre(unsafe { sys::hipMalloc(&mut raw, bytes) }, "hipMalloc")?;
+        if let Err(e) = ptr_registry::register(raw as usize, bytes, device_id, Kind::Device, std::panic::Location::caller()) {
+            unsafe { sys::hipFree(raw) };
+            return Err(e);
+        }
         Ok(DeviceBuffer {
             raw,
             len,
@@ -95,6 +125,14 @@ impl<T> DeviceBuffer<T> {
     /// Non-owning `DeviceBuffer` view over an existing device-accessible
     /// pointer — e.g. the pointer from `hipHostMalloc`, which on an APU is
     /// system RAM mapped into the GPU's address space.
+    ///
+    /// LIFETIME HAZARD (shared with `slice_view` / `slice_view_mut` / `view_as`):
+    /// a view carries no borrow of its parent, so nothing stops it outliving
+    /// the allocation. Not redesigned (2026-10-19); instead every copy / memset
+    /// on a view checks it still lies inside a LIVE registered allocation
+    /// (`ptr_registry`), which catches a view of a freed parent unless the
+    /// address range was re-allocated since. Kernel launches are checked only
+    /// where a launcher validates its operands (the MXFP4 MoE launch canary).
     ///
     /// # Safety
     /// `raw` must be device-accessible from `device_id` and stay alive for
@@ -195,7 +233,9 @@ impl<T> DeviceBuffer<T> {
         self.device_id
     }
 
+    #[track_caller]
     pub fn copy_from_host(&mut self, src: &[T]) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         if src.len() != self.len {
             return Err(eyre!(
                 "copy_from_host length mismatch: src={} dst={}",
@@ -206,6 +246,9 @@ impl<T> DeviceBuffer<T> {
         if crate::alloc_scope::phantom_write(self.raw) {
             return Ok(());
         }
+        on_device("copy_from_host dst", self.raw, self.byte_len(), self.device_id, loc)?;
+        ptr_registry::check_host("copy_from_host src", src.as_ptr() as usize, self.byte_len(), loc)?;
+        ring_copy_sync(self.device_id, "HtoD", loc, self.raw as usize, src.as_ptr() as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpy(
@@ -219,7 +262,9 @@ impl<T> DeviceBuffer<T> {
         )
     }
 
+    #[track_caller]
     pub fn copy_to_host(&self, dst: &mut [T]) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         debug_assert!(!crate::alloc_scope::is_phantom(self.raw), "copy_to_host from a phantom (alloc_scope record pass)");
         if dst.len() != self.len {
             return Err(eyre!(
@@ -228,6 +273,9 @@ impl<T> DeviceBuffer<T> {
                 dst.len()
             ));
         }
+        on_device("copy_to_host src", self.raw, self.byte_len(), self.device_id, loc)?;
+        ptr_registry::check_host("copy_to_host dst", dst.as_ptr() as usize, self.byte_len(), loc)?;
+        ring_copy_sync(self.device_id, "DtoH", loc, dst.as_ptr() as usize, self.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpy(
@@ -241,7 +289,12 @@ impl<T> DeviceBuffer<T> {
         )
     }
 
+    /// `src` may be pageable (HIP stages it before returning) or a slice of a
+    /// `PinnedBuffer`; a slice that starts in a pinned buffer must end in it
+    /// (`ptr_registry::check_host`).
+    #[track_caller]
     pub fn copy_from_host_async(&mut self, src: &[T], stream: &Stream) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         if src.len() != self.len {
             return Err(eyre!(
                 "copy_from_host_async length mismatch: src={} dst={}",
@@ -252,6 +305,9 @@ impl<T> DeviceBuffer<T> {
         if crate::alloc_scope::phantom_write(self.raw) {
             return Ok(());
         }
+        on_device("copy_from_host_async dst", self.raw, self.byte_len(), self.device_id, loc)?;
+        ptr_registry::check_host("copy_from_host_async src", src.as_ptr() as usize, self.byte_len(), loc)?;
+        ring_copy(self.device_id, "HtoD async", loc, stream, self.raw as usize, src.as_ptr() as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpyAsync(
@@ -270,12 +326,14 @@ impl<T> DeviceBuffer<T> {
     /// queued on `stream`. `dst` holds the bytes only once `stream` has been
     /// synchronized (or an event recorded after this copy has); reading it
     /// earlier races the DMA.
+    #[track_caller]
     pub fn copy_to_pinned_async(
         &self,
         dst: &mut PinnedBuffer<T>,
         dst_offset: usize,
         stream: &Stream,
     ) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         if dst_offset.checked_add(self.len).is_none_or(|end| end > dst.len()) {
             return Err(eyre!(
                 "copy_to_pinned_async out of range: offset={} len={} dst={}",
@@ -284,10 +342,15 @@ impl<T> DeviceBuffer<T> {
                 dst.len()
             ));
         }
+        // SAFETY: `dst_offset + len <= dst.len()` was checked above.
+        let dst_ptr = unsafe { dst.as_mut_slice().as_mut_ptr().add(dst_offset) };
+        on_device("copy_to_pinned_async src", self.raw, self.byte_len(), self.device_id, loc)?;
+        ptr_registry::check_pinned("copy_to_pinned_async dst", dst_ptr as usize, self.byte_len(), loc)?;
+        ring_copy(self.device_id, "DtoH async", loc, stream, dst_ptr as usize, self.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpyAsync(
-                    dst.as_mut_slice().as_mut_ptr().add(dst_offset) as sys::hipDeviceptr_t,
+                    dst_ptr as sys::hipDeviceptr_t,
                     self.raw,
                     self.byte_len(),
                     sys::HIP_MEMCPY_DEVICE_TO_HOST,
@@ -303,11 +366,13 @@ impl<T> DeviceBuffer<T> {
     /// work on `stream` completes. Used by the spec-decode snapshot
     /// path (one snapshot per layer per pair = 100s of copies; sync
     /// version would stall the pipeline).
+    #[track_caller]
     pub fn copy_from_buffer_async(
         &mut self,
         src: &DeviceBuffer<T>,
         stream: &Stream,
     ) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         debug_assert!(
             !crate::alloc_scope::is_phantom(self.raw) && !crate::alloc_scope::is_phantom(src.raw),
             "device copy on a phantom (alloc_scope record pass)"
@@ -326,6 +391,9 @@ impl<T> DeviceBuffer<T> {
                 self.device_id
             ));
         }
+        on_device("copy_from_buffer_async dst", self.raw, self.byte_len(), self.device_id, loc)?;
+        on_device("copy_from_buffer_async src", src.raw, self.byte_len(), src.device_id, loc)?;
+        ring_copy(self.device_id, "DtoD async", loc, stream, self.raw as usize, src.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpyAsync(
@@ -344,7 +412,9 @@ impl<T> DeviceBuffer<T> {
     /// when the copy is complete (host-blocking). Used by the spec-
     /// decode snapshot/restore path where we want a strict happens-
     /// before relationship without managing stream events.
+    #[track_caller]
     pub fn copy_from_buffer(&mut self, src: &DeviceBuffer<T>) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         debug_assert!(
             !crate::alloc_scope::is_phantom(self.raw) && !crate::alloc_scope::is_phantom(src.raw),
             "device copy on a phantom (alloc_scope record pass)"
@@ -363,6 +433,9 @@ impl<T> DeviceBuffer<T> {
                 self.device_id
             ));
         }
+        on_device("copy_from_buffer dst", self.raw, self.byte_len(), self.device_id, loc)?;
+        on_device("copy_from_buffer src", src.raw, self.byte_len(), src.device_id, loc)?;
+        ring_copy_sync(self.device_id, "DtoD", loc, self.raw as usize, src.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpy(
@@ -380,11 +453,13 @@ impl<T> DeviceBuffer<T> {
     /// different devices; the copy is queued on `stream` (which itself
     /// belongs to *some* device; per HIP docs, peer copy uses the stream's
     /// device's queue).
+    #[track_caller]
     pub fn copy_to_peer_async(
         &self,
         dst: &mut DeviceBuffer<T>,
         stream: &Stream,
     ) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         if dst.len != self.len {
             return Err(eyre!(
                 "copy_to_peer_async length mismatch: src={} dst={}",
@@ -392,6 +467,9 @@ impl<T> DeviceBuffer<T> {
                 dst.len
             ));
         }
+        on_device("copy_to_peer_async dst", dst.raw, self.byte_len(), dst.device_id, loc)?;
+        on_device("copy_to_peer_async src", self.raw, self.byte_len(), self.device_id, loc)?;
+        ring_copy(stream.device_id(), "peer async", loc, stream, dst.raw as usize, self.raw as usize, self.byte_len());
         check_eyre(
             unsafe {
                 sys::hipMemcpyPeerAsync(
@@ -407,10 +485,14 @@ impl<T> DeviceBuffer<T> {
         )
     }
 
+    #[track_caller]
     pub fn fill_zero(&mut self) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         if crate::alloc_scope::phantom_write(self.raw) {
             return Ok(());
         }
+        on_device("fill_zero", self.raw, self.byte_len(), self.device_id, loc)?;
+        ring_copy_sync(self.device_id, "memset", loc, self.raw as usize, 0, self.byte_len());
         check_eyre(
             unsafe { sys::hipMemset(self.raw, 0, self.byte_len()) },
             "hipMemset",
@@ -420,10 +502,14 @@ impl<T> DeviceBuffer<T> {
     /// Stream-ordered zero fill. Unlike [`fill_zero`](Self::fill_zero)
     /// (synchronous `hipMemset`), this queues on `stream` and returns
     /// immediately — safe to interleave with kernels on the same stream.
+    #[track_caller]
     pub fn fill_zero_async(&mut self, stream: &Stream) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
         if crate::alloc_scope::phantom_write(self.raw) {
             return Ok(());
         }
+        on_device("fill_zero_async", self.raw, self.byte_len(), self.device_id, loc)?;
+        ring_copy(self.device_id, "memset async", loc, stream, self.raw as usize, 0, self.byte_len());
         check_eyre(
             unsafe { sys::hipMemsetAsync(self.raw, 0, self.byte_len(), stream.raw()) },
             "hipMemsetAsync",
@@ -437,6 +523,7 @@ impl<T> Drop for DeviceBuffer<T> {
             // `hipFree` resolves the pointer against the CURRENT device; freeing
             // a dGPU allocation while the iGPU is current corrupts the runtime's
             // bookkeeping. See the note on `Stream`'s Drop.
+            ptr_registry::deregister(self.raw as usize, self.byte_len());
             let _guard = crate::device::DeviceGuard::enter(self.device_id);
             let code = unsafe { sys::hipFree(self.raw) };
             if code != sys::HIP_SUCCESS {
@@ -447,6 +534,7 @@ impl<T> Drop for DeviceBuffer<T> {
 }
 
 /// Pinned host buffer (page-locked). Required for fast async DMA.
+/// Registered in [`ptr_registry`] as pinned host memory while it lives.
 pub struct PinnedBuffer<T> {
     raw: *mut T,
     len: usize,
@@ -459,11 +547,13 @@ pub const HIP_HOST_MALLOC_COHERENT: u32 = 0x4000_0000;
 pub const HIP_HOST_MALLOC_NON_COHERENT: u32 = 0x8000_0000;
 
 impl<T> PinnedBuffer<T> {
+    #[track_caller]
     pub fn new(len: usize) -> eyre::Result<Self> {
         Self::new_with_flags(len, 0)
     }
 
     /// As `new`, with explicit `hipHostMalloc` flags.
+    #[track_caller]
     pub fn new_with_flags(len: usize, flags: u32) -> eyre::Result<Self> {
         let bytes = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
             eyre!("PinnedBuffer size overflow: {} * {}", len, std::mem::size_of::<T>())
@@ -479,6 +569,10 @@ impl<T> PinnedBuffer<T> {
         // memory. PinnedBuffer is only used with plain-data numeric types,
         // for which the all-zero bit pattern is valid.
         unsafe { ptr::write_bytes(raw as *mut u8, 0, bytes) };
+        if let Err(e) = ptr_registry::register(raw as usize, bytes, -1, Kind::Pinned, std::panic::Location::caller()) {
+            unsafe { sys::hipHostFree(raw) };
+            return Err(e);
+        }
         Ok(PinnedBuffer {
             raw: raw as *mut T,
             len,
@@ -518,10 +612,67 @@ impl<T> PinnedBuffer<T> {
 impl<T> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            ptr_registry::deregister(self.raw as usize, self.len * std::mem::size_of::<T>());
             let code = unsafe { sys::hipHostFree(self.raw as *mut c_void) };
             if code != sys::HIP_SUCCESS {
                 tracing::warn!(code, "hipHostFree failed during drop");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ptr_registry::tests::{fake_base, reg};
+
+    /// Every copy / memset path checks its pointers BEFORE calling HIP, so the failing cases run on a CPU: fake
+    /// registered allocations, views into and around them, and a null-handle stream that never reaches HIP.
+    #[test]
+    fn copies_with_unregistered_pointers_fail_before_hip() {
+        if !ptr_registry::enabled() {
+            return; // V41_PTR_REGISTRY=0 in the test environment
+        }
+        let base = fake_base(10);
+        reg(base, 4096, 1, Kind::Device);
+        reg(base + 0x10_000, 4096, 2, Kind::Device);
+        let stream = Stream::null_for_test(1);
+        let view = |addr: usize, n: usize, dev: i32| unsafe { DeviceBuffer::<u32>::from_raw_parts(addr as sys::hipDeviceptr_t, n, dev) };
+        let host = vec![0u32; 16];
+        let mut back = vec![0u32; 16];
+        let named = |e: eyre::Report, what: &str, problem: &str| {
+            let s = e.to_string();
+            assert!(s.contains(what) && s.contains(problem) && s.contains(file!()), "{s}");
+        };
+
+        let mut garbage = view(base + 0x8000, 16, 1);
+        named(garbage.copy_from_host_async(&host, &stream).unwrap_err(), "copy_from_host_async dst", "not inside any live allocation");
+        named(garbage.copy_from_host(&host).unwrap_err(), "copy_from_host dst", "not inside any live allocation");
+        named(garbage.copy_to_host(&mut back).unwrap_err(), "copy_to_host src", "not inside any live allocation");
+        named(garbage.fill_zero().unwrap_err(), "fill_zero", "not inside any live allocation");
+        named(garbage.fill_zero_async(&stream).unwrap_err(), "fill_zero_async", "not inside any live allocation");
+
+        let mut straddle = view(base + 4096 - 32, 16, 1);
+        named(straddle.copy_from_host_async(&host, &stream).unwrap_err(), "copy_from_host_async dst", "runs 32 B past the end");
+
+        let mut wrong_dev = view(base, 16, 0);
+        named(wrong_dev.copy_from_host_async(&host, &stream).unwrap_err(), "dst", "dev1 allocation but the operand claims dev0");
+
+        // DtoD: a good dst with a garbage src fails on the src
+        let mut good = view(base, 16, 1);
+        named(good.copy_from_buffer_async(&garbage, &stream).unwrap_err(), "copy_from_buffer_async src", "not inside any live allocation");
+        named(good.copy_from_buffer(&garbage).unwrap_err(), "copy_from_buffer src", "not inside any live allocation");
+        // peer: the dst on dev 2 is live, the src is not
+        let mut peer_dst = view(base + 0x10_000, 16, 2);
+        named(garbage.copy_to_peer_async(&mut peer_dst, &stream).unwrap_err(), "copy_to_peer_async src", "not inside any live allocation");
+        // a view of a FREED allocation (`slice_view`'s lifetime hazard) fails once its parent deregisters
+        let mut child = good.slice_view(4, 8);
+        ptr_registry::deregister(base, 4096);
+        named(child.copy_from_host_async(&host[..8], &stream).unwrap_err(), "copy_from_host_async dst", "not inside any live allocation");
+        // stream value ops
+        let s2 = Stream::null_for_test(2);
+        let e = unsafe { s2.write_value32((base + 0x20_000) as *mut u32, 1) }.unwrap_err().to_string();
+        assert!(e.contains("write_value32 ptr") && e.contains("not inside any live allocation"), "{e}");
+        ptr_registry::deregister(base + 0x10_000, 4096);
     }
 }

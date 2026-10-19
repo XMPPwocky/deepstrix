@@ -67,10 +67,18 @@ impl Stream {
         self.raw
     }
 
+    /// A null-handle stream for CPU tests of the paths that fail BEFORE any HIP call (the `ptr_registry` checks).
+    /// Never pass it to HIP; its Drop does nothing.
+    #[cfg(test)]
+    pub(crate) fn null_for_test(device_id: i32) -> Self {
+        Stream { raw: ptr::null_mut(), device_id }
+    }
+
     pub fn device_id(&self) -> i32 {
         self.device_id
     }
 
+    #[track_caller]
     pub fn synchronize(&self) -> eyre::Result<()> {
         check_eyre(
             unsafe { sys::hipStreamSynchronize(self.raw) },
@@ -87,6 +95,7 @@ impl Stream {
     /// it waits on nothing (pure host overhead — the fix is to DELETE it). The
     /// stage timer alone cannot tell them apart. Calling this immediately before
     /// the blocking call does: busy = exposed compute, idle = overhead.
+    #[track_caller]
     pub fn query(&self) -> eyre::Result<bool> {
         let r = unsafe { sys::hipStreamQuery(self.raw) };
         if r == sys::HIP_SUCCESS {
@@ -98,6 +107,7 @@ impl Stream {
         check_eyre(r, "hipStreamQuery").map(|_| true)
     }
 
+    #[track_caller]
     pub fn wait_event(&self, event: &Event) -> eyre::Result<()> {
         check_eyre(
             unsafe { sys::hipStreamWaitEvent(self.raw, event.raw(), 0) },
@@ -114,7 +124,13 @@ impl Stream {
     /// # Safety
     /// `ptr` must remain valid (pinned host memory or device memory
     /// accessible to this stream's device) until the wait completes.
+    ///
+    /// `ptr` is checked against the live allocations (`ptr_registry`) first.
+    #[track_caller]
     pub unsafe fn wait_value32_gte(&self, ptr: *mut u32, value: u32) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
+        crate::ptr_registry::check_device("wait_value32 ptr", ptr as usize, 4, self.device_id, loc)?;
+        crate::ring::record(self.device_id, "wait value32", Some(loc), self.raw as usize, [4, 0], &[ptr as u64, value as u64]);
         check_eyre(
             unsafe {
                 sys::hipStreamWaitValue32(
@@ -134,7 +150,13 @@ impl Stream {
     ///
     /// # Safety
     /// `ptr` must remain valid until the write completes.
+    ///
+    /// `ptr` is checked against the live allocations (`ptr_registry`) first.
+    #[track_caller]
     pub unsafe fn write_value32(&self, ptr: *mut u32, value: u32) -> eyre::Result<()> {
+        let loc = std::panic::Location::caller();
+        crate::ptr_registry::check_device("write_value32 ptr", ptr as usize, 4, self.device_id, loc)?;
+        crate::ring::record(self.device_id, "write value32", Some(loc), self.raw as usize, [4, 0], &[ptr as u64, value as u64]);
         check_eyre(
             unsafe {
                 sys::hipStreamWriteValue32(self.raw, ptr as *mut std::ffi::c_void, value, 0)

@@ -2885,6 +2885,8 @@ pub struct ExpertShard {
     owner: std::sync::Arc<V41HfWeights>,
     device: Device,
     pub routed: RoutedExpertWeights,
+    /// `routed`'s base pointers as captured at load, for the MoE launch-arg canary (`crate::moe_canary`).
+    _canary: crate::moe_canary::PoolGuard,
     layers: Vec<Option<LayerShard>>,
     info: ShardInfo,
     pub load_stats: LoadStats,
@@ -5289,6 +5291,7 @@ impl ExpertShard {
             down_bytes_per_expert: dbpe,
             n_slots,
         };
+        let canary = crate::moe_canary::register_pool("box2 shard", igpu.id, &routed)?;
 
         let threads = threads.max(1);
         let batch = batch.max(1);
@@ -5481,6 +5484,7 @@ impl ExpertShard {
             owner: std::sync::Arc::new(owner),
             device: igpu,
             routed,
+            _canary: canary,
             layers,
             info,
             load_stats: LoadStats { n_experts: n_slots as usize, bytes, seconds },

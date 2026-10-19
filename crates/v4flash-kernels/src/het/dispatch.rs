@@ -600,6 +600,7 @@ pub fn pair_prefill_stage_rows(e: &DeviceEngine, dt: GgufType, rows: u32) -> &'s
 /// else is exactly `moe_gate_up_chunked_ex`. Serves box 1's prefill / decode
 /// lanes (forward_prefill) and box 2's batched pass (remote_experts).
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn moe_gate_up_chunked_rows(
     e: &DeviceEngine,
     dt: GgufType,
@@ -653,6 +654,7 @@ pub fn moe_gate_up_chunked_rows(
 /// arguments, device-count contract and partials set. Serves box 1
 /// (forward_prefill) and box 2's batched pass (remote_experts).
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn moe_down_mxfp4(
     e: &DeviceEngine,
     s: &Stream,
@@ -713,6 +715,7 @@ pub fn moe_wi_devcount_supported(gate: GgufType, down: GgufType) -> bool {
 /// `n_work_items` is only an upper bound for the grid; only the MXFP4 kwide
 /// kernel checks a device count, so any other kernel is an error.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn moe_gate_up_chunked_ex(
     e: &DeviceEngine,
     dt: GgufType,
