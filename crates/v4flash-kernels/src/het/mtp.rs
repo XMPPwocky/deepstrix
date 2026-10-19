@@ -1549,17 +1549,33 @@ impl MtpState {
             )?;
         }
         drop(_hq);
+        if crate::fp8_wo_a::attn_o_fp8() {
+            // `V41_ATTN_O_FP8`: the inverse rope at the reference's bf16 rounding points (same launch)
+            e.rope.launch_inverse_batched_bf16(
+                s, &mut self.heads, &self.pos_per_b, N_HEAD, N_HEAD_DIM, N_ROT, B, rope,
+            )?;
+        } else {
         e.rope.launch_inverse_batched(
             s, &mut self.heads, &self.pos_per_b, N_HEAD, N_HEAD_DIM, N_ROT, B, rope,
         )?;
+        }
 
         // --- output projection: grouped wo_a, then wo_b ---
         let _ho = HostUs::start_dev(&MTP_H_ATTNO, s);
         {
             let _t = HostUs::start_dev(&MTP_H_OQUANT, s);
+            if crate::fp8_wo_a::attn_o_fp8() {
+                // `V41_ATTN_O_FP8`: the reference's act_quant of the bf16 `o` (model.py:1073), then the same
+                // Q8_0 quantize of the rounded values for this Q8_0 wo_a (the iGPU has no FP8
+                // dot), in the launch that did the quantize alone.
+                e.fp8().quantize_q8_o8(
+                    s, &mut self.heads_xq, &mut self.heads_xscale, &self.heads, Q_FLAT, B,
+                )?;
+            } else {
             e.q8.quantize_input_batched(
                 s, &mut self.heads_xq, &mut self.heads_xscale, &self.heads, Q_FLAT, B,
             )?;
+            }
         }
         {
             let _t = HostUs::start_dev(&MTP_H_OWA, s);

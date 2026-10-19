@@ -72,6 +72,24 @@ impl<'a> WeightSrc<'a> {
         }
     }
 
+    /// `V41HfWeights::attn_o_rounding_calls`; `Ok(None)` for a GGUF source (no reference code).
+    pub fn attn_o_rounding_calls(&self) -> eyre::Result<Option<(usize, String)>> {
+        match *self {
+            Self::Gguf(_) => Ok(None),
+            Self::V41(v) => v.attn_o_rounding_calls().map(Some),
+        }
+    }
+
+    /// An fp8 projection of layer `layer` as the checkpoint ships it (e4m3 bytes then the e8m0
+    /// 32 x 32 block scales, `V41HfWeights::read_fp8_block32_raw`), with its `[out, in]`.
+    /// `Ok(None)` for a GGUF source: its fp8 projections were converted to Q8_0 when written.
+    pub fn read_fp8_block32_raw(&self, layer: usize, proj: &str) -> eyre::Result<Option<(Vec<u8>, usize, usize)>> {
+        match *self {
+            Self::Gguf(_) => Ok(None),
+            Self::V41(v) => v.read_fp8_block32_raw(layer, proj).map(Some),
+        }
+    }
+
     /// Expert `e` of a stacked `[n_expert, out, in]` tensor; `dst.len()` is the
     /// per-expert byte size (the GGUF arm reads `abs_offset + e * dst.len()`,
     /// exactly the arithmetic the loaders used to do inline).

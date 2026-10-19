@@ -174,6 +174,7 @@ extern "C" __global__ void rope_tail_pdev(
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 #include "fp8_e4m3fn_common.inc"
+#include "act_quant_fp8.inc"
 
 #define RF_FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFull
 
@@ -218,6 +219,63 @@ __device__ __forceinline__ void rf_q8_block(float v, uint32_t lane, int8_t* __re
     xqb[lane] = (int8_t)q;
 }
 
+// `V41_ATTN_O_FP8`: the 1017 reference's act_quant (act_quant_fp8.inc) on one 32-block held one
+// element per lane, `v` already the reference's bf16 `o` value -- the block amax by the same xor
+// tree, the e4m3 code into xqb[lane] (bytes, through the int8 view) and the block scale 2^e into
+// *xs. This rounding IS the quantize of the FP8 wo_a input (no Q8_0 step).
+__device__ __forceinline__ void rf_fp8_block(float v, uint32_t lane, int8_t* __restrict__ xqb, float* __restrict__ xs) {
+    float amax = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(RF_FULL_WARP_MASK, amax, off));
+    const int e = aq_scale_exp(amax);
+    if (lane == 0) *xs = aq_pow2(e);
+    xqb[lane] = (int8_t)aq_e4m3_code(v, e);
+}
+
+// `V41_ATTN_O_FP8` on the paths whose inverse rope is a launch of its own (the legacy single-token
+// decode: rope_tail; the DSpark drafter: rope_tail_batched): the same kernels with the reference's
+// rounding points (act_quant_fp8.inc aq_bf16) -- the rotation reads the bf16 values of the
+// attention output and its result is rounded to bf16. The act_quant launch that follows rounds the
+// other 448 dims (bf16 is idempotent on these). Same arithmetic as rope_tail / rope_tail_batched
+// otherwise; same grids.
+__device__ __forceinline__ void rf_bf16_rot_store(float* tail, unsigned i, float c, float s) {
+    const float x0 = aq_bf16(tail[i + 0]);
+    const float x1 = aq_bf16(tail[i + 1]);
+    tail[i + 0] = aq_bf16(x0 * c - x1 * s);
+    tail[i + 1] = aq_bf16(x0 * s + x1 * c);
+}
+
+extern "C" __global__ void rope_tail_bf16(
+        float* x, unsigned int n_head, unsigned int head_dim, unsigned int n_rot, unsigned int pos,
+        float theta_scale, float freq_scale, float ext_factor, float mscale_eff, float corr_low,
+        float corr_high, int inverse) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (head >= n_head) return;
+    if (2u * lane >= n_rot) return;
+    const float theta = rf_theta((int)pos, lane, theta_scale, freq_scale, ext_factor, corr_low, corr_high);
+    const float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
+    const float c = cosf(theta) * mscale_eff;
+    const float s = sin_sign * sinf(theta) * mscale_eff;
+    rf_bf16_rot_store(x + (unsigned long long)head * head_dim + (head_dim - n_rot), 2u * lane, c, s);
+}
+
+extern "C" __global__ void rope_tail_batched_bf16(
+        float* x, const int* __restrict__ pos_per_b, unsigned int n_head, unsigned int head_dim,
+        unsigned int n_rot, float theta_scale, float freq_scale, float ext_factor, float mscale_eff,
+        float corr_low, float corr_high, int inverse) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int b = blockIdx.z;
+    const unsigned int lane = threadIdx.x;
+    if (head >= n_head) return;
+    if (2u * lane >= n_rot) return;
+    const float theta = rf_theta(pos_per_b[b], lane, theta_scale, freq_scale, ext_factor, corr_low, corr_high);
+    const float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
+    const float c = cosf(theta) * mscale_eff;
+    const float s = sin_sign * sinf(theta) * mscale_eff;
+    rf_bf16_rot_store(x + (unsigned long long)b * n_head * head_dim + (unsigned long long)head * head_dim + (head_dim - n_rot),
+                      2u * lane, c, s);
+}
+
 // kv_rms_rope_fp8 — the decode window-KV chain rms_norm_weighted_batched_fast(n = 512)
 // -> rope_tail_batched(1 head, 512, n_rot 64) -> fp8_act_quant_inplace(512) in one launch,
 // grid (b) x 256 (rms_w_fast<2>'s layout: thread t holds elements t and t + 256). The rope
@@ -249,6 +307,17 @@ extern "C" __global__ __launch_bounds__(128) void rope_inv_quant_q8(
         const int* __restrict__ pos_per_b, float theta_scale, float freq_scale, float ext_factor,
         float mscale_eff, float corr_low, float corr_high) {
 #include "rope_inv_quant_q8_body.inc"
+}
+
+// rope_inv_quant_fp8 -- `V41_ATTN_O_FP8`: rope_inv_quant_q8 with the reference's act_quant in place
+// of the Q8_0 quantize (rf_fp8_block): xq gets the e4m3 codes of the whole [b, 32768] row, xscale
+// the per-32 power-of-two scales, heads the inverse-roped f32 (as rope_inv_quant_q8). Same grid,
+// same launch: the FP8 wo_a's input comes out of the launch that produced the Q8_0 one.
+extern "C" __global__ __launch_bounds__(128) void rope_inv_quant_fp8(
+        float* __restrict__ heads, int8_t* __restrict__ xq, float* __restrict__ xscale,
+        const int* __restrict__ pos_per_b, float theta_scale, float freq_scale, float ext_factor,
+        float mscale_eff, float corr_low, float corr_high) {
+#include "rope_inv_quant_fp8_body.inc"
 }
 
 // ---- `_ind` twins (GRAPH_KEYS_DESIGN.md 2.3, 2.11) ---------------------------------------------
@@ -395,3 +464,45 @@ __device__ __forceinline__ static void rope_inv_quant_q8_ind_impl(
     }
 ROPE_INV_QUANT_IND_KERNEL(rope_inv_quant_q8_ind, false)
 ROPE_INV_QUANT_IND_KERNEL(rope_inv_quant_q8_ind_canary, true)
+
+__device__ __forceinline__ static void rope_inv_quant_fp8_body(
+        float* __restrict__ heads, int8_t* __restrict__ xq, float* __restrict__ xscale,
+        const int* __restrict__ pos_per_b, float theta_scale, float freq_scale, float ext_factor,
+        float mscale_eff, float corr_low, float corr_high) {
+#include "rope_inv_quant_fp8_body.inc"
+}
+
+// operands: 0 heads, 1 xq, 2 xscale, 3 pos_per_b (as rope_inv_quant_q8_ind)
+template <bool CANARY>
+__device__ __forceinline__ static void rope_inv_quant_fp8_ind_impl(
+        uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* heads, int8_t* xq,
+        float* xscale, const int* pos_per_b, const uint64_t* rope01, const uint64_t* rope23,
+        const uint64_t* rope45) {
+    ARENA_CTX_DEREF(ind_mask, 0, float*, heads);
+    ARENA_CTX_DEREF(ind_mask, 1, int8_t*, xq);
+    ARENA_CTX_DEREF(ind_mask, 2, float*, xscale);
+    ARENA_CTX_DEREF(ind_mask, 3, const int*, pos_per_b);
+    ROPE_IND_VALUES
+    if constexpr (CANARY) {
+        ARENA_CTX_CANARY_LOAD(canary, ARENA_CTX_U64(heads) ^ ARENA_CTX_U64(xq) ^ ARENA_CTX_U64(xscale) ^
+                                          ARENA_CTX_U64(pos_per_b) ^ ROPE_IND_XOR);
+        rope_inv_quant_fp8_body(heads, xq, xscale, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
+                                corr_low, corr_high);
+        ARENA_CTX_CANARY_STORE(canary_tag);
+    } else {
+        (void)canary;
+        (void)canary_tag;
+        rope_inv_quant_fp8_body(heads, xq, xscale, pos_per_b, theta_scale, freq_scale, ext_factor, mscale_eff,
+                                corr_low, corr_high);
+    }
+}
+#define ROPE_INV_QUANT_FP8_IND_KERNEL(NAME, CANARY)                                            \
+    extern "C" __global__ __launch_bounds__(128) void NAME(                                    \
+            uint32_t ind_mask, const ArenaCtx* canary, uint32_t canary_tag, float* heads,      \
+            int8_t* xq, float* xscale, const int* pos_per_b, const uint64_t* rope01,           \
+            const uint64_t* rope23, const uint64_t* rope45) {                                  \
+        rope_inv_quant_fp8_ind_impl<CANARY>(ind_mask, canary, canary_tag, heads, xq, xscale,   \
+                                            pos_per_b, rope01, rope23, rope45);                \
+    }
+ROPE_INV_QUANT_FP8_IND_KERNEL(rope_inv_quant_fp8_ind, false)
+ROPE_INV_QUANT_FP8_IND_KERNEL(rope_inv_quant_fp8_ind_canary, true)

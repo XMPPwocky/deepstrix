@@ -1966,6 +1966,10 @@ impl HeterogeneousEngine {
         // a graph. rope_inv takes per-token `pos` and stays a direct launch.
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
         let _s_out = debug_span!("output_proj").entered();
+        // `V41_ATTN_O_FP8`: the inverse rope at the reference's bf16 rounding points (same launch).
+        if crate::fp8_wo_a::attn_o_fp8() {
+            de.rope.launch_inverse_bf16(&de.compute, &mut dgpu_scratch.heads, N_HEAD, N_HEAD_DIM, N_ROT, pos, &dlw.rope_params)?;
+        } else {
         de.rope.launch_inverse(
             &de.compute,
             &mut dgpu_scratch.heads,
@@ -1975,6 +1979,7 @@ impl HeterogeneousEngine {
             pos,
             &dlw.rope_params,
         )?;
+        }
         if super::engine::subtensor_dump_armed(layer as usize) {
             de.compute.synchronize()?;
             super::engine::maybe_dump_subtensor_f32(
@@ -1983,9 +1988,17 @@ impl HeterogeneousEngine {
                 &dgpu_scratch.heads,
             )?;
         }
+        // `V41_ATTN_O_FP8` (static, so a captured graph never mixes the two): the reference's
+        // act_quant of `heads` in place of its Q8_0 quantize, and the FP8 wo_a (same 2 launches).
+        let o8 = crate::fp8_wo_a::attn_o_fp8();
         self.dgpu_graphs.run("output_proj_post_rope", layer as u32, &de.compute, |s| {
+            if o8 {
+                de.fp8().act_quant(s, &mut dgpu_scratch.heads_xq, &mut dgpu_scratch.heads_xscale, &dgpu_scratch.heads, Q_FLAT, 1)?;
+                de.fp8().matvec(s, &mut dgpu_scratch.low, &dlw.attn_output_a.buffer, &dgpu_scratch.heads_xq, &dgpu_scratch.heads_xscale, GROUP_DIM, RANK, N_GROUPS, 1)?;
+            } else {
             de.q8.quantize_input(s, &mut dgpu_scratch.heads_xq, &mut dgpu_scratch.heads_xscale, &dgpu_scratch.heads, Q_FLAT)?;
             de.q8_grouped.matvec_grouped(s, &mut dgpu_scratch.low, &dlw.attn_output_a.buffer, &dgpu_scratch.heads_xq, &dgpu_scratch.heads_xscale, GROUP_DIM, RANK, N_GROUPS)?;
+            }
             de.q8.quantize_input(s, &mut dgpu_scratch.low_xq, &mut dgpu_scratch.low_xscale, &dgpu_scratch.low, OUT_LOW)?;
             de.q8.matvec(s, &mut dgpu_scratch.attn_out, &dlw.attn_output_b.buffer, &dgpu_scratch.low_xq, &dgpu_scratch.low_xscale, N_EMBD, OUT_LOW)?;
             Ok(())

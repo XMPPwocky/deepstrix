@@ -51,6 +51,8 @@
 #include <stdint.h>
 #include <type_traits>
 
+#include "act_quant_fp8.inc"
+
 typedef _Float16 half8  __attribute__((ext_vector_type(8)));
 typedef float    float8 __attribute__((ext_vector_type(8)));
 typedef short    short8 __attribute__((ext_vector_type(8)));
@@ -740,7 +742,10 @@ struct WLds {
     float dq[32][HT][2];
 };
 
-// Epilogue of one 16-dim tile, part 1: 1/sum, inverse rope, the tile's per-head amax into LDS slot
+// Epilogue of one 16-dim tile, part 1: 1/sum, inverse rope, the tile's per-head amax into LDS slot.
+// O8 (`V41_ATTN_O_FP8`): the reference's rounding points (act_quant_fp8.inc aq_bf16): the rope
+// tail rotates the bf16 attention output and is stored bf16; the amax is of the bf16 values.
+template <bool O8 = false>
 __device__ __forceinline__ void g3o_epi1(const float8& c, unsigned dt, unsigned slot, unsigned col, unsigned kh,
                                          const float* s_inv, const float* rope, float (*amax)[HT], float (&v)[8]) {
     const unsigned d = dt * 16u + col;
@@ -750,13 +755,17 @@ __device__ __forceinline__ void g3o_epi1(const float8& c, unsigned dt, unsigned 
         const float cr = rope[(d - 448u) >> 1], sr = rope[32u + ((d - 448u) >> 1)];
         #pragma unroll
         for (int e = 0; e < 8; e++) {
+            if constexpr (O8) v[e] = aq_bf16(v[e]);
             const float p = g3_xor<1>(v[e]);
             v[e] = g3_rot(v[e], p, d, cr, sr);
+            if constexpr (O8) v[e] = aq_bf16(v[e]);
         }
     }
     #pragma unroll
     for (int e = 0; e < 8; e++) {
-        float x = fabsf(v[e]);
+        float x;
+        if constexpr (O8) x = fabsf(aq_bf16(v[e]));
+        else x = fabsf(v[e]);
         x = fmaxf(x, g3_xor<8>(x));
         x = fmaxf(x, g3_xor<4>(x));
         x = fmaxf(x, g3_xor<2>(x));
@@ -764,17 +773,25 @@ __device__ __forceinline__ void g3o_epi1(const float8& c, unsigned dt, unsigned 
         if (col == 0u) amax[slot][kh + (unsigned)e] = x;
     }
 }
-// part 2 (after a barrier): the block's scale from the pair (slot, slot ^ 1), quantize, store
+// part 2 (after a barrier): the block's scale from the pair (slot, slot ^ 1), quantize, store.
+// O8 (`V41_ATTN_O_FP8`): the act_quant scale (of the pair's bf16 amax, epi1) and the e4m3 codes of the bf16 values.
+template <bool O8 = false>
 __device__ __forceinline__ void g3o_epi2(const G3OArgs& a, unsigned b, unsigned h0, unsigned dt, unsigned slot,
                                          unsigned col, unsigned kh, float (*amax)[HT], float (*dq)[HT][2],
                                          const float (&v)[8], int8_t* stg = nullptr, unsigned stg_stride = 0u,
                                          unsigned stg_d0 = 0u) {
     if (col < 8u) {
         const float am = fmaxf(amax[slot][kh + col], amax[slot ^ 1u][kh + col]);
+        if constexpr (O8) {
+            const float s = aq_pow2(aq_scale_exp(am));
+            dq[slot][kh + col][0] = s;
+            if ((dt & 1u) == 0u) a.xscale[(size_t)b * 1024u + (h0 + kh + col) * 16u + (dt >> 1)] = s;
+        } else {
         const float dd = am / 127.0f;
         dq[slot][kh + col][0] = dd;
         dq[slot][kh + col][1] = dd != 0.0f ? 1.0f / dd : 0.0f;
         if ((dt & 1u) == 0u) a.xscale[(size_t)b * 1024u + (h0 + kh + col) * 16u + (dt >> 1)] = dd;
+        }
     }
     __builtin_amdgcn_wave_barrier();
     asm volatile("s_wait_dscnt 0x0" ::: "memory");
@@ -783,6 +800,15 @@ __device__ __forceinline__ void g3o_epi2(const G3OArgs& a, unsigned b, unsigned 
     #pragma unroll
     for (int e = 0; e < 8; e++) {
         const unsigned head = h0 + kh + (unsigned)e;
+        if constexpr (O8) {
+            const int ex = (int)(__float_as_uint(dq[slot][kh + (unsigned)e][0]) >> 23) - 127;
+            const int8_t qv = (int8_t)aq_e4m3_code(aq_bf16(v[e]), ex);   // the bf16 `o` (epi1)
+            const size_t hbase = row + (size_t)head * 512u;
+            if (stg) stg[(kh + (unsigned)e) * stg_stride + d - stg_d0] = qv;
+            else a.xq[hbase + d] = qv;
+            if (a.heads_out) a.heads_out[hbase + d] = v[e];
+            continue;
+        }
         const float id = dq[slot][kh + (unsigned)e][1];
         int qv = (int)lrintf(v[e] * id);
         qv = qv > 127 ? 127 : (qv < -128 ? -128 : qv);
@@ -793,7 +819,7 @@ __device__ __forceinline__ void g3o_epi2(const G3OArgs& a, unsigned b, unsigned 
     }
 }
 
-template <unsigned DPW, unsigned NW>
+template <unsigned DPW, unsigned NW, bool O8 = false>
 __device__ __forceinline__ void g3o_w_body(const G3OArgs& a, unsigned hg, unsigned b, unsigned dp, WLds& L) {
     constexpr unsigned NT = NW * 32u;                    // threads
     constexpr unsigned NDT = 32u / DPW;                  // dim tiles of this WG
@@ -978,7 +1004,7 @@ __device__ __forceinline__ void g3o_w_body(const G3OArgs& a, unsigned hg, unsign
     float v[DTW][8];
     if (vw) {
         #pragma unroll
-        for (unsigned k = 0; k < DTW; k++) g3o_epi1(c[k], dtb + k, wave * DTW + k, col, kh, L.s_inv, L.rope, L.amax, v[k]);
+        for (unsigned k = 0; k < DTW; k++) g3o_epi1<O8>(c[k], dtb + k, wave * DTW + k, col, kh, L.s_inv, L.rope, L.amax, v[k]);
     }
     g3o_lds_barrier();
 #if G3O_WSTG
@@ -989,7 +1015,7 @@ __device__ __forceinline__ void g3o_w_body(const G3OArgs& a, unsigned hg, unsign
     if (vw) {
         #pragma unroll
         for (unsigned k = 0; k < DTW; k++)
-            g3o_epi2(a, b, h0, dtb + k, wave * DTW + k, col, kh, L.amax, L.dq, v[k], stg, SW, dp * SW);
+            g3o_epi2<O8>(a, b, h0, dtb + k, wave * DTW + k, col, kh, L.amax, L.dq, v[k], stg, SW, dp * SW);
     }
     g3o_lds_barrier();
     for (unsigned i = tid; i < HT * SW / 16u; i += NT) {
@@ -1000,7 +1026,7 @@ __device__ __forceinline__ void g3o_w_body(const G3OArgs& a, unsigned hg, unsign
 #else
     if (vw) {
         #pragma unroll
-        for (unsigned k = 0; k < DTW; k++) g3o_epi2(a, b, h0, dtb + k, wave * DTW + k, col, kh, L.amax, L.dq, v[k]);
+        for (unsigned k = 0; k < DTW; k++) g3o_epi2<O8>(a, b, h0, dtb + k, wave * DTW + k, col, kh, L.amax, L.dq, v[k]);
     }
 #endif
     G3O_TS(slot, 7);
@@ -1102,6 +1128,24 @@ G3O_W_ENTRY(2, 16, attn_g3o_w2)
 G3O_W_ENTRY(4, 16, attn_g3o_w4)
 G3O_W_ENTRY(1, 32, attn_g3o_x1)
 G3O_W_ENTRY(2, 32, attn_g3o_x2)
+
+// `V41_ATTN_O_FP8`: the W family with the act_quant epilogue (g3o_epi2<true>): xq gets the e4m3
+// codes, xscale the per-32 power-of-two scales. (The two-launch / ticketed entries have no twin:
+// production's `V41_ATTN_G3_KERNEL` picks only W modes; `AttnDecG3o::launch` refuses the others.)
+#define G3O_W_ENTRY_O8(DPW, NW, NAME)                                                                \
+extern "C" __global__ __launch_bounds__(NW * 32) void NAME(G3OArgs a) {                              \
+    G3O_BODY(                                                                                        \
+    __shared__ __attribute__((aligned(16))) WLds L;                                                  \
+    const unsigned lin_ = blockIdx.y * 4u + blockIdx.x;                                               \
+    const unsigned hg_ = G3O_WMAP ? lin_ / a.b : blockIdx.x, row_ = G3O_WMAP ? lin_ % a.b : blockIdx.y; \
+    g3o_w_body<DPW, NW, true>(a, hg_, row_, blockIdx.z, L);                                          \
+    )                                                                                                \
+}
+G3O_W_ENTRY_O8(1, 16, attn_g3o_w1_o8)
+G3O_W_ENTRY_O8(2, 16, attn_g3o_w2_o8)
+G3O_W_ENTRY_O8(4, 16, attn_g3o_w4_o8)
+G3O_W_ENTRY_O8(1, 32, attn_g3o_x1_o8)
+G3O_W_ENTRY_O8(2, 32, attn_g3o_x2_o8)
 
 // The compiled variant's geometry (the host derives grids from it).
 extern "C" __global__ void attn_g3o_cfg(unsigned* out) {

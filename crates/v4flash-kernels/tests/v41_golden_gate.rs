@@ -53,7 +53,16 @@
 //! GOLDEN_PATHS (serial,arena), GOLDEN_ROUTING (free,pinned), GOLDEN_DECODE_FROM
 //! (first decoded position; default the first span's `<think>`, 0 without spans),
 //! GOLDEN_MAX_STEPS, GOLDEN_REPORT_DIR (default target/; writes golden_gate_<case>.json),
-//! V41_HF_DIR, V41_ENGRAM_DIR, V41_PAGER_POOL_GB (default 40 here).
+//! V41_HF_DIR (default /weights2/dsv4.1f-1017), V41_ENGRAM_DIR, V41_PAGER_POOL_GB (default 40 here).
+//!
+//! `V41_ATTN_O_FP8` (static, read at weight load): a fixture records whether its reference rounded
+//! the attention output (`source.attn_o_fp8.applied`, `V41_ORACLE_ATTN_O_FP8` at capture; absent =
+//! a pre-knob capture = not applied). The gate refuses a case whose setting differs from the
+//! engine's (`GOLDEN_O8_MISMATCH_OK=1`: run it anyway, as a negative control, no hard failure), and
+//! proves which knob-on paths ran from `fp8_wo_a::launch_counts` (knob off: every count must stay
+//! 0; knob on: a prompt of > 16 rows must have run the FP8 GEMM + rope_inv_quant_fp8, <= 16 rows
+//! the FP8 GEMV; serial decode rope_tail_bf16 + act_quant_fp8_wave + the GEMV; arena decode the
+//! GEMV + rope_inv_quant_fp8 or the G3 epilogue, the G3 epilogue when `V41_ATTN_G3=1`).
 
 use std::path::{Path, PathBuf};
 
@@ -77,8 +86,7 @@ use v4flash_kernels::het::{
 use v4flash_kernels::RopeParams;
 
 const ROPE_ORIG_CTX: u64 = 65536;
-const HF_DIR_DEFAULT: &str =
-    "/persist/hf_cache/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277";
+const HF_DIR_DEFAULT: &str = "/weights2/dsv4.1f-1017";
 /// Reference score gap (lost expert minus gained expert) above which a routing
 /// difference cannot be a near-tie flip.
 const LARGE_FLIP_GAP: f32 = 0.05;
@@ -105,6 +113,48 @@ fn pick(prefix: &str) -> eyre::Result<Device> {
     Err(eyre!("no {prefix} device"))
 }
 
+/// Which `V41_ATTN_O_FP8` sites one run must have reached (`fp8_wo_a::launch_counts` deltas of its
+/// prefill and of its decode); one message per broken expectation.
+fn fp8_path_check(
+    prefill: &serde_json::Map<String, serde_json::Value>,
+    decode: &serde_json::Map<String, serde_json::Value>,
+    prompt_rows: usize,
+    path: &str,
+) -> Vec<String> {
+    let n = |m: &serde_json::Map<String, serde_json::Value>, k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut bad = Vec::new();
+    if !v4flash_kernels::fp8_wo_a::attn_o_fp8() {
+        for (k, v) in prefill.iter().chain(decode) {
+            if v.as_u64().unwrap_or(0) != 0 {
+                bad.push(format!("V41_ATTN_O_FP8 is off but {k} launched {v} times"));
+            }
+        }
+        return bad;
+    }
+    let mut want = |ok: bool, what: &str| {
+        if !ok {
+            bad.push(format!("V41_ATTN_O_FP8 is on but {what} never ran"));
+        }
+    };
+    if prompt_rows > 16 {
+        want(n(prefill, "fp8_gemm") > 0, "the prefill FP8 GEMM (fp8_grouped_gemm_wmma)");
+        want(n(prefill, "rope_inv_quant_fp8") > 0, "the prefill rope_inv_quant_fp8");
+    } else if prompt_rows > 0 {
+        want(n(prefill, "fp8_gemv") > 0, "the prefill FP8 GEMV");
+    }
+    if path == "serial" {
+        want(n(decode, "rope_tail_bf16") > 0, "the serial decode rope_tail_bf16");
+        want(n(decode, "act_quant_fp8_wave") > 0, "the serial decode act_quant_fp8_wave");
+    } else {
+        want(n(decode, "rope_inv_quant_fp8") + n(decode, "g3_o8") > 0, "the arena decode act_quant epilogue");
+        if std::env::var("V41_ATTN_G3").as_deref() == Ok("1") {
+            want(n(decode, "g3_o8") > 0, "the G3 act_quant epilogue (V41_ATTN_G3=1)");
+        }
+    }
+    want(n(decode, "fp8_gemv") > 0, "the decode FP8 GEMV");
+    bad
+}
+
 // ------------------------------------------------------------------ fixture
 
 struct Fixture {
@@ -118,6 +168,10 @@ struct Fixture {
     /// Present when the capture kept layer dumps: residual after each layer, and the embedded input.
     residuals: Option<Vec<f32>>, // [L, T, HC_DIM]
     embed_hc: Option<Vec<f32>>,  // [T, HC_DIM]
+    /// The reference rounded the attention output before wo_a (`source.attn_o_fp8.applied`).
+    attn_o_fp8: bool,
+    /// `source.model_dir` (the checkpoint the reference ran).
+    model_dir: String,
 }
 
 fn read_f32(p: &Path) -> eyre::Result<Vec<f32>> {
@@ -164,7 +218,9 @@ impl Fixture {
             f if f.exists() => Some(read_f32(&f)?).filter(|v| v.len() == t * hc),
             _ => None,
         };
-        Ok(Self { tokens, spans, vocab, logits, topk, sel, residuals, embed_hc })
+        let attn_o_fp8 = fx["source"]["attn_o_fp8"]["applied"].as_bool().unwrap_or(false);
+        let model_dir = fx["source"]["model_dir"].as_str().unwrap_or("").to_string();
+        Ok(Self { tokens, spans, vocab, logits, topk, sel, residuals, embed_hc, attn_o_fp8, model_dir })
     }
     fn ref_logits(&self, pos: usize) -> &[f32] {
         &self.logits[pos * self.vocab..(pos + 1) * self.vocab]
@@ -451,6 +507,14 @@ fn v41_golden_gate() -> eyre::Result<()> {
         }
         let runs: Vec<(String, bool)> =
             paths.iter().flat_map(|p| routings.iter().map(move |r| (p.clone(), r == "pinned"))).collect();
+        let o8 = v4flash_kernels::fp8_wo_a::attn_o_fp8();
+        if fx.attn_o_fp8 != o8 && std::env::var("GOLDEN_O8_MISMATCH_OK").as_deref() != Ok("1") {
+            return Err(eyre!(
+                "[{name}] the fixture's reference {} the attention output but V41_ATTN_O_FP8={}: capture it with \
+                 V41_ORACLE_ATTN_O_FP8={} (or GOLDEN_O8_MISMATCH_OK=1 for a negative control)",
+                if fx.attn_o_fp8 { "rounded" } else { "did not round" }, o8 as u8, o8 as u8
+            ));
+        }
         let last_pos = (t_n - 2).min(decode_from + max_steps.saturating_sub(1));
         eprintln!(
             "golden gate: case {name} T={t_n}, prompt {decode_from} tokens, decode positions {decode_from}..={last_pos}, \
@@ -508,6 +572,8 @@ fn v41_golden_gate() -> eyre::Result<()> {
 
         let mut report = serde_json::Map::new();
         report.insert("case".into(), c.name.clone().into());
+        report.insert("fixture_model_dir".into(), fx.model_dir.clone().into());
+        report.insert("hf_dir".into(), dir.clone().into());
         report.insert("tokens".into(), t_n.into());
         report.insert("prompt_tokens".into(), prompt.len().into());
         report.insert("remote".into(), std::env::var("V41_REMOTE_ADDR").is_ok().into());
@@ -516,6 +582,7 @@ fn v41_golden_gate() -> eyre::Result<()> {
             let name = if *pinned { format!("{}/{path}+pin", c.name) } else { format!("{}/{path}", c.name) };
             pin_set(if *pinned { Some(PinTable::new(N_LAYER as usize, t_n, fx.topk.clone())?) } else { None });
             let t0 = std::time::Instant::now();
+            let fp8_c0 = v4flash_kernels::fp8_wo_a::launch_counts();
             let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
             let mut steps = StepStats::default();
             let mut flips = FlipStats::new();
@@ -540,6 +607,7 @@ fn v41_golden_gate() -> eyre::Result<()> {
             }
             flips.pin_overrides.0 = pin_overrides_take();
             let t_prefill = t0.elapsed().as_secs_f64();
+            let fp8_c1 = v4flash_kernels::fp8_wo_a::launch_counts();
 
             // ---- teacher-forced decode over the rest of the transcript
             let mut arena = None;
@@ -598,12 +666,22 @@ fn v41_golden_gate() -> eyre::Result<()> {
                 a.release(slot)?;
             }
             let secs = t0.elapsed().as_secs_f64();
+            let fp8_c2 = v4flash_kernels::fp8_wo_a::launch_counts();
+            let delta = |a: &[(&'static str, u64)], b: &[(&'static str, u64)]| -> serde_json::Map<String, serde_json::Value> {
+                a.iter().zip(b).map(|(x, y)| (x.0.to_string(), serde_json::Value::from(y.1 - x.1))).collect()
+            };
+            let (fp8_prefill, fp8_decode) = (delta(&fp8_c0, &fp8_c1), delta(&fp8_c1, &fp8_c2));
+            for msg in fp8_path_check(&fp8_prefill, &fp8_decode, prompt.len(), path) {
+                failures.push(format!("[{name}] {msg}"));
+            }
             let mut r = serde_json::json!({
                 "prefill_last": prefill_stats.summary(false),
                 "decode_generated": steps.summary(true),
                 "decode_all": steps.summary(false),
                 "routing": flips.summary(),
                 "seconds": {"prefill": t_prefill, "total": secs},
+                "attn_o_fp8": {"engine": v4flash_kernels::fp8_wo_a::attn_o_fp8(), "fixture": fx.attn_o_fp8,
+                               "prefill_launches": fp8_prefill, "decode_launches": fp8_decode},
             });
             if tap_resid {
                 r["residual"] = resid.summary();
@@ -612,7 +690,8 @@ fn v41_golden_gate() -> eyre::Result<()> {
             // Hard failures only for now; thresholds tighten once a baseline exists.
             let d = &r["decode_all"];
             let (mean, top1) = (d["kl_mean"].as_f64().unwrap_or(f64::NAN), d["top1_agree"].as_f64().unwrap_or(0.0));
-            if !(mean < 0.5) || top1 < 0.8 {
+            let o8_control = fx.attn_o_fp8 != v4flash_kernels::fp8_wo_a::attn_o_fp8();
+            if (!(mean < 0.5) || top1 < 0.8) && !o8_control {
                 failures.push(format!("[{name}] gross divergence from the reference: KL mean {mean:.4}, top-1 {top1:.3}"));
             }
             let differing = r["routing"]["differing"].as_u64().unwrap_or(u64::MAX);

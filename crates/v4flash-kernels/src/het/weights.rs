@@ -396,6 +396,44 @@ impl HetGlobalWeights {
     }
 }
 
+/// `V41_ATTN_O_FP8`: layer `layer`'s `wo_a` as the checkpoint ships it -- `[OUT_LOW, GROUP_DIM]`
+/// e4m3 bytes then the `[OUT_LOW / 32, GROUP_DIM / 32]` e8m0 block scales, one device buffer, bytes
+/// verbatim (`crate::fp8_wo_a`; `act_quant_fp8::fp8_weight_bytes`). Only an HF checkpoint has them:
+/// a GGUF's wo_a was converted to Q8_0 when it was written.
+fn load_fp8_wo_a(src: WeightSrc<'_>, layer: i32, device_id: i32) -> eyre::Result<DeviceWeight> {
+    use crate::config::{GROUP_DIM, OUT_LOW};
+    // Startup assert (once): the knob reproduces the 1017 reference's rounding of `o`, so the
+    // checkpoint's own reference must do it -- its shipped inference/model.py calls
+    // `act_quant(o, ...)` (V41HfWeights::attn_o_rounding_calls). A checkpoint without it would get
+    // numerics its reference never had.
+    static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    CHECKED
+        .get_or_init(|| match src.attn_o_rounding_calls() {
+            Ok(Some((n, rev))) if n > 0 => {
+                tracing::info!(calls = n, rev = %rev, "V41_ATTN_O_FP8: the checkpoint's reference rounds the attention output (act_quant(o)) -- FP8 wo_a on");
+                Ok(())
+            }
+            Ok(Some((_, rev))) => Err(format!(
+                "V41_ATTN_O_FP8=1 but this checkpoint's inference/model.py ({rev}) never calls act_quant(o, ...): \
+                 its reference does not round the attention output (pre-1017 weights?)"
+            )),
+            Ok(None) => Err("V41_ATTN_O_FP8=1 needs the HF checkpoint (its reference + native fp8 wo_a); this GGUF has neither".into()),
+            Err(e) => Err(format!("V41_ATTN_O_FP8=1: cannot read the checkpoint's reference: {e:#}")),
+        })
+        .clone()
+        .map_err(|e| eyre!(e))?;
+    let (bytes, out, inn) = src
+        .read_fp8_block32_raw(layer as usize, "attn.wo_a")?
+        .ok_or_else(|| eyre!("V41_ATTN_O_FP8=1 needs the HF checkpoint (the native fp8 wo_a); this GGUF holds it as Q8_0"))?;
+    if (out, inn) != (OUT_LOW as usize, GROUP_DIM as usize) {
+        return Err(eyre!("layers.{layer}.attn.wo_a: [{out}, {inn}], the engine is compiled for [{OUT_LOW}, {GROUP_DIM}]"));
+    }
+    assert_eq!(bytes.len(), crate::act_quant_fp8::fp8_weight_bytes(out, inn), "layers.{layer}.attn.wo_a: fp8 bytes + scales");
+    let mut buffer = DeviceBuffer::<u8>::new(device_id, bytes.len())?;
+    buffer.copy_from_host(&bytes)?;
+    Ok(DeviceWeight { buffer, n_elements: (out * inn) as u64, dtype: GgufType::I8, shape: vec![inn as u64, out as u64] })
+}
+
 impl DgpuLayerWeights {
     pub fn load<'a>(
         gguf: impl Into<WeightSrc<'a>>,
@@ -479,8 +517,13 @@ impl DgpuLayerWeights {
             device_id,
             N_HEAD as usize,
         )?;
-        let attn_output_a =
-            load_to_device(gguf, &format!("blk.{layer}.attn_output_a.weight"), device_id)?;
+        // `V41_ATTN_O_FP8`: the checkpoint's e4m3 wo_a + e8m0 32x32 scales as shipped, INSTEAD of the
+        // Q8_0 conversion (never both resident): 33,587,200 B per layer vs 35,651,584 (-2.06 MB).
+        let attn_output_a = if crate::fp8_wo_a::attn_o_fp8() {
+            load_fp8_wo_a(gguf, layer, device_id)?
+        } else {
+            load_to_device(gguf, &format!("blk.{layer}.attn_output_a.weight"), device_id)?
+        };
         let attn_output_b =
             load_to_device(gguf, &format!("blk.{layer}.attn_output_b.weight"), device_id)?;
         let rope_params = rope_params_for_layer(layer)?;

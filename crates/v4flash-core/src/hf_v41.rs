@@ -725,6 +725,55 @@ impl V41HfWeights {
         Ok(())
     }
 
+    /// Whether this checkpoint's own reference (`inference/model.py`, shipped with the weights)
+    /// rounds the attention output through FP8 before `wo_a` -- the 1017 line
+    /// `act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)` (main attention + DSpark block;
+    /// absent from the earlier checkpoint). Returns the number of such calls and the checkpoint's
+    /// `.hf_fetch_rev` (repo + commit, for the log; "" when absent). The model.py text, not a
+    /// revision list, is the identity: it is the semantics `V41_ATTN_O_FP8` reproduces.
+    pub fn attn_o_rounding_calls(&self) -> eyre::Result<(usize, String)> {
+        let dir = self.st.dir();
+        let p = dir.join("inference").join("model.py");
+        let src = std::fs::read_to_string(&p).wrap_err_with(|| format!("read {}", p.display()))?;
+        let n = src.matches("act_quant(o, fp8_block_size").count();
+        let rev = std::fs::read_to_string(dir.join(".hf_fetch_rev")).unwrap_or_default().trim().to_string();
+        Ok((n, rev))
+    }
+
+    /// An fp8 projection AS SHIPPED, for kernels that consume e4m3 directly (`V41_ATTN_O_FP8`'s
+    /// `wo_a`): the `[out, in]` F8_E4M3 bytes of `layers.{layer}.{proj}.weight`, then the
+    /// `[out/32, in/32]` F8_E8M0 block-scale bytes of its `.scale`, both verbatim (no dequant, no
+    /// requant). NOT part of the presented GGUF table, so the tensor directory (and the snapshot
+    /// fingerprint built from it) is unchanged unless a caller asks for it. Asserts the checkpoint's
+    /// invariants the FP8 kernels rely on: 32 x 32 blocks, no NaN code (0x7F / 0xFF) in the weight
+    /// and no NaN scale (0xFF).
+    pub fn read_fp8_block32_raw(&self, layer: usize, proj: &str) -> eyre::Result<(Vec<u8>, usize, usize)> {
+        let w = format!("layers.{layer}.{proj}.weight");
+        let s = format!("layers.{layer}.{proj}.scale");
+        let t = self.st.get(&w)?;
+        if t.dtype != StDtype::F8E4M3 || t.shape.len() != 2 {
+            return Err(eyre!("{w}: expected a 2-D F8_E4M3 weight, got {:?} {:?}", t.dtype, t.shape));
+        }
+        let (out, inn) = (t.shape[0] as usize, t.shape[1] as usize);
+        let st_ = self.st.get(&s)?;
+        if st_.dtype != StDtype::F8E8M0 || st_.shape != [(out / 32) as u64, (inn / 32) as u64] || out % 32 != 0 || inn % 32 != 0 {
+            return Err(eyre!("{s}: expected F8_E8M0 scales [{}, {}] (32 x 32 blocks of [{out}, {inn}]), got {:?} {:?}",
+                             out / 32, inn / 32, st_.dtype, st_.shape));
+        }
+        let mut bytes = self.st.read(t)?;
+        let scales = self.st.read(st_)?;
+        assert_eq!(bytes.len(), out * inn, "{w}: read {} bytes for [{out}, {inn}] e4m3", bytes.len());
+        assert_eq!(scales.len(), (out / 32) * (inn / 32), "{s}: read {} scale bytes", scales.len());
+        if let Some(i) = bytes.iter().position(|&b| b & 0x7F == 0x7F) {
+            return Err(eyre!("{w}: e4m3 NaN code {:#04x} at [{}, {}]", bytes[i], i / inn, i % inn));
+        }
+        if let Some(i) = scales.iter().position(|&b| b == 0xFF) {
+            return Err(eyre!("{s}: e8m0 NaN scale at block [{}, {}]", i / (inn / 32), i % (inn / 32)));
+        }
+        bytes.extend_from_slice(&scales);
+        Ok((bytes, out, inn))
+    }
+
     fn read_q8(&self, w: &str, scale: Option<&str>, dst: &mut [u8]) -> eyre::Result<()> {
         let t = self.st.get(w)?;
         let (out, inn) = (t.shape[0] as usize, t.shape[1] as usize);

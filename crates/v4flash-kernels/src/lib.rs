@@ -29,6 +29,7 @@ pub(crate) const fn parse_u32_dec(s: &str) -> u32 {
     v
 }
 
+pub mod act_quant_fp8;
 pub mod attention;
 pub mod attn_meta;
 pub mod attention_dec;
@@ -71,6 +72,7 @@ pub mod mxfp4_pair;
 pub mod mxfp4_repack;
 pub mod engram_gate;
 pub mod fp4_kv;
+pub mod fp8_wo_a;
 pub mod mxfp4_tables;
 pub mod kv_cache_append;
 pub mod laguna;

@@ -28,7 +28,7 @@
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::attention_dec::AttentionDec;
-use v4flash_kernels::attn_dec_g3::{AttnDecG3, G3Comp, G3Rows};
+use v4flash_kernels::attn_dec_g3::{AttnDecG3, G3Comp, G3Epilogue, G3Rows};
 use v4flash_kernels::attn_dec_g3o::{AttnDecG3o, G3oMode, G3O_DEFAULT_CFG, G3O_SYNC_ERR, G3O_SYNC_WORDS, G3O_TS_SLOTS};
 use v4flash_kernels::attn_meta::{AttnMetaFill, MetaDst};
 use v4flash_kernels::device_ceilings::DeviceCeilings;
@@ -382,6 +382,14 @@ fn make_case(lane: &mut Lane, rng: &mut Lcg, b: usize, mode: Mode, rows: Rows) -
 /// The production chain (forward_prefill.rs: meta fill -> gather -> fused attention -> rope_inv_quant).
 /// `index_source`: the meta fill also writes n_index_comp_per_b (4 destinations).
 fn run_chain(k: &Kernels, s: &Stream, l: &mut Lane, c: &Case, params: &RopeParams, index_source: bool) -> eyre::Result<()> {
+    run_chain_epi(k, s, l, c, params, index_source, G3Epilogue::Q8_0)
+}
+
+/// The chain with the output projection's input quantize `epi`: `rope_inv_quant_q8`, or under
+/// `V41_ATTN_O_FP8` `rope_inv_quant_fp8` (the reference's act_quant codes + scales).
+#[allow(clippy::too_many_arguments)]
+fn run_chain_epi(k: &Kernels, s: &Stream, l: &mut Lane, c: &Case, params: &RopeParams, index_source: bool,
+                 epi: G3Epilogue) -> eyre::Result<()> {
     let b = c.n_raw.len() as u32;
     k.meta.launch(s, [
         Some(MetaDst::new(&mut l.n_raw_per, &c.n_raw)?),
@@ -408,7 +416,10 @@ fn run_chain(k: &Kernels, s: &Stream, l: &mut Lane, c: &Case, params: &RopeParam
     };
     k.dec.launch_fused_f16s_rows(s, &mut l.heads, &l.sinks, &l.q, &l.kv, comp, &nrp, &nrop, &ncp, NH, HD,
                                  n_total_max, b, stride, base)?;
-    k.rope.launch_inverse_quant_q8(s, &mut l.heads, &mut l.xq, &mut l.xs, &l.pos, NH, HD, 64, b, params)
+    match epi {
+        G3Epilogue::Q8_0 => k.rope.launch_inverse_quant_q8(s, &mut l.heads, &mut l.xq, &mut l.xs, &l.pos, NH, HD, 64, b, params),
+        G3Epilogue::Fp8 => k.rope.launch_inverse_quant_fp8(s, &mut l.heads, &mut l.xq, &mut l.xs, &l.pos, NH, HD, 64, b, params),
+    }
 }
 
 fn comp_of<'a>(l: &'a Lane, c: &Case) -> G3Comp<'a> {
@@ -596,6 +607,111 @@ fn g3o_bit_identical_to_the_chain() -> eyre::Result<()> {
               k.arms.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "));
     if bad != 0 {
         return Err(eyre!("{bad} of {total} comparisons failed"));
+    }
+    Ok(())
+}
+
+/// `V41_ATTN_O_FP8`: the act_quant epilogue of every G3 kernel production can pick (round 1's
+/// `attn_dec_g3_o8` and the W family `attn_g3o_{w1,w2,w4,x1,x2}_o8`) against the fp8 chain (fused
+/// attention -> `rope_inv_quant_fp8`), heads / codes / scales BIT FOR BIT, and the chain's codes /
+/// scales against the CPU emulation of the reference (`act_quant_fp8::act_quant_row_bf16` of the chain's
+/// roped heads). Same lanes, rope sets, key layouts and rows as `g3o_bit_identical_to_the_chain`;
+/// also checks the fp8 chain leaves the Q8_0 chain's attention output on dims 0..447 and bf16 values on the rope tail.
+#[test]
+#[ignore]
+fn g3o_o8_bit_identical_to_the_fp8_chain() -> eyre::Result<()> {
+    use v4flash_kernels::act_quant_fp8::act_quant_row_bf16;
+    install_panic_handler();
+    let (dev, arch) = dgpu()?;
+    dev.set_current()?;
+    let id = dev.id;
+    let s = Stream::new(id)?;
+    let k = Kernels::new(&arch, id, &s)?;
+    let mut rng = Lcg(0x0f8_0017);
+    let mut lanes = [Lane::new(id, &mut rng, 0.5, 1.0)?, Lane::new(id, &mut rng, 2.0, 1.0)?];
+    let w_modes = [(1u32, 16u32), (2, 16), (4, 16), (1, 32), (2, 32)];
+    let (mut total, mut bad, mut cpu_checked) = (0usize, 0usize, 0usize);
+    for (pname, params) in rope_params() {
+        for mode in [Mode::Selected, Mode::SelectedNoBase, Mode::DenseBase, Mode::DenseShared, Mode::NoComp] {
+            for rows in [Rows::Steady(128, 512), Rows::Ragged, Rows::Edges] {
+                for b in 1..=BMAX {
+                    let lane = &mut lanes[b % 2];
+                    let c = make_case(lane, &mut rng, b, mode, rows)?;
+                    let n = b * QF;
+                    // the Q8_0 chain's heads, then the fp8 chain's heads / codes / scales
+                    run_chain_epi(&k, &s, lane, &c, &params, false, G3Epilogue::Q8_0)?;
+                    s.synchronize()?;
+                    let h_q8 = download(&lane.heads)?;
+                    run_chain_epi(&k, &s, lane, &c, &params, false, G3Epilogue::Fp8)?;
+                    s.synchronize()?;
+                    let r = Ref { h: download(&lane.heads)?, q: download(&lane.xq)?, s: download(&lane.xs)? };
+                    // the attention output is the same (dims 0..447 of every head); the rope tail is
+                    // the bf16 rotation of the bf16 values (bf16-valued; its arithmetic is pinned by
+                    // tests/fp8_wo_a.rs rope_inv_quant_fp8_matches_the_cpu)
+                    let dh_chain = (0..n).filter(|&i| if i % 512 < 448 {
+                        h_q8[i].to_bits() != r.h[i].to_bits()
+                    } else {
+                        r.h[i].to_bits() & 0xFFFF != 0
+                    }).count();
+                    // the CPU emulation of the reference on the chain's heads (bf16 first)
+                    let mut codes = vec![0u8; n];
+                    let mut scales = vec![0f32; n / 32];
+                    act_quant_row_bf16(&r.h[..n], &mut codes, &mut scales);
+                    let dq_cpu = codes.iter().zip(&r.q[..n]).filter(|(a, b)| **a != **b as u8).count();
+                    let (ds_cpu, _) = bits_diff_f32(&scales, &r.s[..n / 32]);
+                    cpu_checked += n;
+                    if dh_chain + dq_cpu + ds_cpu != 0 {
+                        bad += 1;
+                        eprintln!("FP8 CHAIN rope={pname} mode={mode:?} rows={rows:?} b={b}: heads vs q8 chain {dh_chain}, \
+                                   codes vs CPU {dq_cpu}, scales vs CPU {ds_cpu}");
+                    }
+                    // every arm against the fp8 chain
+                    let mut arms: Vec<(String, Option<G3oMode>)> = vec![("g3_o8".into(), None)];
+                    arms.extend(w_modes.iter().map(|&(p, w)| (format!("w{p}x{w}_o8"), Some(G3oMode::Whole { parts: p, warps: w }))));
+                    for (name, gm) in arms {
+                        lane.poison()?;
+                        let comp = comp_of(lane, &c);
+                        let l2 = unsafe { &mut *(lane as *const Lane as *mut Lane) };
+                        let rws = G3Rows { n_raw: &c.n_raw, raw_off: &c.raw_off, n_comp: &c.n_comp };
+                        match gm {
+                            None => k.g3.launch_epi(G3Epilogue::Fp8, &s, Some(&mut l2.heads2), &mut l2.xq2, &mut l2.xs2, &lane.zero_row,
+                                                    &lane.sinks, &lane.q, &lane.kv, comp, rws, &lane.pos, NH, HD, 64, &params)?,
+                            Some(m) => k.g3o[0].1.launch_epi(G3Epilogue::Fp8, &s, m, Some(&mut l2.heads2), &mut l2.xq2, &mut l2.xs2,
+                                                             &lane.zero_row, &lane.sinks, &lane.q, &lane.kv, comp, rws, &lane.pos,
+                                                             NH, HD, 64, &params, None, None)?,
+                        }
+                        s.synchronize()?;
+                        let (dh, dq, ds, wh) = compare(lane, &r, b)?;
+                        total += 1;
+                        if dh + dq + ds != 0 {
+                            bad += 1;
+                            eprintln!("MISMATCH {name} rope={pname} mode={mode:?} rows={rows:?} b={b}: heads {dh} (max |d| {wh:e}) \
+                                       codes {dq} scales {ds}  n_raw {:?} n_comp {:?}", c.n_raw, c.n_comp);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("rope {pname}: {total} comparisons so far, {bad} bad");
+    }
+    // the split modes have no fp8 epilogue: refused, not silently Q8_0
+    {
+        let c = make_case(&mut lanes[0], &mut rng, 2, Mode::Selected, Rows::Steady(128, 512))?;
+        let mut sh = Shared::new(id)?;
+        let l = &mut lanes[0];
+        let comp = comp_of(l, &c);
+        let l2 = unsafe { &mut *(l as *const Lane as *mut Lane) };
+        let e = k.g3o[0].1.launch_epi(G3Epilogue::Fp8, &s, G3oMode::TwoLaunch, None, &mut l2.xq2, &mut l2.xs2, &l.zero_row,
+                                      &l.sinks, &l.q, &l.kv, comp, G3Rows { n_raw: &c.n_raw, raw_off: &c.raw_off, n_comp: &c.n_comp },
+                                      &l.pos, NH, HD, 64, &rope_params()[0].1, Some((&mut sh.sc, &mut sh.sync)), None);
+        if e.is_ok() {
+            bad += 1;
+            eprintln!("TwoLaunch with the fp8 epilogue was accepted (must be refused)");
+        }
+    }
+    eprintln!("G3 fp8 epilogues vs the fp8 chain: {total} comparisons, {bad} bad; {cpu_checked} chain values vs the CPU emulation");
+    if bad != 0 {
+        return Err(eyre!("{bad} failures"));
     }
     Ok(())
 }

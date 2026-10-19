@@ -53,6 +53,16 @@ pub struct G3Rows<'a> {
     pub n_comp: &'a [i32],
 }
 
+/// What a G3 epilogue writes into `xq` / `xscale` (both kernels, `attn_dec_g3` and `attn_dec_g3o`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum G3Epilogue {
+    /// The Q8_0 quantize of `heads` (`rope_inv_quant_q8`'s bytes): the default.
+    Q8_0,
+    /// `V41_ATTN_O_FP8`: the 1017 reference's act_quant of `heads` -- e4m3 codes + one power-of-two
+    /// scale per 32 (`rope_inv_quant_fp8`'s bytes), the FP8 `wo_a` input (`crate::fp8_wo_a`).
+    Fp8,
+}
+
 pub struct AttnDecG3 {
     module: Module,
 }
@@ -94,6 +104,32 @@ impl AttnDecG3 {
     #[allow(clippy::too_many_arguments)]
     pub fn launch(
         &self,
+        stream: &Stream,
+        heads_out: Option<&mut DeviceBuffer<f32>>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        zero_row: &DeviceBuffer<u16>,
+        sinks: &DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp: G3Comp<'_>,
+        rows: G3Rows<'_>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        self.launch_epi(G3Epilogue::Q8_0, stream, heads_out, xq, xscale, zero_row, sinks, q, raw_kv, comp, rows,
+                        pos_per_b, n_head, head_dim, n_rot, params)
+    }
+
+    /// [`Self::launch`] with the epilogue `epi` (`attn_dec_g3` / `attn_dec_g3_o8`: the same block and
+    /// grid; only the bytes written into `xq` / `xscale` differ).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_epi(
+        &self,
+        epi: G3Epilogue,
         stream: &Stream,
         heads_out: Option<&mut DeviceBuffer<f32>>,
         xq: &mut DeviceBuffer<i8>,
@@ -158,7 +194,13 @@ impl AttnDecG3 {
         let (theta_scale, mscale_eff, corr_low, corr_high) = crate::RopeTail::device_args(params, n_rot);
         let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
         let heads_ptr = heads_out.map(|h| h.raw()).unwrap_or(std::ptr::null_mut());
-        let function = self.module.get_function("attn_dec_g3")?;
+        let function = self.module.get_function(match epi {
+            G3Epilogue::Q8_0 => "attn_dec_g3",
+            G3Epilogue::Fp8 => "attn_dec_g3_o8",
+        })?;
+        if epi == G3Epilogue::Fp8 {
+            crate::fp8_wo_a::count(crate::fp8_wo_a::Fp8Site::G3);
+        }
         let cfg = LaunchConfig { grid: (n_head / 16, b as u32, 1), block: (512, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [
             heads_ptr, xq.raw(), xscale.raw(), sinks.raw(), q.raw(), raw_kv.raw(),
