@@ -16,8 +16,9 @@ pub struct Module {
     /// `hipModuleGetFunction` results by name. Every kernel wrapper called
     /// `get_function(name)` per LAUNCH (a CString + a runtime symbol lookup
     /// each time); the batched decode step launches ~50 kernels per layer, so
-    /// this sat on the host critical path 2000 times per step.
-    functions: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// this sat on the host critical path 2000 times per step. The value
+    /// carries the kernel's name as a launch-ring kind (`crate::ring::intern_str`).
+    functions: std::sync::Mutex<std::collections::HashMap<String, (usize, crate::ring::KindId)>>,
 }
 
 impl Module {
@@ -36,8 +37,8 @@ impl Module {
 
     pub fn get_function(&self, name: &str) -> eyre::Result<Function<'_>> {
         if let Ok(cache) = self.functions.lock() {
-            if let Some(&raw) = cache.get(name) {
-                return Ok(Function { raw: raw as sys::hipFunction_t, _marker: std::marker::PhantomData });
+            if let Some(&(raw, kind)) = cache.get(name) {
+                return Ok(Function { raw: raw as sys::hipFunction_t, kind, _marker: std::marker::PhantomData });
             }
         }
         let c_name = CString::new(name).expect("kernel name has null byte");
@@ -46,11 +47,14 @@ impl Module {
             unsafe { sys::hipModuleGetFunction(&mut raw, self.raw, c_name.as_ptr()) },
             "hipModuleGetFunction",
         )?;
+        // Interned for the ring: one small leak per distinct kernel name, bounded by the kernels loaded.
+        let kind = crate::ring::intern_str(name);
         if let Ok(mut cache) = self.functions.lock() {
-            cache.insert(name.to_string(), raw as usize);
+            cache.insert(name.to_string(), (raw as usize, kind));
         }
         Ok(Function {
             raw,
+            kind,
             _marker: std::marker::PhantomData,
         })
     }
@@ -73,6 +77,8 @@ impl Drop for Module {
 /// A kernel handle. Borrowed from its parent `Module`.
 pub struct Function<'m> {
     raw: sys::hipFunction_t,
+    /// The kernel's name as a launch-ring kind.
+    kind: crate::ring::KindId,
     _marker: std::marker::PhantomData<&'m Module>,
 }
 
@@ -131,19 +137,51 @@ pub fn launch_audit() -> (u64, u64) {
 }
 
 impl<'m> Function<'m> {
+    /// The kernel's symbol name.
+    pub fn name(&self) -> &'static str {
+        crate::ring::kind_name(self.kind)
+    }
+
     /// Launch with raw kernel-argument pointers. Caller supplies a slice
     /// of `*mut c_void` where each entry points to a single argument
-    /// (HIP/CUDA "kernelParams" ABI).
+    /// (HIP/CUDA "kernelParams" ABI). Recorded in the launch ring without
+    /// its argument values (see [`Self::launch_raw_traced`]).
     ///
     /// # Safety
     /// `args` must contain pointers to live values of the correct type
     /// and lifetime; HIP reads them during the launch (which is async).
+    #[track_caller]
     pub unsafe fn launch_raw(
         &self,
         cfg: LaunchConfig,
         stream: &Stream,
         args: &mut [*mut c_void],
     ) -> eyre::Result<()> {
+        unsafe { self.launch_raw_traced(cfg, stream, args, &[]) }
+    }
+
+    /// [`Self::launch_raw`], recording `words` (the first argument words,
+    /// [`crate::ring::arg_word`]) in the launch ring: what
+    /// [`crate::launch_kernel!`] calls.
+    ///
+    /// # Safety
+    /// As [`Self::launch_raw`].
+    #[track_caller]
+    pub unsafe fn launch_raw_traced(
+        &self,
+        cfg: LaunchConfig,
+        stream: &Stream,
+        args: &mut [*mut c_void],
+        words: &[u64],
+    ) -> eyre::Result<()> {
+        crate::ring::record(
+            stream.device_id(),
+            self.kind,
+            Some(std::panic::Location::caller()),
+            stream.raw() as usize,
+            crate::ring::launch_dims(cfg.grid, cfg.block),
+            words,
+        );
         let extra: *mut *mut c_void = ptr::null_mut();
         // The launch audit (design 2.5): every launch counts; the vetted mark is consumed.
         LAUNCH_AUDIT.with(|c| {

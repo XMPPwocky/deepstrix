@@ -364,6 +364,9 @@ pub struct ExpertPager {
     owner: V41HfWeights,
     /// `n_slots` slots per role; slot `s`'s bytes live at `s * *_bytes_per_expert`.
     pub routed: RoutedExpertWeights,
+    /// `routed`'s base pointers as captured at construction, for the MoE launch-arg canary
+    /// (`crate::moe_canary`); deregisters on drop.
+    _canary: crate::moe_canary::PoolGuard,
     n_slots: u32,
     /// Which (layer, expert) each slot holds, and the slots' LRU stamps.
     res: Residency,
@@ -2281,6 +2284,7 @@ impl ExpertPager {
             down_bytes_per_expert: down_bpe,
             n_slots,
         };
+        let canary = crate::moe_canary::register_pool("box1 pager", device_id, &routed)?;
         // === Prefill/decode pool split (M8 step 0) ===
         //
         // Prefill's dense windows live in slots [0, dense_windows*N_EXPERT); decode's
@@ -2393,6 +2397,7 @@ impl ExpertPager {
         Ok(Self {
             owner,
             routed,
+            _canary: canary,
             n_slots,
             dense_windows,
             window_layer: vec![None; total_windows.max(1) as usize],
@@ -3519,6 +3524,12 @@ impl ExpertPager {
     /// by raw expert id exactly as it would a resident buffer. This is what lets
     /// different layers stay resident in different windows while the kernel still sees
     /// slot == expert id.
+    /// First pool slot of `layer`'s dense window (what [`Self::routed_window`] views from): the MoE canary's expected
+    /// weight base is the pool base + this x bytes-per-expert.
+    pub fn window_slot0(&self, layer: i32) -> usize {
+        self.window_base(self.window_of(layer))
+    }
+
     pub fn routed_window(&self, layer: i32) -> RoutedExpertWeights {
         let w = self.window_of(layer);
         let base = self.window_base(w);

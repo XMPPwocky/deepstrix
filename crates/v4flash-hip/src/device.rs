@@ -112,6 +112,7 @@ impl Device {
     /// is destroyed — otherwise a buffer's `hipFree` runs an implicit
     /// per-buffer `SyncAllStreams` that can orphan a not-yet-executed
     /// cross-device wait and busy-spin forever.
+    #[track_caller]
     pub fn synchronize(&self) -> eyre::Result<()> {
         self.set_current()?;
         check_eyre(unsafe { sys::hipDeviceSynchronize() }, "hipDeviceSynchronize")
@@ -181,11 +182,14 @@ impl Device {
     }
 
     /// Caller must already have `set_current()` for this device.
+    /// Success, and "already enabled" (704), record that `self` may access `peer`'s memory
+    /// (`ptr_registry::peer_enabled`: a kernel operand on the peer is then legitimate).
     pub fn enable_peer_access(&self, peer: Device) -> eyre::Result<()> {
-        check_eyre(
-            unsafe { sys::hipDeviceEnablePeerAccess(peer.id, 0) },
-            "hipDeviceEnablePeerAccess",
-        )
+        let code = unsafe { sys::hipDeviceEnablePeerAccess(peer.id, 0) };
+        if code == sys::HIP_SUCCESS || code == 704 {
+            crate::ptr_registry::note_peer(self.id, peer.id);
+        }
+        check_eyre(code, "hipDeviceEnablePeerAccess")
     }
 
     pub fn stream_priority_range(&self) -> eyre::Result<(i32, i32)> {

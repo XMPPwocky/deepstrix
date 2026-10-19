@@ -1112,11 +1112,47 @@ crate::knobs! {
     /// goes on a LOW-priority rewarm queue for the background prefetcher, drained with what each decode step's
     /// `V41_B1_HOT_PREWARM_STEP` budget leaves after the hot-set newcomers; ownership is re-checked at take time.
     pub static B1_REWARM_AFTER_PREFILL = Knob::flag("V41_B1_REWARM_AFTER_PREFILL", false).live();
+    /// `V41_PTR_REGISTRY` = `off` | `warn` (DEFAULT) | `enforce` (LIVE): what a pointer-registry miss does -- every
+    /// copy's pointer check and the MoE launch-arg canary (`v4flash_hip::ptr_registry`, HIP 700 instrumentation
+    /// 2026-10-19). `warn` logs a rate-limited report and proceeds unchanged; `enforce` refuses (an error before the HIP
+    /// call / launch). The hook pushes the value into `v4flash_hip`. Registration itself is decided at the first
+    /// allocation from the env (on unless `off`): a process started `off` cannot turn checks on without a restart.
+    /// Also `0|false|no` = off, `1|on|true|yes` = enforce.
+    pub static PTR_REGISTRY = Knob::choice(
+        "V41_PTR_REGISTRY",
+        1,
+        &[&["off", "0", "false", "no"], &["warn"], &["enforce", "1", "on", "true", "yes"]],
+    )
+    .live()
+    .hook(ptr_registry_hook);
+    /// `V41_HIP_RING_DUMP` (default 0; live): write a NEW non-zero value (1, then 2, ...) to dump the HIP launch / copy
+    /// ring (`v4flash_hip::ring`: the last 64 launches / copies / memsets per device) to stderr once per change. The
+    /// sticky-HIP-error exit dumps it unasked.
+    pub static HIP_RING_DUMP = Knob::int("V41_HIP_RING_DUMP", 0, 0, u32::MAX as u64).live().hook(hip_ring_dump_hook);
 }
 
 /// Pushes `V41_EXPERT_HEDGE_MS` into the core read path (it cannot read this crate's knobs).
 fn expert_hedge_hook(k: &Knob) {
     v4flash_core::hedge::set_expert_hedge_ms(k.get());
+}
+
+/// Pushes `V41_PTR_REGISTRY` into `v4flash_hip::ptr_registry` (it cannot read this table).
+fn ptr_registry_hook(k: &Knob) {
+    use v4flash_hip::ptr_registry::{set_mode, Mode};
+    set_mode(match k.pick() {
+        0 => Mode::Off,
+        2 => Mode::Enforce,
+        _ => Mode::Warn,
+    });
+}
+
+/// `V41_HIP_RING_DUMP`: dump the ring once per new non-zero value.
+fn hip_ring_dump_hook(k: &Knob) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let v = k.get();
+    if v != 0 && LAST.swap(v, Ordering::Relaxed) != v {
+        v4flash_hip::ring::dump(&format!("knob V41_HIP_RING_DUMP={v}"));
+    }
 }
 
 #[cfg(test)]

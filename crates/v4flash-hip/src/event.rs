@@ -44,6 +44,7 @@ impl Event {
         self.device_id
     }
 
+    #[track_caller]
     pub fn record(&self, stream: &Stream) -> eyre::Result<()> {
         check_eyre(
             unsafe { sys::hipEventRecord(self.raw, stream.raw()) },
@@ -51,6 +52,7 @@ impl Event {
         )
     }
 
+    #[track_caller]
     pub fn synchronize(&self) -> eyre::Result<()> {
         check_eyre(
             unsafe { sys::hipEventSynchronize(self.raw) },
@@ -61,6 +63,7 @@ impl Event {
     /// Non-blocking: `Ok(true)` once every operation before the record has
     /// completed (`hipEventQuery` == hipSuccess), `Ok(false)` while pending
     /// (hipErrorNotReady = 600).
+    #[track_caller]
     pub fn query(&self) -> eyre::Result<bool> {
         let r = unsafe { sys::hipEventQuery(self.raw) };
         if r == sys::HIP_SUCCESS { return Ok(true); }

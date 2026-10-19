@@ -316,6 +316,11 @@ impl Loan {
     /// overwritten. Returns only when the device holds the image's bytes
     /// (`stream` synchronized).
     pub fn give_back(&self, stream: &Stream, host: &mut [PinnedBuffer<u8>; 2], verify: bool, readers: usize) -> eyre::Result<ReturnStats> {
+        // Any error out of here ends in the embed phase's abort (`LoanOut`): a pointer-registry miss on these copies must
+        // not be that error. It is logged as a named ERROR and the copy proceeds, in every registry mode.
+        let _registry = v4flash_hip::ptr_registry::advisory(
+            "dgpu_loan::give_back: refusing a loan-return copy can only end in an abort with the V4.1 weights corrupt",
+        );
         let t0 = Instant::now();
         if host.iter().any(|h| h.len() < self.chunk) {
             return Err(eyre!("give_back: need two pinned buffers of >= {} B", self.chunk));

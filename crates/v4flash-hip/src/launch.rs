@@ -66,6 +66,10 @@ macro_rules! launch_kernel {
     ($func:expr, $cfg:expr, $stream:expr, [ $($arg:expr),* $(,)? ]) => {{
         // Stable storage for every argument (see module docs).
         let mut __lk_store = $crate::__launch_cons!($($arg),*);
+        // The first RING_ARGS argument words, for the launch ring (`v4flash_hip::ring`).
+        let __lk_words_arr = $crate::__launch_words!(@go __lk_store () [] $($arg),*);
+        let __lk_words: &[u64] = &__lk_words_arr;
+        let __lk_n = if __lk_words.len() < $crate::ring::RING_ARGS { __lk_words.len() } else { $crate::ring::RING_ARGS };
         let mut __lk_args = $crate::__launch_ptrs!(@go __lk_store () [] $($arg),*);
         // SAFETY: every element of `__lk_args` points at the matching field
         // of `__lk_store` (one per kernel param, in declaration order); the
@@ -74,7 +78,7 @@ macro_rules! launch_kernel {
         // responsibility — the same contract `launch_raw` already documents.
         #[allow(unused_unsafe)]
         unsafe {
-            $func.launch_raw($cfg, $stream, &mut __lk_args)
+            $func.launch_raw_traced($cfg, $stream, &mut __lk_args, &__lk_words[..__lk_n])
         }
     }};
 }
@@ -110,6 +114,24 @@ macro_rules! __launch_ptrs {
     };
 }
 
+/// As [`__launch_ptrs!`], emitting each argument's ring word
+/// ([`crate::ring::arg_word`]) instead of its pointer. Internal to
+/// [`launch_kernel!`].
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __launch_words {
+    (@go $base:ident ($($pre:tt)*) [$($acc:tt)*] ) => {
+        [ $($acc)* ]
+    };
+    (@go $base:ident ($($pre:tt)*) [$($acc:tt)*] $head:expr $(, $rest:expr)*) => {
+        $crate::__launch_words!(
+            @go $base ($($pre)* .1)
+            [ $($acc)* $crate::ring::arg_word(&$base $($pre)* .0), ]
+            $($rest),*
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     // Validates the arg-pointer plumbing with no GPU: build the same
@@ -130,10 +152,21 @@ mod tests {
     }
 
     #[test]
+    fn arg_words_follow_the_store() {
+        let store = crate::__launch_cons!(11u32, 2.5f32, 0x7e00_0000_1000usize as *mut u8);
+        let words: [u64; 3] = crate::__launch_words!(@go store () [] (), (), ());
+        assert_eq!(words, [11, 2.5f32.to_bits() as u64, 0x7e00_0000_1000]);
+    }
+
+    #[test]
     fn empty_arg_list_is_empty_array() {
         let mut _store = crate::__launch_cons!();
         let args: [*mut ::core::ffi::c_void; 0] =
             crate::__launch_ptrs!(@go _store () []);
         assert_eq!(args.len(), 0);
+        // As the macro binds it: the element type comes from the slice coercion.
+        let words_arr = crate::__launch_words!(@go _store () []);
+        let words: &[u64] = &words_arr;
+        assert!(words.is_empty());
     }
 }

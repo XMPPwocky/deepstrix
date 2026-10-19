@@ -6379,6 +6379,8 @@ impl HeterogeneousEngine {
         rows: &RowLayout<'_>,
     ) -> eyre::Result<PreMoeCarry> {
         let layer = dlw.layer_idx;
+        // HIP ring context (`v4flash_hip::ring::scope`): this phase's launches / copies carry the layer.
+        let _ring_ctx = v4flash_hip::ring::scope(layer as i32, -1);
         // `V41_DGPU_SX_DEFER`: the lane's previous shared expert was dispatched by its Post (the
         // driver flushes before every Post); one still pending here means a driver skipped that.
         if let Some(p) = bd.sx_pending {
@@ -10998,6 +11000,7 @@ impl HeterogeneousEngine {
         rows: &RowLayout<'_>,
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Chained, PreMoePhase::Routed)? { return Ok(()); }
+        let _ring_ctx = v4flash_hip::ring::scope(c.layer, c.lane as i32);
         let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, sub3, prior_on, rb, mp, .. } = *c;
         let _ = (cs_n_embd, split_cap, moe_group_bound);
         // `V41_SUB_DEFER_ACCEPTED`: in a speculative step this lane's admissions,
@@ -12315,6 +12318,7 @@ impl HeterogeneousEngine {
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Routed, PreMoePhase::Prepped)? { return Ok(()); }
+        let _ring_ctx = v4flash_hip::ring::scope(c.layer, c.lane as i32);
         let PreMoeCarry {
             layer, b, cs_n_used, cs_n_embd, dump_pos, cap_ok, defer_shared, remote_split_on, split_cap,
             sparse_resid_layer, moe_group_bound, replay_offload, sparse_resid, mc0, drain_before_ensure, owns_remote_some,
@@ -12903,6 +12907,8 @@ impl HeterogeneousEngine {
             layer, b, cs_n_used, cs_n_embd, moe_group_bound, split_cap, sparse_resid_layer, hot_active, xq_pushed, ref sel_host_audit, ..
         } = *c;
         let _ = (sd, dlw, ilw, hot_active, cs_n_embd);
+        // Tag this phase's launches / copies in the HIP ring (and the MoE canary's messages) with the lane-layer.
+        let _ring_ctx = v4flash_hip::ring::scope(layer, c.lane as i32);
         let pager_window;
         let (routed_src, moe_remap, moe_packed): (
             &crate::model_weights::RoutedExpertWeights,
@@ -12959,6 +12965,16 @@ impl HeterogeneousEngine {
             }
             None => (&ilw.routed, ilw.hot_remap.as_ref(), ilw.igpu_packed),
         };
+        // MoE launch-arg canary, call-site half (`crate::moe_canary`, 10-18 aperture violation): a paged view must start
+        // at the pool base captured when the pager was built + this layer's window slot (0 for the absolute-slot view),
+        // and `n_slots` must fit every role's buffer. The launchers check the rest.
+        let canary_slot0 = pager.as_deref().map(|pg| if sparse_resid_layer { 0 } else { pg.window_slot0(layer) });
+        crate::moe_canary::check_routed(
+            routed_src,
+            canary_slot0.map(|s| ("box1 pager", s)),
+            self.igpu.device.id,
+            std::panic::Location::caller(),
+        )?;
         let gbpe = routed_src.gate_bytes_per_expert as u32;
         let ubpe = routed_src.up_bytes_per_expert as u32;
         let dbpe = routed_src.down_bytes_per_expert as u32;
@@ -12997,13 +13013,30 @@ impl HeterogeneousEngine {
             let words = bd.rb_pack.as_slice();
             let (so, sn) = c.rb.sel.expect("zc_push checked sel");
             let (eo, en) = c.rb.ew.expect("zc_push checked ew");
-            let (xo, _) = c.rb.xq.expect("zc_push checked xq");
+            let (xo, xn) = c.rb.xq.expect("zc_push checked xq");
             let n_xq = (b as usize) * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
+            // Bounds of the three segments BEFORE the raw views below (10-19 audit): the xq view is
+            // `from_raw_parts(.., n_xq)` over the pack's tail, so an `n_xq` past the xq segment (or the pack)
+            // would hand the DMA bytes beyond the pinned buffer. Named errors, not clamps.
+            let seg_end = |what: &str, o: u32, n: u32| -> eyre::Result<usize> {
+                match (o as usize).checked_add(n as usize) {
+                    Some(end) if end <= words.len() => Ok(end),
+                    _ => Err(eyre!("L{layer}: zero-copy pull: readback pack segment `{what}` [{o}, +{n}) words runs past the pack ({} words)", words.len())),
+                }
+            };
+            let (sel_end, ew_end, xq_end) = (seg_end("sel", so, sn)?, seg_end("ew", eo, en)?, seg_end("xq", xo, xn)?);
+            if n_xq % 4 != 0 || n_xq > (xq_end - xo as usize) * 4 || n_xq > (words.len() - xo as usize) * 4 {
+                return Err(eyre!(
+                    "L{layer}: zero-copy pull: n_xq = {n_xq} B, expected a multiple of 4 <= the xq segment ({xn} words) and <= the pack tail ({} words from {xo})",
+                    words.len() - xo as usize
+                ));
+            }
             // SAFETY: the pack's words are plain 32-bit lanes of i32 / f32 / bytes written by
             // `rb_pack` (`PackSeg::words` / `PackSeg::bytes`); reinterpreting them is a bit copy.
-            let sel_w = &words[so as usize..(so + sn) as usize];
-            let ew_w = &words[eo as usize..(eo + en) as usize];
-            let xq_w = &words[xo as usize..];
+            // The xq view's `n_xq` bytes lie inside `words[xo..xq_end]` (checked above).
+            let sel_w = &words[so as usize..sel_end];
+            let ew_w = &words[eo as usize..ew_end];
+            let xq_w = &words[xo as usize..xq_end];
             let sel_i: &[i32] = unsafe { std::slice::from_raw_parts(sel_w.as_ptr() as *const i32, sel_w.len()) };
             let ew_f: &[f32] = unsafe { std::slice::from_raw_parts(ew_w.as_ptr() as *const f32, ew_w.len()) };
             let xq_u8: &[u8] = unsafe { std::slice::from_raw_parts(xq_w.as_ptr() as *const u8, n_xq) };

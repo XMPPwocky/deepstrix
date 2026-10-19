@@ -60,12 +60,18 @@ impl HipError {
 /// Convert a raw HIP return code to a Result. The `context` literal is
 /// included in the error so we can pinpoint the failing call without a
 /// stack trace.
+///
+/// A failure is also handed to [`crate::fatal`], which records the FIRST
+/// sticky (GPU-in-error) code with this call's `#[track_caller]` location.
 #[inline]
+#[track_caller]
 pub fn check(code: sys::hipError_t, context: &'static str) -> Result<(), HipError> {
     if code == sys::HIP_SUCCESS {
         Ok(())
     } else {
-        Err(HipError::from_code(code, context))
+        let e = HipError::from_code(code, context);
+        crate::fatal::observe(code, &e, std::panic::Location::caller());
+        Err(e)
     }
 }
 
@@ -73,6 +79,7 @@ pub fn check(code: sys::hipError_t, context: &'static str) -> Result<(), HipErro
 /// return `eyre::Result<T>`; binaries install `color_eyre::install()` to
 /// pretty-print.
 #[inline]
+#[track_caller]
 pub fn check_eyre(code: sys::hipError_t, context: &'static str) -> eyre::Result<()> {
     check(code, context).map_err(eyre::Report::new)
 }

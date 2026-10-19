@@ -403,6 +403,18 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     // Set by a tick, cleared once the idle-transition housekeeping has run.
     let mut worked = false;
     loop {
+        // 0. A sticky HIP error (`v4flash_hip::fatal`): every later HIP call fails, so fail every request the engine
+        // holds and exit for the supervisor (the step-failure path below would otherwise 500 forever, 10-18).
+        if let Some(msg) = crate::engine_worker::hip_fatal_message() {
+            if v4flash_hip::fatal::exit_on_fatal_installed() {
+                tracing::error!(error = %msg, "multistream: sticky HIP error; failing every request and exiting");
+                sched.abort_all(&msg);
+                if let Some(e) = state.embed.as_mut() {
+                    e.fail_all(&msg);
+                }
+                crate::engine_worker::exit_if_hip_fatal("multistream: every request failed");
+            }
+        }
         // 1. Intake: never block while there is work; block when idle.
         // Parked requests are work too: blocking here with one parked left it
         // waiting for the NEXT request to arrive before it was retried.
