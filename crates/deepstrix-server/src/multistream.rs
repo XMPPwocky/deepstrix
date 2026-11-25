@@ -2437,9 +2437,11 @@ impl Sched {
                 tracing::info!(steps = acc.steps, steps_dev = format!("{}/{}", acc.steps_dev[0], acc.steps_dev[1]), rows_avg = format!("{:.1}", acc.rows as f64 / acc.steps as f64),
                     wall_ms = format!("{:.1}", acc.wall_ms / acc.steps as f64), dgpu_busy_ms = format!("{dgpu_busy:.1}"),
                     igpu_busy_ms = format!("{igpu_busy:.1}"), "ms.stage.total (per step)");
-                // Zero rows are counters this path never feeds; drop them.
+                // Zero rows are counters this path never feeds; drop them. DEBUG on its
+                // own target (off by default: with `ms.step` it was ~90% of the server
+                // log); `RUST_LOG=deepstrix_server=info,info,ms_stage=debug` turns it on.
                 for (d, n, ms, c) in v.iter().filter(|e| e.2 >= 0.005).take(96) {
-                    tracing::info!(device = *d, stage = *n, ms_per_step = format!("{ms:.2}"), calls = *c, "ms.stage");
+                    tracing::debug!(target: "ms_stage", device = *d, stage = *n, ms_per_step = format!("{ms:.2}"), calls = *c, "ms.stage");
                 }
                 acc.stages.clear();
                 acc.steps = 0;
@@ -2590,7 +2592,10 @@ impl Sched {
             let s = self.streams.remove(r);
             finish(state, &mut self.arena, s, f)?;
         }
-        tracing::info!(rows = b, spec = ?spec_out, lanes = if lanes3 { 3 } else if pipelined { 2 } else { 1 },
+        // DEBUG on its own target (off by default: one ~460-byte line per decode step,
+        // 86% of the server log); `RUST_LOG=deepstrix_server=info,info,ms_step=debug`
+        // turns it on. The Engram counters it swaps are reset / overwritten every step.
+        tracing::debug!(target: "ms_step", rows = b, spec = ?spec_out, lanes = if lanes3 { 3 } else if pipelined { 2 } else { 1 },
             step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(),
             head_full = head_stats.full, head_mismatch = head_stats.mismatch, head_diff = head_stats.head_diff,
